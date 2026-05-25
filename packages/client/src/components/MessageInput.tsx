@@ -438,6 +438,8 @@ export function MessageInput({
             slashCommands={slashCommands}
             onSelectSlashCommand={handleSlashCommand}
             contextUsage={contextUsage}
+            projectId={projectId}
+            sessionId={sessionId}
             isRunning={isRunning}
             isThinking={isThinking}
             onStop={onStop}

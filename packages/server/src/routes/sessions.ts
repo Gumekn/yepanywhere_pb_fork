@@ -1,4 +1,5 @@
 import {
+  type ContextStatusResponse,
   type ContextUsage,
   type ModelOption,
   type PermissionRules,
@@ -519,6 +520,135 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       slashCommands,
     });
   });
+
+  // GET /api/projects/:projectId/sessions/:sessionId/context-status
+  // Structured context-window breakdown. When a live SDK Process exists we
+  // call the SDK's getContextUsage() for the full category/MCP/skills/memory
+  // breakdown. Otherwise we fall back to the coarse estimate read from JSONL.
+  routes.get(
+    "/projects/:projectId/sessions/:sessionId/context-status",
+    async (c) => {
+      const projectId = c.req.param("projectId");
+      const sessionId = c.req.param("sessionId");
+
+      if (!isUrlProjectId(projectId)) {
+        return c.json({ error: "Invalid project ID format" }, 400);
+      }
+
+      const project = await deps.scanner.getOrCreateProject(projectId);
+      if (!project) {
+        return c.json({ error: "Project not found" }, 404);
+      }
+
+      const process = deps.supervisor.getProcessForSession(sessionId);
+
+      // Live path — SDK-backed breakdown.
+      if (process) {
+        // Opportunistically probe initializationResult() once per process so
+        // ModelInfoService learns the real context window (and persists it),
+        // even if the user never opens this modal again.
+        if (!process.initializationResultProbed && deps.modelInfoService) {
+          // Fire and forget; failures are already swallowed inside Process.
+          process.markInitializationResultProbed();
+          void process
+            .initializationResult()
+            .then((init) => {
+              if (!init || !init.models) return;
+              for (const m of init.models) {
+                if (m.contextWindow && m.contextWindow > 0) {
+                  deps.modelInfoService?.recordContextWindow(
+                    m.id,
+                    m.contextWindow,
+                    process.provider,
+                  );
+                }
+              }
+            })
+            .catch(() => {
+              // Already logged inside provider; nothing to do here.
+            });
+        }
+
+        try {
+          const usage = await process.getContextUsage();
+          if (usage) {
+            // Persist the live max-tokens against the resolved model so the
+            // fallback path stays accurate after this process exits.
+            const modelForCache =
+              process.resolvedModel ?? process.model ?? usage.model;
+            if (modelForCache && usage.rawMaxTokens > 0) {
+              deps.modelInfoService?.recordContextWindow(
+                modelForCache,
+                usage.rawMaxTokens,
+                process.provider,
+              );
+            }
+            const payload: ContextStatusResponse = usage;
+            return c.json(payload);
+          }
+        } catch {
+          // fall through to estimate
+        }
+      }
+
+      // Estimate path — derive from JSONL via the session reader.
+      const metadataProvider = deps.sessionMetadataService?.getProvider(
+        sessionId,
+      ) as ProviderName | undefined;
+      const sessionSummaryResult = await findSessionSummaryAcrossProviders(
+        project,
+        sessionId,
+        projectId as UrlProjectId,
+        {
+          readerFactory: deps.readerFactory,
+          codexSessionsDir: deps.codexSessionsDir,
+          codexReaderFactory: deps.codexReaderFactory,
+          geminiSessionsDir: deps.geminiSessionsDir,
+          geminiReaderFactory: deps.geminiReaderFactory,
+          geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
+        },
+        metadataProvider ?? process?.provider,
+      );
+      const sessionSummary = sessionSummaryResult?.summary ?? null;
+      const providerName: ProviderName | undefined =
+        sessionSummary?.provider ??
+        metadataProvider ??
+        process?.provider ??
+        project.provider;
+      const model = sessionSummary?.model;
+
+      const cachedWindow = deps.modelInfoService?.getCachedContextWindow(
+        model,
+        providerName,
+      );
+      const contextWindow =
+        cachedWindow ??
+        deps.modelInfoService?.getContextWindow(model, providerName) ??
+        getModelContextWindow(model, providerName);
+
+      // Re-derive percentage with the (possibly cached) contextWindow so the
+      // estimate isn't pinned to the reader's heuristic.
+      let contextUsage = sessionSummary?.contextUsage;
+      if (contextUsage && contextWindow > 0) {
+        contextUsage = {
+          ...contextUsage,
+          percentage: Math.round(
+            (contextUsage.inputTokens / contextWindow) * 100,
+          ),
+          contextWindow,
+        };
+      }
+
+      const payload: ContextStatusResponse = {
+        source: "jsonl",
+        model,
+        contextWindow,
+        contextWindowFromCache: cachedWindow !== undefined,
+        contextUsage,
+      };
+      return c.json(payload);
+    },
+  );
 
   // GET /api/projects/:projectId/sessions/:sessionId - Get session detail
   // Optional query params:

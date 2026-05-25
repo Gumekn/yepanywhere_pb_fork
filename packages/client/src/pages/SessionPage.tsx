@@ -1178,6 +1178,8 @@ function SessionPageContent({
                     supportsPermissionMode={supportsPermissionMode}
                     supportsThinkingToggle={supportsThinkingToggle}
                     contextUsage={session?.contextUsage}
+                    projectId={projectId}
+                    sessionId={actualSessionId}
                     isRunning={status.owner === "self"}
                     isThinking={processState === "in-turn"}
                     onStop={handleAbort}

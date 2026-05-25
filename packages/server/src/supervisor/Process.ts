@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type {
+  ContextStatusSdkPayload,
   EffortLevel,
   ModelInfo,
   PermissionRules,
@@ -80,6 +81,18 @@ export interface ProcessConstructorOptions extends ProcessOptions {
   supportedCommandsFn?: () => Promise<SlashCommand[]>;
   /** Function to change model mid-session (SDK 0.2.7+) */
   setModelFn?: (model?: string) => Promise<void>;
+  /**
+   * Function returning a structured breakdown of current context-window usage
+   * (system prompt, tools, skills, MCP servers, memory files...). SDK 0.2.7+.
+   */
+  getContextUsageFn?: () => Promise<ContextStatusSdkPayload | null>;
+  /**
+   * Function returning the SDK initialization result. Used by Process to
+   * learn the resolved model's true context window on startup. SDK 0.2.7+.
+   */
+  initializationResultFn?: () => Promise<{
+    models: Array<{ id: string; contextWindow?: number }>;
+  } | null>;
 }
 
 export class Process {
@@ -158,6 +171,21 @@ export class Process {
   /** Function to change model mid-session (SDK 0.2.7+) */
   private setModelFn: ((model?: string) => Promise<void>) | null;
 
+  /** Function returning structured live context-window breakdown (SDK 0.2.7+) */
+  private getContextUsageFn:
+    | (() => Promise<ContextStatusSdkPayload | null>)
+    | null;
+
+  /** Function returning SDK initialization result (SDK 0.2.7+) */
+  private initializationResultFn:
+    | (() => Promise<{
+        models: Array<{ id: string; contextWindow?: number }>;
+      } | null>)
+    | null;
+
+  /** Set after the first time we successfully probe initializationResult() */
+  private _initializationResultProbed = false;
+
   /** Resolvers waiting for the real session ID */
   private sessionIdResolvers: Array<(id: string) => void> = [];
   private sessionIdResolved = false;
@@ -218,6 +246,8 @@ export class Process {
     this.supportedCommandsFn = options.supportedCommandsFn ?? null;
     this._pidResolver = options.pid;
     this.setModelFn = options.setModelFn ?? null;
+    this.getContextUsageFn = options.getContextUsageFn ?? null;
+    this.initializationResultFn = options.initializationResultFn ?? null;
     this._isProcessAlive = options.isProcessAlive ?? null;
     this._lastMessageTime = new Date();
 
@@ -488,6 +518,36 @@ export class Process {
       this._resolvedModel = model;
     }
     return true;
+  }
+
+  /**
+   * Live, structured context-window breakdown from the SDK
+   * (Query.getContextUsage()). Returns null if the provider does not
+   * support it (e.g. codex / gemini) or the call fails.
+   */
+  async getContextUsage(): Promise<ContextStatusSdkPayload | null> {
+    if (!this.getContextUsageFn) return null;
+    return this.getContextUsageFn();
+  }
+
+  /**
+   * SDK initialization result — used to learn the resolved model's true
+   * context window on startup, before any result message arrives.
+   * Returns null when unsupported.
+   */
+  async initializationResult(): Promise<{
+    models: Array<{ id: string; contextWindow?: number }>;
+  } | null> {
+    if (!this.initializationResultFn) return null;
+    return this.initializationResultFn();
+  }
+
+  /** Mark that we've already probed initializationResult once. */
+  get initializationResultProbed(): boolean {
+    return this._initializationResultProbed;
+  }
+  markInitializationResultProbed(): void {
+    this._initializationResultProbed = true;
   }
 
   /**

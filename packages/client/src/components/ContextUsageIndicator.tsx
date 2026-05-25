@@ -8,6 +8,15 @@ interface ContextUsageIndicatorProps {
   size?: number;
   /** Whether to show the percentage label (default: true) */
   showLabel?: boolean;
+  /**
+   * When provided, the indicator becomes interactive (button) and invokes
+   * this callback on click — used by SessionPage to open the
+   * ContextStatusModal. Without it, the indicator stays as a static span
+   * (current behavior in list rows).
+   */
+  onClick?: () => void;
+  /** Accessible label for the interactive button. */
+  ariaLabel?: string;
 }
 
 /**
@@ -18,6 +27,8 @@ export function ContextUsageIndicator({
   usage,
   size = 16,
   showLabel = true,
+  onClick,
+  ariaLabel,
 }: ContextUsageIndicatorProps) {
   const { t } = useI18n();
   if (!usage) return null;
@@ -51,7 +62,11 @@ export function ContextUsageIndicator({
       });
 
   return (
-    <span className="context-usage-indicator" title={tooltip}>
+    <ContextUsageWrapper
+      onClick={onClick}
+      title={tooltip}
+      ariaLabel={ariaLabel ?? tooltip}
+    >
       <svg
         width={size}
         height={size}
@@ -84,6 +99,37 @@ export function ContextUsageIndicator({
       {showLabel && (
         <span className="context-usage-label">{clampedPercentage}%</span>
       )}
+    </ContextUsageWrapper>
+  );
+}
+
+function ContextUsageWrapper({
+  onClick,
+  title,
+  ariaLabel,
+  children,
+}: {
+  onClick?: () => void;
+  title: string;
+  ariaLabel: string;
+  children: React.ReactNode;
+}) {
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        className="context-usage-indicator context-usage-indicator--button"
+        title={title}
+        aria-label={ariaLabel}
+        onClick={onClick}
+      >
+        {children}
+      </button>
+    );
+  }
+  return (
+    <span className="context-usage-indicator" title={title}>
+      {children}
     </span>
   );
 }

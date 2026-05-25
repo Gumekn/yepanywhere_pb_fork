@@ -1,8 +1,9 @@
 import type { UploadedFile } from "@yep-anywhere/shared";
-import type { RefObject } from "react";
+import { type RefObject, useState } from "react";
 import { useModelSettings } from "../hooks/useModelSettings";
 import { useI18n } from "../i18n";
 import type { ContextUsage, PermissionMode } from "../types";
+import { ContextStatusModal } from "./ContextStatusModal";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { ModeSelector } from "./ModeSelector";
 import { SlashCommandButton } from "./SlashCommandButton";
@@ -37,6 +38,10 @@ export interface MessageInputToolbarProps {
 
   // Context usage
   contextUsage?: ContextUsage;
+  /** When provided, the ContextUsageIndicator becomes clickable and opens
+   *  the context status modal. */
+  projectId?: string;
+  sessionId?: string;
 
   // Actions
   isRunning?: boolean;
@@ -73,6 +78,8 @@ export function MessageInputToolbar({
   slashCommands = [],
   onSelectSlashCommand,
   contextUsage,
+  projectId,
+  sessionId,
   isRunning,
   isThinking,
   onStop,
@@ -84,6 +91,7 @@ export function MessageInputToolbar({
 }: MessageInputToolbarProps) {
   const { t } = useI18n();
   const { thinkingMode, cycleThinkingMode, thinkingLevel } = useModelSettings();
+  const [isContextModalOpen, setIsContextModalOpen] = useState(false);
 
   return (
     <div className="message-input-toolbar">
@@ -212,7 +220,16 @@ export function MessageInputToolbar({
             </span>
           </button>
         )}
-        <ContextUsageIndicator usage={contextUsage} size={16} />
+        <ContextUsageIndicator
+          usage={contextUsage}
+          size={16}
+          onClick={
+            projectId && sessionId
+              ? () => setIsContextModalOpen(true)
+              : undefined
+          }
+          ariaLabel={t("contextBreakdownTitle")}
+        />
         {/* Queue button - shown when agent is running and there's content to queue */}
         {onQueue && canSend && (
           <button
@@ -264,6 +281,13 @@ export function MessageInputToolbar({
           </button>
         ) : null}
       </div>
+      {isContextModalOpen && projectId && sessionId && (
+        <ContextStatusModal
+          projectId={projectId}
+          sessionId={sessionId}
+          onClose={() => setIsContextModalOpen(false)}
+        />
+      )}
     </div>
   );
 }

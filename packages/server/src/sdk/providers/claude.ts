@@ -9,6 +9,7 @@ import {
   query,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
+  type ContextStatusSdkPayload,
   type ModelInfo,
   type SlashCommand,
   getModelContextWindow,
@@ -552,6 +553,110 @@ export class ClaudeProvider implements AgentProvider {
         }));
       },
       setModel: (model?: string) => sdkQuery.setModel(model),
+      getContextUsage: async (): Promise<ContextStatusSdkPayload | null> => {
+        try {
+          const usage = await sdkQuery.getContextUsage();
+          if (!usage) return null;
+          return {
+            source: "sdk",
+            model: usage.model,
+            totalTokens: usage.totalTokens,
+            maxTokens: usage.maxTokens,
+            rawMaxTokens: usage.rawMaxTokens,
+            percentage: usage.percentage,
+            autoCompactThreshold: usage.autoCompactThreshold,
+            categories: usage.categories.map((c) => ({
+              name: c.name,
+              tokens: c.tokens,
+              color: c.color,
+            })),
+            mcpTools: usage.mcpTools.map((t) => ({
+              name: t.name,
+              serverName: t.serverName,
+              tokens: t.tokens,
+              isLoaded: t.isLoaded,
+            })),
+            memoryFiles: usage.memoryFiles.map((f) => ({
+              path: f.path,
+              type: f.type,
+              tokens: f.tokens,
+            })),
+            agents: usage.agents.map((a) => ({
+              agentType: a.agentType,
+              source: a.source,
+              tokens: a.tokens,
+            })),
+            slashCommands: usage.slashCommands
+              ? {
+                  totalCommands: usage.slashCommands.totalCommands,
+                  includedCommands: usage.slashCommands.includedCommands,
+                  tokens: usage.slashCommands.tokens,
+                }
+              : undefined,
+            skills: usage.skills
+              ? {
+                  totalSkills: usage.skills.totalSkills,
+                  includedSkills: usage.skills.includedSkills,
+                  tokens: usage.skills.tokens,
+                  skillFrontmatter: usage.skills.skillFrontmatter.map((s) => ({
+                    name: s.name,
+                    source: s.source,
+                    tokens: s.tokens,
+                  })),
+                }
+              : undefined,
+            systemPromptSections: usage.systemPromptSections?.map((s) => ({
+              name: s.name,
+              tokens: s.tokens,
+            })),
+            systemTools: usage.systemTools?.map((s) => ({
+              name: s.name,
+              tokens: s.tokens,
+            })),
+            deferredBuiltinTools: usage.deferredBuiltinTools?.map((t) => ({
+              name: t.name,
+              tokens: t.tokens,
+              isLoaded: t.isLoaded,
+            })),
+          };
+        } catch (err) {
+          getLogger().warn(
+            { err: (err as Error).message },
+            "[ClaudeProvider] getContextUsage failed",
+          );
+          return null;
+        }
+      },
+      initializationResult: async () => {
+        try {
+          const init = await sdkQuery.initializationResult();
+          if (!init || !Array.isArray(init.models)) return null;
+          // SDK returns ModelInfo with { value, displayName, ... }; some
+          // entries (esp. [1m] variants) carry a contextWindow field.
+          // Map to the lean { id, contextWindow } pair the supervisor uses.
+          return {
+            models: init.models.map((m) => {
+              const raw = m as unknown as {
+                value: string;
+                contextWindow?: number;
+              };
+              return {
+                id: raw.value,
+                contextWindow:
+                  typeof raw.contextWindow === "number"
+                    ? raw.contextWindow
+                    : undefined,
+              };
+            }),
+          };
+        } catch (err) {
+          getLogger().warn(
+            { err: (err as Error).message },
+            "[ClaudeProvider] initializationResult failed",
+          );
+          return null;
+        }
+      },
     };
   }
 

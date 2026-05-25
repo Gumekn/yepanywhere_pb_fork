@@ -574,6 +574,8 @@ export class Supervisor {
       supportedModels,
       supportedCommands,
       setModel,
+      getContextUsage,
+      initializationResult,
     } = result;
 
     const tempSessionId = randomUUID();
@@ -595,6 +597,8 @@ export class Supervisor {
       supportedModelsFn: supportedModels,
       supportedCommandsFn: supportedCommands,
       setModelFn: setModel,
+      getContextUsageFn: getContextUsage,
+      initializationResultFn: initializationResult,
       permissionMode: effectiveMode,
       provider: activeProvider.name,
       model: modelSettings?.model,
@@ -675,6 +679,8 @@ export class Supervisor {
       supportedModels,
       supportedCommands,
       setModel,
+      getContextUsage,
+      initializationResult,
     } = result;
 
     const options: ProcessConstructorOptions = {
@@ -695,6 +701,8 @@ export class Supervisor {
       supportedModelsFn: supportedModels,
       supportedCommandsFn: supportedCommands,
       setModelFn: setModel,
+      getContextUsageFn: getContextUsage,
+      initializationResultFn: initializationResult,
       permissionMode: effectiveMode,
       provider: activeProvider.name,
       model: modelSettings?.model,

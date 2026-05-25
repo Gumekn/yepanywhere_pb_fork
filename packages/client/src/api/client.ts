@@ -2,6 +2,7 @@ import type {
   AgentActivity,
   BrowserProfilesResponse,
   ConnectionsResponse,
+  ContextStatusResponse,
   DeviceInfo,
   EnrichedRecentEntry,
   FileContentResponse,
@@ -406,6 +407,16 @@ export const api = {
       pendingInputRequest?: InputRequest | null;
       slashCommands?: SlashCommand[] | null;
     }>(`/projects/${projectId}/sessions/${sessionId}/metadata`),
+
+  /**
+   * Get a structured context-window breakdown for a session.
+   * Returns the SDK's live breakdown if a Process is active, otherwise a
+   * coarse JSONL-based estimate. Use `response.source` to tell them apart.
+   */
+  getContextStatus: (projectId: string, sessionId: string) =>
+    fetchJSON<ContextStatusResponse>(
+      `/projects/${projectId}/sessions/${sessionId}/context-status`,
+    ),
 
   /**
    * Get agent session content for lazy-loading completed Tasks.

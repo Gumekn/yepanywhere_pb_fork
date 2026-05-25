@@ -174,6 +174,23 @@ export type {
   CodexSessionContent,
 } from "./session/index.js";
 
+// Context status (full SDK breakdown + fallback estimate)
+export type {
+  ContextStatusResponse,
+  ContextStatusSdkPayload,
+  ContextStatusEstimatePayload,
+  ContextCategoryEntry,
+  ContextMcpToolEntry,
+  ContextMemoryFileEntry,
+  ContextSkillFrontmatterEntry,
+  ContextSkillsSummary,
+  ContextSlashCommandsSummary,
+  ContextAgentEntry,
+  ContextSystemPromptSection,
+  ContextSystemTool,
+  ContextDeferredBuiltinTool,
+} from "./context-status.js";
+
 // Tool result schemas (for runtime validation)
 export {
   TaskResultSchema,

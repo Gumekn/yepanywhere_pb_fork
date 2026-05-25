@@ -1,5 +1,6 @@
 // Provider abstraction types for multi-provider support
 import type {
+  ContextStatusSdkPayload,
   ModelInfo,
   PermissionMode,
   SlashCommand,
@@ -112,6 +113,22 @@ export interface AgentSession {
    * Only supported by Claude SDK 0.2.7+.
    */
   setModel?: (model?: string) => Promise<void>;
+  /**
+   * Live context-window breakdown: how many tokens system prompt, tools,
+   * skills, MCP servers, memory files, etc. each consume.
+   * Returns null if the provider/SDK does not support it.
+   * Only supported by Claude SDK 0.2.7+.
+   */
+  getContextUsage?: () => Promise<ContextStatusSdkPayload | null>;
+  /**
+   * Probe the SDK for its initialization result. Used to learn the real
+   * context window of the resolved model on startup (before any result
+   * message arrives). Returns null if the provider/SDK does not support it.
+   * Only supported by Claude SDK 0.2.7+.
+   */
+  initializationResult?: () => Promise<{
+    models: Array<{ id: string; contextWindow?: number }>;
+  } | null>;
 }
 
 /**

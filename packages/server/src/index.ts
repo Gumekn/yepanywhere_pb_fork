@@ -366,7 +366,7 @@ const serverSettingsService = new ServerSettingsService({
 const sharingService = new SharingService({
   dataDir: config.dataDir,
 });
-const modelInfoService = new ModelInfoService();
+const modelInfoService = new ModelInfoService({ dataDir: config.dataDir });
 
 async function startServer() {
   let tlsOptions: { key: Buffer; cert: Buffer } | undefined;
@@ -399,6 +399,7 @@ async function startServer() {
   await remoteAccessService.initialize();
   await serverSettingsService.initialize();
   await sharingService.initialize();
+  await modelInfoService.initialize();
   await remoteSessionService.setDiskPersistenceEnabled(
     serverSettingsService.getSetting("persistRemoteSessionsToDisk"),
   );
