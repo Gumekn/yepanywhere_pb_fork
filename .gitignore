@@ -1,5 +1,8 @@
 # Dependencies
 node_modules/
+# This project uses pnpm; npm/yarn lockfiles are accidental.
+package-lock.json
+yarn.lock
 
 # Build outputs
 dist/
