@@ -4513,6 +4513,36 @@ a.sidebar-nav-item {
   .filter-search {
     max-width: none;
   }
+
+  .filter-search-form {
+    max-width: none;
+  }
+
+  /* Keep dropdown buttons on a single row; allow horizontal scroll if they
+     overflow. Prevents the filter chips from wrapping onto a second line on
+     narrow Android/iOS Chrome screens. */
+  .filter-dropdowns {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: visible;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    /* Tiny vertical padding so focus/hover outlines aren't clipped by the
+       scroll container. */
+    padding-bottom: 2px;
+  }
+
+  .filter-dropdowns::-webkit-scrollbar {
+    display: none;
+  }
+
+  .filter-dropdowns > * {
+    flex-shrink: 0;
+  }
+
+  .filter-dropdown-button {
+    white-space: nowrap;
+  }
 }
 
 /* ==========================================================================
