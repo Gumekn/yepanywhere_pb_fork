@@ -1,6 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { getGlobalConnection, isRemoteMode } from "../lib/connection";
 
+/**
+ * For browser fetches under a reverse-proxy prefix (Caddy mounts the
+ * server at /yep/), a callsite passing "/api/foo" would resolve against
+ * the document host root and miss the mounted server. Templating with
+ * BASE_URL here lets every existing caller keep passing "/api/foo".
+ */
+const BASE = (import.meta.env.BASE_URL ?? "/").replace(/\/$/, "");
+function directApiUrl(path: string): string {
+  if (!BASE) return path;
+  return path.startsWith(BASE) ? path : `${BASE}${path}`;
+}
+
 interface RemoteImageResult {
   /** URL to use for the image src (either direct path or blob URL) */
   url: string | null;
@@ -149,9 +161,11 @@ export function useFetchedImage(apiPath: string | null): RemoteImageResult {
           const connection = getGlobalConnection();
           if (!connection)
             return Promise.reject(new Error("No connection available"));
+          // Relay protocol path is logical (no reverse-proxy prefix);
+          // server applies BASE_PATH on its end before routing.
           return connection.fetchBlob(apiPath);
         })()
-      : fetch(apiPath, { credentials: "include" }).then((res) => {
+      : fetch(directApiUrl(apiPath), { credentials: "include" }).then((res) => {
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
           return res.blob();
         });

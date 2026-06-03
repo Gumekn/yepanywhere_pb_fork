@@ -18,6 +18,7 @@ import {
   SidebarNavItem,
   SidebarNavSection,
 } from "./SidebarNavItem";
+import { Skeleton } from "./Skeleton";
 import { YepAnywhereLogo } from "./YepAnywhereLogo";
 
 const SWIPE_THRESHOLD = 50; // Minimum distance to trigger close
@@ -393,6 +394,13 @@ export function Sidebar({
                 basePath={basePath}
               />
             )}
+            <SidebarNavItem
+              to="/terminal"
+              icon={SidebarIcons.terminal}
+              label={t("sidebarTerminal")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
             <AgentsNavItem onClick={onNavigate} basePath={basePath} />
             <SidebarNavItem
               to="/settings"
@@ -596,13 +604,18 @@ export function Sidebar({
 
           {filteredStarredSessions.length === 0 &&
             recentDaySessions.length === 0 &&
-            olderSessions.length === 0 && (
-              <p className="sidebar-empty">
-                {sessionsLoading
-                  ? t("sidebarLoadingSessions")
-                  : t("sidebarNoSessions")}
-              </p>
-            )}
+            olderSessions.length === 0 &&
+            (sessionsLoading ? (
+              <div className="sidebar-loading">
+                {/* Mini skeleton matching compact session list rows. */}
+                <Skeleton width="80%" height="0.95em" />
+                <Skeleton width="60%" height="0.95em" />
+                <Skeleton width="72%" height="0.95em" />
+                <Skeleton width="50%" height="0.95em" />
+              </div>
+            ) : (
+              <p className="sidebar-empty">{t("sidebarNoSessions")}</p>
+            ))}
         </div>
 
         {/* Resize handle - desktop only, when expanded */}

@@ -15,19 +15,25 @@ describe("Sessions API", () => {
   let mockSdk: MockClaudeSDK;
   let testDir: string;
   let projectId: string;
+  let sessionDir: string;
 
   beforeEach(async () => {
     mockSdk = new MockClaudeSDK();
-    // Create temp directory structure with a valid project
+    // Create temp directory structure with a valid project. The projectPath
+    // must exist on disk because the spawn wrapper in ClaudeProvider now
+    // pre-validates the cwd to avoid the SDK's misleading "binary failed to
+    // launch" error when the working directory is missing.
     testDir = join(tmpdir(), `claude-test-${randomUUID()}`);
-    const projectPath = "/home/user/myproject";
+    const projectPath = join(testDir, "myproject");
+    await mkdir(projectPath, { recursive: true });
     projectId = encodeProjectId(projectPath);
     const encodedPath = projectPath.replaceAll("/", "-");
+    sessionDir = join(testDir, "localhost", encodedPath);
 
-    await mkdir(join(testDir, "localhost", encodedPath), { recursive: true });
+    await mkdir(sessionDir, { recursive: true });
     // Session file must include cwd field for project path discovery
     await writeFile(
-      join(testDir, "localhost", encodedPath, "sess-existing.jsonl"),
+      join(sessionDir, "sess-existing.jsonl"),
       `{"type":"user","cwd":"${projectPath}","message":{"content":"Hello"}}\n`,
     );
   });
@@ -625,11 +631,6 @@ describe("Sessions API", () => {
     it("returns agent messages for existing agent file", async () => {
       const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
 
-      // Get project path from projectId
-      const projectPath = "/home/user/myproject";
-      const encodedPath = projectPath.replaceAll("/", "-");
-      const sessionDir = join(testDir, "localhost", encodedPath);
-
       // Copy completed agent fixture to session directory
       const fixtureContent = await readFile(
         join(fixturesDir, "agent-completed.jsonl"),
@@ -681,10 +682,6 @@ describe("Sessions API", () => {
     it("infers status correctly for failed agent", async () => {
       const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
 
-      const projectPath = "/home/user/myproject";
-      const encodedPath = projectPath.replaceAll("/", "-");
-      const sessionDir = join(testDir, "localhost", encodedPath);
-
       const fixtureContent = await readFile(
         join(fixturesDir, "agent-failed.jsonl"),
         "utf-8",
@@ -705,10 +702,6 @@ describe("Sessions API", () => {
 
     it("infers status correctly for running agent", async () => {
       const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
-
-      const projectPath = "/home/user/myproject";
-      const encodedPath = projectPath.replaceAll("/", "-");
-      const sessionDir = join(testDir, "localhost", encodedPath);
 
       const fixtureContent = await readFile(
         join(fixturesDir, "agent-running.jsonl"),

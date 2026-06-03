@@ -11,6 +11,7 @@ import { ProviderBadge } from "../components/ProviderBadge";
 import { QuestionAnswerPanel } from "../components/QuestionAnswerPanel";
 import { RecentSessionsDropdown } from "../components/RecentSessionsDropdown";
 import { SessionMenu } from "../components/SessionMenu";
+import { SessionMessagesSkeleton } from "../components/Skeleton";
 import { ToolApprovalPanel } from "../components/ToolApprovalPanel";
 import { AgentContentProvider } from "../contexts/AgentContentContext";
 import { SessionMetadataProvider } from "../contexts/SessionMetadataContext";
@@ -25,6 +26,7 @@ import { useDeveloperMode } from "../hooks/useDeveloperMode";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import type { DraftControls } from "../hooks/useDraftPersistence";
 import { useEngagementTracking } from "../hooks/useEngagementTracking";
+import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { getModelSetting, getThinkingSetting } from "../hooks/useModelSettings";
 import { useProject } from "../hooks/useProjects";
 import { useProviders } from "../hooks/useProviders";
@@ -156,6 +158,10 @@ function SessionPageContent({
     initialStatus,
     streamingMarkdownCallbacks,
   );
+
+  // Dismiss cold-start splash once the session has loaded (covers deep-link
+  // launches that land directly on a session URL).
+  useHideSplashOnReady(!loading || error !== null);
 
   // Developer mode settings
   const { holdModeEnabled, showConnectionBars } = useDeveloperMode();
@@ -1100,7 +1106,7 @@ function SessionPageContent({
 
         <main className="session-messages">
           {loading ? (
-            <div className="loading">{t("sessionLoading")}</div>
+            <SessionMessagesSkeleton />
           ) : (
             <SessionMetadataProvider
               projectId={projectId}

@@ -46,6 +46,7 @@ export class ClientLogCollector {
   private _started = false;
   private _flushing = false;
   private _deviceId: string | undefined;
+  private _flushInterval: ReturnType<typeof setInterval> | null = null;
 
   private _origLog: typeof console.log | null = null;
   private _origWarn: typeof console.warn | null = null;
@@ -87,11 +88,26 @@ export class ClientLogCollector {
     if (connectionManager.state === "connected") {
       this.flush();
     }
+
+    // Periodic flush so logs don't sit indefinitely in IDB between connection
+    // state changes. Without this, only the initial ClientInfo banner makes
+    // it to the server when the toggle is enabled mid-session — every
+    // subsequent log is stranded on-device until the next reconnect.
+    this._flushInterval = setInterval(() => {
+      if (connectionManager.state === "connected") {
+        this.flush();
+      }
+    }, 3000);
   }
 
   stop(): void {
     if (!this._started) return;
     this._started = false;
+
+    if (this._flushInterval !== null) {
+      clearInterval(this._flushInterval);
+      this._flushInterval = null;
+    }
 
     this._restoreConsole();
 

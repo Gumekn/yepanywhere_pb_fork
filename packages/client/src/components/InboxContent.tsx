@@ -1,11 +1,13 @@
 import { useState } from "react";
 import { type InboxItem, useInboxContext } from "../contexts/InboxContext";
 import { useDrafts } from "../hooks/useDrafts";
+import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
 import type { Project } from "../types";
 import { FilterDropdown, type FilterOption } from "./FilterDropdown";
 import { SessionListItem } from "./SessionListItem";
+import { SessionListSkeleton } from "./Skeleton";
 
 /**
  * Tier configuration for visual styling.
@@ -169,6 +171,9 @@ export function InboxContent({
     refresh,
   } = useInboxContext();
 
+  // Dismiss cold-start splash once inbox finishes initial load.
+  useHideSplashOnReady(!loading || error !== null);
+
   // Filter by project if specified
   const needsAttention = filterByProject(allNeedsAttention, projectId);
   const active = filterByProject(allActive, projectId);
@@ -260,14 +265,14 @@ export function InboxContent({
           </button>
         </div>
 
-        {loading && <p className="loading">{t("inboxLoading")}</p>}
+        {loading && <SessionListSkeleton count={5} />}
 
         {error && (
           <p className="error">{t("inboxError", { message: error.message })}</p>
         )}
 
         {!loading && !error && isEmpty && (
-          <div className="inbox-empty">
+          <div className="inbox-empty content-fade-in">
             <svg
               width="48"
               height="48"
@@ -292,7 +297,7 @@ export function InboxContent({
         )}
 
         {!loading && !error && !isEmpty && (
-          <div className="inbox-tiers">
+          <div className="inbox-tiers content-fade-in">
             {TIER_CONFIGS.map((config) => (
               <InboxSection
                 key={config.key}

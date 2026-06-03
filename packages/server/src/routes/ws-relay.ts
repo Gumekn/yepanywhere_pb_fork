@@ -13,6 +13,7 @@ import type {
   ConnectedBrowsersService,
 } from "../services/index.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
+import type { TerminalService } from "../terminal/TerminalService.js";
 import type { UploadManager } from "../uploads/manager.js";
 import type { EventBus, FocusedSessionWatchManager } from "../watcher/index.js";
 import {
@@ -27,6 +28,7 @@ import {
   cleanupConnectionState,
   cleanupDeviceSessions,
   cleanupSubscriptions,
+  cleanupTerminalAttachments,
   cleanupUploads,
   createConnectionState,
   createSendFn,
@@ -42,6 +44,11 @@ export interface WsRelayDeps {
   app: Hono<{ Bindings: HttpBindings }>;
   /** Base URL for internal requests (e.g., "http://localhost:3400") */
   baseUrl: string;
+  /**
+   * Reverse-proxy URL prefix to prepend to relay-tunneled request paths
+   * before they reach the Hono router. See RelayHandlerDeps.basePath.
+   */
+  basePath?: string;
   /** Supervisor for subscribing to session events */
   supervisor: Supervisor;
   /** Event bus for subscribing to activity events */
@@ -60,6 +67,8 @@ export interface WsRelayDeps {
   focusedSessionWatchManager?: FocusedSessionWatchManager;
   /** Emulator bridge service for Android emulator streaming (optional) */
   deviceBridgeService?: DeviceBridgeService;
+  /** Terminal service for remote shell sessions (optional) */
+  terminalService?: TerminalService;
 }
 
 /**
@@ -71,6 +80,8 @@ export interface AcceptRelayConnectionDeps {
   app: Hono<{ Bindings: HttpBindings }>;
   /** Base URL for internal requests (e.g., "http://localhost:3400") */
   baseUrl: string;
+  /** Reverse-proxy URL prefix (see RelayHandlerDeps.basePath) */
+  basePath?: string;
   /** Supervisor for subscribing to session events */
   supervisor: Supervisor;
   /** Event bus for subscribing to activity events */
@@ -89,6 +100,8 @@ export interface AcceptRelayConnectionDeps {
   focusedSessionWatchManager?: FocusedSessionWatchManager;
   /** Emulator bridge service for Android emulator streaming (optional) */
   deviceBridgeService?: DeviceBridgeService;
+  /** Terminal service for remote shell sessions (optional) */
+  terminalService?: TerminalService;
 }
 
 /**
@@ -169,12 +182,14 @@ export function createWsRelayRoutes(
     browserProfileService,
     focusedSessionWatchManager,
     deviceBridgeService,
+    terminalService,
   } = deps;
 
   // Build handler dependencies
   const handlerDeps: RelayHandlerDeps = {
     app,
     baseUrl,
+    basePath: deps.basePath,
     supervisor,
     eventBus,
     uploadManager,
@@ -184,6 +199,7 @@ export function createWsRelayRoutes(
     browserProfileService,
     focusedSessionWatchManager,
     deviceBridgeService,
+    terminalService,
   };
 
   // Return the WebSocket handler with origin validation
@@ -206,6 +222,9 @@ export function createWsRelayRoutes(
     const uploads = new Map<string, RelayUploadState>();
     // Track active emulator streaming sessions for this connection
     const deviceSessions = new Set<string>();
+    // Per-connection identifier for terminal attachments (used to detach all
+    // terminals on disconnect; server-owned PTY keeps running for reattach).
+    const terminalAttachId = `attach-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     // Message queue to serialize async message handling
     let messageQueue: Promise<void> = Promise.resolve();
     // Connection state for SRP authentication
@@ -283,6 +302,7 @@ export function createWsRelayRoutes(
             handlerDeps,
             {},
             deviceSessions,
+            terminalAttachId,
           ).catch((err) => {
             console.error("[WS Relay] Unexpected error:", err);
           }),
@@ -300,6 +320,9 @@ export function createWsRelayRoutes(
 
         // Clean up emulator streaming sessions
         cleanupDeviceSessions(deviceSessions, deviceBridgeService);
+
+        // Detach (but don't kill) any terminals attached over this connection
+        cleanupTerminalAttachments(terminalAttachId, terminalService);
 
         // Clean up all subscriptions
         cleanupSubscriptions(subscriptions);
@@ -344,12 +367,14 @@ export function createAcceptRelayConnection(
     browserProfileService,
     focusedSessionWatchManager,
     deviceBridgeService,
+    terminalService,
   } = deps;
 
   // Build handler dependencies
   const handlerDeps: RelayHandlerDeps = {
     app,
     baseUrl,
+    basePath: deps.basePath,
     supervisor,
     eventBus,
     uploadManager,
@@ -359,6 +384,7 @@ export function createAcceptRelayConnection(
     browserProfileService,
     focusedSessionWatchManager,
     deviceBridgeService,
+    terminalService,
   };
 
   // Return the accept relay connection handler
@@ -375,6 +401,9 @@ export function createAcceptRelayConnection(
     const uploads = new Map<string, RelayUploadState>();
     // Track active emulator streaming sessions for this connection
     const deviceSessions = new Set<string>();
+    // Per-connection identifier for terminal attachments (used to detach all
+    // terminals on disconnect; server-owned PTY keeps running for reattach).
+    const terminalAttachId = `attach-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     // Message queue to serialize async message handling
     let messageQueue: Promise<void> = Promise.resolve();
 
@@ -400,6 +429,7 @@ export function createAcceptRelayConnection(
           handlerDeps,
           { isBinary },
           deviceSessions,
+          terminalAttachId,
         ).catch((err) => {
           console.error("[WS Relay] Unexpected error:", err);
         }),
@@ -427,6 +457,9 @@ export function createAcceptRelayConnection(
       // Clean up emulator streaming sessions
       cleanupDeviceSessions(deviceSessions, deviceBridgeService);
 
+      // Detach (but don't kill) any terminals attached over this connection
+      cleanupTerminalAttachments(terminalAttachId, terminalService);
+
       cleanupSubscriptions(subscriptions);
       console.log("[WS Relay] Relay connection closed");
     });
@@ -449,6 +482,7 @@ export function createAcceptRelayConnection(
         handlerDeps,
         { isBinary: firstMessageIsBinary },
         deviceSessions,
+        terminalAttachId,
       ).catch((err) => {
         console.error("[WS Relay] Error processing first message:", err);
       }),

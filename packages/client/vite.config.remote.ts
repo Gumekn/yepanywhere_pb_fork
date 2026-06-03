@@ -72,6 +72,15 @@ export default defineConfig({
   define: {
     "import.meta.env.VITE_IS_REMOTE_CLIENT": JSON.stringify(true),
     __APP_VERSION__: JSON.stringify(getGitVersion()),
+    // Wall-clock build time, not git commit date: the APK is often rebuilt
+    // with uncommitted working-tree changes, so the commit date wouldn't
+    // distinguish two builds of the same commit. This stamp lets you confirm
+    // on the login screen exactly which build is installed on a device.
+    __BUILD_DATE__: JSON.stringify(new Date().toISOString()),
+    // debug vs release APK can't be told apart from the frontend bundle —
+    // both run plain `vite build`. rebuild-apk.sh exports YEP_BUILD_PROFILE
+    // before the tauri build so the stamp can show which one is installed.
+    __BUILD_PROFILE__: JSON.stringify(process.env.YEP_BUILD_PROFILE ?? "dev"),
   },
   // Build configuration for static site
   build: {

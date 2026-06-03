@@ -1,6 +1,7 @@
 import type {
   DeviceServerMessage,
   RemoteClientMessage,
+  TerminalServerMessage,
   UploadedFile,
 } from "@yep-anywhere/shared";
 
@@ -295,4 +296,11 @@ export interface Connection {
    * Optional - only WebSocket-based connections support this.
    */
   onDeviceMessage?(handler: (msg: DeviceServerMessage) => void): () => void;
+
+  /**
+   * Register a handler for terminal output and lifecycle messages from the
+   * server. Returns an unsubscribe function.
+   * Optional - only WebSocket-based connections support this.
+   */
+  onTerminalMessage?(handler: (msg: TerminalServerMessage) => void): () => void;
 }

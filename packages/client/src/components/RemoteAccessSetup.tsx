@@ -8,9 +8,9 @@ import { useEffect, useState } from "react";
 import { type RelayStatus, useRemoteAccess } from "../hooks/useRemoteAccess";
 import { useI18n } from "../i18n";
 import { parseUserAgent } from "../lib/deviceDetection";
+import { DEFAULT_RELAY_URL } from "../lib/relayConfig";
 import { QRCode } from "./QRCode";
 
-const DEFAULT_RELAY_URL = "wss://relay.yepanywhere.com/ws";
 const CONNECT_URL = "https://yepanywhere.com/remote/login/relay";
 
 export interface RemoteAccessSetupProps {

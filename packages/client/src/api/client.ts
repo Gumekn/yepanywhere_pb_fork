@@ -3,6 +3,7 @@ import type {
   BrowserProfilesResponse,
   ConnectionsResponse,
   ContextStatusResponse,
+  ContextUsage,
   DeviceInfo,
   EnrichedRecentEntry,
   FileContentResponse,
@@ -83,6 +84,8 @@ export interface GlobalSessionItem {
   isStarred?: boolean;
   /** SSH host alias for remote execution (undefined = local) */
   executor?: string;
+  /** Cached context window usage if the server has it. */
+  contextUsage?: ContextUsage;
 }
 
 /** Stats about all sessions (computed during full scan on server) */
@@ -127,7 +130,7 @@ export interface SessionOptions {
 
 export type { UploadedFile } from "@yep-anywhere/shared";
 
-const API_BASE = "/api";
+import { API_BASE } from "../lib/apiPath";
 
 /**
  * Desktop auth token read from URL query parameter (?desktop_token=...).
@@ -752,7 +755,7 @@ export const api = {
   getFileRawUrl: (projectId: string, path: string, download = false) => {
     const params = new URLSearchParams({ path });
     if (download) params.set("download", "true");
-    return `/api/projects/${projectId}/files/raw?${params.toString()}`;
+    return `${API_BASE}/projects/${projectId}/files/raw?${params.toString()}`;
   },
 
   /**

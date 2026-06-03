@@ -69,6 +69,32 @@ export interface ContextDeferredBuiltinTool {
 }
 
 /**
+ * Cumulative token spend across the entire session — sums the per-turn
+ * `usage` blocks of every assistant message in the JSONL.
+ *
+ * Distinct from `ContextUsage`, which represents the **last** turn's
+ * snapshot of context-window fill (used for the "X / Y tokens" meter).
+ * The cumulative figures answer "how many tokens has this session spent
+ * total" (matches Claude Code's `/status` output) and are useful for
+ * cost estimation.
+ */
+export interface ContextCumulativeUsage {
+  /** Sum of usage.input_tokens across all assistant messages — fresh
+   *  tokens billed at the input rate (excludes cached). */
+  inputTokens: number;
+  /** Sum of usage.output_tokens — generated tokens billed at output rate. */
+  outputTokens: number;
+  /** Sum of usage.cache_read_input_tokens — tokens served from prompt cache
+   *  (typically billed at ~10% of fresh input). */
+  cacheReadTokens: number;
+  /** Sum of usage.cache_creation_input_tokens — new entries written to
+   *  prompt cache (billed at ~125% of fresh input). */
+  cacheCreationTokens: number;
+  /** Total assistant turns counted (excludes synthetic / error entries). */
+  turnCount: number;
+}
+
+/**
  * Live, structured breakdown coming straight from the SDK
  * (Query.getContextUsage()).
  */
@@ -92,6 +118,10 @@ export interface ContextStatusSdkPayload {
   systemPromptSections?: ContextSystemPromptSection[];
   systemTools?: ContextSystemTool[];
   deferredBuiltinTools?: ContextDeferredBuiltinTool[];
+  /** Cumulative token spend across the whole session (read from JSONL —
+   *  the SDK's getContextUsage doesn't surface this). Optional because
+   *  some providers' readers haven't implemented it yet. */
+  cumulativeUsage?: ContextCumulativeUsage;
 }
 
 /**
@@ -111,6 +141,8 @@ export interface ContextStatusEstimatePayload {
   contextWindowFromCache: boolean;
   /** Same shape as the meter at the bottom of the input toolbar. */
   contextUsage?: ContextUsage;
+  /** Cumulative token spend across the whole session (see ContextCumulativeUsage). */
+  cumulativeUsage?: ContextCumulativeUsage;
 }
 
 export type ContextStatusResponse =

@@ -13,6 +13,7 @@ import type {
   RelayUploadStart,
   RemoteClientMessage,
   ServerPong,
+  TerminalServerMessage,
   UploadedFile,
   YepMessage,
 } from "@yep-anywhere/shared";
@@ -33,6 +34,7 @@ export interface RelayTransport {
 }
 
 export type EmulatorMessageHandler = (msg: DeviceServerMessage) => void;
+export type TerminalMessageHandler = (msg: TerminalServerMessage) => void;
 
 export interface RelayProtocolOptions {
   debugEnabled?: () => boolean;
@@ -88,6 +90,8 @@ export class RelayProtocol {
   private recentlyClosed = new Set<string>();
   /** Registered handlers for emulator signaling messages */
   private emulatorHandlers = new Set<EmulatorMessageHandler>();
+  /** Registered handlers for terminal output / lifecycle messages */
+  private terminalHandlers = new Set<TerminalMessageHandler>();
 
   private transport: RelayTransport;
   private options: RelayProtocolOptions;
@@ -151,6 +155,13 @@ export class RelayProtocol {
       case "device_stream_profile_event":
         this.handleEmulatorMessage(msg as DeviceServerMessage);
         break;
+      // Remote terminal messages (server → client push)
+      case "terminal_opened":
+      case "terminal_output":
+      case "terminal_exit":
+      case "terminal_error":
+        this.handleTerminalMessage(msg as TerminalServerMessage);
+        break;
       default:
         console.warn(
           `${this.logPrefix} Unknown message type:`,
@@ -173,6 +184,23 @@ export class RelayProtocol {
     this.emulatorHandlers.add(handler);
     return () => {
       this.emulatorHandlers.delete(handler);
+    };
+  }
+
+  private handleTerminalMessage(msg: TerminalServerMessage): void {
+    for (const handler of this.terminalHandlers) {
+      handler(msg);
+    }
+  }
+
+  /**
+   * Register a handler for terminal output / lifecycle messages.
+   * Returns an unsubscribe function.
+   */
+  onTerminalMessage(handler: TerminalMessageHandler): () => void {
+    this.terminalHandlers.add(handler);
+    return () => {
+      this.terminalHandlers.delete(handler);
     };
   }
 

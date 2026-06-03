@@ -9,6 +9,7 @@ import { useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { YepAnywhereLogo } from "../components/YepAnywhereLogo";
 import { useAuth } from "../contexts/AuthContext";
+import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useI18n } from "../i18n";
 
 export function LoginPage() {
@@ -27,6 +28,9 @@ export function LoginPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
+
+  // Login pages are terminal screens, dismiss the cold-start splash.
+  useHideSplashOnReady(!isLoading);
 
   // Get the page they were trying to access before being redirected
   const from =

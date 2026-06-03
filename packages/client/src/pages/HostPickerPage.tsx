@@ -8,8 +8,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { BuildInfo } from "../components/BuildInfo";
 import { YepAnywhereLogo } from "../components/YepAnywhereLogo";
 import { useRemoteConnection } from "../contexts/RemoteConnectionContext";
+import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useI18n } from "../i18n";
 import { type SavedHost, loadSavedHosts, removeHost } from "../lib/hostStorage";
 
@@ -28,6 +30,10 @@ export function HostPickerPage() {
   const [hostStatuses, setHostStatuses] = useState<HostStatusMap>({});
   const [connectingHostId, setConnectingHostId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Login pages are terminal screens (no data fetch), so dismiss the
+  // cold-start splash as soon as we mount.
+  useHideSplashOnReady(true);
 
   // Load hosts on mount
   useEffect(() => {
@@ -325,6 +331,8 @@ export function HostPickerPage() {
             ? t("hostPickerSavedHint")
             : t("hostPickerEmptyHint")}
         </p>
+
+        <BuildInfo />
       </div>
     </div>
   );

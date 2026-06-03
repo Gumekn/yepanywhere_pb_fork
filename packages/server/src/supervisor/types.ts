@@ -1,5 +1,6 @@
 import type {
   AgentActivity,
+  ContextCumulativeUsage,
   ContextUsage,
   EffortLevel,
   InputRequest,
@@ -90,6 +91,11 @@ export interface SessionSummary {
   isStarred?: boolean;
   /** Context usage from the last assistant message */
   contextUsage?: ContextUsage;
+  /** Cumulative input/output/cache token spend across the whole session.
+   *  Computed by walking every assistant message's `usage` block — answers
+   *  "how much has this session cost in total" rather than "how full is
+   *  the context window right now". */
+  cumulativeUsage?: ContextCumulativeUsage;
   /** AI provider used for this session */
   provider: ProviderName;
   /** Model used for this session (extracted from JSONL, e.g. "claude-opus-4-5-20251101") */

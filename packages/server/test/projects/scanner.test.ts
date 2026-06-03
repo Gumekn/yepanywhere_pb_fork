@@ -308,3 +308,63 @@ describe("ProjectScanner cache", () => {
     });
   });
 });
+
+describe("ProjectScanner stale-cwd recovery", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await Promise.all(
+      tempDirs.map((dir) => rm(dir, { recursive: true, force: true })),
+    );
+    tempDirs.length = 0;
+  });
+
+  it("uses cwd from the most recently modified jsonl, ignoring stale ones", async () => {
+    // Reproduces the real-world bug: a project moved on disk leaves a
+    // session directory with a mix of jsonls — older ones still record the
+    // old cwd, newer ones record the new cwd. Scanner must pick the newest
+    // jsonl's cwd; otherwise it surfaces a stale projectId/path that crashes
+    // spawn() with ENOENT.
+    const projectsDir = join(tmpdir(), `scanner-stale-${randomUUID()}`);
+    tempDirs.push(projectsDir);
+
+    // The jsonls live in the dir whose name encodes the *new* path,
+    // because Claude SDK writes new jsonls there after the move.
+    const newPath = "/Users/test/code/myproject";
+    const stalePath = "/Users/test/Desktop/myproject";
+    const sessionDir = join(projectsDir, encodePath(newPath));
+    await mkdir(sessionDir, { recursive: true });
+
+    // Older jsonl records the stale cwd.
+    const staleFile = join(sessionDir, "00-old.jsonl");
+    await writeFile(
+      staleFile,
+      `{"type":"user","cwd":"${stalePath}","message":{"content":"old"}}\n`,
+    );
+    // Backdate it by 1 hour
+    const oneHourAgo = new Date(Date.now() - 3_600_000);
+    const { utimes } = await import("node:fs/promises");
+    await utimes(staleFile, oneHourAgo, oneHourAgo);
+
+    // Newer jsonl records the real cwd.
+    const freshFile = join(sessionDir, "99-new.jsonl");
+    await writeFile(
+      freshFile,
+      `{"type":"user","cwd":"${newPath}","message":{"content":"new"}}\n`,
+    );
+
+    const scanner = new ProjectScanner({
+      projectsDir,
+      enableCodex: false,
+      enableGemini: false,
+    });
+    const projects = await scanner.listProjects();
+
+    expect(projects).toHaveLength(1);
+    expect(projects[0]).toMatchObject({
+      path: newPath,
+      id: encodeProjectId(newPath),
+    });
+  });
+});

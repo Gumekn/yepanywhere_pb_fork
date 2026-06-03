@@ -1,4 +1,7 @@
-import type { ContextStatusResponse } from "@yep-anywhere/shared";
+import type {
+  ContextCumulativeUsage,
+  ContextStatusResponse,
+} from "@yep-anywhere/shared";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
 import { useI18n } from "../i18n";
@@ -69,6 +72,7 @@ export function ContextStatusModal({
         </span>
       }
       onClose={onClose}
+      backLabel={t("contextStatusBackToConversation")}
     >
       {loading && !data && (
         <p className="context-status-loading">{t("sidebarLoadingSessions")}</p>
@@ -89,32 +93,41 @@ function ContextStatusContent({ data }: { data: ContextStatusResponse }) {
     return (
       <div className="context-status-body">
         <SourceBadge source="jsonl" />
-        <div className="context-status-summary">
-          <div className="context-status-meter">
-            <span className="context-status-percent">{pct}%</span>
-            <span className="context-status-meter-detail">
-              {formatTokens(used)} / {formatTokens(cw)}
-            </span>
-          </div>
-          {data.model && (
-            <div className="context-status-meta">
-              <span className="context-status-meta-label">
-                {t("processInfoLabelModel")}
-              </span>
-              <span className="context-status-meta-value">{data.model}</span>
-            </div>
-          )}
-          {!data.contextWindowFromCache && (
-            <p className="context-status-hint">
-              {t("contextBreakdownEstimateHint")}
-            </p>
-          )}
-        </div>
+        <HeroMeter
+          percentage={pct}
+          used={used}
+          total={cw}
+          model={data.model}
+          modelLabel={t("processInfoLabelModel")}
+        />
+        <CumulativeUsageSection usage={data.cumulativeUsage} />
+        {!data.contextWindowFromCache && (
+          <p className="context-status-hint">
+            {t("contextBreakdownEstimateHint")}
+          </p>
+        )}
       </div>
     );
   }
 
   // SDK breakdown
+  // Defensive: the server can return a partial / unexpected shape (e.g. when
+  // the SDK hasn't initialized yet, or a provider doesn't implement context
+  // tracking). Bail to a friendly message instead of letting [...undefined]
+  // crash the whole React tree (which used to unmount the modal → page
+  // turned black with no error visible to the user).
+  if (!Array.isArray(data.categories)) {
+    return (
+      <div className="context-status-body">
+        <p className="context-status-error">
+          {`Unexpected response shape (source: ${
+            (data as { source?: string }).source ?? "missing"
+          }, no categories). The agent process may still be starting — try again in a moment.`}
+        </p>
+      </div>
+    );
+  }
+
   const sortedCategories = [...data.categories].sort(
     (a, b) => b.tokens - a.tokens,
   );
@@ -122,78 +135,45 @@ function ContextStatusContent({ data }: { data: ContextStatusResponse }) {
   return (
     <div className="context-status-body">
       <SourceBadge source="sdk" />
-      <div className="context-status-summary">
-        <div className="context-status-meter">
-          <span className="context-status-percent">{data.percentage}%</span>
-          <span className="context-status-meter-detail">
-            {formatTokens(data.totalTokens)} / {formatTokens(data.maxTokens)}
-          </span>
-        </div>
-        <div className="context-status-meta">
-          <span className="context-status-meta-label">
-            {t("processInfoLabelModel")}
-          </span>
-          <span className="context-status-meta-value">{data.model}</span>
-        </div>
-        {data.rawMaxTokens !== data.maxTokens && (
-          <div className="context-status-meta">
-            <span className="context-status-meta-label">
-              {t("contextBreakdownRawMaxLabel")}
-            </span>
-            <span className="context-status-meta-value">
-              {formatTokens(data.rawMaxTokens)}
-            </span>
-          </div>
-        )}
-      </div>
+      <HeroMeter
+        percentage={data.percentage}
+        used={data.totalTokens}
+        total={data.maxTokens}
+        model={data.model}
+        modelLabel={t("processInfoLabelModel")}
+        rawMax={
+          data.rawMaxTokens !== data.maxTokens ? data.rawMaxTokens : undefined
+        }
+        rawMaxLabel={t("contextBreakdownRawMaxLabel")}
+      />
+
+      <CumulativeUsageSection usage={data.cumulativeUsage} />
 
       <Section heading={t("contextCategoryHeading")}>
-        <ul className="context-status-list">
-          {sortedCategories.map((c) => {
-            const pct =
-              data.maxTokens > 0
-                ? Math.round((c.tokens / data.maxTokens) * 100)
-                : 0;
-            return (
-              <li key={c.name} className="context-status-row">
-                <span className="context-status-row-label">{c.name}</span>
-                <span className="context-status-row-bar">
-                  <span
-                    className="context-status-row-bar-fill"
-                    style={{
-                      width: `${Math.min(100, pct)}%`,
-                      backgroundColor: c.color || undefined,
-                    }}
-                  />
-                </span>
-                <span className="context-status-row-tokens">
-                  {formatTokens(c.tokens)}
-                </span>
-              </li>
-            );
-          })}
-        </ul>
+        <TokenRowList
+          rows={sortedCategories.map((c) => ({
+            key: c.name,
+            label: c.name,
+            tokens: c.tokens,
+            color: c.color || undefined,
+          }))}
+          maxTokens={data.maxTokens}
+          showBar
+        />
       </Section>
 
       {data.mcpTools.length > 0 && (
         <Section heading={t("contextMcpHeading")}>
-          <ul className="context-status-list">
-            {[...data.mcpTools]
+          <TokenRowList
+            rows={[...data.mcpTools]
               .sort((a, b) => b.tokens - a.tokens)
-              .map((tool) => (
-                <li
-                  key={`${tool.serverName}:${tool.name}`}
-                  className="context-status-row"
-                >
-                  <span className="context-status-row-label">
-                    {tool.serverName} / {tool.name}
-                  </span>
-                  <span className="context-status-row-tokens">
-                    {formatTokens(tool.tokens)}
-                  </span>
-                </li>
-              ))}
-          </ul>
+              .map((tool) => ({
+                key: `${tool.serverName}:${tool.name}`,
+                label: `${tool.serverName} / ${tool.name}`,
+                tokens: tool.tokens,
+              }))}
+            maxTokens={data.maxTokens}
+          />
         </Section>
       )}
 
@@ -201,52 +181,162 @@ function ContextStatusContent({ data }: { data: ContextStatusResponse }) {
         <Section
           heading={`${t("contextSkillsHeading")} (${data.skills.includedSkills}/${data.skills.totalSkills})`}
         >
-          <ul className="context-status-list">
-            {[...data.skills.skillFrontmatter]
+          <TokenRowList
+            rows={[...data.skills.skillFrontmatter]
               .sort((a, b) => b.tokens - a.tokens)
-              .map((s) => (
-                <li key={s.name} className="context-status-row">
-                  <span className="context-status-row-label">{s.name}</span>
-                  <span className="context-status-row-tokens">
-                    {formatTokens(s.tokens)}
-                  </span>
-                </li>
-              ))}
-          </ul>
+              .map((s) => ({
+                key: s.name,
+                label: s.name,
+                tokens: s.tokens,
+              }))}
+            maxTokens={data.maxTokens}
+          />
         </Section>
       )}
 
       {data.memoryFiles.length > 0 && (
         <Section heading={t("contextMemoryHeading")}>
-          <ul className="context-status-list">
-            {[...data.memoryFiles]
+          <TokenRowList
+            rows={[...data.memoryFiles]
               .sort((a, b) => b.tokens - a.tokens)
-              .map((f) => (
-                <li key={f.path} className="context-status-row">
-                  <span className="context-status-row-label">{f.path}</span>
-                  <span className="context-status-row-tokens">
-                    {formatTokens(f.tokens)}
-                  </span>
-                </li>
-              ))}
-          </ul>
+              .map((f) => ({
+                key: f.path,
+                label: f.path,
+                tokens: f.tokens,
+              }))}
+            maxTokens={data.maxTokens}
+          />
         </Section>
       )}
 
       {data.slashCommands && data.slashCommands.includedCommands > 0 && (
         <Section heading={t("contextSlashCommandsHeading")}>
-          <p className="context-status-row">
-            <span className="context-status-row-label">
-              {data.slashCommands.includedCommands} /{" "}
-              {data.slashCommands.totalCommands}
-            </span>
-            <span className="context-status-row-tokens">
-              {formatTokens(data.slashCommands.tokens)}
-            </span>
-          </p>
+          <TokenRowList
+            rows={[
+              {
+                key: "all-slash",
+                label: `${data.slashCommands.includedCommands} / ${data.slashCommands.totalCommands}`,
+                tokens: data.slashCommands.tokens,
+              },
+            ]}
+            maxTokens={data.maxTokens}
+          />
         </Section>
       )}
     </div>
+  );
+}
+
+interface HeroMeterProps {
+  percentage: number;
+  used: number;
+  total: number;
+  model?: string;
+  modelLabel: string;
+  rawMax?: number;
+  rawMaxLabel?: string;
+}
+
+function HeroMeter({
+  percentage,
+  used,
+  total,
+  model,
+  modelLabel,
+  rawMax,
+  rawMaxLabel,
+}: HeroMeterProps) {
+  const clamped = Math.max(0, Math.min(100, percentage));
+  const severity = clamped >= 90 ? "danger" : clamped >= 75 ? "warn" : "normal";
+  return (
+    <div className="context-status-hero">
+      <div className="context-status-hero-numbers">
+        <span className={`context-status-percent-big severity-${severity}`}>
+          {clamped}%
+        </span>
+        <span className="context-status-fraction">
+          {formatTokens(used)} / {formatTokens(total)}
+        </span>
+      </div>
+      <div className="context-status-hero-bar" aria-hidden="true">
+        <div
+          className={`context-status-hero-bar-fill severity-${severity}`}
+          style={{ width: `${clamped}%` }}
+        />
+      </div>
+      {(model || rawMax !== undefined) && (
+        <div className="context-status-hero-meta">
+          {model && (
+            <span className="context-status-hero-meta-item">
+              <span className="context-status-meta-label">{modelLabel}</span>
+              <span className="context-status-meta-value">{model}</span>
+            </span>
+          )}
+          {rawMax !== undefined && rawMaxLabel && (
+            <span className="context-status-hero-meta-item">
+              <span className="context-status-meta-label">{rawMaxLabel}</span>
+              <span className="context-status-meta-value">
+                {formatTokens(rawMax)}
+              </span>
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface TokenRow {
+  key: string;
+  label: string;
+  tokens: number;
+  color?: string;
+}
+
+function TokenRowList({
+  rows,
+  maxTokens,
+  showBar = false,
+}: {
+  rows: TokenRow[];
+  maxTokens: number;
+  showBar?: boolean;
+}) {
+  return (
+    <ul className="context-status-list">
+      {rows.map((row) => {
+        const pct =
+          maxTokens > 0 ? Math.round((row.tokens / maxTokens) * 100) : 0;
+        const highlight = pct >= 10;
+        return (
+          <li
+            key={row.key}
+            className={`context-status-row${
+              showBar ? " context-status-row--with-bar" : ""
+            }${highlight ? " context-status-row--highlight" : ""}`}
+          >
+            <span className="context-status-row-label">{row.label}</span>
+            {showBar && (
+              <span className="context-status-row-bar">
+                <span
+                  className="context-status-row-bar-fill"
+                  style={{
+                    width: `${Math.min(100, pct)}%`,
+                    backgroundColor: row.color || undefined,
+                  }}
+                />
+              </span>
+            )}
+            <span className="context-status-row-tokens">
+              <span className="context-status-row-tokens-value">
+                {formatTokens(row.tokens)}
+              </span>
+              <span className="context-status-row-tokens-pct">{pct}%</span>
+            </span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -262,6 +352,73 @@ function Section({
       <h4 className="context-status-section-heading">{heading}</h4>
       {children}
     </section>
+  );
+}
+
+/**
+ * Mirrors Claude Code's `/status` output: a flat list of cumulative input,
+ * output, cache-read, and cache-creation tokens for the whole session.
+ *
+ * Returns null when the server didn't ship the field — older server builds
+ * or providers (Codex/Gemini) that don't expose per-turn usage simply hide
+ * the block instead of showing zeros.
+ */
+function CumulativeUsageSection({
+  usage,
+}: {
+  usage?: ContextCumulativeUsage;
+}) {
+  const { t } = useI18n();
+  if (!usage) return null;
+
+  const rows = [
+    {
+      key: "input",
+      label: t("contextCumulativeInput"),
+      tokens: usage.inputTokens,
+    },
+    {
+      key: "output",
+      label: t("contextCumulativeOutput"),
+      tokens: usage.outputTokens,
+    },
+    {
+      key: "cache-read",
+      label: t("contextCumulativeCacheRead"),
+      tokens: usage.cacheReadTokens,
+    },
+    {
+      key: "cache-creation",
+      label: t("contextCumulativeCacheCreation"),
+      tokens: usage.cacheCreationTokens,
+    },
+  ];
+
+  return (
+    <Section
+      heading={`${t("contextCumulativeHeading")} (${t(
+        "contextCumulativeTurns",
+        {
+          count: usage.turnCount,
+        },
+      )})`}
+    >
+      <ul className="context-status-list">
+        {rows.map((row) => (
+          <li key={row.key} className="context-status-row">
+            <span className="context-status-row-label">{row.label}</span>
+            <span className="context-status-row-tokens">
+              <span
+                className="context-status-row-tokens-value"
+                title={`${row.tokens.toLocaleString()} tokens`}
+              >
+                {formatTokens(row.tokens)}
+              </span>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Section>
   );
 }
 

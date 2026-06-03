@@ -11,6 +11,7 @@ import { initializeFontSize } from "./hooks/useFontSize";
 import { initializeTabSize } from "./hooks/useTabSize";
 import { initializeTheme } from "./hooks/useTheme";
 import { NavigationLayout } from "./layouts";
+import { armSplashSafety } from "./lib/splash";
 import { ActivityPage } from "./pages/ActivityPage";
 import { AgentsPage } from "./pages/AgentsPage";
 import { EmulatorPage } from "./pages/EmulatorPage";
@@ -22,6 +23,7 @@ import { LoginPage } from "./pages/LoginPage";
 import { NewSessionPage } from "./pages/NewSessionPage";
 import { ProjectsPage } from "./pages/ProjectsPage";
 import { SessionPage } from "./pages/SessionPage";
+import { TerminalPage } from "./pages/TerminalPage";
 import { SettingsLayout } from "./pages/settings";
 import "./styles/index.css";
 
@@ -67,6 +69,8 @@ createRoot(rootElement).render(
               <Route path="/git-status" element={<GitStatusPage />} />
               <Route path="/devices" element={<EmulatorPage />} />
               <Route path="/devices/:deviceId" element={<EmulatorPage />} />
+              <Route path="/terminal" element={<TerminalPage />} />
+              <Route path="/terminal/:terminalId" element={<TerminalPage />} />
               <Route path="/new-session" element={<NewSessionPage />} />
               <Route
                 path="/projects/:projectId/sessions/:sessionId"
@@ -83,3 +87,8 @@ createRoot(rootElement).render(
     </ErrorBoundary>
   </Wrapper>,
 );
+
+// Arm the splash safety timeout (max 6s). The splash is dismissed by
+// whichever first-paint screen calls useHideSplashOnReady(); this is just
+// the fallback in case nothing ever signals ready.
+armSplashSafety();

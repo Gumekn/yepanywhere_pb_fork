@@ -275,12 +275,16 @@ export function ModeSelector({
         className={`mode-button ${isHeld ? "mode-button-held" : ""}`}
         onClick={handleButtonClick}
         disabled={disabled}
-        title={t("modeClickToSelect" as never)}
+        title={displayLabel}
+        aria-label={displayLabel}
         aria-haspopup="listbox"
         aria-expanded={isOpen}
       >
         <span className={`mode-dot ${displayDotClass}`} />
-        {displayLabel}
+        {/* Label is hidden on narrow viewports — colored dot is enough as a
+            visual mode indicator and frees space for the icon row. Full
+            label is still announced via aria-label / title. */}
+        <span className="mode-button-label">{displayLabel}</span>
       </button>
       {desktopDropdown}
       {mobileSheet}

@@ -1,5 +1,6 @@
 import type { UploadedFile } from "@yep-anywhere/shared";
 import { uploadFile } from "../../api/upload";
+import { API_BASE } from "../apiPath";
 import { authEvents } from "../authEvents";
 import type {
   Connection,
@@ -7,8 +8,6 @@ import type {
   Subscription,
   UploadOptions,
 } from "./types";
-
-const API_BASE = "/api";
 
 /**
  * Direct connection to yepanywhere server using native browser APIs.

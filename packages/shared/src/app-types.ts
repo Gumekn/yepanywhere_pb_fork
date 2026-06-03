@@ -292,6 +292,33 @@ export function getModelContextWindow(
 }
 
 /**
+ * Bump a known-too-small context window up to the next tier when the
+ * recorded usage exceeds it. The Claude Code SDK strips the `[1m]` suffix
+ * from the model ID before writing to JSONL, so a 1M-context session shows
+ * up as a plain `claude-opus-4-7-thinking-max` — which `getModelContextWindow`
+ * scores as 200K. The user then sees their long sessions as >100% full.
+ *
+ * If `inputTokens` is bigger than `contextWindow`, the original run *must*
+ * have used a larger window (the model physically couldn't have ingested
+ * more tokens than it can hold). Claude only has one larger tier today
+ * (1M), so escalating to that recovers the right denominator.
+ *
+ * No-op for provider/model combos that don't have a larger tier (Codex,
+ * Gemini); the >100% display there indicates a real problem.
+ */
+export function escalateContextWindow(
+  contextWindow: number,
+  inputTokens: number,
+  provider?: ProviderName,
+): number {
+  if (inputTokens <= contextWindow) return contextWindow;
+  if (provider === "codex" || provider === "codex-oss") return contextWindow;
+  if (provider === "gemini" || provider === "gemini-acp") return contextWindow;
+  // Default to Claude's 1M tier for Claude and unknown providers.
+  return Math.max(contextWindow, CLAUDE_EXTENDED_CONTEXT_WINDOW);
+}
+
+/**
  * Session ownership - who controls the session.
  */
 export type SessionOwnership =

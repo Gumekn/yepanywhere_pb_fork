@@ -300,6 +300,7 @@ interface MessageRouteHandlers {
   ) => Promise<void>;
   onPing: (msg: RemoteClientMessage & { type: "ping" }) => Promise<void> | void;
   onDeviceMessage?: (msg: RemoteClientMessage) => Promise<void> | void;
+  onTerminalMessage?: (msg: RemoteClientMessage) => Promise<void> | void;
 }
 
 function getMessageId(msg: RemoteClientMessage): string | undefined {
@@ -317,6 +318,11 @@ function getMessageId(msg: RemoteClientMessage): string | undefined {
     case "device_webrtc_answer":
     case "device_ice_candidate":
       return (msg as { sessionId?: string }).sessionId;
+    case "terminal_open":
+    case "terminal_input":
+    case "terminal_resize":
+    case "terminal_close":
+      return (msg as { terminalId?: string }).terminalId;
     default:
       return undefined;
   }
@@ -361,6 +367,16 @@ export async function routeClientMessageSafely(
           await handlers.onDeviceMessage(msg);
         } else {
           console.warn("[WS Relay] Device message received but no handler");
+        }
+        break;
+      case "terminal_open":
+      case "terminal_input":
+      case "terminal_resize":
+      case "terminal_close":
+        if (handlers.onTerminalMessage) {
+          await handlers.onTerminalMessage(msg);
+        } else {
+          console.warn("[WS Relay] Terminal message received but no handler");
         }
         break;
       default:

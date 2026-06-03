@@ -180,6 +180,11 @@ export interface AppOptions {
   voiceInputEnabled?: boolean;
   /** Allowed directory prefixes for serving local images. Default: ["/tmp"] */
   allowedImagePaths?: string[];
+  /**
+   * Optional reverse-proxy URL prefix (e.g. "/yep" when Caddy mounts us at
+   * https://host/yep/...). Empty string / omitted = serve at root.
+   */
+  basePath?: string;
 }
 
 export interface AppResult {
@@ -193,7 +198,14 @@ export interface AppResult {
 }
 
 export function createApp(options: AppOptions): AppResult {
-  const app = new Hono<{ Bindings: HttpBindings }>();
+  // When running behind a reverse proxy that adds a path prefix (Caddy
+  // exposes us at /yep/), wrap the Hono instance so every subsequent
+  // .use/.route/.get call matches the prefixed URL automatically — we
+  // never have to remember to template `${basePath}/api/...` anywhere
+  // below.
+  const basePath = options.basePath ?? "";
+  const root = new Hono<{ Bindings: HttpBindings }>();
+  const app = basePath ? root.basePath(basePath) : root;
 
   // Security middleware: host validation, CORS, custom header requirement
   app.use("/api/*", hostCheckMiddleware);

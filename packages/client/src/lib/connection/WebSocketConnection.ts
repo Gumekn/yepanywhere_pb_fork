@@ -12,6 +12,7 @@ import {
   isBinaryData,
 } from "@yep-anywhere/shared";
 import { getDesktopAuthToken } from "../../api/client";
+import { API_BASE } from "../apiPath";
 import { RelayProtocol } from "./RelayProtocol";
 import type {
   Connection,
@@ -54,7 +55,9 @@ export class WebSocketConnection implements Connection {
 
   private getWsUrl(): string {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const base = `${protocol}//${window.location.host}/api/ws`;
+    // API_BASE encodes vite's BASE_URL so this works whether the server is
+    // mounted at "/" or behind a reverse-proxy prefix like "/yep".
+    const base = `${protocol}//${window.location.host}${API_BASE}/ws`;
     // Pass desktop token as query param since WebSocket can't set custom headers
     const token = getDesktopAuthToken();
     if (token) {

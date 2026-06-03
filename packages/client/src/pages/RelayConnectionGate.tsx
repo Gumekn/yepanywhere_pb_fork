@@ -18,6 +18,7 @@ import {
   type AutoResumeError,
   useRemoteConnection,
 } from "../contexts/RemoteConnectionContext";
+import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { getHostById, getHostByRelayUsername } from "../lib/hostStorage";
 
 type ConnectionState =
@@ -92,6 +93,17 @@ export function RelayConnectionGate() {
 
   const [state, setState] = useState<ConnectionState>("checking");
   const [error, setError] = useState<AutoResumeError | null>(null);
+
+  // While auto-resume is in flight ("checking"/"connecting"), keep the
+  // cold-start splash on top so the user doesn't see a flash of the inner
+  // "Connecting to..." spinner. Once we leave those states (error modal,
+  // login redirect, or connected → page renders), let the splash fade.
+  // The connected branch then defers further until the page itself
+  // signals ready, but at minimum the splash shouldn't outlive a real
+  // terminal state shown to the user.
+  const splashCanFade =
+    state === "error" || state === "no_host" || state === "no_session";
+  useHideSplashOnReady(splashCanFade);
 
   // Attempt to connect when username changes
   useEffect(() => {

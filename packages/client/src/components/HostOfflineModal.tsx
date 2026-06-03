@@ -10,6 +10,7 @@ import type {
   AutoResumeErrorReason,
 } from "../contexts/RemoteConnectionContext";
 import { useI18n } from "../i18n";
+import { EndpointSwitcher } from "./EndpointSwitcher";
 import { Modal } from "./ui/Modal";
 
 type Translate = ReturnType<typeof useI18n>["t"];
@@ -101,6 +102,11 @@ export function HostOfflineModal({
               ? t("hostOfflineHintRelay")
               : t("hostOfflineHintDirect")}
         </p>
+
+        {/* Failed boot is the right moment to expose the endpoint switch:
+            the saved relay URL is the most common cause of getting stuck
+            here, and Settings is unreachable until we connect. */}
+        <EndpointSwitcher />
 
         <div className="host-offline-actions">
           <button type="button" className="btn-secondary" onClick={onGoToLogin}>

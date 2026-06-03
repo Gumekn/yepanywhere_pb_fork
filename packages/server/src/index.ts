@@ -536,6 +536,7 @@ async function startServer() {
     enabledProviders: config.enabledProviders,
     voiceInputEnabled: config.voiceInputEnabled,
     allowedImagePaths: config.allowedImagePaths,
+    basePath: config.basePath,
   });
 
   const focusedSessionWatchManager = new FocusedSessionWatchManager({
@@ -592,6 +593,7 @@ async function startServer() {
     upgradeWebSocket,
     app,
     baseUrl,
+    basePath: config.basePath,
     supervisor,
     eventBus,
     uploadManager: wsRelayUploadManager,
@@ -609,6 +611,7 @@ async function startServer() {
   const acceptRelayConnection = createAcceptRelayConnection({
     app,
     baseUrl,
+    basePath: config.basePath,
     supervisor,
     eventBus,
     uploadManager: wsRelayUploadManager,
@@ -685,6 +688,13 @@ async function startServer() {
     if (distExists) {
       const staticRoutes = createStaticRoutes({
         distPath: config.clientDistPath,
+        // Hono's `root.basePath(prefix)` only filters which routes match — it
+        // does NOT strip the prefix from `c.req.path`. Pass it through so the
+        // static handler can map "/yep/assets/foo.js" back to "assets/foo.js"
+        // before resolving against distPath. Without this, every asset request
+        // misses on disk and falls back to index.html with text/html, which
+        // trips the browser's strict MIME check on module scripts.
+        basePath: config.basePath || undefined,
       });
       app.route("/", staticRoutes);
       console.log(
@@ -743,7 +753,10 @@ async function startServer() {
 
     attachUnifiedUpgradeHandler(server, {
       frontendProxy,
-      isApiPath: (urlPath) => urlPath.startsWith("/api"),
+      // When BASE_PATH is set, the API routes live at `${basePath}/api/*`;
+      // upgrade routing must match the same prefix or WS handshakes for
+      // `/yep/api/ws` end up at the frontend proxy and 404.
+      isApiPath: (urlPath) => urlPath.startsWith(`${config.basePath}/api`),
       app,
       wss,
     });

@@ -6,6 +6,7 @@ import {
 } from "../lib/preprocessMessages";
 import type { Message } from "../types";
 import type { RenderItem } from "../types/renderItems";
+import { MessageActions } from "./MessageActions";
 import { ProcessingIndicator } from "./ProcessingIndicator";
 import { RenderItemComponent } from "./RenderItemComponent";
 
@@ -181,8 +182,25 @@ export const MessageList = memo(function MessageList({
     });
   }, [onLoadOlderMessages]);
 
+  // Mirror the auto-load state into a ref so handleScroll (which only binds
+  // once for the lifetime of the listener) can read the latest values without
+  // re-attaching the listener on every prop change.
+  const loadOlderStateRef = useRef({
+    hasOlderMessages,
+    loadingOlder,
+    loadOlder: handleLoadOlder,
+  });
+  loadOlderStateRef.current = {
+    hasOlderMessages,
+    loadingOlder,
+    loadOlder: handleLoadOlder,
+  };
+
   // Track scroll position to determine if user is near bottom.
   // Ignore programmatic scrolls - only user-initiated scrolls should affect auto-scroll state.
+  // Also auto-trigger "load older" when the user nears the top of the
+  // scrollable area — gives WhatsApp/Telegram-style infinite scroll instead
+  // of forcing them to hunt for a button on a long, slow-loading session.
   const handleScroll = useCallback(() => {
     if (isProgrammaticScrollRef.current) return;
 
@@ -193,6 +211,24 @@ export const MessageList = memo(function MessageList({
     const distanceFromBottom =
       container.scrollHeight - container.scrollTop - container.clientHeight;
     shouldAutoScrollRef.current = distanceFromBottom < threshold;
+
+    // Top-of-list auto-load. handleLoadOlder anchors scroll position via the
+    // pre-/post-render scrollHeight delta, so the user's view stays put — no
+    // visible "jump" when the prepended chunk lands.
+    const TOP_LOAD_THRESHOLD = 200;
+    const {
+      hasOlderMessages: hasOlder,
+      loadingOlder: loading,
+      loadOlder,
+    } = loadOlderStateRef.current;
+    if (
+      hasOlder &&
+      !loading &&
+      loadOlder &&
+      container.scrollTop < TOP_LOAD_THRESHOLD
+    ) {
+      loadOlder();
+    }
   }, []);
 
   // Attach scroll listener to parent container
@@ -303,6 +339,19 @@ export const MessageList = memo(function MessageList({
         // Assistant items wrapped in timeline container - key based on first item
         const firstItem = group.items[0];
         if (!firstItem) return null;
+        const turnTimestamp = firstItem.sourceMessages[0]?.timestamp;
+        // Concatenate text-block content for the copy button; tool calls and
+        // thinking blocks are skipped because copying their structured form
+        // as plain text isn't useful.
+        const turnCopyText = group.items
+          .filter(
+            (item): item is RenderItem & { type: "text"; text: string } =>
+              item.type === "text" &&
+              typeof (item as { text?: unknown }).text === "string",
+          )
+          .map((item) => item.text)
+          .join("\n\n")
+          .trim();
         return (
           <div key={`turn-${firstItem.id}`} className="assistant-turn">
             {group.items.map((item) => (
@@ -315,6 +364,10 @@ export const MessageList = memo(function MessageList({
                 sessionProvider={provider}
               />
             ))}
+            <MessageActions
+              timestamp={turnTimestamp}
+              copyText={turnCopyText || undefined}
+            />
           </div>
         );
       })}

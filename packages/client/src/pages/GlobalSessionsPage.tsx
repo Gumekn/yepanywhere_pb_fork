@@ -1,5 +1,5 @@
 import { ALL_PROVIDERS, type ProviderName } from "@yep-anywhere/shared";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { type GlobalSessionItem, api } from "../api/client";
 import { BulkActionBar } from "../components/BulkActionBar";
@@ -9,8 +9,10 @@ import {
 } from "../components/FilterDropdown";
 import { PageHeader } from "../components/PageHeader";
 import { SessionListItem } from "../components/SessionListItem";
+import { SessionListSkeleton } from "../components/Skeleton";
 import { useDrafts } from "../hooks/useDrafts";
 import { useGlobalSessions } from "../hooks/useGlobalSessions";
+import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
@@ -148,6 +150,25 @@ export function GlobalSessionsPage() {
     [setSearchParams],
   );
 
+  // Default the age filter to "Last 7 days" on first visit. We only apply this
+  // once per mount: if the user explicitly clears the filter (which removes
+  // ?age= from the URL), we don't re-apply it within the same session.
+  const hasAppliedDefaultAgeRef = useRef(false);
+  useEffect(() => {
+    if (hasAppliedDefaultAgeRef.current) return;
+    hasAppliedDefaultAgeRef.current = true;
+    if (!searchParams.get("age")) {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.set("age", "7");
+          return next;
+        },
+        { replace: true },
+      );
+    }
+  }, [searchParams, setSearchParams]);
+
   // Include archived sessions when archived filter is selected
   const includeArchived = statusFilters.includes("archived");
 
@@ -158,6 +179,9 @@ export function GlobalSessionsPage() {
       includeArchived,
       includeStats: !projectFilter,
     });
+
+  // Dismiss cold-start splash once the first sessions fetch resolves.
+  useHideSplashOnReady(!loading || sessions.length > 0 || error !== null);
 
   // Filter sessions based on status and provider filters (client-side)
   const filteredSessions = useMemo(() => {
@@ -204,11 +228,11 @@ export function GlobalSessionsPage() {
         }
       }
 
-      // Age filtering (only show sessions older than N days)
+      // Age filtering (only show sessions updated within the last N days)
       if (ageFilter) {
         const days = Number(ageFilter);
         const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-        if (new Date(session.updatedAt).getTime() > cutoff) {
+        if (new Date(session.updatedAt).getTime() < cutoff) {
           return false;
         }
       }
@@ -275,7 +299,6 @@ export function GlobalSessionsPage() {
   // Age filter options
   const ageOptions = useMemo((): FilterOption<AgeFilter>[] => {
     return [
-      { value: "3", label: "Older than 3 days" },
       { value: "3", label: t("globalSessionsAge3Days") },
       { value: "7", label: t("globalSessionsAge7Days") },
       { value: "14", label: t("globalSessionsAge14Days") },
@@ -645,7 +668,7 @@ export function GlobalSessionsPage() {
                   options={statusOptions}
                   selected={statusFilters}
                   onChange={setStatusFilters}
-                  placeholder={t("globalSessionsStatusAll")}
+                  placeholder={t("globalSessionsFilterStatusPlaceholder")}
                 />
                 {providerOptions.length > 1 && (
                   <FilterDropdown
@@ -653,7 +676,7 @@ export function GlobalSessionsPage() {
                     options={providerOptions}
                     selected={providerFilters}
                     onChange={setProviderFilters}
-                    placeholder={t("globalSessionsStatusAll")}
+                    placeholder={t("globalSessionsFilterProviderPlaceholder")}
                   />
                 )}
                 {executorOptions.length > 1 && (
@@ -685,9 +708,7 @@ export function GlobalSessionsPage() {
               )}
             </div>
 
-            {loading && sessions.length === 0 && (
-              <p className="loading">{t("sidebarLoadingSessions")}</p>
-            )}
+            {loading && sessions.length === 0 && <SessionListSkeleton />}
 
             {error && (
               <p className="error">
@@ -696,7 +717,7 @@ export function GlobalSessionsPage() {
             )}
 
             {!loading && !error && isEmpty && (
-              <div className="inbox-empty">
+              <div className="inbox-empty content-fade-in">
                 <svg
                   width="48"
                   height="48"
@@ -750,7 +771,7 @@ export function GlobalSessionsPage() {
                   )}
 
                 <ul
-                  className={`session-list ${isSelectionMode ? "session-list--selection-mode" : ""}`}
+                  className={`session-list content-fade-in ${isSelectionMode ? "session-list--selection-mode" : ""}`}
                 >
                   {filteredSessions.map((session) => (
                     <div
@@ -782,6 +803,8 @@ export function GlobalSessionsPage() {
                         isArchived={session.isArchived}
                         mode="card"
                         showContextUsage={false}
+                        showSizeMeta
+                        contextUsage={session.contextUsage}
                         isSelected={selectedIds.has(session.id)}
                         isSelectionMode={isSelectionMode && !isWideScreen}
                         onNavigate={() => {

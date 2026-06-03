@@ -620,7 +620,11 @@ export function RemoteConnectionProvider({ children }: Props) {
             const timeout = setTimeout(() => {
               ws.close();
               reject(new Error("Relay connection timeout"));
-            }, 15000);
+              // Boot-time auto-resume: bail fast (5s) so the user lands
+              // on the host-offline modal — which surfaces the endpoint
+              // switcher — instead of staring at a long spinner. The
+              // interactive login path keeps its longer 15s timeout.
+            }, 5000);
 
             ws.onopen = () => {
               clearTimeout(timeout);

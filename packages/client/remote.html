@@ -17,6 +17,49 @@
       @media (prefers-color-scheme: light) {
         html:not([data-theme]) { background-color: #faf9f5; }
       }
+
+      /* Inline splash — visible the moment WebView paints, before the JS
+         bundle finishes parsing. main script removes/fades it after the
+         first React paint so the user only sees splash → app, never a
+         flash of dark/empty content + popping skeleton. */
+      #splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        background: #181818;
+        color: #b8b8b8;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        transition: opacity 0.35s ease-out;
+        pointer-events: auto;
+      }
+      html[data-theme="light"] #splash { background: #faf9f5; color: #555; }
+      html[data-theme="dark"] #splash { background: #2f2f2f; color: #b8b8b8; }
+      #splash.is-hiding { opacity: 0; pointer-events: none; }
+      #splash-spinner {
+        width: 36px;
+        height: 36px;
+        border: 3px solid rgba(120, 120, 120, 0.25);
+        border-top-color: #7fd17f;
+        border-radius: 50%;
+        animation: splash-spin 0.85s linear infinite;
+      }
+      #splash-label {
+        font-size: 13px;
+        letter-spacing: 0.5px;
+        opacity: 0.7;
+      }
+      @keyframes splash-spin {
+        to { transform: rotate(360deg); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #splash-spinner { animation: none; }
+        #splash { transition: opacity 0.15s linear; }
+      }
     </style>
     <script>
       // Apply theme before page renders to prevent flash
@@ -28,6 +71,10 @@
     </script>
   </head>
   <body>
+    <div id="splash" aria-label="Loading">
+      <div id="splash-spinner" aria-hidden="true"></div>
+      <div id="splash-label">Yep Anywhere</div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/remote-main.tsx"></script>
   </body>

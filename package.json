@@ -31,6 +31,7 @@
     "lint": "biome check .",
     "format": "biome format --write .",
     "prepare": "husky",
+    "postinstall": "chmod +x node_modules/.pnpm/node-pty@*/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null; exit 0",
     "site:dev": "cd site && npm run dev",
     "site:build": "cd site && npm run build"
   },

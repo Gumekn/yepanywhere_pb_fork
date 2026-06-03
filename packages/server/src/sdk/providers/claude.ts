@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -431,6 +432,26 @@ export class ClaudeProvider implements AgentProvider {
       // Local spawn wrapper: delegates to child_process.spawn but captures the
       // SpawnedProcess reference so we can check liveness (exitCode) later.
       spawnClaudeCodeProcess = (spawnOpts) => {
+        // Pre-validate cwd. Without this, a missing cwd causes spawn() to emit
+        // 'error' with code=ENOENT and path=<binary>; the SDK then mis-renders
+        // it as "binary exists but failed to launch" — leading the user to
+        // suspect the Claude binary, not the cwd. Catch it here with a clear
+        // message instead.
+        const cwd = spawnOpts.cwd;
+        if (cwd) {
+          let cwdOk = false;
+          try {
+            cwdOk = statSync(cwd).isDirectory();
+          } catch {
+            cwdOk = false;
+          }
+          if (!cwdOk) {
+            throw new Error(
+              `Cannot spawn Claude: working directory does not exist: ${cwd}`,
+            );
+          }
+        }
+
         const proc = spawn(spawnOpts.command, spawnOpts.args, {
           cwd: spawnOpts.cwd,
           env: spawnOpts.env as NodeJS.ProcessEnv,

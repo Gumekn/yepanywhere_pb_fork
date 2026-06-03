@@ -9,12 +9,18 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { YepAnywhereLogo } from "../components/YepAnywhereLogo";
 import { useRemoteConnection } from "../contexts/RemoteConnectionContext";
+import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useI18n } from "../i18n";
 import {
   createRelayHost,
   getHostByRelayUsername,
   saveHost,
 } from "../lib/hostStorage";
+import {
+  DEFAULT_RELAY_URL,
+  getStoredRelayUrl,
+  setStoredRelayUrl,
+} from "../lib/relayConfig";
 
 /**
  * Parse credentials from URL hash for auto-login via QR code.
@@ -46,9 +52,6 @@ function parseHashCredentials(): {
   return null;
 }
 
-/** Default relay URL */
-const DEFAULT_RELAY_URL = "wss://relay.yepanywhere.com/ws";
-
 type ConnectionStatus =
   | "idle"
   | "connecting_relay"
@@ -64,7 +67,9 @@ export function RelayLoginPage() {
 
   // Form state - relay username is also used as SRP identity
   // Pre-fill from query parameters: ?u=username&r=relay-url
-  const initialRelayUrl = searchParams.get("r") ?? "";
+  // Falls back to last URL the user typed (persisted to localStorage),
+  // so a hand-edited endpoint survives across logins / app restarts.
+  const initialRelayUrl = searchParams.get("r") ?? getStoredRelayUrl();
   const [relayUsername, setRelayUsername] = useState(
     () => searchParams.get("u") ?? "",
   );
@@ -76,6 +81,9 @@ export function RelayLoginPage() {
   // Connection state
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [error, setError] = useState<string | null>(null);
+
+  // Login pages are terminal screens, dismiss the cold-start splash.
+  useHideSplashOnReady(true);
 
   // Auto-login from hash credentials (QR code scan)
   const autoLoginAttempted = useRef(false);
@@ -113,6 +121,7 @@ export function RelayLoginPage() {
     })
       .then(() => {
         // Host already saved and currentHostId already set
+        setStoredRelayUrl(effectiveRelayUrl);
       })
       .catch((err) => {
         const message =
@@ -190,6 +199,8 @@ export function RelayLoginPage() {
         rememberMe,
         onStatusChange: setStatus,
       });
+      // Persist the working endpoint for next launch.
+      setStoredRelayUrl(relayUrl);
       // On success, the RemoteApp will render the main app instead of login
     } catch (err) {
       const message =

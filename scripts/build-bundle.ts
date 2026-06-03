@@ -44,10 +44,15 @@ function error(message: string): void {
   console.error(`[build-bundle] ERROR: ${message}`);
 }
 
-function execStep(command: string, cwd?: string): void {
+function execStep(
+  command: string,
+  cwd?: string,
+  env?: Record<string, string | undefined>,
+): void {
   execSync(command, {
     stdio: "inherit",
     cwd: cwd || ROOT_DIR,
+    env: env ? { ...process.env, ...env } : process.env,
   });
 }
 
@@ -90,8 +95,18 @@ step("Build shared package", () => {
 
 // Build client
 step("Build client", () => {
-  log("Building @yep-anywhere/client (Vite production build)...");
-  execStep("pnpm --filter @yep-anywhere/client build");
+  // Vite's `base` is baked into asset URLs at build time. The server starts with
+  // BASE_PATH=/yep (see scripts/redeploy-server.sh) so the two must match;
+  // otherwise index.html references /assets/* while the server only serves
+  // /yep/assets/*, and the SPA fails to bootstrap. Honor an explicit BASE_PATH
+  // override but default to /yep to match the deployed Caddy route.
+  const clientBasePath = process.env.BASE_PATH ?? "/yep";
+  log(
+    `Building @yep-anywhere/client (Vite production build, BASE_PATH=${clientBasePath || "/"})...`,
+  );
+  execStep("pnpm --filter @yep-anywhere/client build", undefined, {
+    BASE_PATH: clientBasePath,
+  });
 
   // Verify client dist exists
   if (!fs.existsSync(CLIENT_DIST)) {

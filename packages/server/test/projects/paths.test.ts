@@ -13,6 +13,7 @@ import {
   getSessionIdFromPath,
   normalizeProjectPathForDedup,
   readCwdFromSessionFile,
+  resolveResumeCwd,
 } from "../../src/projects/paths.js";
 
 describe("Project Path Utilities", () => {
@@ -320,6 +321,79 @@ describe("Project Path Utilities", () => {
 
       const cwd = await readCwdFromSessionFile(sessionFile);
       expect(cwd).toBe("/home/user/project");
+    });
+  });
+
+  describe("resolveResumeCwd", () => {
+    let testDir: string;
+
+    beforeEach(async () => {
+      testDir = join(tmpdir(), `claude-resolve-test-${randomUUID()}`);
+      await mkdir(testDir, { recursive: true });
+    });
+
+    afterEach(async () => {
+      await rm(testDir, { recursive: true, force: true });
+    });
+
+    it("returns null when projectPath exists (no recovery needed)", async () => {
+      const projectPath = join(testDir, "live-project");
+      const sessionDir = join(testDir, "sessions");
+      await mkdir(projectPath, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        join(sessionDir, "sess-1.jsonl"),
+        `{"type":"user","cwd":"${projectPath}","message":"hi"}\n`,
+      );
+
+      const recovered = await resolveResumeCwd(
+        projectPath,
+        sessionDir,
+        "sess-1",
+      );
+      expect(recovered).toBeNull();
+    });
+
+    it("recovers cwd from jsonl when projectPath is missing", async () => {
+      const stalePath = join(testDir, "moved-away");
+      const realPath = join(testDir, "real-project");
+      const sessionDir = join(testDir, "sessions");
+      await mkdir(realPath, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        join(sessionDir, "sess-2.jsonl"),
+        `{"type":"user","cwd":"${realPath}","message":"hi"}\n`,
+      );
+
+      const recovered = await resolveResumeCwd(stalePath, sessionDir, "sess-2");
+      expect(recovered).toBe(realPath);
+    });
+
+    it("returns null when both projectPath and recovered cwd are missing", async () => {
+      const stalePath = join(testDir, "moved-away");
+      const alsoGone = join(testDir, "also-gone");
+      const sessionDir = join(testDir, "sessions");
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        join(sessionDir, "sess-3.jsonl"),
+        `{"type":"user","cwd":"${alsoGone}","message":"hi"}\n`,
+      );
+
+      const recovered = await resolveResumeCwd(stalePath, sessionDir, "sess-3");
+      expect(recovered).toBeNull();
+    });
+
+    it("returns null when jsonl file is missing", async () => {
+      const stalePath = join(testDir, "moved-away");
+      const sessionDir = join(testDir, "sessions");
+      await mkdir(sessionDir, { recursive: true });
+
+      const recovered = await resolveResumeCwd(
+        stalePath,
+        sessionDir,
+        "missing-session",
+      );
+      expect(recovered).toBeNull();
     });
   });
 });

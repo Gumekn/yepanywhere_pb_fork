@@ -406,6 +406,20 @@
   box-sizing: border-box;
 }
 
+/* Lock the document to vertical-only panning across the whole app.
+   On Tauri/Android WebView even a small horizontal scroll deep in the tree
+   (e.g. a wide <pre>, a long URL, a chip overflow) lets the user drag the
+   whole page sideways. touch-action:pan-y disables horizontal touch panning
+   entirely; overflow-x:hidden + max-width on html/body is a belt-and-braces
+   guard if the WebView ever ignores touch-action. */
+html,
+body {
+  overflow-x: hidden;
+  max-width: 100%;
+  touch-action: pan-y;
+  overscroll-behavior-x: none;
+}
+
 body {
   font-family: var(--font-sans);
   margin: 0;
@@ -416,7 +430,6 @@ body {
   padding-bottom: env(safe-area-inset-bottom, 0px);
   background: var(--bg-surface);
   color: var(--text-primary);
-  overflow-x: hidden;
 }
 
 .page {
@@ -441,6 +454,157 @@ body {
   }
   100% {
     opacity: 1;
+  }
+}
+
+/* ==========================================================================
+   Skeleton placeholders + content fade-in
+   Used for loading states in lists (projects, sessions, inbox). Pulsing
+   placeholders match the real content layout to avoid layout shift; once
+   real data arrives, content fades in over 220ms.
+   ========================================================================== */
+
+.skeleton {
+  display: inline-block;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--bg-hover) 60%, transparent) 0%,
+    color-mix(in srgb, var(--bg-hover) 100%, transparent) 50%,
+    color-mix(in srgb, var(--bg-hover) 60%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  border-radius: var(--radius-sm);
+  animation: skeleton-shimmer 1.6s ease-in-out infinite;
+  vertical-align: middle;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 100% 0;
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.85;
+  }
+  100% {
+    background-position: -100% 0;
+    opacity: 0.55;
+  }
+}
+
+/* Skeleton card wrapper — looks like the real list item but non-interactive. */
+.skeleton-item {
+  pointer-events: none;
+  user-select: none;
+}
+
+.skeleton-item .session-list-item__link,
+.skeleton-item .project-card__link {
+  cursor: default;
+  /* Slightly more muted background so skeleton reads as "not yet content". */
+  background: color-mix(in srgb, var(--bg-secondary) 80%, var(--bg-surface) 20%);
+}
+
+.skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.skeleton-row--title {
+  margin-bottom: var(--space-2);
+}
+
+.skeleton-row--meta {
+  flex-wrap: wrap;
+}
+
+/* Wrap the entire skeleton list in a quick fade so it doesn't pop in itself. */
+.session-list[aria-busy="true"],
+.project-list-cards[aria-busy="true"],
+.card-list-skeleton[aria-busy="true"],
+.session-messages-skeleton[aria-busy="true"] {
+  animation: content-fade-in 0.18s ease-out;
+}
+
+/* Generic vertical stack of placeholder cards (Agents, Git status, etc). */
+.card-list-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.card-list-skeleton .skeleton-block {
+  display: block;
+  width: 100%;
+}
+
+/* Chat-shaped skeleton for SessionPage. */
+.session-messages-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+}
+
+.session-messages-skeleton__row {
+  display: flex;
+  width: 100%;
+}
+
+.session-messages-skeleton__row--left {
+  justify-content: flex-start;
+}
+
+.session-messages-skeleton__row--right {
+  justify-content: flex-end;
+}
+
+.session-messages-skeleton__bubble {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0.55rem 0.75rem;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--bg-hover) 35%, transparent);
+  min-width: 80px;
+  max-width: 85%;
+}
+
+.session-messages-skeleton__row--right .session-messages-skeleton__bubble {
+  background: color-mix(in srgb, var(--bg-user-message) 60%, transparent);
+  border-bottom-right-radius: 6px;
+}
+
+/* Class applied to real content once loading completes. Smooth opacity ramp
+   so the swap from skeleton → content reads as a fade rather than a flash. */
+.content-fade-in {
+  animation: content-fade-in 0.22s ease-out;
+}
+
+@keyframes content-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Respect reduced-motion preference: skip the slide, keep the fade short. */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+    opacity: 0.55;
+  }
+  .content-fade-in,
+  .session-list[aria-busy="true"],
+  .project-list-cards[aria-busy="true"],
+  .card-list-skeleton[aria-busy="true"],
+  .session-messages-skeleton[aria-busy="true"] {
+    animation: none;
   }
 }
 
@@ -821,6 +985,10 @@ h2 {
   height: 100dvh; /* Dynamic viewport height - accounts for mobile browser chrome */
   overflow: hidden; /* Prevent body scroll */
   background: var(--bg-surface);
+  /* Lock horizontal panning on the topmost layout container too. */
+  touch-action: pan-y;
+  overscroll-behavior-x: none;
+  max-width: 100%;
 }
 
 .session-header {
@@ -1228,6 +1396,20 @@ a.sidebar-nav-item {
   text-align: center;
 }
 
+/* Sidebar loading placeholder — small vertical stack of skeleton rows that
+   mimics the compact session list. */
+.sidebar-loading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  animation: content-fade-in 0.18s ease-out;
+}
+
+.sidebar-loading .skeleton {
+  display: block;
+}
+
 .session-title {
   color: var(--text-primary);
   font-weight: 500;
@@ -1457,6 +1639,11 @@ a.sidebar-nav-item {
 .page-scroll-container {
   flex: 1;
   overflow-y: auto;
+  /* Explicitly disable horizontal scroll. Without this, the CSS spec promotes
+     overflow-x from visible to auto whenever overflow-y is auto, so any
+     descendant wider than the viewport (long session title, badge row, etc.)
+     will let the user pan the whole scroll container sideways. */
+  overflow-x: hidden;
   min-height: 0;
   -webkit-overflow-scrolling: touch;
 }
@@ -1477,6 +1664,12 @@ a.sidebar-nav-item {
   display: flex;
   flex-direction: column;
   min-height: 0; /* Critical for nested flex overflow */
+  /* Prevent any descendant horizontal overflow from dragging the whole page
+     sideways (e.g. wide tables, long URLs, filter chip overflow). */
+  overflow-x: hidden;
+  max-width: 100%;
+  touch-action: pan-y;
+  overscroll-behavior-x: none;
 }
 
 .main-content-mobile-inner {
@@ -1484,6 +1677,10 @@ a.sidebar-nav-item {
   display: flex;
   flex-direction: column;
   min-height: 0; /* Critical for nested flex overflow */
+  overflow-x: hidden;
+  max-width: 100%;
+  touch-action: pan-y;
+  overscroll-behavior-x: none;
 }
 
 /* Mobile-specific adjustments */
@@ -1540,20 +1737,69 @@ a.sidebar-nav-item {
   margin-bottom: 1rem;
 }
 
-/* User prompts - compact bubble that shrinks to fit content */
+/* ==========================================================================
+   Chat bubble layout — user right-aligned, assistant full-width left.
+   Inspired by happy: user gets a colored bubble pushed to the right;
+   assistant text flows along the existing timeline on the left, no bubble.
+   ========================================================================== */
+
+/* Right-align the user prompt within the messages column. */
+.user-prompt-container {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  margin-bottom: var(--space-3);
+  position: relative;
+}
+
+/* User prompts - bubble that hugs content, capped at ~70% on desktop. */
 .message-user-prompt {
   background: var(--bg-user-message);
-  border-radius: 6px;
-  margin-left: 0;
+  border-radius: 14px;
+  margin-left: auto;
+  margin-right: 0;
   width: fit-content;
-  max-width: 80%;
-  padding: 0.25rem 0.5rem;
+  max-width: 70%;
+  padding: 0.5rem 0.75rem;
   font-size: var(--font-size-base);
+  line-height: 1.5;
+  /* Round the trailing corner slightly less for that "from me" tail look. */
+  border-bottom-right-radius: 6px;
+}
+
+/* On narrower viewports the bubble can take more width so wrapping reads well. */
+@media (max-width: 600px) {
+  .message-user-prompt {
+    max-width: 85%;
+  }
+}
+
+/* Adjacent user-prompt containers (rare but happens with deferred queues):
+   collapse the gap so it feels grouped, iMessage-style. */
+.user-prompt-container + .user-prompt-container {
+  margin-top: calc(var(--space-3) * -1 + var(--space-1));
+}
+
+/* When an assistant turn follows another assistant turn (the grouping logic
+   in MessageList already merges most of them, but defensive). */
+.assistant-turn + .assistant-turn {
+  margin-top: var(--space-1);
+}
+
+/* Metadata block (opened/uploaded files) sits *under* the bubble and stays
+   right-aligned so it reads as belonging to the user message above. */
+.user-prompt-container .user-prompt-metadata {
+  align-self: flex-end;
+  justify-content: flex-end;
+  text-align: right;
 }
 
 /* Pending messages - waiting for server confirmation */
 .pending-message {
   margin-bottom: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
 }
 
 .pending-message-bubble {
@@ -1565,6 +1811,20 @@ a.sidebar-nav-item {
   color: var(--text-dimmed);
   margin-top: var(--space-1);
   font-style: italic;
+}
+
+.deferred-message {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  margin-bottom: var(--space-3);
+}
+
+.deferred-message-footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
 }
 
 /* User prompt metadata (opened files, etc.) */
@@ -1688,6 +1948,87 @@ a.sidebar-nav-item {
 .assistant-turn {
   position: relative;
   padding-left: 24px;
+}
+
+/* ==========================================================================
+   Message hover actions (timestamp + copy button)
+   Reveals on hover; on touch devices keep them visible at low opacity since
+   :hover doesn't apply.
+   ========================================================================== */
+
+.message-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  margin-top: var(--space-1);
+  /* Allow line-height: 1 so the row hugs the bubble */
+  line-height: 1.2;
+}
+
+.user-prompt-container:hover .message-actions,
+.user-prompt-container:focus-within .message-actions,
+.assistant-turn:hover .message-actions,
+.assistant-turn:focus-within .message-actions,
+.message-actions.is-active {
+  opacity: 1;
+}
+
+/* Touch devices — :hover never matches reliably; show at half-opacity always
+   so users can still discover the controls. */
+@media (hover: none) and (pointer: coarse) {
+  .message-actions {
+    opacity: 0.55;
+  }
+}
+
+.message-actions-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.message-actions-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-1);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.message-actions-copy:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-color);
+  color: var(--text-primary);
+}
+
+.message-actions-copy:focus-visible {
+  outline: 2px solid var(--focus-border, var(--app-yep-green));
+  outline-offset: 1px;
+}
+
+.message-actions-copy.is-copied {
+  color: var(--app-yep-green);
+}
+
+/* User actions sit under the right-aligned bubble. */
+.user-prompt-container .message-actions {
+  align-self: flex-end;
+  flex-direction: row-reverse;
+}
+
+/* Assistant actions sit under the assistant turn, aligned to its content
+   indent (so they don't dangle awkwardly under the timeline gutter). */
+.assistant-turn .message-actions {
+  margin-left: 24px;
 }
 
 .message-content {
@@ -1828,7 +2169,41 @@ a.sidebar-nav-item {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  flex-shrink: 1;
   -webkit-tap-highlight-color: transparent;
+}
+
+.mode-button-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Narrow viewports: hide the long mode label, keep only the colored dot.
+   The full mode is still on the title / aria-label and shown again when
+   the bottom sheet opens. Frees ~120px of toolbar width so the / button
+   and the token-usage circle stop overlapping. */
+@media (max-width: 600px) {
+  /* Match the square icon-button shape used by attach / slash / thinking
+     buttons (~28x28 with a centered glyph) so the mode toggle reads as
+     part of the same icon row rather than a stray rectangle. */
+  .mode-button {
+    gap: 0;
+    padding: 0;
+    width: 28px;
+    min-width: 28px;
+    height: 28px;
+    justify-content: center;
+  }
+  .mode-button-label {
+    display: none;
+  }
+  /* Slightly larger dot so it remains clearly visible at icon-button
+     size — small 8px dot looks lost inside a 28x28 box. */
+  .mode-button .mode-dot {
+    width: 10px;
+    height: 10px;
+  }
 }
 
 .mode-button:focus {
@@ -2178,6 +2553,25 @@ a.sidebar-nav-item {
   gap: var(--space-2);
   min-width: 0;
   flex: 1;
+}
+
+/* Narrow viewports: tighter gaps + ensure icon buttons don't shrink, only
+   the mode button absorbs the space pressure (which is fine, it's already
+   collapsed to a dot). */
+@media (max-width: 600px) {
+  .message-input-toolbar {
+    gap: 0.375rem;
+  }
+  .message-input-left {
+    gap: 0.25rem;
+  }
+  .message-input-actions {
+    gap: 0.25rem;
+  }
+  .message-input-left > button:not(.mode-button),
+  .message-input-left .slash-command-container {
+    flex-shrink: 0;
+  }
 }
 
 /* Attach button */
@@ -4328,12 +4722,17 @@ a.sidebar-nav-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-2);
   padding: var(--space-3) var(--space-4);
   padding-bottom: max(var(--space-3), env(safe-area-inset-bottom, 0px));
   background: var(--bg-surface);
   border-top: 1px solid var(--border-color);
   box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.1);
   animation: slide-up 0.2s ease-out;
+  /* Keep button row inside the bar; prevents wide actions from spilling out
+     and contributing to horizontal pan on Android WebView. */
+  overflow-x: hidden;
+  max-width: 100%;
 }
 
 @keyframes slide-up {
@@ -4380,6 +4779,11 @@ a.sidebar-nav-item {
 .bulk-action-bar__actions {
   display: flex;
   gap: var(--space-2);
+  /* Wrap when too many actions are visible at once (e.g. all of archive +
+     unarchive + star + unstar + read + unread when mixed selection). */
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .bulk-action-button {
@@ -4718,6 +5122,156 @@ button.context-usage-indicator--button:focus-visible {
   color: var(--color-error, #dc3545);
 }
 
+/* ----- Hero meter (big % + progress bar + meta) ----- */
+.context-status-hero {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--bg-code);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+}
+
+.context-status-hero-numbers {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.context-status-percent-big {
+  font-size: 2.25rem;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.context-status-percent-big.severity-warn {
+  color: var(--color-warning, #ffc107);
+}
+
+.context-status-percent-big.severity-danger {
+  color: var(--color-error, #dc3545);
+}
+
+.context-status-fraction {
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.context-status-hero-bar {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  background: var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.context-status-hero-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--app-yep-green);
+  border-radius: 4px;
+  transition: width 0.2s ease;
+}
+
+.context-status-hero-bar-fill.severity-warn {
+  background: var(--color-warning, #ffc107);
+}
+
+.context-status-hero-bar-fill.severity-danger {
+  background: var(--color-error, #dc3545);
+}
+
+.context-status-hero-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  padding-top: var(--space-1);
+  border-top: 1px dashed var(--border-color);
+}
+
+.context-status-hero-meta-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+/* ----- Row enhancements (highlight + dual value/% display) ----- */
+.context-status-row--with-bar {
+  grid-template-columns: minmax(0, 1fr) 60px auto;
+}
+
+.context-status-row--highlight .context-status-row-label {
+  font-weight: 600;
+}
+
+.context-status-row--highlight .context-status-row-tokens-pct {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.context-status-row-tokens {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.context-status-row-tokens-value {
+  color: var(--text-secondary, var(--text-muted));
+}
+
+.context-status-row-tokens-pct {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 2.5em;
+  text-align: right;
+}
+
+/* ----- Mobile tuning: bigger touch targets, larger numbers ----- */
+@media (max-width: 600px) {
+  .context-status-body {
+    gap: var(--space-3);
+    padding: var(--space-3);
+    font-size: var(--font-size-md, 0.9375rem);
+  }
+
+  .context-status-hero {
+    padding: var(--space-4);
+    gap: var(--space-3);
+  }
+
+  .context-status-percent-big {
+    font-size: 2.75rem;
+  }
+
+  .context-status-hero-bar {
+    height: 10px;
+  }
+
+  .context-status-row {
+    padding: var(--space-2) 0;
+  }
+
+  .context-status-row-label {
+    font-size: var(--font-size-sm);
+  }
+
+  .context-status-section-heading {
+    font-size: var(--font-size-sm);
+    letter-spacing: 0.02em;
+    text-transform: none;
+    color: var(--text-primary);
+  }
+}
+
 /* Mobile adjustments for session metadata UI */
 @media (max-width: 600px) {
   .filter-bar {
@@ -4733,30 +5287,37 @@ button.context-usage-indicator--button:focus-visible {
     max-width: none;
   }
 
-  /* Keep dropdown buttons on a single row; allow horizontal scroll if they
-     overflow. Prevents the filter chips from wrapping onto a second line on
-     narrow Android/iOS Chrome screens. */
+  /* Wrap filter chips onto multiple lines instead of horizontal scroll —
+     a horizontal scroll on a child element in Tauri WebView ends up dragging
+     the whole page sideways, exposing background. */
   .filter-dropdowns {
-    flex-wrap: nowrap;
-    overflow-x: auto;
+    flex-wrap: wrap;
+    overflow-x: hidden;
     overflow-y: visible;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-    /* Tiny vertical padding so focus/hover outlines aren't clipped by the
-       scroll container. */
+    /* Tighter gap on mobile so more chips fit per row. */
+    gap: var(--space-1);
+    /* Tiny vertical padding so focus/hover outlines aren't clipped. */
     padding-bottom: 2px;
-  }
-
-  .filter-dropdowns::-webkit-scrollbar {
-    display: none;
   }
 
   .filter-dropdowns > * {
     flex-shrink: 0;
   }
 
+  /* Smaller, denser chips so all 5 filter dropdowns (project / status /
+     provider / executor / age) usually fit on a single row instead of
+     wrapping to two. */
   .filter-dropdown-button {
     white-space: nowrap;
+    font-size: var(--font-size-xs);
+    padding: 4px var(--space-2);
+    gap: var(--space-1);
+    border-radius: var(--radius-sm);
+  }
+
+  .filter-dropdown-chevron {
+    width: 10px;
+    height: 10px;
   }
 }
 
@@ -6182,6 +6743,33 @@ button.context-usage-indicator--button:focus-visible {
   margin-top: var(--space-3);
 }
 
+/* Version + build-timestamp stamp at the bottom of the login screens.
+   Deliberately faint and monospaced — diagnostic info, not a CTA. */
+.login-build-info {
+  margin-top: var(--space-4);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--font-size-xs, 0.75rem);
+  color: var(--text-dimmed);
+  text-align: center;
+  opacity: 0.7;
+  user-select: text;
+}
+
+/* Build profile tag. release = green (the build you ship), debug/dev = amber
+   so a non-release build on a device is visually obvious at a glance. */
+.login-build-profile {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.login-build-profile-release {
+  color: var(--app-yep-green, #2ea043);
+}
+.login-build-profile-debug,
+.login-build-profile-dev {
+  color: var(--color-warning, #d29922);
+}
+
 .login-loading {
   color: var(--text-muted);
   text-align: center;
@@ -6227,6 +6815,77 @@ button.context-usage-indicator--button:focus-visible {
 .auto-resume-loading p {
   color: var(--text-muted);
   font-size: var(--font-size-sm);
+}
+
+/* Escape-hatch endpoint editor shown inside the auto-resume spinner so
+   the user can fix a dead relay URL even if the rest of the app is
+   unreachable. Mounts collapsed (a single text button) so the spinner
+   stays visually quiet during the common case. */
+.endpoint-switcher-toggle {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.endpoint-switcher-toggle:hover {
+  color: var(--text-default);
+}
+
+.endpoint-switcher {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: min(420px, 92vw);
+  margin-top: var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+  background: var(--bg-elevated, var(--bg-surface));
+}
+
+.endpoint-switcher-current {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.endpoint-switcher-current code {
+  font-family: var(--font-mono, monospace);
+}
+
+.endpoint-switcher input {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  background: var(--bg-input, var(--bg-default));
+  color: var(--text-default);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--font-size-sm);
+}
+
+.endpoint-switcher-hint {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.endpoint-switcher-error {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--app-error, #d9534f);
+}
+
+.endpoint-switcher-actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
 }
 
 /* Login mode selection (relay vs direct) */
@@ -6864,11 +7523,13 @@ button.context-usage-indicator--button:focus-visible {
 .session-list-item--card .session-list-item__link {
   display: block;
   flex: 1;
+  min-width: 0; /* allow shrinking inside the flex row so long content can truncate */
   padding: 1rem;
   background: var(--bg-secondary);
   border-radius: 8px;
   text-decoration: none;
   color: inherit;
+  overflow: hidden;
 }
 
 .session-list-item--card .session-list-item__link:hover {
@@ -6879,17 +7540,49 @@ button.context-usage-indicator--button:focus-visible {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  min-width: 0;
+  /* Wrap title row so long titles + badges (Draft, Archived) drop to a new
+     line instead of pushing the card past viewport width. */
+  flex-wrap: wrap;
   font-weight: 600;
   font-size: var(--font-size-base);
+  /* Break very long unbroken strings (paths, URLs) inside the title. */
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .session-list-item--card .session-list-item__meta {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  /* Wrap badge row instead of overflowing — multiple badges (executor,
+     project, status, context usage) easily exceed viewport width on phones. */
+  flex-wrap: wrap;
+  min-width: 0;
   font-size: var(--font-size-sm);
   color: var(--text-muted);
   margin-top: var(--space-1);
+}
+
+/* Timestamp wrapper — kept as a span so we can attach a tooltip with the
+   full datetime without disrupting the meta row's flex layout. */
+.session-list-item__time {
+  white-space: nowrap;
+}
+
+/* "12 条" / "12.3K" chips — non-clickable, lighter than badges. Subtle
+   border so they read as factual metadata rather than interactive elements. */
+.session-list-item__size-meta {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-code);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  line-height: 1.4;
 }
 
 /* Project name in card mode meta line */

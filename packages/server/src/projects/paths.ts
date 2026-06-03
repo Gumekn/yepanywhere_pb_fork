@@ -57,7 +57,7 @@
  * 4. Use `getSessionFilePath()` to construct paths to specific session files.
  */
 
-import { open } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, sep } from "node:path";
 import type { UrlProjectId } from "@yep-anywhere/shared";
@@ -228,6 +228,115 @@ export async function readCwdFromSessionFile(
   } finally {
     await fd?.close();
   }
+}
+
+/**
+ * Recover the working directory to use when resuming a session whose cached
+ * `projectPath` may be stale.
+ *
+ * Background: a `Project` is identified by a base64url-encoded `projectId`.
+ * If the user moves the project directory on disk, the cached index keeps the
+ * old encoding, so `decodeProjectId(project.id)` can point at a path that no
+ * longer exists. The Claude SDK rewrites the real `cwd` into the session jsonl
+ * on every turn, so the jsonl is the source of truth.
+ *
+ * If the project path resolves to a directory that exists, we return null —
+ * the caller should keep using the project as-is. Otherwise we read the latest
+ * `cwd` from the session jsonl and return it iff it exists on disk; if neither
+ * works we return null and the caller should error out cleanly rather than let
+ * `spawn()` fail with an opaque ENOENT (which the SDK currently mis-renders as
+ * "binary exists but failed to launch").
+ */
+export async function resolveResumeCwd(
+  projectPath: string,
+  sessionDir: string,
+  sessionId: string,
+): Promise<string | null> {
+  try {
+    const s = await stat(projectPath);
+    if (s.isDirectory()) return null;
+  } catch {
+    // fall through to recovery
+  }
+
+  const sessionFile = getSessionFilePath(sessionDir, sessionId);
+  let recoveredCwd = await readCwdFromSessionFile(sessionFile);
+  if (!recoveredCwd) {
+    // sessionId.jsonl might not exist (e.g. new session, or the session is
+    // tracked in a sibling directory after a rename). Fall back to scanning
+    // any jsonl in the sessionDir.
+    recoveredCwd = await recoverCwdFromSessionDir(sessionDir);
+  }
+  if (!recoveredCwd) return null;
+
+  try {
+    const s = await stat(recoveredCwd);
+    if (s.isDirectory()) return recoveredCwd;
+  } catch {
+    // recovered path is also gone
+  }
+  return null;
+}
+
+/**
+ * Recover the real cwd for a project by scanning its session directory.
+ *
+ * Used when we need to spawn a Claude process for a project whose `path` is
+ * stale (e.g. the user moved the directory on disk) but we don't have a
+ * specific sessionId to read — for example when starting a brand-new session
+ * via the `POST /api/projects/:projectId/sessions` route, or when the named
+ * session jsonl isn't where we expected it. The SDK writes the real `cwd`
+ * into every session jsonl, so reading any one of them gives a current,
+ * trustworthy path.
+ *
+ * Returns the first cwd we can read that still points at an existing
+ * directory, or null if no recovery is possible.
+ */
+export async function recoverCwdFromSessionDir(
+  sessionDir: string,
+): Promise<string | null> {
+  let entries: string[];
+  try {
+    entries = await readdir(sessionDir);
+  } catch {
+    return null;
+  }
+
+  const jsonlFiles = entries.filter((f) => f.endsWith(".jsonl"));
+  for (const file of jsonlFiles) {
+    const cwd = await readCwdFromSessionFile(join(sessionDir, file));
+    if (!cwd) continue;
+    try {
+      const s = await stat(cwd);
+      if (s.isDirectory()) return cwd;
+    } catch {
+      // try the next jsonl
+    }
+  }
+  return null;
+}
+
+/**
+ * Recover the real cwd for a project whose `projectPath` may be stale.
+ *
+ * Like {@link resolveResumeCwd} but doesn't require a sessionId — used by the
+ * "start new session in project" path where there's no session yet. Returns
+ * the recovered cwd, or null if `projectPath` is already healthy / nothing
+ * could be recovered.
+ */
+export async function resolveStartCwd(
+  projectPath: string,
+  sessionDir: string,
+): Promise<string | null> {
+  try {
+    const s = await stat(projectPath);
+    if (s.isDirectory()) return null;
+  } catch {
+    // fall through to recovery
+  }
+
+  const recovered = await recoverCwdFromSessionDir(sessionDir);
+  return recovered ?? null;
 }
 
 /**

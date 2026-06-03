@@ -158,6 +158,7 @@ export {
   // Context window utilities
   DEFAULT_CONTEXT_WINDOW,
   CODEX_DEFAULT_CONTEXT_WINDOW,
+  escalateContextWindow,
   getModelContextWindow,
 } from "./app-types.js";
 
@@ -180,6 +181,7 @@ export type {
   ContextStatusSdkPayload,
   ContextStatusEstimatePayload,
   ContextCategoryEntry,
+  ContextCumulativeUsage,
   ContextMcpToolEntry,
   ContextMemoryFileEntry,
   ContextSkillFrontmatterEntry,
@@ -318,6 +320,20 @@ export type {
   DeviceServerMessage,
   RTCIceCandidateInit,
 } from "./devices.js";
+
+// Remote terminal types (for remote shell sessions)
+export type {
+  TerminalOpen,
+  TerminalInput,
+  TerminalResize,
+  TerminalClose,
+  TerminalClientMessage,
+  TerminalOpened,
+  TerminalOutput,
+  TerminalExit,
+  TerminalError,
+  TerminalServerMessage,
+} from "./terminal.js";
 
 // Relay protocol types (for remote access via WebSocket)
 export type {

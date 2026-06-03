@@ -2,9 +2,11 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   type AgentStatus,
+  type ContextCumulativeUsage,
   type ProviderName,
   SESSION_TITLE_MAX_LENGTH,
   type UrlProjectId,
+  escalateContextWindow,
   getModelContextWindow,
   isIdeMetadata,
   stripIdeMetadata,
@@ -289,6 +291,10 @@ export class ClaudeSessionReader implements ISessionReader {
         provider,
       );
 
+      const cumulativeUsage = this.extractCumulativeTokenUsage(
+        activeBranch.map((node) => node.raw),
+      );
+
       return {
         id: sessionId,
         projectId,
@@ -299,6 +305,7 @@ export class ClaudeSessionReader implements ISessionReader {
         messageCount: conversationMessages.length,
         ownership: { owner: "none" }, // Will be updated by Supervisor
         contextUsage,
+        cumulativeUsage,
         provider,
         model,
       };
@@ -653,14 +660,22 @@ export class ClaudeSessionReader implements ISessionReader {
           // Apply overhead correction for post-compaction messages
           const inputTokens = rawInputTokens + overhead;
 
-          const percentage = Math.round(
-            (inputTokens / contextWindowSize) * 100,
+          // The Claude Code SDK strips `[1m]` from the model ID it writes to
+          // JSONL, so a 1M-context session reads back as a plain model name
+          // and scores 200K. If usage exceeds that, escalate so the user
+          // doesn't see >100% on perfectly-fine 1M sessions.
+          const effectiveWindow = escalateContextWindow(
+            contextWindowSize,
+            inputTokens,
+            provider,
           );
+
+          const percentage = Math.round((inputTokens / effectiveWindow) * 100);
 
           const result: ContextUsage = {
             inputTokens,
             percentage,
-            contextWindow: contextWindowSize,
+            contextWindow: effectiveWindow,
           };
 
           // Add optional fields if available
@@ -685,6 +700,56 @@ export class ClaudeSessionReader implements ISessionReader {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Walk every assistant message in the active branch and sum the per-turn
+   * `usage` blocks. Returns the cumulative input/output/cache figures shown
+   * in the context-status modal — the same numbers Claude Code prints for
+   * `/status`.
+   *
+   * Synthetic / error messages (model === "<synthetic>") and entries
+   * without a usage block are skipped so a single failed turn doesn't
+   * inflate the totals.
+   */
+  private extractCumulativeTokenUsage(
+    messages: ClaudeSessionEntry[],
+  ): ContextCumulativeUsage | undefined {
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheCreationTokens = 0;
+    let turnCount = 0;
+
+    for (const msg of messages) {
+      if (msg.type !== "assistant") continue;
+      if (msg.message.model === "<synthetic>") continue;
+
+      const usage = msg.message.usage as
+        | {
+            input_tokens?: number;
+            output_tokens?: number;
+            cache_read_input_tokens?: number;
+            cache_creation_input_tokens?: number;
+          }
+        | undefined;
+      if (!usage) continue;
+
+      inputTokens += usage.input_tokens ?? 0;
+      outputTokens += usage.output_tokens ?? 0;
+      cacheReadTokens += usage.cache_read_input_tokens ?? 0;
+      cacheCreationTokens += usage.cache_creation_input_tokens ?? 0;
+      turnCount += 1;
+    }
+
+    if (turnCount === 0) return undefined;
+    return {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      turnCount,
+    };
   }
 
   /**

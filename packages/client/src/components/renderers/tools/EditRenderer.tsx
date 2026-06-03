@@ -13,6 +13,49 @@ import { SchemaWarning } from "../../SchemaWarning";
 import { Modal } from "../../ui/Modal";
 import type { EditInput, EditResult, PatchHunk, ToolRenderer } from "./types";
 
+/**
+ * Compact icon button used in collapsed diff/patch previews to open the
+ * full-content modal. Replaces the previous bulky text buttons
+ * ("Show full diff", "Show full patch", "Click to expand"). The descriptive
+ * label is preserved via aria-label / title so screen readers and
+ * hover-tooltips still surface intent.
+ */
+function DiffExpandButton({
+  label,
+  onClick,
+}: {
+  label: string;
+  onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="diff-expand-button"
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+    >
+      <svg
+        width="14"
+        height="14"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        {/* Diagonal arrows pointing outward = "expand to full view" */}
+        <polyline points="15 3 21 3 21 9" />
+        <polyline points="9 21 3 21 3 15" />
+        <line x1="21" y1="3" x2="14" y2="10" />
+        <line x1="3" y1="21" x2="10" y2="14" />
+      </svg>
+    </button>
+  );
+}
+
 const MAX_VISIBLE_LINES = 12;
 
 /** Extended input type with embedded augment data from server */
@@ -545,16 +588,13 @@ function EditCollapsedPreview({
             </div>
           )}
           {hasProposedDiff && proposedDiffTruncated && (
-            <button
-              type="button"
-              className="diff-expand-button"
+            <DiffExpandButton
+              label="Show full diff"
               onClick={(e) => {
                 e.stopPropagation();
                 setIsModalOpen(true);
               }}
-            >
-              Show full diff
-            </button>
+            />
           )}
         </div>
         {isModalOpen && hasProposedDiff && (
@@ -598,16 +638,13 @@ function EditCollapsedPreview({
               truncateLines={MAX_VISIBLE_LINES}
             />
             {rawPatchPreview.truncated && (
-              <button
-                type="button"
-                className="diff-expand-button"
+              <DiffExpandButton
+                label="Show full patch"
                 onClick={(e) => {
                   e.stopPropagation();
                   setIsModalOpen(true);
                 }}
-              >
-                Show full patch
-              </button>
+              />
             )}
           </div>
           {isModalOpen && (
@@ -657,13 +694,7 @@ function EditCollapsedPreview({
           {isTruncated && <div className="diff-fade-overlay" />}
         </div>
         {isTruncated && (
-          <button
-            type="button"
-            className="diff-expand-button"
-            onClick={handleClick}
-          >
-            Show full diff
-          </button>
+          <DiffExpandButton label="Show full diff" onClick={handleClick} />
         )}
       </div>
       {isModalOpen && (
@@ -928,16 +959,13 @@ function EditToolResult({
               {proposedDiffTruncated && (
                 <>
                   <div className="diff-fade-overlay" />
-                  <button
-                    type="button"
-                    className="diff-expand-button"
+                  <DiffExpandButton
+                    label="Show full diff"
                     onClick={(e) => {
                       e.stopPropagation();
                       setShowModal(true);
                     }}
-                  >
-                    Show full diff
-                  </button>
+                  />
                 </>
               )}
             </div>
@@ -1024,16 +1052,13 @@ function EditToolResult({
           {isTruncated && (
             <>
               <div className="diff-fade-overlay" />
-              <button
-                type="button"
-                className="diff-expand-button"
+              <DiffExpandButton
+                label="Click to expand"
                 onClick={(e) => {
                   e.stopPropagation();
                   setShowModal(true);
                 }}
-              >
-                Click to expand
-              </button>
+              />
             </>
           )}
         </div>

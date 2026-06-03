@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { apiPath } from "../lib/apiPath";
 
 interface Props {
   children: ReactNode;
@@ -45,7 +46,7 @@ export class ErrorBoundary extends Component<Props, State> {
   async fetchServerVersion() {
     this.setState({ versionLoading: true });
     try {
-      const res = await fetch("/api/version");
+      const res = await fetch(apiPath("/version"));
       if (res.ok) {
         const data = await res.json();
         this.setState({ serverVersion: data.current });

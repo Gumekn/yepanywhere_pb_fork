@@ -30,6 +30,7 @@ import {
 } from "./contexts/RemoteConnectionContext";
 import { SchemaValidationProvider } from "./contexts/SchemaValidationContext";
 import { ToastProvider } from "./contexts/ToastContext";
+import { useHideSplashOnReady } from "./hooks/useHideSplashOnReady";
 import { useNeedsAttentionBadge } from "./hooks/useNeedsAttentionBadge";
 import { useSyncNotifyInAppSetting } from "./hooks/useNotifyInApp";
 import { useReloadNotifications } from "./hooks/useReloadNotifications";
@@ -158,6 +159,13 @@ export function ConnectionGate() {
     clearAutoResumeError,
     retryAutoResume,
   } = useRemoteConnection();
+
+  // Hide the cold-start splash only when this gate is about to show a
+  // terminal UI of its own (error modal) — during auto-resume the gate
+  // would otherwise render its inner "Reconnecting..." spinner under the
+  // splash, which is fine; we let the page or login screen fade the splash
+  // once they actually render.
+  useHideSplashOnReady(!isAutoResuming && autoResumeError !== null);
 
   // During reconnection, stay on the current page — don't redirect to /login.
   // ConnectionManager is the source of truth; React connection state may be stale.

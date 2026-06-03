@@ -56,6 +56,7 @@ import {
   createSessionSubscription,
 } from "../subscriptions.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
+import type { TerminalService } from "../terminal/TerminalService.js";
 import type { UploadManager } from "../uploads/manager.js";
 import type { EventBus, FocusedSessionWatchManager } from "../watcher/index.js";
 import {
@@ -194,6 +195,13 @@ export interface RelayHandlerDeps {
   app: Hono<{ Bindings: HttpBindings }>;
   /** Base URL for internal requests (e.g., "http://localhost:3400") */
   baseUrl: string;
+  /**
+   * Reverse-proxy URL prefix to prepend to relay request paths before
+   * they hit the Hono app. Clients send protocol-level paths like
+   * "/api/foo" that are agnostic of the deploy prefix; we apply the
+   * prefix here so the wrapped Hono routes (`${basePath}/api/foo`) match.
+   */
+  basePath?: string;
   /** Supervisor for subscribing to session events */
   supervisor: Supervisor;
   /** Event bus for subscribing to activity events */
@@ -212,6 +220,8 @@ export interface RelayHandlerDeps {
   focusedSessionWatchManager?: FocusedSessionWatchManager;
   /** Emulator bridge service for Android emulator streaming (optional) */
   deviceBridgeService?: DeviceBridgeService;
+  /** Terminal service for remote shell sessions (optional) */
+  terminalService?: TerminalService;
 }
 
 /**
@@ -312,9 +322,16 @@ export async function handleRequest(
   app: Hono<{ Bindings: HttpBindings }>,
   baseUrl: string,
   connState: ConnectionState,
+  basePath = "",
 ): Promise<void> {
   try {
-    const url = new URL(request.path, baseUrl);
+    // Clients send logical paths (e.g. "/api/foo") that do not know
+    // about reverse-proxy prefixes; prepend the deploy basePath so the
+    // request matches the routes registered on the Hono app.
+    const prefixed = basePath
+      ? `${basePath}${request.path.startsWith("/") ? "" : "/"}${request.path}`
+      : request.path;
+    const url = new URL(prefixed, baseUrl);
     const headers = new Headers(request.headers);
     headers.set("X-Yep-Anywhere", "true");
     headers.set("X-Ws-Relay", "true");
@@ -942,6 +959,7 @@ export async function handleMessage(
   deps: RelayHandlerDeps,
   options: HandleMessageOptions,
   deviceSessions?: Set<string>,
+  terminalAttachId?: string,
 ): Promise<void> {
   const {
     app,
@@ -985,7 +1003,7 @@ export async function handleMessage(
   const routeClientMessage = async (msg: RemoteClientMessage): Promise<void> =>
     routeClientMessageSafely(msg, send, {
       onRequest: async (requestMsg) =>
-        handleRequest(requestMsg, send, app, baseUrl, connState),
+        handleRequest(requestMsg, send, app, baseUrl, connState, deps.basePath),
       onSubscribe: async (subscribeMsg) =>
         handleSubscribe(
           subscriptions,
@@ -1029,6 +1047,23 @@ export async function handleMessage(
             };
           })()
         : undefined,
+      onTerminalMessage:
+        deps.terminalService && terminalAttachId
+          ? (() => {
+              const svc = deps.terminalService;
+              const attachId = terminalAttachId;
+              return async (msg: RemoteClientMessage) => {
+                switch (msg.type) {
+                  case "terminal_open":
+                  case "terminal_input":
+                  case "terminal_resize":
+                  case "terminal_close":
+                    await svc.handleMessage(msg, attachId, send);
+                    break;
+                }
+              };
+            })()
+          : undefined,
     });
 
   const parsed = await decodeFrameToParsedMessage(
@@ -1105,6 +1140,23 @@ export function cleanupDeviceSessions(
     }
   }
   deviceSessions.clear();
+}
+
+/**
+ * Detach all terminals attached over this connection. The server-side PTYs
+ * keep running (server-owned process model) and will be GC'd after the
+ * idle timeout if no other client reattaches.
+ */
+export function cleanupTerminalAttachments(
+  terminalAttachId: string | undefined,
+  terminalService?: TerminalService,
+): void {
+  if (!terminalAttachId || !terminalService) return;
+  try {
+    terminalService.detachAll(terminalAttachId);
+  } catch (err) {
+    console.error("[WS Relay] Error detaching terminals:", err);
+  }
 }
 
 /**

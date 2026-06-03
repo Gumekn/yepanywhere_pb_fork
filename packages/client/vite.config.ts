@@ -15,6 +15,18 @@ const vitePort = process.env.VITE_PORT
 // VITE_HOST: Set to "true" to bind to all interfaces (needed in Docker containers)
 const viteHost = process.env.VITE_HOST === "true" ? true : undefined;
 
+// BASE_PATH: when the server is mounted under a reverse-proxy prefix (e.g.
+// Caddy at /yep/), Vite needs to emit asset URLs with that prefix and the
+// runtime needs to know where /api lives. Empty / "/" = serve at root.
+const basePath = (() => {
+  const raw = process.env.BASE_PATH?.trim();
+  if (!raw || raw === "/") return "/";
+  const withLeadingSlash = raw.startsWith("/") ? raw : `/${raw}`;
+  return withLeadingSlash.endsWith("/")
+    ? withLeadingSlash
+    : `${withLeadingSlash}/`;
+})();
+
 function getGitVersion(): string {
   try {
     return execSync("git describe --tags --always", {
@@ -30,8 +42,12 @@ function getGitVersion(): string {
 
 export default defineConfig({
   clearScreen: false,
+  base: basePath,
   define: {
     __APP_VERSION__: JSON.stringify(getGitVersion()),
+    // Wall-clock build time (see vite.config.remote.ts for rationale).
+    __BUILD_DATE__: JSON.stringify(new Date().toISOString()),
+    __BUILD_PROFILE__: JSON.stringify(process.env.YEP_BUILD_PROFILE ?? "dev"),
   },
   plugins: [
     react(),

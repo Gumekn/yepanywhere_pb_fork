@@ -122,6 +122,12 @@ export interface Config {
   httpsSelfSigned: boolean;
   /** Desktop auth token for Tauri app. Requests with matching X-Desktop-Token header bypass auth. */
   desktopAuthToken?: string;
+  /**
+   * URL path prefix to serve under (e.g. "/yep" when behind a reverse proxy
+   * that exposes the server at https://host/yep/...). Empty string = no
+   * prefix (default).
+   */
+  basePath: string;
 }
 
 /**
@@ -273,7 +279,19 @@ export function loadConfig(): Config {
     openBrowser: process.env.OPEN_BROWSER === "true",
     httpsSelfSigned: process.env.HTTPS_SELF_SIGNED === "true",
     desktopAuthToken: process.env.DESKTOP_AUTH_TOKEN || undefined,
+    // Optional reverse-proxy prefix; Caddy in air.yueyuan.uk/yep/* mounts us
+    // here. Stripped of any trailing slash so callers can confidently template
+    // `${basePath}/api/...`. Empty string keeps the legacy "no prefix" mode.
+    basePath: normalizeBasePath(process.env.BASE_PATH),
   };
+}
+
+function normalizeBasePath(raw: string | undefined): string {
+  if (!raw) return "";
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "/") return "";
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/, "");
 }
 
 /**

@@ -591,8 +591,23 @@ export class ProjectScanner {
       const dirStat = await stat(projectDirPath);
       const lastActivity = new Date(dirStat.mtimeMs).toISOString();
 
-      // Read cwd from first available session file
+      // Sort jsonl files by mtime descending. The newest file carries the
+      // most recent `cwd` the SDK wrote — older jsonls may still record the
+      // project's original location from before the user moved it on disk.
+      // Reading any older one would let a stale path leak into the project
+      // snapshot's id/path fields. Stat-ing N files is cheap (≈50µs each).
+      const withMtime: Array<{ file: string; mtime: number }> = [];
       for (const file of jsonlFiles) {
+        try {
+          const s = await stat(join(projectDirPath, file));
+          withMtime.push({ file, mtime: s.mtimeMs });
+        } catch {
+          // Skip files we can't stat (deleted between readdir and stat)
+        }
+      }
+      withMtime.sort((a, b) => b.mtime - a.mtime);
+
+      for (const { file } of withMtime) {
         const filePath = join(projectDirPath, file);
         const cwd = await readCwdFromSessionFile(filePath);
         if (cwd) {

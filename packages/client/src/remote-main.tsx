@@ -26,11 +26,14 @@ const Wrapper = STRICT_MODE ? StrictMode : Fragment;
 
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { ConnectionGate, RemoteApp, UnauthenticatedGate } from "./RemoteApp";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { initializeFontSize } from "./hooks/useFontSize";
 import { initializeTabSize } from "./hooks/useTabSize";
 import { initializeTheme } from "./hooks/useTheme";
 import { I18nProvider } from "./i18n";
 import { NavigationLayout } from "./layouts";
+import { migrateDeadRelayHosts } from "./lib/relayConfig";
+import { armSplashSafety } from "./lib/splash";
 import { ActivityPage } from "./pages/ActivityPage";
 import { AgentsPage } from "./pages/AgentsPage";
 import { DirectLoginPage } from "./pages/DirectLoginPage";
@@ -43,8 +46,10 @@ import { InboxPage } from "./pages/InboxPage";
 import { NewSessionPage } from "./pages/NewSessionPage";
 import { ProjectsPage } from "./pages/ProjectsPage";
 import { RelayConnectionGate } from "./pages/RelayConnectionGate";
+// RelayLoginPage retained on disk (Relay mode is dark-launched, not deleted).
 import { RelayLoginPage } from "./pages/RelayLoginPage";
 import { SessionPage } from "./pages/SessionPage";
+import { TerminalPage } from "./pages/TerminalPage";
 import { SettingsLayout } from "./pages/settings";
 import "./styles/index.css";
 
@@ -52,6 +57,11 @@ import "./styles/index.css";
 initializeTheme();
 initializeFontSize();
 initializeTabSize();
+
+// Rewrite saved relay URLs that point at retired frp hostnames before
+// the auto-resume logic reads them — otherwise the APK boots straight
+// into a 15s "Reconnecting…" stall against a NXDOMAIN host.
+migrateDeadRelayHosts();
 
 // Get base URL for router (Vite sets this based on --base flag)
 // Remove trailing slash for BrowserRouter basename
@@ -75,6 +85,8 @@ const APP_ROUTES = (
       <Route path="git-status" element={<GitStatusPage />} />
       <Route path="devices" element={<EmulatorPage />} />
       <Route path="devices/:deviceId" element={<EmulatorPage />} />
+      <Route path="terminal" element={<TerminalPage />} />
+      <Route path="terminal/:terminalId" element={<TerminalPage />} />
       <Route path="settings" element={<SettingsLayout />} />
       <Route path="settings/:category" element={<SettingsLayout />} />
       <Route path="new-session" element={<NewSessionPage />} />
@@ -100,29 +112,36 @@ if (!rootElement) {
 
 createRoot(rootElement).render(
   <Wrapper>
-    <BrowserRouter basename={basename}>
-      <I18nProvider>
-        <RemoteApp>
-          <Routes>
-            {/* Login routes — redirect to app if already connected */}
-            <Route element={<UnauthenticatedGate />}>
-              <Route path="/login" element={<HostPickerPage />} />
-              <Route path="/login/direct" element={<DirectLoginPage />} />
-              <Route path="/login/relay" element={<RelayLoginPage />} />
-            </Route>
+    <ErrorBoundary>
+      <BrowserRouter basename={basename}>
+        <I18nProvider>
+          <RemoteApp>
+            <Routes>
+              {/* Login routes — redirect to app if already connected */}
+              <Route element={<UnauthenticatedGate />}>
+                <Route path="/login" element={<HostPickerPage />} />
+                <Route path="/login/direct" element={<DirectLoginPage />} />
+                <Route path="/login/relay" element={<RelayLoginPage />} />
+              </Route>
 
-            {/* Direct mode — requires connection, no relay username in URL */}
-            <Route element={<ConnectionGate />}>{APP_ROUTES}</Route>
+              {/* Direct mode — requires connection, no relay username in URL */}
+              <Route element={<ConnectionGate />}>{APP_ROUTES}</Route>
 
-            {/* Relay mode — manages relay connection by URL username.
-                React Router ranks static segments above dynamic params,
-                so /projects matches ConnectionGate, not /:relayUsername. */}
-            <Route path="/:relayUsername" element={<RelayConnectionGate />}>
-              {APP_ROUTES}
-            </Route>
-          </Routes>
-        </RemoteApp>
-      </I18nProvider>
-    </BrowserRouter>
+              {/* Relay mode — manages relay connection by URL username.
+                  React Router ranks static segments above dynamic params,
+                  so /projects matches ConnectionGate, not /:relayUsername. */}
+              <Route path="/:relayUsername" element={<RelayConnectionGate />}>
+                {APP_ROUTES}
+              </Route>
+            </Routes>
+          </RemoteApp>
+        </I18nProvider>
+      </BrowserRouter>
+    </ErrorBoundary>
   </Wrapper>,
 );
+
+// Arm the splash safety timeout (max 6s). The splash is dismissed by
+// whichever first-paint screen calls useHideSplashOnReady(); this is just
+// the fallback in case nothing ever signals ready (e.g. hung connection).
+armSplashSafety();

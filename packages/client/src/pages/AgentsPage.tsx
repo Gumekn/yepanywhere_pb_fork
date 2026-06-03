@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { ContextUsageIndicator } from "../components/ContextUsageIndicator";
 import { PageHeader } from "../components/PageHeader";
+import { CardListSkeleton } from "../components/Skeleton";
 import { ThinkingIndicator } from "../components/ThinkingIndicator";
 import { type ProcessInfo, useProcesses } from "../hooks/useProcesses";
 import { useI18n } from "../i18n";
@@ -220,9 +221,7 @@ export function AgentsPage() {
 
         <main className="page-scroll-container">
           <div className="page-content-inner">
-            {loading && (
-              <p className="loading">{t("agentsLoading" as never)}</p>
-            )}
+            {loading && <CardListSkeleton count={3} height={88} />}
 
             {error && (
               <p className="error">
@@ -231,7 +230,7 @@ export function AgentsPage() {
             )}
 
             {!loading && !error && (
-              <>
+              <div className="content-fade-in">
                 <section className="agents-section">
                   <h2>{t("agentsSectionActive" as never)}</h2>
                   {activeProcesses.length === 0 ? (
@@ -280,7 +279,7 @@ export function AgentsPage() {
                     </div>
                   )}
                 </section>
-              </>
+              </div>
             )}
           </div>
         </main>

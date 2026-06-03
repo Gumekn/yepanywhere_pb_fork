@@ -18,6 +18,16 @@ import type {
   DeviceWebRTCAnswer,
   DeviceWebRTCOffer,
 } from "./devices.js";
+import type {
+  TerminalClose,
+  TerminalError,
+  TerminalExit,
+  TerminalInput,
+  TerminalOpen,
+  TerminalOpened,
+  TerminalOutput,
+  TerminalResize,
+} from "./terminal.js";
 import type { UploadedFile } from "./upload.js";
 
 // Re-export OriginMetadata for convenience
@@ -239,7 +249,12 @@ export type RemoteClientMessage =
   | DeviceStreamStart
   | DeviceStreamStop
   | DeviceWebRTCAnswer
-  | DeviceICECandidate;
+  | DeviceICECandidate
+  // Remote terminal
+  | TerminalOpen
+  | TerminalInput
+  | TerminalResize
+  | TerminalClose;
 
 /** All messages from yepanywhere server -> phone/browser */
 export type YepMessage =
@@ -253,7 +268,12 @@ export type YepMessage =
   | DeviceWebRTCOffer
   | DeviceICECandidateEvent
   | DeviceSessionState
-  | DeviceStreamProfileEvent;
+  | DeviceStreamProfileEvent
+  // Remote terminal
+  | TerminalOpened
+  | TerminalOutput
+  | TerminalExit
+  | TerminalError;
 
 /** All relay protocol messages */
 export type RelayMessage = RemoteClientMessage | YepMessage;

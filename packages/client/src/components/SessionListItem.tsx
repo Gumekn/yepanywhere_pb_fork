@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import type { AgentActivity } from "../hooks/useFileActivity";
+import { useI18n } from "../i18n";
+import { formatSmartTime } from "../lib/datetime";
 import type {
   ContextUsage,
   PendingInputType,
@@ -65,6 +67,12 @@ interface SessionListItemProps {
 
   /** Number of messages in session (0 indicates brand new session) */
   messageCount?: number;
+
+  /** When true (and `mode === "card"`), the card shows a "12 条 · 12.3K
+   *  tokens" line below the timestamp. Used on the All Sessions page so users
+   *  can see at a glance how big each session is. Off by default so other
+   *  callers (Inbox, sidebar) aren't disturbed. */
+  showSizeMeta?: boolean;
 }
 
 /**
@@ -123,7 +131,9 @@ export function SessionListItem({
   basePath = "",
   // New session detection
   messageCount,
+  showSizeMeta = false,
 }: SessionListItemProps) {
+  const { t, locale } = useI18n();
   const navigate = useNavigate();
 
   // Local state for optimistic updates (only used when action handlers are provided)
@@ -290,22 +300,6 @@ export function SessionListItem({
     return null;
   };
 
-  // Format relative time for card mode
-  const formatRelativeTime = (timestamp: string): string => {
-    const now = Date.now();
-    const then = new Date(timestamp).getTime();
-    const diffMs = now - then;
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHours = Math.floor(diffMs / 3600000);
-    const diffDays = Math.floor(diffMs / 86400000);
-
-    if (diffMins < 1) return "just now";
-    if (diffMins < 60) return `${diffMins}m ago`;
-    if (diffHours < 24) return `${diffHours}h ago`;
-    if (diffDays < 7) return `${diffDays}d ago`;
-    return new Date(timestamp).toLocaleDateString();
-  };
-
   // Build CSS classes
   const liClasses = [
     "session-list-item",
@@ -392,7 +386,29 @@ export function SessionListItem({
                     {projectName}
                   </span>
                 )}
-                {showTimestamp && updatedAt && formatRelativeTime(updatedAt)}
+                {showTimestamp && updatedAt && (
+                  <span
+                    className="session-list-item__time"
+                    title={new Date(updatedAt).toLocaleString(locale)}
+                  >
+                    {formatSmartTime(updatedAt, locale)}
+                  </span>
+                )}
+                {showSizeMeta && messageCount !== undefined && (
+                  <span className="session-list-item__size-meta">
+                    {t("cardMessageCount", { count: messageCount })}
+                  </span>
+                )}
+                {showSizeMeta &&
+                  contextUsage &&
+                  contextUsage.inputTokens > 0 && (
+                    <span
+                      className="session-list-item__size-meta"
+                      title={`${contextUsage.inputTokens.toLocaleString()} tokens`}
+                    >
+                      {formatTokenCount(contextUsage.inputTokens)}
+                    </span>
+                  )}
                 {executor && (
                   <span
                     className="session-badge session-badge-executor"
@@ -469,4 +485,13 @@ export function SessionListItem({
       )}
     </li>
   );
+}
+
+/** Compact human-readable token count: 1234 → "1.2K", 12345 → "12.3K",
+ *  1234567 → "1.2M". Mirrors the format used in the context-usage modal
+ *  so the same number looks the same everywhere. */
+function formatTokenCount(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
+  return tokens.toString();
 }

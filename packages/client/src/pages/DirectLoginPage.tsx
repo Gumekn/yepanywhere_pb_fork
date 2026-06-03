@@ -7,8 +7,10 @@
 
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { BuildInfo } from "../components/BuildInfo";
 import { YepAnywhereLogo } from "../components/YepAnywhereLogo";
 import { useRemoteConnection } from "../contexts/RemoteConnectionContext";
+import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useI18n } from "../i18n";
 import { createDirectHost, loadSavedHosts, saveHost } from "../lib/hostStorage";
 
@@ -25,10 +27,13 @@ export function DirectLoginPage() {
     resumeSession,
   } = useRemoteConnection();
 
+  // Login pages are terminal screens, dismiss the cold-start splash.
+  useHideSplashOnReady(true);
+
   // Form state - pre-fill from stored credentials
   // All hooks must be before any conditional returns
   const [serverUrl, setServerUrl] = useState(
-    storedUrl ?? "ws://localhost:3400/api/ws",
+    storedUrl ?? "wss://air.yueyuan.uk/yep/api/ws",
   );
   const [username, setUsername] = useState(storedUsername ?? "");
   const [password, setPassword] = useState("");
@@ -146,7 +151,7 @@ export function DirectLoginPage() {
               type="text"
               value={serverUrl}
               onChange={(e) => setServerUrl(e.target.value)}
-              placeholder="ws://localhost:3400/api/ws"
+              placeholder="wss://air.yueyuan.uk/yep/api/ws"
               disabled={isConnecting}
               autoComplete="url"
               data-testid="ws-url-input"
@@ -219,6 +224,8 @@ export function DirectLoginPage() {
         </form>
 
         <p className="login-hint">{t("directLoginHint")}</p>
+
+        <BuildInfo />
       </div>
     </div>
   );

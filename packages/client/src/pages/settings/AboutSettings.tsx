@@ -115,6 +115,10 @@ export function AboutSettings() {
             </p>
             <p>
               {t("aboutClientVersion")} v{__APP_VERSION__}
+              <br />
+              <span style={{ opacity: 0.7 }}>
+                {new Date(__BUILD_DATE__).toLocaleString()}
+              </span>
             </p>
             {versionError && (
               <p className="settings-warning">{t("aboutUnableRefresh")}</p>

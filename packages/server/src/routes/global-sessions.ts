@@ -6,6 +6,7 @@
  */
 
 import {
+  type ContextUsage,
   type ProviderName,
   getSessionDisplayTitle,
 } from "@yep-anywhere/shared";
@@ -77,6 +78,12 @@ export interface GlobalSessionItem {
   isStarred?: boolean;
   /** SSH host alias for remote execution (undefined = local) */
   executor?: string;
+  /** Latest context-window snapshot from the session summary. Included so
+   *  the All Sessions page can render the token count immediately on first
+   *  paint, without waiting for a session-updated SSE event. */
+  contextUsage?: ContextUsage;
+  /** Model name from the session summary (matches contextUsage's scope). */
+  model?: string;
 }
 
 /** Stats about all sessions (computed during full scan) */
@@ -382,6 +389,8 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           isArchived,
           isStarred,
           executor,
+          contextUsage: session.contextUsage,
+          model: session.model,
         });
       }
     }

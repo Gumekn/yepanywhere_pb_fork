@@ -2,13 +2,18 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Yep Anywhere",
   "version": "0.1.0",
-  "identifier": "com.yepanywhere.mobile",
+  "identifier": "com.yepanywhere.mobile.local",
   "build": {
     "beforeBuildCommand": "pnpm prepare-frontend",
     "frontendDist": "../../../packages/client/dist-remote"
   },
   "app": {
-    "windows": [{ "title": "Yep Anywhere", "fullscreen": false }],
+    "windows": [
+      {
+        "title": "Yep Anywhere",
+        "fullscreen": false
+      }
+    ],
     "security": { "csp": null }
   },
   "bundle": {

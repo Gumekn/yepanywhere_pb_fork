@@ -1204,6 +1204,14 @@ export class SecureConnection implements Connection {
     return this.protocol.onDeviceMessage(handler);
   }
 
+  onTerminalMessage(
+    handler: (
+      msg: import("@yep-anywhere/shared").TerminalServerMessage,
+    ) => void,
+  ): () => void {
+    return this.protocol.onTerminalMessage(handler);
+  }
+
   /**
    * Close the secure connection.
    */

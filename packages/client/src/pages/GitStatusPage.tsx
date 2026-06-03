@@ -4,6 +4,7 @@ import { useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
 import { ProjectSelector } from "../components/ProjectSelector";
+import { CardListSkeleton } from "../components/Skeleton";
 import { Modal } from "../components/ui/Modal";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { useGitStatus } from "../hooks/useGitStatus";
@@ -77,19 +78,23 @@ export function GitStatusPage() {
         <main className="page-scroll-container">
           <div className="page-content-inner">
             {loading || projectsLoading ? (
-              <div className="loading">{t("gitStatusLoading")}</div>
+              <CardListSkeleton count={4} height={56} />
             ) : error ? (
               <div className="error">
                 {t("gitStatusErrorPrefix")} {error.message}
               </div>
             ) : gitStatus && !gitStatus.isGitRepo ? (
-              <div className="git-status-empty">{t("gitStatusNotRepo")}</div>
+              <div className="git-status-empty content-fade-in">
+                {t("gitStatusNotRepo")}
+              </div>
             ) : gitStatus && effectiveProjectId ? (
-              <GitStatusContent
-                status={gitStatus}
-                projectId={effectiveProjectId}
-                t={t as never}
-              />
+              <div className="content-fade-in">
+                <GitStatusContent
+                  status={gitStatus}
+                  projectId={effectiveProjectId}
+                  t={t as never}
+                />
+              </div>
             ) : null}
           </div>
         </main>

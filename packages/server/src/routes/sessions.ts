@@ -1,4 +1,5 @@
 import {
+  type ContextCumulativeUsage,
   type ContextStatusResponse,
   type ContextUsage,
   type ModelOption,
@@ -7,6 +8,7 @@ import {
   type ThinkingOption,
   type UploadedFile,
   type UrlProjectId,
+  escalateContextWindow,
   getModelContextWindow,
   isUrlProjectId,
   thinkingOptionToConfig,
@@ -17,7 +19,13 @@ import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
+import {
+  encodeProjectId,
+  resolveResumeCwd,
+  resolveStartCwd,
+} from "../projects/paths.js";
 import type { ProjectScanner } from "../projects/scanner.js";
+import type { RecentsService } from "../recents/index.js";
 import { getProjectDirFromCwd, syncSessions } from "../sdk/session-sync.js";
 import type { PermissionMode, SDKMessage, UserMessage } from "../sdk/types.js";
 import type { ModelInfoService } from "../services/ModelInfoService.js";
@@ -116,6 +124,8 @@ export interface SessionsDeps {
   serverSettingsService?: ServerSettingsService;
   /** ModelInfoService for context window lookups */
   modelInfoService?: ModelInfoService;
+  /** RecentsService for repairing stale projectId entries on resume */
+  recentsService?: RecentsService;
 }
 
 interface StartSessionBody {
@@ -571,7 +581,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
         try {
           const usage = await process.getContextUsage();
-          if (usage) {
+          // Validate shape: an empty {} from a not-yet-initialized SDK is
+          // truthy but would crash the client when it iterates over
+          // `categories`. Only accept fully-formed SDK payloads; otherwise
+          // fall through to the JSONL estimate.
+          if (usage && Array.isArray(usage.categories)) {
             // Persist the live max-tokens against the resolved model so the
             // fallback path stays accurate after this process exits.
             const modelForCache =
@@ -583,7 +597,38 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
                 process.provider,
               );
             }
-            const payload: ContextStatusResponse = usage;
+
+            // The SDK breakdown describes the *current turn*'s context-window
+            // fill — categories/MCP tools/skills/etc. It does not surface
+            // session-level cumulative usage (input/output/cache totals
+            // across every turn). Read those from the persisted JSONL so the
+            // modal can show Claude Code's `/status`-style numbers even
+            // while the agent is live.
+            let cumulativeUsage: ContextCumulativeUsage | undefined;
+            try {
+              const summaryResult = await findSessionSummaryAcrossProviders(
+                project,
+                sessionId,
+                projectId as UrlProjectId,
+                {
+                  readerFactory: deps.readerFactory,
+                  codexSessionsDir: deps.codexSessionsDir,
+                  codexReaderFactory: deps.codexReaderFactory,
+                  geminiSessionsDir: deps.geminiSessionsDir,
+                  geminiReaderFactory: deps.geminiReaderFactory,
+                  geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
+                },
+                process.provider,
+              );
+              cumulativeUsage = summaryResult?.summary?.cumulativeUsage;
+            } catch {
+              // Cumulative is best-effort; never block the SDK breakdown.
+            }
+
+            const payload: ContextStatusResponse = {
+              ...usage,
+              cumulativeUsage,
+            };
             return c.json(payload);
           }
         } catch {
@@ -621,30 +666,42 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         model,
         providerName,
       );
-      const contextWindow =
+      const baseContextWindow =
         cachedWindow ??
         deps.modelInfoService?.getContextWindow(model, providerName) ??
         getModelContextWindow(model, providerName);
 
       // Re-derive percentage with the (possibly cached) contextWindow so the
-      // estimate isn't pinned to the reader's heuristic.
+      // estimate isn't pinned to the reader's heuristic. Also escalate
+      // upward when usage exceeds the resolved window — covers 1M sessions
+      // whose [1m] suffix was stripped before being written to JSONL.
       let contextUsage = sessionSummary?.contextUsage;
-      if (contextUsage && contextWindow > 0) {
+      const escalatedWindow =
+        contextUsage && contextUsage.inputTokens > 0
+          ? escalateContextWindow(
+              baseContextWindow,
+              contextUsage.inputTokens,
+              providerName,
+            )
+          : baseContextWindow;
+
+      if (contextUsage && escalatedWindow > 0) {
         contextUsage = {
           ...contextUsage,
           percentage: Math.round(
-            (contextUsage.inputTokens / contextWindow) * 100,
+            (contextUsage.inputTokens / escalatedWindow) * 100,
           ),
-          contextWindow,
+          contextWindow: escalatedWindow,
         };
       }
 
       const payload: ContextStatusResponse = {
         source: "jsonl",
         model,
-        contextWindow,
+        contextWindow: escalatedWindow,
         contextWindowFromCache: cachedWindow !== undefined,
         contextUsage,
+        cumulativeUsage: sessionSummary?.cumulativeUsage,
       };
       return c.json(payload);
     },
@@ -925,9 +982,34 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     }
 
     // Use getOrCreateProject to allow starting sessions in new directories
-    const project = await deps.scanner.getOrCreateProject(projectId);
+    let project = await deps.scanner.getOrCreateProject(projectId);
     if (!project) {
       return c.json({ error: "Project not found or path does not exist" }, 404);
+    }
+
+    // Self-heal stale projectId: same problem as resume, but for a new
+    // session we can't read the named session's jsonl (it doesn't exist
+    // yet) — scan the project's session directory instead. Any existing
+    // jsonl carries the SDK-written cwd, which is the source of truth.
+    const recoveredCwd = await resolveStartCwd(
+      project.path,
+      project.sessionDir,
+    );
+    if (recoveredCwd) {
+      const recoveredId = encodeProjectId(recoveredCwd);
+      const fresh = await deps.scanner.getOrCreateProject(recoveredId);
+      if (!fresh) {
+        return c.json(
+          {
+            error: `Project directory ${project.path} no longer exists and recovered path ${recoveredCwd} is also invalid`,
+          },
+          404,
+        );
+      }
+      console.warn(
+        `[startSession] Stale projectId: ${project.path} no longer exists; recovered cwd=${recoveredCwd}`,
+      );
+      project = fresh;
     }
 
     let body: StartSessionBody;
@@ -1131,9 +1213,41 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     }
 
     // Use getOrCreateProject to allow resuming in directories that may have been moved
-    const project = await deps.scanner.getOrCreateProject(projectId);
+    let project = await deps.scanner.getOrCreateProject(projectId);
     if (!project) {
       return c.json({ error: "Project not found or path does not exist" }, 404);
+    }
+    let resolvedProjectId: UrlProjectId = projectId as UrlProjectId;
+
+    // Self-heal stale projectId: cached projectId may encode an old absolute
+    // path if the user moved or deleted the project directory. spawn() would
+    // then fail with ENOENT, which the SDK mis-renders as "binary exists but
+    // failed to launch". Recover the real cwd from the session's jsonl (the
+    // SDK rewrites it on every turn) and re-resolve the project.
+    const recoveredCwd = await resolveResumeCwd(
+      project.path,
+      project.sessionDir,
+      sessionId,
+    );
+    if (recoveredCwd) {
+      const recoveredId = encodeProjectId(recoveredCwd);
+      const fresh = await deps.scanner.getOrCreateProject(recoveredId);
+      if (!fresh) {
+        return c.json(
+          {
+            error: `Project directory ${project.path} no longer exists and recovered path ${recoveredCwd} is also invalid`,
+          },
+          404,
+        );
+      }
+      console.warn(
+        `[resume] Stale projectId for session ${sessionId}: ${project.path} no longer exists; recovered cwd=${recoveredCwd}`,
+      );
+      project = fresh;
+      resolvedProjectId = recoveredId;
+      if (deps.recentsService) {
+        await deps.recentsService.recordVisit(sessionId, recoveredId);
+      }
     }
 
     let body: StartSessionBody;
@@ -1218,7 +1332,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       const sessionSummaryResult = await findSessionSummaryAcrossProviders(
         project,
         sessionId,
-        projectId as UrlProjectId,
+        resolvedProjectId,
         {
           readerFactory: deps.readerFactory,
           codexSessionsDir: deps.codexSessionsDir,

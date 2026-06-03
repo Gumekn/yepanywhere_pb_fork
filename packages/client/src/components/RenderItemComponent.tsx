@@ -186,7 +186,12 @@ export const RenderItemComponent = memo(function RenderItemComponent({
         );
 
       case "user_prompt":
-        return <UserPromptBlock content={item.content} />;
+        return (
+          <UserPromptBlock
+            content={item.content}
+            timestamp={item.sourceMessages[0]?.timestamp}
+          />
+        );
 
       case "session_setup":
         return <SessionSetupBlock title={item.title} prompts={item.prompts} />;

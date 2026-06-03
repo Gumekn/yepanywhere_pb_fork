@@ -1123,22 +1123,35 @@ details[open] .collapsible__icon {
   pointer-events: none;
 }
 
-/* Expand button (appears on hover) */
+/* Expand button (appears on hover) — icon-only, sits in the corner of a
+   truncated diff/patch preview. The aria-label / title carries the
+   descriptive text ("Show full diff", "Show full patch", etc.). */
 .diff-expand-button {
   position: absolute;
-  bottom: 0.5rem;
-  right: 0.5rem;
-  padding: 0.25rem 0.75rem;
+  bottom: 0.375rem;
+  right: 0.375rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
   background: var(--vscode-button-background, #0e639c);
   color: var(--vscode-button-foreground, #fff);
   border: none;
-  border-radius: 4px;
+  border-radius: 6px;
   font-size: var(--font-size-sm);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, background 0.15s ease;
   z-index: 10;
   pointer-events: auto;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+.diff-expand-button svg {
+  display: block;
+  pointer-events: none;
 }
 
 .diff-view-container:hover .diff-expand-button {
@@ -1149,10 +1162,16 @@ details[open] .collapsible__icon {
   background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
-/* Always show expand button on mobile (no hover on touch devices) */
-@media (max-width: 600px) {
+.diff-expand-button:focus-visible {
+  outline: 2px solid var(--focus-border, var(--app-yep-green));
+  outline-offset: 2px;
+  opacity: 1;
+}
+
+/* Always show expand button on touch devices (no hover) */
+@media (max-width: 600px), (hover: none) and (pointer: coarse) {
   .diff-expand-button {
-    opacity: 1;
+    opacity: 0.85;
   }
 }
 
@@ -1195,6 +1214,46 @@ details[open] .collapsible__icon {
   border-radius: 4px 4px 0 0;
 }
 
+/* When a back button is present, the title is no longer the leftmost item.
+   Center it between the back and close buttons so the header reads as a
+   familiar mobile-style nav bar: [← back]  [title]  [×]. */
+.modal-header--with-back .modal-title {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+  /* Avoid bumping into the back/close buttons when title is long */
+  padding: 0 0.5rem;
+}
+
+.modal-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0.375rem 0.5rem;
+  border-radius: 4px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.modal-back:hover {
+  background: var(--bg-hover);
+}
+
+.modal-back:active {
+  background: var(--bg-active, var(--bg-hover));
+}
+
+.modal-back-label {
+  white-space: nowrap;
+}
+
 .modal-title {
   font-weight: 600;
   font-size: 0.9375rem;
@@ -1230,27 +1289,48 @@ details[open] .collapsible__icon {
 /* Mobile: Make modals nearly full-screen with minimal chrome */
 @media (max-width: 600px) {
   .modal-overlay {
-    align-items: flex-end;
+    /* Let flexbox stretch the modal to fill, rather than position: fixed
+       inside another position: fixed (which can cause layer-composition
+       glitches in older Android System WebView — modal renders then
+       gets blanked out by the GPU compositor). */
+    align-items: stretch;
+    justify-content: stretch;
+    padding: 0;
   }
 
   .modal {
-    width: 100vw;
-    max-width: 100vw;
-    max-height: 100vh; /* fallback */
-    max-height: 100dvh; /* dynamic viewport height - accounts for mobile browser chrome */
-    height: 100vh; /* fallback */
-    height: 100dvh;
+    /* Stretched by overlay's flex; no positioning escape. Solid bg so
+       overlay never bleeds through during a paint. */
+    width: 100%;
+    max-width: none;
+    max-height: none;
+    height: auto;
+    flex: 1;
     border-radius: 0;
     border: none;
+    background: var(--bg-surface);
+    /* Hint the WebView to keep this on its own compositor layer instead
+       of merging with the overlay (which is what triggers the post-
+       paint blank on Android WebView). */
+    transform: translateZ(0);
+    will-change: auto;
   }
 
+  /* Push the header below the iOS notch / Android status bar / browser
+     status overlay. Without this the close button and title get clipped
+     under the system chrome on full-bleed mobile layouts. */
   .modal-header {
     padding: 0.25rem 0.5rem;
+    padding-top: calc(0.25rem + env(safe-area-inset-top, 0px));
     border-radius: 0;
   }
 
   .modal-content {
     padding: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    /* Defensive background so any momentary render glitch doesn't show
+       through to the overlay underneath. */
+    background: var(--bg-surface);
   }
 
   .modal-title {

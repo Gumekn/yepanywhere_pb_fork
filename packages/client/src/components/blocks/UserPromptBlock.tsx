@@ -6,6 +6,7 @@ import {
   parseUserPrompt,
 } from "../../lib/parseUserPrompt";
 import type { ContentBlock } from "../../types";
+import { MessageActions } from "../MessageActions";
 import { Modal } from "../ui/Modal";
 
 const MAX_LINES = 12;
@@ -13,6 +14,8 @@ const MAX_CHARS = MAX_LINES * 100;
 
 interface Props {
   content: string | ContentBlock[];
+  /** ISO timestamp from the source JSONL entry, used for hover-revealed time. */
+  timestamp?: string;
 }
 
 interface InputImageBlock extends ContentBlock {
@@ -330,6 +333,7 @@ function CollapsibleText({ text }: { text: string }) {
 
 export const UserPromptBlock = memo(function UserPromptBlock({
   content,
+  timestamp,
 }: Props) {
   if (typeof content === "string") {
     const { text, openedFiles, uploadedFiles } = parseUserPrompt(content);
@@ -353,6 +357,7 @@ export const UserPromptBlock = memo(function UserPromptBlock({
             <UploadedFilesMetadata files={uploadedFiles} />
           </div>
         </div>
+        <MessageActions timestamp={timestamp} copyText={text} />
         <OpenedFilesMetadata files={openedFiles} />
       </div>
     );
@@ -397,6 +402,7 @@ export const UserPromptBlock = memo(function UserPromptBlock({
           <UploadedFilesMetadata files={allUploadedFiles} />
         </div>
       </div>
+      <MessageActions timestamp={timestamp} copyText={text} />
       <OpenedFilesMetadata files={openedFiles} />
     </div>
   );
