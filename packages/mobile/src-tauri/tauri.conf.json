@@ -4,13 +4,13 @@
   "version": "0.1.0",
   "identifier": "com.yepanywhere.mobile.local",
   "build": {
-    "beforeBuildCommand": "pnpm prepare-frontend",
-    "frontendDist": "../../../packages/client/dist-remote"
+    "frontendDist": "../static-shim"
   },
   "app": {
     "windows": [
       {
         "title": "Yep Anywhere",
+        "useHttpsScheme": true,
         "fullscreen": false
       }
     ],
