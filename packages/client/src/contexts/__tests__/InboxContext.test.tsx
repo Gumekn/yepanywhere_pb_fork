@@ -6,11 +6,8 @@ import {
   useInboxContext,
 } from "../InboxContext";
 
-const { mockGetInbox, remoteState } = vi.hoisted(() => ({
+const { mockGetInbox } = vi.hoisted(() => ({
   mockGetInbox: vi.fn<() => Promise<InboxResponse>>(),
-  remoteState: {
-    connection: null as { connection: object | null } | null,
-  },
 }));
 
 vi.mock("../../api/client", () => ({
@@ -21,14 +18,6 @@ vi.mock("../../api/client", () => ({
 
 vi.mock("../../hooks/useFileActivity", () => ({
   useFileActivity: vi.fn(),
-}));
-
-vi.mock("../../lib/connection", () => ({
-  isRemoteClient: () => true,
-}));
-
-vi.mock("../RemoteConnectionContext", () => ({
-  useOptionalRemoteConnection: () => remoteState.connection,
 }));
 
 function InboxConsumer() {
@@ -52,16 +41,28 @@ describe("InboxProvider", () => {
       unread8h: [],
       unread24h: [],
     });
-    remoteState.connection = null;
     window.history.replaceState({}, "", "/inbox");
   });
 
   afterEach(() => {
-    remoteState.connection = null;
     vi.clearAllMocks();
   });
 
-  it("does not fetch before remote connection is ready", async () => {
+  it("fetches on mount when enabled", async () => {
+    render(
+      <InboxProvider>
+        <InboxConsumer />
+      </InboxProvider>,
+    );
+
+    await waitFor(() => {
+      expect(mockGetInbox).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("does not fetch on the login page", async () => {
+    window.history.replaceState({}, "", "/login");
+
     render(
       <InboxProvider>
         <InboxConsumer />
@@ -71,26 +72,5 @@ describe("InboxProvider", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mockGetInbox).not.toHaveBeenCalled();
-  });
-
-  it("fetches once the remote connection becomes available", async () => {
-    const view = render(
-      <InboxProvider>
-        <InboxConsumer />
-      </InboxProvider>,
-    );
-
-    expect(mockGetInbox).not.toHaveBeenCalled();
-
-    remoteState.connection = { connection: {} };
-    view.rerender(
-      <InboxProvider>
-        <InboxConsumer />
-      </InboxProvider>,
-    );
-
-    await waitFor(() => {
-      expect(mockGetInbox).toHaveBeenCalledTimes(1);
-    });
   });
 });

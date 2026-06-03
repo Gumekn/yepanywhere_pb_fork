@@ -1,5 +1,5 @@
 /**
- * Connection metadata types shared between relay and SRP protocols.
+ * Connection metadata types for the WebSocket connection.
  * Extracted to avoid circular dependencies.
  */
 

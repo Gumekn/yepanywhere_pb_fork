@@ -3,7 +3,7 @@
  *
  * A terminal is a long-lived PTY (pseudo-terminal) on the server that a
  * client attaches to over the same authenticated WebSocket used by the rest
- * of the relay protocol. Stdin/stdout bytes are base64-encoded inside JSON
+ * of the wire protocol. Stdin/stdout bytes are base64-encoded inside JSON
  * messages so they ride the existing encrypted JSON envelope without any
  * changes to the binary framing layer.
  *

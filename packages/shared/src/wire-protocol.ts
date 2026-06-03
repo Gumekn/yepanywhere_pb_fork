@@ -1,10 +1,8 @@
 /**
- * Relay protocol types for remote access via WebSocket.
+ * Wire protocol types for the local WebSocket connection.
  *
  * This protocol multiplexes HTTP-like requests, SSE-style event subscriptions,
- * and file uploads over a single WebSocket connection. In secure mode, all
- * messages are encrypted with NaCl secretbox using a session key derived from
- * SRP authentication.
+ * and file uploads over a single WebSocket connection.
  */
 
 import type { OriginMetadata } from "./connection.js";
@@ -37,16 +35,16 @@ export type { OriginMetadata } from "./connection.js";
 // Request/Response (HTTP-like)
 // ============================================================================
 
-/** HTTP method for relay requests */
-export type RelayHttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+/** HTTP method for wire requests */
+export type WireHttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
 
 /** Client -> Server: HTTP-like request */
-export interface RelayRequest {
+export interface WireRequest {
   type: "request";
   /** UUID for matching response */
   id: string;
   /** HTTP method */
-  method: RelayHttpMethod;
+  method: WireHttpMethod;
   /** Request path, e.g., "/api/sessions" */
   path: string;
   /** Optional headers */
@@ -56,7 +54,7 @@ export interface RelayRequest {
 }
 
 /** Server -> Client: HTTP-like response */
-export interface RelayResponse {
+export interface WireResponse {
   type: "response";
   /** Matches request.id */
   id: string;
@@ -73,15 +71,15 @@ export interface RelayResponse {
 // ============================================================================
 
 /** Subscription channel types */
-export type RelaySubscriptionChannel = "session" | "activity" | "session-watch";
+export type WireSubscriptionChannel = "session" | "activity" | "session-watch";
 
 /** Client -> Server: Subscribe to events */
-export interface RelaySubscribe {
+export interface WireSubscribe {
   type: "subscribe";
   /** Client-generated ID for this subscription (used to unsubscribe) */
   subscriptionId: string;
   /** Channel to subscribe to */
-  channel: RelaySubscriptionChannel;
+  channel: WireSubscriptionChannel;
   /** Required for channel: "session" */
   sessionId?: string;
   /** Required for channel: "session-watch" */
@@ -97,14 +95,14 @@ export interface RelaySubscribe {
 }
 
 /** Client -> Server: Unsubscribe from events */
-export interface RelayUnsubscribe {
+export interface WireUnsubscribe {
   type: "unsubscribe";
   /** The subscriptionId from the subscribe message */
   subscriptionId: string;
 }
 
 /** Server -> Client: Event pushed to subscriber */
-export interface RelayEvent {
+export interface WireEvent {
   type: "event";
   /** The subscriptionId this event belongs to */
   subscriptionId: string;
@@ -143,9 +141,9 @@ import type { BinaryFormatValue } from "./binary-framing.js";
 /**
  * Client -> Server: Declare supported binary formats.
  *
- * Sent immediately after SRP authentication completes (first encrypted message).
- * Server records supported formats and uses them for outgoing messages.
- * If no capabilities message is received, server assumes only format 0x01 (JSON).
+ * Sent on connect before application messages. Server records supported formats
+ * and uses them for outgoing messages. If no capabilities message is received,
+ * server assumes only format 0x01 (JSON).
  */
 export interface ClientCapabilities {
   type: "client_capabilities";
@@ -170,7 +168,7 @@ export function isClientCapabilities(msg: unknown): msg is ClientCapabilities {
 // ============================================================================
 
 /** Client -> Server: Start a file upload */
-export interface RelayUploadStart {
+export interface WireUploadStart {
   type: "upload_start";
   /** Client-generated upload ID */
   uploadId: string;
@@ -187,7 +185,7 @@ export interface RelayUploadStart {
 }
 
 /** Client -> Server: Upload chunk */
-export interface RelayUploadChunk {
+export interface WireUploadChunk {
   type: "upload_chunk";
   /** Upload ID from upload_start */
   uploadId: string;
@@ -198,14 +196,14 @@ export interface RelayUploadChunk {
 }
 
 /** Client -> Server: End upload (all chunks sent) */
-export interface RelayUploadEnd {
+export interface WireUploadEnd {
   type: "upload_end";
   /** Upload ID from upload_start */
   uploadId: string;
 }
 
 /** Server -> Client: Upload progress update */
-export interface RelayUploadProgress {
+export interface WireUploadProgress {
   type: "upload_progress";
   /** Upload ID */
   uploadId: string;
@@ -214,7 +212,7 @@ export interface RelayUploadProgress {
 }
 
 /** Server -> Client: Upload completed successfully */
-export interface RelayUploadComplete {
+export interface WireUploadComplete {
   type: "upload_complete";
   /** Upload ID */
   uploadId: string;
@@ -223,7 +221,7 @@ export interface RelayUploadComplete {
 }
 
 /** Server -> Client: Upload failed */
-export interface RelayUploadError {
+export interface WireUploadError {
   type: "upload_error";
   /** Upload ID */
   uploadId: string;
@@ -237,12 +235,12 @@ export interface RelayUploadError {
 
 /** All messages from phone/browser -> yepanywhere server */
 export type RemoteClientMessage =
-  | RelayRequest
-  | RelaySubscribe
-  | RelayUnsubscribe
-  | RelayUploadStart
-  | RelayUploadChunk
-  | RelayUploadEnd
+  | WireRequest
+  | WireSubscribe
+  | WireUnsubscribe
+  | WireUploadStart
+  | WireUploadChunk
+  | WireUploadEnd
   | ClientCapabilities
   | ClientPing
   // Device bridge signaling
@@ -258,11 +256,11 @@ export type RemoteClientMessage =
 
 /** All messages from yepanywhere server -> phone/browser */
 export type YepMessage =
-  | RelayResponse
-  | RelayEvent
-  | RelayUploadProgress
-  | RelayUploadComplete
-  | RelayUploadError
+  | WireResponse
+  | WireEvent
+  | WireUploadProgress
+  | WireUploadComplete
+  | WireUploadError
   | ServerPong
   // Device bridge signaling
   | DeviceWebRTCOffer
@@ -275,61 +273,5 @@ export type YepMessage =
   | TerminalExit
   | TerminalError;
 
-/** All relay protocol messages */
-export type RelayMessage = RemoteClientMessage | YepMessage;
-
-// ============================================================================
-// Secure Connection Types (SRP + Encryption)
-// ============================================================================
-
-// Re-export SRP types for convenience
-export type {
-  SrpClientHello,
-  SrpServerChallenge,
-  SrpClientProof,
-  SrpServerVerify,
-  SrpError,
-  SrpErrorCode,
-  SrpClientMessage,
-  SrpServerMessage,
-  SrpMessage,
-  // Session resumption types
-  SrpSessionResumeInit,
-  SrpSessionResumeChallenge,
-  SrpSessionResume,
-  SrpSessionResumed,
-  SrpSessionInvalid,
-  SrpSessionInvalidReason,
-} from "./crypto/srp-types.js";
-
-export {
-  isSrpClientHello,
-  isSrpClientProof,
-  isSrpServerChallenge,
-  isSrpServerVerify,
-  isSrpError,
-  // Session resumption type guards
-  isSrpSessionResumeInit,
-  isSrpSessionResumeChallenge,
-  isSrpSessionResume,
-  isSrpSessionResumed,
-  isSrpSessionInvalid,
-} from "./crypto/srp-types.js";
-
-// Re-export encryption types
-export type {
-  EncryptedEnvelope,
-  SequencedEncryptedPayload,
-} from "./crypto/encryption-types.js";
-export {
-  isEncryptedEnvelope,
-  isSequencedEncryptedPayload,
-} from "./crypto/encryption-types.js";
-
-/** Connection state for secure WebSocket */
-export type SecureConnectionState =
-  | "connecting" // WebSocket connecting
-  | "srp_hello" // Sent SRP hello, waiting for challenge
-  | "srp_proof" // Sent SRP proof, waiting for verify
-  | "authenticated" // SRP complete, session key established
-  | "error"; // Authentication failed
+/** All wire protocol messages */
+export type WireMessage = RemoteClientMessage | YepMessage;

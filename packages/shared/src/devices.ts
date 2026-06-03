@@ -2,7 +2,7 @@
  * Shared types for the device bridge streaming feature.
  *
  * These types are used by:
- * - Server: DeviceBridgeService, REST routes, relay message routing
+ * - Server: DeviceBridgeService, REST routes, websocket message routing
  * - Client: device tab UI, WebRTC signaling (Phase 3)
  */
 
@@ -44,7 +44,7 @@ export interface DeviceInfo {
 }
 
 // ============================================================================
-// Client → Server: device signaling messages (carried via relay WebSocket)
+// Client → Server: device signaling messages (carried via the WebSocket)
 // ============================================================================
 
 /** Client requests to start streaming an emulator. */
@@ -93,7 +93,7 @@ export type DeviceClientMessage =
   | DeviceICECandidate;
 
 // ============================================================================
-// Server → Client: device signaling messages (pushed via relay WebSocket)
+// Server → Client: device signaling messages (pushed via the WebSocket)
 // ============================================================================
 
 /** Server sends SDP offer for WebRTC negotiation. */

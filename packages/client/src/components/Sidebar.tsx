@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 import type { GlobalSessionItem } from "../api/client";
-import { useOptionalRemoteConnection } from "../contexts/RemoteConnectionContext";
 import { useDrafts } from "../hooks/useDrafts";
 import { useGlobalSessions } from "../hooks/useGlobalSessions";
 import { useNeedsAttentionBadge } from "../hooks/useNeedsAttentionBadge";
@@ -65,10 +64,8 @@ export function Sidebar({
   onResizeEnd,
 }: SidebarProps) {
   const { t } = useI18n();
-  // Get base path for relay mode (e.g., "/remote/my-server")
+  // Base path for navigation links (empty — app is served at its own root).
   const basePath = useRemoteBasePath();
-  const navigate = useNavigate();
-  const remoteConnection = useOptionalRemoteConnection();
 
   // Fetch global sessions for sidebar (non-starred only for recent/older sections)
   const { sessions: globalSessions, loading: globalLoading } =
@@ -202,13 +199,6 @@ export function Sidebar({
       document.removeEventListener("mouseup", handleMouseUp);
     };
   }, [isResizing, onResize, onResizeEnd]);
-
-  // Handle switching hosts - disconnect and go to host picker
-  const handleSwitchHost = () => {
-    remoteConnection?.disconnect();
-    navigate("/login");
-    onNavigate();
-  };
 
   // Starred sessions come from dedicated fetch (filtered by server)
   // Filter out archived just in case
@@ -409,36 +399,6 @@ export function Sidebar({
               onClick={onNavigate}
               basePath={basePath}
             />
-            {/* Switch Host - show whenever we have a remote connection */}
-            {remoteConnection && (
-              <button
-                type="button"
-                className="sidebar-nav-item sidebar-switch-host"
-                onClick={handleSwitchHost}
-              >
-                <span className="sidebar-nav-icon">
-                  <svg
-                    width="16"
-                    height="16"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <polyline points="17 1 21 5 17 9" />
-                    <path d="M3 11V9a4 4 0 0 1 4-4h14" />
-                    <polyline points="7 23 3 19 7 15" />
-                    <path d="M21 13v2a4 4 0 0 1-4 4H3" />
-                  </svg>
-                </span>
-                <span className="sidebar-nav-label">
-                  {t("sidebarSwitchHost")}
-                </span>
-              </button>
-            )}
           </SidebarNavSection>
 
           {/* Global sessions list */}

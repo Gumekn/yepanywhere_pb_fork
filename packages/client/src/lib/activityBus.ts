@@ -5,12 +5,7 @@ import type {
   UrlProjectId,
 } from "@yep-anywhere/shared";
 import type { SessionStatus, SessionSummary } from "../types";
-import {
-  connectionManager,
-  getGlobalConnection,
-  getWebSocketConnection,
-  isRemoteClient,
-} from "./connection";
+import { connectionManager, getWebSocketConnection } from "./connection";
 import type { Subscription } from "./connection/types";
 
 declare global {
@@ -224,25 +219,14 @@ class ActivityBus {
       this._connectionManagerStarted = true;
 
       const sendPing = (id: string): void => {
-        const globalConn = getGlobalConnection();
-        if (globalConn && "sendPing" in globalConn) {
-          (globalConn as { sendPing: (id: string) => void }).sendPing(id);
-        } else {
-          getWebSocketConnection().sendPing(id);
-        }
+        getWebSocketConnection().sendPing(id);
       };
 
-      const label = getGlobalConnection() ? "relay" : "ws";
       connectionManager.start(
         async () => {
-          const globalConn = getGlobalConnection();
-          if (globalConn?.forceReconnect) {
-            await globalConn.forceReconnect();
-          } else {
-            await getWebSocketConnection().reconnect();
-          }
+          await getWebSocketConnection().reconnect();
         },
-        { sendPing, label },
+        { sendPing, label: "ws" },
       );
 
       // Listen for ConnectionManager state changes to re-subscribe
@@ -263,29 +247,6 @@ class ActivityBus {
       );
     }
 
-    // Check for global connection (remote mode with SecureConnection)
-    const globalConn = getGlobalConnection();
-    if (globalConn) {
-      if (this.debugEnabled) {
-        console.log("[ActivityBus] Connecting via global connection");
-      }
-      if ("setOnPong" in globalConn) {
-        (
-          globalConn as { setOnPong: (cb: (id: string) => void) => void }
-        ).setOnPong((id) => connectionManager.receivePong(id));
-      }
-      this.connectWithConnection(globalConn);
-      return;
-    }
-
-    // In remote client mode, we MUST have a SecureConnection
-    if (isRemoteClient()) {
-      console.warn(
-        "[ActivityBus] Remote client requires SecureConnection - not authenticated",
-      );
-      return;
-    }
-
     // Local mode: use WebSocket
     if (this.debugEnabled) {
       console.log("[ActivityBus] Connecting via local WebSocket");
@@ -296,7 +257,7 @@ class ActivityBus {
   }
 
   /**
-   * Connect using a provided connection (remote or local WebSocket).
+   * Connect using the local WebSocket connection.
    */
   private connectWithConnection(connection: {
     subscribeActivity: (handlers: {

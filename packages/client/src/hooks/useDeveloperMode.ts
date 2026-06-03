@@ -3,8 +3,6 @@ import { UI_KEYS } from "../lib/storageKeys";
 
 interface DeveloperModeSettings {
   holdModeEnabled: boolean;
-  /** Log relay requests/responses to console for debugging */
-  relayDebugEnabled: boolean;
   /** Capture connection logs and send to server for debugging */
   remoteLogCollectionEnabled: boolean;
   /** Show connection status bars (green/orange/red) */
@@ -13,7 +11,6 @@ interface DeveloperModeSettings {
 
 const DEFAULT_SETTINGS: DeveloperModeSettings = {
   holdModeEnabled: false,
-  relayDebugEnabled: false,
   remoteLogCollectionEnabled: false,
   showConnectionBars: false,
 };
@@ -78,10 +75,6 @@ export function useDeveloperMode() {
     updateSettings({ ...currentSettings, holdModeEnabled: enabled });
   }, []);
 
-  const setRelayDebugEnabled = useCallback((enabled: boolean) => {
-    updateSettings({ ...currentSettings, relayDebugEnabled: enabled });
-  }, []);
-
   const setRemoteLogCollectionEnabled = useCallback((enabled: boolean) => {
     updateSettings({ ...currentSettings, remoteLogCollectionEnabled: enabled });
   }, []);
@@ -93,21 +86,11 @@ export function useDeveloperMode() {
   return {
     holdModeEnabled: settings.holdModeEnabled,
     setHoldModeEnabled,
-    relayDebugEnabled: settings.relayDebugEnabled,
-    setRelayDebugEnabled,
     remoteLogCollectionEnabled: settings.remoteLogCollectionEnabled,
     setRemoteLogCollectionEnabled,
     showConnectionBars: settings.showConnectionBars,
     setShowConnectionBars,
   };
-}
-
-/**
- * Get the current relay debug setting without React hooks.
- * Used by SecureConnection to check the setting synchronously.
- */
-export function getRelayDebugEnabled(): boolean {
-  return currentSettings.relayDebugEnabled;
 }
 
 /**

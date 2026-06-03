@@ -21,7 +21,6 @@ import { LocalAccessSettings } from "./LocalAccessSettings";
 import { ModelSettings } from "./ModelSettings";
 import { NotificationsSettings } from "./NotificationsSettings";
 import { ProvidersSettings } from "./ProvidersSettings";
-import { RemoteAccessSettings } from "./RemoteAccessSettings";
 import { RemoteExecutorsSettings } from "./RemoteExecutorsSettings";
 import type { SettingsCategory } from "./types";
 
@@ -34,7 +33,6 @@ const CATEGORY_COMPONENTS: Record<string, React.ComponentType> = {
   webhooks: LifecycleWebhooksSettings,
   devices: DevicesSettings,
   "local-access": LocalAccessSettings,
-  remote: RemoteAccessSettings,
   providers: ProvidersSettings,
   "remote-executors": RemoteExecutorsSettings,
   emulator: EmulatorSettings,

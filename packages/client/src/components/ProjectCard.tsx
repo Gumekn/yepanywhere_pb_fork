@@ -9,7 +9,7 @@ interface ProjectCardProps {
   needsAttentionCount: number;
   /** Number of sessions actively thinking (running, no pending input) */
   thinkingCount: number;
-  /** Base path prefix for relay mode (e.g., "/remote/my-server") */
+  /** Base path prefix for navigation links */
   basePath?: string;
 }
 

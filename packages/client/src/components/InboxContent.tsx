@@ -68,7 +68,7 @@ interface InboxSectionProps {
   items: InboxItem[];
   /** When true, hides project name (for single-project inbox) */
   hideProjectName?: boolean;
-  /** Base path prefix for relay mode (e.g., "/remote/my-server") */
+  /** Base path prefix for navigation links */
   basePath?: string;
   /** Set of session IDs that have unsent drafts */
   drafts: Set<string>;

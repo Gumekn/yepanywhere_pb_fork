@@ -2,8 +2,6 @@ import { useState } from "react";
 import { api } from "../../api/client";
 import { FilterDropdown } from "../../components/FilterDropdown";
 import { useOptionalAuth } from "../../contexts/AuthContext";
-import { useOptionalRemoteConnection } from "../../contexts/RemoteConnectionContext";
-import { useDeveloperMode } from "../../hooks/useDeveloperMode";
 import { useNetworkBinding } from "../../hooks/useNetworkBinding";
 import { useServerInfo } from "../../hooks/useServerInfo";
 import { useServerSettings } from "../../hooks/useServerSettings";
@@ -12,8 +10,6 @@ import { useI18n } from "../../i18n";
 export function LocalAccessSettings() {
   const { t } = useI18n();
   const auth = useOptionalAuth();
-  const remoteConnection = useOptionalRemoteConnection();
-  const { relayDebugEnabled, setRelayDebugEnabled } = useDeveloperMode();
   const { serverInfo, loading: serverInfoLoading } = useServerInfo();
   const {
     binding,
@@ -616,47 +612,6 @@ export function LocalAccessSettings() {
             </div>
           </div>
         )}
-      </section>
-    );
-  }
-
-  // Remote mode (SRP auth)
-  if (remoteConnection) {
-    return (
-      <section className="settings-section">
-        <h2>{t("settingsLocalAccessTitle")}</h2>
-        <p className="settings-section-description">
-          {t("localAccessRemoteDescription")}
-        </p>
-        <div className="settings-group">
-          <div className="settings-item">
-            <div className="settings-item-info">
-              <strong>{t("remoteAccessLogoutTitle")}</strong>
-              <p>{t("localAccessRemoteLogoutDescription")}</p>
-            </div>
-            <button
-              type="button"
-              className="settings-button settings-button-danger"
-              onClick={() => remoteConnection.disconnect()}
-            >
-              {t("remoteAccessLogout")}
-            </button>
-          </div>
-          <div className="settings-item">
-            <div className="settings-item-info">
-              <strong>{t("localAccessRelayDebugTitle")}</strong>
-              <p>{t("localAccessRelayDebugDescription")}</p>
-            </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={relayDebugEnabled}
-                onChange={(e) => setRelayDebugEnabled(e.target.checked)}
-              />
-              <span className="toggle-slider" />
-            </label>
-          </div>
-        </div>
       </section>
     );
   }

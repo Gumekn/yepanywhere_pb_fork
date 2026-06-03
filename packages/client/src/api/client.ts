@@ -17,7 +17,6 @@ import type {
   UploadedFile,
 } from "@yep-anywhere/shared";
 import { authEvents } from "../lib/authEvents";
-import { getGlobalConnection, isRemoteClient } from "../lib/connection";
 import type {
   AgentSession,
   InputRequest,
@@ -179,20 +178,6 @@ export async function fetchJSON<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
-  // Route through global connection in remote mode (SecureConnection)
-  const globalConn = getGlobalConnection();
-  if (globalConn) {
-    return globalConn.fetch<T>(path, options);
-  }
-
-  // In remote client mode, we MUST have a SecureConnection
-  // If we reach this point, it means authentication hasn't completed yet
-  if (isRemoteClient()) {
-    throw new Error(
-      "Remote client requires SecureConnection - not authenticated",
-    );
-  }
-
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Yep-Anywhere": "true",
@@ -491,6 +476,12 @@ export const api = {
     options?: SessionOptions,
     attachments?: UploadedFile[],
     tempId?: string,
+    /**
+     * Rewind/edit: resume only up to (and including) this message UUID,
+     * branching the conversation in place (same session). Pass the edited
+     * message's parentUuid. Maps to the SDK `resumeSessionAt` option.
+     */
+    resumeSessionAt?: string,
   ) =>
     fetchJSON<{
       processId: string;
@@ -507,6 +498,7 @@ export const api = {
         executor: options?.executor,
         attachments,
         tempId,
+        resumeSessionAt,
       }),
     }),
 
@@ -1040,8 +1032,6 @@ export interface RemoteExecutorTestResult {
 export interface ServerSettings {
   /** Whether clients should register the service worker */
   serviceWorkerEnabled: boolean;
-  /** Whether remote SRP resume sessions should be persisted to disk */
-  persistRemoteSessionsToDisk: boolean;
   /** SSH host aliases for remote executors */
   remoteExecutors?: string[];
   /** SSH host aliases for ChromeOS device bridge targets */

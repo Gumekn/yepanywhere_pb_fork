@@ -19,7 +19,7 @@ interface RecentSessionsDropdownProps {
   onNavigate: (sessionId: string, projectId: string) => void;
   /** Trigger element ref for positioning */
   triggerRef: React.RefObject<HTMLElement | null>;
-  /** Base path prefix for relay mode (e.g., "/remote/my-server") */
+  /** Base path prefix for navigation links */
   basePath?: string;
 }
 

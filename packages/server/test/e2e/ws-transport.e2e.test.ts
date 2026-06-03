@@ -5,17 +5,17 @@ import { join } from "node:path";
 import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import type {
-  RelayEvent,
-  RelayRequest,
-  RelayResponse,
-  RelaySubscribe,
-  RelayUnsubscribe,
-  RelayUploadChunk,
-  RelayUploadComplete,
-  RelayUploadEnd,
-  RelayUploadError,
-  RelayUploadProgress,
-  RelayUploadStart,
+  WireEvent,
+  WireRequest,
+  WireResponse,
+  WireSubscribe,
+  WireUnsubscribe,
+  WireUploadChunk,
+  WireUploadComplete,
+  WireUploadEnd,
+  WireUploadError,
+  WireUploadProgress,
+  WireUploadStart,
   YepMessage,
 } from "@yep-anywhere/shared";
 import {
@@ -28,7 +28,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { createApp } from "../../src/app.js";
 import { attachUnifiedUpgradeHandler } from "../../src/frontend/index.js";
-import { createWsRelayRoutes } from "../../src/routes/ws-relay.js";
+import { createWsRoutes } from "../../src/routes/ws.js";
 import { MockClaudeSDK } from "../../src/sdk/mock.js";
 import { UploadManager } from "../../src/uploads/manager.js";
 import { EventBus } from "../../src/watcher/index.js";
@@ -80,7 +80,7 @@ describe("WebSocket Transport E2E", () => {
     const uploadManager = new UploadManager({
       uploadsDir: join(testDir, "uploads"),
     });
-    const wsRelayHandler = createWsRelayRoutes({
+    const wsHandler = createWsRoutes({
       upgradeWebSocket,
       app,
       baseUrl,
@@ -88,7 +88,7 @@ describe("WebSocket Transport E2E", () => {
       eventBus,
       uploadManager,
     });
-    app.get("/api/ws", wsRelayHandler);
+    app.get("/api/ws", wsHandler);
 
     // Start server on random port
     server = serve({ fetch: app.fetch, port: 0 }, (info) => {
@@ -130,8 +130,8 @@ describe("WebSocket Transport E2E", () => {
    */
   function sendRequest(
     ws: WebSocket,
-    request: RelayRequest,
-  ): Promise<RelayResponse> {
+    request: WireRequest,
+  ): Promise<WireResponse> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(
         () => reject(new Error("Request timeout")),
@@ -160,9 +160,9 @@ describe("WebSocket Transport E2E", () => {
     subscriptionId: string,
     count: number,
     timeoutMs = 5000,
-  ): Promise<RelayEvent[]> {
+  ): Promise<WireEvent[]> {
     return new Promise((resolve, reject) => {
-      const events: RelayEvent[] = [];
+      const events: WireEvent[] = [];
       const timeout = setTimeout(() => {
         ws.off("message", handler);
         // Return what we have, even if not enough
@@ -190,7 +190,7 @@ describe("WebSocket Transport E2E", () => {
       const ws = await connectWebSocket();
 
       try {
-        const request: RelayRequest = {
+        const request: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -210,7 +210,7 @@ describe("WebSocket Transport E2E", () => {
       const ws = await connectWebSocket();
 
       try {
-        const request: RelayRequest = {
+        const request: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -231,7 +231,7 @@ describe("WebSocket Transport E2E", () => {
       const ws = await connectWebSocket();
 
       try {
-        const request: RelayRequest = {
+        const request: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -255,7 +255,7 @@ describe("WebSocket Transport E2E", () => {
       const ws = await connectWebSocket();
 
       try {
-        const request: RelayRequest = {
+        const request: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -274,13 +274,13 @@ describe("WebSocket Transport E2E", () => {
       const ws = await connectWebSocket();
 
       try {
-        const request1: RelayRequest = {
+        const request1: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
           path: "/health",
         };
-        const request2: RelayRequest = {
+        const request2: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -309,7 +309,7 @@ describe("WebSocket Transport E2E", () => {
 
       try {
         const subscriptionId = randomUUID();
-        const subscribe: RelaySubscribe = {
+        const subscribe: WireSubscribe = {
           type: "subscribe",
           subscriptionId,
           channel: "activity",
@@ -334,7 +334,7 @@ describe("WebSocket Transport E2E", () => {
 
       try {
         const subscriptionId = randomUUID();
-        const subscribe: RelaySubscribe = {
+        const subscribe: WireSubscribe = {
           type: "subscribe",
           subscriptionId,
           channel: "activity",
@@ -389,7 +389,7 @@ describe("WebSocket Transport E2E", () => {
         const subscriptionId = randomUUID();
 
         // Subscribe
-        const subscribe: RelaySubscribe = {
+        const subscribe: WireSubscribe = {
           type: "subscribe",
           subscriptionId,
           channel: "activity",
@@ -400,7 +400,7 @@ describe("WebSocket Transport E2E", () => {
         await collectEvents(ws, subscriptionId, 1);
 
         // Unsubscribe
-        const unsubscribe: RelayUnsubscribe = {
+        const unsubscribe: WireUnsubscribe = {
           type: "unsubscribe",
           subscriptionId,
         };
@@ -443,12 +443,12 @@ describe("WebSocket Transport E2E", () => {
         const events2Promise = collectEvents(ws, subscriptionId2, 2, 2000);
 
         // Subscribe to activity twice with different IDs
-        const subscribe1: RelaySubscribe = {
+        const subscribe1: WireSubscribe = {
           type: "subscribe",
           subscriptionId: subscriptionId1,
           channel: "activity",
         };
-        const subscribe2: RelaySubscribe = {
+        const subscribe2: WireSubscribe = {
           type: "subscribe",
           subscriptionId: subscriptionId2,
           channel: "activity",
@@ -488,7 +488,7 @@ describe("WebSocket Transport E2E", () => {
 
       try {
         const subscriptionId = randomUUID();
-        const subscribe: RelaySubscribe = {
+        const subscribe: WireSubscribe = {
           type: "subscribe",
           subscriptionId,
           channel: "session",
@@ -496,7 +496,7 @@ describe("WebSocket Transport E2E", () => {
         };
 
         // Listen for response (error will come as a response)
-        const responsePromise = new Promise<RelayResponse>((resolve) => {
+        const responsePromise = new Promise<WireResponse>((resolve) => {
           const handler = (data: WebSocket.RawData) => {
             const msg = JSON.parse(data.toString()) as YepMessage;
             if (msg.type === "response" && msg.id === subscriptionId) {
@@ -524,7 +524,7 @@ describe("WebSocket Transport E2E", () => {
 
       // Connect and subscribe
       const ws = await connectWebSocket();
-      const subscribe: RelaySubscribe = {
+      const subscribe: WireSubscribe = {
         type: "subscribe",
         subscriptionId,
         channel: "activity",
@@ -550,7 +550,7 @@ describe("WebSocket Transport E2E", () => {
     it("should handle reconnection", async () => {
       // First connection
       const ws1 = await connectWebSocket();
-      const request1: RelayRequest = {
+      const request1: WireRequest = {
         type: "request",
         id: randomUUID(),
         method: "GET",
@@ -565,7 +565,7 @@ describe("WebSocket Transport E2E", () => {
 
       // Second connection - should work fine
       const ws2 = await connectWebSocket();
-      const request2: RelayRequest = {
+      const request2: WireRequest = {
         type: "request",
         id: randomUUID(),
         method: "GET",
@@ -627,7 +627,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessages(ws, uploadId);
 
         // Send upload_start
-        const startMsg: RelayUploadStart = {
+        const startMsg: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -643,7 +643,7 @@ describe("WebSocket Transport E2E", () => {
 
         // Send chunk (base64 encoded)
         const base64Content = Buffer.from(fileContent).toString("base64");
-        const chunkMsg: RelayUploadChunk = {
+        const chunkMsg: WireUploadChunk = {
           type: "upload_chunk",
           uploadId,
           offset: 0,
@@ -652,7 +652,7 @@ describe("WebSocket Transport E2E", () => {
         ws.send(JSON.stringify(chunkMsg));
 
         // Send upload_end
-        const endMsg: RelayUploadEnd = {
+        const endMsg: WireUploadEnd = {
           type: "upload_end",
           uploadId,
         };
@@ -668,7 +668,7 @@ describe("WebSocket Transport E2E", () => {
         const lastMsg = messages[messages.length - 1];
         expect(lastMsg.type).toBe("upload_complete");
 
-        const completeMsg = lastMsg as RelayUploadComplete;
+        const completeMsg = lastMsg as WireUploadComplete;
         expect(completeMsg.file).toBeDefined();
         expect(completeMsg.file.originalName).toBe(filename);
         expect(completeMsg.file.size).toBe(fileSize);
@@ -693,7 +693,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessages(ws, uploadId);
 
         // Send upload_start
-        const startMsg: RelayUploadStart = {
+        const startMsg: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -712,7 +712,7 @@ describe("WebSocket Transport E2E", () => {
         while (offset < fileSize) {
           const end = Math.min(offset + chunkSize, fileSize);
           const chunk = fileContent.slice(offset, end);
-          const chunkMsg: RelayUploadChunk = {
+          const chunkMsg: WireUploadChunk = {
             type: "upload_chunk",
             uploadId,
             offset,
@@ -723,7 +723,7 @@ describe("WebSocket Transport E2E", () => {
         }
 
         // Send upload_end
-        const endMsg: RelayUploadEnd = {
+        const endMsg: WireUploadEnd = {
           type: "upload_end",
           uploadId,
         };
@@ -738,14 +738,14 @@ describe("WebSocket Transport E2E", () => {
         // Check we got progress updates
         const progressMsgs = messages.filter(
           (m) => m.type === "upload_progress",
-        ) as RelayUploadProgress[];
+        ) as WireUploadProgress[];
         expect(progressMsgs.length).toBeGreaterThanOrEqual(1);
 
         // Last message should be upload_complete
         const lastMsg = messages[messages.length - 1];
         expect(lastMsg.type).toBe("upload_complete");
 
-        const completeMsg = lastMsg as RelayUploadComplete;
+        const completeMsg = lastMsg as WireUploadComplete;
         expect(completeMsg.file.size).toBe(fileSize);
       } finally {
         ws.close();
@@ -764,7 +764,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessages(ws, uploadId);
 
         // Send upload_start
-        const startMsg: RelayUploadStart = {
+        const startMsg: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -778,7 +778,7 @@ describe("WebSocket Transport E2E", () => {
         await new Promise((resolve) => setTimeout(resolve, 50));
 
         // Send chunk with wrong offset (should be 0)
-        const chunkMsg: RelayUploadChunk = {
+        const chunkMsg: WireUploadChunk = {
           type: "upload_chunk",
           uploadId,
           offset: 50, // Wrong offset!
@@ -793,7 +793,7 @@ describe("WebSocket Transport E2E", () => {
         const lastMsg = messages[messages.length - 1];
         expect(lastMsg.type).toBe("upload_error");
 
-        const errorMsg = lastMsg as RelayUploadError;
+        const errorMsg = lastMsg as WireUploadError;
         expect(errorMsg.error).toContain("Invalid offset");
       } finally {
         ws.close();
@@ -810,7 +810,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessages(ws, uploadId, 2000);
 
         // Send chunk for non-existent upload
-        const chunkMsg: RelayUploadChunk = {
+        const chunkMsg: WireUploadChunk = {
           type: "upload_chunk",
           uploadId,
           offset: 0,
@@ -824,7 +824,7 @@ describe("WebSocket Transport E2E", () => {
         expect(messages.length).toBe(1);
         expect(messages[0].type).toBe("upload_error");
 
-        const errorMsg = messages[0] as RelayUploadError;
+        const errorMsg = messages[0] as WireUploadError;
         expect(errorMsg.error).toContain("Upload not found");
       } finally {
         ws.close();
@@ -840,7 +840,7 @@ describe("WebSocket Transport E2E", () => {
         const sessionId = "test-session";
 
         // Send first upload_start
-        const startMsg1: RelayUploadStart = {
+        const startMsg1: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -857,7 +857,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessages(ws, uploadId, 2000);
 
         // Send duplicate upload_start with same ID
-        const startMsg2: RelayUploadStart = {
+        const startMsg2: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -874,7 +874,7 @@ describe("WebSocket Transport E2E", () => {
         // Should get an error for the duplicate
         const errorMsgs = messages.filter(
           (m) => m.type === "upload_error",
-        ) as RelayUploadError[];
+        ) as WireUploadError[];
         expect(errorMsgs.length).toBe(1);
         expect(errorMsgs[0].error).toContain("already in use");
       } finally {
@@ -889,8 +889,8 @@ describe("WebSocket Transport E2E", () => {
      */
     function sendBinaryRequest(
       ws: WebSocket,
-      request: RelayRequest,
-    ): Promise<RelayResponse> {
+      request: WireRequest,
+    ): Promise<WireResponse> {
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(
           () => reject(new Error("Request timeout")),
@@ -938,7 +938,7 @@ describe("WebSocket Transport E2E", () => {
       const ws = await connectWebSocket();
 
       try {
-        const request: RelayRequest = {
+        const request: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -958,7 +958,7 @@ describe("WebSocket Transport E2E", () => {
       const ws = await connectWebSocket();
 
       try {
-        const request: RelayRequest = {
+        const request: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -1013,7 +1013,7 @@ describe("WebSocket Transport E2E", () => {
 
       try {
         // First request as text
-        const textRequest: RelayRequest = {
+        const textRequest: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -1023,7 +1023,7 @@ describe("WebSocket Transport E2E", () => {
         expect(textResponse.status).toBe(200);
 
         // Second request as binary
-        const binaryRequest: RelayRequest = {
+        const binaryRequest: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -1040,7 +1040,7 @@ describe("WebSocket Transport E2E", () => {
       const ws = await connectWebSocket();
 
       try {
-        const request: RelayRequest = {
+        const request: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -1050,7 +1050,7 @@ describe("WebSocket Transport E2E", () => {
         // Track whether we received a binary response
         let receivedBinary = false;
 
-        const response = await new Promise<RelayResponse>((resolve, reject) => {
+        const response = await new Promise<WireResponse>((resolve, reject) => {
           const timeout = setTimeout(
             () => reject(new Error("Request timeout")),
             5000,
@@ -1103,15 +1103,15 @@ describe("WebSocket Transport E2E", () => {
 
       try {
         const subscriptionId = randomUUID();
-        const subscribe: RelaySubscribe = {
+        const subscribe: WireSubscribe = {
           type: "subscribe",
           subscriptionId,
           channel: "activity",
         };
 
         // Collect events using binary frames
-        const eventsPromise = new Promise<RelayEvent[]>((resolve) => {
-          const events: RelayEvent[] = [];
+        const eventsPromise = new Promise<WireEvent[]>((resolve) => {
+          const events: WireEvent[] = [];
           const timeout = setTimeout(() => {
             ws.off("message", handler);
             resolve(events);
@@ -1163,7 +1163,7 @@ describe("WebSocket Transport E2E", () => {
       try {
         // Send a request - the UTF-8 test is about the binary frame encoding
         // of JSON content with unicode characters in the body
-        const request: RelayRequest = {
+        const request: WireRequest = {
           type: "request",
           id: randomUUID(),
           method: "GET",
@@ -1177,7 +1177,7 @@ describe("WebSocket Transport E2E", () => {
         expect(response.status).toBe(200);
 
         // Also test that a request ID with UTF-8 round-trips correctly
-        const utf8Request: RelayRequest = {
+        const utf8Request: WireRequest = {
           type: "request",
           id: `test-${randomUUID()}-emoji-🎉`,
           method: "GET",
@@ -1253,7 +1253,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessagesForBinary(ws, uploadId);
 
         // Send upload_start as JSON (to initiate the upload)
-        const startMsg: RelayUploadStart = {
+        const startMsg: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -1274,7 +1274,7 @@ describe("WebSocket Transport E2E", () => {
         ws.send(Buffer.from(binaryFrame));
 
         // Send upload_end as JSON
-        const endMsg: RelayUploadEnd = {
+        const endMsg: WireUploadEnd = {
           type: "upload_end",
           uploadId,
         };
@@ -1290,7 +1290,7 @@ describe("WebSocket Transport E2E", () => {
         const lastMsg = messages[messages.length - 1];
         expect(lastMsg.type).toBe("upload_complete");
 
-        const completeMsg = lastMsg as RelayUploadComplete;
+        const completeMsg = lastMsg as WireUploadComplete;
         expect(completeMsg.file).toBeDefined();
         expect(completeMsg.file.originalName).toBe(filename);
         expect(completeMsg.file.size).toBe(fileSize);
@@ -1315,7 +1315,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessagesForBinary(ws, uploadId);
 
         // Send upload_start
-        const startMsg: RelayUploadStart = {
+        const startMsg: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -1343,7 +1343,7 @@ describe("WebSocket Transport E2E", () => {
         }
 
         // Send upload_end
-        const endMsg: RelayUploadEnd = {
+        const endMsg: WireUploadEnd = {
           type: "upload_end",
           uploadId,
         };
@@ -1358,14 +1358,14 @@ describe("WebSocket Transport E2E", () => {
         // Check we got progress updates
         const progressMsgs = messages.filter(
           (m) => m.type === "upload_progress",
-        ) as RelayUploadProgress[];
+        ) as WireUploadProgress[];
         expect(progressMsgs.length).toBeGreaterThanOrEqual(1);
 
         // Last message should be upload_complete
         const lastMsg = messages[messages.length - 1];
         expect(lastMsg.type).toBe("upload_complete");
 
-        const completeMsg = lastMsg as RelayUploadComplete;
+        const completeMsg = lastMsg as WireUploadComplete;
         expect(completeMsg.file.size).toBe(fileSize);
       } finally {
         ws.close();
@@ -1387,7 +1387,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessagesForBinary(ws, uploadId);
 
         // Send upload_start as binary JSON frame (format 0x01)
-        const startMsg: RelayUploadStart = {
+        const startMsg: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -1406,7 +1406,7 @@ describe("WebSocket Transport E2E", () => {
         ws.send(Buffer.from(binaryFrame));
 
         // Send upload_end as binary JSON frame (format 0x01)
-        const endMsg: RelayUploadEnd = {
+        const endMsg: WireUploadEnd = {
           type: "upload_end",
           uploadId,
         };
@@ -1447,7 +1447,7 @@ describe("WebSocket Transport E2E", () => {
         expect(messages.length).toBe(1);
         expect(messages[0].type).toBe("upload_error");
 
-        const errorMsg = messages[0] as RelayUploadError;
+        const errorMsg = messages[0] as WireUploadError;
         expect(errorMsg.error).toContain("Upload not found");
       } finally {
         ws.close();
@@ -1466,7 +1466,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessagesForBinary(ws, uploadId);
 
         // Send upload_start
-        const startMsg: RelayUploadStart = {
+        const startMsg: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -1491,7 +1491,7 @@ describe("WebSocket Transport E2E", () => {
         const lastMsg = messages[messages.length - 1];
         expect(lastMsg.type).toBe("upload_error");
 
-        const errorMsg = lastMsg as RelayUploadError;
+        const errorMsg = lastMsg as WireUploadError;
         expect(errorMsg.error).toContain("Invalid offset");
       } finally {
         ws.close();
@@ -1517,7 +1517,7 @@ describe("WebSocket Transport E2E", () => {
         const messagesPromise = collectUploadMessagesForBinary(ws, uploadId);
 
         // Send upload_start
-        const startMsg: RelayUploadStart = {
+        const startMsg: WireUploadStart = {
           type: "upload_start",
           uploadId,
           projectId,
@@ -1535,7 +1535,7 @@ describe("WebSocket Transport E2E", () => {
         ws.send(Buffer.from(binaryFrame));
 
         // Send upload_end
-        const endMsg: RelayUploadEnd = {
+        const endMsg: WireUploadEnd = {
           type: "upload_end",
           uploadId,
         };
@@ -1548,7 +1548,7 @@ describe("WebSocket Transport E2E", () => {
         const lastMsg = messages[messages.length - 1];
         expect(lastMsg.type).toBe("upload_complete");
 
-        const completeMsg = lastMsg as RelayUploadComplete;
+        const completeMsg = lastMsg as WireUploadComplete;
         expect(completeMsg.file.size).toBe(fileSize);
       } finally {
         ws.close();

@@ -62,7 +62,7 @@ interface SessionListItemProps {
   // For sidebar compact mode
   hasDraft?: boolean;
 
-  /** Base path prefix for relay mode (e.g., "/remote/my-server") */
+  /** Base path prefix for navigation links */
   basePath?: string;
 
   /** Number of messages in session (0 indicates brand new session) */
@@ -127,7 +127,7 @@ export function SessionListItem({
   onNavigate,
   // Sidebar
   hasDraft = false,
-  // Relay mode
+  // Base path prefix
   basePath = "",
   // New session detection
   messageCount,

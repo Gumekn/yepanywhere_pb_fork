@@ -21,7 +21,7 @@ A better remote interface for Claude Code and Codex. Self-hosted, no cloud accou
 - **Interop** — View and resume sessions started in CLI, VS Code, or other tools. No new database — piggybacks on CLI persistence
 - **File uploads** — Share screenshots, photos, PDFs, and code files directly from your phone's camera roll
 - **Push notifications** — Get alerted when approval is needed, respond from your lock screen
-- **E2E encrypted remote access** — Connect from anywhere via our free relay. We can't see your data (SRP-6a + TweetNaCl)
+- **Remote access** — Reach your server from anywhere over Tailscale, a LAN IP, or your own reverse proxy. Optional cookie-based auth.
 - **Fork/clone conversations** — Branch from any message point to explore alternatives
 - **Tiered inbox** — Needs Attention → Active → Recent → Unread. Stop cycling through terminal tabs
 - **Global activity stream** — See what all your agents are doing across sessions
@@ -82,17 +82,11 @@ Open http://localhost:3400 in your browser. The app auto-detects installed CLI a
 
 ## Remote Access
 
-**Easiest:** Use our free public relay — configure it in Settings, or via CLI for headless setups:
-
-```bash
-yepanywhere --setup-remote-access --username myserver --password "secretpass123"
-```
-
-Then connect from anywhere at [yepanywhere.com/remote](https://yepanywhere.com/remote).
-
-All traffic is end-to-end encrypted and we can't see your data. No accounts required.
-
-**Self-hosted:** Prefer to run your own infrastructure? Use Tailscale, Caddy, or any reverse proxy with SSL termination. See the [remote access docs](docs/project/remote-access.md) for details.
+The server runs on your machine and the client connects to its WebSocket directly.
+Reach it from your phone over your own network — Tailscale, a LAN IP, or any reverse
+proxy / tunnel with SSL termination (e.g. Caddy). Enable cookie-based auth in Settings
+(or via `yepanywhere --setup-auth "<password>"` for headless setups) to require a
+password. See the [remote access docs](docs/project/remote-access.md) for details.
 
 ## Why not just use the terminal?
 

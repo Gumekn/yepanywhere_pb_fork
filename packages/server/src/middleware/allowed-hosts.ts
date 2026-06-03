@@ -6,7 +6,7 @@
  * | Check       | What              | Where        | Protects Against           |
  * |-------------|-------------------|--------------|----------------------------|
  * | Host header | Host on /api/*    | security.ts  | DNS rebinding              |
- * | WS Origin   | Origin on WS      | ws-relay.ts  | Cross-site WS hijacking    |
+ * | WS Origin   | Origin on WS      | ws.ts        | Cross-site WS hijacking    |
  * | CORS        | Origin on HTTP    | security.ts  | Cross-origin data leaks    |
  *
  * Built-in allowed hostnames:

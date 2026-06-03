@@ -1,7 +1,6 @@
 /**
  * InstallService manages a unique installation identifier for this yepanywhere instance.
- * The install ID is used by the relay server to verify username ownership - if an
- * installation disconnects and reconnects, it can reclaim its username using the same ID.
+ * The install ID is a stable per-installation identifier surfaced via server-info.
  *
  * State is persisted to a JSON file for durability across server restarts.
  */

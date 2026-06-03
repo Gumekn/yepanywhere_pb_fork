@@ -12,9 +12,10 @@ A mobile-first supervisor for Claude Code agents. Like the VS Code Claude extens
 
 **Architecture:** Hono server manages Claude SDK processes. React client connects via WebSocket for real-time streaming. Sessions persist to jsonl files (handled by SDK).
 
-**Remote access:** Two connection modes:
-- **Direct (Tailscale/LAN)** — Client connects to server WebSocket directly
-- **Relay** — Client connects through a relay server (`packages/relay/`). SRP (Secure Remote Password) authenticates without exposing the password to the relay. All messages are end-to-end encrypted with NaCl (XSalsa20-Poly1305) so the relay sees only opaque ciphertext.
+**Remote access:** The client connects to the server's WebSocket directly. Run the
+server on your own network and reach it over Tailscale, a LAN IP, or any reverse
+proxy / tunnel you control (e.g. Caddy with TLS). Cookie-based auth (optional)
+gates access; see `docs/project/remote-access.md`.
 
 For detailed overview, see `docs/project/`. Historical vision docs in `docs/archive/`.
 
@@ -193,7 +194,7 @@ The workflow runs lint, typecheck, and tests, then builds with `pnpm build:bundl
 
 ## Releasing the Website
 
-The website (landing pages + remote relay client at `/remote`) is deployed to GitHub Pages separately from npm. **Pushing to main does NOT deploy the site** — it only runs CI (lint, typecheck, tests). The site only deploys when a `site-v*` tag is pushed (or via manual workflow_dispatch).
+The website (marketing landing pages) is deployed to GitHub Pages separately from npm. **Pushing to main does NOT deploy the site** — it only runs CI (lint, typecheck, tests). The site only deploys when a `site-v*` tag is pushed (or via manual workflow_dispatch).
 
 See `site/RELEASING.md` for the full process.
 

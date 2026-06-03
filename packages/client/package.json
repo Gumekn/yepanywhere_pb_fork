@@ -5,11 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node ../../scripts/run-with-safe-home.js vite",
-    "dev:remote": "node ../../scripts/run-with-safe-home.js vite --config vite.config.remote.ts",
     "build": "tsc && vite build",
     "build:stable": "tsc && vite build --base /_stable/ --outDir dist-stable",
-    "build:remote": "tsc && vite build --config vite.config.remote.ts",
-    "preview:remote": "vite preview --config vite.config.remote.ts",
     "test": "node ../../scripts/run-with-safe-home.js vitest run",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
@@ -27,8 +24,6 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.11.0",
-    "tssrp6a": "^3.0.0",
-    "tweetnacl": "^1.0.3",
     "uqr": "^0.1.2",
     "zod": "^4.3.4"
   },

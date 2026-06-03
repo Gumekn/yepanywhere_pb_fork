@@ -16,6 +16,11 @@ interface Props {
   content: string | ContentBlock[];
   /** ISO timestamp from the source JSONL entry, used for hover-revealed time. */
   timestamp?: string;
+  /**
+   * When provided, show an edit button on the prompt. Called with the parsed
+   * prompt text so the parent can prefill the input and rewind from here.
+   */
+  onEdit?: (text: string) => void;
 }
 
 interface InputImageBlock extends ContentBlock {
@@ -225,7 +230,7 @@ function UploadedFileItem({ file }: { file: UploadedFileInfo }) {
   const apiPath = isImage ? getUploadUrl(file.path) : null;
   const directPreviewUrl = isImage ? (file.previewUrl ?? null) : null;
 
-  // Use the remote image hook to handle fetching via relay when needed
+  // Use the remote image hook to handle fetching the image
   const { url: remoteImageUrl, loading, error } = useRemoteImage(apiPath);
   const imageUrl = directPreviewUrl ?? remoteImageUrl;
 
@@ -334,6 +339,7 @@ function CollapsibleText({ text }: { text: string }) {
 export const UserPromptBlock = memo(function UserPromptBlock({
   content,
   timestamp,
+  onEdit,
 }: Props) {
   if (typeof content === "string") {
     const { text, openedFiles, uploadedFiles } = parseUserPrompt(content);
@@ -357,7 +363,11 @@ export const UserPromptBlock = memo(function UserPromptBlock({
             <UploadedFilesMetadata files={uploadedFiles} />
           </div>
         </div>
-        <MessageActions timestamp={timestamp} copyText={text} />
+        <MessageActions
+          timestamp={timestamp}
+          copyText={text}
+          onEdit={onEdit ? () => onEdit(text) : undefined}
+        />
         <OpenedFilesMetadata files={openedFiles} />
       </div>
     );
@@ -402,7 +412,11 @@ export const UserPromptBlock = memo(function UserPromptBlock({
           <UploadedFilesMetadata files={allUploadedFiles} />
         </div>
       </div>
-      <MessageActions timestamp={timestamp} copyText={text} />
+      <MessageActions
+        timestamp={timestamp}
+        copyText={text}
+        onEdit={onEdit ? () => onEdit(text) : undefined}
+      />
       <OpenedFilesMetadata files={openedFiles} />
     </div>
   );

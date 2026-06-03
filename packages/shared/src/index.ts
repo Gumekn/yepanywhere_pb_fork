@@ -335,74 +335,37 @@ export type {
   TerminalServerMessage,
 } from "./terminal.js";
 
-// Relay protocol types (for remote access via WebSocket)
+// Wire protocol types (for the local WebSocket connection)
 export type {
-  RelayHttpMethod,
-  RelayRequest,
-  RelayResponse,
-  RelaySubscriptionChannel,
-  RelaySubscribe,
-  RelayUnsubscribe,
-  RelayEvent,
-  RelayUploadStart,
-  RelayUploadChunk,
-  RelayUploadEnd,
-  RelayUploadProgress,
-  RelayUploadComplete,
-  RelayUploadError,
+  WireHttpMethod,
+  WireRequest,
+  WireResponse,
+  WireSubscriptionChannel,
+  WireSubscribe,
+  WireUnsubscribe,
+  WireEvent,
+  WireUploadStart,
+  WireUploadChunk,
+  WireUploadEnd,
+  WireUploadProgress,
+  WireUploadComplete,
+  WireUploadError,
   RemoteClientMessage,
   YepMessage,
-  RelayMessage,
+  WireMessage,
   // Connection metadata types
   OriginMetadata,
-  // SRP authentication types (re-exported from relay.ts)
-  SrpClientHello,
-  SrpServerChallenge,
-  SrpClientProof,
-  SrpServerVerify,
-  SrpError,
-  SrpErrorCode,
-  SrpClientMessage,
-  SrpServerMessage,
-  SrpMessage,
-  // Session resumption types
-  SrpSessionResumeInit,
-  SrpSessionResumeChallenge,
-  SrpSessionResume,
-  SrpSessionResumed,
-  SrpSessionInvalid,
-  SrpSessionInvalidReason,
-  // Encryption types
-  EncryptedEnvelope,
-  SequencedEncryptedPayload,
-  // Connection state
-  SecureConnectionState,
   // Client capabilities (Phase 3)
   ClientCapabilities,
   // Keepalive ping/pong
   ClientPing,
   ServerPong,
-} from "./relay.js";
+} from "./wire-protocol.js";
 
 export {
-  // SRP type guards
-  isSrpClientHello,
-  isSrpClientProof,
-  isSrpServerChallenge,
-  isSrpServerVerify,
-  isSrpError,
-  // Session resumption type guards
-  isSrpSessionResumeInit,
-  isSrpSessionResumeChallenge,
-  isSrpSessionResume,
-  isSrpSessionResumed,
-  isSrpSessionInvalid,
-  // Encryption type guard
-  isEncryptedEnvelope,
-  isSequencedEncryptedPayload,
   // Client capabilities type guard
   isClientCapabilities,
-} from "./relay.js";
+} from "./wire-protocol.js";
 
 // Binary framing utilities (Phase 0/1/2/3 of binary WebSocket protocol)
 export {
@@ -457,32 +420,3 @@ export {
   decompressBytes,
   compressJsonIfBeneficial,
 } from "./compression.js";
-
-// Relay server routing protocol (for relay server <-> yepanywhere/phone)
-export type {
-  RelayServerCompatibilityMetadata,
-  RelayServerRegister,
-  RelayServerRegistered,
-  RelayServerRejectedReason,
-  RelayServerRejected,
-  RelayClientConnect,
-  RelayClientConnected,
-  RelayClientErrorReason,
-  RelayClientError,
-  RelayServerMessage,
-  RelayServerResponse,
-  RelayClientMessage,
-  RelayClientResponse,
-  RelayRoutingMessage,
-} from "./relay-protocol.js";
-
-export {
-  isRelayServerRegister,
-  isRelayServerRegistered,
-  isRelayServerRejected,
-  isRelayClientConnect,
-  isRelayClientConnected,
-  isRelayClientError,
-  USERNAME_REGEX,
-  isValidRelayUsername,
-} from "./relay-protocol.js";

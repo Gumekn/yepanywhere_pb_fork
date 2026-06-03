@@ -30,8 +30,6 @@ export default async function globalTeardown() {
   const pathsFile = join(tempDir, "paths.json");
   let paths: {
     pidFile?: string;
-    remoteClientPidFile?: string;
-    relayPidFile?: string;
   } = {};
 
   if (existsSync(pathsFile)) {
@@ -45,14 +43,6 @@ export default async function globalTeardown() {
   // Kill processes using PID files
   const pidFiles = [
     { file: paths.pidFile ?? join(tempDir, "pid"), name: "server" },
-    {
-      file: paths.remoteClientPidFile ?? join(tempDir, "remote-pid"),
-      name: "remote client",
-    },
-    {
-      file: paths.relayPidFile ?? join(tempDir, "relay-pid"),
-      name: "relay server",
-    },
   ];
 
   for (const { file, name } of pidFiles) {

@@ -4,7 +4,7 @@ import { SidebarIcons, SidebarNavItem } from "./SidebarNavItem";
 interface AgentsNavItemProps {
   /** Called when item is clicked (e.g., to close mobile sidebar) */
   onClick?: () => void;
-  /** Base path prefix for relay mode (e.g., "/remote/my-server") */
+  /** Base path prefix for navigation links */
   basePath?: string;
 }
 

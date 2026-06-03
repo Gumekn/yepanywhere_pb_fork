@@ -178,7 +178,7 @@ export class ConnectionManager {
    * @param options.sendPing - Optional function to send a keepalive ping with a given ID.
    *   When provided, visibility changes trigger a ping/pong check instead of
    *   blindly forcing reconnect.
-   * @param options.label - Optional label for log messages (e.g., "ws", "relay").
+   * @param options.label - Optional label for log messages (e.g., "ws").
    */
   start(
     reconnectFn: ReconnectFn,

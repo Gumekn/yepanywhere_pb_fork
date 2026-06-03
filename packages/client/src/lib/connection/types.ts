@@ -38,74 +38,6 @@ export class WebSocketCloseError extends Error {
 }
 
 /**
- * Error thrown when a relay connection needs to be re-established through the relay.
- * This happens when the WebSocket drops and SecureConnection tries to auto-reconnect,
- * but it was originally connected via relay (wsUrl = "relay://").
- */
-export class RelayReconnectRequiredError extends Error {
-  /** The underlying error that caused the reconnection to fail */
-  readonly cause?: Error;
-
-  constructor(cause?: Error) {
-    // Use a user-friendly message based on the underlying cause
-    const message = formatRelayReconnectError(cause);
-    super(message);
-    this.name = "RelayReconnectRequiredError";
-    this.cause = cause;
-  }
-
-  /**
-   * Check if this relay error is non-retryable (terminal).
-   * Terminal errors won't resolve by retrying (e.g., unknown user, missing config).
-   * Transient errors (timeouts, network issues, server_offline) should be retried.
-   */
-  isNonRetryable(): boolean {
-    if (!this.cause) return false;
-    const msg = this.cause.message.toLowerCase();
-    if (msg.includes("unknown_username")) return true;
-    if (msg.includes("missing relay config")) return true;
-    return false;
-  }
-}
-
-/**
- * Format a user-friendly error message for relay reconnection failures.
- */
-function formatRelayReconnectError(cause?: Error): string {
-  if (!cause) {
-    return "Connection lost. Please try again.";
-  }
-
-  const msg = cause.message.toLowerCase();
-
-  // Timeout errors - server is unreachable
-  if (
-    msg.includes("timeout") ||
-    msg.includes("timed out") ||
-    msg.includes("waiting for server")
-  ) {
-    return "Couldn't reach the server. Make sure your computer is turned on and connected to the internet.";
-  }
-
-  // Connection errors - network issue
-  if (
-    msg.includes("connection error") ||
-    msg.includes("connection closed") ||
-    msg.includes("failed to connect")
-  ) {
-    return "Connection failed. Check your internet connection and try again.";
-  }
-
-  // Server offline (relay knows about the user but server isn't connected)
-  if (msg.includes("server_offline") || msg.includes("not connected")) {
-    return "Server is offline. Make sure your server is running and connected to the relay.";
-  }
-
-  // Default fallback
-  return "Connection lost. Please try again.";
-}
-
-/**
  * Error for subscription-level failures (e.g., 404 "No active process for session").
  * Distinguished from transport-level errors so callers can decide whether to retry.
  */
@@ -123,11 +55,6 @@ export class SubscriptionError extends Error {
  * Check if an error is non-retryable (retrying won't help).
  */
 export function isNonRetryableError(error: unknown): boolean {
-  // Relay errors: only non-retryable if the cause is terminal (e.g., unknown username).
-  // Transient causes (timeouts, network issues) are retryable via ConnectionManager backoff.
-  if (error instanceof RelayReconnectRequiredError) {
-    return error.isNonRetryable();
-  }
   // Subscription 4xx errors (e.g., 404 "No active process") won't resolve by retrying.
   // The activity stream will trigger a fresh subscription when the process starts.
   if (
@@ -184,14 +111,13 @@ export interface UploadOptions {
  * Implementations:
  * - DirectConnection: Uses native fetch for REST, WebSocket for uploads (localhost)
  * - WebSocketConnection: Multiplexes everything over a single WebSocket (localhost subscriptions)
- * - SecureConnection: Multiplexes everything over encrypted WebSocket (remote/relay)
  *
  * The interface abstracts HTTP requests, WebSocket subscriptions, and file uploads
  * so they can be routed through different transports.
  */
 export interface Connection {
   /** Connection mode identifier */
-  readonly mode: "direct" | "secure";
+  readonly mode: "direct";
 
   /**
    * Make a JSON API request.
@@ -275,13 +201,6 @@ export interface Connection {
     file: File,
     options?: UploadOptions,
   ): Promise<UploadedFile>;
-
-  /**
-   * Force reconnection of the underlying transport.
-   * Useful when the connection may have gone stale (e.g., mobile wake from sleep).
-   * Optional - only SecureConnection implements this.
-   */
-  forceReconnect?(): Promise<void>;
 
   /**
    * Send a raw protocol message (bypassing REST).

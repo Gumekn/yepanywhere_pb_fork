@@ -53,9 +53,6 @@ import ArticleLayout from "../layouts/ArticleLayout.astro";
       <tr><td>File uploads from phone</td><td class="check">&#10003;</td><td class="check">&#10003;</td></tr>
       <tr><td>Native app integration</td><td class="cross">&mdash;</td><td class="check">&#10003;</td></tr>
       <tr class="section-row"><td colspan="3">Connectivity</td></tr>
-      <tr><td>Free hosted relay</td><td class="check">&#10003;</td><td class="check">&#10003;</td></tr>
-      <tr><td>Self-hosted relay option</td><td class="check">&#10003;</td><td class="cross">&mdash;</td></tr>
-      <tr><td>E2E encryption (relay can't read traffic)</td><td class="check">&#10003;</td><td class="cross">&mdash;</td></tr>
       <tr><td>Direct LAN / Tailscale</td><td class="check">&#10003;</td><td class="cross">&mdash;</td></tr>
       <tr><td>No extra supervision telemetry to Anthropic</td><td class="check">&#10003;</td><td class="cross">&mdash;</td></tr>
       <tr><td>No extra install needed</td><td class="cross">&mdash;</td><td class="check">&#10003;</td></tr>
@@ -87,7 +84,7 @@ import ArticleLayout from "../layouts/ArticleLayout.astro";
 
   <p><strong>Multiple providers.</strong> Remote Control is Claude Code only. Yep Anywhere also supports Codex CLI in the same interface.</p>
 
-  <p><strong>Self-hosted and encrypted.</strong> Remote Control routes through Anthropic's API servers. Yep Anywhere runs your own server with an optional relay &mdash; all messages are end-to-end encrypted with NaCl, so even the relay sees only ciphertext. Or skip the relay entirely and connect over Tailscale or LAN.</p>
+  <p><strong>Self-hosted.</strong> Remote Control routes through Anthropic's API servers. Yep Anywhere runs your own server and you connect over Tailscale or LAN &mdash; your phone talks to your machine directly.</p>
 
   <p><strong>Works with API keys too.</strong> Remote Control requires a Pro or Max plan. Yep Anywhere works with Pro, Max, or API keys.</p>
 

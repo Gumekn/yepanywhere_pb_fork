@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type Subscription,
   connectionManager,
-  getGlobalConnection,
   getWebSocketConnection,
   isNonRetryableError,
 } from "../lib/connection";
@@ -42,19 +41,11 @@ export function useSessionStream(
     if (mountedSessionIdRef.current === sessionId) return;
     mountedSessionIdRef.current = sessionId;
 
-    // Check for global connection first (remote mode with SecureConnection)
-    const globalConn = getGlobalConnection();
-    if (globalConn) {
-      connectWithConnection(sessionId, globalConn);
-      return;
-    }
-
-    // Local mode: always use WebSocket
     connectWithConnection(sessionId, getWebSocketConnection());
   }, [sessionId]);
 
   /**
-   * Connect using a provided connection (remote or local WebSocket).
+   * Connect using the local WebSocket connection.
    */
   const connectWithConnection = useCallback(
     (

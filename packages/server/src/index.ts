@@ -43,14 +43,8 @@ import { GeminiSessionScanner } from "./projects/gemini-scanner.js";
 import { ProjectScanner } from "./projects/scanner.js";
 import { PushService, getOrCreateVapidKeys } from "./push/index.js";
 import { RecentsService } from "./recents/index.js";
-import {
-  RemoteAccessService,
-  RemoteSessionService,
-} from "./remote-access/index.js";
 import { createUploadRoutes } from "./routes/upload.js";
-import { getServerCompatibilityInfo } from "./routes/version.js";
-import { createWsRelayRoutes } from "./routes/ws-relay.js";
-import { createAcceptRelayConnection } from "./routes/ws-relay.js";
+import { createWsRoutes } from "./routes/ws.js";
 import { detectClaudeCli, detectCodexCli } from "./sdk/cli-detection.js";
 import { initMessageLogger } from "./sdk/messageLogger.js";
 import { ClaudeOllamaProvider } from "./sdk/providers/claude-ollama.js";
@@ -61,7 +55,6 @@ import {
   InstallService,
   ModelInfoService,
   NetworkBindingService,
-  RelayClientService,
   ServerSettingsService,
   SharingService,
 } from "./services/index.js";
@@ -343,16 +336,9 @@ const authService = new AuthService({
   sessionTtlMs: config.authSessionTtlMs,
   cookieSecret: config.authCookieSecret,
 });
-const remoteAccessService = new RemoteAccessService({
-  dataDir: config.dataDir,
-});
-const remoteSessionService = new RemoteSessionService({
-  dataDir: config.dataDir,
-});
 const installService = new InstallService({
   dataDir: config.dataDir,
 });
-const relayClientService = new RelayClientService();
 const networkBindingService = new NetworkBindingService({
   dataDir: config.dataDir,
   cliPortOverride: config.cliPortOverride ? config.port : undefined,
@@ -396,14 +382,9 @@ async function startServer() {
   await browserProfileService.initialize();
   await recentsService.initialize();
   await authService.initialize();
-  await remoteAccessService.initialize();
   await serverSettingsService.initialize();
   await sharingService.initialize();
   await modelInfoService.initialize();
-  await remoteSessionService.setDiskPersistenceEnabled(
-    serverSettingsService.getSetting("persistRemoteSessionsToDisk"),
-  );
-  await remoteSessionService.initialize();
   await networkBindingService.initialize();
 
   // Seed allowed hosts middleware from persisted settings
@@ -452,9 +433,6 @@ async function startServer() {
       `[Frontend] Proxying to Vite at http://localhost:${config.vitePort}`,
     );
   }
-
-  // Callback holder for relay config changes - will be set after app creation
-  const relayConfigCallbackHolder: { callback?: () => Promise<void> } = {};
 
   // Callback holder for network binding changes - will be set after servers are created
   const networkBindingCallbackHolder: {
@@ -516,10 +494,6 @@ async function startServer() {
     authService,
     authDisabled: config.authDisabled,
     desktopAuthToken: config.desktopAuthToken,
-    remoteAccessService,
-    remoteSessionService,
-    relayClientService,
-    relayConfigCallbackHolder,
     // Note: frontendProxy not passed - will be added below
     serverHost: "127.0.0.1", // Always report localhost as main binding
     serverPort: effectiveServerPort,
@@ -583,81 +557,26 @@ async function startServer() {
   });
   app.route("/api", uploadRoutes);
 
-  // Add WebSocket relay route for Phase 2b/2c/2d
+  // Add the local WebSocket route (/api/ws)
   // This allows clients to make HTTP-like requests, subscriptions, and uploads over WebSocket
   const baseUrl = `${serverProtocol}://${config.host}:${config.port}`;
-  const wsRelayUploadManager = new UploadManager({
+  const wsUploadManager = new UploadManager({
     maxUploadSizeBytes: config.maxUploadSizeBytes,
   });
-  const wsRelayHandler = createWsRelayRoutes({
+  const wsHandler = createWsRoutes({
     upgradeWebSocket,
     app,
     baseUrl,
     basePath: config.basePath,
     supervisor,
     eventBus,
-    uploadManager: wsRelayUploadManager,
-    remoteAccessService,
-    remoteSessionService,
+    uploadManager: wsUploadManager,
     connectedBrowsers: connectedBrowsersService,
     browserProfileService,
     focusedSessionWatchManager,
     deviceBridgeService,
   });
-  app.get("/api/ws", wsRelayHandler);
-
-  // Create relay connection handler for connections from relay server (Phase 7)
-  // This accepts WebSocket connections that have already been upgraded at the relay
-  const acceptRelayConnection = createAcceptRelayConnection({
-    app,
-    baseUrl,
-    basePath: config.basePath,
-    supervisor,
-    eventBus,
-    uploadManager: wsRelayUploadManager,
-    remoteAccessService,
-    remoteSessionService,
-    connectedBrowsers: connectedBrowsersService,
-    browserProfileService,
-    focusedSessionWatchManager,
-    deviceBridgeService,
-  });
-
-  // Function to start/restart relay client with current config
-  async function updateRelayConnection() {
-    const relayConfig = remoteAccessService.getRelayConfig();
-    if (relayConfig?.url && relayConfig?.username) {
-      const compatibility = await getServerCompatibilityInfo({
-        getDeviceBridgeState: () => {
-          if (!deviceBridgeService) return "unavailable";
-          return deviceBridgeService.hasBinary() ? "available" : "downloadable";
-        },
-        isDeviceBridgeEnabled: () =>
-          serverSettingsService.getSetting("deviceBridgeEnabled") ?? false,
-      });
-      relayClientService.start({
-        relayUrl: relayConfig.url,
-        username: relayConfig.username,
-        installId: installService.getInstallId(),
-        appVersion: compatibility.appVersion,
-        resumeProtocolVersion: compatibility.resumeProtocolVersion,
-        renderProtocolVersion: compatibility.renderProtocolVersion,
-        capabilities: compatibility.capabilities,
-        onRelayConnection: acceptRelayConnection,
-        onStatusChange: (status) => {
-          console.log(`[Relay] Status: ${status}`);
-        },
-      });
-    } else {
-      relayClientService.stop();
-    }
-  }
-
-  // Wire up the callback for relay config changes from API routes
-  relayConfigCallbackHolder.callback = updateRelayConnection;
-
-  // Start relay connection on boot if configured
-  await updateRelayConnection();
+  app.get("/api/ws", wsHandler);
 
   // Serve stable (emergency) UI from /_stable/ path if available
   // This bypasses HMR and serves pre-built assets directly

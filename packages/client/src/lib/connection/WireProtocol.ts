@@ -1,20 +1,20 @@
 import type {
   ClientPing,
   DeviceServerMessage,
-  RelayEvent,
-  RelayRequest,
-  RelayResponse,
-  RelaySubscribe,
-  RelayUnsubscribe,
-  RelayUploadComplete,
-  RelayUploadEnd,
-  RelayUploadError,
-  RelayUploadProgress,
-  RelayUploadStart,
   RemoteClientMessage,
   ServerPong,
   TerminalServerMessage,
   UploadedFile,
+  WireEvent,
+  WireRequest,
+  WireResponse,
+  WireSubscribe,
+  WireUnsubscribe,
+  WireUploadComplete,
+  WireUploadEnd,
+  WireUploadError,
+  WireUploadProgress,
+  WireUploadStart,
   YepMessage,
 } from "@yep-anywhere/shared";
 import { getOrCreateBrowserProfileId } from "../storageKeys";
@@ -26,7 +26,7 @@ import { SubscriptionError } from "./types";
  * Transport callbacks injected by the owning connection class.
  * These abstract the difference between plain WS and encrypted WS.
  */
-export interface RelayTransport {
+export interface WireTransport {
   sendMessage(msg: RemoteClientMessage): void;
   sendUploadChunk(uploadId: string, offset: number, chunk: Uint8Array): void;
   ensureConnected(): Promise<void>;
@@ -36,7 +36,7 @@ export interface RelayTransport {
 export type EmulatorMessageHandler = (msg: DeviceServerMessage) => void;
 export type TerminalMessageHandler = (msg: TerminalServerMessage) => void;
 
-export interface RelayProtocolOptions {
+export interface WireProtocolOptions {
   debugEnabled?: () => boolean;
   logPrefix?: string;
   onPong?: (id: string) => void;
@@ -61,7 +61,7 @@ function isActivityDebugEnabled(): boolean {
 const DEFAULT_CHUNK_SIZE = 64 * 1024;
 
 interface PendingRequest {
-  resolve: (response: RelayResponse) => void;
+  resolve: (response: WireResponse) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
   startTime?: number;
@@ -76,13 +76,13 @@ interface PendingUpload {
 }
 
 /**
- * Shared relay protocol logic for routing messages, managing subscriptions,
+ * Shared wire protocol logic for routing messages, managing subscriptions,
  * and coordinating request/response correlation.
  *
- * Both WebSocketConnection and SecureConnection compose this class,
- * providing transport-specific send/receive via RelayTransport callbacks.
+ * WebSocketConnection composes this class, providing transport-specific
+ * send/receive via WireTransport callbacks.
  */
-export class RelayProtocol {
+export class WireProtocol {
   readonly pendingRequests = new Map<string, PendingRequest>();
   readonly pendingUploads = new Map<string, PendingUpload>();
   readonly subscriptions = new Map<string, StreamHandlers>();
@@ -93,16 +93,16 @@ export class RelayProtocol {
   /** Registered handlers for terminal output / lifecycle messages */
   private terminalHandlers = new Set<TerminalMessageHandler>();
 
-  private transport: RelayTransport;
-  private options: RelayProtocolOptions;
+  private transport: WireTransport;
+  private options: WireProtocolOptions;
 
-  constructor(transport: RelayTransport, options: RelayProtocolOptions = {}) {
+  constructor(transport: WireTransport, options: WireProtocolOptions = {}) {
     this.transport = transport;
     this.options = options;
   }
 
   private get logPrefix(): string {
-    return this.options.logPrefix ?? "[RelayProtocol]";
+    return this.options.logPrefix ?? "[WireProtocol]";
   }
 
   private get debugEnabled(): boolean {
@@ -204,7 +204,7 @@ export class RelayProtocol {
     };
   }
 
-  private handleEvent(event: RelayEvent): void {
+  private handleEvent(event: WireEvent): void {
     const handlers = this.subscriptions.get(event.subscriptionId);
     const logEventDebug = this.debugEnabled || isActivityDebugEnabled();
 
@@ -235,7 +235,7 @@ export class RelayProtocol {
     handlers.onEvent(event.eventType, event.eventId, event.data);
   }
 
-  private handleResponse(response: RelayResponse): void {
+  private handleResponse(response: WireResponse): void {
     // Check if this is a subscription error response.
     // When a session subscription fails (e.g., 404 for no active process),
     // the server sends a response with id=subscriptionId.
@@ -274,21 +274,21 @@ export class RelayProtocol {
       const statusIcon = response.status >= 400 ? "\u2717" : "\u2190";
       const responseSize = JSON.stringify(response.body).length;
       console.log(
-        `[Relay] ${statusIcon} ${pending.method} ${pending.path} ${response.status} (${duration}ms, ${responseSize} bytes)`,
+        `[WS] ${statusIcon} ${pending.method} ${pending.path} ${response.status} (${duration}ms, ${responseSize} bytes)`,
       );
     }
 
     pending.resolve(response);
   }
 
-  private handleUploadProgress(msg: RelayUploadProgress): void {
+  private handleUploadProgress(msg: WireUploadProgress): void {
     const pending = this.pendingUploads.get(msg.uploadId);
     if (pending?.onProgress) {
       pending.onProgress(msg.bytesReceived);
     }
   }
 
-  private handleUploadComplete(msg: RelayUploadComplete): void {
+  private handleUploadComplete(msg: WireUploadComplete): void {
     const pending = this.pendingUploads.get(msg.uploadId);
     if (pending) {
       this.pendingUploads.delete(msg.uploadId);
@@ -296,7 +296,7 @@ export class RelayProtocol {
     }
   }
 
-  private handleUploadError(msg: RelayUploadError): void {
+  private handleUploadError(msg: WireUploadError): void {
     const pending = this.pendingUploads.get(msg.uploadId);
     if (pending) {
       this.pendingUploads.delete(msg.uploadId);
@@ -305,13 +305,13 @@ export class RelayProtocol {
   }
 
   /**
-   * Make a JSON API request over the relay transport.
+   * Make a JSON API request over the WebSocket transport.
    */
   async fetch<T>(path: string, init?: RequestInit): Promise<T> {
     await this.transport.ensureConnected();
 
     const id = generateId();
-    const method = (init?.method ?? "GET") as RelayRequest["method"];
+    const method = (init?.method ?? "GET") as WireRequest["method"];
 
     let body: unknown;
     if (init?.body) {
@@ -344,7 +344,7 @@ export class RelayProtocol {
     headers["Content-Type"] = "application/json";
     headers["X-Yep-Anywhere"] = "true";
 
-    const request: RelayRequest = {
+    const request: WireRequest = {
       type: "request",
       id,
       method,
@@ -356,7 +356,7 @@ export class RelayProtocol {
     const startTime = Date.now();
 
     if (this.debugEnabled) {
-      console.log(`[Relay] \u2192 ${method} ${request.path}`);
+      console.log(`[WS] \u2192 ${method} ${request.path}`);
     }
 
     return new Promise<T>((resolve, reject) => {
@@ -364,7 +364,7 @@ export class RelayProtocol {
         if (this.debugEnabled) {
           const duration = Date.now() - startTime;
           console.log(
-            `[Relay] \u2717 ${method} ${request.path} TIMEOUT (${duration}ms)`,
+            `[WS] \u2717 ${method} ${request.path} TIMEOUT (${duration}ms)`,
           );
         }
         this.pendingRequests.delete(id);
@@ -372,7 +372,7 @@ export class RelayProtocol {
       }, 30000);
 
       this.pendingRequests.set(id, {
-        resolve: (response: RelayResponse) => {
+        resolve: (response: WireResponse) => {
           if (response.status >= 400) {
             const error = new Error(
               `API error: ${response.status}`,
@@ -412,7 +412,7 @@ export class RelayProtocol {
     const id = generateId();
     const method = "GET";
 
-    const request: RelayRequest = {
+    const request: WireRequest = {
       type: "request",
       id,
       method,
@@ -423,7 +423,7 @@ export class RelayProtocol {
     const startTime = Date.now();
 
     if (this.debugEnabled) {
-      console.log(`[Relay] \u2192 ${method} ${request.path} (blob)`);
+      console.log(`[WS] \u2192 ${method} ${request.path} (blob)`);
     }
 
     return new Promise<Blob>((resolve, reject) => {
@@ -431,7 +431,7 @@ export class RelayProtocol {
         if (this.debugEnabled) {
           const duration = Date.now() - startTime;
           console.log(
-            `[Relay] \u2717 ${method} ${request.path} TIMEOUT (${duration}ms)`,
+            `[WS] \u2717 ${method} ${request.path} TIMEOUT (${duration}ms)`,
           );
         }
         this.pendingRequests.delete(id);
@@ -439,7 +439,7 @@ export class RelayProtocol {
       }, 30000);
 
       this.pendingRequests.set(id, {
-        resolve: (response: RelayResponse) => {
+        resolve: (response: WireResponse) => {
           if (response.status >= 400) {
             reject(new Error(`API error: ${response.status}`));
             return;
@@ -493,7 +493,7 @@ export class RelayProtocol {
     this.transport
       .ensureConnected()
       .then(() => {
-        const msg: RelaySubscribe = {
+        const msg: WireSubscribe = {
           type: "subscribe",
           subscriptionId,
           channel: "session",
@@ -512,7 +512,7 @@ export class RelayProtocol {
         this.subscriptions.delete(subscriptionId);
         this.trackRecentlyClosed(subscriptionId);
         if (this.transport.isConnected()) {
-          const msg: RelayUnsubscribe = {
+          const msg: WireUnsubscribe = {
             type: "unsubscribe",
             subscriptionId,
           };
@@ -550,7 +550,7 @@ export class RelayProtocol {
     this.transport
       .ensureConnected()
       .then(() => {
-        const msg: RelaySubscribe = {
+        const msg: WireSubscribe = {
           type: "subscribe",
           subscriptionId,
           channel: "activity",
@@ -581,7 +581,7 @@ export class RelayProtocol {
           );
         }
         if (this.transport.isConnected()) {
-          const msg: RelayUnsubscribe = {
+          const msg: WireUnsubscribe = {
             type: "unsubscribe",
             subscriptionId,
           };
@@ -614,7 +614,7 @@ export class RelayProtocol {
     this.transport
       .ensureConnected()
       .then(() => {
-        const msg: RelaySubscribe = {
+        const msg: WireSubscribe = {
           type: "subscribe",
           subscriptionId,
           channel: "session-watch",
@@ -634,7 +634,7 @@ export class RelayProtocol {
         this.subscriptions.delete(subscriptionId);
         this.trackRecentlyClosed(subscriptionId);
         if (this.transport.isConnected()) {
-          const msg: RelayUnsubscribe = {
+          const msg: WireUnsubscribe = {
             type: "unsubscribe",
             subscriptionId,
           };
@@ -650,7 +650,7 @@ export class RelayProtocol {
   }
 
   /**
-   * Upload a file via the relay transport.
+   * Upload a file via the WebSocket transport.
    */
   async upload(
     projectId: string,
@@ -679,7 +679,7 @@ export class RelayProtocol {
     });
 
     try {
-      const startMsg: RelayUploadStart = {
+      const startMsg: WireUploadStart = {
         type: "upload_start",
         uploadId,
         projectId,
@@ -714,7 +714,7 @@ export class RelayProtocol {
         }
       }
 
-      const endMsg: RelayUploadEnd = {
+      const endMsg: WireUploadEnd = {
         type: "upload_end",
         uploadId,
       };

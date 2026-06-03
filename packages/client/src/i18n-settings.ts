@@ -107,12 +107,6 @@ export function getSettingsCategories(
       description: t("settingsLocalAccessDescription"),
     },
     {
-      id: "remote",
-      label: t("settingsRemoteTitle"),
-      icon: "🌐",
-      description: t("settingsRemoteDescription"),
-    },
-    {
       id: "providers",
       label: t("settingsProvidersTitle"),
       icon: "🔌",

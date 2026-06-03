@@ -15,8 +15,6 @@ const CURRENT_VERSION = 1;
 export interface ServerSettings {
   /** Whether clients should register the service worker (for push notifications) */
   serviceWorkerEnabled: boolean;
-  /** Whether remote SRP resume sessions should be persisted to disk (default: false/in-memory only) */
-  persistRemoteSessionsToDisk: boolean;
   /** SSH host aliases for remote executors (from ~/.ssh/config) */
   remoteExecutors?: string[];
   /** SSH host aliases for ChromeOS device-bridge targets */
@@ -48,7 +46,6 @@ export interface ServerSettings {
 /** Default settings */
 export const DEFAULT_SERVER_SETTINGS: ServerSettings = {
   serviceWorkerEnabled: true,
-  persistRemoteSessionsToDisk: false,
   lifecycleWebhooksEnabled: false,
   lifecycleWebhookDryRun: true,
 };

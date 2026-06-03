@@ -1,8 +1,7 @@
 /**
  * useRemoteTerminal — connect to a server-side PTY over the existing WS
  * connection. Mirrors the shape of useEmulatorStream:
- * - Resolves a WS-capable Connection (SecureConnection in remote mode,
- *   plain WebSocketConnection in direct mode).
+ * - Resolves a WS-capable Connection (the plain WebSocketConnection).
  * - Sends `terminal_open` on mount and `terminal_close` on unmount (close
  *   only detaches; the server keeps the PTY alive for reattach).
  * - Subscribes to terminal_* server messages, decodes base64 output, and
@@ -11,7 +10,6 @@
 
 import type { TerminalServerMessage } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getGlobalConnection } from "../lib/connection";
 import { getWebSocketConnection } from "../lib/connection/WebSocketConnection";
 import type { Connection } from "../lib/connection/types";
 
@@ -73,11 +71,6 @@ function bytesToBase64(bytes: Uint8Array): string {
 
 /** Resolve a connection capable of sending RemoteClientMessage over WS. */
 function getWsConnection(): Connection | null {
-  const global = getGlobalConnection();
-  if (global?.sendMessage && global.onTerminalMessage) {
-    return global;
-  }
-  // Fall back to direct WS connection (local mode without remote relay).
   // The concrete WebSocketConnection always provides sendMessage and
   // onTerminalMessage; we still return it through the Connection interface.
   return getWebSocketConnection();

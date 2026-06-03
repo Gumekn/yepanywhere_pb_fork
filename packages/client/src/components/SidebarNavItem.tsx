@@ -200,7 +200,7 @@ export interface SidebarNavItemProps {
   hasDraft?: boolean;
   /** Show pulsing activity indicator (e.g., for active agents) */
   hasActivityIndicator?: boolean;
-  /** Base path prefix for relay mode (e.g., "/remote/my-server") */
+  /** Base path prefix for navigation links */
   basePath?: string;
 }
 

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Modal } from "../ui/Modal";
-import { RemoteAccessStep, ThemeStep } from "./steps";
+import { ThemeStep } from "./steps";
 import type { OnboardingStepConfig } from "./types";
 
 /**
@@ -12,11 +12,6 @@ const ONBOARDING_STEPS: OnboardingStepConfig[] = [
     id: "theme",
     title: "Choose Your Theme",
     component: ThemeStep,
-  },
-  {
-    id: "remote-access",
-    title: "Remote Access",
-    component: RemoteAccessStep,
   },
 ];
 

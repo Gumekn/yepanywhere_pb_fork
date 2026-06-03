@@ -4,7 +4,6 @@ import type {
   DeviceType,
 } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getGlobalConnection } from "../lib/connection";
 import { getWebSocketConnection } from "../lib/connection/WebSocketConnection";
 import { generateUUID } from "../lib/uuid";
 import { QUALITY_TO_CRF, getEmulatorSettings } from "./useEmulatorSettings";
@@ -71,7 +70,7 @@ function publishProfileTelemetry(event: DeviceStreamProfileEvent) {
  * Hook that manages WebRTC peer connection and signaling for emulator streaming.
  *
  * Signaling flow:
- * 1. Client sends device_stream_start via relay
+ * 1. Client sends device_stream_start over the WebSocket
  * 2. Server/sidecar responds with device_webrtc_offer (SDP)
  * 3. Client creates RTCPeerConnection, sets remote description, creates answer
  * 4. Client sends device_webrtc_answer
@@ -95,10 +94,6 @@ export function useEmulatorStream(): UseEmulatorStreamResult {
   const unsubRef = useRef<(() => void) | null>(null);
 
   const getConnection = useCallback(() => {
-    // Remote mode: use global SecureConnection
-    const global = getGlobalConnection();
-    if (global) return global;
-    // Local mode: use WebSocket connection
     return getWebSocketConnection();
   }, []);
 
@@ -256,7 +251,7 @@ export function useEmulatorStream(): UseEmulatorStreamResult {
         );
       };
 
-      // Send ICE candidates to sidecar via relay
+      // Send ICE candidates to sidecar over the WebSocket
       pc.onicecandidate = (event) => {
         if (event.candidate) {
           console.log(
@@ -371,7 +366,7 @@ export function useEmulatorStream(): UseEmulatorStreamResult {
 
       // Ensure WebSocket is connected before sending start message
       const ensureConnected = (
-        conn as { ensureConnected?: () => Promise<void> }
+        conn as unknown as { ensureConnected?: () => Promise<void> }
       ).ensureConnected?.bind(conn);
       const sendStart = () => {
         const { maxFps, maxWidth, quality } = getEmulatorSettings();
@@ -421,8 +416,7 @@ export function useEmulatorStream(): UseEmulatorStreamResult {
       // Send stop if we have a session
       if (sessionIdRef.current) {
         try {
-          const global = getGlobalConnection();
-          const conn = global ?? getWebSocketConnection();
+          const conn = getWebSocketConnection();
           conn.sendMessage?.({
             type: "device_stream_stop",
             sessionId: sessionIdRef.current,

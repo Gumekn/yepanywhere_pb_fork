@@ -30,11 +30,6 @@ import { ProjectScanner } from "./projects/scanner.js";
 import { PushNotifier, type PushService } from "./push/index.js";
 import { createPushRoutes } from "./push/routes.js";
 import type { RecentsService } from "./recents/index.js";
-import type {
-  RemoteAccessService,
-  RemoteSessionService,
-} from "./remote-access/index.js";
-import { createRemoteAccessRoutes } from "./remote-access/index.js";
 import { createActivityRoutes } from "./routes/activity.js";
 import { createBrowserProfilesRoutes } from "./routes/browser-profiles.js";
 import { createClientLogsRoutes } from "./routes/client-logs.js";
@@ -72,7 +67,6 @@ import type { BrowserProfileService } from "./services/BrowserProfileService.js"
 import type { ConnectedBrowsersService } from "./services/ConnectedBrowsersService.js";
 import type { ModelInfoService } from "./services/ModelInfoService.js";
 import type { NetworkBindingService } from "./services/NetworkBindingService.js";
-import type { RelayClientService } from "./services/RelayClientService.js";
 import type { ServerSettingsService } from "./services/ServerSettingsService.js";
 import type { SharingService } from "./services/SharingService.js";
 import { CodexSessionReader } from "./sessions/codex-reader.js";
@@ -129,17 +123,6 @@ export interface AppOptions {
   authDisabled?: boolean;
   /** Desktop auth token for Tauri app. Requests with matching X-Desktop-Token header bypass auth. */
   desktopAuthToken?: string;
-  /** RemoteAccessService for SRP-based remote access (optional) */
-  remoteAccessService?: RemoteAccessService;
-  /** RemoteSessionService for session persistence (optional) */
-  remoteSessionService?: RemoteSessionService;
-  /** RelayClientService for relay connection status (optional) */
-  relayClientService?: RelayClientService;
-  /**
-   * Holder for relay config change callback.
-   * The `callback` property can be set after createApp returns.
-   */
-  relayConfigCallbackHolder?: { callback?: () => Promise<void> };
   /** Server host (for server-info endpoint) */
   serverHost?: string;
   /** Server port (for server-info endpoint) */
@@ -234,22 +217,6 @@ export function createApp(options: AppOptions): AppResult {
         authService: options.authService,
         authDisabled: options.authDisabled,
         desktopAuthToken: options.desktopAuthToken,
-      }),
-    );
-  }
-
-  // Remote access routes (SRP authentication for relay)
-  if (options.remoteAccessService) {
-    const callbackHolder = options.relayConfigCallbackHolder;
-    app.route(
-      "/api/remote-access",
-      createRemoteAccessRoutes({
-        remoteAccessService: options.remoteAccessService,
-        remoteSessionService: options.remoteSessionService,
-        relayClientService: options.relayClientService,
-        onRelayConfigChanged: callbackHolder
-          ? () => callbackHolder.callback?.() ?? Promise.resolve()
-          : undefined,
       }),
     );
   }
@@ -473,7 +440,7 @@ export function createApp(options: AppOptions): AppResult {
     );
   }
 
-  // Server admin routes (restart, always available for remote relay)
+  // Server admin routes (restart, always available for remote clients)
   app.route(
     "/api/server",
     createServerAdminRoutes({
@@ -686,10 +653,6 @@ export function createApp(options: AppOptions): AppResult {
       createSettingsRoutes({
         serverSettingsService: options.serverSettingsService,
         onAllowedHostsChanged: updateAllowedHosts,
-        onRemoteSessionPersistenceChanged: options.remoteSessionService
-          ? (enabled) =>
-              options.remoteSessionService?.setDiskPersistenceEnabled(enabled)
-          : undefined,
         onOllamaUrlChanged: (url) => {
           ClaudeOllamaProvider.setOllamaUrl(url);
         },

@@ -23,7 +23,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
       <h2>Network Requests</h2>
       <p>The application makes minimal network requests:</p>
       <ul>
-        <li><strong>Yep Anywhere update service</strong> — The app periodically checks <code>updates.yepanywhere.com</code> for version information, and opening Settings → About or using the manual update check triggers a fresh check. These requests include the running app version and an installation identifier so we can maintain relay compatibility, monitor rollout reliability, and support backwards compatibility.</li>
+        <li><strong>Yep Anywhere update service</strong> — The app periodically checks <code>updates.yepanywhere.com</code> for version information, and opening Settings → About or using the manual update check triggers a fresh check. These requests include the running app version and an installation identifier so we can monitor rollout reliability and support backwards compatibility.</li>
         <li><strong>Your AI provider</strong> — When you run sessions, requests go directly to your configured AI provider (Anthropic, OpenAI, etc.) using your own API keys.</li>
       </ul>
       <p>Aside from update/version checks to <code>updates.yepanywhere.com</code>, app data is not sent to yepanywhere servers. We do not send session contents, prompts, or files to that service.</p>
@@ -35,15 +35,6 @@ import BaseLayout from "../layouts/BaseLayout.astro";
         <li>Server state including logs, uploads, and settings (in <code>~/.yep-anywhere/</code>)</li>
         <li>Push notification VAPID keys (generated locally, no third-party service)</li>
         <li>Optional password hash if you enable authentication</li>
-      </ul>
-
-      <h2>Public Relay (Future)</h2>
-      <p>We're building an optional public relay service to enable secure remote access without requiring Tailscale or port forwarding. If you choose to use the public relay:</p>
-      <ul>
-        <li>Connection metadata (timestamps, bandwidth usage) will be logged to prevent abuse</li>
-        <li>Message content is end-to-end encrypted — the relay cannot read your conversations</li>
-        <li>This is entirely opt-in; local-only usage will always be available</li>
-        <li>You can also self-host your own relay server</li>
       </ul>
 
       <h2>This Website</h2>

@@ -1,5 +1,5 @@
 /**
- * Compression utilities for WebSocket relay protocol (Phase 3).
+ * Compression utilities for the WebSocket wire protocol (Phase 3).
  *
  * Uses native CompressionStream/DecompressionStream APIs (Chrome 80+, Firefox 113+, Safari 16.4+).
  * Falls back gracefully when compression APIs are unavailable.

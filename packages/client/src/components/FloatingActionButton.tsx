@@ -248,11 +248,9 @@ export function FloatingActionButton() {
 
 /**
  * Extract projectId from URL path.
- * Matches: /projects/:projectId, /projects/:projectId/sessions/:sessionId,
- * and relay mode paths like /remote/:username/projects/:projectId
+ * Matches: /projects/:projectId and /projects/:projectId/sessions/:sessionId.
  */
 function extractProjectIdFromPath(pathname: string): string | null {
-  // Match both direct paths and relay mode paths
   const match = pathname.match(/\/projects\/([^/]+)/);
   return match?.[1] ? decodeURIComponent(match[1]) : null;
 }

@@ -1,7 +1,7 @@
 /**
  * Shared subscription handlers for session and activity streams.
  *
- * WebSocket relay handlers call these functions, providing their own
+ * WebSocket handlers call these functions, providing their own
  * `emit` implementation for the transport layer.
  */
 

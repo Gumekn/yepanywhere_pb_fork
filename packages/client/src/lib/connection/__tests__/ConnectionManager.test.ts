@@ -5,7 +5,7 @@ import {
   type ReconnectFn,
   type SendPingFn,
 } from "../ConnectionManager";
-import { RelayReconnectRequiredError, WebSocketCloseError } from "../types";
+import { WebSocketCloseError } from "../types";
 import { MockTimers, MockVisibility } from "./ConnectionSimulator";
 
 /** Flush the microtask queue (needed for promise chains in reconnectFn) */
@@ -195,113 +195,6 @@ describe("ConnectionManager", () => {
 
       expect(cm.state).toBe("disconnected");
       expect(reconnectFailures).toHaveLength(1);
-    });
-  });
-
-  describe("relay error retryability", () => {
-    it("relay timeout → retryable, ConnectionManager retries and succeeds", async () => {
-      const { cm, reconnectFn, timers, reconnectFailures } = setup({
-        maxAttempts: 3,
-      });
-      reconnectFn
-        .mockRejectedValueOnce(
-          new RelayReconnectRequiredError(
-            new Error("Relay connection timeout"),
-          ),
-        )
-        .mockResolvedValueOnce(undefined);
-      cm.start(reconnectFn);
-
-      cm.handleClose();
-      timers.advance(1000);
-      await flush();
-      expect(cm.state).toBe("reconnecting");
-
-      timers.advance(2000);
-      await flush();
-      cm.markConnected();
-
-      expect(cm.state).toBe("connected");
-      expect(reconnectFn).toHaveBeenCalledTimes(2);
-      expect(reconnectFailures).toHaveLength(0);
-    });
-
-    it("server_offline → retryable, ConnectionManager retries", async () => {
-      const { cm, reconnectFn, timers, reconnectFailures } = setup({
-        maxAttempts: 3,
-      });
-      reconnectFn
-        .mockRejectedValueOnce(
-          new RelayReconnectRequiredError(new Error("server_offline")),
-        )
-        .mockResolvedValueOnce(undefined);
-      cm.start(reconnectFn);
-
-      cm.handleClose();
-      timers.advance(1000);
-      await flush();
-      timers.advance(2000);
-      await flush();
-      cm.markConnected();
-
-      expect(cm.state).toBe("connected");
-      expect(reconnectFn).toHaveBeenCalledTimes(2);
-      expect(reconnectFailures).toHaveLength(0);
-    });
-
-    it("unknown_username → non-retryable, immediate disconnect", async () => {
-      const { cm, reconnectFn, timers, reconnectFailures } = setup();
-      reconnectFn.mockRejectedValue(
-        new RelayReconnectRequiredError(new Error("unknown_username")),
-      );
-      cm.start(reconnectFn);
-
-      cm.handleClose();
-      timers.advance(1000);
-      await flush();
-
-      expect(cm.state).toBe("disconnected");
-      expect(reconnectFn).toHaveBeenCalledTimes(1);
-      expect(reconnectFailures).toHaveLength(1);
-    });
-
-    it("missing relay config → non-retryable, immediate disconnect", async () => {
-      const { cm, reconnectFn, timers, reconnectFailures } = setup();
-      reconnectFn.mockRejectedValue(
-        new RelayReconnectRequiredError(
-          new Error("Missing relay config or stored session"),
-        ),
-      );
-      cm.start(reconnectFn);
-
-      cm.handleClose();
-      timers.advance(1000);
-      await flush();
-
-      expect(cm.state).toBe("disconnected");
-      expect(reconnectFn).toHaveBeenCalledTimes(1);
-      expect(reconnectFailures).toHaveLength(1);
-    });
-
-    it("no cause → retryable", async () => {
-      const { cm, reconnectFn, timers, reconnectFailures } = setup({
-        maxAttempts: 3,
-      });
-      reconnectFn
-        .mockRejectedValueOnce(new RelayReconnectRequiredError())
-        .mockResolvedValueOnce(undefined);
-      cm.start(reconnectFn);
-
-      cm.handleClose();
-      timers.advance(1000);
-      await flush();
-      timers.advance(2000);
-      await flush();
-      cm.markConnected();
-
-      expect(cm.state).toBe("connected");
-      expect(reconnectFn).toHaveBeenCalledTimes(2);
-      expect(reconnectFailures).toHaveLength(0);
     });
   });
 

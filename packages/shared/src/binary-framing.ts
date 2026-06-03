@@ -1,5 +1,5 @@
 /**
- * Binary framing utilities for WebSocket relay protocol.
+ * Binary framing utilities for the WebSocket wire protocol.
  *
  * Phase 0 - Unencrypted binary frames:
  * [1 byte: format][payload]

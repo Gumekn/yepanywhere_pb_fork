@@ -3,12 +3,7 @@
 /**
  * Staging server for yepanywhere.com
  *
- * Serves:
- * - / → Astro dev server (site/)
- * - /remote/ → packages/client/dist-remote/ (remote client app)
- *
- * Runs Astro dev server for the marketing site (with HMR) and
- * vite build --watch for the remote client.
+ * Serves the Astro dev server (site/) for the marketing site with HMR.
  *
  * Usage:
  *   pnpm staging              # Default port 3000
@@ -31,7 +26,6 @@ const port = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : 3000;
 const astroPort = port + 10; // Internal Astro dev port (not exposed directly)
 
 const sitePath = path.join(rootDir, "site");
-const remoteDistPath = path.join(rootDir, "packages/client/dist-remote");
 
 // Content types for static files
 const contentTypes = {
@@ -116,26 +110,7 @@ function proxyToAstro(req, res) {
  * Handle incoming requests.
  */
 function handleRequest(req, res) {
-  const url = new URL(req.url, `http://localhost:${port}`);
-  const pathname = url.pathname;
-
-  // /remote/ paths -> serve from dist-remote
-  if (pathname.startsWith("/remote")) {
-    let remotePath = pathname.slice("/remote".length) || "/";
-    if (remotePath === "") remotePath = "/";
-
-    const filePath = path.join(remoteDistPath, remotePath);
-
-    if (remotePath.endsWith("/") || !path.extname(remotePath)) {
-      const indexPath = path.join(remoteDistPath, "remote.html");
-      serveFile(res, filePath, indexPath);
-    } else {
-      serveFile(res, filePath);
-    }
-    return;
-  }
-
-  // All other paths -> proxy to Astro dev server
+  // All paths -> proxy to Astro dev server
   proxyToAstro(req, res);
 }
 
@@ -189,54 +164,6 @@ function startAstroDev() {
 }
 
 /**
- * Start the vite build watcher for the remote client.
- */
-function startViteWatch() {
-  console.log("[Staging] Starting vite build --watch for remote client...");
-
-  const vite = spawn(
-    "pnpm",
-    [
-      "--filter",
-      "client",
-      "exec",
-      "vite",
-      "build",
-      "--watch",
-      "--config",
-      "vite.config.remote.ts",
-      "--base",
-      "/remote/",
-    ],
-    {
-      cwd: rootDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: true,
-    },
-  );
-
-  children.push(vite);
-
-  vite.stdout.on("data", (data) => {
-    const msg = data.toString().trim();
-    if (msg) console.log(`[Vite] ${msg}`);
-  });
-
-  vite.stderr.on("data", (data) => {
-    const msg = data.toString().trim();
-    if (msg) console.error(`[Vite] ${msg}`);
-  });
-
-  vite.on("exit", (code) => {
-    if (code !== null && code !== 0) {
-      console.error(`[Vite] Exited with code ${code}`);
-    }
-  });
-
-  return vite;
-}
-
-/**
  * Start the proxy server.
  */
 function startServer() {
@@ -247,48 +174,10 @@ function startServer() {
     console.log(
       `[Staging]   /         -> Astro dev server (port ${astroPort})`,
     );
-    console.log("[Staging]   /remote/  -> packages/client/dist-remote/");
     console.log("[Staging] Site has HMR via Astro dev server");
   });
 
   return server;
-}
-
-// Check if dist-remote exists, if not do initial build
-async function ensureInitialBuild() {
-  const indexPath = path.join(remoteDistPath, "remote.html");
-  if (!fs.existsSync(indexPath)) {
-    console.log("[Staging] dist-remote not found, running initial build...");
-    return new Promise((resolve, reject) => {
-      const build = spawn(
-        "pnpm",
-        [
-          "--filter",
-          "client",
-          "exec",
-          "vite",
-          "build",
-          "--config",
-          "vite.config.remote.ts",
-          "--base",
-          "/remote/",
-        ],
-        {
-          cwd: rootDir,
-          stdio: "inherit",
-          shell: true,
-        },
-      );
-
-      build.on("exit", (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(`Initial build failed with code ${code}`));
-        }
-      });
-    });
-  }
 }
 
 // Main
@@ -302,14 +191,8 @@ async function main() {
     process.exit(1);
   }
 
-  // Ensure initial remote client build exists
-  await ensureInitialBuild();
-
   // Start Astro dev server for marketing site
   startAstroDev();
-
-  // Start vite watch for remote client
-  startViteWatch();
 
   // Start proxy server
   startServer();

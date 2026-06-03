@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type Subscription,
   connectionManager,
-  getGlobalConnection,
   getWebSocketConnection,
   isNonRetryableError,
 } from "../lib/connection";
@@ -46,12 +45,6 @@ export function useSessionWatchStream(
     if (wsSubscriptionRef.current) return;
     if (mountedKeyRef.current === targetKey) return;
     mountedKeyRef.current = targetKey;
-
-    const globalConn = getGlobalConnection();
-    if (globalConn) {
-      connectWithConnection(target, globalConn);
-      return;
-    }
 
     connectWithConnection(target, getWebSocketConnection());
   }, [target]);

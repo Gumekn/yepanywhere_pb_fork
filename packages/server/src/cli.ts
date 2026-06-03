@@ -94,14 +94,6 @@ SETUP OPTIONS (for headless installation):
                         Set up local authentication with the given password
                         (min 6 characters). Exits after setup.
 
-  --setup-remote-access --username <name> --password <pass> [--relay <url>]
-                        Set up remote access with SRP authentication.
-                        Registers with the relay to verify username availability.
-                        Exits with error if username is taken.
-                        --username: Relay username (3-32 chars, lowercase alphanumeric + hyphens)
-                        --password: SRP password (min 8 characters)
-                        --relay: Relay URL (default: wss://relay.yepanywhere.com/ws)
-
 ENVIRONMENT VARIABLES:
   PORT                          Server port (default: 3400)
   HOST                          Host/interface to bind (default: localhost)
@@ -147,12 +139,6 @@ EXAMPLES:
 
   # Emergency auth bypass (temporary)
   yepanywhere --auth-disable
-
-  # Headless setup: configure remote access
-  yepanywhere --setup-remote-access --username myserver --password "secretpass123"
-
-  # Headless setup: remote access with custom relay
-  yepanywhere --setup-remote-access --username myserver --password "secretpass123" --relay wss://my-relay.example.com/ws
 
 DOCUMENTATION:
   For full documentation, see: https://github.com/kzahel/yepanywhere
@@ -264,64 +250,6 @@ if (setupAuthIndex !== -1) {
   args.splice(setupAuthIndex, 2);
 }
 
-// Parse --setup-remote-access flag and its options
-const setupRemoteIndex = args.indexOf("--setup-remote-access");
-let setupRemoteAccess = false;
-let remoteUsername: string | undefined;
-let remotePassword: string | undefined;
-let remoteRelay: string | undefined;
-
-if (setupRemoteIndex !== -1) {
-  setupRemoteAccess = true;
-  args.splice(setupRemoteIndex, 1);
-
-  // Parse --username
-  const usernameIndex = args.indexOf("--username");
-  if (usernameIndex !== -1) {
-    const usernameValue = args[usernameIndex + 1];
-    if (!usernameValue || usernameValue.startsWith("-")) {
-      console.error("Error: --username requires a value");
-      process.exit(1);
-    }
-    remoteUsername = usernameValue;
-    args.splice(usernameIndex, 2);
-  }
-
-  // Parse --password
-  const passwordIndex = args.indexOf("--password");
-  if (passwordIndex !== -1) {
-    const passwordValue = args[passwordIndex + 1];
-    if (!passwordValue || passwordValue.startsWith("-")) {
-      console.error("Error: --password requires a value");
-      process.exit(1);
-    }
-    remotePassword = passwordValue;
-    args.splice(passwordIndex, 2);
-  }
-
-  // Parse --relay (optional)
-  const relayIndex = args.indexOf("--relay");
-  if (relayIndex !== -1) {
-    const relayValue = args[relayIndex + 1];
-    if (!relayValue || relayValue.startsWith("-")) {
-      console.error("Error: --relay requires a URL value");
-      process.exit(1);
-    }
-    remoteRelay = relayValue;
-    args.splice(relayIndex, 2);
-  }
-
-  // Validate required options
-  if (!remoteUsername) {
-    console.error("Error: --setup-remote-access requires --username");
-    process.exit(1);
-  }
-  if (!remotePassword) {
-    console.error("Error: --setup-remote-access requires --password");
-    process.exit(1);
-  }
-}
-
 // If there are unknown arguments, show error and help
 if (args.length > 0) {
   console.error(`Error: Unknown arguments: ${args.join(" ")}`);
@@ -339,14 +267,8 @@ if (!process.env.NODE_ENV) {
 }
 
 // Handle setup commands (exit after completion)
-if (setupAuthPassword || setupRemoteAccess) {
-  runSetup(
-    setupAuthPassword,
-    setupRemoteAccess,
-    remoteUsername,
-    remotePassword,
-    remoteRelay,
-  );
+if (setupAuthPassword) {
+  runSetup(setupAuthPassword);
 } else {
   // Only check for Claude CLI when starting the server (not for setup commands)
   checkClaudeCli();
@@ -354,22 +276,12 @@ if (setupAuthPassword || setupRemoteAccess) {
   runServer();
 }
 
-async function runSetup(
-  authPassword: string | undefined,
-  remoteAccess: boolean,
-  username: string | undefined,
-  password: string | undefined,
-  relay: string | undefined,
-): Promise<never> {
+async function runSetup(authPassword: string | undefined): Promise<never> {
   try {
-    const { setupAuth, setupRemoteAccess } = await import("./cli-setup.js");
+    const { setupAuth } = await import("./cli-setup.js");
 
     if (authPassword) {
       await setupAuth({ password: authPassword });
-    }
-
-    if (remoteAccess && username && password) {
-      await setupRemoteAccess({ username, password, relayUrl: relay });
     }
 
     process.exit(0);

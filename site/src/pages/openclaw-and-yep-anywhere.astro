@@ -34,7 +34,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 
         <p>The core idea is server-owned processes. Claude runs on your dev machine. You aren't tied to your desk &mdash; walk away, come back, the agent is still working. Push notification when it needs approval, tap approve from your lock screen, it keeps going. Works best for tasks you don't need to manually verify on the desktop.</p>
 
-        <p>But it's grown beyond that. I run Yep Anywhere on all my machines &mdash; desktop, laptop, Pi. The encrypted relay means I can switch between hosts from a menu. It's like ssh without ssh. Kick off a task on my desktop from my phone while I'm on the couch, check on my Pi's build from the same app. When I go out I can continue to brainstorm, execute refactorings, manage multiple agents across multiple projects, deploy fixes, act on PRs, push releases.</p>
+        <p>But it's grown beyond that. I run Yep Anywhere on all my machines &mdash; desktop, laptop, Pi. Over Tailscale I can reach any of them from a menu. It's like ssh without ssh. Kick off a task on my desktop from my phone while I'm on the couch, check on my Pi's build from the same app. When I go out I can continue to brainstorm, execute refactorings, manage multiple agents across multiple projects, deploy fixes, act on PRs, push releases.</p>
 
         <p>For coding tasks, I mostly run in YOLO mode. Once I approve a plan or the task is well-scoped within a repo, I don't need to see every edit. For interesting debugging, I watch and steer. The point is having the <em>choice</em> &mdash; from my phone, at any moment.</p>
 
@@ -76,7 +76,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 
         <p>The <a href="https://news.ycombinator.com/item?id=47028013">HN thread</a> about Peter's announcement is dominated by security concerns.</p>
 
-        <p>Yep Anywhere's answer is layered: E2E encrypted relay (NaCl, XSalsa20-Poly1305), SRP authentication that never exposes your password to the relay server, minimal external dependencies, and human-in-the-loop approval when you want it. The relay server sees only opaque ciphertext. No skill marketplace to be poisoned.</p>
+        <p>Yep Anywhere's answer is layered: you run your own server and reach it over your own network (Tailscale, LAN, or a reverse proxy you control), optional password auth, minimal external dependencies, and human-in-the-loop approval when you want it. Nothing routes through a third party. No skill marketplace to be poisoned.</p>
 
         <h2>Not a competition</h2>
 

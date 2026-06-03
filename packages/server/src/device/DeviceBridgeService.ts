@@ -825,7 +825,7 @@ export class DeviceBridgeService {
   }
 
   // =========================================================================
-  // Public API: Called by relay message router
+  // Public API: Called by the websocket message router
   // =========================================================================
 
   /** Register a client's send function for a streaming session. */

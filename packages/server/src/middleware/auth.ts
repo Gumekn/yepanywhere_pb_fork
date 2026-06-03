@@ -11,7 +11,7 @@
  * Desktop token (DESKTOP_AUTH_TOKEN set):
  * Acts as a minimum auth floor. The token is always accepted as valid auth.
  * If the user has also set up password auth, cookie sessions still work too.
- * Relay-internal (SRP) requests are always allowed. The token prevents
+ * Internal websocket requests are always allowed. The token prevents
  * unauthenticated access when no other auth is configured.
  */
 
@@ -91,8 +91,8 @@ export function createAuthMiddleware(
       return;
     }
 
-    // Skip local password auth for requests from the SRP tunnel.
-    // The relay handler sets this Symbol when routing requests through app.fetch().
+    // Skip local password auth for requests from the trusted local websocket.
+    // The websocket handler sets this Symbol when routing requests through app.fetch().
     // Using a Symbol ensures this cannot be forged by external HTTP requests.
     if (c.env[WS_INTERNAL_AUTHENTICATED]) {
       c.set("authenticated", true);

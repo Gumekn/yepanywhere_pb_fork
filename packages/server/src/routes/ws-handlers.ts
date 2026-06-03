@@ -1,52 +1,32 @@
 /**
- * Shared WebSocket relay handler logic.
+ * Shared WebSocket handler logic for the local `/api/ws` endpoint.
  *
- * This module contains the core message handling logic used by both:
- * - createWsRelayRoutes (Hono's upgradeWebSocket for direct connections)
- * - createAcceptRelayConnection (raw WebSocket for relay connections)
- *
- * The handlers are parameterized by dependencies and connection state,
- * allowing both entry points to share the same implementation.
+ * Clients send HTTP-like requests, subscriptions, and uploads over a single
+ * WebSocket. Messages are plaintext (JSON text frames or binary format frames);
+ * the connection is trusted at the HTTP-upgrade layer (cookie/local policy).
  */
 
 import type { HttpBindings } from "@hono/node-server";
 import type {
-  BinaryFormatValue,
-  EncryptedEnvelope,
-  OriginMetadata,
-  RelayRequest,
-  RelaySubscribe,
-  RelayUnsubscribe,
-  RelayUploadChunk,
-  RelayUploadEnd,
-  RelayUploadStart,
   RemoteClientMessage,
   UrlProjectId,
+  WireRequest,
+  WireSubscribe,
+  WireUnsubscribe,
+  WireUploadChunk,
+  WireUploadEnd,
+  WireUploadStart,
   YepMessage,
 } from "@yep-anywhere/shared";
 import {
-  BinaryFormat,
   UploadChunkError,
   decodeUploadChunkPayload,
   encodeJsonFrame,
-  isSrpClientHello,
-  isSrpClientProof,
-  isSrpSessionResume,
-  isSrpSessionResumeInit,
 } from "@yep-anywhere/shared";
 import type { Hono } from "hono";
-import {
-  encrypt,
-  encryptToBinaryEnvelopeWithCompression,
-} from "../crypto/index.js";
-import type { SrpServerSession } from "../crypto/index.js";
 import type { DeviceBridgeService } from "../device/DeviceBridgeService.js";
 import { getLogger } from "../logging/logger.js";
 import { WS_INTERNAL_AUTHENTICATED } from "../middleware/internal-auth.js";
-import type {
-  RemoteAccessService,
-  RemoteSessionService,
-} from "../remote-access/index.js";
 import type {
   BrowserProfileService,
   ConnectedBrowsersService,
@@ -60,103 +40,21 @@ import type { TerminalService } from "../terminal/TerminalService.js";
 import type { UploadManager } from "../uploads/manager.js";
 import type { EventBus, FocusedSessionWatchManager } from "../watcher/index.js";
 import {
-  type WsConnectionPolicy,
-  isPolicySrpRequired,
-} from "./ws-auth-policy.js";
-import {
   decodeFrameToParsedMessage,
   routeClientMessageSafely,
 } from "./ws-message-router.js";
-import {
-  cleanupSrpConnectionState,
-  createInitialSrpLimiterState,
-  handleSrpHello,
-  handleSrpProof,
-  handleSrpResume,
-  handleSrpResumeInit,
-} from "./ws-srp-handlers.js";
-import {
-  hasEstablishedSrpTransport,
-  shouldMarkInternalWsAuthenticated,
-} from "./ws-transport-auth.js";
-import { parseApplicationClientMessage } from "./ws-transport-message-auth.js";
 
 /** Progress report interval in bytes (64KB) */
 export const PROGRESS_INTERVAL = 64 * 1024;
 
-/** Connection authentication state */
-export type ConnectionAuthState =
-  | "unauthenticated" // Waiting for SRP handshake to begin
-  | "srp_waiting_proof" // Sent challenge, waiting for proof
-  | "authenticated"; // Admitted by trusted policy or SRP complete
-
-interface SrpTokenBucket {
-  capacity: number;
-  refillPerMs: number;
-  tokens: number;
-  lastRefillAt: number;
-}
-
-interface SrpLimiterState {
-  helloBucket: SrpTokenBucket;
-  blockedUntil: number;
-  failedProofCount: number;
-}
-
-interface SrpConnectionLimiterState extends SrpLimiterState {
-  handshakeTimeout: ReturnType<typeof setTimeout> | null;
-}
-
-/** Per-connection state for secure connections */
+/** Per-connection state for the WebSocket connection. */
 export interface ConnectionState {
-  /** SRP session during handshake */
-  srpSession: SrpServerSession | null;
-  /** Derived secretbox key (32 bytes) for encryption */
-  sessionKey: Uint8Array | null;
-  /** Long-lived base key derived from SRP/session key (for compatibility fallback) */
-  baseSessionKey: Uint8Array | null;
-  /** Whether this connection has fallen back to legacy base-key traffic mode */
-  usingLegacyTrafficKey: boolean;
-  /** Authentication state */
-  authState: ConnectionAuthState;
-  /** Admission policy for this connection (distinct from SRP transport key state). */
-  connectionPolicy: WsConnectionPolicy;
-  /**
-   * Whether this authenticated connection must use encrypted envelopes.
-   * Set for SRP-authenticated connections; false for trusted local cookie auth.
-   */
-  requiresEncryptedMessages: boolean;
-  /** Username if authenticated */
-  username: string | null;
-  /** Persistent session ID for resumption (set after successful auth) */
-  sessionId: string | null;
-  /** Whether client sent binary frames (respond with binary if true) - Phase 0 */
+  /** Whether client sent binary frames (respond with binary if true) */
   useBinaryFrames: boolean;
-  /** Whether client sent binary encrypted frames (respond with binary encrypted if true) - Phase 1 */
-  useBinaryEncrypted: boolean;
-  /** Client's supported binary formats (Phase 3 capabilities) - defaults to [0x01] */
-  supportedFormats: Set<BinaryFormatValue>;
-  /** Browser profile ID from SRP hello (for session tracking) */
-  browserProfileId: string | null;
-  /** Origin metadata from SRP hello (for session tracking) */
-  originMetadata: OriginMetadata | null;
-  /** Pending one-time challenge for session resume (if any) */
-  pendingResumeChallenge: {
-    nonce: string;
-    sessionId: string;
-    username: string;
-    issuedAt: number;
-  } | null;
-  /** SRP rate-limit and handshake timeout state */
-  srpLimiter: SrpConnectionLimiterState;
-  /** Next sequence number for encrypted messages sent to the peer */
-  nextOutboundSeq: number;
-  /** Last accepted inbound encrypted sequence from the peer */
-  lastInboundSeq: number | null;
 }
 
-/** Tracks an active upload over WebSocket relay */
-export interface RelayUploadState {
+/** Tracks an active upload over the WebSocket */
+export interface WsUploadState {
   /** Client-provided upload ID */
   clientUploadId: string;
   /** Server-generated upload ID from UploadManager */
@@ -188,15 +86,15 @@ export interface WSAdapter {
 export type SendFn = (msg: YepMessage) => void;
 
 /**
- * Dependencies for relay handlers.
+ * Dependencies for the WebSocket handlers.
  */
-export interface RelayHandlerDeps {
+export interface WsHandlerDeps {
   /** The main Hono app to route requests through */
   app: Hono<{ Bindings: HttpBindings }>;
   /** Base URL for internal requests (e.g., "http://localhost:3400") */
   baseUrl: string;
   /**
-   * Reverse-proxy URL prefix to prepend to relay request paths before
+   * Reverse-proxy URL prefix to prepend to tunneled request paths before
    * they hit the Hono app. Clients send protocol-level paths like
    * "/api/foo" that are agnostic of the deploy prefix; we apply the
    * prefix here so the wrapped Hono routes (`${basePath}/api/foo`) match.
@@ -208,10 +106,6 @@ export interface RelayHandlerDeps {
   eventBus: EventBus;
   /** Upload manager for handling file uploads */
   uploadManager: UploadManager;
-  /** Remote access service for SRP authentication (optional for direct, required for relay) */
-  remoteAccessService?: RemoteAccessService;
-  /** Remote session service for session persistence (optional for direct, required for relay) */
-  remoteSessionService?: RemoteSessionService;
   /** Connected browsers service for tracking WS connections (optional) */
   connectedBrowsers?: ConnectedBrowsersService;
   /** Browser profile service for tracking connection origins (optional) */
@@ -229,36 +123,17 @@ export interface RelayHandlerDeps {
  */
 export function createConnectionState(): ConnectionState {
   return {
-    srpSession: null,
-    sessionKey: null,
-    baseSessionKey: null,
-    usingLegacyTrafficKey: false,
-    authState: "unauthenticated",
-    connectionPolicy: "srp_required",
-    requiresEncryptedMessages: false,
-    username: null,
-    sessionId: null,
     useBinaryFrames: false,
-    useBinaryEncrypted: false,
-    supportedFormats: new Set([BinaryFormat.JSON]),
-    browserProfileId: null,
-    originMetadata: null,
-    pendingResumeChallenge: null,
-    srpLimiter: createInitialSrpLimiterState(),
-    nextOutboundSeq: 0,
-    lastInboundSeq: null,
   };
 }
 
-export function cleanupConnectionState(connState: ConnectionState): void {
-  cleanupSrpConnectionState(connState);
+export function cleanupConnectionState(_connState: ConnectionState): void {
+  // No per-connection resources to release for plaintext local connections.
 }
 
 /**
- * Create an encryption-aware send function for a connection.
- * Automatically encrypts messages when the connection is authenticated with a session key.
- * Uses binary frames when the client has sent binary frames (Phase 0/1 binary protocol).
- * Compresses large payloads when client supports format 0x03 (Phase 3).
+ * Create a send function for a connection.
+ * Uses binary frames when the client has sent binary frames; otherwise text.
  */
 export function createSendFn(
   ws: WSAdapter,
@@ -266,44 +141,15 @@ export function createSendFn(
 ): SendFn {
   return (msg: YepMessage) => {
     try {
-      if (hasEstablishedSrpTransport(connState)) {
-        const seq = connState.nextOutboundSeq;
-        connState.nextOutboundSeq += 1;
-        const plaintext = JSON.stringify({ seq, msg });
-
-        if (connState.useBinaryEncrypted) {
-          // Phase 1/3: Binary encrypted envelope with optional compression
-          const supportsCompression = connState.supportedFormats.has(
-            BinaryFormat.COMPRESSED_JSON,
-          );
-          const envelope = encryptToBinaryEnvelopeWithCompression(
-            plaintext,
-            connState.sessionKey,
-            supportsCompression,
-          );
-          ws.send(envelope);
-        } else {
-          // Legacy: JSON encrypted envelope
-          const { nonce, ciphertext } = encrypt(
-            plaintext,
-            connState.sessionKey,
-          );
-          const envelope: EncryptedEnvelope = {
-            type: "encrypted",
-            nonce,
-            ciphertext,
-          };
-          ws.send(JSON.stringify(envelope));
-        }
-      } else if (connState.useBinaryFrames) {
+      if (connState.useBinaryFrames) {
         // Client sent binary frames, respond with binary
         ws.send(encodeJsonFrame(msg));
       } else {
-        // Text frame fallback (backwards compat)
+        // Text frame
         ws.send(JSON.stringify(msg));
       }
     } catch (err) {
-      console.warn("[WS Relay] Failed to send message, closing socket:", err);
+      console.warn("[WS] Failed to send message, closing socket:", err);
       try {
         ws.close(1011, "Send failed");
       } catch {
@@ -314,14 +160,13 @@ export function createSendFn(
 }
 
 /**
- * Handle a RelayRequest by routing it through the Hono app.
+ * Handle a WireRequest by routing it through the Hono app.
  */
 export async function handleRequest(
-  request: RelayRequest,
+  request: WireRequest,
   send: SendFn,
   app: Hono<{ Bindings: HttpBindings }>,
   baseUrl: string,
-  connState: ConnectionState,
   basePath = "",
 ): Promise<void> {
   try {
@@ -334,7 +179,7 @@ export async function handleRequest(
     const url = new URL(prefixed, baseUrl);
     const headers = new Headers(request.headers);
     headers.set("X-Yep-Anywhere", "true");
-    headers.set("X-Ws-Relay", "true");
+    headers.set("X-Ws-Internal", "true");
     if (request.body !== undefined) {
       headers.set("Content-Type", "application/json");
     }
@@ -353,11 +198,9 @@ export async function handleRequest(
     }
 
     const fetchRequest = new Request(url.toString(), fetchInit);
-    // Mark requests from authenticated websocket transport as internal auth so
-    // cookie middleware does not re-challenge routed API requests.
-    const internalEnv = shouldMarkInternalWsAuthenticated(connState)
-      ? { [WS_INTERNAL_AUTHENTICATED]: true }
-      : {};
+    // Local WS connections are trusted at the HTTP-upgrade layer, so mark
+    // routed API requests as internally authenticated to skip cookie re-checks.
+    const internalEnv = { [WS_INTERNAL_AUTHENTICATED]: true };
     const response = await app.fetch(fetchRequest, internalEnv);
 
     let body: unknown;
@@ -404,7 +247,7 @@ export async function handleRequest(
       body,
     });
   } catch (err) {
-    console.error("[WS Relay] Request error:", err);
+    console.error("[WS] Request error:", err);
     send({
       type: "response",
       id: request.id,
@@ -416,11 +259,11 @@ export async function handleRequest(
 
 /**
  * Handle a session subscription.
- * Subscribes to process events, computes augments, and forwards them as RelayEvent messages.
+ * Subscribes to process events, computes augments, and forwards them as WireEvent messages.
  */
 export function handleSessionSubscribe(
   subscriptions: Map<string, () => void>,
-  msg: RelaySubscribe,
+  msg: WireSubscribe,
   send: SendFn,
   supervisor: Supervisor,
 ): void {
@@ -460,24 +303,22 @@ export function handleSessionSubscribe(
 
   const { cleanup } = createSessionSubscription(process, sendEvent, {
     onError: (err) => {
-      console.error("[WS Relay] Error in session subscription:", err);
+      console.error("[WS] Error in session subscription:", err);
     },
   });
 
   subscriptions.set(subscriptionId, cleanup);
 
-  console.log(
-    `[WS Relay] Subscribed to session ${sessionId} (${subscriptionId})`,
-  );
+  console.log(`[WS] Subscribed to session ${sessionId} (${subscriptionId})`);
 }
 
 /**
  * Handle an activity subscription.
- * Subscribes to event bus and forwards events as RelayEvent messages.
+ * Subscribes to event bus and forwards events as WireEvent messages.
  */
 export function handleActivitySubscribe(
   subscriptions: Map<string, () => void>,
-  msg: RelaySubscribe,
+  msg: WireSubscribe,
   send: SendFn,
   eventBus: EventBus,
   connectedBrowsers?: ConnectedBrowsersService,
@@ -496,10 +337,7 @@ export function handleActivitySubscribe(
     browserProfileService
       .recordConnection(browserProfileId, originMetadata)
       .catch((err) => {
-        console.warn(
-          "[WS Relay] Failed to record browser profile origin:",
-          err,
-        );
+        console.warn("[WS] Failed to record browser profile origin:", err);
       });
   }
 
@@ -517,7 +355,7 @@ export function handleActivitySubscribe(
   const { cleanup } = createActivitySubscription(eventBus, sendEvent, {
     logLabel: subscriptionId,
     onError: (err) => {
-      console.error("[WS Relay] Error in activity subscription:", err);
+      console.error("[WS] Error in activity subscription:", err);
     },
   });
 
@@ -528,7 +366,7 @@ export function handleActivitySubscribe(
     }
   });
 
-  getLogger().debug(`[WS Relay] Subscribed to activity (${subscriptionId})`);
+  getLogger().debug(`[WS] Subscribed to activity (${subscriptionId})`);
 }
 
 /**
@@ -537,7 +375,7 @@ export function handleActivitySubscribe(
  */
 export function handleSessionWatchSubscribe(
   subscriptions: Map<string, () => void>,
-  msg: RelaySubscribe,
+  msg: WireSubscribe,
   send: SendFn,
   focusedSessionWatchManager?: FocusedSessionWatchManager,
 ): void {
@@ -599,7 +437,7 @@ export function handleSessionWatchSubscribe(
   });
 
   getLogger().debug(
-    `[WS Relay] Subscribed to session-watch ${sessionId} (${subscriptionId})`,
+    `[WS] Subscribed to session-watch ${sessionId} (${subscriptionId})`,
   );
 }
 
@@ -608,7 +446,7 @@ export function handleSessionWatchSubscribe(
  */
 export function handleSubscribe(
   subscriptions: Map<string, () => void>,
-  msg: RelaySubscribe,
+  msg: WireSubscribe,
   send: SendFn,
   supervisor: Supervisor,
   eventBus: EventBus,
@@ -668,14 +506,14 @@ export function handleSubscribe(
  */
 export function handleUnsubscribe(
   subscriptions: Map<string, () => void>,
-  msg: RelayUnsubscribe,
+  msg: WireUnsubscribe,
 ): void {
   const { subscriptionId } = msg;
   const cleanup = subscriptions.get(subscriptionId);
   if (cleanup) {
     cleanup();
     subscriptions.delete(subscriptionId);
-    getLogger().debug(`[WS Relay] Unsubscribed (${subscriptionId})`);
+    getLogger().debug(`[WS] Unsubscribed (${subscriptionId})`);
   }
 }
 
@@ -683,8 +521,8 @@ export function handleUnsubscribe(
  * Handle upload_start message.
  */
 export async function handleUploadStart(
-  uploads: Map<string, RelayUploadState>,
-  msg: RelayUploadStart,
+  uploads: Map<string, WsUploadState>,
+  msg: WireUploadStart,
   send: SendFn,
   uploadManager: UploadManager,
 ): Promise<void> {
@@ -720,7 +558,7 @@ export async function handleUploadStart(
     send({ type: "upload_progress", uploadId, bytesReceived: 0 });
 
     console.log(
-      `[WS Relay] Upload started: ${uploadId} (${filename}, ${size} bytes)`,
+      `[WS] Upload started: ${uploadId} (${filename}, ${size} bytes)`,
     );
   } catch (err) {
     const message =
@@ -733,8 +571,8 @@ export async function handleUploadStart(
  * Handle upload_chunk message.
  */
 export async function handleUploadChunk(
-  uploads: Map<string, RelayUploadState>,
-  msg: RelayUploadChunk,
+  uploads: Map<string, WsUploadState>,
+  msg: WireUploadChunk,
   send: SendFn,
   uploadManager: UploadManager,
 ): Promise<void> {
@@ -798,7 +636,7 @@ export async function handleUploadChunk(
  * Payload format: [16 bytes UUID][8 bytes offset big-endian][chunk data]
  */
 export async function handleBinaryUploadChunk(
-  uploads: Map<string, RelayUploadState>,
+  uploads: Map<string, WsUploadState>,
   payload: Uint8Array,
   send: SendFn,
   uploadManager: UploadManager,
@@ -813,7 +651,7 @@ export async function handleBinaryUploadChunk(
       e instanceof UploadChunkError
         ? `Invalid upload chunk: ${e.message}`
         : "Invalid binary upload chunk format";
-    console.warn(`[WS Relay] ${message}`, e);
+    console.warn(`[WS] ${message}`, e);
     send({
       type: "response",
       id: "binary-upload-error",
@@ -879,8 +717,8 @@ export async function handleBinaryUploadChunk(
  * Handle upload_end message.
  */
 export async function handleUploadEnd(
-  uploads: Map<string, RelayUploadState>,
-  msg: RelayUploadEnd,
+  uploads: Map<string, WsUploadState>,
+  msg: WireUploadEnd,
   send: SendFn,
   uploadManager: UploadManager,
 ): Promise<void> {
@@ -899,9 +737,7 @@ export async function handleUploadEnd(
     const file = await uploadManager.completeUpload(state.serverUploadId);
     uploads.delete(uploadId);
     send({ type: "upload_complete", uploadId, file });
-    getLogger().debug(
-      `[WS Relay] Upload complete: ${uploadId} (${file.size} bytes)`,
-    );
+    getLogger().debug(`[WS] Upload complete: ${uploadId} (${file.size} bytes)`);
   } catch (err) {
     const message =
       err instanceof Error ? err.message : "Failed to complete upload";
@@ -919,22 +755,22 @@ export async function handleUploadEnd(
  * Clean up all active uploads for a connection.
  */
 export async function cleanupUploads(
-  uploads: Map<string, RelayUploadState>,
+  uploads: Map<string, WsUploadState>,
   uploadManager: UploadManager,
 ): Promise<void> {
   for (const [clientId, state] of uploads) {
     try {
       await uploadManager.cancelUpload(state.serverUploadId);
-      console.log(`[WS Relay] Cancelled upload on disconnect: ${clientId}`);
+      console.log(`[WS] Cancelled upload on disconnect: ${clientId}`);
     } catch (err) {
-      console.error(`[WS Relay] Error cancelling upload ${clientId}:`, err);
+      console.error(`[WS] Error cancelling upload ${clientId}:`, err);
     }
   }
   uploads.clear();
 }
 
 /**
- * Options for handleMessage that differ between direct and relay connections.
+ * Options for handleMessage.
  */
 export interface HandleMessageOptions {
   /**
@@ -952,25 +788,16 @@ export interface HandleMessageOptions {
 export async function handleMessage(
   ws: WSAdapter,
   subscriptions: Map<string, () => void>,
-  uploads: Map<string, RelayUploadState>,
+  uploads: Map<string, WsUploadState>,
   connState: ConnectionState,
   send: SendFn,
   data: unknown,
-  deps: RelayHandlerDeps,
+  deps: WsHandlerDeps,
   options: HandleMessageOptions,
   deviceSessions?: Set<string>,
   terminalAttachId?: string,
 ): Promise<void> {
-  const {
-    app,
-    baseUrl,
-    supervisor,
-    eventBus,
-    uploadManager,
-    remoteAccessService,
-    remoteSessionService,
-  } = deps;
-  const srpRequiredPolicy = isPolicySrpRequired(connState.connectionPolicy);
+  const { app, baseUrl, supervisor, eventBus, uploadManager } = deps;
 
   // Debug: log incoming data type and preview
   // Check Buffer BEFORE Uint8Array since Buffer extends Uint8Array
@@ -997,13 +824,13 @@ export async function handleMessage(
             .join(" ")}...]`
         : String(data).slice(0, 100);
   getLogger().debug(
-    `[WS Relay] handleMessage: type=${dataType}, isBinary=${options.isBinary}, preview=${preview}`,
+    `[WS] handleMessage: type=${dataType}, isBinary=${options.isBinary}, preview=${preview}`,
   );
 
   const routeClientMessage = async (msg: RemoteClientMessage): Promise<void> =>
     routeClientMessageSafely(msg, send, {
       onRequest: async (requestMsg) =>
-        handleRequest(requestMsg, send, app, baseUrl, connState, deps.basePath),
+        handleRequest(requestMsg, send, app, baseUrl, deps.basePath),
       onSubscribe: async (subscribeMsg) =>
         handleSubscribe(
           subscriptions,
@@ -1071,12 +898,10 @@ export async function handleMessage(
     data,
     options,
     connState,
-    srpRequiredPolicy,
     {
       uploads,
       send,
       uploadManager,
-      routeClientMessage,
       handleBinaryUploadChunk,
     },
   );
@@ -1084,38 +909,7 @@ export async function handleMessage(
     return;
   }
 
-  // Handle SRP messages first (always plaintext)
-  if (isSrpSessionResumeInit(parsed)) {
-    await handleSrpResumeInit(ws, connState, parsed, remoteSessionService);
-    return;
-  }
-
-  if (isSrpSessionResume(parsed)) {
-    await handleSrpResume(ws, connState, parsed, remoteSessionService);
-    return;
-  }
-
-  if (isSrpClientHello(parsed)) {
-    await handleSrpHello(ws, connState, parsed, remoteAccessService);
-    return;
-  }
-
-  if (isSrpClientProof(parsed)) {
-    await handleSrpProof(ws, connState, parsed, parsed.A, remoteSessionService);
-    return;
-  }
-
-  const msg = parseApplicationClientMessage(
-    ws,
-    connState,
-    srpRequiredPolicy,
-    parsed,
-  );
-  if (!msg) {
-    return;
-  }
-
-  await routeClientMessage(msg);
+  await routeClientMessage(parsed as RemoteClientMessage);
 }
 
 /**
@@ -1134,7 +928,7 @@ export function cleanupDeviceSessions(
       });
     } catch (err) {
       console.error(
-        `[WS Relay] Error cleaning up emulator session ${sessionId}:`,
+        `[WS] Error cleaning up emulator session ${sessionId}:`,
         err,
       );
     }
@@ -1155,7 +949,7 @@ export function cleanupTerminalAttachments(
   try {
     terminalService.detachAll(terminalAttachId);
   } catch (err) {
-    console.error("[WS Relay] Error detaching terminals:", err);
+    console.error("[WS] Error detaching terminals:", err);
   }
 }
 
@@ -1169,7 +963,7 @@ export function cleanupSubscriptions(
     try {
       cleanup();
     } catch (err) {
-      console.error(`[WS Relay] Error cleaning up subscription ${id}:`, err);
+      console.error(`[WS] Error cleaning up subscription ${id}:`, err);
     }
   }
   subscriptions.clear();

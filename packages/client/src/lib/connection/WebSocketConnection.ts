@@ -13,7 +13,7 @@ import {
 } from "@yep-anywhere/shared";
 import { getDesktopAuthToken } from "../../api/client";
 import { API_BASE } from "../apiPath";
-import { RelayProtocol } from "./RelayProtocol";
+import { WireProtocol } from "./WireProtocol";
 import type {
   Connection,
   StreamHandlers,
@@ -25,19 +25,19 @@ import { WebSocketCloseError } from "./types";
 /**
  * Connection to yepanywhere server using WebSocket transport.
  *
- * Implements the relay protocol for HTTP-like request/response
- * over a single WebSocket connection. Protocol logic (request correlation,
- * subscriptions, uploads) is delegated to RelayProtocol.
+ * Implements an HTTP-like request/response protocol over a single WebSocket
+ * connection. Protocol logic (request correlation, subscriptions, uploads)
+ * is delegated to WireProtocol.
  */
 export class WebSocketConnection implements Connection {
   readonly mode = "direct" as const;
 
   private ws: WebSocket | null = null;
   private connectionPromise: Promise<void> | null = null;
-  private protocol: RelayProtocol;
+  private protocol: WireProtocol;
 
   constructor() {
-    this.protocol = new RelayProtocol(
+    this.protocol = new WireProtocol(
       {
         sendMessage: (msg) => this.send(msg),
         sendUploadChunk: (id, offset, chunk) => {

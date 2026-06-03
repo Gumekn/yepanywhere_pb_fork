@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, fetchJSON } from "../../api/client";
-import { useOptionalRemoteConnection } from "../../contexts/RemoteConnectionContext";
 import { useDeveloperMode } from "../../hooks/useDeveloperMode";
 import { useOnboarding } from "../../hooks/useOnboarding";
 import { usePwaInstall } from "../../hooks/usePwaInstall";
@@ -17,15 +16,9 @@ export function AboutSettings() {
     error: versionError,
     refetchFresh: refetchVersionFresh,
   } = useVersion({ freshOnMount: true });
-  const remoteConnection = useOptionalRemoteConnection();
   const { resetOnboarding } = useOnboarding();
   const { remoteLogCollectionEnabled, setRemoteLogCollectionEnabled } =
     useDeveloperMode();
-  const isRelayConnection = !!remoteConnection?.currentRelayUsername;
-  const hasResumeProtocolSupport =
-    (versionInfo?.resumeProtocolVersion ?? 1) >= 2;
-  const showRelayResumeUpdateWarning =
-    isRelayConnection && !!versionInfo && !hasResumeProtocolSupport;
 
   // Server restart state
   const [restarting, setRestarting] = useState(false);
@@ -122,9 +115,6 @@ export function AboutSettings() {
             </p>
             {versionError && (
               <p className="settings-warning">{t("aboutUnableRefresh")}</p>
-            )}
-            {showRelayResumeUpdateWarning && (
-              <p className="settings-warning">{t("aboutRelayResumeWarning")}</p>
             )}
             {versionInfo?.updateAvailable && (
               <p className="settings-update-hint">{t("aboutUpdateHint")}</p>

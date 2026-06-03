@@ -10,7 +10,6 @@ describe("api.updateServerSettings", () => {
       json: async () => ({
         settings: {
           serviceWorkerEnabled: true,
-          persistRemoteSessionsToDisk: false,
         },
       }),
     } as Response);

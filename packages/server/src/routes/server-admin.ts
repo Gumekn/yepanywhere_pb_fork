@@ -9,7 +9,7 @@ export interface ServerAdminDeps {
 
 /**
  * Administrative routes for server management.
- * Always mounted (not dev-mode-only), so remote relay clients can use them.
+ * Always mounted (not dev-mode-only), so remote clients can use them.
  */
 export function createServerAdminRoutes(deps: ServerAdminDeps): Hono {
   const routes = new Hono();

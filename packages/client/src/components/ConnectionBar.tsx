@@ -13,7 +13,7 @@ import { useActivityBusState } from "../hooks/useActivityBusState";
 import { useDeveloperMode } from "../hooks/useDeveloperMode";
 
 /** Routes where we don't show the connection bar */
-const LOGIN_ROUTES = ["/login", "/login/direct", "/login/relay"];
+const LOGIN_ROUTES = ["/login"];
 
 export function ConnectionBar() {
   const location = useLocation();

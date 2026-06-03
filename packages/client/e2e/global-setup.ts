@@ -23,10 +23,6 @@ let E2E_TEMP_DIR: string;
 let PORT_FILE: string;
 let MAINTENANCE_PORT_FILE: string;
 let PID_FILE: string;
-let REMOTE_CLIENT_PORT_FILE: string;
-let REMOTE_CLIENT_PID_FILE: string;
-let RELAY_PORT_FILE: string;
-let RELAY_PID_FILE: string;
 
 // Isolated test directories to avoid polluting real ~/.claude, ~/.codex, ~/.gemini
 let E2E_TEST_DIR: string;
@@ -74,10 +70,6 @@ export default async function globalSetup() {
   PORT_FILE = join(E2E_TEMP_DIR, "port");
   MAINTENANCE_PORT_FILE = join(E2E_TEMP_DIR, "maintenance-port");
   PID_FILE = join(E2E_TEMP_DIR, "pid");
-  REMOTE_CLIENT_PORT_FILE = join(E2E_TEMP_DIR, "remote-port");
-  REMOTE_CLIENT_PID_FILE = join(E2E_TEMP_DIR, "remote-pid");
-  RELAY_PORT_FILE = join(E2E_TEMP_DIR, "relay-port");
-  RELAY_PID_FILE = join(E2E_TEMP_DIR, "relay-pid");
 
   // Set up isolated test directories within the temp dir
   E2E_TEST_DIR = join(E2E_TEMP_DIR, "sessions");
@@ -107,10 +99,6 @@ export default async function globalSetup() {
       portFile: PORT_FILE,
       maintenancePortFile: MAINTENANCE_PORT_FILE,
       pidFile: PID_FILE,
-      remoteClientPortFile: REMOTE_CLIENT_PORT_FILE,
-      remoteClientPidFile: REMOTE_CLIENT_PID_FILE,
-      relayPortFile: RELAY_PORT_FILE,
-      relayPidFile: RELAY_PID_FILE,
     }),
   );
 
@@ -152,55 +140,6 @@ export default async function globalSetup() {
     cwd: repoRoot,
     stdio: "inherit",
   });
-
-  // Start relay server for relay integration tests
-  const relayDataDir = join(E2E_TEST_DIR, "relay");
-  mkdirSync(relayDataDir, { recursive: true });
-
-  console.log("[E2E] Starting relay server...");
-  const relayRoot = join(repoRoot, "packages", "relay");
-  const relayProcess = spawn(
-    "pnpm",
-    ["exec", "tsx", "--conditions", "source", "src/index.ts"],
-    {
-      cwd: relayRoot,
-      env: {
-        ...process.env,
-        RELAY_PORT: "0", // Auto-assign port
-        RELAY_PORT_FILE: RELAY_PORT_FILE,
-        RELAY_DATA_DIR: relayDataDir,
-        RELAY_LOG_LEVEL: "warn", // Reduce noise, port comes from file
-        RELAY_LOG_TO_FILE: "false",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-    },
-  );
-
-  if (relayProcess.pid) {
-    writeFileSync(RELAY_PID_FILE, String(relayProcess.pid));
-  }
-
-  // Log stderr for debugging
-  relayProcess.stderr?.on("data", (data: Buffer) => {
-    const msg = data.toString();
-    if (!msg.includes("ExperimentalWarning")) {
-      console.error("[E2E Relay]", msg);
-    }
-  });
-
-  relayProcess.on("error", (err) => {
-    console.error("[E2E Relay] Process error:", err);
-  });
-
-  // Wait for port file
-  const relayPort = await waitForPortFile(
-    RELAY_PORT_FILE,
-    "relay server",
-    30000,
-  );
-  console.log(`[E2E] Relay server on port ${relayPort}`);
-  relayProcess.unref();
 
   // Start main server with PORT_FILE for port reporting
   console.log("[E2E] Starting main server...");
@@ -279,47 +218,6 @@ export default async function globalSetup() {
   }
 
   serverProcess.unref();
-
-  // Start remote client Vite dev server
-  console.log("[E2E] Starting remote client dev server...");
-  const remoteClientProcess = spawn(
-    "pnpm",
-    ["exec", "tsx", "--conditions", "source", "e2e/start-vite-remote.ts"],
-    {
-      cwd: join(repoRoot, "packages", "client"),
-      env: {
-        ...process.env,
-        VITE_PORT_FILE: REMOTE_CLIENT_PORT_FILE,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-    },
-  );
-
-  if (remoteClientProcess.pid) {
-    writeFileSync(REMOTE_CLIENT_PID_FILE, String(remoteClientProcess.pid));
-  }
-
-  // Log stderr for debugging
-  remoteClientProcess.stderr?.on("data", (data: Buffer) => {
-    const msg = data.toString();
-    if (!msg.includes("ExperimentalWarning")) {
-      console.error("[E2E Remote Client]", msg);
-    }
-  });
-
-  remoteClientProcess.on("error", (err) => {
-    console.error("[E2E Remote Client] Process error:", err);
-  });
-
-  // Wait for port file
-  const remotePort = await waitForPortFile(
-    REMOTE_CLIENT_PORT_FILE,
-    "remote client",
-    30000,
-  );
-  console.log(`[E2E] Remote client dev server on port ${remotePort}`);
-  remoteClientProcess.unref();
 }
 
 // Export session file path for teardown

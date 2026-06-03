@@ -5,13 +5,6 @@ export {
 } from "./InstallService.js";
 
 export {
-  RelayClientService,
-  type RelayClientConfig,
-  type RelayClientState,
-  type RelayClientStatus,
-} from "./RelayClientService.js";
-
-export {
   NetworkBindingService,
   type NetworkBindingServiceOptions,
   type NetworkBindingState,

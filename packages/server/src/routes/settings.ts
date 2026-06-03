@@ -24,10 +24,6 @@ export interface SettingsRoutesDeps {
   serverSettingsService: ServerSettingsService;
   /** Callback to apply allowedHosts changes at runtime */
   onAllowedHostsChanged?: (value: string | undefined) => void;
-  /** Callback to apply remote session persistence changes at runtime */
-  onRemoteSessionPersistenceChanged?: (
-    enabled: boolean,
-  ) => Promise<void> | void;
   /** Callback to apply Ollama URL changes at runtime */
   onOllamaUrlChanged?: (url: string | undefined) => void;
   /** Callback to apply Ollama system prompt changes at runtime */
@@ -126,7 +122,6 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
   const {
     serverSettingsService,
     onAllowedHostsChanged,
-    onRemoteSessionPersistenceChanged,
     onOllamaUrlChanged,
     onOllamaSystemPromptChanged,
     onOllamaUseFullSystemPromptChanged,
@@ -154,10 +149,6 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
     if (typeof body.serviceWorkerEnabled === "boolean") {
       updates.serviceWorkerEnabled = body.serviceWorkerEnabled;
     }
-    if (typeof body.persistRemoteSessionsToDisk === "boolean") {
-      updates.persistRemoteSessionsToDisk = body.persistRemoteSessionsToDisk;
-    }
-
     // Handle remoteExecutors array
     if (Array.isArray(body.remoteExecutors)) {
       const { hosts, invalidHost } = parseHostAliasList(body.remoteExecutors);
@@ -293,14 +284,6 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
     // Apply allowedHosts change to middleware at runtime
     if ("allowedHosts" in updates && onAllowedHostsChanged) {
       onAllowedHostsChanged(settings.allowedHosts);
-    }
-    if (
-      "persistRemoteSessionsToDisk" in updates &&
-      onRemoteSessionPersistenceChanged
-    ) {
-      await onRemoteSessionPersistenceChanged(
-        settings.persistRemoteSessionsToDisk,
-      );
     }
     if ("ollamaUrl" in updates && onOllamaUrlChanged) {
       onOllamaUrlChanged(settings.ollamaUrl);
