@@ -143,6 +143,13 @@ interface StartSessionBody {
   executor?: string;
   /** Permission rules for tool filtering (deny/allow patterns) */
   permissions?: PermissionRules;
+  /**
+   * Rewind/edit: resume the session only up to (and including) this message
+   * UUID, branching the conversation in place (same session id). Pass the
+   * edited message's parentUuid so that message and everything after it are
+   * dropped. Maps to the SDK `resumeSessionAt` option. Claude provider only.
+   */
+  resumeSessionAt?: string;
 }
 
 interface CreateSessionBody {
@@ -1364,6 +1371,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         executor,
         globalInstructions,
         permissions: body.permissions,
+        // Rewind/edit: resume the SAME session but only up to (and including)
+        // this message UUID, branching the conversation in place. The old tail
+        // becomes a dead branch the reader filters out by timestamp. Pass the
+        // edited message's parentUuid so that message and everything after it
+        // are dropped. Claude provider only (SDK feature).
+        resumeSessionAt:
+          providerName === "claude" ? body.resumeSessionAt : undefined,
       },
     );
 

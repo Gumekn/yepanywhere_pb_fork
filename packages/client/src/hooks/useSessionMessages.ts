@@ -77,6 +77,8 @@ export interface UseSessionMessagesResult {
   setToolUseToAgent: React.Dispatch<React.SetStateAction<Map<string, string>>>;
   /** Direct messages setter (for clearing streaming placeholders) */
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
+  /** Rewind/edit: drop the given uuid and everything after it */
+  truncateMessagesBefore: (uuid: string) => void;
   /** Fetch new messages incrementally (for file change events) */
   fetchNewMessages: () => Promise<void>;
   /** Fetch session metadata only */
@@ -516,6 +518,22 @@ export function useSessionMessages(
     }
   }, [projectId, sessionId]);
 
+  /**
+   * Rewind/edit: drop the message with `uuid` and everything after it (keeping
+   * everything before). Used when editing a past prompt — we optimistically
+   * remove the original message and its old branch so the freshly streamed
+   * branch replaces it instead of stacking. We key on the edited message's OWN
+   * uuid (always present in the list) rather than its parent, which may be a
+   * non-rendered entry like a system message. No-op if the uuid isn't found.
+   */
+  const truncateMessagesBefore = useCallback((uuid: string) => {
+    setMessages((prev) => {
+      const idx = prev.findIndex((m) => getMessageId(m) === uuid);
+      if (idx === -1) return prev;
+      return prev.slice(0, idx);
+    });
+  }, []);
+
   return {
     messages,
     agentContent,
@@ -530,6 +548,7 @@ export function useSessionMessages(
     setAgentContent,
     setToolUseToAgent,
     setMessages,
+    truncateMessagesBefore,
     fetchNewMessages,
     fetchSessionMetadata,
     pagination,

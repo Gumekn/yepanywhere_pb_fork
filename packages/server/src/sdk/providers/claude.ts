@@ -481,6 +481,9 @@ export class ClaudeProvider implements AgentProvider {
         options: {
           cwd: effectiveCwd,
           resume: options.resumeSessionId,
+          // Rewind/edit: resume only up to (and including) this message UUID,
+          // branching the conversation in place (same session id).
+          resumeSessionAt: options.resumeSessionAt,
           abortController,
           // Pass permission mode to SDK for system prompt configuration.
           // However, for "bypassPermissions" we pass "default" to the SDK so it always

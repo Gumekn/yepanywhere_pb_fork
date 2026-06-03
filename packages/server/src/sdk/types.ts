@@ -124,6 +124,12 @@ export interface StartSessionOptions {
   cwd: string;
   initialMessage?: UserMessage;
   resumeSessionId?: string;
+  /**
+   * Rewind/edit: resume only up to (and including) this message UUID, branching
+   * the conversation in place. Used with resumeSessionId. Maps to the SDK
+   * `resumeSessionAt` option.
+   */
+  resumeSessionAt?: string;
   permissionMode?: PermissionMode;
   /** Model to use (e.g., "sonnet", "opus", "haiku"). undefined = use CLI default */
   model?: string;

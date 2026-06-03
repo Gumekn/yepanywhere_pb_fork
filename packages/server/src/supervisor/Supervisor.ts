@@ -84,6 +84,11 @@ export interface ModelSettings {
   globalInstructions?: string;
   /** Permission rules for tool filtering (deny/allow patterns) */
   permissions?: PermissionRules;
+  /**
+   * Rewind/edit: resume only up to (and including) this message UUID, branching
+   * the conversation in place. Maps to the SDK `resumeSessionAt` query option.
+   */
+  resumeSessionAt?: string;
 }
 
 /** Error response when queue is full */
@@ -458,6 +463,7 @@ export class Supervisor {
       executor: modelSettings?.executor,
       remoteEnv: modelSettings?.remoteEnv,
       globalInstructions: modelSettings?.globalInstructions,
+      resumeSessionAt: modelSettings?.resumeSessionAt,
       onToolApproval: async (toolName, input, opts) => {
         // Delegate to the process's handleToolApproval
         if (!processHolder.process) {
@@ -660,6 +666,7 @@ export class Supervisor {
       executor: modelSettings?.executor,
       remoteEnv: modelSettings?.remoteEnv,
       globalInstructions: modelSettings?.globalInstructions,
+      resumeSessionAt: modelSettings?.resumeSessionAt,
       onToolApproval: async (toolName, input, opts) => {
         if (!processHolder.process) {
           return { behavior: "deny", message: "Process not ready" };

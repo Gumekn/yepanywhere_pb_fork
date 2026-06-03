@@ -235,6 +235,7 @@ export function useSession(
     setAgentContent,
     setToolUseToAgent,
     setMessages,
+    truncateMessagesBefore,
     fetchNewMessages,
     fetchSessionMetadata,
     pagination,
@@ -1088,5 +1089,6 @@ export function useSession(
     loadingOlder, // Whether older messages are being loaded
     loadOlderMessages, // Load next chunk of older messages
     reconnectStream, // Force session stream reconnection (e.g., after process restart)
+    truncateMessagesBefore, // Rewind/edit: drop a uuid and everything after it
   };
 }

@@ -12,6 +12,15 @@ interface Props {
   thinkingExpanded: boolean;
   toggleThinkingExpanded: () => void;
   sessionProvider?: string;
+  /**
+   * When provided, user prompts show an edit button. Called with the prompt's
+   * parsed text plus its DAG identity so the parent can rewind/fork from here.
+   */
+  onEditUserPrompt?: (args: {
+    text: string;
+    uuid: string;
+    parentUuid: string | null;
+  }) => void;
 }
 
 function getMessageIdLike(message: Record<string, unknown>): string {
@@ -126,6 +135,7 @@ export const RenderItemComponent = memo(function RenderItemComponent({
   thinkingExpanded,
   toggleThinkingExpanded,
   sessionProvider,
+  onEditUserPrompt,
 }: Props) {
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
@@ -185,13 +195,26 @@ export const RenderItemComponent = memo(function RenderItemComponent({
           />
         );
 
-      case "user_prompt":
+      case "user_prompt": {
+        const src = item.sourceMessages[0];
+        const uuid = src?.uuid;
         return (
           <UserPromptBlock
             content={item.content}
-            timestamp={item.sourceMessages[0]?.timestamp}
+            timestamp={src?.timestamp}
+            onEdit={
+              onEditUserPrompt && uuid
+                ? (text) =>
+                    onEditUserPrompt({
+                      text,
+                      uuid,
+                      parentUuid: src?.parentUuid ?? null,
+                    })
+                : undefined
+            }
           />
         );
+      }
 
       case "session_setup":
         return <SessionSetupBlock title={item.title} prompts={item.prompts} />;

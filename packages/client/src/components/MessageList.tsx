@@ -83,6 +83,12 @@ interface Props {
   loadingOlder?: boolean;
   /** Callback to load the next chunk of older messages */
   onLoadOlderMessages?: () => void;
+  /** Edit/rewind a past user prompt (forks the session from that point) */
+  onEditUserPrompt?: (args: {
+    text: string;
+    uuid: string;
+    parentUuid: string | null;
+  }) => void;
 }
 
 export const MessageList = memo(function MessageList({
@@ -100,6 +106,7 @@ export const MessageList = memo(function MessageList({
   hasOlderMessages = false,
   loadingOlder = false,
   onLoadOlderMessages,
+  onEditUserPrompt,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -333,6 +340,7 @@ export const MessageList = memo(function MessageList({
               thinkingExpanded={thinkingExpanded}
               toggleThinkingExpanded={toggleThinkingExpanded}
               sessionProvider={provider}
+              onEditUserPrompt={onEditUserPrompt}
             />
           );
         }

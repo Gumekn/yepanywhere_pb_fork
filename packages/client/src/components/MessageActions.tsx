@@ -6,6 +6,11 @@ interface MessageActionsProps {
   timestamp?: string;
   /** Plain-text payload to copy. When omitted, the copy button is hidden. */
   copyText?: string;
+  /**
+   * When provided, show an "edit" button. Used on user messages to rewind the
+   * conversation: forks the session up to this message and prefills the input.
+   */
+  onEdit?: () => void;
 }
 
 /**
@@ -17,7 +22,11 @@ interface MessageActionsProps {
  * index.css. On touch devices the actions are kept faintly visible (see
  * `@media (hover: none)` block) since `:hover` never reliably triggers.
  */
-export function MessageActions({ timestamp, copyText }: MessageActionsProps) {
+export function MessageActions({
+  timestamp,
+  copyText,
+  onEdit,
+}: MessageActionsProps) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
 
@@ -52,7 +61,7 @@ export function MessageActions({ timestamp, copyText }: MessageActionsProps) {
     }
   }, [copyText]);
 
-  if (!timestamp && !copyText) return null;
+  if (!timestamp && !copyText && !onEdit) return null;
 
   return (
     <span
@@ -69,6 +78,17 @@ export function MessageActions({ timestamp, copyText }: MessageActionsProps) {
           {formatShortTime(timestamp)}
         </time>
       )}
+      {onEdit && (
+        <button
+          type="button"
+          className="message-actions-edit"
+          onClick={onEdit}
+          aria-label={t("messageActionEdit")}
+          title={t("messageActionEdit")}
+        >
+          <EditIcon />
+        </button>
+      )}
       {copyText && (
         <button
           type="button"
@@ -83,6 +103,25 @@ export function MessageActions({ timestamp, copyText }: MessageActionsProps) {
         </button>
       )}
     </span>
+  );
+}
+
+function EditIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
   );
 }
 

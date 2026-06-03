@@ -9,6 +9,8 @@ export interface DraftControls {
   clearDraft: () => void;
   /** Restore from localStorage (call on failure) */
   restoreFromStorage: () => void;
+  /** Programmatically set the input text (e.g. prefill when editing a past message) */
+  setText: (value: string) => void;
 }
 
 /** Save a value to localStorage immediately */
@@ -152,8 +154,8 @@ export function useDraftPersistence(
   }, []);
 
   const controls = useMemo(
-    () => ({ clearInput, clearDraft, restoreFromStorage }),
-    [clearInput, clearDraft, restoreFromStorage],
+    () => ({ clearInput, clearDraft, restoreFromStorage, setText: setValue }),
+    [clearInput, clearDraft, restoreFromStorage, setValue],
   );
 
   return [value, setValue, controls];

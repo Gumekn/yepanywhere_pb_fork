@@ -152,6 +152,7 @@ function SessionPageContent({
     loadingOlder,
     loadOlderMessages,
     reconnectStream,
+    truncateMessagesBefore,
   } = useSession(
     projectId,
     sessionId,
@@ -189,6 +190,36 @@ function SessionPageContent({
     draftControlsRef.current = controls;
   }, []);
   const { showToast } = useToastContext();
+
+  // Edit/rewind: when set, the next send forks the conversation from a past
+  // user message instead of continuing. `parentUuid` is the fork point (the
+  // edited message's parent) sent to the server as resumeSessionAt; `uuid` is
+  // the edited message's own id, used to optimistically trim the local list.
+  // `parentUuid` null means the edited message was the first one, so we start a
+  // fresh session instead of rewinding. `preview` is shown in the banner.
+  const [editRewind, setEditRewind] = useState<{
+    parentUuid: string | null;
+    uuid: string;
+    preview: string;
+  } | null>(null);
+
+  const handleEditUserPrompt = useCallback(
+    ({
+      text,
+      uuid,
+      parentUuid,
+    }: { text: string; uuid: string; parentUuid: string | null }) => {
+      setEditRewind({ parentUuid, uuid, preview: text });
+      draftControlsRef.current?.setText(text);
+      setScrollTrigger((prev) => prev + 1);
+    },
+    [],
+  );
+
+  const handleCancelEdit = useCallback(() => {
+    setEditRewind(null);
+    draftControlsRef.current?.clearInput();
+  }, []);
 
   // Sharing: check if configured (hidden unless sharing.json exists on server)
   const [sharingConfigured, setSharingConfigured] = useState(false);
@@ -364,6 +395,57 @@ function SessionPageContent({
     }
 
     try {
+      // Edit/rewind: branch the conversation from the chosen message.
+      // For a message with a parent we rewind IN PLACE (same session): the SDK
+      // resumes only up to the parent, the old tail becomes a dead branch the
+      // server filters out, and the edited turn streams in. We optimistically
+      // trim the local tail so it doesn't linger before the stream arrives.
+      // Editing the very first message has no parent to rewind to, so we fall
+      // back to starting a fresh session.
+      if (editRewind) {
+        const model = session?.model ?? getModelSetting();
+        const thinking = getThinkingSetting();
+        const sessionOptions = {
+          mode: permissionMode,
+          model,
+          thinking,
+          provider: effectiveProvider,
+          executor: session?.executor,
+        };
+        const attachmentsArg =
+          currentAttachments.length > 0 ? currentAttachments : undefined;
+        setEditRewind(null);
+        if (editRewind.parentUuid) {
+          truncateMessagesBefore(editRewind.uuid);
+          const result = await api.resumeSession(
+            projectId,
+            sessionId,
+            text,
+            sessionOptions,
+            attachmentsArg,
+            tempId,
+            editRewind.parentUuid,
+          );
+          draftControlsRef.current?.clearDraft();
+          setStatus({ owner: "self", processId: result.processId });
+          reconnectStream();
+        } else {
+          // Edited the first message — no parent to rewind to; start fresh.
+          const result = await api.startSession(
+            projectId,
+            text,
+            sessionOptions,
+            attachmentsArg,
+          );
+          draftControlsRef.current?.clearDraft();
+          removePendingMessage(tempId);
+          navigate(
+            `${basePath}/projects/${projectId}/sessions/${result.sessionId}`,
+          );
+        }
+        return;
+      }
+
       if (status.owner === "none") {
         // Resume the session with current permission mode and model settings
         // Use session's existing model if available (important for non-Claude providers),
@@ -1138,6 +1220,11 @@ function SessionPageContent({
                   hasOlderMessages={pagination?.hasOlderMessages}
                   loadingOlder={loadingOlder}
                   onLoadOlderMessages={loadOlderMessages}
+                  onEditUserPrompt={
+                    session?.provider === "claude" || !session?.provider
+                      ? handleEditUserPrompt
+                      : undefined
+                  }
                 />
               </AgentContentProvider>
             </SessionMetadataProvider>
@@ -1200,6 +1287,25 @@ function SessionPageContent({
                   />
                 </>
               )}
+
+            {/* Edit/rewind banner: shown while editing a past message */}
+            {editRewind && (
+              <div
+                className="edit-rewind-banner"
+                data-testid="edit-rewind-banner"
+              >
+                <span className="edit-rewind-banner-text">
+                  {t("sessionEditingFromHere")}
+                </span>
+                <button
+                  type="button"
+                  className="edit-rewind-banner-cancel"
+                  onClick={handleCancelEdit}
+                >
+                  {t("actionCancel")}
+                </button>
+              </div>
+            )}
 
             {/* No pending approval: show full message input */}
             {!(
