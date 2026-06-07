@@ -190,6 +190,10 @@ export function useSessionMessages(
   // Highest timestamp observed from persisted JSONL messages.
   // Used to suppress startup replay events that are already on disk.
   const maxPersistedTimestampMsRef = useRef<number>(Number.NEGATIVE_INFINITY);
+  // Tracks whether the same session has already completed its first load.
+  // Codex branch changes reuse the page shell and should keep showing the
+  // previous message list until the selected branch content arrives.
+  const loadedSessionKeyRef = useRef<string | null>(null);
 
   const updatePersistedTimestampWatermark = useCallback(
     (persistedMessages: Message[]) => {
@@ -291,13 +295,21 @@ export function useSessionMessages(
     }
   }, [processStreamMessage, processStreamSubagentMessage]);
 
-  // Initial load
+  // Initial load. Codex branch switches reload message content for the same
+  // session without returning the page to its full-screen loading state.
   useEffect(() => {
+    const sessionLoadKey = `${projectId}\u0000${sessionId}`;
+    const isBranchReloadWithinSession =
+      loadedSessionKeyRef.current === sessionLoadKey;
+    let isCurrent = true;
+
     initialLoadCompleteRef.current = false;
     streamBufferRef.current = [];
     maxPersistedTimestampMsRef.current = Number.NEGATIVE_INFINITY;
-    setLoading(true);
-    setAgentContent({});
+    if (!isBranchReloadWithinSession) {
+      setLoading(true);
+      setAgentContent({});
+    }
 
     api
       .getSession(projectId, sessionId, undefined, {
@@ -305,6 +317,7 @@ export function useSessionMessages(
         branchId,
       })
       .then((data) => {
+        if (!isCurrent) return;
         setSession(data.session);
         setPagination(data.pagination);
         providerRef.current = data.session.provider;
@@ -326,14 +339,15 @@ export function useSessionMessages(
         // useEffect that normally updates lastMessageIdRef runs asynchronously.
         // Without this, fetchNewMessages() would use undefined and refetch everything.
         const lastMessage = taggedMessages[taggedMessages.length - 1];
-        if (lastMessage) {
-          lastMessageIdRef.current = getMessageId(lastMessage);
-        }
+        lastMessageIdRef.current = lastMessage
+          ? getMessageId(lastMessage)
+          : undefined;
 
         // Mark ready and flush buffer
         initialLoadCompleteRef.current = true;
         flushBuffer();
 
+        loadedSessionKeyRef.current = sessionLoadKey;
         setLoading(false);
 
         // Notify parent
@@ -345,9 +359,16 @@ export function useSessionMessages(
         });
       })
       .catch((err) => {
+        if (!isCurrent) return;
+        initialLoadCompleteRef.current = true;
+        flushBuffer();
         setLoading(false);
         onLoadError?.(err);
       });
+
+    return () => {
+      isCurrent = false;
+    };
   }, [
     projectId,
     sessionId,

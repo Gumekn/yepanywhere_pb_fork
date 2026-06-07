@@ -1865,6 +1865,16 @@ a.sidebar-nav-item {
   text-align: right;
 }
 
+.codex-branch-focus-target {
+  outline: none;
+  scroll-margin-block: 7rem;
+}
+
+.codex-branch-focus-target:focus .message-user-prompt,
+.codex-branch-focus-target:focus-within .message-user-prompt {
+  box-shadow: 0 0 0 2px var(--focus-border, var(--app-yep-green));
+}
+
 @media (max-width: 600px) {
   .codex-branch-panel {
     max-width: 85%;

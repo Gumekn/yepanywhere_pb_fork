@@ -235,6 +235,9 @@ function SessionPageContent({
     preview: string;
     rollbackNumTurns?: number | null;
   } | null>(null);
+  const [pendingBranchFocusId, setPendingBranchFocusId] = useState<
+    string | null
+  >(null);
 
   const isViewingHistoricalCodexBranch = useMemo(() => {
     if (!selectedBranchId || session?.provider !== "codex") return false;
@@ -263,6 +266,7 @@ function SessionPageContent({
 
   const handleSelectCodexBranch = useCallback(
     (branchId: string) => {
+      setPendingBranchFocusId(branchId);
       setSearchParams(
         (current) => {
           const next = new URLSearchParams(current);
@@ -274,6 +278,10 @@ function SessionPageContent({
     },
     [setSearchParams],
   );
+
+  const handleCodexBranchFocused = useCallback(() => {
+    setPendingBranchFocusId(null);
+  }, []);
 
   const handleCancelEdit = useCallback(() => {
     setEditRewind(null);
@@ -1309,6 +1317,8 @@ function SessionPageContent({
                       : undefined
                   }
                   onSelectCodexBranch={handleSelectCodexBranch}
+                  focusCodexBranchId={pendingBranchFocusId}
+                  onCodexBranchFocused={handleCodexBranchFocused}
                 />
               </AgentContentProvider>
             </SessionMetadataProvider>
