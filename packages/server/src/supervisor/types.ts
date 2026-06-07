@@ -1,5 +1,6 @@
 import type {
   AgentActivity,
+  CodexBranchState,
   ContextCumulativeUsage,
   ContextUsage,
   EffortLevel,
@@ -110,6 +111,8 @@ export interface SessionSummary {
   approvalPolicy?: string;
   /** Sandbox policy from turn_context */
   sandboxPolicy?: SessionSandboxPolicy;
+  /** Codex-only branch state derived from thread_rolled_back markers. */
+  codexBranchState?: CodexBranchState;
 }
 
 /**

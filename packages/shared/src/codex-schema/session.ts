@@ -379,6 +379,24 @@ export const CodexTurnAbortedEventSchema = z
 export type CodexTurnAbortedEvent = z.infer<typeof CodexTurnAbortedEventSchema>;
 
 /**
+ * Thread rolled back event.
+ *
+ * Codex CLI backtrack (Esc Esc) appends this marker to the rollout file after
+ * `thread/rollback`. The previous response_item/event_msg lines remain on
+ * disk; readers must apply the marker when deriving the visible conversation.
+ */
+export const CodexThreadRolledBackEventSchema = z
+  .object({
+    type: z.literal("thread_rolled_back"),
+    num_turns: z.number().int().nonnegative(),
+  })
+  .passthrough();
+
+export type CodexThreadRolledBackEvent = z.infer<
+  typeof CodexThreadRolledBackEventSchema
+>;
+
+/**
  * Task started event - emitted at the beginning of an agent turn.
  */
 export const CodexTaskStartedEventSchema = z.object({
@@ -408,6 +426,7 @@ export const CodexEventMsgPayloadSchema = z.discriminatedUnion("type", [
   CodexContextCompactedEventSchema,
   CodexItemCompletedEventSchema,
   CodexTurnAbortedEventSchema,
+  CodexThreadRolledBackEventSchema,
   CodexTaskStartedEventSchema,
   CodexTaskCompleteEventSchema,
 ]);

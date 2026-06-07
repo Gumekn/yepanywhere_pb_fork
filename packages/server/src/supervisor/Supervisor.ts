@@ -89,6 +89,25 @@ export interface ModelSettings {
    * the conversation in place. Maps to the SDK `resumeSessionAt` query option.
    */
   resumeSessionAt?: string;
+  /**
+   * Provider-native same-thread rollback count. Currently Codex-only, mapping
+   * to app-server `thread/rollback` before the edited turn starts.
+   */
+  rollbackNumTurns?: number;
+}
+
+function getRewindSettings(modelSettings?: ModelSettings): {
+  hasRewind: boolean;
+  resumeSessionAt: string | null;
+  rollbackNumTurns: number | null;
+} {
+  const resumeSessionAt = modelSettings?.resumeSessionAt ?? null;
+  const rollbackNumTurns = modelSettings?.rollbackNumTurns ?? null;
+  return {
+    hasRewind: Boolean(resumeSessionAt || rollbackNumTurns),
+    resumeSessionAt,
+    rollbackNumTurns,
+  };
 }
 
 /** Error response when queue is full */
@@ -654,6 +673,22 @@ export class Supervisor {
     // Generate UUID for the initial message so SDK and SSE use the same ID.
     const messageUuid = randomUUID();
     const messageWithUuid: UserMessage = { ...message, uuid: messageUuid };
+    const rewind = getRewindSettings(modelSettings);
+
+    getLogger().info(
+      {
+        event: "provider_session_start_requested",
+        providerName: activeProvider.name,
+        projectId,
+        projectPath,
+        resumeSessionId: resumeSessionId ?? null,
+        permissionMode: effectiveMode,
+        model: modelSettings?.model ?? null,
+        resumeSessionAt: rewind.resumeSessionAt,
+        rollbackNumTurns: rewind.rollbackNumTurns,
+      },
+      "Provider session start requested",
+    );
 
     const result = await activeProvider.startSession({
       cwd: projectPath,
@@ -667,6 +702,7 @@ export class Supervisor {
       remoteEnv: modelSettings?.remoteEnv,
       globalInstructions: modelSettings?.globalInstructions,
       resumeSessionAt: modelSettings?.resumeSessionAt,
+      rollbackNumTurns: modelSettings?.rollbackNumTurns,
       onToolApproval: async (toolName, input, opts) => {
         if (!processHolder.process) {
           return { behavior: "deny", message: "Process not ready" };
@@ -785,6 +821,8 @@ export class Supervisor {
     permissionMode?: PermissionMode,
     modelSettings?: ModelSettings,
   ): Promise<Process | QueuedResponse | QueueFullResponse> {
+    const rewind = getRewindSettings(modelSettings);
+
     // Check if already have a process for this session
     const existingProcessId = this.sessionToProcess.get(sessionId);
     if (existingProcessId) {
@@ -792,6 +830,22 @@ export class Supervisor {
       if (existingProcess) {
         // Check if process is terminated - if so, start a fresh one
         if (existingProcess.isTerminated) {
+          this.unregisterProcess(existingProcess);
+        } else if (rewind.hasRewind) {
+          getLogger().info(
+            {
+              event: "session_rewind_existing_process_restart",
+              sessionId,
+              processId: existingProcess.id,
+              projectId: existingProcess.projectId,
+              projectPath,
+              providerName: modelSettings?.providerName ?? null,
+              resumeSessionAt: rewind.resumeSessionAt,
+              rollbackNumTurns: rewind.rollbackNumTurns,
+            },
+            "Restarting existing session process to apply rewind",
+          );
+          await existingProcess.abort();
           this.unregisterProcess(existingProcess);
         } else {
           // Check if thinking/effort settings changed
@@ -869,13 +923,27 @@ export class Supervisor {
     // Check if there's already a queued request for this session
     const existingQueued = this.workerQueue.findBySessionId(sessionId);
     if (existingQueued) {
-      // Already queued - return current position
-      const position = this.workerQueue.getPosition(existingQueued.id);
-      return {
-        queued: true,
-        queueId: existingQueued.id,
-        position: position ?? 1,
-      };
+      if (rewind.hasRewind) {
+        getLogger().info(
+          {
+            event: "session_rewind_cancelled_existing_queue",
+            sessionId,
+            queueId: existingQueued.id,
+            resumeSessionAt: rewind.resumeSessionAt,
+            rollbackNumTurns: rewind.rollbackNumTurns,
+          },
+          "Cancelling existing queued resume request to apply rewind",
+        );
+        this.workerQueue.cancel(existingQueued.id);
+      } else {
+        // Already queued - return current position
+        const position = this.workerQueue.getPosition(existingQueued.id);
+        return {
+          queued: true,
+          queueId: existingQueued.id,
+          position: position ?? 1,
+        };
+      }
     }
 
     const projectId = encodeProjectId(projectPath);

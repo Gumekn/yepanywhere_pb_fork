@@ -132,6 +132,8 @@ export type {
   ContextUsage,
   SessionOwnership,
   SessionSandboxPolicy,
+  CodexBranchOption,
+  CodexBranchState,
   AppSessionSummary,
   AppSession,
   // Agent session types
@@ -236,6 +238,7 @@ export type {
   CodexResponseItemEntry,
   CodexEventMsgPayload,
   CodexTurnAbortedEvent,
+  CodexThreadRolledBackEvent,
   CodexEventMsgEntry,
   CodexCompactedPayload,
   CodexCompactedEntry,

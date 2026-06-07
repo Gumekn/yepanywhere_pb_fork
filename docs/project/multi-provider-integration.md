@@ -74,7 +74,7 @@ The `parentUuid` field enables conversation branching - rewinding to a previous 
 
 **Implementation:** `packages/server/src/sdk/providers/codex.ts`
 
-Uses `@openai/codex-sdk`. Key difference from Claude: **turn-based** rather than continuous streaming.
+Uses `codex app-server` over stdio. Key difference from Claude: **turn-based** rather than continuous streaming.
 
 ### Process Lifecycle
 
@@ -99,6 +99,31 @@ JSONL with linear structure at `~/.codex/sessions/YYYY/MM/DD/`:
 {"type":"response_item","payload":{"item":{"type":"reasoning","text":"..."}}}
 {"type":"event_msg","payload":{"role":"assistant","content":"..."}}
 ```
+
+### Same-session prompt edit / backtrack
+
+Codex CLI's Esc Esc backtrack flow is not a clone/fork. It calls app-server
+`thread/rollback` with a trailing user-turn count, then starts the edited turn
+on the same thread id. The rollout file keeps the old `response_item` records
+and appends an `event_msg` marker:
+
+```json
+{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}
+```
+
+Yep Anywhere applies those markers when rendering Codex persisted sessions and
+uses a Codex-only `rollbackNumTurns` option when editing a prior Codex prompt.
+Claude continues to use its `resumeSessionAt`/`parentUuid` branch mechanism.
+Future Claude Code CLI support should add its own provider capability instead
+of reusing Codex's app-server rollback parameter.
+
+The Codex reader also derives a lightweight branch tree from those rollback
+markers. `GET /api/projects/:projectId/sessions/:sessionId?branchId=...` can
+project an older Codex branch for display while keeping the original session id
+and rollout file unchanged. The client exposes this through a Codex-only branch
+switcher under user prompts that have sibling branches. This is a display/read
+projection; writing or editing historical branches is not shared with Claude's
+DAG reader and should remain a provider-specific capability.
 
 ---
 

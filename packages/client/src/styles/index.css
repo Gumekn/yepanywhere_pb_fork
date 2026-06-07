@@ -1794,6 +1794,83 @@ a.sidebar-nav-item {
   text-align: right;
 }
 
+.codex-branch-panel {
+  align-self: flex-end;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+  width: fit-content;
+  max-width: 70%;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.codex-branch-switcher {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding: 2px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+
+.codex-branch-nav {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.codex-branch-nav:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.codex-branch-nav:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.codex-branch-nav:focus-visible {
+  outline: 2px solid var(--focus-border, var(--app-yep-green));
+  outline-offset: 1px;
+}
+
+.codex-branch-position {
+  min-width: 4.8rem;
+  color: var(--text-primary);
+  font-size: var(--font-size-xs);
+  line-height: 24px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.codex-branch-session {
+  max-width: 100%;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+@media (max-width: 600px) {
+  .codex-branch-panel {
+    max-width: 85%;
+  }
+}
+
 /* Pending messages - waiting for server confirmation */
 .pending-message {
   margin-bottom: var(--space-3);
@@ -2081,10 +2158,12 @@ a.sidebar-nav-item {
   color: var(--text-primary);
 }
 
-/* User actions sit under the right-aligned bubble. */
+/* User actions sit above the right-aligned bubble. */
 .user-prompt-container .message-actions {
   align-self: flex-end;
   flex-direction: row-reverse;
+  margin-top: 0;
+  margin-bottom: var(--space-1);
 }
 
 /* Assistant actions sit under the assistant turn, aligned to its content

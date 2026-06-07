@@ -367,7 +367,11 @@ export const api = {
     projectId: string,
     sessionId: string,
     afterMessageId?: string,
-    options?: { tailCompactions?: number; beforeMessageId?: string },
+    options?: {
+      tailCompactions?: number;
+      beforeMessageId?: string;
+      branchId?: string;
+    },
   ) => {
     const params = new URLSearchParams();
     if (afterMessageId) params.set("afterMessageId", afterMessageId);
@@ -375,6 +379,7 @@ export const api = {
       params.set("tailCompactions", String(options.tailCompactions));
     if (options?.beforeMessageId)
       params.set("beforeMessageId", options.beforeMessageId);
+    if (options?.branchId) params.set("branchId", options.branchId);
     const qs = params.toString();
     return fetchJSON<{
       session: Session;
@@ -484,6 +489,11 @@ export const api = {
      * message's parentUuid. Maps to the SDK `resumeSessionAt` option.
      */
     resumeSessionAt?: string,
+    /**
+     * Codex app-server rewind/edit: drop this many trailing user turns via
+     * `thread/rollback` before sending the edited prompt in the same session.
+     */
+    rollbackNumTurns?: number,
   ) =>
     fetchJSON<{
       processId: string;
@@ -501,6 +511,7 @@ export const api = {
         attachments,
         tempId,
         resumeSessionAt,
+        rollbackNumTurns,
       }),
     }),
 

@@ -43,6 +43,8 @@ export interface SessionLoadResult {
 export interface UseSessionMessagesOptions {
   projectId: string;
   sessionId: string;
+  /** Codex-only branch id selected from the URL query. */
+  branchId?: string;
   /** Called when initial load completes with session data */
   onLoadComplete?: (result: SessionLoadResult) => void;
   /** Called on load error */
@@ -157,7 +159,8 @@ function isEmptyAssistantContent(message: Message): boolean {
 export function useSessionMessages(
   options: UseSessionMessagesOptions,
 ): UseSessionMessagesResult {
-  const { projectId, sessionId, onLoadComplete, onLoadError } = options;
+  const { projectId, sessionId, branchId, onLoadComplete, onLoadError } =
+    options;
 
   // Core state
   const [messages, setMessages] = useState<Message[]>([]);
@@ -297,7 +300,10 @@ export function useSessionMessages(
     setAgentContent({});
 
     api
-      .getSession(projectId, sessionId, undefined, { tailCompactions: 2 })
+      .getSession(projectId, sessionId, undefined, {
+        tailCompactions: 2,
+        branchId,
+      })
       .then((data) => {
         setSession(data.session);
         setPagination(data.pagination);
@@ -345,6 +351,7 @@ export function useSessionMessages(
   }, [
     projectId,
     sessionId,
+    branchId,
     onLoadComplete,
     onLoadError,
     flushBuffer,
@@ -448,6 +455,7 @@ export function useSessionMessages(
         projectId,
         sessionId,
         lastMessageIdRef.current,
+        { branchId },
       );
       if (data.messages.length > 0) {
         updatePersistedTimestampWatermark(data.messages);
@@ -471,7 +479,7 @@ export function useSessionMessages(
     } catch {
       // Silent fail for incremental updates
     }
-  }, [projectId, sessionId, updatePersistedTimestampWatermark]);
+  }, [projectId, sessionId, branchId, updatePersistedTimestampWatermark]);
 
   // Load older messages (previous chunk before the current truncation point)
   const loadOlderMessages = useCallback(async () => {
@@ -483,6 +491,7 @@ export function useSessionMessages(
       const data = await api.getSession(projectId, sessionId, undefined, {
         tailCompactions: 2,
         beforeMessageId: pagination.truncatedBeforeMessageId,
+        branchId,
       });
       setMessages((prev) => {
         const taggedOlder = data.messages.map((m) => ({
@@ -501,7 +510,13 @@ export function useSessionMessages(
     } finally {
       setLoadingOlder(false);
     }
-  }, [projectId, sessionId, pagination, updatePersistedTimestampWatermark]);
+  }, [
+    projectId,
+    sessionId,
+    branchId,
+    pagination,
+    updatePersistedTimestampWatermark,
+  ]);
 
   // Fetch session metadata only
   const fetchSessionMetadata = useCallback(async () => {

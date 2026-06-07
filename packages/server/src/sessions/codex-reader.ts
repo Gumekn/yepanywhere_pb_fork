@@ -38,6 +38,10 @@ import type {
   SessionSummary,
 } from "../supervisor/types.js";
 import { readFirstLine, readJsonlLines } from "../utils/jsonl.js";
+import {
+  applyCodexRollbackMarkers,
+  buildCodexBranchView,
+} from "./codex-rollback.js";
 import type {
   GetSessionOptions,
   ISessionReader,
@@ -144,6 +148,7 @@ export class CodexSessionReader implements ISessionReader {
       }
 
       if (entries.length === 0) return null;
+      const visibleEntries = applyCodexRollbackMarkers(entries);
 
       // Extract session metadata from first entry
       const metaEntry = entries.find((e) => e.type === "session_meta") as
@@ -152,12 +157,16 @@ export class CodexSessionReader implements ISessionReader {
       if (!metaEntry) return null;
 
       const stats = await stat(sessionFile.filePath);
-      const { title, fullTitle } = this.extractTitle(entries);
-      const messageCount = this.countMessages(entries);
-      const model = this.extractModel(entries);
+      const { title, fullTitle } = this.extractTitle(visibleEntries);
+      const messageCount = this.countMessages(visibleEntries);
+      const model = this.extractModel(visibleEntries);
       const provider = this.determineProvider(metaEntry, model);
-      const turnContext = this.extractTurnContext(entries);
-      const contextUsage = this.extractContextUsage(entries, model, provider);
+      const turnContext = this.extractTurnContext(visibleEntries);
+      const contextUsage = this.extractContextUsage(
+        visibleEntries,
+        model,
+        provider,
+      );
 
       // Skip sessions with no actual conversation messages
       if (messageCount === 0) return null;
@@ -198,7 +207,7 @@ export class CodexSessionReader implements ISessionReader {
     sessionId: string,
     projectId: UrlProjectId,
     afterMessageId?: string,
-    _options?: GetSessionOptions,
+    options?: GetSessionOptions,
   ): Promise<LoadedSession | null> {
     const summary = await this.getSessionSummary(sessionId, projectId);
     if (!summary) return null;
@@ -220,7 +229,12 @@ export class CodexSessionReader implements ISessionReader {
     // Note: Codex entries are not 1:1 with messages, so standard ID filtering is tricky
     // with raw format. We return all entries for now.
     // Ideally the client handles diffing/appending.
-    const finalEntries = entries;
+    const branchView = buildCodexBranchView(
+      entries,
+      sessionId,
+      options?.branchId,
+    );
+    const finalEntries = branchView.entries;
     if (afterMessageId) {
       // Logic to filter entries would go here if strict incremental loading is needed
     }
@@ -233,6 +247,7 @@ export class CodexSessionReader implements ISessionReader {
           entries: finalEntries,
         },
       },
+      codexBranchState: branchView.branchState,
     };
   }
 

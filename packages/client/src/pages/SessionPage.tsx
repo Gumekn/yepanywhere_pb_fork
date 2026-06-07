@@ -1,6 +1,12 @@
 import type { ProviderName, UploadedFile } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import { api } from "../api/client";
 import { MessageInput, type UploadProgress } from "../components/MessageInput";
 import { MessageInputToolbar } from "../components/MessageInputToolbar";
@@ -38,8 +44,10 @@ import {
 } from "../hooks/useSession";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
+import { getMessageId } from "../lib/mergeMessages";
 import { preprocessMessages } from "../lib/preprocessMessages";
 import { generateUUID } from "../lib/uuid";
+import type { Message } from "../types";
 import { getSessionDisplayTitle } from "../utils";
 
 export function SessionPage() {
@@ -71,6 +79,28 @@ function SessionPageInvalidRoute() {
   return <div className="error">{t("sessionInvalidUrl")}</div>;
 }
 
+function isCodexAppServerProvider(
+  provider: ProviderName | string | undefined | null,
+): provider is "codex" {
+  return provider === "codex";
+}
+
+function calculateCodexRollbackNumTurns(
+  messages: Message[],
+  editedUuid: string,
+): number | null {
+  const userPrompts = preprocessMessages(messages).filter(
+    (item) => item.type === "user_prompt",
+  );
+  const editedIndex = userPrompts.findIndex((item) =>
+    item.sourceMessages.some((message) => getMessageId(message) === editedUuid),
+  );
+  if (editedIndex < 0) return null;
+
+  const rollbackNumTurns = userPrompts.length - editedIndex;
+  return rollbackNumTurns > 0 ? rollbackNumTurns : null;
+}
+
 function SessionPageContent({
   projectId,
   sessionId,
@@ -85,6 +115,8 @@ function SessionPageContent({
   const { project } = useProject(projectId);
   const navigate = useNavigate();
   const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selectedBranchId = searchParams.get("branch") || undefined;
   // Get initial status and title from navigation state (passed by NewSessionPage)
   // This allows SSE to connect immediately and show optimistic title without waiting for getSession
   // Also get model/provider so ProviderBadge can render immediately
@@ -158,6 +190,7 @@ function SessionPageContent({
     sessionId,
     initialStatus,
     streamingMarkdownCallbacks,
+    selectedBranchId,
   );
 
   // Dismiss cold-start splash once the session has loaded (covers deep-link
@@ -191,17 +224,25 @@ function SessionPageContent({
   }, []);
   const { showToast } = useToastContext();
 
-  // Edit/rewind: when set, the next send forks the conversation from a past
-  // user message instead of continuing. `parentUuid` is the fork point (the
-  // edited message's parent) sent to the server as resumeSessionAt; `uuid` is
-  // the edited message's own id, used to optimistically trim the local list.
-  // `parentUuid` null means the edited message was the first one, so we start a
-  // fresh session instead of rewinding. `preview` is shown in the banner.
+  // Edit/rewind: when set, the next send rewinds from a past user message.
+  // Claude uses `parentUuid` as the SDK resume point. Codex app-server uses
+  // `rollbackNumTurns` to match Codex CLI Esc Esc backtrack semantics.
+  // `uuid` is the edited message's own id, used to optimistically trim the
+  // local list. `preview` is shown in the banner.
   const [editRewind, setEditRewind] = useState<{
     parentUuid: string | null;
     uuid: string;
     preview: string;
+    rollbackNumTurns?: number | null;
   } | null>(null);
+
+  const isViewingHistoricalCodexBranch = useMemo(() => {
+    if (!selectedBranchId || session?.provider !== "codex") return false;
+    const selectedBranch = session.codexBranchState?.branches.find(
+      (branch) => branch.id === selectedBranchId,
+    );
+    return selectedBranch ? !selectedBranch.isActive : false;
+  }, [selectedBranchId, session?.provider, session?.codexBranchState]);
 
   const handleEditUserPrompt = useCallback(
     ({
@@ -209,11 +250,29 @@ function SessionPageContent({
       uuid,
       parentUuid,
     }: { text: string; uuid: string; parentUuid: string | null }) => {
-      setEditRewind({ parentUuid, uuid, preview: text });
+      if (isViewingHistoricalCodexBranch) return;
+      const rollbackNumTurns = isCodexAppServerProvider(effectiveProvider)
+        ? calculateCodexRollbackNumTurns(messages, uuid)
+        : null;
+      setEditRewind({ parentUuid, uuid, preview: text, rollbackNumTurns });
       draftControlsRef.current?.setText(text);
       setScrollTrigger((prev) => prev + 1);
     },
-    [],
+    [effectiveProvider, isViewingHistoricalCodexBranch, messages],
+  );
+
+  const handleSelectCodexBranch = useCallback(
+    (branchId: string) => {
+      setSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          next.set("branch", branchId);
+          return next;
+        },
+        { replace: false },
+      );
+    },
+    [setSearchParams],
   );
 
   const handleCancelEdit = useCallback(() => {
@@ -415,7 +474,28 @@ function SessionPageContent({
         const attachmentsArg =
           currentAttachments.length > 0 ? currentAttachments : undefined;
         setEditRewind(null);
-        if (editRewind.parentUuid) {
+        if (isCodexAppServerProvider(effectiveProvider)) {
+          const rollbackNumTurns =
+            editRewind.rollbackNumTurns ??
+            calculateCodexRollbackNumTurns(messages, editRewind.uuid);
+          if (!rollbackNumTurns) {
+            throw new Error("Could not determine Codex rollback point");
+          }
+          truncateMessagesBefore(editRewind.uuid);
+          const result = await api.resumeSession(
+            projectId,
+            sessionId,
+            text,
+            sessionOptions,
+            attachmentsArg,
+            tempId,
+            undefined,
+            rollbackNumTurns,
+          );
+          draftControlsRef.current?.clearDraft();
+          setStatus({ owner: "self", processId: result.processId });
+          reconnectStream();
+        } else if (editRewind.parentUuid) {
           truncateMessagesBefore(editRewind.uuid);
           const result = await api.resumeSession(
             projectId,
@@ -1221,10 +1301,14 @@ function SessionPageContent({
                   loadingOlder={loadingOlder}
                   onLoadOlderMessages={loadOlderMessages}
                   onEditUserPrompt={
-                    session?.provider === "claude" || !session?.provider
+                    !isViewingHistoricalCodexBranch &&
+                    (session?.provider === "claude" ||
+                      session?.provider === "codex" ||
+                      !session?.provider)
                       ? handleEditUserPrompt
                       : undefined
                   }
+                  onSelectCodexBranch={handleSelectCodexBranch}
                 />
               </AgentContentProvider>
             </SessionMetadataProvider>

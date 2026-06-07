@@ -5,7 +5,7 @@ import {
   getFilename,
   parseUserPrompt,
 } from "../../lib/parseUserPrompt";
-import type { ContentBlock } from "../../types";
+import type { CodexBranchOption, ContentBlock } from "../../types";
 import { MessageActions } from "../MessageActions";
 import { Modal } from "../ui/Modal";
 
@@ -16,6 +16,19 @@ interface Props {
   content: string | ContentBlock[];
   /** ISO timestamp from the source JSONL entry, used for hover-revealed time. */
   timestamp?: string;
+  /** Codex-only branch metadata derived from thread_rolled_back markers. */
+  codexBranch?: {
+    sessionId: string;
+    branchId: string;
+    activeBranchId: string | null;
+    selectedBranchId: string | null;
+    parentId: string | null;
+    siblingIndex: number;
+    siblingCount: number;
+    alternatives: CodexBranchOption[];
+  };
+  /** Codex-only: switch the rendered derived branch. */
+  onSelectCodexBranch?: (branchId: string) => void;
   /**
    * When provided, show an edit button on the prompt. Called with the parsed
    * prompt text so the parent can prefill the input and rewind from here.
@@ -284,6 +297,54 @@ function UploadedFilesMetadata({ files }: { files: UploadedFileInfo[] }) {
   );
 }
 
+function CodexBranchControls({
+  branch,
+  onSelect,
+}: {
+  branch: NonNullable<Props["codexBranch"]>;
+  onSelect?: (branchId: string) => void;
+}) {
+  if (branch.alternatives.length <= 1) return null;
+
+  const selectedIndex = Math.max(
+    0,
+    branch.alternatives.findIndex(
+      (alternative) => alternative.id === branch.branchId,
+    ),
+  );
+  const previousBranch = branch.alternatives[selectedIndex - 1];
+  const nextBranch = branch.alternatives[selectedIndex + 1];
+
+  return (
+    <div className="codex-branch-panel">
+      <div className="codex-branch-switcher" aria-label="Codex branch switcher">
+        <button
+          type="button"
+          className="codex-branch-nav"
+          aria-label="Previous Codex branch"
+          disabled={!previousBranch || !onSelect}
+          onClick={() => previousBranch && onSelect?.(previousBranch.id)}
+        >
+          ‹
+        </button>
+        <span className="codex-branch-position">
+          Branch {branch.siblingIndex}/{branch.siblingCount}
+        </span>
+        <button
+          type="button"
+          className="codex-branch-nav"
+          aria-label="Next Codex branch"
+          disabled={!nextBranch || !onSelect}
+          onClick={() => nextBranch && onSelect?.(nextBranch.id)}
+        >
+          ›
+        </button>
+      </div>
+      <div className="codex-branch-session">Session {branch.sessionId}</div>
+    </div>
+  );
+}
+
 /**
  * Renders text content with optional truncation and "Show more" button
  */
@@ -339,6 +400,8 @@ function CollapsibleText({ text }: { text: string }) {
 export const UserPromptBlock = memo(function UserPromptBlock({
   content,
   timestamp,
+  codexBranch,
+  onSelectCodexBranch,
   onEdit,
 }: Props) {
   if (typeof content === "string") {
@@ -357,17 +420,23 @@ export const UserPromptBlock = memo(function UserPromptBlock({
 
     return (
       <div className="user-prompt-container">
+        <MessageActions
+          timestamp={timestamp}
+          copyText={text}
+          onEdit={onEdit ? () => onEdit(text) : undefined}
+        />
         <div className="message message-user-prompt">
           <div className="message-content">
             <CollapsibleText text={text} />
             <UploadedFilesMetadata files={uploadedFiles} />
           </div>
         </div>
-        <MessageActions
-          timestamp={timestamp}
-          copyText={text}
-          onEdit={onEdit ? () => onEdit(text) : undefined}
-        />
+        {codexBranch && (
+          <CodexBranchControls
+            branch={codexBranch}
+            onSelect={onSelectCodexBranch}
+          />
+        )}
         <OpenedFilesMetadata files={openedFiles} />
       </div>
     );
@@ -406,17 +475,23 @@ export const UserPromptBlock = memo(function UserPromptBlock({
 
   return (
     <div className="user-prompt-container">
+      <MessageActions
+        timestamp={timestamp}
+        copyText={text}
+        onEdit={onEdit ? () => onEdit(text) : undefined}
+      />
       <div className="message message-user-prompt">
         <div className="message-content">
           <CollapsibleText text={text} />
           <UploadedFilesMetadata files={allUploadedFiles} />
         </div>
       </div>
-      <MessageActions
-        timestamp={timestamp}
-        copyText={text}
-        onEdit={onEdit ? () => onEdit(text) : undefined}
-      />
+      {codexBranch && (
+        <CodexBranchControls
+          branch={codexBranch}
+          onSelect={onSelectCodexBranch}
+        />
+      )}
       <OpenedFilesMetadata files={openedFiles} />
     </div>
   );

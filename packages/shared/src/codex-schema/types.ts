@@ -29,6 +29,7 @@ export type {
   CodexResponseItemEntry,
   CodexEventMsgPayload,
   CodexTurnAbortedEvent,
+  CodexThreadRolledBackEvent,
   CodexEventMsgEntry,
   CodexCompactedPayload,
   CodexCompactedEntry,

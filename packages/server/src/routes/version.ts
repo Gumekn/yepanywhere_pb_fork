@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Hono } from "hono";
+import { type RuntimeBuildInfo, getRuntimeBuildInfo } from "../build-info.js";
 import { isNewerSemver } from "../utils/semver.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -118,6 +119,8 @@ export interface VersionInfo {
   current: string;
   latest: string | null;
   updateAvailable: boolean;
+  /** Build metadata for the server process currently handling requests. */
+  build: RuntimeBuildInfo;
   /** Session resume protocol version supported by this server. */
   resumeProtocolVersion: number;
   /** Feature capabilities supported by this server. Used by clients to show/hide UI. */
@@ -223,6 +226,7 @@ export function createVersionRoutes(options?: VersionRouteOptions): Hono {
 
   routes.get("/", async (c) => {
     const current = await getCurrentVersion();
+    const build = await getRuntimeBuildInfo();
     const fresh =
       c.req.query("fresh") === "1" || c.req.query("fresh") === "true";
     const deviceBridgeStatus = options?.getDeviceBridgeStatus
@@ -247,6 +251,7 @@ export function createVersionRoutes(options?: VersionRouteOptions): Hono {
       current,
       latest,
       updateAvailable,
+      build,
       resumeProtocolVersion: RESUME_PROTOCOL_VERSION,
       capabilities,
       deviceBridgeState: deviceBridgeStatus.state,

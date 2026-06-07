@@ -1,0 +1,360 @@
+import type {
+  CodexBranchOption,
+  CodexBranchState,
+  CodexSessionEntry,
+} from "@yep-anywhere/shared";
+
+interface CodexBranchNode {
+  id: string;
+  parentId: string | null;
+  prompt: string;
+  title: string;
+  timestamp?: string;
+  depth: number;
+  userEntryIndex: number;
+  setupEntries: CodexSessionEntry[];
+  entries: CodexSessionEntry[];
+  children: string[];
+}
+
+export interface CodexBranchView {
+  entries: CodexSessionEntry[];
+  branchState: CodexBranchState;
+}
+
+const SESSION_SETUP_PREFIXES = [
+  "# AGENTS.md instructions",
+  "<environment_context>",
+];
+
+function hasResponseItemUserMessages(entries: CodexSessionEntry[]): boolean {
+  return entries.some(
+    (entry) =>
+      entry.type === "response_item" &&
+      entry.payload.type === "message" &&
+      entry.payload.role === "user",
+  );
+}
+
+function isUserTurnStart(
+  entry: CodexSessionEntry,
+  hasResponseItemUser: boolean,
+): boolean {
+  if (entry.type === "response_item") {
+    return (
+      entry.payload.type === "message" &&
+      entry.payload.role === "user" &&
+      hasResponseItemUser
+    );
+  }
+
+  return (
+    entry.type === "event_msg" &&
+    entry.payload.type === "user_message" &&
+    !hasResponseItemUser
+  );
+}
+
+function getResponseMessageText(entry: CodexSessionEntry): string | null {
+  if (
+    entry.type !== "response_item" ||
+    entry.payload.type !== "message" ||
+    entry.payload.role !== "user"
+  ) {
+    return null;
+  }
+
+  const text = entry.payload.content
+    .map((block) =>
+      "text" in block && typeof block.text === "string" ? block.text : "",
+    )
+    .join("");
+  const trimmed = text.trim();
+  return trimmed.length > 0 ? text : null;
+}
+
+function getEventUserMessageText(entry: CodexSessionEntry): string | null {
+  if (entry.type !== "event_msg" || entry.payload.type !== "user_message") {
+    return null;
+  }
+
+  const text = entry.payload.message.trim();
+  return text.length > 0 ? entry.payload.message : null;
+}
+
+function getUserTurnText(
+  entry: CodexSessionEntry,
+  hasResponseItemUser: boolean,
+): string | null {
+  if (!isUserTurnStart(entry, hasResponseItemUser)) {
+    return null;
+  }
+  return hasResponseItemUser
+    ? getResponseMessageText(entry)
+    : getEventUserMessageText(entry);
+}
+
+function isSessionSetupText(text: string): boolean {
+  const trimmed = text.trimStart();
+  return SESSION_SETUP_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+function getRollbackNumTurns(entry: CodexSessionEntry): number | null {
+  if (entry.type !== "event_msg") return null;
+
+  const payload = entry.payload as { type?: unknown; num_turns?: unknown };
+  if (payload.type !== "thread_rolled_back") return null;
+  if (typeof payload.num_turns !== "number") return null;
+  if (!Number.isInteger(payload.num_turns) || payload.num_turns <= 0) {
+    return null;
+  }
+
+  return payload.num_turns;
+}
+
+function branchTitle(prompt: string): string {
+  const firstLine = prompt
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  const text = firstLine ?? prompt.trim();
+  if (text.length <= 28) return text;
+  return `${text.slice(0, 27)}...`;
+}
+
+function buildPathToNode(
+  nodesById: Map<string, CodexBranchNode>,
+  tipId: string | null,
+): CodexBranchNode[] {
+  const path: CodexBranchNode[] = [];
+  let cursor = tipId;
+
+  while (cursor) {
+    const node = nodesById.get(cursor);
+    if (!node) break;
+    path.push(node);
+    cursor = node.parentId;
+  }
+
+  return path.reverse();
+}
+
+function findLatestTipUnderNode(
+  nodesById: Map<string, CodexBranchNode>,
+  nodeId: string | null,
+): string | null {
+  if (!nodeId) return null;
+  const root = nodesById.get(nodeId);
+  if (!root) return null;
+
+  let best = root;
+  const stack = [...root.children];
+  while (stack.length > 0) {
+    const id = stack.pop();
+    if (!id) continue;
+    const node = nodesById.get(id);
+    if (!node) continue;
+    if (
+      node.children.length === 0 &&
+      node.userEntryIndex > best.userEntryIndex
+    ) {
+      best = node;
+    }
+    stack.push(...node.children);
+  }
+
+  return best.id;
+}
+
+function siblingIdsForNode(
+  node: CodexBranchNode,
+  nodesById: Map<string, CodexBranchNode>,
+  rootNodeIds: string[],
+): string[] {
+  if (!node.parentId) return rootNodeIds;
+  return nodesById.get(node.parentId)?.children ?? [node.id];
+}
+
+function buildBranchState(args: {
+  sessionId: string;
+  nodes: CodexBranchNode[];
+  nodesById: Map<string, CodexBranchNode>;
+  rootNodeIds: string[];
+  activePathIds: Set<string>;
+  activeBranchId: string | null;
+  selectedBranchId: string | null;
+}): CodexBranchState {
+  const {
+    sessionId,
+    nodes,
+    nodesById,
+    rootNodeIds,
+    activePathIds,
+    activeBranchId,
+    selectedBranchId,
+  } = args;
+
+  const branches: CodexBranchOption[] = nodes.map((node, index) => {
+    const siblings = siblingIdsForNode(node, nodesById, rootNodeIds);
+    const siblingIndex = Math.max(0, siblings.indexOf(node.id));
+    return {
+      id: node.id,
+      sessionId,
+      parentId: node.parentId,
+      prompt: node.prompt,
+      title: node.title,
+      depth: node.depth,
+      index: index + 1,
+      siblingIndex: siblingIndex + 1,
+      siblingCount: siblings.length,
+      isActive: activePathIds.has(node.id),
+      createdAt: node.timestamp,
+    };
+  });
+
+  return {
+    sessionId,
+    activeBranchId,
+    selectedBranchId,
+    branches,
+  };
+}
+
+/**
+ * Build a visible Codex branch from an append-only rollout.
+ *
+ * Codex keeps old turns in the JSONL file and appends `thread_rolled_back`
+ * markers. This reconstructs a lightweight turn tree so the UI can render the
+ * latest branch by default or project an older sibling branch for review.
+ */
+export function buildCodexBranchView(
+  entries: CodexSessionEntry[],
+  sessionId: string,
+  selectedBranchId?: string,
+): CodexBranchView {
+  const hasResponseItemUser = hasResponseItemUserMessages(entries);
+  const prefixEntries: CodexSessionEntry[] = [];
+  const nodes: CodexBranchNode[] = [];
+  const nodesById = new Map<string, CodexBranchNode>();
+  const rootNodeIds: string[] = [];
+  let activePathIds: string[] = [];
+  let currentNode: CodexBranchNode | null = null;
+  let pendingSetupEntries: CodexSessionEntry[] = [];
+  let sawConversationTurn = false;
+
+  for (const [entryIndex, entry] of entries.entries()) {
+    const numTurns = getRollbackNumTurns(entry);
+    if (numTurns !== null) {
+      activePathIds = activePathIds.slice(
+        0,
+        Math.max(0, activePathIds.length - numTurns),
+      );
+      currentNode =
+        activePathIds.length > 0
+          ? (nodesById.get(activePathIds[activePathIds.length - 1] ?? "") ??
+            null)
+          : null;
+      pendingSetupEntries = [];
+      continue;
+    }
+
+    const userText = getUserTurnText(entry, hasResponseItemUser);
+    if (userText !== null) {
+      if (isSessionSetupText(userText)) {
+        if (sawConversationTurn) {
+          pendingSetupEntries.push(entry);
+        } else {
+          prefixEntries.push(entry);
+        }
+        continue;
+      }
+
+      const parentId =
+        activePathIds.length > 0
+          ? (activePathIds[activePathIds.length - 1] ?? null)
+          : null;
+      const id = `codex-branch-${entryIndex}`;
+      const parent = parentId ? nodesById.get(parentId) : undefined;
+      const node: CodexBranchNode = {
+        id,
+        parentId,
+        prompt: userText,
+        title: branchTitle(userText),
+        timestamp: entry.timestamp,
+        depth: parent ? parent.depth + 1 : 1,
+        userEntryIndex: entryIndex,
+        setupEntries: pendingSetupEntries,
+        entries: [entry],
+        children: [],
+      };
+
+      pendingSetupEntries = [];
+      nodes.push(node);
+      nodesById.set(id, node);
+      if (parent) {
+        parent.children.push(id);
+      } else {
+        rootNodeIds.push(id);
+      }
+
+      activePathIds = [...activePathIds, id];
+      currentNode = node;
+      sawConversationTurn = true;
+      continue;
+    }
+
+    if (!sawConversationTurn) {
+      prefixEntries.push(entry);
+    } else if (currentNode) {
+      currentNode.entries.push(entry);
+    } else {
+      pendingSetupEntries.push(entry);
+    }
+  }
+
+  const activeBranchId =
+    activePathIds.length > 0
+      ? (activePathIds[activePathIds.length - 1] ?? null)
+      : null;
+  const requestedNodeId =
+    selectedBranchId && nodesById.has(selectedBranchId)
+      ? selectedBranchId
+      : activeBranchId;
+  const selectedTipId =
+    requestedNodeId === activeBranchId
+      ? activeBranchId
+      : findLatestTipUnderNode(nodesById, requestedNodeId);
+  const selectedPath = buildPathToNode(nodesById, selectedTipId);
+  const selectedEntries: CodexSessionEntry[] = [...prefixEntries];
+
+  for (const node of selectedPath) {
+    selectedEntries.push(...node.setupEntries, ...node.entries);
+  }
+
+  const activePathSet = new Set(activePathIds);
+  return {
+    entries: selectedEntries,
+    branchState: buildBranchState({
+      sessionId,
+      nodes,
+      nodesById,
+      rootNodeIds,
+      activePathIds: activePathSet,
+      activeBranchId,
+      selectedBranchId: requestedNodeId,
+    }),
+  };
+}
+
+/**
+ * Apply Codex CLI `thread_rolled_back` markers to persisted rollout entries.
+ *
+ * Codex backtrack/rollback keeps old response_item lines on disk and appends a
+ * marker instead. This returns the visible branch by dropping the requested
+ * number of user turns from the history accumulated before each marker.
+ */
+export function applyCodexRollbackMarkers(
+  entries: CodexSessionEntry[],
+): CodexSessionEntry[] {
+  return buildCodexBranchView(entries, "codex-session").entries;
+}

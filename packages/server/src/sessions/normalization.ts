@@ -1,5 +1,7 @@
 import type {
   ClaudeSessionEntry,
+  CodexBranchOption,
+  CodexBranchState,
   CodexCompactedEntry,
   CodexCustomToolCallOutputPayload,
   CodexCustomToolCallPayload,
@@ -36,6 +38,7 @@ import {
 } from "../codex/normalization.js";
 import type { ContentBlock, Message, Session } from "../supervisor/types.js";
 import { collectVisibleClaudeEntries } from "./claude-messages.js";
+import { applyCodexRollbackMarkers } from "./codex-rollback.js";
 import type { LoadedSession } from "./types.js";
 
 interface CodexToolUseConversion {
@@ -106,7 +109,12 @@ export function normalizeSession(loaded: LoadedSession): Session {
     case "codex-oss":
       return {
         ...summary,
-        messages: convertCodexEntries(data.session.entries, summary.id),
+        codexBranchState: loaded.codexBranchState,
+        messages: convertCodexEntries(
+          applyCodexRollbackMarkers(data.session.entries),
+          summary.id,
+          loaded.codexBranchState,
+        ),
       };
     case "gemini":
       return {
@@ -200,6 +208,7 @@ function convertClaudeMessage(
 function convertCodexEntries(
   entries: CodexSessionEntry[],
   sessionId: string,
+  branchState?: CodexBranchState,
 ): Message[] {
   const messages: Message[] = [];
   let messageIndex = 0;
@@ -278,7 +287,88 @@ function convertCodexEntries(
     }
   }
 
-  return messages;
+  return branchState
+    ? annotateCodexBranchMessages(messages, branchState)
+    : messages;
+}
+
+function getNormalizedUserText(message: Message): string | null {
+  if (message.type !== "user") return null;
+
+  const content = message.message?.content ?? message.content;
+  if (typeof content === "string") {
+    const text = content.trim();
+    return text.length > 0 ? content : null;
+  }
+
+  if (!Array.isArray(content)) return null;
+
+  const text = content
+    .map((block) =>
+      block && typeof block === "object" && "text" in block
+        ? String(block.text ?? "")
+        : "",
+    )
+    .join("");
+  return text.trim().length > 0 ? text : null;
+}
+
+function codexBranchMessageKey(timestamp: string | undefined, prompt: string) {
+  return `${timestamp ?? ""}\n${prompt}`;
+}
+
+function annotateCodexBranchMessages(
+  messages: Message[],
+  branchState: CodexBranchState,
+): Message[] {
+  if (branchState.branches.length === 0) {
+    return messages;
+  }
+
+  const branchByKey = new Map<string, CodexBranchOption>();
+  const branchesByParent = new Map<string, CodexBranchOption[]>();
+
+  for (const branch of branchState.branches) {
+    branchByKey.set(
+      codexBranchMessageKey(branch.createdAt, branch.prompt),
+      branch,
+    );
+
+    const parentKey = branch.parentId ?? "<root>";
+    const siblings = branchesByParent.get(parentKey) ?? [];
+    siblings.push(branch);
+    branchesByParent.set(parentKey, siblings);
+  }
+
+  for (const siblings of branchesByParent.values()) {
+    siblings.sort((a, b) => a.siblingIndex - b.siblingIndex);
+  }
+
+  return messages.map((message) => {
+    const text = getNormalizedUserText(message);
+    if (!text) return message;
+
+    const branch = branchByKey.get(
+      codexBranchMessageKey(message.timestamp, text),
+    );
+    if (!branch || branch.siblingCount <= 1) return message;
+
+    const parentKey = branch.parentId ?? "<root>";
+    const alternatives = branchesByParent.get(parentKey) ?? [branch];
+    return {
+      ...message,
+      codexBranch: {
+        sessionId: branchState.sessionId,
+        branchId: branch.id,
+        activeBranchId: branchState.activeBranchId,
+        selectedBranchId: branchState.selectedBranchId,
+        parentId: branch.parentId,
+        siblingIndex: branch.siblingIndex,
+        siblingCount: branch.siblingCount,
+        alternatives,
+      },
+    };
+  });
 }
 
 function getCodexResponseEventKind(

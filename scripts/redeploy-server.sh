@@ -40,6 +40,15 @@ dim()  { echo -e "${C_DIM}    $*${C_RESET}"; }
 # ----- args -----
 DO_BUILD=true
 DO_RESTART=true
+SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
+SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
+if [[ "$SERVER_BASE_PATH" == "/" ]]; then
+  SERVER_BASE_PATH=""
+else
+  SERVER_BASE_PATH="/${SERVER_BASE_PATH#/}"
+  SERVER_BASE_PATH="${SERVER_BASE_PATH%/}"
+fi
+SERVER_BASE_URL="http://127.0.0.1:${SERVER_PORT}${SERVER_BASE_PATH}"
 for arg in "$@"; do
   case "$arg" in
     --restart)    DO_BUILD=false ;;
@@ -121,7 +130,7 @@ if $DO_RESTART; then
 
   # Wait briefly for the old process to release the port.
   for _ in $(seq 1 20); do
-    if ! lsof -iTCP:8022 -sTCP:LISTEN -t >/dev/null 2>&1; then
+    if ! lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
       break
     fi
     sleep 0.25
@@ -132,17 +141,17 @@ if $DO_RESTART; then
   # cleanly (see INFRA.md). The Hono app + client bundle both pick up BASE_PATH.
   # APK / direct-mode tcp tunnel callers are unaffected — they hit ws://host:8022
   # which still serves /yep/api/ws; only the URL prefix changes, not the port.
-  BASE_PATH=/yep nohup yepanywhere >/tmp/yep-server.log 2>&1 & disown
+  BASE_PATH="${SERVER_BASE_PATH:-/}" nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
 
   # Health-check loop. Tries up to 15s; the server usually answers within 2s
   # but Tauri activity / large data dirs can stretch first-boot.
   # /yep/api/version is a small JSON endpoint that exists on every server build —
   # /api/health doesn't (unmatched routes fall through to the SPA shell).
   # The /yep prefix matches the BASE_PATH set above.
-  log "Waiting for /yep/api/version on 8022 ..."
+  log "Waiting for ${SERVER_BASE_URL}/api/version ..."
   HEALTH_OK=false
   for _ in $(seq 1 60); do
-    if curl -fsS http://127.0.0.1:8022/yep/api/version >/dev/null 2>&1; then
+    if curl -fsS "${SERVER_BASE_URL}/api/version" >/dev/null 2>&1; then
       HEALTH_OK=true
       break
     fi
@@ -152,8 +161,19 @@ if $DO_RESTART; then
   if $HEALTH_OK; then
     log "Server is up."
     # Show what the freshly started server reports.
-    SERVER_VERSION_LINE="$(curl -fsS http://127.0.0.1:8022/yep/api/version 2>/dev/null | python3 -c 'import sys, json; d=json.load(sys.stdin); print(f"current={d[\"current\"]} protocol={d[\"resumeProtocolVersion\"]}")' 2>/dev/null || true)"
-    dim "/yep/api/version → ${SERVER_VERSION_LINE}"
+    SERVER_VERSION_LINE="$(curl -fsS "${SERVER_BASE_URL}/api/version" 2>/dev/null | node -e 'let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => { const d=JSON.parse(raw); console.log(`current=${d.current} protocol=${d.resumeProtocolVersion} buildId=${d.build?.buildId ?? "missing"}`); })' 2>/dev/null || true)"
+    dim "${SERVER_BASE_URL}/api/version → ${SERVER_VERSION_LINE}"
+
+    LISTEN_PID="$(lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+    if [[ -n "$LISTEN_PID" ]]; then
+      LISTEN_CMD="$(ps -p "$LISTEN_PID" -o command= 2>/dev/null || true)"
+      dim "pid ${LISTEN_PID}: ${LISTEN_CMD}"
+    fi
+
+    log "Verifying deployed server/client build metadata ..."
+    node scripts/verify-deploy.mjs \
+      --base-url "$SERVER_BASE_URL" \
+      --build-info "$REPO_ROOT/dist/npm-package/build-info.json"
 
     # Relay (4400) was retired in favor of self-hosted frp tcp tunnels.
     # Skipping relay status check — see INFRA.md.

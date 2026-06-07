@@ -89,6 +89,8 @@ interface Props {
     uuid: string;
     parentUuid: string | null;
   }) => void;
+  /** Codex-only: switch the rendered derived branch. */
+  onSelectCodexBranch?: (branchId: string) => void;
 }
 
 export const MessageList = memo(function MessageList({
@@ -107,6 +109,7 @@ export const MessageList = memo(function MessageList({
   loadingOlder = false,
   onLoadOlderMessages,
   onEditUserPrompt,
+  onSelectCodexBranch,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -341,6 +344,7 @@ export const MessageList = memo(function MessageList({
               toggleThinkingExpanded={toggleThinkingExpanded}
               sessionProvider={provider}
               onEditUserPrompt={onEditUserPrompt}
+              onSelectCodexBranch={onSelectCodexBranch}
             />
           );
         }
@@ -370,6 +374,7 @@ export const MessageList = memo(function MessageList({
                 thinkingExpanded={thinkingExpanded}
                 toggleThinkingExpanded={toggleThinkingExpanded}
                 sessionProvider={provider}
+                onSelectCodexBranch={onSelectCodexBranch}
               />
             ))}
             <MessageActions

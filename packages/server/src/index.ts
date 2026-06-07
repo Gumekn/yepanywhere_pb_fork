@@ -9,6 +9,7 @@ import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { createApp } from "./app.js";
 import { AuthService } from "./auth/AuthService.js";
+import { getRuntimeBuildInfo } from "./build-info.js";
 import {
   closeCodexCorrelationDebugLogger,
   initCodexCorrelationDebugLogger,
@@ -181,6 +182,10 @@ initCodexCorrelationDebugLogger();
 console.log(`[Config] Data dir: ${config.dataDir}`);
 console.log(
   `[Config] Log file: ${getLogFilePath({ logDir: config.logDir, logFile: config.logFile })}`,
+);
+const runtimeBuildInfo = await getRuntimeBuildInfo();
+console.log(
+  `[Build] id=${runtimeBuildInfo.buildId} version=${runtimeBuildInfo.version} git=${runtimeBuildInfo.gitCommit?.slice(0, 12) ?? "unknown"} dirty=${String(runtimeBuildInfo.gitDirty)} source=${runtimeBuildInfo.source} builtAt=${runtimeBuildInfo.builtAt}`,
 );
 
 // Check for Claude CLI (optional - warn if not found)

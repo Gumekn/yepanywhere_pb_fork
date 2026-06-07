@@ -93,6 +93,7 @@ export function useSession(
   sessionId: string,
   initialStatus?: { owner: "self"; processId: string },
   streamingMarkdownCallbacks?: StreamingMarkdownCallbacks,
+  branchId?: string,
 ) {
   // Use initial status if provided (from navigation state) to connect stream immediately
   const [status, setStatus] = useState<SessionStatus>(
@@ -148,7 +149,7 @@ export function useSession(
   // biome-ignore lint/correctness/useExhaustiveDependencies: effect intentionally runs on session switches
   useEffect(() => {
     hasHandledConnectedEventRef.current = false;
-  }, [sessionId]);
+  }, [sessionId, branchId]);
 
   // Slash commands available for this session (from init message)
   const [slashCommands, setSlashCommands] = useState<string[]>([]);
@@ -244,6 +245,7 @@ export function useSession(
   } = useSessionMessages({
     projectId,
     sessionId,
+    branchId,
     onLoadComplete: handleLoadComplete,
     onLoadError: handleLoadError,
   });

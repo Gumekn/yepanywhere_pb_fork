@@ -185,6 +185,15 @@ interface CodexTurnRuntimeState {
   activeTurnId: string | null;
 }
 
+interface ThreadRollbackParams {
+  threadId: string;
+  numTurns: number;
+}
+
+interface ThreadRollbackResponse {
+  thread: ThreadResumeResponse["thread"];
+}
+
 async function terminateChildProcess(
   child: ChildProcess | null | undefined,
   graceMs = APP_SERVER_SHUTDOWN_GRACE_MS,
@@ -994,6 +1003,12 @@ export class CodexProvider implements AgentProvider {
     });
   }
 
+  private normalizeRollbackNumTurns(value?: number): number | null {
+    if (typeof value !== "number") return null;
+    if (!Number.isInteger(value) || value <= 0) return null;
+    return value;
+  }
+
   /**
    * Start a new Codex session.
    */
@@ -1137,6 +1152,41 @@ export class CodexProvider implements AgentProvider {
 
       sessionId = threadResult.thread.id;
       runtimeState.threadId = sessionId;
+
+      const rollbackNumTurns = this.normalizeRollbackNumTurns(
+        options.rollbackNumTurns,
+      );
+      if (rollbackNumTurns !== null) {
+        const beforeRollbackThreadId = sessionId;
+        const rollbackParams: ThreadRollbackParams = {
+          threadId: sessionId,
+          numTurns: rollbackNumTurns,
+        };
+        log.info(
+          {
+            event: "codex_thread_rollback_requested",
+            sessionId: beforeRollbackThreadId,
+            rollbackNumTurns,
+          },
+          "Requesting Codex app-server thread rollback",
+        );
+        const rollbackResult = await appServer.request<ThreadRollbackResponse>(
+          "thread/rollback",
+          rollbackParams,
+        );
+        sessionId = rollbackResult.thread.id;
+        runtimeState.threadId = sessionId;
+        log.info(
+          {
+            event: "codex_thread_rollback_completed",
+            beforeRollbackThreadId,
+            sessionId,
+            rollbackNumTurns,
+          },
+          "Rolled back Codex app-server thread before edited turn",
+        );
+      }
+
       log.info(
         {
           sessionId,

@@ -44,9 +44,15 @@ export default defineConfig({
   clearScreen: false,
   base: basePath,
   define: {
-    __APP_VERSION__: JSON.stringify(getGitVersion()),
+    __APP_VERSION__: JSON.stringify(
+      process.env.YEP_BUILD_VERSION ??
+        process.env.YEP_BUILD_GIT_DESCRIBE ??
+        getGitVersion(),
+    ),
     // Wall-clock build time (see vite.config.remote.ts for rationale).
-    __BUILD_DATE__: JSON.stringify(new Date().toISOString()),
+    __BUILD_DATE__: JSON.stringify(
+      process.env.YEP_BUILD_DATE ?? new Date().toISOString(),
+    ),
     __BUILD_PROFILE__: JSON.stringify(process.env.YEP_BUILD_PROFILE ?? "dev"),
   },
   plugins: [

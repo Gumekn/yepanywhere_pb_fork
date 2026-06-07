@@ -100,6 +100,167 @@ describe("Supervisor", () => {
 
       expect(process1.id).not.toBe(process2.id);
     });
+
+    it("passes rollbackNumTurns to provider-backed resumed sessions", async () => {
+      let aborted = false;
+      const startSession = vi.fn(
+        async (options: {
+          resumeSessionId?: string;
+          rollbackNumTurns?: number;
+          initialMessage?: { text: string };
+        }) => {
+          async function* iterator() {
+            yield {
+              type: "system",
+              subtype: "init",
+              session_id: options.resumeSessionId ?? "new-session",
+            };
+            while (!aborted) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+          }
+
+          return {
+            iterator: iterator(),
+            queue: new MessageQueue(),
+            abort: () => {
+              aborted = true;
+            },
+          };
+        },
+      );
+      const provider: AgentProvider = {
+        name: "codex",
+        displayName: "Codex",
+        supportsPermissionMode: true,
+        supportsThinkingToggle: true,
+        supportsSlashCommands: false,
+        isInstalled: async () => true,
+        isAuthenticated: async () => true,
+        getAuthStatus: async () => ({
+          installed: true,
+          authenticated: true,
+          enabled: true,
+        }),
+        startSession,
+        getAvailableModels: async () => [],
+      };
+      const providerSupervisor = new Supervisor({
+        provider,
+        idleTimeoutMs: 100,
+      });
+
+      const process = await providerSupervisor.resumeSession(
+        "sess-123",
+        "/tmp/test",
+        { text: "q2-1" },
+        undefined,
+        { rollbackNumTurns: 2 },
+      );
+
+      expect(startSession).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resumeSessionId: "sess-123",
+          rollbackNumTurns: 2,
+          initialMessage: expect.objectContaining({ text: "q2-1" }),
+        }),
+      );
+
+      aborted = true;
+      await providerSupervisor.abortProcess((process as { id: string }).id);
+    });
+
+    it("restarts an existing process before applying rollbackNumTurns", async () => {
+      const starts: Array<{
+        aborted: boolean;
+        options: {
+          resumeSessionId?: string;
+          rollbackNumTurns?: number;
+          initialMessage?: { text: string };
+        };
+      }> = [];
+      const startSession = vi.fn(
+        async (options: {
+          resumeSessionId?: string;
+          rollbackNumTurns?: number;
+          initialMessage?: { text: string };
+        }) => {
+          const start = { aborted: false, options };
+          starts.push(start);
+
+          async function* iterator() {
+            yield {
+              type: "system",
+              subtype: "init",
+              session_id: options.resumeSessionId ?? "new-session",
+            };
+            while (!start.aborted) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+          }
+
+          return {
+            iterator: iterator(),
+            queue: new MessageQueue(),
+            abort: () => {
+              start.aborted = true;
+            },
+          };
+        },
+      );
+      const provider: AgentProvider = {
+        name: "codex",
+        displayName: "Codex",
+        supportsPermissionMode: true,
+        supportsThinkingToggle: true,
+        supportsSlashCommands: false,
+        isInstalled: async () => true,
+        isAuthenticated: async () => true,
+        getAuthStatus: async () => ({
+          installed: true,
+          authenticated: true,
+          enabled: true,
+        }),
+        startSession,
+        getAvailableModels: async () => [],
+      };
+      const providerSupervisor = new Supervisor({
+        provider,
+        idleTimeoutMs: 100,
+      });
+
+      const process1 = await providerSupervisor.resumeSession(
+        "sess-123",
+        "/tmp/test",
+        { text: "q1" },
+      );
+      const process2 = await providerSupervisor.resumeSession(
+        "sess-123",
+        "/tmp/test",
+        { text: "q1-1" },
+        undefined,
+        { rollbackNumTurns: 1 },
+      );
+
+      expect(startSession).toHaveBeenCalledTimes(2);
+      expect((process2 as { id: string }).id).not.toBe(
+        (process1 as { id: string }).id,
+      );
+      expect(starts[0]?.aborted).toBe(true);
+      expect(starts[1]?.options).toEqual(
+        expect.objectContaining({
+          resumeSessionId: "sess-123",
+          rollbackNumTurns: 1,
+          initialMessage: expect.objectContaining({ text: "q1-1" }),
+        }),
+      );
+
+      const secondStart = starts[1];
+      if (secondStart) {
+        secondStart.aborted = true;
+      }
+      await providerSupervisor.abortProcess((process2 as { id: string }).id);
+    });
   });
 
   describe("getProcess", () => {

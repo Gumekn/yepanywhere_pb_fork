@@ -15,6 +15,7 @@ import {
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
 import { augmentTextBlocks } from "../augments/markdown-augments.js";
+import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
@@ -104,6 +105,27 @@ function isCodexProviderName(
   return provider === "codex" || provider === "codex-oss";
 }
 
+function parseOptionalPositiveInteger(
+  value: unknown,
+  fieldName: string,
+): { value: number | undefined; error?: string } {
+  if (value === undefined || value === null) {
+    return { value: undefined };
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return { value: undefined, error: `${fieldName} must be a number` };
+  }
+
+  if (!Number.isInteger(value) || value < 1) {
+    return {
+      value: undefined,
+      error: `${fieldName} must be a positive integer`,
+    };
+  }
+
+  return { value };
+}
+
 export interface SessionsDeps {
   supervisor: Supervisor;
   scanner: ProjectScanner;
@@ -150,6 +172,11 @@ interface StartSessionBody {
    * dropped. Maps to the SDK `resumeSessionAt` option. Claude provider only.
    */
   resumeSessionAt?: string;
+  /**
+   * Rewind/edit for Codex app-server: drop this many trailing user turns via
+   * `thread/rollback` before sending the edited prompt in the same session.
+   */
+  rollbackNumTurns?: number;
 }
 
 interface CreateSessionBody {
@@ -719,12 +746,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   //   ?afterMessageId=<id> - incremental forward-fetch (append new messages)
   //   ?tailCompactions=<n> - return only last N compact boundaries worth of messages
   //   ?beforeMessageId=<id> - cursor for loading older chunks (used with tailCompactions)
+  //   ?branchId=<id> - Codex-only derived branch id to render
   routes.get("/projects/:projectId/sessions/:sessionId", async (c) => {
     const projectId = c.req.param("projectId");
     const sessionId = c.req.param("sessionId");
     const afterMessageId = c.req.query("afterMessageId");
     const tailCompactionsParam = c.req.query("tailCompactions");
     const beforeMessageId = c.req.query("beforeMessageId");
+    const branchId = c.req.query("branchId");
     const tailCompactions =
       tailCompactionsParam !== undefined
         ? Number.parseInt(tailCompactionsParam, 10)
@@ -763,6 +792,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         // 2. No active process (tools aren't potentially in progress)
         // When we own the session, tools without results might be pending approval
         includeOrphans: wasEverOwned && !process,
+        branchId,
       },
     );
 
@@ -786,7 +816,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           sessionId,
           project.id,
           afterMessageId,
-          { includeOrphans: wasEverOwned && !process },
+          { includeOrphans: wasEverOwned && !process, branchId },
         );
       }
     }
@@ -812,7 +842,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           sessionId,
           project.id,
           afterMessageId,
-          { includeOrphans: wasEverOwned && !process },
+          { includeOrphans: wasEverOwned && !process, branchId },
         );
       }
     }
@@ -1271,6 +1301,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     if (parsedBodyExecutor.error) {
       return c.json({ error: parsedBodyExecutor.error }, 400);
     }
+    const parsedRollbackNumTurns = parseOptionalPositiveInteger(
+      body.rollbackNumTurns,
+      "rollbackNumTurns",
+    );
+    if (parsedRollbackNumTurns.error) {
+      return c.json({ error: parsedRollbackNumTurns.error }, 400);
+    }
 
     const userMessage: UserMessage = {
       text: body.message,
@@ -1358,6 +1395,34 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         project.provider;
     }
 
+    getLogger().info(
+      {
+        event: "session_resume_requested",
+        sessionId,
+        projectId: resolvedProjectId,
+        projectPath: project.path,
+        providerName,
+        bodyProvider: body.provider ?? null,
+        metadataProvider: metadataProvider ?? null,
+        executor: executor ?? null,
+        resumeSessionAt:
+          providerName === "claude" ? (body.resumeSessionAt ?? null) : null,
+        rollbackNumTurns:
+          providerName === "codex"
+            ? (parsedRollbackNumTurns.value ?? null)
+            : null,
+        ignoredResumeSessionAt:
+          providerName !== "claude" ? (body.resumeSessionAt ?? null) : null,
+        ignoredRollbackNumTurns:
+          providerName !== "codex"
+            ? (parsedRollbackNumTurns.value ?? null)
+            : null,
+        tempId: body.tempId ?? null,
+        messageLength: body.message.length,
+      },
+      "Session resume requested",
+    );
+
     const result = await deps.supervisor.resumeSession(
       sessionId,
       project.path,
@@ -1378,6 +1443,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         // are dropped. Claude provider only (SDK feature).
         resumeSessionAt:
           providerName === "claude" ? body.resumeSessionAt : undefined,
+        // Codex app-server models Codex CLI Esc Esc backtrack as a
+        // same-thread rollback count, not as a message UUID.
+        rollbackNumTurns:
+          providerName === "codex" ? parsedRollbackNumTurns.value : undefined,
       },
     );
 
@@ -1391,8 +1460,32 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Check if request was queued
     if (isQueuedResponse(result)) {
+      getLogger().info(
+        {
+          event: "session_resume_queued",
+          sessionId,
+          projectId: resolvedProjectId,
+          providerName,
+          queueId: result.queueId,
+          position: result.position,
+        },
+        "Session resume queued",
+      );
       return c.json(result, 202); // 202 Accepted - queued for processing
     }
+
+    getLogger().info(
+      {
+        event: "session_resume_process_started",
+        sessionId,
+        projectId: resolvedProjectId,
+        providerName,
+        processId: result.id,
+        permissionMode: result.permissionMode,
+        modeVersion: result.modeVersion,
+      },
+      "Session resume process started",
+    );
 
     return c.json({
       processId: result.id,

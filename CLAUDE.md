@@ -218,6 +218,47 @@ All `console.log/error/warn` output is captured. Logs are JSON format in the fil
 Environment variables:
 - `LOG_DIR` - Custom log directory
 - `LOG_FILE` - Custom log filename (default: server.log)
+
+## Local Deploy Memory
+
+The historical shell alias in `~/.zshrc` is:
+
+```bash
+alias yep-deploy='/Users/yueyuan/Desktop/work/before_work/yepanywhere/scripts/redeploy-server.sh && /Users/yueyuan/Desktop/work/before_work/yepanywhere/scripts/rebuild-apk.sh'
+alias yep-server='/Users/yueyuan/Desktop/work/before_work/yepanywhere/scripts/redeploy-server.sh'
+```
+
+Prefer the unified project entrypoint for new work:
+
+```bash
+scripts/deploy.sh                 # server rebuild/restart/verify, then APK build/install
+scripts/deploy.sh --server-only   # server only
+scripts/deploy.sh --apk-only      # APK only
+pnpm deploy -- --server-only      # same entrypoint through package.json
+```
+
+`scripts/redeploy-server.sh` now performs a hard deployment verification after
+restart. It compares the running server's `/api/version` `build.buildId` and
+the served frontend `/build-info.json` against `dist/npm-package/build-info.json`.
+If this fails, the process responding on 8022 or the static frontend bundle is
+not the just-built code. Check `/tmp/yep-server.log` and
+`~/.yep-anywhere/logs/server.log` before debugging application behavior.
+
+For Codex edited-message/session-branch issues, first inspect server logs for:
+
+- `session_resume_requested` — API received provider, `resumeSessionAt`, and
+  `rollbackNumTurns`.
+- `session_rewind_existing_process_restart` — Supervisor aborted an existing
+  process so rewind parameters can take effect instead of queueing a normal
+  next turn.
+- `provider_session_start_requested` — provider start options include the
+  rewind fields.
+- `codex_thread_rollback_requested` and `codex_thread_rollback_completed` —
+  Codex app-server `thread/rollback` was actually called.
+
+If the Codex JSONL has no `thread_rolled_back` event and these logs are absent,
+the client/server path did not submit rollback. If these logs exist but the JSONL
+has no marker, investigate the Codex app-server response path.
 - `LOG_LEVEL` - Minimum level: fatal, error, warn, info, debug, trace (default: info)
 - `LOG_FILE_LEVEL` - Separate level for file logging (default: same as LOG_LEVEL)
 - `LOG_TO_FILE` - Set to "true" to enable file logging (default: off)

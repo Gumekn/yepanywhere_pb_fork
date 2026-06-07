@@ -3,8 +3,9 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../src/app.js";
+import type { SessionMetadataService } from "../../src/metadata/index.js";
 import { MockClaudeSDK, createMockScenario } from "../../src/sdk/mock.js";
 import { encodeProjectId } from "../../src/supervisor/types.js";
 
@@ -272,6 +273,126 @@ describe("Sessions API", () => {
       expect(res.status).toBe(200);
       const json = await res.json();
       expect(json.processId).toBeDefined();
+    });
+
+    it("passes Codex rollbackNumTurns when resuming an edited Codex prompt", async () => {
+      const sessionMetadataService = {
+        getProvider: vi.fn(() => "codex"),
+        getExecutor: vi.fn(() => undefined),
+      };
+      const { app, supervisor } = createApp({
+        sdk: mockSdk,
+        projectsDir: testDir,
+        sessionMetadataService:
+          sessionMetadataService as unknown as SessionMetadataService,
+      });
+      const resumeSpy = vi
+        .spyOn(supervisor, "resumeSession")
+        .mockResolvedValue({
+          id: "process-codex",
+          permissionMode: "default",
+          modeVersion: 0,
+        } as unknown as Awaited<ReturnType<typeof supervisor.resumeSession>>);
+
+      const res = await app.request(
+        `/api/projects/${projectId}/sessions/sess-existing/resume`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Yep-Anywhere": "true",
+          },
+          body: JSON.stringify({
+            message: "q2-1",
+            rollbackNumTurns: 2,
+          }),
+        },
+      );
+
+      expect(res.status).toBe(200);
+      expect(resumeSpy).toHaveBeenCalledWith(
+        "sess-existing",
+        expect.any(String),
+        expect.objectContaining({ text: "q2-1" }),
+        undefined,
+        expect.objectContaining({
+          providerName: "codex",
+          rollbackNumTurns: 2,
+          resumeSessionAt: undefined,
+        }),
+      );
+    });
+
+    it("does not pass Codex rollbackNumTurns when resuming Claude", async () => {
+      const sessionMetadataService = {
+        getProvider: vi.fn(() => "claude"),
+        getExecutor: vi.fn(() => undefined),
+      };
+      const { app, supervisor } = createApp({
+        sdk: mockSdk,
+        projectsDir: testDir,
+        sessionMetadataService:
+          sessionMetadataService as unknown as SessionMetadataService,
+      });
+      const resumeSpy = vi
+        .spyOn(supervisor, "resumeSession")
+        .mockResolvedValue({
+          id: "process-claude",
+          permissionMode: "default",
+          modeVersion: 0,
+        } as unknown as Awaited<ReturnType<typeof supervisor.resumeSession>>);
+
+      const res = await app.request(
+        `/api/projects/${projectId}/sessions/sess-existing/resume`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Yep-Anywhere": "true",
+          },
+          body: JSON.stringify({
+            message: "q2-1",
+            resumeSessionAt: "parent-uuid",
+            rollbackNumTurns: 2,
+          }),
+        },
+      );
+
+      expect(res.status).toBe(200);
+      expect(resumeSpy).toHaveBeenCalledWith(
+        "sess-existing",
+        expect.any(String),
+        expect.objectContaining({ text: "q2-1" }),
+        undefined,
+        expect.objectContaining({
+          providerName: "claude",
+          rollbackNumTurns: undefined,
+          resumeSessionAt: "parent-uuid",
+        }),
+      );
+    });
+
+    it("returns 400 for non-integer rollbackNumTurns", async () => {
+      const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
+
+      const res = await app.request(
+        `/api/projects/${projectId}/sessions/sess-existing/resume`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Yep-Anywhere": "true",
+          },
+          body: JSON.stringify({
+            message: "continue",
+            rollbackNumTurns: 1.5,
+          }),
+        },
+      );
+
+      expect(res.status).toBe(400);
+      const json = await res.json();
+      expect(json.error).toBe("rollbackNumTurns must be a positive integer");
     });
 
     it("accepts permission mode parameter", async () => {

@@ -341,6 +341,27 @@ export interface SessionSandboxPolicy {
   excludeSlashTmp?: boolean;
 }
 
+export interface CodexBranchOption {
+  id: string;
+  sessionId: string;
+  parentId: string | null;
+  prompt: string;
+  title: string;
+  depth: number;
+  index: number;
+  siblingIndex: number;
+  siblingCount: number;
+  isActive: boolean;
+  createdAt?: string;
+}
+
+export interface CodexBranchState {
+  sessionId: string;
+  activeBranchId: string | null;
+  selectedBranchId: string | null;
+  branches: CodexBranchOption[];
+}
+
 /**
  * Recent session entry with enriched data from the server.
  * Session data is looked up server-side to avoid N+1 client requests.
@@ -394,6 +415,8 @@ export interface AppSessionSummary {
   approvalPolicy?: string;
   /** Sandbox policy from turn_context */
   sandboxPolicy?: SessionSandboxPolicy;
+  /** Codex-only branch state derived from thread_rolled_back markers. */
+  codexBranchState?: CodexBranchState;
 }
 
 /**

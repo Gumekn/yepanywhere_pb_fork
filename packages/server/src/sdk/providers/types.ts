@@ -52,6 +52,13 @@ export interface StartSessionOptions {
    * `resumeSessionAt` option.
    */
   resumeSessionAt?: string;
+  /**
+   * Drop this many trailing user turns before continuing the same provider
+   * session. Currently used by Codex app-server `thread/rollback`; other
+   * providers should ignore it unless they expose equivalent same-thread
+   * history control.
+   */
+  rollbackNumTurns?: number;
   /** Permission mode for tool approvals */
   permissionMode?: PermissionMode;
   /** Model to use (e.g., "sonnet", "opus", "haiku") */

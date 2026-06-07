@@ -3,7 +3,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { UrlProjectId } from "@yep-anywhere/shared";
+import type { CodexSessionEntry, UrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { encodeProjectId } from "../../src/projects/paths.js";
 import { CodexSessionReader } from "../../src/sessions/codex-reader.js";
@@ -109,6 +109,71 @@ describe("CodexSessionReader - OSS Support", () => {
       `${lines.join("\n")}\n`,
     );
   };
+
+  const createRollbackSessionFile = async (sessionId: string) => {
+    const now = new Date().toISOString();
+    const responseMessage = (
+      role: "user" | "assistant",
+      text: string,
+      index: number,
+    ) =>
+      JSON.stringify({
+        type: "response_item",
+        timestamp: `2024-01-01T00:00:${String(index).padStart(2, "0")}Z`,
+        payload: {
+          type: "message",
+          role,
+          content: [
+            {
+              type: role === "user" ? "input_text" : "output_text",
+              text,
+            },
+          ],
+        },
+      });
+
+    const lines = [
+      JSON.stringify({
+        type: "session_meta",
+        timestamp: now,
+        payload: {
+          id: sessionId,
+          cwd: "/test/project",
+          timestamp: now,
+          model_provider: "openai",
+        },
+      }),
+      responseMessage("user", "q1", 1),
+      responseMessage("assistant", "a1", 2),
+      responseMessage("user", "q2", 3),
+      responseMessage("assistant", "a2", 4),
+      responseMessage("user", "q3", 5),
+      responseMessage("assistant", "a3", 6),
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:07Z",
+        payload: {
+          type: "thread_rolled_back",
+          num_turns: 2,
+        },
+      }),
+      responseMessage("user", "q2-1", 8),
+      responseMessage("assistant", "a2-1", 9),
+    ];
+
+    await writeFile(
+      join(testDir, `${sessionId}.jsonl`),
+      `${lines.join("\n")}\n`,
+    );
+  };
+
+  const visibleMessageTexts = (entries: CodexSessionEntry[]) =>
+    entries.flatMap((entry) => {
+      if (entry.type !== "response_item") return [];
+      if (entry.payload.type !== "message") return [];
+      const firstContent = entry.payload.content[0];
+      return firstContent && "text" in firstContent ? [firstContent.text] : [];
+    });
 
   it("identifies session as codex-oss when model_provider is ollama", async () => {
     const sessionId = "oss-session-1";
@@ -320,6 +385,45 @@ describe("CodexSessionReader - OSS Support", () => {
       "test-project" as UrlProjectId,
     );
     expect(summary?.messageCount).toBe(1);
+  });
+
+  it("hides Codex rollout entries removed by thread_rolled_back markers", async () => {
+    const sessionId = "rollback-visible-branch";
+    await createRollbackSessionFile(sessionId);
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+    expect(summary?.provider).toBe("codex");
+    expect(summary?.messageCount).toBe(4);
+
+    const session = await reader.getSession(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+    expect(session).not.toBeNull();
+    expect(visibleMessageTexts(session?.data.session.entries ?? [])).toEqual([
+      "q1",
+      "a1",
+      "q2-1",
+      "a2-1",
+    ]);
+
+    const oldQ2Branch = session?.codexBranchState?.branches.find(
+      (branch) => branch.prompt === "q2",
+    );
+    expect(oldQ2Branch?.siblingCount).toBe(2);
+
+    const oldBranchSession = await reader.getSession(
+      sessionId,
+      "test-project" as UrlProjectId,
+      undefined,
+      { branchId: oldQ2Branch?.id },
+    );
+    expect(
+      visibleMessageTexts(oldBranchSession?.data.session.entries ?? []),
+    ).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
   });
 
   it("preserves originator from session metadata", async () => {

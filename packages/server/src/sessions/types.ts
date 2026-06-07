@@ -5,7 +5,11 @@
  * but all readers implement this interface to provide a common API.
  */
 
-import type { UnifiedSession, UrlProjectId } from "@yep-anywhere/shared";
+import type {
+  CodexBranchState,
+  UnifiedSession,
+  UrlProjectId,
+} from "@yep-anywhere/shared";
 import type { Message, Session, SessionSummary } from "../supervisor/types.js";
 
 /**
@@ -14,12 +18,16 @@ import type { Message, Session, SessionSummary } from "../supervisor/types.js";
 export interface GetSessionOptions {
   /** Include orphaned tool use detection (default: true, only applicable for Claude) */
   includeOrphans?: boolean;
+  /** Codex-only: choose a derived branch id to render instead of the latest branch. */
+  branchId?: string;
 }
 
 // Return type that includes both the computed summary and the raw provider data
 export interface LoadedSession {
   summary: SessionSummary;
   data: UnifiedSession;
+  /** Codex-only branch state derived from thread_rolled_back markers. */
+  codexBranchState?: CodexBranchState;
 }
 
 /**

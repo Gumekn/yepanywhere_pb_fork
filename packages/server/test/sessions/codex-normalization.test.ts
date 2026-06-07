@@ -1,15 +1,19 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { CodexSessionEntry } from "@yep-anywhere/shared";
+import type { CodexBranchState, CodexSessionEntry } from "@yep-anywhere/shared";
 import { describe, expect, it } from "vitest";
 import { preprocessMessages } from "../../../client/src/lib/preprocessMessages.ts";
+import { buildCodexBranchView } from "../../src/sessions/codex-rollback.js";
 import { normalizeSession } from "../../src/sessions/normalization.js";
 import type { LoadedSession } from "../../src/sessions/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-function buildLoadedSession(entries: CodexSessionEntry[]): LoadedSession {
+function buildLoadedSession(
+  entries: CodexSessionEntry[],
+  codexBranchState?: CodexBranchState,
+): LoadedSession {
   return {
     summary: {
       id: "test-session",
@@ -31,6 +35,7 @@ function buildLoadedSession(entries: CodexSessionEntry[]): LoadedSession {
       },
       // biome-ignore lint/suspicious/noExplicitAny: mock session shape
     } as any,
+    codexBranchState,
   };
 }
 
@@ -48,6 +53,67 @@ function loadCodexFixtureEntries(name: string): CodexSessionEntry[] {
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
     .map((line) => JSON.parse(line) as CodexSessionEntry);
+}
+
+function codexUserMessage(text: string, second: number): CodexSessionEntry {
+  return {
+    type: "response_item",
+    timestamp: `2024-01-01T00:00:${String(second).padStart(2, "0")}Z`,
+    payload: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text }],
+    },
+  };
+}
+
+function codexAssistantMessage(
+  text: string,
+  second: number,
+): CodexSessionEntry {
+  return {
+    type: "response_item",
+    timestamp: `2024-01-01T00:00:${String(second).padStart(2, "0")}Z`,
+    payload: {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text }],
+    },
+  };
+}
+
+function codexRollbackMarker(
+  numTurns: number,
+  second: number,
+): CodexSessionEntry {
+  return {
+    type: "event_msg",
+    timestamp: `2024-01-01T00:00:${String(second).padStart(2, "0")}Z`,
+    payload: {
+      type: "thread_rolled_back",
+      num_turns: numTurns,
+    },
+  };
+}
+
+function firstMessageText(message: {
+  message?: { content?: unknown };
+}): string | undefined {
+  const content = message.message?.content;
+  if (typeof content === "string") return content;
+  const block = Array.isArray(content) ? content[0] : content;
+  if (block && typeof block === "object" && "text" in block) {
+    return String(block.text);
+  }
+  return undefined;
+}
+
+function firstEntryText(entry: CodexSessionEntry): string | undefined {
+  if (entry.type !== "response_item" || entry.payload.type !== "message") {
+    return undefined;
+  }
+  const block = entry.payload.content[0];
+  return block && "text" in block ? block.text : undefined;
 }
 
 describe("Codex Normalization", () => {
@@ -114,6 +180,100 @@ describe("Codex Normalization", () => {
       type: "text",
       text: "How are you?",
     });
+  });
+
+  it("applies Codex thread_rolled_back markers before normalizing", () => {
+    const entries: CodexSessionEntry[] = [
+      codexUserMessage("q1", 1),
+      codexAssistantMessage("a1", 2),
+      codexUserMessage("q2", 3),
+      codexAssistantMessage("a2", 4),
+      codexUserMessage("q3", 5),
+      codexAssistantMessage("a3", 6),
+      codexRollbackMarker(2, 7),
+      codexUserMessage("q2-1", 8),
+      codexAssistantMessage("a2-1", 9),
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+
+    expect(result.messages.map(firstMessageText)).toEqual([
+      "q1",
+      "a1",
+      "q2-1",
+      "a2-1",
+    ]);
+    expect(result.messages.map(firstMessageText)).not.toContain("q2");
+    expect(result.messages.map(firstMessageText)).not.toContain("q3");
+  });
+
+  it("can project an older Codex rollback branch", () => {
+    const entries: CodexSessionEntry[] = [
+      codexUserMessage("q1", 1),
+      codexAssistantMessage("a1", 2),
+      codexUserMessage("q2", 3),
+      codexAssistantMessage("a2", 4),
+      codexUserMessage("q3", 5),
+      codexAssistantMessage("a3", 6),
+      codexRollbackMarker(2, 7),
+      codexUserMessage("q2-1", 8),
+      codexAssistantMessage("a2-1", 9),
+    ];
+
+    const activeView = buildCodexBranchView(entries, "test-session");
+    expect(activeView.entries.map(firstEntryText)).toEqual([
+      "q1",
+      "a1",
+      "q2-1",
+      "a2-1",
+    ]);
+
+    const oldQ2Branch = activeView.branchState.branches.find(
+      (branch) => branch.prompt === "q2",
+    );
+    expect(oldQ2Branch?.siblingCount).toBe(2);
+
+    const oldView = buildCodexBranchView(
+      entries,
+      "test-session",
+      oldQ2Branch?.id,
+    );
+    expect(oldView.entries.map(firstEntryText)).toEqual([
+      "q1",
+      "a1",
+      "q2",
+      "a2",
+      "q3",
+      "a3",
+    ]);
+  });
+
+  it("annotates Codex user prompts with sibling branch choices", () => {
+    const entries: CodexSessionEntry[] = [
+      codexUserMessage("q1", 1),
+      codexAssistantMessage("a1", 2),
+      codexUserMessage("q2", 3),
+      codexAssistantMessage("a2", 4),
+      codexRollbackMarker(1, 5),
+      codexUserMessage("q2-1", 6),
+      codexAssistantMessage("a2-1", 7),
+    ];
+    const branchView = buildCodexBranchView(entries, "test-session");
+    const result = normalizeSession(
+      buildLoadedSession(branchView.entries, branchView.branchState),
+    );
+    const editedPrompt = result.messages.find(
+      (message) => firstMessageText(message) === "q2-1",
+    );
+
+    expect(editedPrompt?.codexBranch).toMatchObject({
+      sessionId: "test-session",
+      branchId: "codex-branch-5",
+      siblingCount: 2,
+    });
+    expect(
+      editedPrompt?.codexBranch?.alternatives.map((branch) => branch.prompt),
+    ).toEqual(["q2", "q2-1"]);
   });
 
   it("normalizes function_call_output into user tool_result blocks", () => {

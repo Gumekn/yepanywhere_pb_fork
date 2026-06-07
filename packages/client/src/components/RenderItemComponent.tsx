@@ -1,4 +1,5 @@
 import { memo, useCallback } from "react";
+import { getMessageId } from "../lib/mergeMessages";
 import type { RenderItem } from "../types/renderItems";
 import { SessionSetupBlock } from "./blocks/SessionSetupBlock";
 import { TextBlock } from "./blocks/TextBlock";
@@ -21,6 +22,8 @@ interface Props {
     uuid: string;
     parentUuid: string | null;
   }) => void;
+  /** Codex-only: switch the rendered derived branch. */
+  onSelectCodexBranch?: (branchId: string) => void;
 }
 
 function getMessageIdLike(message: Record<string, unknown>): string {
@@ -136,6 +139,7 @@ export const RenderItemComponent = memo(function RenderItemComponent({
   toggleThinkingExpanded,
   sessionProvider,
   onEditUserPrompt,
+  onSelectCodexBranch,
 }: Props) {
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
@@ -197,11 +201,13 @@ export const RenderItemComponent = memo(function RenderItemComponent({
 
       case "user_prompt": {
         const src = item.sourceMessages[0];
-        const uuid = src?.uuid;
+        const uuid = src ? getMessageId(src) : "";
         return (
           <UserPromptBlock
             content={item.content}
             timestamp={src?.timestamp}
+            codexBranch={src?.codexBranch}
+            onSelectCodexBranch={onSelectCodexBranch}
             onEdit={
               onEditUserPrompt && uuid
                 ? (text) =>

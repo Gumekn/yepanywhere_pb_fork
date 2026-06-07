@@ -27,6 +27,53 @@ const STAGING_DIR = path.join(ROOT_DIR, "dist/npm-package");
 
 // Version for npm package - set via NPM_VERSION env var (from git tag in CI) or fallback
 const NPM_VERSION = process.env.NPM_VERSION || "0.4.8";
+const BUILD_DATE = process.env.YEP_BUILD_DATE || new Date().toISOString();
+
+function commandOutput(command: string): string | null {
+  try {
+    const output = execSync(command, {
+      cwd: ROOT_DIR,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "ignore"],
+    }).trim();
+    return output.length > 0 ? output : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeBasePath(raw: string | undefined): string {
+  if (!raw || raw === "/") return "/";
+  const withLeadingSlash = raw.startsWith("/") ? raw : `/${raw}`;
+  return withLeadingSlash.replace(/\/+$/, "");
+}
+
+function createBuildInfo() {
+  const gitDescribe = commandOutput("git describe --tags --always")?.replace(
+    /^v/,
+    "",
+  );
+  const gitCommit = commandOutput("git rev-parse HEAD");
+  const gitBranch = commandOutput("git branch --show-current");
+  const gitStatus = commandOutput("git status --porcelain");
+  const shortCommit = gitCommit?.slice(0, 12) ?? "nogit";
+  const compactDate = BUILD_DATE.replace(/\D/g, "").slice(0, 14) || "unknown";
+
+  return {
+    schemaVersion: 1,
+    buildId: `${NPM_VERSION}-${shortCommit}-${compactDate}`,
+    version: NPM_VERSION,
+    gitDescribe: gitDescribe ?? null,
+    gitCommit: gitCommit ?? null,
+    gitBranch: gitBranch ?? null,
+    gitDirty: gitStatus !== null ? gitStatus.length > 0 : null,
+    builtAt: BUILD_DATE,
+    buildProfile: process.env.YEP_BUILD_PROFILE ?? "production",
+    basePath: normalizeBasePath(process.env.BASE_PATH ?? "/yep"),
+  };
+}
+
+const BUILD_INFO = createBuildInfo();
 
 interface StepResult {
   step: string;
@@ -106,6 +153,10 @@ step("Build client", () => {
   );
   execStep("pnpm --filter @yep-anywhere/client build", undefined, {
     BASE_PATH: clientBasePath,
+    YEP_BUILD_VERSION: BUILD_INFO.version,
+    YEP_BUILD_DATE: BUILD_INFO.builtAt,
+    YEP_BUILD_GIT_DESCRIBE: BUILD_INFO.gitDescribe ?? BUILD_INFO.version,
+    YEP_BUILD_PROFILE: BUILD_INFO.buildProfile,
   });
 
   // Verify client dist exists
@@ -122,7 +173,13 @@ step("Build client", () => {
     );
   }
 
+  fs.writeFileSync(
+    path.join(CLIENT_DIST, "build-info.json"),
+    `${JSON.stringify(BUILD_INFO, null, 2)}\n`,
+  );
+
   log(`  Client built successfully: ${path.relative(ROOT_DIR, CLIENT_DIST)}`);
+  log(`  Client build id: ${BUILD_INFO.buildId}`);
 });
 
 // Build server
@@ -147,6 +204,16 @@ step("Create staging directory", () => {
     `Creating staging directory at ${path.relative(ROOT_DIR, STAGING_DIR)}...`,
   );
   fs.mkdirSync(STAGING_DIR, { recursive: true });
+});
+
+// Write build metadata for the running server to expose through /api/version.
+step("Write build metadata", () => {
+  fs.writeFileSync(
+    path.join(STAGING_DIR, "build-info.json"),
+    `${JSON.stringify(BUILD_INFO, null, 2)}\n`,
+  );
+  log(`  Build id: ${BUILD_INFO.buildId}`);
+  log("  Written to: dist/npm-package/build-info.json");
 });
 
 // Copy server dist to staging
