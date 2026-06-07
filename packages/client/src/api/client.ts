@@ -85,6 +85,8 @@ export interface GlobalSessionItem {
   executor?: string;
   /** Cached context window usage if the server has it. */
   contextUsage?: ContextUsage;
+  /** Model name from the session summary (e.g. "opus", "gpt-5.5"). */
+  model?: string;
 }
 
 /** Stats about all sessions (computed during full scan on server) */

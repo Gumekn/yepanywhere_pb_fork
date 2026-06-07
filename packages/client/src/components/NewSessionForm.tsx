@@ -1,5 +1,6 @@
 import {
   type ModelInfo,
+  type ProviderInfo,
   type ProviderName,
   resolveModel,
 } from "@yep-anywhere/shared";
@@ -119,6 +120,10 @@ export function NewSessionForm({
   >({});
   const [interimTranscript, setInterimTranscript] = useState("");
   const [isSavingDefaults, setIsSavingDefaults] = useState(false);
+  // Unavailable providers (not installed / not authed) are collapsed by default
+  // so the selector grid stays tidy instead of showing tall, uneven cards.
+  const [showUnavailableProviders, setShowUnavailableProviders] =
+    useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceButtonRef = useRef<VoiceInputButtonRef>(null);
@@ -582,6 +587,53 @@ export function NewSessionForm({
     (savedDefaults?.model ?? undefined) === (selectedModel ?? undefined) &&
     (savedDefaults?.permissionMode ?? "default") === mode;
 
+  // Split providers into available vs unavailable so the unavailable ones can
+  // be tucked behind a toggle (keeps the grid from looking ragged).
+  const { availableProviderList, unavailableProviderList } = useMemo(() => {
+    const isAvailable = (p: ProviderInfo) =>
+      p.installed && (p.authenticated || p.enabled);
+    return {
+      availableProviderList: providers.filter(isAvailable),
+      unavailableProviderList: providers.filter((p) => !isAvailable(p)),
+    };
+  }, [providers]);
+
+  const renderProviderButton = (p: ProviderInfo) => {
+    const isAvailable = p.installed && (p.authenticated || p.enabled);
+    const isSelected = selectedProvider === p.name;
+    return (
+      <button
+        key={p.name}
+        type="button"
+        className={`provider-option ${isSelected ? "selected" : ""} ${!isAvailable ? "disabled" : ""}`}
+        onClick={() => isAvailable && handleProviderSelect(p.name)}
+        disabled={isStarting || !isAvailable}
+        title={
+          !isAvailable
+            ? t("newSessionProviderUnavailable", {
+                provider: p.displayName,
+                reason: !p.installed
+                  ? t("newSessionProviderNotInstalled")
+                  : t("newSessionProviderNotAuthenticated"),
+              })
+            : p.displayName
+        }
+      >
+        <span className={`provider-option-dot provider-${p.name}`} />
+        <div className="provider-option-content">
+          <span className="provider-option-label">{p.displayName}</span>
+          {!isAvailable && (
+            <span className="provider-option-status">
+              {!p.installed
+                ? t("newSessionProviderStatusNotInstalled")
+                : t("newSessionProviderStatusNotAuthenticated")}
+            </span>
+          )}
+        </div>
+      </button>
+    );
+  };
+
   // Shared input area with toolbar (textarea + attach/voice on left, send on right)
   const inputArea = (
     <>
@@ -785,43 +837,25 @@ export function NewSessionForm({
         <div className="new-session-provider-section">
           <h3>{t("newSessionProviderTitle")}</h3>
           <div className="provider-options">
-            {providers.map((p) => {
-              const isAvailable = p.installed && (p.authenticated || p.enabled);
-              const isSelected = selectedProvider === p.name;
-              return (
-                <button
-                  key={p.name}
-                  type="button"
-                  className={`provider-option ${isSelected ? "selected" : ""} ${!isAvailable ? "disabled" : ""}`}
-                  onClick={() => isAvailable && handleProviderSelect(p.name)}
-                  disabled={isStarting || !isAvailable}
-                  title={
-                    !isAvailable
-                      ? t("newSessionProviderUnavailable", {
-                          provider: p.displayName,
-                          reason: !p.installed
-                            ? t("newSessionProviderNotInstalled")
-                            : t("newSessionProviderNotAuthenticated"),
-                        })
-                      : p.displayName
-                  }
-                >
-                  <span className={`provider-option-dot provider-${p.name}`} />
-                  <div className="provider-option-content">
-                    <span className="provider-option-label">
-                      {p.displayName}
-                    </span>
-                    {!isAvailable && (
-                      <span className="provider-option-status">
-                        {!p.installed
-                          ? t("newSessionProviderStatusNotInstalled")
-                          : t("newSessionProviderStatusNotAuthenticated")}
-                      </span>
-                    )}
-                  </div>
-                </button>
-              );
-            })}
+            {availableProviderList.map(renderProviderButton)}
+            {showUnavailableProviders &&
+              unavailableProviderList.map(renderProviderButton)}
+            {unavailableProviderList.length > 0 && (
+              <button
+                type="button"
+                className="provider-option provider-option-toggle"
+                onClick={() => setShowUnavailableProviders((v) => !v)}
+                aria-expanded={showUnavailableProviders}
+              >
+                <span className="provider-option-label">
+                  {showUnavailableProviders
+                    ? t("newSessionProviderShowLess")
+                    : t("newSessionProviderShowMore", {
+                        count: unavailableProviderList.length,
+                      })}
+                </span>
+              </button>
+            )}
           </div>
         </div>
       )}

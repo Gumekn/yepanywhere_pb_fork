@@ -11,6 +11,7 @@ import type {
   SessionStatus,
 } from "../types";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
+import { ProviderBadge } from "./ProviderBadge";
 import { SessionMenu } from "./SessionMenu";
 import { SessionStatusBadge } from "./StatusBadge";
 import { ThinkingIndicator } from "./ThinkingIndicator";
@@ -67,6 +68,9 @@ interface SessionListItemProps {
 
   /** Number of messages in session (0 indicates brand new session) */
   messageCount?: number;
+
+  /** Model identifier for provider badge display (e.g. "opus", "gpt-5.5") */
+  model?: string;
 
   /** When true (and `mode === "card"`), the card shows a "12 条 · 12.3K
    *  tokens" line below the timestamp. Used on the All Sessions page so users
@@ -131,6 +135,7 @@ export function SessionListItem({
   basePath = "",
   // New session detection
   messageCount,
+  model,
   showSizeMeta = false,
 }: SessionListItemProps) {
   const { t, locale } = useI18n();
@@ -386,6 +391,13 @@ export function SessionListItem({
                     {projectName}
                   </span>
                 )}
+                {provider && (
+                  <ProviderBadge
+                    provider={provider}
+                    model={model}
+                    isThinking={activity === "in-turn"}
+                  />
+                )}
                 {showTimestamp && updatedAt && (
                   <span
                     className="session-list-item__time"
@@ -445,6 +457,15 @@ export function SessionListItem({
                   {displayTitle}
                 </span>
                 {hasDraft && <span className="session-draft-badge">Draft</span>}
+                {provider && (
+                  <ProviderBadge
+                    provider={provider}
+                    model={model}
+                    isThinking={activity === "in-turn"}
+                    compact
+                    className="session-list-item__provider"
+                  />
+                )}
               </span>
               {showProjectName && projectName && (
                 <span className="session-list-item__project-compact">

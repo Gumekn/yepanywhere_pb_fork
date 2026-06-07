@@ -798,6 +798,7 @@ export function GlobalSessionsPage() {
                         pendingInputType={session.pendingInputType}
                         status={session.ownership}
                         provider={session.provider}
+                        model={session.model}
                         executor={session.executor}
                         isStarred={session.isStarred}
                         isArchived={session.isArchived}

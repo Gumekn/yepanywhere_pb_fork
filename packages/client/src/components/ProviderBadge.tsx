@@ -13,7 +13,11 @@ const PROVIDER_COLORS: Record<ProviderName, string> = {
 
 const PROVIDER_LABELS: Record<ProviderName, string> = {
   claude: "Claude",
-  "claude-ollama": "Ollama",
+  // Same product brand as `claude` (both use the Claude SDK + Anthropic agent
+  // loop). The model name is what distinguishes them — e.g. "Sonnet 4" vs a
+  // local "MiniMax-M3" — so we deliberately don't surface "Ollama" as the
+  // short label here; the model chip carries that information instead.
+  "claude-ollama": "Claude",
   codex: "Codex",
   "codex-oss": "CodexOSS",
   gemini: "Gemini",

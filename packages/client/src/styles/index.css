@@ -5613,6 +5613,23 @@ button.context-usage-indicator--button:focus-visible {
   color: var(--text-muted);
 }
 
+/* Toggle chip that expands/collapses unavailable providers */
+.provider-option-toggle {
+  color: var(--text-muted);
+  border-style: dashed;
+  background: transparent;
+}
+
+.provider-option-toggle:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+  border-color: var(--text-dimmed);
+}
+
+.provider-option-toggle .provider-option-label {
+  color: inherit;
+}
+
 /* Provider Badge Component */
 .provider-badge {
   display: inline-flex;
@@ -8209,17 +8226,19 @@ button.context-usage-indicator--button:focus-visible {
 
 .fab-submit {
   flex-shrink: 0;
-  width: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
   height: 28px;
+  padding: 0 var(--space-3);
   border-radius: var(--radius-md);
   background: var(--app-yep-green);
   color: white;
   border: none;
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  white-space: nowrap;
   transition: opacity 0.15s ease;
 }
 
