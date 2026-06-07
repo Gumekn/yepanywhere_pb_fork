@@ -182,13 +182,16 @@ export interface TaskResult {
  * WebSearch tool types
  */
 export interface WebSearchInput {
-  query: string;
+  query?: string;
+  action?: unknown;
 }
 
 export interface WebSearchResult {
-  query: string;
-  results: Array<{ content: Array<{ title: string; url: string }> }>;
-  durationSeconds: number;
+  query?: string;
+  results?: Array<{ content?: Array<{ title: string; url: string }> }>;
+  durationSeconds?: number;
+  codexActionLabel?: string;
+  codexAction?: unknown;
 }
 
 /**

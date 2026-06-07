@@ -2247,6 +2247,13 @@ details[open] .collapsible__icon {
 .websearch-query-display {
   color: var(--text-secondary, var(--text-muted));
   font-style: italic;
+  word-break: break-word;
+}
+
+.websearch-action {
+  color: var(--text-secondary, var(--text-muted));
+  font-size: var(--font-size-sm);
+  word-break: break-word;
 }
 
 .websearch-links {

@@ -96,6 +96,20 @@ function isSessionSetupPrompt(item: UserPromptItem): boolean {
   return SESSION_SETUP_PREFIXES.some((prefix) => text.startsWith(prefix));
 }
 
+function dedupeSessionSetupItems(items: UserPromptItem[]): UserPromptItem[] {
+  const seen = new Set<string>();
+  const deduped: UserPromptItem[] = [];
+
+  for (const item of items) {
+    const key = getPromptText(item.content).trim();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+
+  return deduped;
+}
+
 function collapseSessionSetupRuns(items: RenderItem[]): RenderItem[] {
   const result: RenderItem[] = [];
   let index = 0;
@@ -125,8 +139,10 @@ function collapseSessionSetupRuns(items: RenderItem[]): RenderItem[] {
 
     // Preserve likely user-authored single setup-like messages mid-session.
     // Collapse any run at session start and any multi-item run (typical resume preamble).
-    if (setupItems.length > 1 || index === 0) {
-      const firstSetupItem = setupItems[0];
+    const shouldCollapse = setupItems.length > 1 || index === 0;
+    if (shouldCollapse) {
+      const dedupedSetupItems = dedupeSessionSetupItems(setupItems);
+      const firstSetupItem = dedupedSetupItems[0];
       if (!firstSetupItem) {
         index = runIndex;
         continue;
@@ -136,8 +152,8 @@ function collapseSessionSetupRuns(items: RenderItem[]): RenderItem[] {
         type: "session_setup",
         id: `session-setup-${firstSetupItem.id}`,
         title: "Session setup",
-        prompts: setupItems.map((setupItem) => setupItem.content),
-        sourceMessages: setupItems.flatMap(
+        prompts: dedupedSetupItems.map((setupItem) => setupItem.content),
+        sourceMessages: dedupedSetupItems.flatMap(
           (setupItem) => setupItem.sourceMessages,
         ),
       };

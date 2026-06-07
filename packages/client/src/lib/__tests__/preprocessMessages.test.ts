@@ -626,6 +626,44 @@ describe("preprocessMessages", () => {
     });
   });
 
+  it("deduplicates identical setup prompts inside a collapsed setup run", () => {
+    const setupContent =
+      "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nfoo\n</INSTRUCTIONS><environment_context>\n  <cwd>/repo</cwd>\n</environment_context>";
+    const messages: Message[] = [
+      {
+        id: "msg-setup-1",
+        role: "user",
+        content: setupContent,
+        timestamp: "2024-01-01T00:00:00Z",
+      },
+      {
+        id: "msg-setup-2",
+        role: "user",
+        content: setupContent,
+        timestamp: "2024-01-01T00:00:01Z",
+      },
+      {
+        id: "msg-user-1",
+        role: "user",
+        content: "Implement the requested change",
+        timestamp: "2024-01-01T00:00:02Z",
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({
+      type: "session_setup",
+      title: "Session setup",
+      prompts: [setupContent],
+    });
+    expect(items[1]).toMatchObject({
+      type: "user_prompt",
+      content: "Implement the requested change",
+    });
+  });
+
   it("attaches markdown augment to assistant string content", () => {
     const messages: Message[] = [
       {

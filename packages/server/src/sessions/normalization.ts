@@ -217,12 +217,17 @@ function convertCodexEntries(
 
   for (const entry of entries) {
     if (entry.type === "response_item") {
-      const msg = convertCodexResponseItem(
+      const converted = convertCodexResponseItem(
         entry,
         messageIndex++,
         toolCallContexts,
       );
-      if (msg) {
+      const convertedMessages = Array.isArray(converted)
+        ? converted
+        : converted
+          ? [converted]
+          : [];
+      for (const msg of convertedMessages) {
         if (isCodexCorrelationDebugEnabled()) {
           logCodexCorrelationDebug({
             sessionId,
@@ -458,7 +463,7 @@ function convertCodexResponseItem(
   entry: CodexResponseItemEntry,
   index: number,
   toolCallContexts: Map<string, CodexToolCallContext>,
-): Message | null {
+): Message | Message[] | null {
   const payload = entry.payload;
   const uuid = `codex-${index}-${entry.timestamp}`;
 
@@ -574,26 +579,14 @@ function convertCodexReasoningPayload(
   payload: CodexReasoningPayload,
   uuid: string,
   timestamp: string,
-): Message {
+): Message | null {
   const summaryText = payload.summary
     ?.map((s) => s.text)
     .join("\n")
     .trim();
 
-  const content: ContentBlock[] = [];
-
-  if (summaryText) {
-    content.push({
-      type: "thinking",
-      thinking: summaryText,
-    });
-  }
-
-  if (payload.encrypted_content && !summaryText) {
-    content.push({
-      type: "thinking",
-      thinking: "Reasoning [internal]",
-    });
+  if (!summaryText) {
+    return null;
   }
 
   return {
@@ -601,7 +594,12 @@ function convertCodexReasoningPayload(
     type: "assistant",
     message: {
       role: "assistant",
-      content,
+      content: [
+        {
+          type: "thinking",
+          thinking: summaryText,
+        },
+      ],
     },
     timestamp,
   };
@@ -761,10 +759,13 @@ function convertCodexWebSearchCallPayload(
   payload: CodexWebSearchCallPayload,
   uuid: string,
   timestamp: string,
-): Message {
+): Message[] {
   const callId = payload.call_id ?? payload.id ?? `${uuid}-web-search`;
   const rawToolName = payload.name ?? payload.type;
   const toolName = canonicalizeCodexToolName(rawToolName);
+  const payloadRecord = payload as Record<string, unknown>;
+  const status =
+    typeof payloadRecord.status === "string" ? payloadRecord.status : undefined;
 
   const parsedArguments = parseCodexToolArguments(payload.arguments);
   let input: Record<string, unknown>;
@@ -784,6 +785,13 @@ function convertCodexWebSearchCallPayload(
   if (payload.action !== undefined && input.action === undefined) {
     input.action = payload.action;
   }
+  const actionSummary = summarizeCodexWebSearchAction(payload.action);
+  if (typeof input.query !== "string" && actionSummary.query) {
+    input.query = actionSummary.query;
+  }
+  if (actionSummary.label && typeof input.query !== "string") {
+    input.query = actionSummary.label;
+  }
 
   const content: ContentBlock[] = [
     {
@@ -794,7 +802,7 @@ function convertCodexWebSearchCallPayload(
     },
   ];
 
-  return {
+  const toolUseMessage: Message = {
     uuid,
     type: "assistant",
     message: {
@@ -804,6 +812,98 @@ function convertCodexWebSearchCallPayload(
     codexToolName: rawToolName,
     timestamp,
   };
+
+  if (status !== "completed" && status !== "complete") {
+    return [toolUseMessage];
+  }
+
+  const query =
+    typeof input.query === "string" && input.query.trim()
+      ? input.query
+      : actionSummary.label || "Codex web search";
+  const result = {
+    query,
+    results: [],
+    codexActionLabel: actionSummary.label,
+    codexAction: payload.action,
+  };
+  const toolResult: ContentBlock = {
+    type: "tool_result",
+    tool_use_id: callId,
+    content: actionSummary.label
+      ? `Codex web search completed: ${actionSummary.label}`
+      : "Codex web search completed",
+  };
+
+  return [
+    toolUseMessage,
+    {
+      uuid: `${uuid}-result`,
+      type: "user",
+      message: {
+        role: "user",
+        content: [toolResult],
+      },
+      toolUseResult: result,
+      timestamp,
+    },
+  ];
+}
+
+function summarizeCodexWebSearchAction(action: unknown): {
+  label?: string;
+  query?: string;
+} {
+  if (!isRecord(action)) {
+    return {};
+  }
+
+  const actionType =
+    typeof action.type === "string" && action.type.trim()
+      ? action.type.trim()
+      : undefined;
+
+  if (actionType === "search") {
+    const query = getFirstString(
+      action.query,
+      Array.isArray(action.queries) ? action.queries[0] : undefined,
+    );
+    return {
+      ...(query ? { query } : {}),
+      label: query ? `Search: ${query}` : "Search",
+    };
+  }
+
+  if (actionType === "open_page" || actionType === "openPage") {
+    const url = getFirstString(action.url);
+    return {
+      ...(url ? { query: url } : {}),
+      label: url ? `Open page: ${url}` : "Open page",
+    };
+  }
+
+  if (actionType === "find_in_page" || actionType === "findInPage") {
+    const pattern = getFirstString(action.pattern);
+    const url = getFirstString(action.url);
+    const target = [pattern, url].filter(Boolean).join(" @ ");
+    return {
+      ...(target ? { query: target } : {}),
+      label: target ? `Find in page: ${target}` : "Find in page",
+    };
+  }
+
+  return actionType ? { label: actionType } : {};
+}
+
+function getFirstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return undefined;
 }
 
 function convertCodexToolCallOutputPayload(

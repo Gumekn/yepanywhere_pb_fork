@@ -326,6 +326,51 @@ describe("Codex Normalization", () => {
     });
   });
 
+  it("normalizes completed Codex web_search_call into a completed tool row", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "web_search_call",
+          status: "completed",
+          action: {
+            type: "search",
+            query: "weather: Shanghai",
+            queries: ["weather: Shanghai"],
+          },
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    expect(normalized.messages).toHaveLength(2);
+
+    const renderItems = preprocessMessages(normalized.messages);
+    const webSearchItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "WebSearch",
+    );
+
+    expect(webSearchItem?.type).toBe("tool_call");
+    if (webSearchItem?.type !== "tool_call") {
+      throw new Error("Expected WebSearch render item");
+    }
+
+    expect(webSearchItem.status).toBe("complete");
+    expect(webSearchItem.toolInput).toMatchObject({
+      query: "weather: Shanghai",
+      action: {
+        type: "search",
+        query: "weather: Shanghai",
+      },
+    });
+    expect(webSearchItem.toolResult?.structured).toMatchObject({
+      query: "weather: Shanghai",
+      results: [],
+      codexActionLabel: "Search: weather: Shanghai",
+    });
+  });
+
   it("normalizes exec_command input.cmd into Bash input.command", () => {
     const entries: CodexSessionEntry[] = [
       {
@@ -1010,7 +1055,7 @@ describe("Codex Normalization", () => {
     });
   });
 
-  it("adds internal reasoning placeholder thinking block when no summary is present", () => {
+  it("skips encrypted-only reasoning when no summary is present", () => {
     const entries: CodexSessionEntry[] = [
       {
         type: "response_item",
@@ -1023,16 +1068,7 @@ describe("Codex Normalization", () => {
     ];
 
     const result = normalizeSession(buildLoadedSession(entries));
-    expect(result.messages).toHaveLength(1);
-
-    const content = result.messages[0]?.message?.content;
-    const blocks = Array.isArray(content) ? content : [];
-
-    expect(blocks).toHaveLength(1);
-    expect(blocks[0]).toMatchObject({
-      type: "thinking",
-      thinking: "Reasoning [internal]",
-    });
+    expect(result.messages).toHaveLength(0);
   });
 
   it("skips developer messages from the normalized transcript", () => {

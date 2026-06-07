@@ -5,13 +5,77 @@ import { validateToolResult } from "../../../lib/validateToolResult";
 import { SchemaWarning } from "../../SchemaWarning";
 import type { ToolRenderer, WebSearchInput, WebSearchResult } from "./types";
 
+function getCodexWebSearchActionLabel(action: unknown): string | undefined {
+  if (!action || typeof action !== "object" || Array.isArray(action)) {
+    return undefined;
+  }
+
+  const record = action as Record<string, unknown>;
+  const actionType =
+    typeof record.type === "string" && record.type.trim()
+      ? record.type.trim()
+      : undefined;
+
+  if (actionType === "search") {
+    const query =
+      typeof record.query === "string" && record.query.trim()
+        ? record.query.trim()
+        : Array.isArray(record.queries) && typeof record.queries[0] === "string"
+          ? record.queries[0].trim()
+          : undefined;
+    return query ? `Search: ${query}` : "Search";
+  }
+
+  if (actionType === "open_page" || actionType === "openPage") {
+    const url =
+      typeof record.url === "string" && record.url.trim()
+        ? record.url.trim()
+        : undefined;
+    return url ? `Open page: ${url}` : "Open page";
+  }
+
+  if (actionType === "find_in_page" || actionType === "findInPage") {
+    const pattern =
+      typeof record.pattern === "string" && record.pattern.trim()
+        ? record.pattern.trim()
+        : undefined;
+    const url =
+      typeof record.url === "string" && record.url.trim()
+        ? record.url.trim()
+        : undefined;
+    const target = [pattern, url].filter(Boolean).join(" @ ");
+    return target ? `Find in page: ${target}` : "Find in page";
+  }
+
+  return actionType;
+}
+
+function getWebSearchDisplayText(value: WebSearchInput | WebSearchResult) {
+  const record = value as WebSearchInput & WebSearchResult;
+  return (
+    record.query?.trim() ||
+    record.codexActionLabel?.trim() ||
+    getCodexWebSearchActionLabel(record.action ?? record.codexAction) ||
+    "Web search"
+  );
+}
+
+function isRedundantSearchActionLabel(
+  actionLabel: string | undefined,
+  query: string | undefined,
+) {
+  if (!actionLabel || !query) return false;
+  return actionLabel === `Search: ${query}`;
+}
+
 /**
  * WebSearch tool use - shows search query
  */
 function WebSearchToolUse({ input }: { input: WebSearchInput }) {
+  const displayText = getWebSearchDisplayText(input);
   return (
     <div className="websearch-tool-use">
-      <span className="websearch-query">{input.query}</span>
+      <span className="websearch-query">{displayText}</span>
     </div>
   );
 }
@@ -68,11 +132,19 @@ function WebSearchToolResult({
   // Flatten results from potentially nested structure
   const allResults =
     result.results?.flatMap((r) => r.content || []).filter(Boolean) || [];
+  const displayText = getWebSearchDisplayText(result);
+  const queryText = result.query?.trim();
+  const actionLabel =
+    result.codexActionLabel?.trim() ||
+    getCodexWebSearchActionLabel(result.codexAction);
+  const showActionLabel = !isRedundantSearchActionLabel(actionLabel, queryText);
 
   return (
     <div className="websearch-result">
       <div className="websearch-header">
-        <span className="websearch-query-display">"{result.query}"</span>
+        <span className="websearch-query-display">
+          {queryText ? `"${queryText}"` : displayText}
+        </span>
         {result.durationSeconds !== undefined && (
           <span className="badge">{result.durationSeconds.toFixed(2)}s</span>
         )}
@@ -80,6 +152,9 @@ function WebSearchToolResult({
           <SchemaWarning toolName="WebSearch" errors={validationErrors} />
         )}
       </div>
+      {actionLabel && actionLabel !== displayText && showActionLabel && (
+        <div className="websearch-action">{actionLabel}</div>
+      )}
       {allResults.length > 0 ? (
         <ul className="websearch-links">
           {allResults.map((item, i) => (
@@ -96,7 +171,7 @@ function WebSearchToolResult({
             </li>
           ))}
         </ul>
-      ) : (
+      ) : actionLabel ? null : (
         <div className="websearch-empty">No results found</div>
       )}
     </div>
@@ -121,13 +196,16 @@ export const webSearchRenderer: ToolRenderer<WebSearchInput, WebSearchResult> =
     },
 
     getUseSummary(input) {
-      return (input as WebSearchInput).query;
+      return getWebSearchDisplayText(input as WebSearchInput);
     },
 
     getResultSummary(result, isError) {
       if (isError) return "Error";
       const r = result as WebSearchResult;
       const count = r?.results?.flatMap((res) => res.content || []).length || 0;
+      if (count === 0 && (r?.codexActionLabel || r?.codexAction)) {
+        return getWebSearchDisplayText(r);
+      }
       return `${count} results`;
     },
   };
