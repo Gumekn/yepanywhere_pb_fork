@@ -1,141 +1,141 @@
-# Device Bridge: iOS Simulator Support
+# Device Bridge：iOS Simulator 支持
 
-## Goal
+## 目标
 
-Add iOS simulator streaming to the device bridge, following the same architecture as ChromeOS and Android physical devices: a small native daemon that speaks the shared binary framing protocol over stdin/stdout, launched as a subprocess by the Go sidecar.
+为 device bridge 增加 iOS simulator streaming，沿用 ChromeOS 和实体 Android 的同一架构：一个小型 native daemon，通过 stdin/stdout 使用共享 binary framing protocol，由 Go sidecar 作为 subprocess 启动。
 
-## Background
+## 背景
 
-The iOS simulator exposes its framebuffer as a shared-memory **IOSurface** via Apple's private `SimulatorKit` framework. This is the same mechanism used by Facebook's IDB (`idb_companion`) and the Simulator.app GUI itself. Direct IOSurface access is orders of magnitude faster than `xcrun simctl io screenshot` (~500ms per frame, limited to ~2 FPS).
+iOS simulator 通过 Apple 私有 `SimulatorKit` framework，把 framebuffer 暴露为共享内存 **IOSurface**。Facebook IDB（`idb_companion`）和 Simulator.app GUI 也使用同一机制。直接访问 IOSurface 比 `xcrun simctl io screenshot` 快几个数量级；后者每帧约 500ms，基本限制在约 2 FPS。
 
-For input injection, the simulator accepts **IndigoHID** messages — a Mach message-based protocol used internally by SimulatorKit. IDB reverse-engineered the structs and provides MIT-licensed headers we can reference.
+输入注入使用 **IndigoHID** messages。这是 SimulatorKit 内部使用的 Mach message-based protocol。IDB 已 reverse-engineer 相关 structs，并提供 MIT-licensed headers 可参考。
 
-## Architecture
+## 架构
 
-Same subprocess-with-framing pattern as ChromeOS and Android:
+和 ChromeOS、Android 一样，采用 subprocess + framing pattern：
 
-```
+```text
 Go sidecar ──(stdin/stdout framing)──► ios-sim-server ──(IOSurface + IndigoHID)──► Simulator
 ```
 
-Compare with existing device types:
+与现有设备类型对比：
 
-| Device Type | Daemon | Transport | Frame Source | Input Method |
-|---|---|---|---|---|
-| Android emulator | — (gRPC built-in) | gRPC | Emulator gRPC API | Emulator gRPC API |
+| 设备类型 | Daemon | Transport | Frame source | Input method |
+|----------|--------|-----------|--------------|--------------|
+| Android emulator | 无，gRPC built-in | gRPC | Emulator gRPC API | Emulator gRPC API |
 | Android physical | `yep-device-server.apk` | TCP via `adb forward` | `SurfaceControl.screenshot()` | `InputManager.injectInputEvent()` |
-| ChromeOS | `daemon.py` | SSH stdin/stdout | `drm_screenshot_jpeg()` | evdev (`VirtualMouse`, keyboard) |
-| **iOS simulator** | **`ios-sim-server`** | **stdin/stdout** | **IOSurface → VideoToolbox JPEG** | **IndigoHID via SimDeviceLegacyClient** |
+| ChromeOS | `daemon.py` | SSH stdin/stdout | `drm_screenshot_jpeg()` | evdev（`VirtualMouse`、keyboard） |
+| **iOS simulator** | **`ios-sim-server`** | **stdin/stdout** | **IOSurface -> VideoToolbox JPEG** | **IndigoHID via SimDeviceLegacyClient** |
 
-## iOS Simulator Daemon (`ios-sim-server`)
+## iOS Simulator Daemon（`ios-sim-server`）
 
-A Swift command-line tool (~300 lines) built with Swift Package Manager. Takes a simulator UDID as its sole argument.
+一个 Swift command-line tool，约 300 行，用 Swift Package Manager 构建。唯一参数是 simulator UDID。
 
 ### Frame capture
 
-1. Create `SimServiceContext` for the active Xcode developer dir, then construct `SimDeviceSet` with `initWithSetPath:serviceContext:`
-2. Look up the booted `SimDevice` by UDID by iterating `deviceSet.devices` (do not rely on `bootedDevices`, which was `nil` in the local spike)
-3. Get the main display's IOSurface from the **port descriptor** implementing `SimDisplayIOSurfaceRenderable` via `framebufferSurface` (or `.ioSurface` on older Xcode)
-3. Wrap IOSurface in a `CVPixelBuffer` via `CVPixelBufferCreateWithIOSurface()`
-4. On each 0x01 frame request:
-   - Optionally scale with `vImageScale_ARGB8888` (Accelerate framework) for bandwidth reduction
-   - Encode to JPEG via `VideoToolbox` (`VTCompressionSession` with `kCMVideoCodecType_JPEG`) using hardware acceleration
-   - Write 0x02 response with JPEG payload to stdout
+1. 为当前 Xcode developer dir 创建 `SimServiceContext`，再用 `initWithSetPath:serviceContext:` 构造 `SimDeviceSet`。
+2. 遍历 `deviceSet.devices` 按 UDID 找到 booted `SimDevice`；不要依赖 `bootedDevices`，本地 spike 中它为 `nil`。
+3. 从实现 `SimDisplayIOSurfaceRenderable` 的 **port descriptor** 获取 main display IOSurface：优先 `framebufferSurface`，旧 Xcode fallback 到 `.ioSurface`。
+4. 通过 `CVPixelBufferCreateWithIOSurface()` 把 IOSurface 包成 `CVPixelBuffer`。
+5. 每次收到 0x01 frame request：
+   - 可选用 Accelerate framework 的 `vImageScale_ARGB8888` 做缩放，降低带宽。
+   - 用 `VideoToolbox` 做 JPEG 编码（`VTCompressionSession` + `kCMVideoCodecType_JPEG`），使用硬件加速。
+   - 向 stdout 写入带 JPEG payload 的 0x02 response。
 
-Two frame modes (matching IDB's approach):
+两种 frame mode，对齐 IDB 的思路：
 
-- **Eager (default):** On 0x01 request, re-read the current IOSurface pixel buffer and encode. The IOSurface is always current — it's shared memory. Simple polling, no callback registration needed.
-- **Lazy (future optimization):** Register a `damageRectanglesCallback` on the display descriptor. Only encode when the screen actually changes. Reduces CPU for static screens.
+- **Eager（默认）：** 收到 0x01 request 时，重新读取当前 IOSurface pixel buffer 并编码。IOSurface 是共享内存，始终是最新画面。实现简单，不需要注册 callback。
+- **Lazy（未来优化）：** 在 display descriptor 上注册 `damageRectanglesCallback`，只有屏幕变化时才编码。静态画面 CPU 更低。
 
-Start with eager mode — it's simpler and matches the Android/ChromeOS pull model.
+先实现 eager mode。它更简单，也与 Android/ChromeOS 的 pull model 一致。
 
 ### Input injection
 
-Uses the IndigoHID mechanism from SimulatorKit:
+使用 SimulatorKit 的 IndigoHID 机制：
 
-1. Load `SimulatorKit.framework` and resolve three C functions via `dlsym`:
-   - `IndigoHIDMessageForMouseNSEvent` — touch events
-   - `IndigoHIDMessageForKeyboardArbitrary` — key events
-   - `IndigoHIDMessageForButton` — hardware buttons (home, lock, siri)
+1. 加载 `SimulatorKit.framework`，并通过 `dlsym` 解析三个 C functions：
+   - `IndigoHIDMessageForMouseNSEvent`：touch events
+   - `IndigoHIDMessageForKeyboardArbitrary`：key events
+   - `IndigoHIDMessageForButton`：hardware buttons，如 home、lock、siri
+2. 创建一个用 `SimDevice` 初始化的 `SimDeviceLegacyHIDClient`。
+3. 每次收到 0x03 control command：
+   - 解析 JSON payload，例如 `{"cmd":"touch",...}` 或 `{"cmd":"key",...}`。
+   - 构造对应 `IndigoMessage` struct。
+   - 通过 `client.sendWithMessage(_:freeWhenDone:)` 发送。
 
-2. Create a `SimDeviceLegacyHIDClient` (from SimulatorKit) initialized with the `SimDevice`
+Touch coordinates 使用 0-1 normalized values，与 Android/ChromeOS 一致。转换到 IndigoHID ratio format：
 
-3. On each 0x03 control command:
-   - Parse JSON payload (`{"cmd":"touch",...}` or `{"cmd":"key",...}`)
-   - Build the appropriate `IndigoMessage` struct
-   - Send via `client.sendWithMessage(_:freeWhenDone:)`
-
-Touch coordinates arrive as normalized 0–1 values (matching Android/ChromeOS). Convert to IndigoHID's ratio format:
-```
-xRatio = touch.x  (already 0–1, from top-left)
+```text
+xRatio = touch.x  (already 0-1, from top-left)
 yRatio = touch.y
 ```
 
 ### Handshake
 
-Same 4-byte handshake as Android/ChromeOS:
-```
+与 Android/ChromeOS 使用相同的 4-byte handshake：
+
+```text
 [width uint16 LE][height uint16 LE]
 ```
 
-Screen dimensions from `SimDisplayDescriptorState.defaultWidthForDisplay` / `defaultHeightForDisplay`, or read directly from the IOSurface dimensions.
+屏幕尺寸来自 `SimDisplayDescriptorState.defaultWidthForDisplay` / `defaultHeightForDisplay`，也可以直接从 IOSurface dimensions 读取。
 
 ### Wire protocol
 
-Identical to Android and ChromeOS — the shared binary framing protocol:
+与 Android 和 ChromeOS 完全一致，使用共享 binary framing protocol：
 
-```
-Handshake (daemon → sidecar on connect):
+```text
+Handshake (daemon -> sidecar on connect):
   [width uint16 LE][height uint16 LE]
 
-Frame request (sidecar → daemon):
+Frame request (sidecar -> daemon):
   [0x01]
 
-Frame response (daemon → sidecar):
+Frame response (daemon -> sidecar):
   [0x02][4-byte LE JPEG length][JPEG bytes]
 
-Control command (sidecar → daemon, fire-and-forget):
+Control command (sidecar -> daemon, fire-and-forget):
   [0x03][4-byte LE JSON length][JSON bytes]
 ```
 
 ### Private framework headers
 
-Referenced from IDB's `PrivateHeaders/` directory (MIT-licensed). We need a minimal subset:
+从 IDB 的 `PrivateHeaders/` 目录引用（MIT-licensed）。需要最小子集：
 
-| Header | Purpose |
-|---|---|
-| `Indigo.h` | IndigoMessage, IndigoTouch, IndigoButton structs |
-| `Mach.h` | MachMessageHeader for IndigoMessage |
-| `SimDisplayIOSurfaceRenderable-Protocol.h` | `.framebufferSurface` / `.ioSurface` access |
-| `SimDisplayRenderable-Protocol.h` | `.displaySize`, damage rect callbacks |
-| `SimDisplayDescriptorState-Protocol.h` | `.defaultWidthForDisplay`, `.displayClass` |
-| `SimDeviceIOPortInterface-Protocol.h` | Port enumeration to find main display |
-| `SimDeviceIOProtocol-Protocol.h` | `.ioPorts` on device IO |
-| `SimDeviceLegacyClient.h` | `sendWithMessage:freeWhenDone:` for HID input |
-| `SimDevice.h` | Device object (`.io`, `.deviceType`, `.UDID`) |
-| `SimDeviceSet.h` | `defaultSet.devices` for lookup by UDID |
+| Header | 用途 |
+|--------|------|
+| `Indigo.h` | `IndigoMessage`、`IndigoTouch`、`IndigoButton` structs |
+| `Mach.h` | `IndigoMessage` 的 `MachMessageHeader` |
+| `SimDisplayIOSurfaceRenderable-Protocol.h` | 访问 `.framebufferSurface` / `.ioSurface` |
+| `SimDisplayRenderable-Protocol.h` | `.displaySize`、damage rect callbacks |
+| `SimDisplayDescriptorState-Protocol.h` | `.defaultWidthForDisplay`、`.displayClass` |
+| `SimDeviceIOPortInterface-Protocol.h` | 枚举 port，找到 main display |
+| `SimDeviceIOProtocol-Protocol.h` | 访问 device IO 上的 `.ioPorts` |
+| `SimDeviceLegacyClient.h` | HID input 的 `sendWithMessage:freeWhenDone:` |
+| `SimDevice.h` | Device object：`.io`、`.deviceType`、`.UDID` |
+| `SimDeviceSet.h` | `defaultSet.devices`，用于按 UDID 查找 |
 
-These are Objective-C headers used via a bridging header in the Swift project.
+这些 Objective-C headers 通过 Swift 项目的 bridging header 使用。
 
 ### Framework dependencies
 
-Linked at build time (all ship with Xcode):
+构建时链接，均随 Xcode 提供：
 
-| Framework | Purpose |
-|---|---|
-| `CoreSimulator` | `SimDevice`, `SimDeviceSet` (private, from Xcode) |
-| `SimulatorKit` | `SimDeviceLegacyHIDClient`, IndigoHID functions (private, from Xcode) |
-| `IOSurface` | IOSurface object wrapping |
+| Framework | 用途 |
+|-----------|------|
+| `CoreSimulator` | `SimDevice`、`SimDeviceSet`，来自 Xcode 的 private framework |
+| `SimulatorKit` | `SimDeviceLegacyHIDClient`、IndigoHID functions，来自 Xcode 的 private framework |
+| `IOSurface` | 包装 IOSurface object |
 | `CoreVideo` | `CVPixelBufferCreateWithIOSurface` |
-| `VideoToolbox` | Hardware JPEG encoding |
-| `Accelerate` | `vImageScale_ARGB8888` for downscaling |
-| `CoreGraphics` | `CGPoint`, `CGSize` |
+| `VideoToolbox` | 硬件 JPEG 编码 |
+| `Accelerate` | `vImageScale_ARGB8888` 降采样 |
+| `CoreGraphics` | `CGPoint`、`CGSize` |
 
 ### Build
 
-Swift Package Manager, single executable target:
+Swift Package Manager，单 executable target：
 
-```
+```text
 packages/ios-sim-server/
 ├── Package.swift
 ├── Sources/
@@ -151,7 +151,8 @@ packages/ios-sim-server/
     └── ... (framing protocol round-trip)
 ```
 
-Build command:
+构建命令：
+
 ```bash
 cd packages/ios-sim-server
 swift build -c release \
@@ -159,27 +160,24 @@ swift build -c release \
   -Xlinker -F/Library/Developer/PrivateFrameworks
 ```
 
-Output: `.build/release/ios-sim-server`
+输出：`.build/release/ios-sim-server`
 
-The built binary must also include runtime `rpath` entries for Xcode/private
-framework directories or dyld will fail to locate `SimulatorKit.framework` at
-launch.
+构建出的 binary 还必须包含指向 Xcode/private framework 目录的 runtime `rpath`，否则启动时 dyld 找不到 `SimulatorKit.framework`。
 
 ### Distribution
 
-**Cannot cross-compile** — private frameworks are macOS-only and Xcode-version-specific. Two options:
+**不能 cross-compile**。这些 private frameworks 只在 macOS/Xcode 上可用，并且和 Xcode 版本绑定。两个方案：
 
-1. **Build on first use** (preferred): Go sidecar runs `swift build -c release` in `packages/ios-sim-server/` when an iOS simulator device is first selected. Cache the binary alongside the device-bridge binary. Similar to how the Android APK is resolved.
+1. **首次使用时构建（推荐）**：选择 iOS simulator device 时，Go sidecar 在 `packages/ios-sim-server/` 中运行 `swift build -c release`，并把 binary 缓存在 device-bridge binary 旁边。类似 Android APK 的 resolve 机制。
+2. **CI 预构建 macOS binary**：GitHub Actions macOS runner 构建 binary 并附到 release，像 device-bridge binary 一样按需下载。只有用户 Xcode 版本匹配 CI 时才可靠。
 
-2. **CI pre-build for macOS**: GitHub Actions macOS runner builds the binary and attaches it to releases. Downloaded on-demand like the device-bridge binary. Works only if the user's Xcode version matches the CI build.
-
-Option 1 is more robust since private framework layouts can change between Xcode versions. The build is fast (~5 seconds for a small Swift CLI).
+方案 1 更稳，因为 private framework layout 可能在 Xcode 版本之间变化。这个 Swift CLI 很小，构建约 5 秒。
 
 ---
 
-## Go Sidecar: `IOSSimulatorDevice`
+## Go Sidecar：`IOSSimulatorDevice`
 
-Lives in `packages/device-bridge/internal/device/ios_simulator_device.go`. Mirrors `ChromeOSDevice` almost exactly:
+位于 `packages/device-bridge/internal/device/ios_simulator_device.go`。结构几乎完全对齐 `ChromeOSDevice`：
 
 ```go
 type IOSSimulatorDevice struct {
@@ -206,12 +204,13 @@ func NewIOSSimulatorDevice(ctx context.Context, udid string) (*IOSSimulatorDevic
 
 ### Discovery
 
-The Go sidecar discovers iOS simulators via:
+Go sidecar 通过以下命令发现 iOS simulators：
+
 ```bash
 xcrun simctl list devices booted -j
 ```
 
-This returns JSON with all booted simulators. Each gets reported as `type: "ios-simulator"` in the `DeviceInfo` list.
+该命令返回所有 booted simulators 的 JSON。每个 simulator 在 `DeviceInfo` 中报告为 `type: "ios-simulator"`。
 
 ```go
 type DeviceInfo struct {
@@ -222,138 +221,127 @@ type DeviceInfo struct {
 }
 ```
 
-Client signaling should pass `deviceType: "ios-simulator"` in
-`device_stream_start` so server runtime selection never depends on parsing a
-UDID-like `deviceId`.
+Client signaling 应在 `device_stream_start` 中传入 `deviceType: "ios-simulator"`，这样 server runtime selection 不需要解析类似 UDID 的 `deviceId`。
 
 ### Binary resolution
 
-Priority order (same pattern as Android APK):
-1. `IOS_SIM_SERVER` env var (explicit path)
-2. `{data-dir}/bin/ios-sim-server` (pre-downloaded)
-3. Build from source: `swift build -c release` in `packages/ios-sim-server/`
+优先级顺序与 Android APK 类似：
+
+1. `IOS_SIM_SERVER` env var，显式路径。
+2. `{data-dir}/bin/ios-sim-server`，预下载 binary。
+3. 从源码构建：在 `packages/ios-sim-server/` 中运行 `swift build -c release`。
 
 ---
 
-## Implementation Steps
+## 实现步骤
 
-### Step 1 — Swift daemon skeleton
+### Step 1：Swift daemon skeleton
 
-1. Create `packages/ios-sim-server/` with Package.swift
-2. Copy minimal private headers from IDB `PrivateHeaders/` (Indigo.h, Mach.h, SimDisplay protocols, SimDevice, SimDeviceLegacyClient)
-3. Implement `main.swift`:
-   - Parse UDID from argv
-   - Look up SimDevice by UDID
-   - Get IOSurface from main display
-   - Write handshake (width/height)
-   - Enter read loop: dispatch 0x01 → JPEG frame, 0x03 → HID input
-4. Verify: `swift build -c release && echo "test" | .build/release/ios-sim-server <UDID>`
+1. 创建 `packages/ios-sim-server/` 和 `Package.swift`。
+2. 从 IDB `PrivateHeaders/` 复制最小 private headers：`Indigo.h`、`Mach.h`、SimDisplay protocols、`SimDevice`、`SimDeviceLegacyClient`。
+3. 实现 `main.swift`：
+   - 从 argv 解析 UDID。
+   - 按 UDID 查找 `SimDevice`。
+   - 从 main display 获取 IOSurface。
+   - 写出 handshake（width/height）。
+   - 进入 read loop：0x01 -> JPEG frame，0x03 -> HID input。
+4. 验证：`swift build -c release && echo "test" | .build/release/ios-sim-server <UDID>`。
 
-### Step 2 — Frame capture
+### Step 2：Frame capture
 
-1. Implement `Framebuffer.swift`:
-   - `CVPixelBufferCreateWithIOSurface` to wrap the IOSurface
-   - VideoToolbox JPEG compression session (hardware-accelerated)
-   - Optional downscaling via `vImageScale_ARGB8888`
-2. Verify: manual test capturing frames, compare quality/speed to `simctl screenshot`
+1. 实现 `Framebuffer.swift`：
+   - 用 `CVPixelBufferCreateWithIOSurface` 包装 IOSurface。
+   - 使用 VideoToolbox JPEG compression session，启用硬件加速。
+   - 可选用 `vImageScale_ARGB8888` 降采样。
+2. 验证：手动 capture frames，并与 `simctl screenshot` 的质量/速度对比。
 
-### Spike findings on this machine
+### 本机 spike 发现
 
-Validated locally on the booted simulator:
+已在本机 booted simulator 上验证：
 
-- Booted simulator: `iPhone 17` / `F87D9B80-78AD-4398-B7D4-CA5E74D5474A`
-- `xcrun simctl io ... screenshot` baseline: ~`0.52s` for one frame
-- `framebufferSurface` access via private frameworks: working
-- `SimDeviceLegacyHIDClient initWithDevice:error:`: working
-- `IndigoHIDMessageForMouseNSEvent`, `IndigoHIDMessageForKeyboardArbitrary`,
-  `IndigoHIDMessageForButton`: all present via `dlsym`
-- One-shot IOSurface -> VideoToolbox JPEG encode: working
-- In-process steady-state capture + JPEG encode benchmark: ~`218-240 FPS`
-  (`~4.2-4.6ms` per frame) on a mostly static simulator screen
+- Booted simulator：`iPhone 17` / `F87D9B80-78AD-4398-B7D4-CA5E74D5474A`
+- `xcrun simctl io ... screenshot` baseline：单帧约 `0.52s`
+- 通过 private frameworks 访问 `framebufferSurface`：可用
+- `SimDeviceLegacyHIDClient initWithDevice:error:`：可用
+- `IndigoHIDMessageForMouseNSEvent`、`IndigoHIDMessageForKeyboardArbitrary`、`IndigoHIDMessageForButton`：均可通过 `dlsym` 找到
+- One-shot IOSurface -> VideoToolbox JPEG encode：可用
+- In-process steady-state capture + JPEG encode benchmark：在基本静态 simulator 屏幕上约 `218-240 FPS`，即每帧约 `4.2-4.6ms`
 
-These measurements confirm that simulator capture is not the bottleneck.
-Production work should therefore keep the existing Go sidecar for WebRTC,
-adaptive streaming, and session lifecycle rather than introducing a separate
-Swift-side streaming stack.
+这些测量说明 simulator capture 不是瓶颈。生产实现应继续复用现有 Go sidecar 处理 WebRTC、adaptive streaming 和 session lifecycle，而不是在 Swift 侧新做一套 streaming stack。
 
-### Recommended production shape
+### 推荐生产形态
 
 #### V1
 
-- Keep `ios-sim-server` as a tiny macOS-only daemon responsible only for:
-  - simulator discovery by UDID
-  - IOSurface access
+- 保持 `ios-sim-server` 很小，只负责：
+  - 按 UDID 处理 simulator discovery
+  - IOSurface 访问
   - VideoToolbox JPEG encode
   - IndigoHID input injection
   - stdin/stdout framing
-- Integrate through the existing Go sidecar as `IOSSimulatorDevice`
-- Reuse the existing `Device` pull-frame path and WebRTC stack unchanged
+- 通过现有 Go sidecar 集成为 `IOSSimulatorDevice`
+- 复用现有 `Device` pull-frame path 和 WebRTC stack
 
-This matches the current ChromeOS subprocess model and minimizes platform-
-specific complexity in the main bridge.
+这与当前 ChromeOS subprocess model 一致，也能把平台相关复杂度限制在主 bridge 之外。
 
-#### V2 optimization only if needed
+#### V2，仅在需要时优化
 
-If end-to-end tests show JPEG decode/re-encode is too expensive, upgrade the
-simulator path to push H.264 directly and implement `StreamCapable` in the Go
-bridge. Do not start there; the simpler JPEG-framed path should land first.
+如果端到端测试显示 JPEG decode/re-encode 成本过高，再把 simulator path 升级为直接 push H.264，并在 Go bridge 中实现 `StreamCapable`。不要一开始就做这个；更简单的 JPEG-framed path 应该先落地。
 
-### Step 3 — Input injection
+### Step 3：Input injection
 
-1. Implement `HIDInput.swift`:
-   - Load SimulatorKit, resolve IndigoHID functions via `dlsym`
-   - Create `SimDeviceLegacyHIDClient`
-   - Touch: build IndigoMessage from normalized coordinates
-   - Key: build IndigoMessage from keycode
-   - Button: home, lock, siri
-2. Verify: send touch events, confirm simulator responds
+1. 实现 `HIDInput.swift`：
+   - 加载 SimulatorKit，通过 `dlsym` 解析 IndigoHID functions。
+   - 创建 `SimDeviceLegacyHIDClient`。
+   - Touch：用 normalized coordinates 构造 `IndigoMessage`。
+   - Key：用 keycode 构造 `IndigoMessage`。
+   - Button：home、lock、siri。
+2. 验证：发送 touch events，确认 simulator 响应。
 
-### Step 4 — Go sidecar integration
+### Step 4：Go sidecar integration
 
-1. Add `ios_simulator_device.go` — subprocess management + framing protocol
-2. Add iOS simulator discovery to device list (parse `xcrun simctl list devices booted -j`)
-3. Add `type: "ios-simulator"` to `DeviceInfo`
-4. Wire into `SessionManager` and pool
+1. 增加 `ios_simulator_device.go`：subprocess management + framing protocol。
+2. 在 device list 中增加 iOS simulator discovery，解析 `xcrun simctl list devices booted -j`。
+3. 在 `DeviceInfo` 中增加 `type: "ios-simulator"`。
+4. 接入 `SessionManager` 和 pool。
 
-### Step 5 — Tests
+### Step 5：Tests
 
-- **Go: `IOSSimulatorDevice` with mock subprocess** — `io.Pipe()` fake, same pattern as ChromeOS tests
-- **Go: simctl JSON parsing** — unit test for device list parsing
-- **E2E: iOS simulator streaming** (skips if no booted simulator) — same structure as emulator E2E test
+- **Go：`IOSSimulatorDevice` with mock subprocess**：使用 `io.Pipe()` fake，模式与 ChromeOS tests 一致。
+- **Go：simctl JSON parsing**：为 device list parsing 写单元测试。
+- **E2E：iOS simulator streaming**：没有 booted simulator 时 skip，结构与 emulator E2E test 相同。
 
 ---
 
-## Performance Expectations
+## 性能预期
 
-| Metric | `simctl screenshot` | `ios-sim-server` (IOSurface) |
-|---|---|---|
-| Frame latency | ~500ms | ~4-5ms steady-state encode on local spike |
-| Max FPS | ~2 | 200+ local encode loop, likely lower end-to-end |
-| Encoding | N/A (file I/O) | VideoToolbox hardware JPEG |
-| Scaling | Not supported | `vImageScale_ARGB8888` before encode |
-| Process overhead | New process per frame | Persistent process, shared memory |
-
----
-
-## Xcode Version Compatibility
-
-The private frameworks change between Xcode versions. Known variations:
-
-- **IOSurface access**: Xcode 13.2+ split `ioSurface` into `framebufferSurface` + `maskedFramebufferSurface`. The daemon tries `framebufferSurface` first, falls back to `ioSurface`.
-- **HID client class**: `SimDeviceLegacyHIDClient` has been stable since Xcode 9+.
-- **IndigoHID functions**: Stable since Xcode 9+, loaded dynamically via `dlsym` so missing symbols fail gracefully.
-- **Device set lookup**: `+[SimDeviceSet defaultSet]` was unavailable in the
-  local spike; constructing `SimDeviceSet` via `SimServiceContext` was stable.
-- **Display lookup**: `framebufferSurface` was exposed on the display
-  **descriptor proxy**, not the port object itself, in the local spike.
-
-Building from source on the user's machine (Step 1 distribution option) sidesteps most compatibility issues since it links against the locally-installed frameworks.
+| 指标 | `simctl screenshot` | `ios-sim-server`（IOSurface） |
+|------|---------------------|-------------------------------|
+| Frame latency | ~500ms | 本机 spike 中 steady-state encode 约 ~4-5ms |
+| Max FPS | ~2 | 本地 encode loop 200+；端到端可能更低 |
+| Encoding | N/A，file I/O | VideoToolbox hardware JPEG |
+| Scaling | 不支持 | encode 前用 `vImageScale_ARGB8888` |
+| Process overhead | 每帧新进程 | 持久进程，共享内存 |
 
 ---
 
-## Non-Goals
+## Xcode 版本兼容性
 
-- Physical iOS device support (requires `usbmuxd` + developer disk images — completely different stack)
-- Audio streaming from simulator
-- Multiple simultaneous simulator displays (only main display class 0)
-- Xcode-less operation (private frameworks require Xcode installed)
+Private frameworks 在不同 Xcode 版本之间会变化。已知差异：
+
+- **IOSurface access**：Xcode 13.2+ 把 `ioSurface` 拆成 `framebufferSurface` + `maskedFramebufferSurface`。Daemon 先尝试 `framebufferSurface`，再 fallback 到 `ioSurface`。
+- **HID client class**：`SimDeviceLegacyHIDClient` 从 Xcode 9+ 起较稳定。
+- **IndigoHID functions**：从 Xcode 9+ 起较稳定，通过 `dlsym` 动态加载，缺失时可优雅失败。
+- **Device set lookup**：本机 spike 中 `+[SimDeviceSet defaultSet]` 不可用；通过 `SimServiceContext` 构造 `SimDeviceSet` 较稳定。
+- **Display lookup**：本机 spike 中 `framebufferSurface` 暴露在 display **descriptor proxy** 上，而不是 port object 本身。
+
+在用户机器上从源码构建（distribution 方案 1）可以绕开大多数兼容性问题，因为会链接本机安装的 frameworks。
+
+---
+
+## 非目标
+
+- 实体 iOS device 支持；那需要 `usbmuxd` + developer disk images，是完全不同的技术栈。
+- Simulator audio streaming。
+- 同时支持多个 simulator display；当前只处理 main display class 0。
+- 无 Xcode 运行；private frameworks 要求安装 Xcode。

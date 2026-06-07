@@ -1,28 +1,29 @@
-# Relay System Design
+# Relay 系统设计
 
-**Status:** Draft
-**Author:** Design discussion 2026-01-10
+**状态：** 草案
 
-## Overview
+**作者：** 2026-01-10 设计讨论
 
-A relay service that enables phone clients to connect to yepanywhere servers behind NAT without requiring Tailscale, Cloudflare tunnels, or port forwarding.
+## 总览
 
-### Goals
+Relay service 让手机客户端可以连接到 NAT 后面的 yepanywhere server，不再依赖 Tailscale、Cloudflare Tunnel 或端口转发。
 
-1. **Zero-config remote access** - User sets username/password, connects from any browser
-2. **E2E encryption** - Relay cannot read user traffic (SRP + NaCl)
-3. **Simple pairing** - No QR codes required (optional optimization)
-4. **Scalable** - Config-based relay discovery allows future migration from self-hosted to managed service
+### 目标
 
-### Non-Goals (Initially)
+1. **零配置远程访问**：用户只设置 username/password，就能从任意浏览器连接。
+2. **端到端加密**：Relay 不能读取用户流量，认证使用 SRP，加密使用 NaCl。
+3. **简单配对**：不强制扫码；QR code 可以作为后续优化。
+4. **可扩展**：通过 config endpoint 发现 relay，未来可从自托管迁移到托管服务。
 
-- Mobile app (web-only for now)
-- UPnP hole punching (future optimization)
-- Multiple relay regions (start with one)
+### 初始非目标
 
-## Architecture
+- 移动 App；当前先做 Web。
+- UPnP hole punching；后续可优化。
+- 多 relay region；先从单 region 开始。
 
-```
+## 架构
+
+```text
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │  Phone/Browser  │────▶│     Relay       │◀────│   Yepanywhere   │
 │                 │     │                 │     │                 │
@@ -39,11 +40,11 @@ A relay service that enables phone clients to connect to yepanywhere servers beh
                         └─────────────────┘
 ```
 
-## Components
+## 组件
 
-### 1. Config Endpoint (yepanywhere.com)
+### 1. Config Endpoint（yepanywhere.com）
 
-Returns relay URLs and version requirements. Allows migration without client updates.
+返回 relay URL 和版本要求。这样以后迁移 relay 时，不需要更新客户端。
 
 ```json
 {
@@ -57,62 +58,66 @@ Returns relay URLs and version requirements. Allows migration without client upd
 }
 ```
 
-Yepanywhere server fetches this on startup (already fetches version info).
+Yepanywhere server 启动时拉取该配置；当前已有版本信息拉取流程，可复用。
 
 ### 2. Relay
 
-Lightweight WebSocket router. Responsibilities:
-- Accept yepanywhere server connections (authenticated via secret)
-- Accept phone connections (SRP handshake, then encrypted traffic)
-- Route encrypted messages between phone and yepanywhere server
-- Track which yepanywhere server is connected to which relay (for multi-relay scaling)
+Relay 是轻量 WebSocket router。
 
-**Does NOT:**
-- Read message contents (E2E encrypted)
-- Store user data
-- Handle SRP verification (user's yepanywhere server does this)
+职责：
 
-### 3. Yepanywhere Server Changes
+- 接受 yepanywhere server connection，并用 secret/注册信息认证。
+- 接受 phone connection；SRP handshake 穿过 relay，由 yepanywhere server 完成验证。
+- 在 phone 和 yepanywhere server 之间转发加密消息。
+- 跟踪 yepanywhere server 当前连在哪个 relay，便于未来多 relay 扩展。
 
-- **Relay client** - Persistent WebSocket connection to relay
-- **SRP verifier storage** - Store username, salt, verifier in data dir
-- **Settings UI** - Enable remote access, set username/password
-- **Connection handler** - Handle relay protocol messages, decrypt, route to existing handlers
+Relay 不做这些事：
 
-### 4. Client (Phone/Browser) Changes
+- 不读取消息内容；所有 app traffic 都端到端加密。
+- 不存用户数据。
+- 不处理 SRP verifier；verifier 存在用户自己的 yepanywhere server 上。
 
-- **Connection abstraction** - Interface for Direct vs Relay modes
-- **SRP client** - Authenticate to yepanywhere server via relay
-- **Encryption layer** - Encrypt/decrypt all traffic
-- **Relay protocol** - Multiplex HTTP requests, SSE events, uploads over single WebSocket
+### 3. Yepanywhere Server 变更
 
-## User Flow
+- **Relay client**：到 relay 的持久 WebSocket connection。
+- **SRP verifier storage**：在 data dir 存储 username、salt、verifier。
+- **Settings UI**：启用 remote access，设置 username/password。
+- **Connection handler**：处理 relay protocol messages，解密后转给现有 handlers。
 
-### Setup (one-time)
+### 4. Client（Phone/Browser）变更
 
-1. User opens yepanywhere settings
-2. Enables "Remote Access"
-3. Enters username (e.g., `kgraehl`) - checked for availability
-4. Enters password
-5. Yepanywhere server stores SRP verifier (never the password)
-6. Yepanywhere server connects to relay, registers username
+- **Connection abstraction**：抽象 Direct 和 Relay 模式。
+- **SRP client**：通过 relay 向 yepanywhere server 认证。
+- **Encryption layer**：加密/解密全部流量。
+- **Relay protocol**：在单个 WebSocket 上复用 HTTP request、event stream、upload 等能力。
 
-### Connecting from Phone
+## 用户流程
 
-1. User visits `yepanywhere.com/c/kgraehl`
-2. Enters password
-3. SRP handshake via relay (proves both sides know password)
-4. Session key established
-5. All traffic encrypted with session key
-6. Phone stores derived key for future sessions (auto-reconnect)
+### 一次性配置
 
-## Protocol Details
+1. 用户打开 yepanywhere settings。
+2. 启用 Remote Access。
+3. 输入 username，例如 `kgraehl`，并检查可用性。
+4. 输入 password。
+5. Yepanywhere server 存储 SRP verifier，不存 password。
+6. Yepanywhere server 连接 relay，并注册 username。
 
-### SRP Authentication
+### 手机连接
 
-Using SRP-6a with SHA-256. Yepanywhere server stores verifier, never password.
+1. 用户访问 `yepanywhere.com/c/kgraehl`。
+2. 输入 password。
+3. 通过 relay 完成 SRP handshake，证明双方都知道 password。
+4. 建立 session key。
+5. 所有 traffic 使用 session key 加密。
+6. 手机保存派生 key，用于后续自动重连。
 
-```
+## 协议细节
+
+### SRP 认证
+
+使用 SRP-6a + SHA-256。Yepanywhere server 只存 verifier，不存 password。
+
+```text
 Phone                      Relay                      Yepanywhere
   │                          │                          │
   │ ── SRP hello (A) ──────▶ │ ── forward ───────────▶ │
@@ -128,16 +133,17 @@ Phone                      Relay                      Yepanywhere
   │ ══ encrypted traffic ══▶ │ ══ passthrough ═══════▶ │
 ```
 
-### Message Encryption
+### 消息加密
 
-Using NaCl secretbox (XSalsa20-Poly1305):
-- 24-byte random nonce per message
-- Session key from SRP
-- Authenticated encryption (tamper-evident)
+使用 NaCl secretbox（XSalsa20-Poly1305）：
 
-### Relay Protocol (Encrypted Payload)
+- 每条消息使用 24-byte random nonce。
+- Session key 来自 SRP。
+- 使用 authenticated encryption，篡改可检测。
 
-All messages inside encrypted envelope:
+### Relay Protocol（加密 payload）
+
+所有 app-level 消息都放在加密 envelope 内。
 
 ```typescript
 // HTTP-like request/response
@@ -154,7 +160,7 @@ All messages inside encrypted envelope:
 { type: "upload_complete", uploadId: "...", file: {...} }
 ```
 
-### Connection Abstraction (Client)
+### Client Connection Abstraction
 
 ```typescript
 interface Connection {
@@ -174,765 +180,304 @@ class SecureConnection implements Connection {
 }
 
 // Direct secure - WS straight to yepanywhere (LAN testing)
-new SecureConnection('wss://192.168.1.50:3400/ws', 'kgraehl')
+new SecureConnection("wss://192.168.1.50:3400/ws", "kgraehl")
 
 // Via relay - WS to relay (production remote access)
-new SecureConnection('wss://relay.yepanywhere.com/ws', 'kgraehl')
+new SecureConnection("wss://relay.yepanywhere.com/ws", "kgraehl")
 ```
 
-**Connection modes:**
+**连接模式：**
 
-| Mode | Transport | Auth | Use Case |
-|------|-----------|------|----------|
-| DirectConnection | fetch/WS/SSE | Cookie session | Default for localhost, network tab debugging |
-| WebSocketConnection | WS to yepanywhere | Cookie session | Dev setting to test WS protocol without encryption |
-| SecureConnection (direct) | WS to yepanywhere | SRP + encryption | LAN, test secure protocol without relay |
-| SecureConnection (relay) | WS to relay | SRP + encryption | Production remote access |
+| 模式 | 传输 | 认证 | 用途 |
+|------|------|------|------|
+| DirectConnection | fetch/WS/SSE | Cookie session | localhost 默认模式，方便 Network tab 调试 |
+| WebSocketConnection | WS to yepanywhere | Cookie session | 开发设置，用来测试 WS protocol，不加密 |
+| SecureConnection (direct) | WS to yepanywhere | SRP + encryption | LAN，测试 secure protocol 但不经过 relay |
+| SecureConnection (relay) | WS to relay | SRP + encryption | 生产远程访问 |
 
-**Mode selection:**
-- DirectConnection is the **default** for localhost/LAN access (normal fetch/XHR/SSE)
-- WebSocketConnection can be enabled via **developer settings** toggle for testing
-- SecureConnection is used automatically when connecting via relay URL
+**模式选择：**
 
-SecureConnection extends WebSocketConnection, adding SRP handshake and encryption. Same WS protocol, same message routing - just with an encryption layer on top.
+- localhost/LAN 默认使用 `DirectConnection`，仍走普通 fetch/XHR/SSE。
+- `WebSocketConnection` 通过 developer settings toggle 启用，用于测试。
+- 通过 relay URL 连接时自动使用 `SecureConnection`。
 
-## Multi-Relay Scaling
+`SecureConnection` 扩展 `WebSocketConnection`，只是在同一套 WS protocol 和 message routing 外面增加 SRP handshake 和 encryption layer。
 
-For load balancing across multiple relays:
+## 多 Relay 扩展
 
-1. **Registration** - Yepanywhere server registers with central DB (Redis/Postgres)
-2. **Discovery** - Phone asks "where is kgraehl?" → gets assigned relay URL
-3. **Routing** - Phone connects to correct relay
+未来做多 relay load balancing 时：
 
-```
+1. **Registration**：Yepanywhere server 注册到中心数据库（Redis/Postgres）。
+2. **Discovery**：Phone 查询 `kgraehl` 在哪里，拿到 relay URL。
+3. **Routing**：Phone 连接正确的 relay。
+
+```text
 Phone ──▶ /api/relay/locate/kgraehl ──▶ { "relay": "wss://relay2.yepanywhere.com" }
       │
       └──▶ connect to relay2
 ```
 
-This allows rebalancing by telling yepanywhere servers to reconnect to different relays.
+这样可以通过指示 yepanywhere server 重连到不同 relay 来实现 rebalance。
 
-## Security Considerations
+## 安全考虑
 
-### What relay CAN see
-- Username being connected to
-- Connection timing/duration
-- Encrypted blob sizes (traffic analysis)
+### Relay 能看到
 
-### What relay CANNOT see
-- Password (SRP zero-knowledge)
-- Session keys (derived from password, never transmitted)
-- Message contents (encrypted)
-- Files being uploaded (encrypted)
+- 正在连接的 username
+- 连接时间和持续时长
+- 加密数据块大小，因此存在 traffic analysis 可能
 
-### Compression Before Encryption (reviewed 2026-02-21)
-- Relay payloads may be gzip-compressed before encryption for bandwidth/latency wins on large responses.
-- This pattern can theoretically enable CRIME/BREACH-style length-oracle attacks when attacker-controlled input and secrets share the same compressed payload and an attacker can repeatedly observe ciphertext lengths.
-- Current risk is accepted as low for this architecture: authenticated E2E relay traffic, per-message gzip streams (no shared cross-message compression context), and no known high-risk secret-reflection response classes in relay payloads.
-- If this threat model changes, keep compression and add ciphertext length bucketing/padding for sensitive message classes rather than disabling compression globally.
+### Relay 看不到
 
-### Abuse Prevention
-- Rate limit registration (3 per IP per hour)
-- Rate limit SRP attempts (prevent brute force)
-- Username blocklist (offensive terms)
-- Inactive username reclamation (90 days?)
+- Password；SRP 是 zero-knowledge
+- Session key；key 由 password 派生，永不传输
+- 消息内容；已加密
+- 上传文件内容；已加密
 
-## Push Notifications
+### 加密前压缩（2026-02-21 已评审）
 
-Separate concern from relay. Two options:
+- Relay payload 可以在加密前 gzip 压缩，以改善大响应的带宽和延迟。
+- 如果攻击者可控输入和 secret 出现在同一个压缩 payload 中，并且攻击者能反复观察 ciphertext length，理论上可能出现 CRIME/BREACH 类 length-oracle 攻击。
+- 当前架构接受该风险为低：relay traffic 是认证后的端到端加密；每条消息独立 gzip，没有跨消息共享压缩上下文；当前也没有已知高风险 secret-reflection response 类型。
+- 如果威胁模型变化，应保留压缩，并对敏感消息类型增加 ciphertext length bucketing/padding，而不是全局关闭压缩。
 
-**Option A: Generic notifications**
+### 滥用防护
+
+- 限制 registration 频率：每 IP 每小时 3 次。
+- 限制 SRP attempts，防止暴力破解。
+- Username blocklist，过滤冒犯性词汇。
+- 回收长期未活动 username，例如 90 天。
+
+## 推送通知
+
+推送通知和 relay 是独立问题。有两种选择：
+
+**方案 A：通用通知**
+
 ```json
 { "title": "kgraehl", "body": "Action needed" }
 ```
-User taps, app fetches details over encrypted relay.
 
-**Option B: User choice**
-Setting to show full details (less private) or generic (more private).
+用户点击后，app 再通过加密 relay 拉取详情。
 
-## Implementation Phases
+**方案 B：用户可选**
 
-### Phase 1: Protocol Types
+设置中允许用户选择显示完整详情（隐私较弱）或通用提示（隐私更强）。
 
-Define all message types in `packages/shared/src/relay.ts`:
+## 实现阶段状态
 
-**Request/Response (HTTP-like)**
+### Phase 1：Protocol Types
+
+在 `packages/shared/src/relay.ts` 中定义 request/response、subscription、upload 和 union types。
+
 ```typescript
 type RelayRequest = {
   type: "request";
-  id: string;              // UUID for matching response
+  id: string;
   method: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
-  path: string;            // e.g., "/api/sessions"
+  path: string;
   headers?: Record<string, string>;
   body?: unknown;
 };
 
 type RelayResponse = {
   type: "response";
-  id: string;              // matches request.id
-  status: number;          // HTTP status code
+  id: string;
+  status: number;
   headers?: Record<string, string>;
   body?: unknown;
 };
 ```
 
-**Event Subscriptions (SSE replacement)**
-```typescript
-type RelaySubscribe = {
-  type: "subscribe";
-  subscriptionId: string;  // client-generated, for unsubscribe
-  channel: "session" | "activity";
-  sessionId?: string;      // required for channel: "session"
-  lastEventId?: string;    // for resumption
-};
+任务：
 
-type RelayUnsubscribe = {
-  type: "unsubscribe";
-  subscriptionId: string;
-};
+- [x] 在 shared package 中定义类型
+- [x] 从 `shared/index.ts` 导出
 
-type RelayEvent = {
-  type: "event";
-  subscriptionId: string;
-  eventType: string;       // "message", "status", "stream_event", etc.
-  eventId?: string;        // for resumption
-  data: unknown;
-};
-```
+### Phase 2：Connection Interface + WebSocket Transport
 
-**File Upload**
-```typescript
-type RelayUploadStart = {
-  type: "upload_start";
-  uploadId: string;
-  projectId: string;
-  sessionId: string;
-  filename: string;
-  size: number;
-  mimeType: string;
-};
+- [x] 定义 `Connection` interface。
+- [x] `DirectConnection` 包装现有 fetch。
+- [x] `useConnection` hook 返回 `DirectConnection`。
+- [x] `/ws` endpoint 支持 request/response。
+- [x] `WebSocketConnection.fetch()` 根据 ID 匹配 response。
+- [x] Developer settings 增加 `Use WebSocket transport` toggle，默认关闭。
+- [x] 支持 event subscription，替代 SSE。
+- [x] 支持 file upload。
+- [ ] 全量切换 app 到 `WebSocketConnection`。
+- [ ] localhost 上做完整 E2E。
+- [ ] 补齐重连、错误、超时等边界情况。
 
-type RelayUploadChunk = {
-  type: "upload_chunk";
-  uploadId: string;
-  offset: number;
-  data: string;            // base64 encoded
-};
+### Phase 3：SRP + Encryption
 
-type RelayUploadEnd = {
-  type: "upload_end";
-  uploadId: string;
-};
+- [x] SRP helpers：生成 verifier、client/server handshake。
+- [x] NaCl encryption helpers：secretbox wrapper。
+- [x] SRP + encryption 单元测试。
+- [x] `/ws` endpoint 增加 SRP handshake。
+- [x] `WebSocketConnection` 增加 encryption layer，形成 `SecureConnection`。
+- [x] SRP verifier 存储到 data dir。
+- [x] Settings UI 支持 remote access username/password setup。
 
-type RelayUploadProgress = {
-  type: "upload_progress";
-  uploadId: string;
-  bytesReceived: number;
-};
+### Phase 3.5：Direct Secure 静态站点测试
 
-type RelayUploadComplete = {
-  type: "upload_complete";
-  uploadId: string;
-  file: UploadedFile;
-};
+在加入 relay 复杂度前，先用 GitHub Pages 托管的 client 直接连接 yepanywhere server，验证完整 secure connection flow。
 
-type RelayUploadError = {
-  type: "upload_error";
-  uploadId: string;
-  error: string;
-};
-```
+已完成：
 
-**Union types**
-```typescript
-// Messages from phone/browser → yepanywhere
-type RemoteClientMessage = RelayRequest | RelaySubscribe | RelayUnsubscribe
-                         | RelayUploadStart | RelayUploadChunk | RelayUploadEnd;
+- [x] `remote.html` entrypoint 和 `remote-main.tsx`
+- [x] `vite.config.remote.ts`
+- [x] `pnpm build:remote` / `pnpm dev:remote`
+- [x] GitHub Actions 部署 `dist-remote/` 到 GitHub Pages
+- [x] 独立登录页 `RemoteLoginPage.tsx`
+- [x] WebSocket URL、username、password 表单
+- [x] 通过 `SecureConnection` 完成 SRP handshake
+- [x] 登录成功后用 `SecureConnection` 渲染主应用
 
-// Messages from yepanywhere → phone/browser
-type YepMessage = RelayResponse | RelayEvent
-                | RelayUploadProgress | RelayUploadComplete | RelayUploadError;
-```
+待验证：
 
-Tasks:
-- [x] Define all types above in shared package
-- [x] Export from shared/index.ts
+- [ ] localhost remote client -> localhost yepanywhere
+- [ ] LAN 测试，例如 `ws://192.168.1.50:3400/ws`
+- [ ] 服务端设置页生成 QR code
+- [ ] 静态站点登录页扫码连接
 
-### Phase 2a: Connection Interface + DirectConnection
-- [x] Define Connection interface
-- [x] DirectConnection wraps existing fetch (trivial)
-- [x] useConnection hook returns DirectConnection
-- [x] App works unchanged (just routed through interface)
+### Phase 3.6：Remote Login 浏览器 E2E
 
-### Phase 2b: WebSocket Endpoint + Request/Response
-- [x] `/ws` endpoint on yepanywhere server
-- [x] Basic message routing: receive request, call Hono handler, send response
-- [x] WebSocketConnection class implementing Connection interface
-- [x] WebSocketConnection.fetch() - send request, match response by ID
-- [x] Developer settings toggle: "Use WebSocket transport" (default: off)
-- [x] useConnection hook checks dev setting, returns WebSocketConnection or DirectConnection
-- [x] "Test" button in settings to verify WebSocket connection before enabling
-- [x] Wire up `fetchJSON` in `api/client.ts` to check setting and use WebSocketConnection
-- [x] Test: simple API calls work over WS when enabled (ws-transport.e2e.test.ts)
+目标：用 Playwright 启动 remote client，并执行真实登录流程。
 
-### Phase 2c: Event Subscriptions (SSE Replacement)
-- [x] Server: track subscriptions per WS connection
-- [x] Server: pipe session events to subscribed connections
-- [x] Client: WebSocketConnection.subscribeSession() and subscribeActivity()
-- [x] Handle multiple concurrent subscriptions (session + activity)
-- [x] Test: live streaming works over WS (ws-transport.e2e.test.ts)
+已完成：
 
-### Phase 2d: File Upload
-- [x] Server: handle upload_start/chunk/end messages
-- [x] Server: pipe to existing upload handler
-- [x] Client: WebSocketConnection.upload() with progress
-- [x] Test: file uploads work over WS
+- [x] E2E test server 使用自动分配端口
+- [x] test helpers：`configureRemoteAccess()` / `disableRemoteAccess()`
+- [x] fixtures：`maintenanceURL`、`wsURL`、`remoteClientURL`
+- [x] remote client dev server 在 global setup 中启动
+- [x] CORS 允许 remote client origin
+- [x] `RemoteLoginPage` 增加 data-testid
+- [x] 登录页渲染、成功登录、错误密码、未知用户、server unreachable、空字段校验
+- [x] SecureConnection 下 sidebar navigation、activity subscription、mock project 可见
 
-### Phase 2e: Integration Testing
-- [ ] Switch app to WebSocketConnection
-- [ ] Full E2E testing on localhost
-- [ ] Handle edge cases (reconnection, errors, timeouts)
+待补：
 
-### Phase 3: SRP + Encryption
-- [x] SRP helpers (generate verifier, client/server handshake)
-- [x] NaCl encryption helpers (secretbox wrapper)
-- [x] Unit tests for SRP + encryption
-- [x] Add SRP handshake to `/ws` endpoint
-- [x] Add encryption layer to WebSocketConnection → SecureConnection
-- [x] SRP verifier storage in data dir
-- [x] Settings UI for remote access (username/password setup)
+- [ ] 创建 session、发送消息并验证 streaming，需要更多 UI instrumentation
+- [ ] 通过 encrypted WebSocket 上传文件，需要更多 UI instrumentation
 
-### Phase 3.5: Static Site for Direct Secure Testing
+### Phase 3.7：Session Resumption
 
-Before adding relay complexity, validate the full secure connection flow using a GitHub Pages-hosted client that connects directly to the yepanywhere server.
+问题：SRP 派生出的 session key 只存在内存中。刷新页面、URL 导航或浏览器重启后，需要重新输入密码。
 
-**Static Site Build** (in `packages/client/`)
-- [x] Add `remote.html` entrypoint and `remote-main.tsx`
-- [x] Add `vite.config.remote.ts` for static site build
-- [x] Add `pnpm build:remote` and `pnpm dev:remote` scripts
-- [x] GitHub Actions workflow to deploy `dist-remote/` to GitHub Pages on push to main
+方案：本地保存 session key，并增加 session resumption protocol。有效 session 存在时跳过完整 SRP handshake。
 
-**Login Entrypoint**
-- [x] Standalone login page (RemoteLoginPage.tsx)
-- [x] Form: WebSocket URL input (default: `ws://localhost:3400/ws`)
-- [x] Form: Username and password fields
-- [x] "Remember URL" option (stores URL/username in localStorage)
-- [x] SRP handshake via SecureConnection
-- [x] On success, render main app with SecureConnection
-
-**Connection Flow**
-- [x] Remote client uses SecureConnection exclusively (no DirectConnection)
-- [x] All API calls go through encrypted WebSocket (global connection routing)
-- [x] URL/username stored in localStorage for reconnection (password not stored)
-- [x] Handle connection errors gracefully (shows error in login form)
-
-**Testing Scenarios**
-- [ ] Localhost dev server → localhost yepanywhere (primary development flow)
-- [ ] LAN testing once localhost works (e.g., `ws://192.168.1.50:3400/ws`)
-
-**Nice to Have**
-- [ ] QR code generation on server settings page (encodes WS URL + username)
-- [ ] QR scanner on static site login (phone camera → quick connect)
-
-This phase validates:
-1. SRP authentication works from external origin
-2. SecureConnection handles all app traffic correctly
-3. Encryption/decryption is seamless
-4. The protocol is ready for relay passthrough
-
-### Phase 3.6: Browser E2E Tests for Remote Login
-
-Full Playwright browser tests that serve the remote client and perform real login flows.
-
-**Test Infrastructure** (completed)
-- [x] E2E test server uses auto-assigned ports (PORT=0)
-- [x] Maintenance server enabled in dev-mock.ts for test configuration
-- [x] Health check before tests start
-- [x] `configureRemoteAccess()` / `disableRemoteAccess()` test helpers
-- [x] `maintenanceURL` and `wsURL` Playwright fixtures
-
-#### Implementation Plan
-
-##### Step 1: Add Remote Client Dev Server Script
-
-Add proper package.json scripts for running the remote client with HMR, usable for both development and E2E testing.
-
-**File: `packages/client/package.json`** - Add scripts:
-```json
-{
-  "scripts": {
-    "dev:remote": "vite --config vite.config.remote.ts",
-    "build:remote": "vite build --config vite.config.remote.ts",
-    "preview:remote": "vite preview --config vite.config.remote.ts"
-  }
-}
-```
-
-**File: `packages/client/vite.config.remote.ts`** - Support dynamic port for E2E:
-```typescript
-const remoteDevPort = process.env.REMOTE_PORT
-  ? Number.parseInt(process.env.REMOTE_PORT, 10)
-  : 3403;
-
-export default defineConfig({
-  // ...existing config...
-  server: {
-    // When REMOTE_PORT=0, let Vite pick an available port
-    port: remoteDevPort === 0 ? undefined : remoteDevPort,
-    strictPort: remoteDevPort !== 0,
-    host: true,
-  },
-});
-```
-
-##### Step 2: Start Remote Client Dev Server in Global Setup
-
-**File: `packages/client/e2e/global-setup.ts`**
-
-Add after main server startup:
-```typescript
-const REMOTE_CLIENT_PORT_FILE = join(tmpdir(), "claude-e2e-remote-port");
-const REMOTE_CLIENT_PID_FILE = join(tmpdir(), "claude-e2e-remote-pid");
-
-// Start remote client Vite dev server for E2E testing
-console.log("[E2E] Starting remote client dev server...");
-const clientRoot = join(repoRoot, "packages", "client");
-const remoteClientProcess = spawn(
-  "pnpm",
-  ["exec", "vite", "--config", "vite.config.remote.ts"],
-  {
-    cwd: clientRoot,
-    env: { ...process.env, REMOTE_PORT: "0" },
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true,
-  }
-);
-
-if (remoteClientProcess.pid) {
-  writeFileSync(REMOTE_CLIENT_PID_FILE, String(remoteClientProcess.pid));
-}
-
-// Parse port from Vite's "Local: http://localhost:XXXXX/" output
-const remotePort = await new Promise<number>((resolve, reject) => {
-  const timeout = setTimeout(() => reject(new Error("Timeout waiting for remote client")), 30000);
-  let output = "";
-  remoteClientProcess.stdout?.on("data", (data: Buffer) => {
-    output += data.toString();
-    const match = output.match(/Local:\s+http:\/\/localhost:(\d+)/);
-    if (match) {
-      clearTimeout(timeout);
-      resolve(Number.parseInt(match[1], 10));
-    }
-  });
-});
-
-writeFileSync(REMOTE_CLIENT_PORT_FILE, String(remotePort));
-console.log(`[E2E] Remote client dev server on port ${remotePort}`);
-remoteClientProcess.unref();
-```
-
-**File: `packages/client/e2e/global-teardown.ts`** - Kill remote client process:
-```typescript
-const REMOTE_CLIENT_PID_FILE = join(tmpdir(), "claude-e2e-remote-pid");
-
-// Kill remote client process
-if (existsSync(REMOTE_CLIENT_PID_FILE)) {
-  const pid = Number.parseInt(readFileSync(REMOTE_CLIENT_PID_FILE, "utf-8"), 10);
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {}
-  unlinkSync(REMOTE_CLIENT_PID_FILE);
-}
-```
-
-##### Step 3: Add remoteClientURL Fixture
-
-**File: `packages/client/e2e/fixtures.ts`**
-```typescript
-const REMOTE_CLIENT_PORT_FILE = join(tmpdir(), "claude-e2e-remote-port");
-
-export const test = base.extend<{
-  baseURL: string;
-  maintenanceURL: string;
-  wsURL: string;
-  remoteClientURL: string;  // NEW
-}>({
-  // ...existing fixtures...
-  remoteClientURL: async ({}, use) => {
-    const port = readFileSync(REMOTE_CLIENT_PORT_FILE, "utf-8").trim();
-    await use(`http://localhost:${port}`);
-  },
-});
-```
-
-##### Step 4: Configure CORS for Remote Client Origin
-
-The yepanywhere server WebSocket endpoint must accept connections from the remote client origin.
-
-**File: `packages/server/src/routes/ws.ts`** - Add origin validation:
-```typescript
-// In WebSocket upgrade handler
-const origin = request.headers.get("origin");
-const allowedOrigins = [
-  /^https?:\/\/localhost:\d+$/,
-  /^https?:\/\/127\.0\.0\.1:\d+$/,
-  /^https:\/\/[\w-]+\.github\.io$/,  // GitHub Pages
-];
-
-const isAllowed = !origin || allowedOrigins.some((re) => re.test(origin));
-if (!isAllowed) {
-  return new Response("Forbidden", { status: 403 });
-}
-```
-
-##### Step 5: Add data-testid Attributes to RemoteLoginPage
-
-**File: `packages/client/src/pages/RemoteLoginPage.tsx`**
-
-Add test IDs to form elements:
-```tsx
-<form data-testid="login-form" onSubmit={handleSubmit}>
-  <input data-testid="ws-url-input" ... />
-  <input data-testid="username-input" ... />
-  <input data-testid="password-input" ... />
-  <button data-testid="login-button" type="submit">Connect</button>
-  {error && <div data-testid="login-error">{error}</div>}
-</form>
-```
-
-##### Step 6: Create Remote Login E2E Test File
-
-**File: `packages/client/e2e/remote-login.spec.ts`**
+协议：
 
 ```typescript
-import { expect } from "@playwright/test";
-import { test, configureRemoteAccess, disableRemoteAccess } from "./fixtures";
-
-test.describe("Remote Login Flow", () => {
-  const testUsername = "e2e-test-user";
-  const testPassword = "test-password-123";
-
-  test.beforeEach(async ({ baseURL, page }) => {
-    await configureRemoteAccess(baseURL, {
-      username: testUsername,
-      password: testPassword,
-    });
-    // Clear localStorage for fresh state
-    await page.addInitScript(() => {
-      localStorage.clear();
-      sessionStorage.clear();
-    });
-  });
-
-  test.afterEach(async ({ baseURL }) => {
-    await disableRemoteAccess(baseURL);
-  });
-
-  test("successful login renders main app", async ({ page, remoteClientURL, wsURL }) => {
-    await page.goto(remoteClientURL);
-
-    await page.fill('[data-testid="ws-url-input"]', wsURL);
-    await page.fill('[data-testid="username-input"]', testUsername);
-    await page.fill('[data-testid="password-input"]', testPassword);
-    await page.click('[data-testid="login-button"]');
-
-    // Wait for main app (projects list)
-    await expect(page.locator('[data-testid="projects-list"]')).toBeVisible({ timeout: 10000 });
-  });
-
-  test("wrong password shows error", async ({ page, remoteClientURL, wsURL }) => {
-    await page.goto(remoteClientURL);
-
-    await page.fill('[data-testid="ws-url-input"]', wsURL);
-    await page.fill('[data-testid="username-input"]', testUsername);
-    await page.fill('[data-testid="password-input"]', "wrong-password");
-    await page.click('[data-testid="login-button"]');
-
-    await expect(page.locator('[data-testid="login-error"]')).toBeVisible();
-    await expect(page.locator('[data-testid="login-form"]')).toBeVisible();
-  });
-
-  test("server unreachable shows connection error", async ({ page, remoteClientURL }) => {
-    await page.goto(remoteClientURL);
-
-    await page.fill('[data-testid="ws-url-input"]', "ws://localhost:9999/api/ws");
-    await page.fill('[data-testid="username-input"]', testUsername);
-    await page.fill('[data-testid="password-input"]', testPassword);
-    await page.click('[data-testid="login-button"]');
-
-    await expect(page.locator('[data-testid="login-error"]')).toBeVisible();
-  });
-});
-```
-
-##### Step 7: Add Encrypted Data Flow Tests
-
-Add to `packages/client/e2e/remote-login.spec.ts`:
-
-```typescript
-test.describe("Encrypted Data Flow", () => {
-  const testUsername = "e2e-test-user";
-  const testPassword = "test-password-123";
-
-  async function login(page, remoteClientURL, wsURL) {
-    await page.goto(remoteClientURL);
-    await page.fill('[data-testid="ws-url-input"]', wsURL);
-    await page.fill('[data-testid="username-input"]', testUsername);
-    await page.fill('[data-testid="password-input"]', testPassword);
-    await page.click('[data-testid="login-button"]');
-    await expect(page.locator('[data-testid="projects-list"]')).toBeVisible({ timeout: 10000 });
-  }
-
-  test.beforeEach(async ({ baseURL }) => {
-    await configureRemoteAccess(baseURL, { username: testUsername, password: testPassword });
-  });
-
-  test.afterEach(async ({ baseURL }) => {
-    await disableRemoteAccess(baseURL);
-  });
-
-  test("projects list loads via SecureConnection", async ({ page, remoteClientURL, wsURL }) => {
-    await login(page, remoteClientURL, wsURL);
-    // If we get here, encrypted fetch worked
-    const projectItems = page.locator('[data-testid="project-item"]');
-    await expect(projectItems.first()).toBeVisible();
-  });
-
-  test("can create session and receive streaming response", async ({ page, remoteClientURL, wsURL }) => {
-    await login(page, remoteClientURL, wsURL);
-
-    // Click on a project to create/view session
-    await page.locator('[data-testid="project-item"]').first().click();
-
-    // Create new session
-    await page.click('[data-testid="new-session-button"]');
-
-    // Send a message
-    await page.fill('[data-testid="message-input"]', "Hello from E2E test");
-    await page.click('[data-testid="send-button"]');
-
-    // Verify streaming response appears
-    await expect(page.locator('[data-testid="assistant-message"]')).toBeVisible({ timeout: 15000 });
-  });
-});
-```
-
-#### Checklist Summary
-
-**Remote Client E2E Setup**
-- [x] Add `dev:remote` / `build:remote` / `preview:remote` scripts to package.json
-- [x] Update vite.config.remote.ts to support REMOTE_PORT=0 for auto-assign
-- [x] Start remote client Vite dev server in global-setup.ts
-- [x] Add `remoteClientURL` fixture to fixtures.ts
-- [x] Kill remote client process in global-teardown.ts
-- [x] Configure CORS in ws-relay.ts for remote client origins
-
-**Full Login Flow Tests** (remote-login.spec.ts)
-- [x] Add data-testid attributes to RemoteLoginPage.tsx
-- [x] Test: login page renders correctly
-- [x] Test: successful login renders main app
-- [x] Test: wrong password shows error
-- [x] Test: unknown username shows error
-- [x] Test: server unreachable shows connection error
-- [x] Test: empty fields show validation error
-
-**Encrypted Data Flow Tests**
-- [x] Test: sidebar navigation loads via SecureConnection
-- [x] Test: activity subscription receives events
-- [x] Test: mock project visible in sidebar
-- [ ] Test: create session, send message, verify streaming (requires more UI instrumentation)
-- [ ] Test: file upload through encrypted WebSocket (requires more UI instrumentation)
-
-**Test Isolation**
-- [x] beforeEach configures fresh remote access credentials
-- [x] beforeEach clears localStorage/sessionStorage
-- [x] afterEach disables remote access
-
-This phase validates the complete user experience: a browser loading the remote client, entering credentials, and using the app through an encrypted WebSocket connection.
-
-### Phase 3.7: Session Resumption
-
-Enable page refresh and navigation without re-entering password by persisting the SRP session key.
-
-**Problem**: Currently, the session key derived from SRP is stored only in memory. Page refresh, URL navigation, or browser restart requires full re-authentication with password.
-
-**Solution**: Store the session key locally and add a session resumption protocol that skips the SRP handshake when a valid session exists.
-
-#### Protocol Messages
-
-Add to `packages/shared/src/relay.ts`:
-
-```typescript
-// Client → Server: Attempt to resume existing session
 type SrpSessionResume = {
   type: "srp_resume";
-  identity: string;           // Username
-  sessionId: string;          // Session identifier from previous auth
-  proof: string;              // Encrypted timestamp to prove key possession
+  identity: string;
+  sessionId: string;
+  proof: string;
 };
 
-// Server → Client: Session resumed successfully
 type SrpSessionResumed = {
   type: "srp_resumed";
   sessionId: string;
 };
 
-// Server → Client: Session invalid, do full SRP
 type SrpSessionInvalid = {
   type: "srp_invalid";
   reason: "expired" | "unknown" | "invalid_proof";
 };
 ```
 
-#### Server Changes
+安全取舍：
 
-**Session storage** (`packages/server/src/services/remote-access.ts`):
-- Store session keys in data dir: `{dataDir}/remote-sessions.json`
-- Map: `{ [sessionId]: { username, sessionKey, createdAt, lastUsed } }`
-- Session expiry: configurable (default 7 days idle, 30 days max)
+- Session key 存在 localStorage，同 origin JS 可访问；这是便利性和安全性的权衡。
+- Proof 使用 session key 加密当前 timestamp，降低 replay 风险；server 要校验 timestamp 在 5 分钟内。
+- 改密码会让所有 session 失效，并应提供 `sign out everywhere`。
+- 每个用户最多 5 个 active sessions，新认证会淘汰最旧 session。
 
-**WebSocket handler** (`packages/server/src/routes/ws-relay.ts`):
-- Handle `srp_resume` message before SRP hello
-- Verify proof by decrypting with stored session key
-- Send `srp_resumed` on success, `srp_invalid` on failure
-- Update `lastUsed` timestamp on successful resume
+状态：
 
-#### Client Changes
+- [x] 协议类型和 type guards
+- [x] server session storage service
+- [x] `ws-relay.ts` 处理 `srp_resume`
+- [x] 启动和定期清理过期 session
+- [x] 改密码时让 session 失效
+- [x] client 存储 `sessionId` 和 `sessionKey`
+- [x] `SecureConnection.fromStoredSession()`
+- [x] `connectAndAuthenticate()` 先尝试 resume，失败再回落 SRP
+- [x] login form 增加 `Remember me`
+- [ ] session storage service 单元测试
+- [ ] E2E：登录后刷新仍保持认证
+- [ ] E2E：session 过期触发重新登录
+- [ ] E2E：改密码后 session 失效
 
-**Session storage** (`packages/client/src/contexts/RemoteConnectionContext.tsx`):
-```typescript
-interface StoredSession {
-  wsUrl: string;
-  username: string;
-  sessionId: string;
-  sessionKey: string;  // Base64-encoded Uint8Array
-  createdAt: number;
-}
-```
-- Store in localStorage after successful SRP
-- Clear on explicit logout or auth failure
+### Phase 4：Relay
 
-**SecureConnection** (`packages/client/src/lib/connection/SecureConnection.ts`):
-- Add `static fromStoredSession(session: StoredSession)` factory
-- `connectAndAuthenticate()` tries resume first, falls back to SRP
-- Generate proof: encrypt current timestamp with session key
+- [ ] 独立 relay package/service
+- [ ] 接受 yepanywhere server connection
+- [ ] 接受 phone connection，透传 SRP 到 yepanywhere server
+- [ ] 转发加密消息
+- [ ] 连接跟踪：`username -> socket`
+- [ ] 重连处理
 
-#### Flow
+### Phase 5：Production
 
-```
-Reconnect with stored session:
+- [ ] yepanywhere server 中的 relay client 启动时连接 relay
+- [ ] yepanywhere.com config endpoint
+- [ ] 部署 relay
+- [ ] 必要时支持多 relay
+- [ ] monitoring/alerting
 
-Client                           Server
-  │                                │
-  │ ── srp_resume ───────────────▶ │  (sessionId + encrypted timestamp)
-  │                                │
-  │ ◀── srp_resumed ────────────── │  (session valid)
-  │                                │
-  │ ══ encrypted traffic ════════▶ │  (using stored session key)
+## 待确认问题
 
-Session expired/invalid:
+1. **Username format**：是否允许 dots/dashes？最小和最大长度？
+2. **Password requirements**：最低熵要求？是否给 passphrase 建议？
+3. **Session persistence**：手机端缓存 session key 多久？见 Phase 3.7：7 天 idle、30 天 max。
+4. **Conflict handling**：yepanywhere server 换机器时是否 last-write-wins？
+5. **Offline indicator**：如何区分 `yepanywhere offline` 和 `wrong password`？
 
-Client                           Server
-  │                                │
-  │ ── srp_resume ───────────────▶ │
-  │                                │
-  │ ◀── srp_invalid ────────────── │  (reason: expired)
-  │                                │
-  │    (fall back to full SRP handshake)
-```
-
-#### Security Considerations
-
-- **Session key storage**: localStorage is accessible to JS on same origin. Acceptable for convenience vs. security tradeoff. Users can choose to not save session.
-- **Proof mechanism**: Encrypting timestamp prevents replay attacks. Server validates timestamp is recent (within 5 minutes).
-- **Session revocation**: Changing password invalidates all sessions. Add explicit "sign out everywhere" option.
-- **Session limits**: Max 5 active sessions per user. Oldest evicted on new auth.
-
-#### Checklist
-
-**Protocol**
-- [x] Add `SrpSessionResume`, `SrpSessionResumed`, `SrpSessionInvalid` types
-- [x] Add type guards for new message types
-
-**Server**
-- [x] Add session storage service (create, lookup, delete, cleanup)
-- [x] Handle `srp_resume` in ws-relay.ts
-- [x] Session expiry cleanup (on startup + periodic)
-- [x] Invalidate sessions on password change
-
-**Client**
-- [x] Update `StoredCredentials` to include sessionId and sessionKey
-- [x] Add `SecureConnection.fromStoredSession()` factory
-- [x] Try session resume in `connectAndAuthenticate()`
-- [x] Fall back to SRP on `srp_invalid`
-- [x] Add "Remember me" checkbox to login form (controls session storage)
-
-**Tests**
-- [ ] Unit tests for session storage service
-- [ ] E2E test: login, refresh page, still authenticated
-- [ ] E2E test: session expiry triggers re-login
-- [ ] E2E test: password change invalidates sessions
-
-### Phase 4: Relay
-- [ ] Separate relay package/service
-- [ ] Accept yepanywhere server connections (authenticated)
-- [ ] Accept phone connections (passthrough SRP to yepanywhere server)
-- [ ] Route encrypted messages (opaque blobs)
-- [ ] Connection tracking (username → socket mapping)
-- [ ] Reconnection handling
-
-### Phase 5: Production
-- [ ] Relay client in yepanywhere server (connect to relay on startup)
-- [ ] Config endpoint on yepanywhere.com
-- [ ] Deploy relay
-- [ ] Multi-relay support (if needed)
-- [ ] Monitoring/alerting
-
-## Open Questions
-
-1. **Username format** - Allow dots/dashes? Min/max length?
-2. **Password requirements** - Minimum entropy? Passphrase suggestions?
-3. **Session persistence** - ~~How long to cache session key on phone?~~ → See Phase 3.7 (7 days idle, 30 days max)
-4. **Conflict handling** - When yepanywhere server moves to new machine, last-write-wins?
-5. **Offline indicator** - Show "yepanywhere offline" vs "wrong password"?
-
-## Alternatives Considered
+## 考虑过的替代方案
 
 ### QR Code Pairing
-- Pro: High-entropy key without password
-- Con: Requires camera, awkward for second device
-- Decision: Keep as optional optimization, password-first
+
+- 优点：不依赖密码，可使用高熵 key。
+- 缺点：需要摄像头，第二台设备配置不方便。
+- 决策：保留为可选优化，主流程先 password-first。
 
 ### FCM/Push for Wake-up
-- Pro: No persistent connection
-- Con: FCM is client-focused, not for desktop/server applications
-- Decision: Persistent WebSocket is fine for always-on yepanywhere servers
+
+- 优点：不需要持久连接。
+- 缺点：FCM 更偏 client 场景，不适合 desktop/server application。
+- 决策：yepanywhere server 通常常驻，使用持久 WebSocket 足够。
 
 ### Direct WebRTC
-- Pro: True P2P, no relay bandwidth
-- Con: Complex NAT traversal, TURN fallback needed anyway
-- Decision: Relay is simpler, traffic is lightweight
 
-## References
+- 优点：真正 P2P，不消耗 relay bandwidth。
+- 缺点：NAT traversal 复杂，而且最终仍可能需要 TURN。
+- 决策：Relay 更简单，且流量较轻。
+
+## 参考资料
 
 - [SRP Protocol](http://srp.stanford.edu/design.html)
 - [TweetNaCl.js](https://tweetnacl.js.org/)
-- [tssrp6a](https://github.com/midonet/tssrp6a) - TypeScript SRP-6a implementation (chosen library)
+- [tssrp6a](https://github.com/midonet/tssrp6a)：TypeScript SRP-6a 实现，当前选型
 
-### SRP Library Choice: tssrp6a
+### SRP Library Choice：tssrp6a
 
-Evaluated options:
-- **tssrp6a** (chosen) - Zero dependencies, native TypeScript, SHA-512 default, built-in session serialization for stateless HTTP/WS
-- secure-remote-password - Simpler API but unmaintained (7 years), JavaScript only
-- thinbus-srp-npm - More complex, designed for Java backend interop
-- mozilla/node-srp - Node-only, older crypto patterns
+评估过的选项：
 
-Key factors:
-- Session serialization support (critical for relay protocol)
-- Active maintenance (v3.0.0)
-- Zero dependencies (minimal bundle size)
-- Native TypeScript types
+- **tssrp6a**（选用）：零依赖、原生 TypeScript、默认 SHA-512，支持 session serialization，适合 stateless HTTP/WS。
+- `secure-remote-password`：API 更简单，但 7 年未维护，且只有 JavaScript。
+- `thinbus-srp-npm`：更复杂，主要面向 Java backend interop。
+- `mozilla/node-srp`：Node-only，crypto pattern 较旧。
 
-Caveats:
-- Requires HTTPS/WSS (uses WebCrypto `Crypto.subtle`)
-- Default config excludes user identity from verifier (allows username changes without password reset; can customize for strict RFC compliance)
+关键因素：
+
+- 支持 session serialization；relay protocol 很需要。
+- 仍在维护，目前版本为 v3.0.0。
+- 零依赖，bundle 更小。
+- 原生 TypeScript types。
+
+注意事项：
+
+- 需要 HTTPS/WSS，因为会使用 WebCrypto `Crypto.subtle`。
+- 默认配置不把 user identity 纳入 verifier；这允许不重置密码就改 username。如需严格 RFC compliance，可以自定义配置。

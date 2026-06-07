@@ -1,6 +1,6 @@
-# Development
+# 开发指南
 
-## Setup
+## 环境准备
 
 ```bash
 git clone https://github.com/kzahel/yepanywhere.git
@@ -9,83 +9,85 @@ pnpm install
 pnpm dev
 ```
 
-Open http://localhost:3400 in your browser.
+然后在浏览器打开 http://localhost:3400。
 
-If you only want the main app and do not want to install the relay workspace, use:
+如果只需要主应用，不想安装 relay workspace，可以使用：
 
 ```bash
 pnpm setup:core
 pnpm dev
 ```
 
-## Commands
+## 常用命令
 
 ```bash
-pnpm setup:core # Install root + client + server + shared, skipping relay
-pnpm dev        # Start dev server
-pnpm lint       # Biome linter
-pnpm typecheck  # TypeScript type checking
-pnpm test       # Unit tests
-pnpm test:e2e   # E2E tests
+pnpm setup:core # 只安装 root + client + server + shared，跳过 relay
+pnpm dev        # 启动开发服务器
+pnpm lint       # 运行 Biome linter
+pnpm typecheck  # 运行 TypeScript 类型检查
+pnpm test       # 运行单元测试
+pnpm test:e2e   # 运行 E2E 测试
 ```
 
-## Port Configuration
+## 端口配置
 
-Ports are derived from a single `PORT` variable (default: 3400):
+端口都从同一个 `PORT` 变量推导出来，默认值是 `3400`：
 
-| Port | Purpose |
-|------|---------|
-| PORT + 0 | Main server |
-| PORT + 1 | Maintenance server |
-| PORT + 2 | Vite dev server |
+| 端口 | 用途 |
+|------|------|
+| PORT + 0 | 主服务器 |
+| PORT + 1 | 维护服务器 |
+| PORT + 2 | Vite 开发服务器 |
 
 ```bash
-PORT=4000 pnpm dev  # Uses 4000, 4001, 4002
+PORT=4000 pnpm dev  # 使用 4000、4001、4002
 ```
 
-## Data Directory
+## 数据目录
 
-Server state is stored in `~/.yep-anywhere/` by default:
+服务端状态默认保存在 `~/.yep-anywhere/`：
 
-- `logs/` — Server logs
-- `indexes/` — Session index cache
-- `uploads/` — Uploaded files
-- `session-metadata.json` — Custom titles, archive/starred status
+- `logs/`：服务器日志
+- `indexes/`：会话索引缓存
+- `uploads/`：上传文件
+- `session-metadata.json`：自定义标题、归档/收藏状态
 
-### Running Multiple Instances
+### 同时运行多个实例
 
-Use profiles to run dev and production instances simultaneously:
+可以使用 profile 同时运行开发和生产实例：
 
 ```bash
-# Production (default profile, port 3400)
+# 生产实例（默认 profile，端口 3400）
 PORT=3400 pnpm start
 
-# Development (dev profile, port 4000)
+# 开发实例（dev profile，端口 4000）
 PORT=4000 YEP_ANYWHERE_PROFILE=dev pnpm dev
 ```
 
-Environment variables:
-- `YEP_ANYWHERE_PROFILE` — Profile name suffix (creates `~/.yep-anywhere-{profile}/`)
-- `YEP_ANYWHERE_DATA_DIR` — Full path override for data directory
+环境变量：
 
-## Server Logs
+- `YEP_ANYWHERE_PROFILE`：profile 名称后缀，会创建 `~/.yep-anywhere-{profile}/`
+- `YEP_ANYWHERE_DATA_DIR`：完整的数据目录覆盖路径
 
-Logs are written to `{dataDir}/logs/server.log`. View in real-time:
+## 服务器日志
+
+日志写入 `{dataDir}/logs/server.log`。实时查看：
 
 ```bash
 tail -f ~/.yep-anywhere/logs/server.log
 ```
 
-Environment variables:
-- `LOG_LEVEL` — Minimum level: fatal, error, warn, info, debug, trace (default: info)
-- `LOG_TO_FILE` — Set to "true" to enable file logging (default: off)
-- `LOG_PRETTY` — Set to "false" to disable pretty console logs (default: on)
+环境变量：
 
-## Maintenance Server
+- `LOG_LEVEL`：最低日志级别，可选 `fatal`、`error`、`warn`、`info`、`debug`、`trace`，默认 `info`
+- `LOG_TO_FILE`：设为 `"true"` 时启用文件日志，默认关闭
+- `LOG_PRETTY`：设为 `"false"` 时关闭控制台美化输出，默认开启
 
-A lightweight HTTP server runs on PORT + 1 for diagnostics when the main server is unresponsive:
+## 维护服务器
+
+当主服务器无响应时，`PORT + 1` 上会运行一个轻量 HTTP 维护服务器，用于诊断：
 
 ```bash
-curl http://localhost:3401/status          # Server status
-curl -X POST http://localhost:3401/reload  # Restart server
+curl http://localhost:3401/status          # 查看服务器状态
+curl -X POST http://localhost:3401/reload  # 重启服务器
 ```

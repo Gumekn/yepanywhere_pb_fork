@@ -1,91 +1,95 @@
-# Android Real-Device Streaming: MediaCodec Hardware Encoding
+# Android 实体设备串流：MediaCodec 硬件编码
 
-## Problem
+## 问题
 
-The current real-device capture pipeline polls screenshot APIs per frame. Each call to `ScreenCapture.capture()` or `SurfaceControl.captureDisplay()` costs ~400ms on a Pixel 7a (Android 16), capping throughput at ~2.5 fps before any streaming overhead. The bottleneck is on-device capture, not WebRTC or x264.
+当前实体设备 capture pipeline 是逐帧轮询 screenshot APIs。在 Pixel 7a（Android 16）上，每次 `ScreenCapture.capture()` 或 `SurfaceControl.captureDisplay()` 约 400ms，任何 streaming overhead 之前就已经被限制在约 2.5 fps。瓶颈在设备端 capture，不在 WebRTC 或 x264。
 
-Current pipeline (per frame):
-```
+当前 pipeline（逐帧）：
+
+```text
 Screenshot API call (~400ms)
-  → Hardware bitmap → software copy
-  → Optional downscale
-  → JPEG encode (Bitmap.compress)
-  → TCP send to Go sidecar
-  → JPEG decode → RGB → I420 → x264 encode
-  → WebRTC RTP
+  -> Hardware bitmap -> software copy
+  -> Optional downscale
+  -> JPEG encode (Bitmap.compress)
+  -> TCP send to Go sidecar
+  -> JPEG decode -> RGB -> I420 -> x264 encode
+  -> WebRTC RTP
 ```
 
-## Solution: Continuous VirtualDisplay → Hardware H.264
+## 方案：连续 VirtualDisplay -> 硬件 H.264
 
-Replace per-frame screenshot polling with a persistent VirtualDisplay that mirrors the physical screen into a hardware MediaCodec encoder. The encoder outputs H.264 NAL units continuously — no bitmap readback, no CPU image processing, no re-encoding on the Go side.
+用持久 VirtualDisplay 替换逐帧 screenshot polling，把实体屏幕镜像到硬件 MediaCodec encoder。Encoder 连续输出 H.264 NAL units，不需要 bitmap readback，不需要 CPU image processing，也不需要 Go 侧重新编码。
 
-New pipeline:
-```
+新 pipeline：
+
+```text
 DisplayManager.createVirtualDisplay() or SurfaceControl.createDisplay() (once)
-  → VirtualDisplay mirrors physical screen (continuous)
-  → MediaCodec hardware H.264 encoder (continuous)
-  → NAL units over TCP to Go sidecar
-  → Go forwards NALs directly to WebRTC
+  -> VirtualDisplay mirrors physical screen (continuous)
+  -> MediaCodec hardware H.264 encoder (continuous)
+  -> NAL units over TCP to Go sidecar
+  -> Go forwards NALs directly to WebRTC
 ```
 
-Expected improvement: ~2.5 fps / 400ms latency → 30-60 fps / <50ms latency.
+预期提升：约 2.5 fps / 400ms latency -> 30-60 fps / <50ms latency。
 
-## Compatibility Contract (Must Keep)
+## 必须保持的兼容契约
 
-The legacy screenshot path is still the default fallback and must remain valid:
+Legacy screenshot path 仍是默认 fallback，必须继续有效：
 
-- `0x01`/`0x02` frame request/response remains unchanged
-- `0x03` control remains unchanged
-- If `stream_start` is unsupported (older APK), sidecar falls back to `GetFrame()` polling
-- Emulator and ChromeOS paths remain on existing frame/x264 pipeline
+- `0x01`/`0x02` frame request/response 保持不变。
+- `0x03` control 保持不变。
+- 如果 `stream_start` 不受支持（旧 APK），sidecar fallback 到 `GetFrame()` polling。
+- Emulator 和 ChromeOS 继续使用现有 frame/x264 pipeline。
 
-## Display Mirroring: DisplayManager vs SurfaceControl vs MediaProjection
+## Display Mirroring：DisplayManager vs SurfaceControl vs MediaProjection
 
-Three APIs can create a VirtualDisplay that mirrors the physical screen. scrcpy uses a two-tier fallback:
+有三种 API 可以创建镜像实体屏幕的 VirtualDisplay。scrcpy 使用两级 fallback：
 
-| | DisplayManager (preferred) | SurfaceControl (fallback) | MediaProjection |
+| | DisplayManager（优先） | SurfaceControl（fallback） | MediaProjection |
 |---|---|---|---|
-| User consent dialog | No | No | Yes (system UI prompt) |
-| Shell user access | Yes (hidden API) | Yes (hidden API) | Unreliable from shell |
-| API level | Varies by method | Android 5+ | Android 5+ |
-| Android 14+ | Methods may move to `DisplayControl` class | Same | Same |
-| scrcpy uses it | Primary path | Fallback | Never |
+| 用户同意弹窗 | 否 | 否 | 是，系统 UI prompt |
+| Shell user access | 是，hidden API | 是，hidden API | 从 shell 不可靠 |
+| API level | 随方法而异 | Android 5+ | Android 5+ |
+| Android 14+ | 方法可能移到 `DisplayControl` class | 同左 | 同左 |
+| scrcpy 使用 | 主路径 | fallback | 从不使用 |
 
-scrcpy's strategy (`ScreenCapture.java:127-144`):
-1. Try `DisplayManager.createVirtualDisplay(name, w, h, displayId, surface)` first
-2. If that fails, fall back to `SurfaceControl.createDisplay()` + transaction setup
-3. Never uses MediaProjection
+scrcpy 的策略（`ScreenCapture.java:127-144`）：
 
-Since `DeviceServer.java` already runs as shell user via `app_process` and already uses reflection for `SurfaceControl` screenshot APIs, we follow the same two-tier approach.
+1. 先尝试 `DisplayManager.createVirtualDisplay(name, w, h, displayId, surface)`。
+2. 失败时 fallback 到 `SurfaceControl.createDisplay()` + transaction setup。
+3. 永不使用 MediaProjection。
 
-### Android Version Considerations
+`DeviceServer.java` 已经通过 `app_process` 以 shell user 运行，并为 `SurfaceControl` screenshot APIs 使用 reflection。因此我们沿用同样的两级方案。
 
-From scrcpy's `SurfaceControl.java` and `DisplayControl.java`:
+### Android 版本注意事项
 
-- **Android 5-9:** `SurfaceControl.getBuiltInDisplay(0)` to get physical display token
-- **Android 10-13:** `SurfaceControl.getInternalDisplayToken()` (no parameter)
-- **Android 14+:** Physical display methods moved to `DisplayControl` class — `DisplayControl.getPhysicalDisplayToken(long)` and `getPhysicalDisplayIds()`
-- **Android 12+:** `secure` flag on `createDisplay()` may be restricted
+来自 scrcpy 的 `SurfaceControl.java` 和 `DisplayControl.java`：
 
-Our existing `DeviceServer.java` already handles some of these version differences for screenshot capture. The streaming path needs the same version-aware reflection.
+- **Android 5-9**：用 `SurfaceControl.getBuiltInDisplay(0)` 获取 physical display token。
+- **Android 10-13**：用 `SurfaceControl.getInternalDisplayToken()`，无参数。
+- **Android 14+**：physical display methods 移到 `DisplayControl` class：`DisplayControl.getPhysicalDisplayToken(long)` 和 `getPhysicalDisplayIds()`。
+- **Android 12+**：`createDisplay()` 上的 `secure` flag 可能受限。
 
-## APK Changes (DeviceServer.java)
+现有 `DeviceServer.java` 已经为 screenshot capture 处理了一部分版本差异。Streaming path 也需要同样的 version-aware reflection。
 
-### New Streaming Mode
+## APK 变更（DeviceServer.java）
 
-Add a `MediaCodecStreamer` class alongside the existing `FrameCapturer` backends. The existing screenshot path stays intact for single-frame capture (agent CLI, etc.); streaming uses the new path.
+### 新 streaming mode
 
-**Activation:** New control command starts/stops the stream:
+在现有 `FrameCapturer` backends 旁边增加 `MediaCodecStreamer` class。现有 screenshot path 继续用于 single-frame capture（agent CLI 等）；streaming 使用新路径。
+
+**Activation：** 新 control command 用于启动/停止 stream：
+
 ```json
 {"cmd": "stream_start", "width": 720, "height": 1600, "bitrate": 2000000, "fps": 30}
 {"cmd": "stream_stop"}
 ```
 
-When streaming is active, the device pushes NAL units continuously instead of waiting for `0x01` frame requests.
+Streaming active 时，设备连续 push NAL units，不再等待 `0x01` frame requests。
 
-### Key Components
+### 关键组件
 
-**1. VirtualDisplay setup (two-tier, following scrcpy)**
+**1. VirtualDisplay setup（两级，遵循 scrcpy）**
 
 ```java
 // Tier 1: DisplayManager (preferred)
@@ -108,11 +112,11 @@ try {
 }
 ```
 
-All calls via reflection — same pattern already used in `DeviceServer.java` for screenshot backends.
+所有调用都通过 reflection，和 `DeviceServer.java` 中现有 screenshot backends 模式一致。
 
 **2. MediaCodec configuration**
 
-Following scrcpy's proven parameters (`SurfaceEncoder.java:256-286`):
+沿用 scrcpy 已验证的参数（`SurfaceEncoder.java:256-286`）：
 
 ```java
 MediaFormat format = new MediaFormat();
@@ -136,11 +140,11 @@ Surface inputSurface = codec.createInputSurface();
 codec.start();
 ```
 
-Note: scrcpy sets `KEY_FRAME_RATE = 60` as a hint but actual FPS is determined by display refresh and `KEY_MAX_FPS_TO_ENCODER` (float, available as private API pre-Android 10, public in 10+). We can use `KEY_MAX_FPS_TO_ENCODER` for real FPS capping.
+说明：scrcpy 把 `KEY_FRAME_RATE = 60` 作为 hint，但实际 FPS 由 display refresh 和 `KEY_MAX_FPS_TO_ENCODER` 决定。`KEY_MAX_FPS_TO_ENCODER` 在 Android 10+ 是 public API，之前是 private API。我们可以用它控制真实 FPS cap。
 
 **3. Encoder output loop**
 
-scrcpy uses blocking `dequeueOutputBuffer(bufferInfo, -1)` (infinite wait). We use a bounded timeout so we can check for stop signals:
+scrcpy 使用 blocking `dequeueOutputBuffer(bufferInfo, -1)`。我们使用 bounded timeout，便于检查 stop signals：
 
 ```java
 MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
@@ -156,20 +160,21 @@ while (streaming) {
 }
 ```
 
-**4. Size downgrade on initial failure**
+**4. 初始失败时降低尺寸**
 
-scrcpy retries with progressively smaller sizes if the encoder fails before producing the first frame (`SurfaceEncoder.java:149-182`). Fallback sizes: 2560, 1920, 1600, 1280, 1024, 800. Max 3 retries. We should do the same — some hardware encoders reject large resolutions.
+如果 encoder 在产出第一帧前失败，scrcpy 会逐步降低尺寸重试（`SurfaceEncoder.java:149-182`）。Fallback sizes：2560、1920、1600、1280、1024、800。最多 3 次。我们也应这样做，因为部分硬件 encoder 会拒绝过高分辨率。
 
-### Dynamic Controls (No Pipeline Restart)
+### Dynamic controls（不重启 pipeline）
 
-MediaCodec supports these mid-stream via `setParameters()`:
+MediaCodec 通过 `setParameters()` 支持 mid-stream 修改：
 
 ```json
 {"cmd": "stream_bitrate", "bps": 1000000}
 {"cmd": "stream_keyframe"}
 ```
 
-Implementation:
+实现：
+
 ```java
 // Bitrate change — takes effect within 1-2 frames
 Bundle params = new Bundle();
@@ -182,34 +187,35 @@ kf.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
 codec.setParameters(kf);
 ```
 
-**FPS control:** Unlike bitrate and keyframe, there's no `setParameters()` for FPS. scrcpy doesn't support mid-stream FPS changes either. Options:
-- Use `KEY_MAX_FPS_TO_ENCODER` at configure time (requires pipeline restart to change)
-- Throttle on the Go side by dropping frames at a target cadence (wasteful but no restart)
-- Accept that FPS is primarily controlled by bitrate (lower bitrate → encoder naturally produces fewer high-quality frames)
+**FPS control：** 与 bitrate/keyframe 不同，FPS 没有 `setParameters()`。scrcpy 也不支持 mid-stream FPS 修改。可选方案：
 
-For backpressure, bitrate reduction + keyframe requests are the primary levers. FPS reduction via pipeline restart is a last resort.
+- configure 时使用 `KEY_MAX_FPS_TO_ENCODER`，修改时需要重启 pipeline。
+- Go 侧按目标 cadence drop frames，浪费但无需重启。
+- 接受 FPS 主要由 bitrate 控制；低 bitrate 会让 encoder 自然产出更少高质量帧。
 
-### Rotation Handling
+对于 backpressure，主要手段是降低 bitrate + 请求 keyframe。FPS 降低作为最后手段，需要 pipeline restart。
 
-scrcpy restarts the entire capture+encode pipeline on rotation change (`DisplaySizeMonitor.java:109-140` detects rotation → `CaptureReset.java` calls `signalEndOfInputStream()` → `SurfaceEncoder.java` do-while loop restarts). We should do the same:
+### Rotation handling
 
-1. Monitor display rotation (polling or listener)
-2. On change: `codec.signalEndOfInputStream()` → teardown VirtualDisplay → reconfigure with new dimensions → restart
+scrcpy 在 rotation change 时重启整个 capture + encode pipeline：`DisplaySizeMonitor.java:109-140` 检测 rotation，`CaptureReset.java` 调 `signalEndOfInputStream()`，`SurfaceEncoder.java` 的 loop 重启。我们也应这样做：
 
-This causes a brief interruption but rotation changes are infrequent.
+1. 监控 display rotation，可以 polling 或 listener。
+2. 变化后：`codec.signalEndOfInputStream()` -> teardown VirtualDisplay -> 用新尺寸重新配置 -> restart。
 
-### Wire Protocol Extension
+这会造成短暂中断，但 rotation change 并不频繁。
 
-New message types for streaming:
+### Wire protocol extension
 
-```
-Stream status (device → sidecar, length-prefixed JSON):
+新增 streaming message types：
+
+```text
+Stream status (device -> sidecar, length-prefixed JSON):
   [0x04][len u32 LE][json bytes]
   e.g. {"cmd":"stream_start","ok":true,"width":720,"height":1600,"bitrate":2000000,"fps":30}
 ```
 
-```
-Stream NAL (device → sidecar, push-based):
+```text
+Stream NAL (device -> sidecar, push-based):
   [0x05][flags u8][pts u64 LE][len u32 LE][H.264 NAL bytes]
 
   flags:
@@ -217,26 +223,27 @@ Stream NAL (device → sidecar, push-based):
     bit 1: config (1 = SPS/PPS, 0 = frame data)
 ```
 
-`0x05` distinguishes stream data from `0x02` JPEG frame responses. The existing `0x01`/`0x02` request-response protocol continues to work for single-frame screenshots when not streaming.
+`0x05` 用来区分 stream data 和 `0x02` JPEG frame responses。不 streaming 时，现有 `0x01`/`0x02` request-response 协议仍可用于 single-frame screenshots。
 
-`0x04` allows explicit start/failure reporting so the sidecar can quickly decide between MediaCodec and fallback polling.
+`0x04` 提供明确的 start/failure reporting，让 sidecar 能快速决定使用 MediaCodec 还是 fallback polling。
 
-PTS (presentation timestamp, microseconds) is included for proper frame timing on the WebRTC side. scrcpy uses a similar 12-byte header: 8-byte PTS+flags (flags in top 2 bits), 4-byte size (`Streamer.java:85-109`). Our format is slightly different (separate flags byte) for simpler parsing.
+PTS（presentation timestamp，microseconds）用于 WebRTC 侧正确 timing。scrcpy 使用类似的 12-byte header：8-byte PTS+flags（flags 在 top 2 bits）+ 4-byte size（`Streamer.java:85-109`）。我们的格式略有不同，把 flags byte 单独拆出，解析更简单。
 
-The `flags` byte lets the Go side make drop decisions without parsing H.264:
-- Always forward `config` packets (SPS/PPS) — needed to initialize the decoder
-- Can safely drop non-keyframe packets during congestion
-- After dropping, request a keyframe to resync
+`flags` byte 让 Go 侧无需解析 H.264 就能做 drop decision：
 
-## Go Sidecar Changes (device-bridge)
+- 总是 forward `config` packets（SPS/PPS），它们是初始化 decoder 必需的。
+- 拥塞时可安全 drop non-keyframe packets。
+- Drop 后请求 keyframe 重新同步。
 
-### New Stream Mode in AndroidDevice
+## Go Sidecar 变更（device-bridge）
 
-`AndroidDevice` gains a `StartStream()`/`StopStream()` method pair. When streaming:
+### AndroidDevice 增加 stream mode
 
-- Sends `stream_start` command to the APK
-- Switches from poll-based `GetFrame()` to push-based NAL reader
-- Exposes NALs through a new `NalSource` (analogous to `FrameSource`)
+`AndroidDevice` 增加 `StartStream()` / `StopStream()`。Streaming 时：
+
+- 向 APK 发送 `stream_start` command。
+- 从 poll-based `GetFrame()` 切换到 push-based NAL reader。
+- 通过新的 `NalSource` 暴露 NALs，类似 `FrameSource`。
 
 ```go
 type NalUnit struct {
@@ -251,215 +258,220 @@ type NalSource struct {
 }
 ```
 
-### Pipeline Bypass
+### Pipeline bypass
 
-When streaming from a real device with MediaCodec, the pipeline in `signaling.go` changes from:
+实体设备使用 MediaCodec streaming 时，`signaling.go` 中的 pipeline 从：
 
-```
-FrameSource → ScaleAndConvertToI420 → H264Encoder.Encode → WriteVideoSample
-```
-
-to:
-
-```
-NalSource → WriteVideoSample (direct passthrough)
+```text
+FrameSource -> ScaleAndConvertToI420 -> H264Encoder.Encode -> WriteVideoSample
 ```
 
-The `FrameSource` / `H264Encoder` path remains for emulators (gRPC screenshots → x264).
+变成：
 
-The `SignalingHandler` / `runPipeline` need to support both modes. Options:
-- **Interface approach:** Define a `VideoSource` interface with `Subscribe()`/`Unsubscribe()` that both `FrameSource`+encoder and `NalSource` implement
-- **Flag approach:** `runPipeline` checks the device type and runs the appropriate loop
-
-The interface approach is cleaner since the signaling handler shouldn't know about device types.
-
-### Backpressure & Adaptive Quality
-
-**How scrcpy handles it:** Blocking. `dequeueOutputBuffer(-1)` blocks until the consumer reads. No frame dropping, no adaptive quality. If the socket is slow, the encoder just stalls. On broken pipe, it exits.
-
-**We need more because** our path goes through WebRTC over potentially-slow mobile networks, not a local USB socket. The Go side should actively manage quality.
-
-**Congestion detection signals:**
-1. **WebRTC RTCP feedback** — Pion fires PLI (Picture Loss Indication) when the browser detects missing frames. Already handled via `ReadRTCP()` in `peer.go`.
-2. **NAL queue depth** — if the subscriber channel backs up, frames are arriving faster than they can be sent.
-3. **Write errors** — `WriteVideoSample` failures indicate transport congestion.
-
-**Response strategy (progressive):**
-
+```text
+NalSource -> WriteVideoSample (direct passthrough)
 ```
+
+`FrameSource` / `H264Encoder` path 继续用于 emulators（gRPC screenshots -> x264）。
+
+`SignalingHandler` / `runPipeline` 需要支持两种模式。方案：
+
+- **Interface approach：** 定义 `VideoSource` interface，暴露 `Subscribe()` / `Unsubscribe()`；`FrameSource`+encoder 和 `NalSource` 都实现。
+- **Flag approach：** `runPipeline` 根据 device type 选择对应 loop。
+
+Interface approach 更干净，因为 signaling handler 不应该关心 device types。
+
+### Backpressure 与 adaptive quality
+
+**scrcpy 的做法：** blocking。`dequeueOutputBuffer(-1)` 阻塞直到 consumer 读取。不 drop frame，也不自适应画质。socket 慢时 encoder 停住；broken pipe 时退出。
+
+**我们需要更多控制：** 路径会经过 WebRTC 和可能较慢的移动网络，不是本地 USB socket。Go 侧应主动管理画质。
+
+**拥塞检测信号：**
+
+1. **WebRTC RTCP feedback**：浏览器检测到丢帧时，Pion 会收到 PLI（Picture Loss Indication）。`peer.go` 中已通过 `ReadRTCP()` 处理。
+2. **NAL queue depth**：subscriber channel 堆积说明 frames 到达速度超过发送速度。
+3. **Write errors**：`WriteVideoSample` 失败表示 transport congestion。
+
+**响应策略（逐级）：**
+
+```text
 1. Mild congestion (queue > 2 NALs):
-   → Reduce bitrate by 25%
-   → Send {"cmd": "stream_bitrate", "bps": <reduced>}
+   -> Reduce bitrate by 25%
+   -> Send {"cmd": "stream_bitrate", "bps": <reduced>}
 
 2. Moderate congestion (queue > 5 NALs or PLI received):
-   → Request keyframe + drop queued non-keyframe NALs
-   → Send {"cmd": "stream_keyframe"}
+   -> Request keyframe + drop queued non-keyframe NALs
+   -> Send {"cmd": "stream_keyframe"}
 
 3. Severe congestion (sustained for >2s):
-   → Drop to minimum bitrate (500kbps)
-   → Request keyframe, flush queue
+   -> Drop to minimum bitrate (500kbps)
+   -> Request keyframe, flush queue
 
 4. Recovery (queue empty for >1s):
-   → Ramp bitrate back up by 25% per second
+   -> Ramp bitrate back up by 25% per second
 ```
 
-Note: FPS reduction requires pipeline restart (no mid-stream `setParameters` for FPS), so we prefer bitrate reduction as the primary lever. FPS change is a last resort requiring `stream_stop` + `stream_start`.
+说明：FPS 降低需要 pipeline restart，因为没有 mid-stream `setParameters`。因此优先用 bitrate reduction。FPS change 是最后手段，需要 `stream_stop` + `stream_start`。
 
-**NAL dropping rules:**
-- Never drop SPS/PPS config packets
-- Never drop keyframes (IDR)
-- Can drop P-frames, but must request a keyframe afterward
-- After any drop, the next forwarded frame must be a keyframe
+**NAL dropping rules：**
 
-### Resolution Changes
+- 永不 drop SPS/PPS config packets。
+- 永不 drop keyframes（IDR）。
+- 可 drop P-frames，但之后必须请求 keyframe。
+- 一旦发生 drop，下一个 forward frame 必须是 keyframe。
 
-Resolution requires recreating the VirtualDisplay and MediaCodec (can't resize mid-stream — scrcpy also restarts the full pipeline for this). The Go side sends:
+### Resolution changes
+
+修改分辨率需要重建 VirtualDisplay 和 MediaCodec；不能 mid-stream resize，scrcpy 也会重启完整 pipeline。Go 侧发送：
 
 ```json
 {"cmd": "stream_stop"}
 {"cmd": "stream_start", "width": 540, "height": 1200, "bitrate": 1000000, "fps": 30}
 ```
 
-This causes a brief interruption (~100ms). Use sparingly — prefer bitrate adjustment first.
+这会造成短暂中断，约 100ms。应谨慎使用，优先调整 bitrate。
 
-## Compatibility & Fallback
+## 兼容性与 fallback
 
-The MediaCodec path requires:
-- `DisplayManager.createVirtualDisplay()` or `SurfaceControl.createDisplay()` — Android 5+ from shell user
-- `MediaCodec` with `COLOR_FormatSurface` — Android 5+
+MediaCodec path 需要：
 
-Scrcpy handles initial encoder failure by retrying with smaller sizes (2560 → 1920 → 1600 → 1280 → 1024 → 800), up to 3 retries. We do the same. If the encoder still fails, fall back to the existing screenshot-polling path. The APK responds to `stream_start` with an error JSON, so the Go side knows to use `GetFrame()` polling instead.
+- `DisplayManager.createVirtualDisplay()` 或 `SurfaceControl.createDisplay()`：Android 5+，shell user 可用。
+- 支持 `COLOR_FormatSurface` 的 `MediaCodec`：Android 5+。
 
-## Implementation Phases
+scrcpy 在初始 encoder 失败时会降低尺寸重试（2560 -> 1920 -> 1600 -> 1280 -> 1024 -> 800），最多 3 次。我们也这样做。如果仍失败，就 fallback 到现有 screenshot-polling path。APK 会用 error JSON 响应 `stream_start`，Go 侧据此改用 `GetFrame()` polling。
 
-Each phase/slice must be gated by tests before landing.
+## 实现阶段
 
-### Phase 1 — MediaCodec streaming in APK
+每个 phase/slice landing 前都必须有测试门禁。
 
-1. Add `MediaCodecStreamer` class to `DeviceServer.java`
-   - Two-tier VirtualDisplay setup: DisplayManager (preferred) → SurfaceControl (fallback)
-   - Version-aware reflection (Android 5-9, 10-13, 14+ display token APIs)
-   - MediaCodec H.264 encoder with `createInputSurface()`
-   - Output loop reading NAL units and sending via `0x05` messages
-   - Size downgrade retry on initial encoder failure (scrcpy pattern)
-2. Add `stream_start` / `stream_stop` / `stream_bitrate` / `stream_keyframe` command handlers
-3. Add rotation detection → pipeline restart
-4. Test standalone: `adb forward` + read raw NAL output, verify with ffprobe/ffplay
+### Phase 1：APK 中的 MediaCodec streaming
 
-### Phase 2 — Go sidecar NAL passthrough + fallback
+1. 在 `DeviceServer.java` 中增加 `MediaCodecStreamer` class：
+   - 两级 VirtualDisplay setup：DisplayManager（优先）-> SurfaceControl（fallback）
+   - Version-aware reflection：Android 5-9、10-13、14+ display token APIs
+   - 使用 `createInputSurface()` 的 MediaCodec H.264 encoder
+   - 读取 NAL units，并通过 `0x05` messages 发送
+   - 初始 encoder 失败时按 scrcpy 模式降低尺寸重试
+2. 增加 `stream_start` / `stream_stop` / `stream_bitrate` / `stream_keyframe` command handlers。
+3. 增加 rotation detection -> pipeline restart。
+4. 独立测试：`adb forward` + 读取 raw NAL output，用 ffprobe/ffplay 验证。
 
-1. Add `0x05` message parsing to `conn` package
-2. Add `NalSource` with subscribe/unsubscribe (mirrors `FrameSource` API)
-3. Add `StartStream()` / `StopStream()` to `AndroidDevice`
-4. Modify `runPipeline` to support NAL passthrough mode (skip JPEG decode + x264)
-5. Test: real device → WebRTC → browser video at 30fps
+### Phase 2：Go sidecar NAL passthrough + fallback
 
-### Phase 2A (current slice) status
+1. 在 `conn` package 中解析 `0x05` message。
+2. 增加带 subscribe/unsubscribe 的 `NalSource`，API 对齐 `FrameSource`。
+3. 为 `AndroidDevice` 增加 `StartStream()` / `StopStream()`。
+4. 修改 `runPipeline`，支持 NAL passthrough mode，跳过 JPEG decode + x264。
+5. 测试：real device -> WebRTC -> browser video，达到 30fps。
 
-- Added protocol constants and framing support for `0x04`/`0x05`
-- Added Android stream controls and NAL source path in `device-bridge`
-- Added automatic fallback: stream startup timeout/error returns to screenshot polling
-- Kept legacy API behavior intact (`GetFrame` path unchanged when stream mode is unavailable)
-- APK stream startup now tries `DisplayManager.createVirtualDisplay()` first, then falls back to `SurfaceControl.createDisplay()`
-- Added startup resolution downgrade retries (initial + up to 3 smaller attempts)
-- Added display-size change detection with automatic encoder/display pipeline restart
-- Added `internal/ipc` bridge gate tests covering stream-capable start path vs fallback path
-- Added H.264 payload normalization in sidecar (`avcC` config + length-prefixed NALs -> Annex-B) before WebRTC packetization
-- Added stream-format diagnostics (`YEP_BRIDGE_STREAM_DEBUG=true`) to log config/keyframe payload shape and conversion path for physical-device debug runs
-- Updated on-device encoder config to prefer H.264 baseline profile and prepend SPS/PPS on sync frames for browser decoder compatibility and long-duration stability
+### Phase 2A 当前 slice 状态
 
-### Phase 3 — Adaptive quality
+- 增加了 `0x04` / `0x05` protocol constants 和 framing support。
+- 在 `device-bridge` 中增加 Android stream controls 和 NAL source path。
+- 增加 automatic fallback：stream startup timeout/error 后回到 screenshot polling。
+- 保持 legacy API 行为不变：stream mode 不可用时 `GetFrame` path 不变。
+- APK stream startup 先尝试 `DisplayManager.createVirtualDisplay()`，再 fallback 到 `SurfaceControl.createDisplay()`。
+- 增加 startup resolution downgrade retries：初始尺寸 + 最多 3 个更小尺寸。
+- 增加 display-size change detection，并自动重启 encoder/display pipeline。
+- 增加 `internal/ipc` bridge gate tests，覆盖 stream-capable start path 和 fallback path。
+- 在 sidecar 中增加 H.264 payload normalization：WebRTC packetization 前把 `avcC` config + length-prefixed NALs 转为 Annex-B。
+- 增加 stream-format diagnostics：`YEP_BRIDGE_STREAM_DEBUG=true` 时记录 physical-device debug runs 的 config/keyframe payload shape 和 conversion path。
+- 更新设备端 encoder config：优先 H.264 baseline profile，并在 sync frames 上 prepend SPS/PPS，提高 browser decoder 兼容性和长时间稳定性。
 
-1. Add congestion detection (queue depth monitoring, PLI forwarding)
-2. Implement progressive backpressure (bitrate → keyframe request → resolution)
-3. Add recovery ramp-up logic
-4. Wire PLI from Pion RTCP → `stream_keyframe` command to APK
+### Phase 3：Adaptive quality
 
-### Phase 3A (current slice) status
+1. 增加 congestion detection：queue depth monitoring、PLI forwarding。
+2. 实现 progressive backpressure：bitrate -> keyframe request -> resolution。
+3. 增加 recovery ramp-up。
+4. 连接 Pion RTCP PLI -> APK `stream_keyframe` command。
 
-- Added RTCP feedback forwarding from WebRTC (`PLI`/`FIR`) into the sidecar pipeline
-- Added queue-depth congestion detection in the NAL pipeline
-- Implemented progressive bitrate reduction (25% steps, floor at 500 kbps)
-- Implemented keyframe request + non-keyframe drop-until-keyframe behavior under moderate/severe congestion
-- Implemented bitrate recovery ramp (25% per second back toward baseline when queue is stable)
+### Phase 3A 当前 slice 状态
 
-Known gaps in this slice:
-- Resolution/FPS restart fallback under sustained congestion is not yet wired; current behavior uses bitrate + keyframe controls only.
+- 将 WebRTC RTCP feedback（`PLI`/`FIR`）转发到 sidecar pipeline。
+- 在 NAL pipeline 中增加 queue-depth congestion detection。
+- 实现 progressive bitrate reduction：每次 25%，最低 500 kbps。
+- 在 moderate/severe congestion 下实现 keyframe request + non-keyframe drop-until-keyframe。
+- 实现 bitrate recovery ramp：queue 稳定后，每秒按 25% 回升到 baseline。
 
-### Phase 3B (current slice) status
+本 slice 已知缺口：
 
-- Added sustained-congestion fallback to lower stream profiles via `stream_stop` + `stream_start`
-- Added profile ladder with coordinated resolution/FPS/bitrate steps and restart cooldowns
-- Added stability-based recovery restarts back toward higher profiles when queue pressure clears
-- Added unit gates for profile generation and restart wiring in `internal/ipc`
+- Sustained congestion 下的 resolution/FPS restart fallback 尚未接入；当前只使用 bitrate + keyframe controls。
 
-### Phase 4 — Polish
+### Phase 3B 当前 slice 状态
 
-1. Auto-detect device capability: try `stream_start`, fall back to polling if it fails
-2. Client UI: show current stream stats (fps, bitrate, resolution)
-3. Client controls: manual quality override (low/medium/high presets)
-4. Benchmark: measure end-to-end latency and fps on multiple devices
+- 增加 sustained-congestion fallback，通过 `stream_stop` + `stream_start` 降到更低 stream profile。
+- 增加 profile ladder，协调 resolution/FPS/bitrate steps 和 restart cooldowns。
+- queue pressure 清除后，基于稳定性向更高 profile recovery restart。
+- 为 profile generation 和 restart wiring 增加 `internal/ipc` unit gates。
+
+### Phase 4：Polish
+
+1. 自动检测 device capability：尝试 `stream_start`，失败则 fallback 到 polling。
+2. Client UI 显示当前 stream stats：fps、bitrate、resolution。
+3. Client controls：手动画质覆盖，提供 low/medium/high presets。
+4. Benchmark：在多台设备上测量端到端 latency 和 fps。
 
 ## Test Gates By Slice
 
-Minimum required gates:
+最低测试门禁：
 
-1. **Protocol gate** (`packages/device-bridge/internal/conn/framing_test.go`)
-   - Legacy framing still passes
-   - `TypeStreamStatus (0x04)` round-trip
-   - `TypeStreamNAL (0x05)` round-trip
+1. **Protocol gate**（`packages/device-bridge/internal/conn/framing_test.go`）
+   - Legacy framing 仍通过。
+   - `TypeStreamStatus (0x04)` round-trip。
+   - `TypeStreamNAL (0x05)` round-trip。
 
-2. **Android transport gate** (`packages/device-bridge/internal/device/android_device_test.go`)
-   - Stream unsupported ⇒ timeout ⇒ fallback to `GetFrame` still works
-   - Stream supported ⇒ NAL reception works
+2. **Android transport gate**（`packages/device-bridge/internal/device/android_device_test.go`）
+   - Stream unsupported -> timeout -> fallback 到 `GetFrame` 仍可用。
+   - Stream supported -> NAL reception 可用。
 
-3. **Bridge pipeline gate** (`packages/device-bridge/internal/ipc/...`)
-   - Android stream path can start
-   - Fallback path still works when stream unavailable
+3. **Bridge pipeline gate**（`packages/device-bridge/internal/ipc/...`）
+   - Android stream path 能启动。
+   - Stream unavailable 时 fallback path 仍可用。
 
-4. **Browser E2E gate** (`packages/client/e2e/*.spec.ts`)
-   - Existing emulator and physical-android Playwright streaming tests must remain green
-   - APK transport override E2E remains required for regression testing
-   - Adaptive quality regression gate: `pnpm test:e2e:emulator:apk:adaptive` must show downshift and recovery/upshift profile events
+4. **Browser E2E gate**（`packages/client/e2e/*.spec.ts`）
+   - 现有 emulator 和 physical-android Playwright streaming tests 必须保持 green。
+   - APK transport override E2E 仍是回归测试要求。
+   - Adaptive quality regression gate：`pnpm test:e2e:emulator:apk:adaptive` 必须显示 downshift 和 recovery/upshift profile events。
 
-5. **Long-duration reliability soak (optional, recommended before release)**
-   - Physical Android stream remains connected and playback keeps advancing for a configurable duration
-   - Opt-in env vars:
+5. **Long-duration reliability soak**（可选，release 前推荐）
+   - Physical Android stream 在可配置时长内保持 connected，playback 持续推进。
+   - Opt-in env vars：
      - `YEP_E2E_ANDROID_LONG_STREAM=true`
-     - `YEP_E2E_ANDROID_LONG_STREAM_MS` (default `120000`)
-     - `YEP_E2E_ANDROID_LONG_STREAM_POLL_MS` (default `1000`)
-     - `YEP_E2E_ANDROID_LONG_STREAM_STALL_MS` (default `15000`)
-     - `YEP_E2E_ANDROID_LONG_STREAM_STARTUP_MS` (default `45000`)
-     - `YEP_E2E_ANDROID_LONG_STREAM_NUDGE_MS` (default `4000`)
-   - Run: `pnpm test:e2e:android:soak`
+     - `YEP_E2E_ANDROID_LONG_STREAM_MS`（默认 `120000`）
+     - `YEP_E2E_ANDROID_LONG_STREAM_POLL_MS`（默认 `1000`）
+     - `YEP_E2E_ANDROID_LONG_STREAM_STALL_MS`（默认 `15000`）
+     - `YEP_E2E_ANDROID_LONG_STREAM_STARTUP_MS`（默认 `45000`）
+     - `YEP_E2E_ANDROID_LONG_STREAM_NUDGE_MS`（默认 `4000`）
+   - 运行：`pnpm test:e2e:android:soak`
 
-## Reference: scrcpy Source
+## 参考：scrcpy 源码
 
-Local clone: `~/code/references/scrcpy/`
+本地 clone：`~/code/references/scrcpy/`
 
-Key files in `server/src/main/java/com/genymobile/scrcpy/`:
+`server/src/main/java/com/genymobile/scrcpy/` 中关键文件：
 
-| File | What to study |
-|------|---------------|
-| `video/SurfaceEncoder.java` | Encoding loop (197-224), MediaFormat config (256-286), size downgrade retry (149-182) |
-| `video/ScreenCapture.java` | Two-tier VirtualDisplay creation (127-144), display projection setup (204-212), rotation handling |
-| `wrappers/SurfaceControl.java` | Reflection wrappers for createDisplay, setDisplaySurface/Projection/LayerStack (40-121) |
-| `wrappers/DisplayControl.java` | Android 14+ physical display token APIs (49-81) |
-| `wrappers/DisplayManager.java` | DisplayManager.createVirtualDisplay reflection (163-182) |
-| `device/Streamer.java` | NAL framing: 8-byte PTS+flags + 4-byte size header (85-109) |
-| `video/CaptureReset.java` | Pipeline restart via signalEndOfInputStream (14-36) |
-| `video/DisplaySizeMonitor.java` | Rotation/size change detection (41-77, 109-140) |
-| `video/NewDisplayCapture.java` | Alternative: new virtual display (not mirroring physical) |
+| 文件 | 重点 |
+|------|------|
+| `video/SurfaceEncoder.java` | Encoding loop（197-224）、MediaFormat config（256-286）、size downgrade retry（149-182） |
+| `video/ScreenCapture.java` | 两级 VirtualDisplay creation（127-144）、display projection setup（204-212）、rotation handling |
+| `wrappers/SurfaceControl.java` | createDisplay、setDisplaySurface/Projection/LayerStack 的 reflection wrappers（40-121） |
+| `wrappers/DisplayControl.java` | Android 14+ physical display token APIs（49-81） |
+| `wrappers/DisplayManager.java` | DisplayManager.createVirtualDisplay reflection（163-182） |
+| `device/Streamer.java` | NAL framing：8-byte PTS+flags + 4-byte size header（85-109） |
+| `video/CaptureReset.java` | 通过 signalEndOfInputStream 重启 pipeline（14-36） |
+| `video/DisplaySizeMonitor.java` | Rotation/size change detection（41-77、109-140） |
+| `video/NewDisplayCapture.java` | 替代方案：new virtual display，不镜像实体屏幕 |
 
-## File Locations
+## 文件位置
 
-| Component | Path |
-|-----------|------|
+| 组件 | 路径 |
+|------|------|
 | APK source | `packages/android-device-server/app/src/main/java/com/yepanywhere/DeviceServer.java` |
 | Go device abstraction | `packages/device-bridge/internal/device/android_device.go` |
 | Go frame source | `packages/device-bridge/internal/device/frame_source.go` |
-| Go encoder (emulator path) | `packages/device-bridge/internal/encoder/h264.go` |
+| Go encoder（emulator path） | `packages/device-bridge/internal/encoder/h264.go` |
 | Go WebRTC pipeline | `packages/device-bridge/internal/stream/signaling.go` |
 | Wire protocol | `packages/device-bridge/internal/conn/framing.go` |
 | scrcpy reference | `~/code/references/scrcpy/` |
-| This doc | `docs/project/device-bridge-mediacodec.md` |
+| 本文档 | `docs/project/device-bridge-mediacodec.md` |

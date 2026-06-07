@@ -1,40 +1,40 @@
-# Android Agent Control: Accessibility Tree + CLI Skill
+# Android Agent Control：Accessibility Tree + CLI Skill
 
-## Goal
+## 目标
 
-Add structured UI understanding to Android devices so AI agents can efficiently interact with them — without screenshots, without MCP, without vision models. Modeled after the [chromeos-testbed](~/code/chromeos-testbed) pattern: a CLI that agents invoke directly, backed by an on-device daemon.
+为 Android 设备增加结构化 UI 理解能力，让 AI agents 能高效操作设备，不依赖截图、不依赖 MCP，也不依赖 vision model。设计参考 [chromeos-testbed](~/code/chromeos-testbed)：agent 直接调用 CLI，背后由设备端 daemon 支撑。
 
-The streaming infrastructure (device-bridge, WebRTC, H.264) handles **human** remote viewing. This layer handles **agent** control: fast accessibility tree snapshots, element-by-reference actions, text search, all over the existing APK's TCP connection.
+Streaming infrastructure（device-bridge、WebRTC、H.264）负责 **人类** 远程查看；这一层负责 **agent** 控制：快速 accessibility tree snapshot、按 ref 操作元素、文本搜索，并通过现有 APK 的 TCP connection 完成通信。
 
-## Prior Art / References
+## 参考项目
 
-- **[iPhone-MCP](https://github.com/blitzdotdev/iPhone-mcp)** (cloned to `~/code/references/iPhone-mcp`) — iOS agent control via WebDriverAgent (physical) and custom `ax-scan` Objective-C daemon (simulator). Grid-based accessibility probing, ~250ms quarter-screen. Good architecture reference, but MCP-based.
-- **[mobile-mcp](https://github.com/mobile-next/mobile-mcp)** — Cross-platform (iOS+Android), accessibility snapshots for LLMs. Most polished of the MCP projects.
-- **[Android-MCP (CursorTouch)](https://github.com/CursorTouch/Android-MCP)** — Lightweight, uses ADB + Android Accessibility API.
-- **[Android-Mobile-MCP](https://github.com/erichung9060/Android-Mobile-MCP)** — Another MCP server bridging AI agents to Android.
-- **[mcp-android-server-python](https://github.com/nim444/mcp-android-server-python)** — Python MCP server using uiautomator2.
-- **[chromeos-testbed](~/code/chromeos-testbed)** — Our own ChromeOS agent control. Uses CDP + `chrome.automation` for the desktop accessibility tree. Bash CLI + on-device Python handler. **The direct model for this work.**
+- **[iPhone-MCP](https://github.com/blitzdotdev/iPhone-mcp)**（clone 在 `~/code/references/iPhone-mcp`）：通过 WebDriverAgent（实体机）和自定义 `ax-scan` Objective-C daemon（模拟器）控制 iOS agent。Grid-based accessibility probing，quarter-screen 约 250ms。架构值得参考，但它基于 MCP。
+- **[mobile-mcp](https://github.com/mobile-next/mobile-mcp)**：跨平台（iOS + Android），为 LLM 提供 accessibility snapshots，是 MCP 项目里较完整的一个。
+- **[Android-MCP (CursorTouch)](https://github.com/CursorTouch/Android-MCP)**：轻量，使用 ADB + Android Accessibility API。
+- **[Android-Mobile-MCP](https://github.com/erichung9060/Android-Mobile-MCP)**：另一个连接 AI agents 和 Android 的 MCP server。
+- **[mcp-android-server-python](https://github.com/nim444/mcp-android-server-python)**：使用 uiautomator2 的 Python MCP server。
+- **[chromeos-testbed](~/code/chromeos-testbed)**：我们自己的 ChromeOS agent control。使用 CDP + `chrome.automation` 获取桌面 accessibility tree，Bash CLI + 设备端 Python handler。**这是本工作的直接参考模型。**
 
-All the above Android projects shell out to `adb` per command (slow). Our APK already has a persistent TCP connection — we can do much better.
+上面这些 Android 项目通常每条命令都 shell out 到 `adb`，速度较慢。我们的 APK 已经有持久 TCP connection，可以做得更快。
 
 ## Android Accessibility APIs
 
-| Method | Latency | Root Required | Limitations |
-|--------|---------|---------------|-------------|
-| `adb shell uiautomator dump` | ~1-3s | No | Slow (spawns process), fails on animated UIs, XML output |
-| **UiAutomation** (in-process, via app_process) | ~50-100ms | No | Needs reflection to obtain instance from shell user context |
-| **AccessibilityService** (installed APK) | ~50-100ms | No | Requires user to manually enable in Settings |
-| `adb shell dumpsys activity top` | ~200ms | No | Very limited — view hierarchy only, no accessibility labels |
+| 方法 | 延迟 | 需要 root | 限制 |
+|------|------|-----------|------|
+| `adb shell uiautomator dump` | ~1-3s | 否 | 慢，需要启动进程；动画 UI 上容易失败；输出 XML |
+| **UiAutomation**（in-process，通过 app_process） | ~50-100ms | 否 | 需要 reflection 从 shell user context 获取实例 |
+| **AccessibilityService**（安装 APK） | ~50-100ms | 否 | 用户需要手动在 Settings 里启用 |
+| `adb shell dumpsys activity top` | ~200ms | 否 | 信息很有限，只有 view hierarchy，没有 accessibility labels |
 
-We use **UiAutomation** because `DeviceServer.java` already runs as shell user via `app_process` and already uses reflection for `SurfaceControl` and `InputManager`. This is the same approach uiautomator2 and scrcpy use.
+我们使用 **UiAutomation**，因为 `DeviceServer.java` 已经通过 `app_process` 以 shell user 运行，并且已经为 `SurfaceControl` 和 `InputManager` 使用 reflection。这和 uiautomator2、scrcpy 的思路一致。
 
-## What Changes
+## 需要改变什么
 
-### 1. Extend DeviceServer.java
+### 1. 扩展 DeviceServer.java
 
-Add `UiAutomation` access via reflection. The shell user (`app_process`) can create a `UiAutomation` instance by connecting to the accessibility manager service directly — no Instrumentation needed.
+通过 reflection 增加 `UiAutomation` 访问。Shell user（`app_process`）可以直接连接 accessibility manager service 创建 `UiAutomation` 实例，不需要 Instrumentation。
 
-New control commands:
+新增 control commands：
 
 ```json
 {"cmd": "snapshot", "maxDepth": 10}
@@ -46,7 +46,7 @@ New control commands:
 {"cmd": "launch", "package": "com.example.app"}
 ```
 
-Key Java APIs (all available to shell user):
+关键 Java APIs（shell user 可用）：
 
 ```java
 // Obtain UiAutomation via reflection (same technique as uiautomator2-server)
@@ -70,27 +70,27 @@ node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,
 node.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
 ```
 
-### 2. Protocol Extension: Query Responses
+### 2. Protocol extension：query responses
 
-Currently 0x03 control messages are fire-and-forget. Queries need responses. Two options:
+当前 0x03 control messages 是 fire-and-forget。查询类命令需要 response。
 
-**Option A (simple):** Reuse 0x03 for both. Commands that are queries (`snapshot`, `find`, `info`, `apps`) send a 0x03 response back. The Go/CLI side knows which commands expect responses based on the command name.
+**Option A（简单）：** 复用 0x03。`snapshot`、`find`、`info`、`apps` 这类 query command 会发回 0x03 response。Go/CLI 侧根据 command name 判断哪些命令需要 response。
 
-**Option B (explicit):** Add 0x04 as a query/response type:
+**Option B（显式）：** 增加 0x04 作为 query/response 类型：
 
+```text
+Query (sidecar -> device):   [0x04][len u32 LE][JSON]
+Response (device -> sidecar): [0x04][len u32 LE][JSON]
 ```
-Query (sidecar → device):   [0x04][len u32 LE][JSON]
-Response (device → sidecar): [0x04][len u32 LE][JSON]
-```
 
-Option A is simpler and doesn't break the existing protocol — the sidecar just starts reading a response after sending certain commands. Go with Option A.
+选择 Option A。它更简单，也不会破坏现有协议；sidecar 只需要在发送特定命令后读取 response。
 
-### 3. CLI: `bin/android-agent`
+### 3. CLI：`bin/android-agent`
 
-A standalone CLI (bash wrapper + TypeScript/Go core) that manages its own ADB forward and speaks the binary framing protocol directly to the device APK. **Independent of the bridge sidecar** — an agent can use this without any streaming session active.
+一个独立 CLI（bash wrapper + TypeScript/Go core），自己管理 ADB forward，并直接和设备 APK 说 binary framing protocol。它 **独立于 bridge sidecar**，agent 不需要启动 streaming session 也能使用。
 
-```
-CLI (on Mac) → adb forward tcp:27183 tcp:27183 → DeviceServer APK (on device)
+```text
+CLI (on Mac) -> adb forward tcp:27183 tcp:27183 -> DeviceServer APK (on device)
 ```
 
 #### Commands
@@ -132,11 +132,11 @@ android-agent devices                         # List connected devices
 android-agent info                            # Screen size, API level, etc.
 ```
 
-#### Output Format (LLM-Friendly)
+#### 输出格式（LLM-friendly）
 
-Compact indented tree with refs, like chromeos-testbed's `desktop-tree`:
+像 chromeos-testbed 的 `desktop-tree` 一样，输出带 ref 的紧凑缩进树：
 
-```
+```text
 [0] FrameLayout {0,0 1080x2400}
   [1] LinearLayout {0,100 1080x200}
     [2] Button "Sign In" {400,120 280x60} clickable focused
@@ -146,13 +146,13 @@ Compact indented tree with refs, like chromeos-testbed's `desktop-tree`:
     [6] TextView "Item 2" {0,300 1080x100}
 ```
 
-Elements get stable refs per snapshot. Agent says `android-agent tap 2` to tap "Sign In".
+每次 snapshot 给元素分配稳定 refs。Agent 可以执行 `android-agent tap 2` 来点击 “Sign In”。
 
-JSON output available with `--json` flag for programmatic use.
+如需程序化使用，可通过 `--json` 输出 JSON。
 
-### 4. Skill Definition
+### 4. Skill definition
 
-A markdown skill file that agents reference from their CLAUDE.md:
+Agent 可在 `CLAUDE.md` 中引用一个 markdown skill 文件：
 
 ```markdown
 # Android Agent Skill
@@ -168,9 +168,9 @@ Control Android devices (emulators and physical) for testing and automation.
 ## Workflow: snapshot → act → snapshot
 ```
 
-### 5. Diff Snapshots (Future Enhancement)
+### 5. Diff snapshots（未来增强）
 
-After an action, return what changed rather than the full tree. Dramatically reduces tokens for the LLM:
+Action 后只返回变化，而不是完整 tree。这样可以显著减少 LLM token：
 
 ```bash
 android-agent tap 2
@@ -180,59 +180,59 @@ android-agent tap 2
 #   [1] LinearLayout → children changed
 ```
 
-## Performance Comparison
+## 性能对比
 
-| | Existing projects (Android-MCP etc.) | Our approach |
-|---|---|---|
-| **Transport** | Shell out to `adb` per command (~200ms spawn overhead) | Persistent TCP connection via APK (~10ms per query) |
-| **Snapshot speed** | `adb shell uiautomator dump` (~1-3s, fails on animations) | `UiAutomation.getRootInActiveWindow()` in-process (~50-100ms) |
-| **Input** | `adb shell input tap` (spawns process) | `InputManager.injectInputEvent()` via reflection (<10ms, already working) |
-| **Protocol** | MCP (JSON-RPC over stdio, requires MCP client setup) | Plain CLI (any agent, any shell) |
-| **Integration** | Requires MCP config per agent | Drop a skill file, reference from CLAUDE.md |
+| 维度 | 现有项目（Android-MCP 等） | 我们的方案 |
+|------|----------------------------|------------|
+| **Transport** | 每条命令 shell out 到 `adb`，约 200ms spawn overhead | 通过 APK 持久 TCP connection，query 约 10ms |
+| **Snapshot speed** | `adb shell uiautomator dump`，约 1-3s，动画 UI 易失败 | in-process `UiAutomation.getRootInActiveWindow()`，约 50-100ms |
+| **Input** | `adb shell input tap`，需要启动进程 | 通过 reflection 调 `InputManager.injectInputEvent()`，<10ms，已有能力 |
+| **Protocol** | MCP（JSON-RPC over stdio，需要 MCP client 配置） | 普通 CLI，任何 agent、任何 shell 都可用 |
+| **Integration** | 每个 agent 都要配置 MCP | 放一个 skill 文件，在 `CLAUDE.md` 中引用 |
 
-## Implementation Phases
+## 实现阶段
 
-### Phase 1 — UiAutomation in DeviceServer.java
+### Phase 1：DeviceServer.java 中支持 UiAutomation
 
-1. Add `UiAutomation` access via reflection (mirror uiautomator2-server's approach)
-2. Implement `snapshot` command: walk `AccessibilityNodeInfo` tree → compact JSON
-3. Implement `find` command: text/role matching with regex support
-4. Implement `action` command: click, setText, scroll, longClick by node reference
-5. Add query response support to the protocol (0x03 with response)
+1. 通过 reflection 增加 `UiAutomation` 访问，对齐 uiautomator2-server 的做法。
+2. 实现 `snapshot` command：遍历 `AccessibilityNodeInfo` tree，输出紧凑 JSON。
+3. 实现 `find` command：支持 text/role matching 和 regex。
+4. 实现 `action` command：通过 node reference 执行 click、setText、scroll、longClick。
+5. 为协议增加 query response 支持，即带 response 的 0x03。
 
-Test: `adb forward` + manual TCP client to verify responses.
+测试：`adb forward` + 手写 TCP client 验证 responses。
 
-### Phase 2 — CLI (`bin/android-agent`)
+### Phase 2：CLI（`bin/android-agent`）
 
-1. Build CLI that manages ADB forward and speaks binary protocol
-2. Implement all commands: snapshot, find, tap, type, key, screenshot, launch, etc.
-3. Compact tree output format (indented, with refs)
-4. `--json` flag for programmatic output
-5. `--device` flag for multi-device support (defaults to first connected)
+1. 构建 CLI，管理 ADB forward，并说 binary protocol。
+2. 实现所有命令：snapshot、find、tap、type、key、screenshot、launch 等。
+3. 输出紧凑 tree format，带缩进和 refs。
+4. 增加 `--json` 方便程序化使用。
+5. 增加 `--device` 支持多设备，默认使用第一台 connected device。
 
-Test: Run against emulator, verify snapshot output, tap-by-ref workflow.
+测试：对 emulator 运行，验证 snapshot output 和 tap-by-ref workflow。
 
-### Phase 3 — Skill + Agent Integration
+### Phase 3：Skill + Agent integration
 
-1. Write skill definition markdown
-2. Add reference from project CLAUDE.md
-3. Test with Claude Code: can it navigate an app using only the CLI?
-4. Iterate on output format based on what the agent struggles with
+1. 编写 skill definition markdown。
+2. 从项目 `CLAUDE.md` 引用它。
+3. 用 Claude Code 测试：是否能只靠 CLI 导航 app？
+4. 根据 agent 遇到的问题迭代输出格式。
 
-### Phase 4 — Enhancements
+### Phase 4：增强
 
-- Diff snapshots (return changes after actions)
-- Targeted queries (find without full tree walk)
-- Element watching (notify when element appears/disappears)
-- `android-agent wait "Loading"` — block until element appears
-- Batch commands (`android-agent do tap 2, wait "Welcome", screenshot`)
+- Diff snapshots，action 后返回变化。
+- Targeted queries，不必每次完整 tree walk。
+- Element watching，元素出现/消失时通知。
+- `android-agent wait "Loading"`：阻塞直到元素出现。
+- Batch commands，例如 `android-agent do tap 2, wait "Welcome", screenshot`。
 
-## File Locations
+## 文件位置
 
-| Component | Path |
-|-----------|------|
+| 组件 | 路径 |
+|------|------|
 | APK source | `packages/android-device-server/app/src/main/java/com/yepanywhere/DeviceServer.java` |
 | Binary framing | `packages/device-bridge/internal/conn/framing.go` |
-| CLI | `bin/android-agent` (new) |
-| Skill definition | `skills/android-agent.md` (new) |
-| This doc | `docs/project/device-bridge-android-a11y.md` |
+| CLI | `bin/android-agent`（新增） |
+| Skill definition | `skills/android-agent.md`（新增） |
+| 本文档 | `docs/project/device-bridge-android-a11y.md` |

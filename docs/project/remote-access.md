@@ -1,62 +1,70 @@
-# Remote Access
+# 远程访问
 
-Yep Anywhere runs on your development machine. To access it from your phone or another device outside your local network, you'll need to set up remote access.
+Yep Anywhere 运行在你的开发机上。如果想从手机或局域网外的其他设备访问它，需要配置远程访问。
 
-## Secure Relay
+## 安全 Relay
 
-The easiest way to access Yep Anywhere remotely. Zero-config, no port forwarding required.
+这是远程访问 Yep Anywhere 最简单的方式。无需端口转发，也不需要额外网络配置。
 
-**Setup via Settings UI:**
-1. Go to Settings → Remote Access
-2. Enter a username and password
-3. Connect from anywhere at `yepanywhere.com/remote`
+**通过设置界面配置：**
 
-**Setup via CLI (for headless/automated deployments):**
+1. 打开 Settings -> Remote Access
+2. 输入 username 和 password
+3. 从任意地点访问 `yepanywhere.com/remote`
+
+**通过 CLI 配置（适合无头或自动化部署）：**
+
 ```bash
 yepanywhere --setup-remote-access --username myserver --password "secretpass123"
 ```
 
-**How it works:**
-- Your yepanywhere server connects to our public relay
-- Your phone connects to the same relay and authenticates with SRP-6a (zero-knowledge password proof)
-- All traffic is end-to-end encrypted with TweetNaCl — the relay only sees opaque blobs
-- You can [run your own relay](relay-design.md) if you prefer
+**工作方式：**
 
-**Security:**
-- The relay never sees your password or session keys
-- Traffic is encrypted with XSalsa20-Poly1305 (same as Signal, Keybase, etc.)
-- No accounts or sign-ups required — just a username/password you control
+- 你的 yepanywhere server 会连接到公共 relay
+- 手机连接到同一个 relay，并使用 SRP-6a 做认证（零知识密码证明）
+- 所有流量都用 TweetNaCl 做端到端加密；relay 只能看到不透明的加密数据块
+- 如果愿意，也可以[运行自己的 relay](relay-design.md)
 
-See [relay-design.md](relay-design.md) for technical details.
+**安全性：**
+
+- Relay 永远看不到你的密码或会话密钥
+- 流量使用 XSalsa20-Poly1305 加密（Signal、Keybase 等也使用同类方案）
+- 不需要账号或注册流程，只需要你自己控制的一组 username/password
+
+技术细节见 [relay-design.md](relay-design.md)。
 
 ---
 
-## Alternative Options
+## 其他方案
 
-If you prefer not to use the relay, here are other options. All require you to trust some external party with routing your traffic.
+如果不想使用 relay，也可以选择下面这些方案。它们都需要你信任某个外部方来帮你路由流量。
 
-## Option 1: Tailscale (Recommended)
+## 方案 1：Tailscale（推荐）
 
-[Tailscale](https://tailscale.com) creates a private network between your devices. Zero port forwarding, zero firewall config.
+[Tailscale](https://tailscale.com) 会在你的设备之间创建一个私有网络。无需端口转发，也不需要手动配置防火墙。
 
-**Setup:**
-1. Install Tailscale on your dev machine and phone
-2. Sign in with the same account on both
-3. Access Yep Anywhere at `http://<tailscale-ip>:3400`
+**配置步骤：**
 
-**Pros:** Dead simple, encrypted, works behind NAT, free for personal use
-**Cons:** Requires Tailscale account, app on each device
+1. 在开发机和手机上安装 Tailscale
+2. 两台设备登录同一个账号
+3. 通过 `http://<tailscale-ip>:3400` 访问 Yep Anywhere
 
-**Note:** On Chromebooks, the Tailscale Android app may have installation issues. Consider the Cloudflare Tunnel option instead.
+**优点：** 非常简单、加密、可穿透 NAT，个人使用免费
 
-## Option 2: Cloudflare Tunnel
+**缺点：** 需要 Tailscale 账号，每台设备都要安装应用
 
-[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) exposes your local server through Cloudflare's network. No port forwarding needed.
+**注意：** Chromebook 上安装 Tailscale Android 应用可能会遇到问题，这种情况下可以考虑 Cloudflare Tunnel。
 
-**Setup:**
-1. Create a free Cloudflare account
-2. Add a domain (or use a free `*.trycloudflare.com` URL for testing)
-3. Install `cloudflared` on your dev machine:
+## 方案 2：Cloudflare Tunnel
+
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) 可以通过 Cloudflare 网络暴露你的本地服务，不需要端口转发。
+
+**配置步骤：**
+
+1. 创建一个免费的 Cloudflare 账号
+2. 添加域名，或者测试时使用免费的 `*.trycloudflare.com` URL
+3. 在开发机上安装 `cloudflared`：
+
    ```bash
    # macOS
    brew install cloudflared
@@ -65,29 +73,34 @@ If you prefer not to use the relay, here are other options. All require you to t
    curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
    chmod +x cloudflared
    ```
-4. Run the tunnel:
+
+4. 启动 tunnel：
+
    ```bash
-   # Quick test (random URL, no account needed)
+   # 快速测试（随机 URL，不需要账号）
    cloudflared tunnel --url http://localhost:3400
 
-   # Persistent (requires CF account + domain)
+   # 持久配置（需要 Cloudflare 账号 + 域名）
    cloudflared tunnel create yep-anywhere
    cloudflared tunnel route dns yep-anywhere claude.yourdomain.com
    cloudflared tunnel run yep-anywhere
    ```
 
-**Pros:** Free, handles HTTPS automatically, no port forwarding
-**Cons:** Requires Cloudflare account for persistent URLs
+**优点：** 免费、自动处理 HTTPS、无需端口转发
 
-## Option 3: Caddy + SSH Tunnel (Self-Hosted)
+**缺点：** 持久 URL 需要 Cloudflare 账号
 
-If you have a server with a public IP (like a Raspberry Pi with port 443 forwarded), you can use Caddy for HTTPS and an SSH tunnel for connectivity.
+## 方案 3：Caddy + SSH Tunnel（自托管）
 
-**On your public-facing server (e.g., Raspberry Pi):**
-1. Install [Caddy](https://caddyserver.com)
-2. Point a DNS A record to your home IP
-3. Create `/etc/caddy/Caddyfile`:
-   ```
+如果你有一台带公网 IP 的服务器（例如已转发 443 端口的 Raspberry Pi），可以用 Caddy 提供 HTTPS，再用 SSH tunnel 连接回开发机。
+
+**在公网服务器上（例如 Raspberry Pi）：**
+
+1. 安装 [Caddy](https://caddyserver.com)
+2. 将 DNS A 记录指向你的家庭公网 IP
+3. 创建 `/etc/caddy/Caddyfile`：
+
+   ```text
    claude.yourdomain.com {
        reverse_proxy 127.0.0.1:3400
        basicauth /* {
@@ -95,21 +108,26 @@ If you have a server with a public IP (like a Raspberry Pi with port 443 forward
        }
    }
    ```
-   Generate the password hash with `caddy hash-password`
-4. Start Caddy: `sudo caddy start --config /etc/caddy/Caddyfile`
 
-**On your dev machine:**
-Set up a reverse SSH tunnel to forward the local port to the server:
+   使用 `caddy hash-password` 生成密码 hash。
+
+4. 启动 Caddy：`sudo caddy start --config /etc/caddy/Caddyfile`
+
+**在开发机上：**
+
+配置反向 SSH tunnel，把本地端口转发到服务器：
+
 ```bash
-# One-time
+# 一次性运行
 ssh -N -R 3400:localhost:3400 yourserver
 
-# Persistent (install autossh)
+# 持久运行（需要安装 autossh）
 autossh -M 0 -N -o "ServerAliveInterval 30" -o "ServerAliveCountMax 3" \
     -R 3400:localhost:3400 yourserver
 ```
 
-For a systemd service, create `~/.config/systemd/user/claude-tunnel.service`:
+如果使用 systemd service，创建 `~/.config/systemd/user/claude-tunnel.service`：
+
 ```ini
 [Unit]
 Description=SSH tunnel for Yep Anywhere
@@ -124,18 +142,20 @@ RestartSec=10
 WantedBy=default.target
 ```
 
-Then:
+然后运行：
+
 ```bash
 systemctl --user enable claude-tunnel
 systemctl --user start claude-tunnel
 ```
 
-**Pros:** Full control, no third-party accounts
-**Cons:** More complex setup, requires existing server infrastructure
+**优点：** 完全可控，不需要第三方账号
 
-## Security Considerations
+**缺点：** 配置更复杂，需要已有服务器基础设施
 
-- Yep Anywhere has access to your codebase. Only use remote access methods you trust.
-- Always use HTTPS for remote access (all options above provide this).
-- Consider adding authentication (basic auth, Cloudflare Access, etc.) as an extra layer.
-- The server listens on localhost by default. Remote access methods tunnel to localhost rather than exposing on all interfaces.
+## 安全注意事项
+
+- Yep Anywhere 可以访问你的代码库。只使用你信任的远程访问方式。
+- 远程访问始终使用 HTTPS；上面的方案都能提供 HTTPS。
+- 建议额外添加认证层，例如 basic auth、Cloudflare Access 等。
+- 服务器默认只监听 localhost。远程访问方案应 tunnel 到 localhost，而不是直接监听所有网卡。

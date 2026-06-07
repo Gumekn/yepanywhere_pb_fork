@@ -1,52 +1,57 @@
-# Connection Matrix
+# 连接矩阵
 
-This document describes the four connection modes, their reconnection behavior, and test coverage.
+本文说明四种连接模式、它们的重连行为，以及目前的测试覆盖。
 
-For server-side WebSocket auth semantics (policy vs SRP transport state), see
-[`ws-auth-state-model.md`](ws-auth-state-model.md).
+服务端 WebSocket 认证语义（policy 与 SRP transport state 的区分）见
+[`ws-auth-state-model.md`](ws-auth-state-model.md)。
 
-## Connection Modes Overview
+## 连接模式总览
 
-| Mode | Transport | Auth | When Used |
-|------|-----------|------|-----------|
-| **DirectConnection** | fetch + SSE | Cookies | Default for localhost/LAN |
-| **WebSocketConnection** | Single WS | Cookies | Dev setting enabled |
-| **SecureConnection** | Encrypted WS | SRP + NaCl | Remote mode (direct) |
-| **SecureConnection + Relay** | Encrypted WS via relay | SRP + NaCl | Remote mode (NAT traversal) |
+| 模式 | 传输 | 认证 | 使用场景 |
+|------|------|------|----------|
+| **DirectConnection** | fetch + SSE | Cookies | localhost/LAN 默认模式 |
+| **WebSocketConnection** | 单条 WS | Cookies | 开启开发设置时使用 |
+| **SecureConnection** | 加密 WS | SRP + NaCl | Remote mode，直连 |
+| **SecureConnection + Relay** | 通过 relay 的加密 WS | SRP + NaCl | Remote mode，NAT traversal |
 
-### Selection Logic
+### 选择逻辑
 
-From `packages/client/src/hooks/useConnection.ts`:
+来自 `packages/client/src/hooks/useConnection.ts`：
 
+```text
+1. 已设置全局 SecureConnection？-> 使用 SecureConnection（remote mode）
+2. developer setting websocketTransportEnabled？-> 使用 WebSocketConnection
+3. 默认 -> 使用 DirectConnection
 ```
-1. Global SecureConnection set? → Use SecureConnection (remote mode)
-2. Developer setting websocketTransportEnabled? → Use WebSocketConnection
-3. Default → Use DirectConnection
-```
 
-## Detailed Connection Modes
+## 连接模式细节
 
-### 1. DirectConnection (SSE + fetch)
+### 1. DirectConnection（SSE + fetch）
 
-**Files:**
-- Client: `packages/client/src/lib/connection/DirectConnection.ts`
-- SSE: `packages/client/src/lib/connection/FetchSSE.ts`
+**文件：**
 
-**Transport:**
-- API calls: native `fetch()` with credentials
-- Streaming: Custom `FetchSSE` (not native EventSource)
-  - Why custom? Detect HTTP status codes (401/403), control reconnection
+- Client：`packages/client/src/lib/connection/DirectConnection.ts`
+- SSE：`packages/client/src/lib/connection/FetchSSE.ts`
 
-**Auth:**
-- Cookie-based session (implicit via `credentials: "include"`)
-- 401/403 triggers `authEvents.signalLoginRequired()`
+**传输：**
 
-**Initial Data Load:**
-- Session: REST call to `/api/sessions/:id/jsonl` returns full history
-- Live updates: SSE to `/api/sessions/:id/stream`
+- API calls：原生 `fetch()`，带 credentials。
+- Streaming：自定义 `FetchSSE`，不是原生 `EventSource`。
+  - 原因：需要检测 HTTP status code（401/403），并控制重连。
 
-**Message Flow:**
-```
+**认证：**
+
+- 基于 cookie 的 session，通过 `credentials: "include"` 隐式发送。
+- 401/403 会触发 `authEvents.signalLoginRequired()`。
+
+**初始数据加载：**
+
+- Session：REST 调用 `/api/sessions/:id/jsonl` 获取完整历史。
+- Live updates：SSE 连接 `/api/sessions/:id/stream`。
+
+**消息流：**
+
+```text
 ┌─────────────┐     REST /jsonl      ┌─────────────┐
 │   Client    │ ──────────────────▶  │   Server    │
 │             │                      │             │
@@ -59,40 +64,48 @@ From `packages/client/src/hooks/useConnection.ts`:
 
 ### 2. WebSocketConnection
 
-**Files:**
-- Client: `packages/client/src/lib/connection/WebSocketConnection.ts`
-- Server: `packages/server/src/routes/ws.ts`
+**文件：**
 
-**Transport:**
-- Single WebSocket for all traffic
-- Multiplexed requests via `{ id, type: "request" }` / `{ id, type: "response" }`
+- Client：`packages/client/src/lib/connection/WebSocketConnection.ts`
+- Server：`packages/server/src/routes/ws.ts`
 
-**Auth:**
-- Cookie-based (cookies sent in WS upgrade)
+**传输：**
 
-**When Used:**
-- Developer setting only (for testing WS protocol without encryption)
+- 所有流量走单条 WebSocket。
+- 通过 `{ id, type: "request" }` / `{ id, type: "response" }` multiplex request。
+
+**认证：**
+
+- 基于 cookie；cookie 在 WS upgrade 时发送。
+
+**使用场景：**
+
+- 仅开发设置中使用，用来测试不带加密的 WS protocol。
 
 ---
 
-### 3. SecureConnection (Encrypted WebSocket)
+### 3. SecureConnection（加密 WebSocket）
 
-**Files:**
-- Client: `packages/client/src/lib/connection/SecureConnection.ts`
-- Crypto: `packages/client/src/lib/connection/srp-client.ts`, `nacl-wrapper.ts`
-- Server: `packages/server/src/routes/ws-relay.ts`, `ws-relay-handlers.ts`
+**文件：**
 
-**Transport:**
-- Single WebSocket with all messages encrypted
-- Encryption: XSalsa20-Poly1305 (NaCl secretbox)
+- Client：`packages/client/src/lib/connection/SecureConnection.ts`
+- Crypto：`packages/client/src/lib/connection/srp-client.ts`、`nacl-wrapper.ts`
+- Server：`packages/server/src/routes/ws-relay.ts`、`ws-relay-handlers.ts`
 
-**Auth:**
-- SRP-6a zero-knowledge password proof
-- Session key derived from SRP, never transmitted
-- Session resumption supported (skip full SRP on reconnect)
+**传输：**
 
-**Protocol:**
-```
+- 所有消息走单条 WebSocket，并全部加密。
+- 加密算法：XSalsa20-Poly1305（NaCl secretbox）。
+
+**认证：**
+
+- SRP-6a 零知识密码证明。
+- Session key 由 SRP 派生，永不传输。
+- 支持 session resumption，重连时可跳过完整 SRP。
+
+**协议：**
+
+```text
 Full SRP Handshake:
   Client                          Server
     │                               │
@@ -109,7 +122,7 @@ Session Resume (stored session):
   Client                          Server
     │                               │
     │ ── srp_resume ──────────────▶ │  (sessionId + encrypted timestamp)
-    │ ◀── srp_resumed ─────────────│  (or srp_invalid → fall back to full SRP)
+    │ ◀── srp_resumed ─────────────│  (or srp_invalid -> fall back to full SRP)
     │                               │
     │ ══ encrypted traffic ════════▶│
 ```
@@ -118,15 +131,18 @@ Session Resume (stored session):
 
 ### 4. SecureConnection + Relay
 
-**Additional Files:**
-- Client context: `packages/client/src/contexts/RemoteConnectionContext.tsx`
-- Relay server: `packages/relay/src/`
+**额外文件：**
 
-**When Used:**
-- Remote access through public relay for NAT traversal
+- Client context：`packages/client/src/contexts/RemoteConnectionContext.tsx`
+- Relay server：`packages/relay/src/`
 
-**Flow:**
-```
+**使用场景：**
+
+- 通过公共 relay 做远程访问，用于 NAT traversal。
+
+**流程：**
+
+```text
 ┌──────────┐    ┌───────────┐    ┌─────────────┐
 │  Phone   │───▶│   Relay   │◀───│ Yepanywhere │
 │          │    │           │    │   Server    │
@@ -135,118 +151,125 @@ Session Resume (stored session):
 └──────────┘    └───────────┘    └─────────────┘
 ```
 
-Relay only sees encrypted blobs. SRP handshake passes through relay to yepanywhere server.
+Relay 只能看到加密数据块。SRP handshake 会穿过 relay，到 yepanywhere server 完成。
 
 ---
 
-## Reconnection Behavior
+## 重连行为
 
-### Trigger Points
+### 触发点
 
-| Trigger | Description |
-|---------|-------------|
-| Network drop | WebSocket closes, SSE errors |
-| Device sleep | Laptop lid close, phone screen off |
-| Page visibility | Tab hidden > 5 seconds |
-| Server restart | Connection closes with code |
+| 触发 | 说明 |
+|------|------|
+| 网络断开 | WebSocket close，SSE error |
+| 设备休眠 | 笔记本合盖、手机息屏 |
+| 页面可见性变化 | Tab hidden 超过 5 秒 |
+| 服务器重启 | 连接带 close code 关闭 |
 
-### Reconnection by Mode
+### 各模式重连
 
-#### DirectConnection (SSE)
+#### DirectConnection（SSE）
 
-| Event | Behavior |
-|-------|----------|
-| SSE error | FetchSSE auto-reconnects after 2s |
-| SSE close | FetchSSE auto-reconnects after 2s |
-| 401/403 | Stop reconnecting, signal login required |
-| Reconnect | `connected` event triggers `fetchNewMessages()` with `?afterMessageId` |
+| 事件 | 行为 |
+|------|------|
+| SSE error | `FetchSSE` 2 秒后自动重连 |
+| SSE close | `FetchSSE` 2 秒后自动重连 |
+| 401/403 | 停止重连，发出 login required |
+| Reconnect | `connected` event 触发带 `?afterMessageId` 的 `fetchNewMessages()` |
 
-**Note:** SSE `lastEventId` is ignored, but JSONL incremental fetch handles missed messages.
+**注意：** SSE 的 `lastEventId` 当前被忽略，但 JSONL incremental fetch 会补齐漏掉的消息。
 
 #### WebSocketConnection
 
-| Event | Behavior |
-|-------|----------|
-| WS close | `ensureConnected()` on next request |
-| Max retries | 3 attempts with 1s delay |
-| Pending requests | Rejected with `WebSocketCloseError` |
-| Subscriptions | Notified via `onClose()` callback |
+| 事件 | 行为 |
+|------|------|
+| WS close | 下一次 request 触发 `ensureConnected()` |
+| Max retries | 1 秒间隔重试 3 次 |
+| Pending requests | 以 `WebSocketCloseError` reject |
+| Subscriptions | 通过 `onClose()` callback 通知 |
 
-#### SecureConnection (Direct + Relay)
+#### SecureConnection（Direct + Relay）
 
-| Event | Behavior |
-|-------|----------|
-| WS close | `ensureConnected()` attempts reconnect |
-| Session stored | Try `srp_resume` first |
-| Session invalid | Fall back to full SRP |
-| Relay mode | Use `reconnectThroughRelay()` |
-| Relay failure | Throw `RelayReconnectRequiredError` |
+| 事件 | 行为 |
+|------|------|
+| WS close | `ensureConnected()` 尝试重连 |
+| 已存 session | 优先尝试 `srp_resume` |
+| Session invalid | 回落到完整 SRP |
+| Relay mode | 使用 `reconnectThroughRelay()` |
+| Relay failure | 抛出 `RelayReconnectRequiredError` |
 
-**Mobile wake handling** (`useRemoteActivityBusConnection.ts:40-57`):
-- Listens to `document.visibilitychange`
-- If hidden > 5 seconds, calls `forceReconnect()`
-- Forces WebSocket close and full reconnection
-- All subscriptions notified to re-subscribe
+**移动端唤醒处理**（`useRemoteActivityBusConnection.ts:40-57`）：
+
+- 监听 `document.visibilitychange`。
+- hidden 超过 5 秒后调用 `forceReconnect()`。
+- 强制关闭 WebSocket 并完整重连。
+- 通知所有 subscriptions 重新订阅。
 
 ---
 
-## Data Sync After Reconnection
+## 重连后的数据同步
 
 ### Session Messages
 
-**Initial page load:**
-1. REST call to `/api/sessions/:id` loads full JSONL history
-2. SSE connects to `/api/sessions/:id/stream`
-3. Client buffers SSE messages until REST load completes
-4. Client merges with duplicate detection via `getMessageId()`
+**初次加载页面：**
 
-**On SSE reconnect (laptop wake, network recovery):**
-1. SSE reconnects (auto-reconnect after 2s)
-2. Server sends `connected` event
-3. Client calls `fetchNewMessages()` with `?afterMessageId=<lastKnownId>` (`useSession.ts:774`)
-4. Server returns only messages after that ID (`reader.ts:201-207`)
-5. Client merges new messages via `mergeJSONLMessages()`
-6. SSE also replays its in-memory buffer (last 30-60s of SDK messages)
-7. Duplicate detection ensures no duplicates
+1. REST 调用 `/api/sessions/:id` 加载完整 JSONL 历史。
+2. SSE 连接 `/api/sessions/:id/stream`。
+3. Client 在 REST 加载完成前暂存 SSE messages。
+4. 使用 `getMessageId()` 做重复检测并合并。
 
-**Key code:**
-- `lastMessageIdRef` tracks last known message ID (`useSessionMessages.ts:112`)
-- `fetchNewMessages()` uses incremental API (`useSessionMessages.ts:294-320`)
-- Server `afterMessageId` implemented in all readers (`reader.ts`, `gemini-reader.ts`, etc.)
-- Unit tested: `packages/server/test/incremental-session.test.ts`
+**SSE 重连时（笔记本唤醒、网络恢复）：**
 
-**Example scenario:**
-```
-1. Open session, see 10 messages → lastMessageIdRef = msg10.id
-2. Close laptop
-3. 100 messages added on another computer
-4. Open laptop
-5. SSE reconnects → "connected" event fires
-6. fetchNewMessages() requests ?afterMessageId=msg10
-7. Server returns messages 11-110
-8. Client now has all 110 messages
+1. SSE 自动重连，默认 2 秒后重试。
+2. Server 发送 `connected` event。
+3. Client 调用 `fetchNewMessages()`，带 `?afterMessageId=<lastKnownId>`（`useSession.ts:774`）。
+4. Server 只返回该 ID 之后的消息（`reader.ts:201-207`）。
+5. Client 用 `mergeJSONLMessages()` 合并新消息。
+6. SSE 也会 replay 内存 buffer，通常是最近 30-60 秒 SDK messages。
+7. 重复检测保证不会产生重复消息。
+
+**关键代码：**
+
+- `lastMessageIdRef` 跟踪最后已知 message ID（`useSessionMessages.ts:112`）。
+- `fetchNewMessages()` 使用 incremental API（`useSessionMessages.ts:294-320`）。
+- 所有 readers 都实现了 server `afterMessageId`：`reader.ts`、`gemini-reader.ts` 等。
+- 单元测试：`packages/server/test/incremental-session.test.ts`。
+
+**示例：**
+
+```text
+1. 打开 session，看到 10 条消息 -> lastMessageIdRef = msg10.id
+2. 合上笔记本
+3. 另一台电脑新增 100 条消息
+4. 打开笔记本
+5. SSE 重连，触发 "connected" event
+6. fetchNewMessages() 请求 ?afterMessageId=msg10
+7. Server 返回 messages 11-110
+8. Client 现在拥有全部 110 条消息
 ```
 
 ### Activity Events
 
-**Current flow:**
-- No historical sync - only events after subscription
-- Visibility change triggers `forceReconnect()` which re-subscribes
+**当前流程：**
 
-**Gap:** If offline for N seconds, miss session status changes during that window.
+- 不做历史同步；订阅之后只接收新事件。
+- Visibility change 会触发 `forceReconnect()` 并重新订阅。
+
+**缺口：** 如果离线 N 秒，这段时间内的 session status changes 可能会漏掉。
 
 ---
 
 ## Session Persistence
 
-| Mode | What's Stored | Where | Purpose |
-|------|---------------|-------|---------|
-| DirectConnection | Browser profile ID | localStorage | Correlate tabs |
-| WebSocketConnection | Nothing | - | Stateless |
-| SecureConnection | Session key, URL, username | localStorage | Skip SRP on refresh |
-| SecureConnection + Relay | + relay URL, relay username | localStorage | Reconnect through relay |
+| 模式 | 存储内容 | 位置 | 目的 |
+|------|----------|------|------|
+| DirectConnection | Browser profile ID | localStorage | 关联多个 tab |
+| WebSocketConnection | 无 | - | Stateless |
+| SecureConnection | Session key、URL、username | localStorage | 刷新后跳过 SRP |
+| SecureConnection + Relay | 另加 relay URL、relay username | localStorage | 通过 relay 重连 |
 
-**Stored session format:**
+**Stored session format：**
+
 ```typescript
 interface StoredSession {
   wsUrl: string;
@@ -258,103 +281,115 @@ interface StoredSession {
 
 ---
 
-## Current Gaps
+## 当前缺口
 
-### 1. SSE Stream `lastEventId` Not Implemented (Low Impact)
+### 1. SSE stream 未实现 `lastEventId`（影响低）
 
-**Status:** Not implemented
-**Impact:** Low
-**Location:** `packages/server/src/routes/stream.ts`
+**状态：** 未实现
 
-The SSE stream ignores the `?lastEventId=X` parameter for streaming events (SDK messages). However:
-- SDK messages clear every 30-60s (two clearing buckets)
-- JSONL incremental fetch IS implemented via `?afterMessageId=X` (see above)
-- On reconnect, client fetches missed JSONL messages and SSE replays its buffer
-- This covers the gap for any realistic offline period
+**影响：** 低
 
-### 2. Activity Stream Has No Catch-up
+**位置：** `packages/server/src/routes/stream.ts`
 
-**Status:** Not implemented
-**Impact:** Medium (can miss status changes while offline)
+SSE stream 会忽略 `?lastEventId=X` 参数。但实际影响有限：
 
-After reconnect, client only sees new activity events. If session status changed while disconnected, client may show stale state until next update.
+- SDK messages 每 30-60 秒清空一次，有两个 clearing bucket。
+- JSONL incremental fetch 已通过 `?afterMessageId=X` 实现。
+- 重连时 client 会拉取漏掉的 JSONL messages，SSE 也会 replay buffer。
+- 对现实中的离线时间来说，这足够覆盖。
 
-**Workaround:** Client can refresh session list on reconnect.
+### 2. Activity stream 没有 catch-up
 
-### 3. In-Flight Requests Lost on Reconnect
+**状态：** 未实现
 
-**Status:** By design
-**Impact:** Medium
+**影响：** 中等，离线期间可能漏掉 status changes。
 
-When WebSocket closes:
-- Pending requests are rejected with `WebSocketCloseError`
-- Client must retry at application level
-- No automatic request queuing/replay
+重连后，client 只能看到新的 activity events。如果断线期间 session status 变了，client 可能一直显示旧状态，直到下一次更新。
 
-### 4. No E2E Test for Reconnection + Incremental Fetch
+**Workaround：** client 可以在重连时刷新 session list。
 
-**Status:** Missing test coverage
-**Impact:** Medium (feature works but not regression-tested)
+### 3. 重连时丢失 in-flight requests
 
-The JSONL incremental fetch is unit tested (`incremental-session.test.ts`), but there's no browser e2e test that simulates:
-1. Connect to session, see messages
-2. Disconnect (simulate laptop close)
-3. Messages added while disconnected
-4. Reconnect
-5. Verify all messages fetched
+**状态：** 符合当前设计
 
-This should be added to catch regressions in the full reconnection flow.
+**影响：** 中等
+
+WebSocket 关闭时：
+
+- Pending requests 以 `WebSocketCloseError` reject。
+- Client 必须在应用层重试。
+- 不自动排队或 replay requests。
+
+### 4. 缺少重连 + incremental fetch 的 E2E
+
+**状态：** 测试缺口
+
+**影响：** 中等；功能可用，但缺少回归测试。
+
+JSONL incremental fetch 已有单元测试（`incremental-session.test.ts`），但还没有 browser E2E 模拟：
+
+1. 连接 session，看到 messages。
+2. 断开连接，模拟 laptop close。
+3. 离线期间追加 messages 到 JSONL。
+4. 重连。
+5. 验证所有 messages 都被 fetch 回来。
+
+这类测试应该补上，用来防止完整重连链路回归。
 
 ---
 
-## E2E Test Coverage
+## E2E 测试覆盖
 
-### What's Tested
+### 已测试
 
-| Scenario | Mode | Test File |
-|----------|------|-----------|
-| Basic WS request/response | WebSocket | `ws-transport.e2e.test.ts` |
+| 场景 | 模式 | 测试文件 |
+|------|------|----------|
+| 基础 WS request/response | WebSocket | `ws-transport.e2e.test.ts` |
 | WS event subscriptions | WebSocket | `ws-transport.e2e.test.ts` |
 | WS file uploads | WebSocket | `ws-transport.e2e.test.ts` |
 | SRP handshake | Secure WS | `ws-secure.e2e.test.ts` |
-| Encrypted traffic | Secure WS | `ws-secure.e2e.test.ts` |
-| Session resume on refresh | Relay | `relay-integration.spec.ts` |
-| Wrong password error | Relay | `relay-integration.spec.ts` |
+| 加密流量 | Secure WS | `ws-secure.e2e.test.ts` |
+| 刷新后 session resume | Relay | `relay-integration.spec.ts` |
+| 错误密码 | Relay | `relay-integration.spec.ts` |
 | Relay message forwarding | Relay | `relay.e2e.test.ts` |
 
-### What's NOT Tested
+### 未测试
 
-| Scenario | Gap |
-|----------|-----|
-| SSE transport | No SSE e2e tests at all |
-| Reconnection + incremental fetch | Feature works, but no e2e regression test |
-| Network interruption simulation | Only graceful disconnects tested |
-| Device sleep / wake recovery | Not simulated in tests |
-| Long-lived connections | No duration tests |
-| Multi-tab coordination | Not tested |
-| Partial message recovery | Not tested |
+| 场景 | 缺口 |
+|------|------|
+| SSE transport | 完全没有 SSE E2E |
+| Reconnection + incremental fetch | 功能可用，但没有 E2E 回归测试 |
+| 网络中断模拟 | 只测试了 graceful disconnect |
+| 设备 sleep / wake recovery | 未模拟 |
+| 长连接 | 没有 duration tests |
+| 多 tab 协调 | 未测试 |
+| 部分消息恢复 | 未测试 |
 
-### Recommended New Tests
+### 建议新增测试
 
-1. **Reconnection + incremental message fetch** (HIGH PRIORITY)
-   - Connect to session, receive N messages
-   - Simulate disconnect (close SSE/WS)
-   - Add messages to JSONL while disconnected
-   - Reconnect
-   - Verify client receives all messages via `?afterMessageId`
+1. **Reconnection + incremental message fetch**（高优先级）
+   - 连接 session，收到 N 条消息。
+   - 模拟断开连接，关闭 SSE/WS。
+   - 离线期间向 JSONL 追加消息。
+   - 重连。
+   - 验证 client 通过 `?afterMessageId` 收到所有消息。
 
-2. **SSE basic flow** - Connect, receive events, verify order
+2. **SSE basic flow**
+   - 连接、接收 events、验证顺序。
 
-3. **Visibility change** - Simulate tab hidden/visible, verify reconnect
+3. **Visibility change**
+   - 模拟 tab hidden/visible，验证重连。
 
-4. **Concurrent reconnection** - Multiple subscriptions reconnecting simultaneously
+4. **Concurrent reconnection**
+   - 多个 subscription 同时重连。
 
 ---
 
-## Key Code Locations
+## 关键代码位置
 
 ### Client Connection Layer
-```
+
+```text
 packages/client/src/lib/connection/
 ├── DirectConnection.ts      # SSE + fetch
 ├── WebSocketConnection.ts   # WS protocol
@@ -366,7 +401,8 @@ packages/client/src/lib/connection/
 ```
 
 ### Hooks
-```
+
+```text
 packages/client/src/hooks/
 ├── useConnection.ts         # Mode selection
 ├── useSSE.ts                # SSE subscription logic
@@ -374,7 +410,8 @@ packages/client/src/hooks/
 ```
 
 ### Server Streaming
-```
+
+```text
 packages/server/src/routes/
 ├── stream.ts                # SSE endpoint
 ├── activity.ts              # Activity SSE
@@ -385,7 +422,7 @@ packages/server/src/routes/
 
 ---
 
-## See Also
+## 参见
 
-- [Relay Design](relay-design.md) - Detailed relay protocol and implementation
-- [Remote Access](remote-access.md) - User-facing remote access options
+- [Relay Design](relay-design.md)：详细 relay 协议和实现
+- [Remote Access](remote-access.md)：面向用户的远程访问选项

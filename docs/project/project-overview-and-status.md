@@ -1,121 +1,127 @@
-# Yep Anywhere: Project Overview & Status
+# Yep Anywhere：项目总览与状态
 
-A polished web interface for managing Claude and Codex agents. Works great on mobile and desktop.
+Yep Anywhere 是用于管理 Claude 和 Codex 智能体的 Web 界面，在手机和桌面端都能良好使用。
 
-> For original vision documents and detailed design rationale, see `docs/archive/`.
+> 原始愿景文档和更详细的设计背景见 `docs/archive/`。
 
-## What It Is
+## 它是什么
 
-Like the VS Code Claude extension, but:
-- **Multi-provider** — Claude, Codex (including local models), Gemini
-- **Mobile-first** — Touch-friendly UI, push notifications, works on phones
-- **Multi-session** — See all projects at a glance, no window cycling
-- **Server-owned** — Disconnect and reconnect without losing state
+可以把它理解为类似 VS Code Claude 扩展的体验，但重点不同：
 
-## Current State
+- **多提供商**：支持 Claude、Codex（包括本地模型）、Gemini
+- **移动优先**：触控友好的 UI、推送通知，适合在手机上使用
+- **多会话**：从一个面板查看所有项目，不需要来回切换窗口
+- **服务端托管**：断开后可以重新连接，不丢失状态
 
-### Working Features
+## 当前状态
 
-**Core Loop**
-- Server spawns and manages Claude Code SDK processes
-- Real-time WebSocket streaming of agent messages to clients
-- Message queuing while Claude is working
-- Tool approval UI with approve/deny actions
-- Permission modes: default, acceptEdits, plan, bypassPermissions
+### 已可用功能
 
-**Session Management**
-- Multi-project dashboard showing all sessions
-- Session persistence via SDK's jsonl files
-- Resume sessions after process restart
-- Detect external sessions (CLI, VS Code) as read-only
-- Custom session titles and archive status
+**核心循环**
 
-**Mobile Experience**
-- PWA with installable web app support
-- Push notifications for approval requests (VAPID, no Firebase)
-- Approve/deny from lock screen
-- WebSocket auto-reconnect with resume
+- 服务端启动并管理 Claude Code SDK 进程
+- 通过 WebSocket 向客户端实时流式推送智能体消息
+- Claude 正在工作时支持消息排队
+- 工具审批 UI 支持批准/拒绝操作
+- 权限模式：`default`、`acceptEdits`、`plan`、`bypassPermissions`
 
-**Agent Features**
-- Subagent (Task tool) tracking with status display
-- Model selection and extended thinking support
-- File uploads via WebSocket
-- Plan mode with approval workflow
-- Voice input via browser speech API
-- Session search and filtering
+**会话管理**
 
-**Multi-Provider Support**
-- Claude Code: Full support (primary provider, full tool transparency)
-- Codex: Functional but limited transparency (edits are opaque, no granular tool events)
-- Codex-OSS: Local models via shell commands (more transparent than cloud Codex)
-- Gemini: Read-only mode (no editing tools, good for exploration/planning)
+- 多项目仪表盘展示全部会话
+- 通过 SDK 的 jsonl 文件持久化会话
+- 进程重启后可继续会话
+- 检测外部会话（CLI、VS Code）并以只读方式展示
+- 支持自定义会话标题和归档状态
 
-### Architecture
+**移动端体验**
 
-```
+- PWA 支持安装为 Web 应用
+- 审批请求支持推送通知（VAPID，无 Firebase）
+- 可在锁屏界面批准/拒绝
+- WebSocket 自动重连并恢复会话
+
+**智能体功能**
+
+- 跟踪 subagent（Task 工具）并展示状态
+- 支持模型选择和 extended thinking
+- 通过 WebSocket 上传文件
+- Plan mode 支持审批工作流
+- 通过浏览器语音 API 输入语音
+- 支持会话搜索和筛选
+
+**多提供商支持**
+
+- Claude Code：完整支持，是主要提供商，工具可见性最好
+- Codex：功能可用，但透明度有限，编辑过程较黑盒，没有细粒度工具事件
+- Codex-OSS：通过 shell 命令使用本地模型，比云端 Codex 更透明
+- Gemini：只读模式，没有编辑工具，适合探索和规划
+
+### 架构
+
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │  Client (React PWA)                                         │
-│  - SessionPage: real-time message display + tool approval   │
-│  - Dashboard: multi-project session list                    │
+│  - SessionPage: 实时消息展示 + 工具审批                     │
+│  - Dashboard: 多项目会话列表                                │
 │  - Push notification service worker                         │
 └─────────────────────────┬───────────────────────────────────┘
-                          │ WebSocket (streaming + actions)
+                          │ WebSocket（流式消息 + 操作）
 ┌─────────────────────────▼───────────────────────────────────┐
 │  Server (Hono)                                              │
-│  - Supervisor: manages process pool with worker queue       │
-│  - Process: wraps Claude SDK, handles approvals/queue       │
-│  - SessionReader: merges jsonl + live events via DAG        │
-│  - PushNotifier: VAPID web push                             │
+│  - Supervisor: 管理进程池和 worker 队列                     │
+│  - Process: 封装 Claude SDK，处理审批和消息队列             │
+│  - SessionReader: 通过 DAG 合并 jsonl 和实时事件            │
+│  - PushNotifier: VAPID Web Push                             │
 └─────────────────────────┬───────────────────────────────────┘
                           │ Claude Code SDK
 ┌─────────────────────────▼───────────────────────────────────┐
 │  Claude Code CLI                                            │
-│  - Runs in ~/.claude/projects/{projectId}/                  │
-│  - Persists to session jsonl files                          │
+│  - 运行在 ~/.claude/projects/{projectId}/                   │
+│  - 持久化到 session jsonl 文件                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Known Gaps
+### 已知缺口
 
-| Area | Status | Notes |
-|------|--------|-------|
-| Multi-device push | Basic | Works, may need stale subscription cleanup |
-| Process recovery | By design | Server restart halts processes; resume on next message |
+| 领域 | 状态 | 说明 |
+|------|------|------|
+| 多设备推送 | 基础可用 | 已能工作，可能还需要清理过期 subscription |
+| 进程恢复 | 符合当前设计 | 服务端重启会停止进程；下一条消息可继续会话 |
 
-## Tech Stack
+## 技术栈
 
-- **Server**: Node.js, Hono, @anthropic-ai/claude-code SDK
-- **Client**: React, Vite, React Router
-- **Push**: web-push (VAPID protocol)
-- **Linting**: Biome
-- **Testing**: Vitest
+- **服务端**：Node.js、Hono、@anthropic-ai/claude-code SDK
+- **客户端**：React、Vite、React Router
+- **推送**：web-push（VAPID 协议）
+- **Lint**：Biome
+- **测试**：Vitest
 
-## Project Structure
+## 项目结构
 
-```
+```text
 packages/
-├── server/     # Hono backend
-│   ├── supervisor/   # Process lifecycle (Supervisor, Process, WorkerQueue)
-│   ├── routes/       # API endpoints
-│   ├── sessions/     # Session file reading
-│   └── push/         # Web push notifications
-├── client/     # React frontend
-│   ├── pages/        # SessionPage, NewSessionPage, etc.
-│   ├── components/   # MessageInput, MessageList, ToolApprovalPanel
-│   └── hooks/        # useSession, useConnection, usePushNotifications
-└── shared/     # Shared types
+├── server/     # Hono 后端
+│   ├── supervisor/   # 进程生命周期（Supervisor、Process、WorkerQueue）
+│   ├── routes/       # API 端点
+│   ├── sessions/     # 会话文件读取
+│   └── push/         # Web Push 通知
+├── client/     # React 前端
+│   ├── pages/        # SessionPage、NewSessionPage 等
+│   ├── components/   # MessageInput、MessageList、ToolApprovalPanel
+│   └── hooks/        # useSession、useConnection、usePushNotifications
+└── shared/     # 共享类型
 ```
 
-## Competitive Position
+## 竞争位置
 
-| Tool | Multi-session | Desktop | Mobile | Push Notifications | Zero External Deps |
-|------|---------------|---------|--------|-------------------|-------------------|
-| Claude Code CLI | No | Yes | No | No | Yes |
-| VS Code Extension | No | Yes | Partial* | No | Yes |
-| **yep-anywhere** | Yes | Yes | Yes | Yes | Yes |
+| 工具 | 多会话 | 桌面端 | 移动端 | 推送通知 | 无外部依赖 |
+|------|--------|--------|--------|----------|------------|
+| Claude Code CLI | 否 | 是 | 否 | 否 | 是 |
+| VS Code Extension | 否 | 是 | 部分支持* | 否 | 是 |
+| **yep-anywhere** | 是 | 是 | 是 | 是 | 是 |
 
-*VS Code Remote works but webview state is fragile.
+*VS Code Remote 能用，但 webview 状态较脆弱。
 
-## Future Directions
+## 后续方向
 
-See dated docs in this folder (e.g., `2026-01-05-*.md`) for planned features.
+计划功能见本目录下带日期的文档，例如 `2026-01-05-*.md`。
