@@ -238,6 +238,7 @@ export function useSession(
     setMessages,
     truncateMessagesBefore,
     fetchNewMessages,
+    refreshSessionMessages,
     fetchSessionMetadata,
     pagination,
     loadingOlder,
@@ -1092,5 +1093,6 @@ export function useSession(
     loadOlderMessages, // Load next chunk of older messages
     reconnectStream, // Force session stream reconnection (e.g., after process restart)
     truncateMessagesBefore, // Rewind/edit: drop a uuid and everything after it
+    refreshSessionMessages, // Reload authoritative JSONL/session snapshot
   };
 }

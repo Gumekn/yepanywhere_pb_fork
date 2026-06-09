@@ -6,6 +6,7 @@ import {
 } from "../lib/preprocessMessages";
 import type { Message } from "../types";
 import type { RenderItem } from "../types/renderItems";
+import { getMessageId } from "../utils";
 import { MessageActions } from "./MessageActions";
 import { ProcessingIndicator } from "./ProcessingIndicator";
 import { RenderItemComponent } from "./RenderItemComponent";
@@ -43,9 +44,10 @@ function groupItemsIntoTurns(
   return groups;
 }
 
-function getCodexBranchId(item: RenderItem): string | undefined {
+function getBranchId(item: RenderItem): string | undefined {
   if (item.type !== "user_prompt") return undefined;
-  return item.sourceMessages[0]?.codexBranch?.branchId;
+  const source = item.sourceMessages[0];
+  return source?.branch?.branchId ?? source?.codexBranch?.branchId;
 }
 
 /** Pending message waiting for server confirmation */
@@ -94,12 +96,16 @@ interface Props {
     uuid: string;
     parentUuid: string | null;
   }) => void;
-  /** Codex-only: switch the rendered derived branch. */
-  onSelectCodexBranch?: (branchId: string) => void;
-  /** Codex-only: branch prompt to bring back into view after switching. */
-  focusCodexBranchId?: string | null;
-  /** Called after the selected Codex branch prompt has been focused. */
-  onCodexBranchFocused?: () => void;
+  /** Switch the rendered derived branch. */
+  onSelectBranch?: (branchId: string) => void;
+  /** Branch prompt to bring back into view after switching. */
+  focusBranchId?: string | null;
+  /** Called after the selected branch prompt has been focused. */
+  onBranchFocused?: () => void;
+  /** Message id to scroll to and highlight (e.g. from a search deep-link). */
+  targetMessageId?: string | null;
+  /** Called after the target message has been focused. */
+  onTargetFocused?: () => void;
 }
 
 export const MessageList = memo(function MessageList({
@@ -118,12 +124,15 @@ export const MessageList = memo(function MessageList({
   loadingOlder = false,
   onLoadOlderMessages,
   onEditUserPrompt,
-  onSelectCodexBranch,
-  focusCodexBranchId,
-  onCodexBranchFocused,
+  onSelectBranch,
+  focusBranchId,
+  onBranchFocused,
+  targetMessageId,
+  onTargetFocused,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const focusedCodexBranchRef = useRef<HTMLDivElement | null>(null);
+  const focusedBranchRef = useRef<HTMLDivElement | null>(null);
+  const targetMessageRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const isInitialLoadRef = useRef(true);
   const isProgrammaticScrollRef = useRef(false);
@@ -172,13 +181,23 @@ export const MessageList = memo(function MessageList({
     () => groupItemsIntoTurns(renderItems),
     [renderItems],
   );
-  const focusedCodexBranchItemId = useMemo(() => {
-    if (!focusCodexBranchId) return null;
+  const focusedBranchItemId = useMemo(() => {
+    if (!focusBranchId) return null;
     return (
-      renderItems.find((item) => getCodexBranchId(item) === focusCodexBranchId)
-        ?.id ?? null
+      renderItems.find((item) => getBranchId(item) === focusBranchId)?.id ??
+      null
     );
-  }, [focusCodexBranchId, renderItems]);
+  }, [focusBranchId, renderItems]);
+
+  // Render item that contains the deep-link target message (search results).
+  const targetItemId = useMemo(() => {
+    if (!targetMessageId) return null;
+    return (
+      renderItems.find((item) =>
+        item.sourceMessages.some((m) => getMessageId(m) === targetMessageId),
+      )?.id ?? null
+    );
+  }, [targetMessageId, renderItems]);
 
   const toggleThinkingExpanded = useCallback(() => {
     setThinkingExpanded((prev) => !prev);
@@ -330,8 +349,8 @@ export const MessageList = memo(function MessageList({
   }, [renderItems.length, scrollToBottom]);
 
   useEffect(() => {
-    if (!focusCodexBranchId || !focusedCodexBranchItemId) return;
-    const target = focusedCodexBranchRef.current;
+    if (!focusBranchId || !focusedBranchItemId) return;
+    const target = focusedBranchRef.current;
     const container = containerRef.current?.parentElement;
     if (!target || !container) return;
 
@@ -345,14 +364,77 @@ export const MessageList = memo(function MessageList({
       requestAnimationFrame(() => {
         isProgrammaticScrollRef.current = false;
       });
-      onCodexBranchFocused?.();
+      onBranchFocused?.();
     });
 
     return () => {
       cancelled = true;
       cancelAnimationFrame(raf);
     };
-  }, [focusCodexBranchId, focusedCodexBranchItemId, onCodexBranchFocused]);
+  }, [focusBranchId, focusedBranchItemId, onBranchFocused]);
+
+  // Scroll to + highlight a deep-linked target message (e.g. search result).
+  // If the target isn't in the loaded window yet, auto-load older chunks a few
+  // times until it appears, then scroll. Gives up quietly if never found.
+  const targetLoadAttemptsRef = useRef(0);
+  useEffect(() => {
+    if (!targetMessageId) {
+      targetLoadAttemptsRef.current = 0;
+      return;
+    }
+
+    // Found in the current window — scroll and highlight it.
+    if (targetItemId) {
+      const target = targetMessageRef.current;
+      const container = containerRef.current?.parentElement;
+      if (!target || !container) return;
+
+      targetLoadAttemptsRef.current = 0;
+      let cancelled = false;
+      const raf = requestAnimationFrame(() => {
+        if (cancelled) return;
+        isProgrammaticScrollRef.current = true;
+        target.scrollIntoView({ block: "center", behavior: "smooth" });
+        lastHeightRef.current = container.scrollHeight;
+        requestAnimationFrame(() => {
+          isProgrammaticScrollRef.current = false;
+        });
+        // Self-clearing highlight: the CSS animation removes itself on end, so
+        // it survives the re-render triggered by onTargetFocused() below.
+        target.classList.remove("message-target-highlight");
+        target.addEventListener(
+          "animationend",
+          () => target.classList.remove("message-target-highlight"),
+          { once: true },
+        );
+        // Force reflow so re-adding the class restarts the animation.
+        void target.offsetWidth;
+        target.classList.add("message-target-highlight");
+        onTargetFocused?.();
+      });
+
+      return () => {
+        cancelled = true;
+        cancelAnimationFrame(raf);
+      };
+    }
+
+    // Not loaded yet — pull in older messages and try again (bounded).
+    if (
+      hasOlderMessages &&
+      onLoadOlderMessages &&
+      targetLoadAttemptsRef.current < 6
+    ) {
+      targetLoadAttemptsRef.current += 1;
+      onLoadOlderMessages();
+    }
+  }, [
+    targetMessageId,
+    targetItemId,
+    hasOlderMessages,
+    onLoadOlderMessages,
+    onTargetFocused,
+  ]);
 
   return (
     <div className="message-list" ref={containerRef}>
@@ -379,7 +461,8 @@ export const MessageList = memo(function MessageList({
           // User prompts render directly without timeline wrapper
           const item = group.items[0];
           if (!item) return null;
-          const shouldFocusBranch = item.id === focusedCodexBranchItemId;
+          const shouldFocusBranch = item.id === focusedBranchItemId;
+          const isTarget = item.id === targetItemId;
           const renderedItem = (
             <RenderItemComponent
               key={item.id}
@@ -389,16 +472,21 @@ export const MessageList = memo(function MessageList({
               toggleThinkingExpanded={toggleThinkingExpanded}
               sessionProvider={provider}
               onEditUserPrompt={onEditUserPrompt}
-              onSelectCodexBranch={onSelectCodexBranch}
+              onSelectBranch={onSelectBranch}
             />
           );
-          if (!shouldFocusBranch) return renderedItem;
+          if (!shouldFocusBranch && !isTarget) return renderedItem;
           return (
             <div
               key={item.id}
-              ref={focusedCodexBranchRef}
-              className="codex-branch-focus-target"
-              tabIndex={-1}
+              ref={(node) => {
+                if (shouldFocusBranch) focusedBranchRef.current = node;
+                if (isTarget) targetMessageRef.current = node;
+              }}
+              className={
+                shouldFocusBranch ? "codex-branch-focus-target" : undefined
+              }
+              tabIndex={shouldFocusBranch ? -1 : undefined}
             >
               {renderedItem}
             </div>
@@ -420,8 +508,15 @@ export const MessageList = memo(function MessageList({
           .map((item) => item.text)
           .join("\n\n")
           .trim();
+        const turnHasTarget = group.items.some(
+          (item) => item.id === targetItemId,
+        );
         return (
-          <div key={`turn-${firstItem.id}`} className="assistant-turn">
+          <div
+            key={`turn-${firstItem.id}`}
+            className="assistant-turn"
+            ref={turnHasTarget ? targetMessageRef : undefined}
+          >
             {group.items.map((item) => (
               <RenderItemComponent
                 key={item.id}
@@ -430,7 +525,7 @@ export const MessageList = memo(function MessageList({
                 thinkingExpanded={thinkingExpanded}
                 toggleThinkingExpanded={toggleThinkingExpanded}
                 sessionProvider={provider}
-                onSelectCodexBranch={onSelectCodexBranch}
+                onSelectBranch={onSelectBranch}
               />
             ))}
             <MessageActions

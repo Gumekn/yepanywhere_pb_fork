@@ -746,7 +746,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   //   ?afterMessageId=<id> - incremental forward-fetch (append new messages)
   //   ?tailCompactions=<n> - return only last N compact boundaries worth of messages
   //   ?beforeMessageId=<id> - cursor for loading older chunks (used with tailCompactions)
-  //   ?branchId=<id> - Codex-only derived branch id to render
+  //   ?branchId=<id> - derived branch id to render
   routes.get("/projects/:projectId/sessions/:sessionId", async (c) => {
     const projectId = c.req.param("projectId");
     const sessionId = c.req.param("sessionId");
@@ -754,9 +754,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     const tailCompactionsParam = c.req.query("tailCompactions");
     const beforeMessageId = c.req.query("beforeMessageId");
     const branchId = c.req.query("branchId");
+    const maxMessagesParam = c.req.query("maxMessages");
     const tailCompactions =
       tailCompactionsParam !== undefined
         ? Number.parseInt(tailCompactionsParam, 10)
+        : undefined;
+    const maxMessages =
+      maxMessagesParam !== undefined
+        ? Number.parseInt(maxMessagesParam, 10)
         : undefined;
 
     // Validate projectId format at API boundary
@@ -962,6 +967,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         session.messages,
         tailCompactions,
         beforeMessageId,
+        maxMessages !== undefined &&
+          !Number.isNaN(maxMessages) &&
+          maxMessages > 0
+          ? maxMessages
+          : undefined,
       );
       session = { ...session, messages: sliced.messages };
       paginationInfo = sliced.pagination;

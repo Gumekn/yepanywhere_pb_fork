@@ -22,8 +22,8 @@ interface Props {
     uuid: string;
     parentUuid: string | null;
   }) => void;
-  /** Codex-only: switch the rendered derived branch. */
-  onSelectCodexBranch?: (branchId: string) => void;
+  /** Switch the rendered derived branch. */
+  onSelectBranch?: (branchId: string) => void;
 }
 
 function getMessageIdLike(message: Record<string, unknown>): string {
@@ -139,7 +139,7 @@ export const RenderItemComponent = memo(function RenderItemComponent({
   toggleThinkingExpanded,
   sessionProvider,
   onEditUserPrompt,
-  onSelectCodexBranch,
+  onSelectBranch,
 }: Props) {
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
@@ -206,8 +206,9 @@ export const RenderItemComponent = memo(function RenderItemComponent({
           <UserPromptBlock
             content={item.content}
             timestamp={src?.timestamp}
+            branch={src?.branch}
             codexBranch={src?.codexBranch}
-            onSelectCodexBranch={onSelectCodexBranch}
+            onSelectBranch={onSelectBranch}
             onEdit={
               onEditUserPrompt && uuid
                 ? (text) =>

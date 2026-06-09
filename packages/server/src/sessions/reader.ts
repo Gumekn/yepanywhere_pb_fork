@@ -32,7 +32,10 @@ import {
   isCompactBoundary,
   isConversationEntry,
 } from "@yep-anywhere/shared";
-import { collectVisibleClaudeEntries } from "./claude-messages.js";
+import {
+  buildClaudeBranchView,
+  collectVisibleClaudeEntries,
+} from "./claude-messages.js";
 import { buildDag } from "./dag.js";
 
 export interface ClaudeSessionReaderOptions {
@@ -338,16 +341,23 @@ export class ClaudeSessionReader implements ISessionReader {
       }
     }
 
-    // Filter messages for incremental fetching if needed
-    // Note: Raw messages might not have UUIDs if they are old format or haven't been normalized.
-    // But typically they do.
-    let finalMessages = rawMessages;
+    const branchView = buildClaudeBranchView(
+      rawMessages,
+      sessionId,
+      _options?.branchId,
+      { includeOrphans: _options?.includeOrphans },
+    );
+
+    // Filter messages for incremental fetching if needed. Use the selected
+    // branch projection so a historical branch does not append active-branch
+    // siblings during branch navigation.
+    let finalMessages = branchView.entries;
     if (afterMessageId) {
-      const afterIndex = rawMessages.findIndex(
+      const afterIndex = finalMessages.findIndex(
         (m) => "uuid" in m && m.uuid === afterMessageId,
       );
       if (afterIndex !== -1) {
-        finalMessages = rawMessages.slice(afterIndex + 1);
+        finalMessages = finalMessages.slice(afterIndex + 1);
       }
     }
 
@@ -359,6 +369,9 @@ export class ClaudeSessionReader implements ISessionReader {
           messages: finalMessages,
         },
       },
+      messagesAlreadyProjected: true,
+      orphanedToolUses: branchView.orphanedToolUses,
+      branchState: branchView.branchState,
     };
   }
 

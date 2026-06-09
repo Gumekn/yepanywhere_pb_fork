@@ -371,6 +371,7 @@ export const api = {
       tailCompactions?: number;
       beforeMessageId?: string;
       branchId?: string;
+      maxMessages?: number;
     },
   ) => {
     const params = new URLSearchParams();
@@ -380,6 +381,8 @@ export const api = {
     if (options?.beforeMessageId)
       params.set("beforeMessageId", options.beforeMessageId);
     if (options?.branchId) params.set("branchId", options.branchId);
+    if (options?.maxMessages !== undefined)
+      params.set("maxMessages", String(options.maxMessages));
     const qs = params.toString();
     return fetchJSON<{
       session: Session;

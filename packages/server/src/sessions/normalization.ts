@@ -1,7 +1,5 @@
 import type {
   ClaudeSessionEntry,
-  CodexBranchOption,
-  CodexBranchState,
   CodexCompactedEntry,
   CodexCustomToolCallOutputPayload,
   CodexCustomToolCallPayload,
@@ -17,6 +15,8 @@ import type {
   GeminiUserMessage,
   OpenCodeSessionEntry,
   OpenCodeStoredPart,
+  SessionBranchOption,
+  SessionBranchState,
   UnifiedSession,
 } from "@yep-anywhere/shared";
 import {
@@ -94,28 +94,41 @@ export function normalizeSession(loaded: LoadedSession): Session {
     case "claude":
     case "claude-ollama": {
       const rawMessages = data.session.messages;
-      const { entries, orphanedToolUses } =
-        collectVisibleClaudeEntries(rawMessages);
+      const { entries, orphanedToolUses } = loaded.messagesAlreadyProjected
+        ? {
+            entries: rawMessages,
+            orphanedToolUses: loaded.orphanedToolUses ?? new Set<string>(),
+          }
+        : collectVisibleClaudeEntries(rawMessages, {
+            branchId: loaded.branchState?.selectedBranchId ?? undefined,
+            sessionId: summary.id,
+          });
       const messages: Message[] = entries.map((raw, index) =>
         convertClaudeMessage(raw, index, orphanedToolUses),
       );
 
       return {
         ...summary,
-        messages,
+        branchState: loaded.branchState,
+        messages: loaded.branchState
+          ? annotateBranchMessages(messages, loaded.branchState)
+          : messages,
       };
     }
     case "codex":
-    case "codex-oss":
+    case "codex-oss": {
+      const branchState = loaded.codexBranchState ?? loaded.branchState;
       return {
         ...summary,
+        branchState,
         codexBranchState: loaded.codexBranchState,
         messages: convertCodexEntries(
           applyCodexRollbackMarkers(data.session.entries),
           summary.id,
-          loaded.codexBranchState,
+          branchState,
         ),
       };
+    }
     case "gemini":
       return {
         ...summary,
@@ -208,7 +221,7 @@ function convertClaudeMessage(
 function convertCodexEntries(
   entries: CodexSessionEntry[],
   sessionId: string,
-  branchState?: CodexBranchState,
+  branchState?: SessionBranchState,
 ): Message[] {
   const messages: Message[] = [];
   let messageIndex = 0;
@@ -293,7 +306,7 @@ function convertCodexEntries(
   }
 
   return branchState
-    ? annotateCodexBranchMessages(messages, branchState)
+    ? annotateBranchMessages(messages, branchState, { includeCodexAlias: true })
     : messages;
 }
 
@@ -318,26 +331,26 @@ function getNormalizedUserText(message: Message): string | null {
   return text.trim().length > 0 ? text : null;
 }
 
-function codexBranchMessageKey(timestamp: string | undefined, prompt: string) {
+function branchMessageKey(timestamp: string | undefined, prompt: string) {
   return `${timestamp ?? ""}\n${prompt}`;
 }
 
-function annotateCodexBranchMessages(
+function annotateBranchMessages(
   messages: Message[],
-  branchState: CodexBranchState,
+  branchState: SessionBranchState,
+  options: { includeCodexAlias?: boolean } = {},
 ): Message[] {
   if (branchState.branches.length === 0) {
     return messages;
   }
 
-  const branchByKey = new Map<string, CodexBranchOption>();
-  const branchesByParent = new Map<string, CodexBranchOption[]>();
+  const branchById = new Map<string, SessionBranchOption>();
+  const branchByKey = new Map<string, SessionBranchOption>();
+  const branchesByParent = new Map<string, SessionBranchOption[]>();
 
   for (const branch of branchState.branches) {
-    branchByKey.set(
-      codexBranchMessageKey(branch.createdAt, branch.prompt),
-      branch,
-    );
+    branchById.set(branch.id, branch);
+    branchByKey.set(branchMessageKey(branch.createdAt, branch.prompt), branch);
 
     const parentKey = branch.parentId ?? "<root>";
     const siblings = branchesByParent.get(parentKey) ?? [];
@@ -353,25 +366,34 @@ function annotateCodexBranchMessages(
     const text = getNormalizedUserText(message);
     if (!text) return message;
 
-    const branch = branchByKey.get(
-      codexBranchMessageKey(message.timestamp, text),
-    );
+    const messageId =
+      typeof message.uuid === "string"
+        ? message.uuid
+        : typeof message.id === "string"
+          ? message.id
+          : undefined;
+    const branch =
+      (messageId ? branchById.get(messageId) : undefined) ??
+      branchByKey.get(branchMessageKey(message.timestamp, text));
     if (!branch || branch.siblingCount <= 1) return message;
 
     const parentKey = branch.parentId ?? "<root>";
     const alternatives = branchesByParent.get(parentKey) ?? [branch];
+    const branchMetadata = {
+      sessionId: branchState.sessionId,
+      branchId: branch.id,
+      activeBranchId: branchState.activeBranchId,
+      selectedBranchId: branchState.selectedBranchId,
+      parentId: branch.parentId,
+      siblingIndex: branch.siblingIndex,
+      siblingCount: branch.siblingCount,
+      alternatives,
+    };
+
     return {
       ...message,
-      codexBranch: {
-        sessionId: branchState.sessionId,
-        branchId: branch.id,
-        activeBranchId: branchState.activeBranchId,
-        selectedBranchId: branchState.selectedBranchId,
-        parentId: branch.parentId,
-        siblingIndex: branch.siblingIndex,
-        siblingCount: branch.siblingCount,
-        alternatives,
-      },
+      branch: branchMetadata,
+      ...(options.includeCodexAlias && { codexBranch: branchMetadata }),
     };
   });
 }

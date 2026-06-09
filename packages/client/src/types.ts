@@ -5,6 +5,8 @@ import type {
   AppMessage,
   CodexBranchOption,
   CodexBranchState,
+  SessionBranchOption,
+  SessionBranchState,
 } from "@yep-anywhere/shared";
 
 // Re-export shared types
@@ -40,6 +42,8 @@ export type {
   PendingInputType,
   AgentActivity,
   ContextUsage,
+  SessionBranchOption,
+  SessionBranchState,
   CodexBranchOption,
   CodexBranchState,
   SessionOwnership,
@@ -123,6 +127,17 @@ export interface Message {
   isSubagent?: boolean;
   /** True if message is still being streamed (incomplete) */
   _isStreaming?: boolean;
+  /** Provider-agnostic branch metadata for editable conversation history. */
+  branch?: {
+    sessionId: string;
+    branchId: string;
+    activeBranchId: string | null;
+    selectedBranchId: string | null;
+    parentId: string | null;
+    siblingIndex: number;
+    siblingCount: number;
+    alternatives: SessionBranchOption[];
+  };
   /** Codex-only branch metadata derived from thread_rolled_back markers. */
   codexBranch?: {
     sessionId: string;
@@ -153,6 +168,8 @@ export type SessionSummary = AppSessionSummary;
  */
 export interface Session extends SessionSummary {
   messages: Message[];
+  /** Provider-agnostic branch state for sessions with editable DAG/rollback history. */
+  branchState?: SessionBranchState;
   /** Codex-only branch state derived from thread_rolled_back markers. */
   codexBranchState?: CodexBranchState;
 }

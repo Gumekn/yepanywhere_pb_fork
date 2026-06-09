@@ -1,5 +1,11 @@
-import type { ClaudeSessionEntry } from "@yep-anywhere/shared";
 import {
+  type ClaudeSessionEntry,
+  type SessionBranchOption,
+  type SessionBranchState,
+  getLogicalParentUuid,
+} from "@yep-anywhere/shared";
+import {
+  type DagNode,
   buildDag,
   collectAllToolResultIds,
   findOrphanedToolUses,
@@ -12,8 +18,297 @@ export interface VisibleClaudeEntriesResult {
   orphanedToolUses: Set<string>;
 }
 
+export interface ClaudeBranchView extends VisibleClaudeEntriesResult {
+  branchState: SessionBranchState;
+}
+
 interface NormalizeClaudeEntriesOptions {
   includeOrphans?: boolean;
+  branchId?: string;
+  sessionId?: string;
+}
+
+const SESSION_SETUP_PREFIXES = [
+  "# AGENTS.md instructions",
+  "<environment_context>",
+];
+
+function isSessionSetupText(text: string): boolean {
+  const trimmed = text.trimStart();
+  return SESSION_SETUP_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+function getClaudeUserPromptText(raw: ClaudeSessionEntry): string | null {
+  if (raw.type !== "user") return null;
+
+  const content = raw.message?.content;
+  if (typeof content === "string") {
+    const trimmed = content.trim();
+    return trimmed.length > 0 && !isSessionSetupText(content) ? content : null;
+  }
+
+  if (!Array.isArray(content)) return null;
+  if (
+    content.some(
+      (block) =>
+        block &&
+        typeof block === "object" &&
+        "type" in block &&
+        block.type === "tool_result",
+    )
+  ) {
+    return null;
+  }
+
+  const text = content
+    .map((block) => {
+      if (typeof block === "string") return block;
+      if (!block || typeof block !== "object") return "";
+      return "text" in block && typeof block.text === "string"
+        ? block.text
+        : "";
+    })
+    .join("\n");
+
+  const trimmed = text.trim();
+  return trimmed.length > 0 && !isSessionSetupText(text) ? text : null;
+}
+
+function branchTitle(prompt: string): string {
+  const firstLine = prompt
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  const text = firstLine ?? prompt.trim();
+  if (text.length <= 28) return text;
+  return `${text.slice(0, 27)}...`;
+}
+
+function buildClaudeDagMaps(rawMessages: ClaudeSessionEntry[]): {
+  nodeMap: Map<string, DagNode>;
+  childrenMap: Map<string | null, string[]>;
+} {
+  const nodeMap = new Map<string, DagNode>();
+  const childrenMap = new Map<string | null, string[]>();
+
+  for (let lineIndex = 0; lineIndex < rawMessages.length; lineIndex++) {
+    const raw = rawMessages[lineIndex];
+    if (!raw) continue;
+
+    const uuid = "uuid" in raw ? raw.uuid : undefined;
+    if (!uuid) continue;
+    if (raw.type === "progress") continue;
+
+    const parentUuid = "parentUuid" in raw ? (raw.parentUuid ?? null) : null;
+    const node: DagNode = { uuid, parentUuid, lineIndex, raw };
+    nodeMap.set(uuid, node);
+
+    const children = childrenMap.get(parentUuid) ?? [];
+    children.push(uuid);
+    childrenMap.set(parentUuid, children);
+  }
+
+  return { nodeMap, childrenMap };
+}
+
+function findFallbackParentByLineIndex(
+  beforeLineIndex: number,
+  nodeMap: Map<string, DagNode>,
+  excludeUuids: Set<string>,
+): DagNode | null {
+  let best: DagNode | null = null;
+  for (const node of nodeMap.values()) {
+    if (node.lineIndex >= beforeLineIndex) continue;
+    if (excludeUuids.has(node.uuid)) continue;
+    if (!best || node.lineIndex > best.lineIndex) {
+      best = node;
+    }
+  }
+  return best;
+}
+
+function buildPathToNode(
+  nodeMap: Map<string, DagNode>,
+  tipUuid: string | null,
+): DagNode[] {
+  const path: DagNode[] = [];
+  const visited = new Set<string>();
+  let current = tipUuid ? (nodeMap.get(tipUuid) ?? null) : null;
+
+  while (current && !visited.has(current.uuid)) {
+    visited.add(current.uuid);
+    path.unshift(current);
+
+    let nextUuid = current.parentUuid;
+    const logicalParent = getLogicalParentUuid(current.raw);
+    if (!nextUuid && logicalParent) {
+      nextUuid = logicalParent;
+    }
+
+    let nextNode = nextUuid ? (nodeMap.get(nextUuid) ?? null) : null;
+    if (!nextNode && nextUuid && logicalParent && !nodeMap.has(logicalParent)) {
+      nextNode = findFallbackParentByLineIndex(
+        current.lineIndex,
+        nodeMap,
+        visited,
+      );
+    }
+
+    current = nextNode;
+  }
+
+  return path;
+}
+
+function getTipTimestamp(node: DagNode): string {
+  return "timestamp" in node.raw && typeof node.raw.timestamp === "string"
+    ? node.raw.timestamp
+    : "";
+}
+
+function findLatestTipUnderNode(
+  nodeMap: Map<string, DagNode>,
+  childrenMap: Map<string | null, string[]>,
+  nodeUuid: string,
+): string | null {
+  const root = nodeMap.get(nodeUuid);
+  if (!root) return null;
+
+  let best = root;
+  const stack = [nodeUuid];
+  const visited = new Set<string>();
+
+  while (stack.length > 0) {
+    const uuid = stack.pop();
+    if (!uuid || visited.has(uuid)) continue;
+    visited.add(uuid);
+
+    const node = nodeMap.get(uuid);
+    if (!node) continue;
+    const children = childrenMap.get(uuid) ?? [];
+    if (children.length === 0) {
+      const bestTs = getTipTimestamp(best);
+      const nodeTs = getTipTimestamp(node);
+      if (
+        nodeTs > bestTs ||
+        (nodeTs === bestTs && node.lineIndex > best.lineIndex)
+      ) {
+        best = node;
+      }
+      continue;
+    }
+
+    stack.push(...children);
+  }
+
+  return best.uuid;
+}
+
+function findNearestPromptAncestor(
+  node: DagNode,
+  nodeMap: Map<string, DagNode>,
+  promptIds: Set<string>,
+): string | null {
+  let parentUuid = node.parentUuid;
+  const visited = new Set<string>();
+
+  while (parentUuid && !visited.has(parentUuid)) {
+    visited.add(parentUuid);
+    if (promptIds.has(parentUuid)) return parentUuid;
+    const parent = nodeMap.get(parentUuid);
+    if (!parent) return null;
+    parentUuid = parent.parentUuid;
+  }
+
+  return null;
+}
+
+function buildClaudeBranchState(args: {
+  sessionId: string;
+  selectedBranchId?: string;
+  activeBranch: DagNode[];
+  nodeMap: Map<string, DagNode>;
+}): SessionBranchState {
+  const { sessionId, selectedBranchId, activeBranch, nodeMap } = args;
+  const promptNodes = [...nodeMap.values()].filter(
+    (node) => getClaudeUserPromptText(node.raw) !== null,
+  );
+  const promptIds = new Set(promptNodes.map((node) => node.uuid));
+  const parentById = new Map<string, string | null>();
+
+  for (const node of promptNodes) {
+    parentById.set(
+      node.uuid,
+      findNearestPromptAncestor(node, nodeMap, promptIds),
+    );
+  }
+
+  const depthCache = new Map<string, number>();
+  const depthFor = (id: string): number => {
+    const cached = depthCache.get(id);
+    if (cached !== undefined) return cached;
+    const parentId = parentById.get(id) ?? null;
+    const depth = parentId ? depthFor(parentId) + 1 : 1;
+    depthCache.set(id, depth);
+    return depth;
+  };
+
+  const siblingsByParent = new Map<string, DagNode[]>();
+  for (const node of promptNodes) {
+    const parentKey = parentById.get(node.uuid) ?? "<root>";
+    const siblings = siblingsByParent.get(parentKey) ?? [];
+    siblings.push(node);
+    siblingsByParent.set(parentKey, siblings);
+  }
+  for (const siblings of siblingsByParent.values()) {
+    siblings.sort((a, b) => a.lineIndex - b.lineIndex);
+  }
+
+  const activePromptIds = activeBranch
+    .filter((node) => promptIds.has(node.uuid))
+    .map((node) => node.uuid);
+  const activePathIds = new Set(activePromptIds);
+  const activeBranchId =
+    activePromptIds.length > 0
+      ? (activePromptIds[activePromptIds.length - 1] ?? null)
+      : null;
+  const requestedBranchId =
+    selectedBranchId && promptIds.has(selectedBranchId)
+      ? selectedBranchId
+      : activeBranchId;
+
+  const branches: SessionBranchOption[] = promptNodes.map((node, index) => {
+    const prompt = getClaudeUserPromptText(node.raw) ?? "";
+    const parentId = parentById.get(node.uuid) ?? null;
+    const siblings = siblingsByParent.get(parentId ?? "<root>") ?? [node];
+    const siblingIndex = Math.max(0, siblings.indexOf(node));
+
+    return {
+      id: node.uuid,
+      sessionId,
+      parentId,
+      prompt,
+      title: branchTitle(prompt),
+      depth: depthFor(node.uuid),
+      index: index + 1,
+      siblingIndex: siblingIndex + 1,
+      siblingCount: siblings.length,
+      isActive: activePathIds.has(node.uuid),
+      createdAt:
+        "timestamp" in node.raw && typeof node.raw.timestamp === "string"
+          ? node.raw.timestamp
+          : undefined,
+      provider: "claude",
+    };
+  });
+
+  return {
+    sessionId,
+    provider: "claude",
+    activeBranchId,
+    selectedBranchId: requestedBranchId,
+    branches,
+  };
 }
 
 function hasQueueOperationContent(raw: ClaudeSessionEntry): boolean {
@@ -77,12 +372,11 @@ function insertEntryByLineIndex(
   entries.splice(insertAt, 0, entry);
 }
 
-export function collectVisibleClaudeEntries(
+function collectVisibleEntriesForBranch(
   rawMessages: ClaudeSessionEntry[],
-  options: NormalizeClaudeEntriesOptions = {},
+  activeBranch: DagNode[],
+  includeOrphans: boolean,
 ): VisibleClaudeEntriesResult {
-  const { includeOrphans = true } = options;
-  const { activeBranch } = buildDag(rawMessages);
   const allToolResultIds = collectAllToolResultIds(rawMessages);
   const orphanedToolUses = includeOrphans
     ? findOrphanedToolUses(activeBranch, allToolResultIds)
@@ -174,5 +468,61 @@ export function collectVisibleClaudeEntries(
   return {
     entries: entries.map((entry) => entry.raw),
     orphanedToolUses,
+  };
+}
+
+export function buildClaudeBranchView(
+  rawMessages: ClaudeSessionEntry[],
+  sessionId: string,
+  selectedBranchId?: string,
+  options: NormalizeClaudeEntriesOptions = {},
+): ClaudeBranchView {
+  const { includeOrphans = true } = options;
+  const dag = buildDag(rawMessages);
+  const { nodeMap, childrenMap } = buildClaudeDagMaps(rawMessages);
+  const branchState = buildClaudeBranchState({
+    sessionId,
+    selectedBranchId,
+    activeBranch: dag.activeBranch,
+    nodeMap,
+  });
+
+  const requestedBranchId =
+    selectedBranchId &&
+    branchState.branches.some((branch) => branch.id === selectedBranchId)
+      ? selectedBranchId
+      : null;
+  const selectedTipId = requestedBranchId
+    ? findLatestTipUnderNode(nodeMap, childrenMap, requestedBranchId)
+    : dag.tip?.uuid;
+  const selectedBranch = requestedBranchId
+    ? buildPathToNode(nodeMap, selectedTipId ?? null)
+    : dag.activeBranch;
+
+  const visible = collectVisibleEntriesForBranch(
+    rawMessages,
+    selectedBranch,
+    includeOrphans,
+  );
+
+  return {
+    ...visible,
+    branchState,
+  };
+}
+
+export function collectVisibleClaudeEntries(
+  rawMessages: ClaudeSessionEntry[],
+  options: NormalizeClaudeEntriesOptions = {},
+): VisibleClaudeEntriesResult {
+  const branchView = buildClaudeBranchView(
+    rawMessages,
+    options.sessionId ?? "claude-session",
+    options.branchId,
+    options,
+  );
+  return {
+    entries: branchView.entries,
+    orphanedToolUses: branchView.orphanedToolUses,
   };
 }

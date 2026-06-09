@@ -247,6 +247,7 @@ export class CodexSessionReader implements ISessionReader {
           entries: finalEntries,
         },
       },
+      branchState: branchView.branchState,
       codexBranchState: branchView.branchState,
     };
   }

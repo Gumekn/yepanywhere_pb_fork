@@ -43,7 +43,7 @@ export interface SessionLoadResult {
 export interface UseSessionMessagesOptions {
   projectId: string;
   sessionId: string;
-  /** Codex-only branch id selected from the URL query. */
+  /** Branch id selected from the URL query. */
   branchId?: string;
   /** Called when initial load completes with session data */
   onLoadComplete?: (result: SessionLoadResult) => void;
@@ -83,6 +83,10 @@ export interface UseSessionMessagesResult {
   truncateMessagesBefore: (uuid: string) => void;
   /** Fetch new messages incrementally (for file change events) */
   fetchNewMessages: () => Promise<void>;
+  /** Reload the authoritative session snapshot from REST */
+  refreshSessionMessages: (options?: {
+    branchId?: string | null;
+  }) => Promise<Session | null>;
   /** Fetch session metadata only */
   fetchSessionMetadata: () => Promise<void>;
   /** Pagination info from compact-boundary-based loading */
@@ -96,6 +100,14 @@ export interface UseSessionMessagesResult {
 function isCodexProvider(provider?: string): boolean {
   return provider === "codex" || provider === "codex-oss";
 }
+
+/**
+ * Hard cap on messages fetched per chunk (initial load and each "load older").
+ * Compact-boundary slicing already bounds compacted sessions; this also bounds
+ * long sessions that were never compacted, keeping first paint fast. Older
+ * messages load on demand via the top-of-list infinite scroll.
+ */
+const INITIAL_MESSAGE_LIMIT = 100;
 
 function getMessageRole(message: Message): string {
   const nestedRole = (message.message as { role?: unknown } | undefined)?.role;
@@ -187,11 +199,12 @@ export function useSessionMessages(
 
   // Track last message ID for incremental fetching
   const lastMessageIdRef = useRef<string | undefined>(undefined);
+  const loadedMessageCountRef = useRef(0);
   // Highest timestamp observed from persisted JSONL messages.
   // Used to suppress startup replay events that are already on disk.
   const maxPersistedTimestampMsRef = useRef<number>(Number.NEGATIVE_INFINITY);
   // Tracks whether the same session has already completed its first load.
-  // Codex branch changes reuse the page shell and should keep showing the
+  // Branch changes reuse the page shell and should keep showing the
   // previous message list until the selected branch content arrives.
   const loadedSessionKeyRef = useRef<string | null>(null);
 
@@ -215,6 +228,7 @@ export function useSessionMessages(
     if (lastMessage) {
       lastMessageIdRef.current = getMessageId(lastMessage);
     }
+    loadedMessageCountRef.current = messages.length;
   }, [messages]);
 
   // Process a stream message event.
@@ -295,7 +309,45 @@ export function useSessionMessages(
     }
   }, [processStreamMessage, processStreamSubagentMessage]);
 
-  // Initial load. Codex branch switches reload message content for the same
+  const applySessionSnapshot = useCallback(
+    (data: {
+      session: Session;
+      messages: Message[];
+      pagination?: PaginationInfo;
+    }) => {
+      setSession(data.session);
+      setPagination(data.pagination);
+      providerRef.current = data.session.provider;
+
+      // Tag messages from JSONL as authoritative
+      const taggedMessages = data.messages.map((m) => ({
+        ...m,
+        _source: "jsonl" as const,
+      }));
+      maxPersistedTimestampMsRef.current = Number.NEGATIVE_INFINITY;
+      updatePersistedTimestampWatermark(taggedMessages);
+      setMessages(
+        isCodexProvider(data.session.provider)
+          ? reconcileCodexLinearMessages(taggedMessages)
+          : taggedMessages,
+      );
+
+      // Update lastMessageIdRef synchronously to avoid race condition:
+      // stream "connected" event calls fetchNewMessages() immediately, but the
+      // useEffect that normally updates lastMessageIdRef runs asynchronously.
+      // Without this, fetchNewMessages() would use undefined and refetch everything.
+      const lastMessage = taggedMessages[taggedMessages.length - 1];
+      lastMessageIdRef.current = lastMessage
+        ? getMessageId(lastMessage)
+        : undefined;
+
+      loadedMessageCountRef.current = taggedMessages.length;
+      return data.session;
+    },
+    [updatePersistedTimestampWatermark],
+  );
+
+  // Initial load. Branch switches reload message content for the same
   // session without returning the page to its full-screen loading state.
   useEffect(() => {
     const sessionLoadKey = `${projectId}\u0000${sessionId}`;
@@ -314,34 +366,12 @@ export function useSessionMessages(
     api
       .getSession(projectId, sessionId, undefined, {
         tailCompactions: 2,
+        maxMessages: INITIAL_MESSAGE_LIMIT,
         branchId,
       })
       .then((data) => {
         if (!isCurrent) return;
-        setSession(data.session);
-        setPagination(data.pagination);
-        providerRef.current = data.session.provider;
-
-        // Tag messages from JSONL as authoritative
-        const taggedMessages = data.messages.map((m) => ({
-          ...m,
-          _source: "jsonl" as const,
-        }));
-        updatePersistedTimestampWatermark(taggedMessages);
-        setMessages(
-          isCodexProvider(data.session.provider)
-            ? reconcileCodexLinearMessages(taggedMessages)
-            : taggedMessages,
-        );
-
-        // Update lastMessageIdRef synchronously to avoid race condition:
-        // stream "connected" event calls fetchNewMessages() immediately, but the
-        // useEffect that normally updates lastMessageIdRef runs asynchronously.
-        // Without this, fetchNewMessages() would use undefined and refetch everything.
-        const lastMessage = taggedMessages[taggedMessages.length - 1];
-        lastMessageIdRef.current = lastMessage
-          ? getMessageId(lastMessage)
-          : undefined;
+        applySessionSnapshot(data);
 
         // Mark ready and flush buffer
         initialLoadCompleteRef.current = true;
@@ -376,7 +406,7 @@ export function useSessionMessages(
     onLoadComplete,
     onLoadError,
     flushBuffer,
-    updatePersistedTimestampWatermark,
+    applySessionSnapshot,
   ]);
 
   // Handle streaming content updates (from useStreamingContent)
@@ -502,6 +532,29 @@ export function useSessionMessages(
     }
   }, [projectId, sessionId, branchId, updatePersistedTimestampWatermark]);
 
+  const refreshSessionMessages = useCallback(
+    async (options?: { branchId?: string | null }) => {
+      const resolvedBranchId =
+        options?.branchId === undefined
+          ? branchId
+          : (options.branchId ?? undefined);
+      try {
+        const data = await api.getSession(projectId, sessionId, undefined, {
+          tailCompactions: 2,
+          maxMessages: Math.max(
+            INITIAL_MESSAGE_LIMIT,
+            loadedMessageCountRef.current,
+          ),
+          branchId: resolvedBranchId,
+        });
+        return applySessionSnapshot(data);
+      } catch {
+        return null;
+      }
+    },
+    [projectId, sessionId, branchId, applySessionSnapshot],
+  );
+
   // Load older messages (previous chunk before the current truncation point)
   const loadOlderMessages = useCallback(async () => {
     if (!pagination?.hasOlderMessages || !pagination.truncatedBeforeMessageId) {
@@ -511,6 +564,7 @@ export function useSessionMessages(
     try {
       const data = await api.getSession(projectId, sessionId, undefined, {
         tailCompactions: 2,
+        maxMessages: INITIAL_MESSAGE_LIMIT,
         beforeMessageId: pagination.truncatedBeforeMessageId,
         branchId,
       });
@@ -586,6 +640,7 @@ export function useSessionMessages(
     setMessages,
     truncateMessagesBefore,
     fetchNewMessages,
+    refreshSessionMessages,
     fetchSessionMetadata,
     pagination,
     loadingOlder,

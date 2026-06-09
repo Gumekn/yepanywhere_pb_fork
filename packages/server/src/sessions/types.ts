@@ -7,6 +7,7 @@
 
 import type {
   CodexBranchState,
+  SessionBranchState,
   UnifiedSession,
   UrlProjectId,
 } from "@yep-anywhere/shared";
@@ -18,7 +19,7 @@ import type { Message, Session, SessionSummary } from "../supervisor/types.js";
 export interface GetSessionOptions {
   /** Include orphaned tool use detection (default: true, only applicable for Claude) */
   includeOrphans?: boolean;
-  /** Codex-only: choose a derived branch id to render instead of the latest branch. */
+  /** Choose a derived branch id to render instead of the latest branch. */
   branchId?: string;
 }
 
@@ -26,6 +27,12 @@ export interface GetSessionOptions {
 export interface LoadedSession {
   summary: SessionSummary;
   data: UnifiedSession;
+  /** Internal: Claude messages have already been projected to the selected visible branch. */
+  messagesAlreadyProjected?: boolean;
+  /** Internal: orphaned tool IDs computed while projecting Claude messages. */
+  orphanedToolUses?: Set<string>;
+  /** Provider-agnostic branch state for sessions with editable DAG/rollback history. */
+  branchState?: SessionBranchState;
   /** Codex-only branch state derived from thread_rolled_back markers. */
   codexBranchState?: CodexBranchState;
 }

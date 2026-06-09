@@ -15,6 +15,21 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "fixtures", "agents");
 
+function messageText(message: { message?: { content?: unknown } }): string {
+  const content = message.message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => {
+      if (typeof block === "string") return block;
+      if (!block || typeof block !== "object") return "";
+      return "text" in block && typeof block.text === "string"
+        ? block.text
+        : "";
+    })
+    .join("\n");
+}
+
 describe("SessionReader", () => {
   let testDir: string;
   let reader: SessionReader;
@@ -259,6 +274,125 @@ describe("SessionReader", () => {
 
       expect(session?.messages).toHaveLength(3); // a, d, e (not b, c)
       expect(session?.messages.map((m) => m.uuid)).toEqual(["a", "d", "e"]);
+    });
+
+    it("projects Claude prompt branches and annotates sibling choices", async () => {
+      const sessionId = "dag-branch-test";
+      const entries: ClaudeSessionEntry[] = [
+        {
+          type: "user",
+          uuid: "u1",
+          parentUuid: null,
+          timestamp: "2024-01-01T00:00:01Z",
+          message: { role: "user", content: "q1" },
+        },
+        {
+          type: "assistant",
+          uuid: "a1",
+          parentUuid: "u1",
+          timestamp: "2024-01-01T00:00:02Z",
+          message: { role: "assistant", content: "a1" },
+        },
+        {
+          type: "user",
+          uuid: "u2-old",
+          parentUuid: "a1",
+          timestamp: "2024-01-01T00:00:03Z",
+          message: { role: "user", content: "q2 old" },
+        },
+        {
+          type: "assistant",
+          uuid: "a2-old",
+          parentUuid: "u2-old",
+          timestamp: "2024-01-01T00:00:04Z",
+          message: { role: "assistant", content: "a2 old" },
+        },
+        {
+          type: "user",
+          uuid: "u3-old",
+          parentUuid: "a2-old",
+          timestamp: "2024-01-01T00:00:05Z",
+          message: { role: "user", content: "q3 old" },
+        },
+        {
+          type: "assistant",
+          uuid: "a3-old",
+          parentUuid: "u3-old",
+          timestamp: "2024-01-01T00:00:06Z",
+          message: { role: "assistant", content: "a3 old" },
+        },
+        {
+          type: "user",
+          uuid: "u2-new",
+          parentUuid: "a1",
+          timestamp: "2024-01-01T00:00:10Z",
+          message: { role: "user", content: "q2 new" },
+        },
+        {
+          type: "assistant",
+          uuid: "a2-new",
+          parentUuid: "u2-new",
+          timestamp: "2024-01-01T00:00:11Z",
+          message: { role: "assistant", content: "a2 new" },
+        },
+      ];
+      const jsonl = entries.map((entry) => JSON.stringify(entry)).join("\n");
+      await writeFile(join(testDir, `${sessionId}.jsonl`), `${jsonl}\n`);
+
+      const activeLoaded = await reader.getSession(
+        sessionId,
+        "test-project" as UrlProjectId,
+      );
+      const activeSession = activeLoaded
+        ? normalizeSession(activeLoaded)
+        : null;
+
+      expect(activeSession?.messages.map(messageText)).toEqual([
+        "q1",
+        "a1",
+        "q2 new",
+        "a2 new",
+      ]);
+      expect(activeSession?.branchState?.activeBranchId).toBe("u2-new");
+      expect(activeSession?.branchState?.selectedBranchId).toBe("u2-new");
+      const activePrompt = activeSession?.messages.find(
+        (message) => message.uuid === "u2-new",
+      );
+      expect(activePrompt?.branch).toMatchObject({
+        branchId: "u2-new",
+        siblingIndex: 2,
+        siblingCount: 2,
+      });
+      expect(
+        activePrompt?.branch?.alternatives.map((branch) => branch.id),
+      ).toEqual(["u2-old", "u2-new"]);
+
+      const oldLoaded = await reader.getSession(
+        sessionId,
+        "test-project" as UrlProjectId,
+        undefined,
+        { branchId: "u2-old" },
+      );
+      const oldSession = oldLoaded ? normalizeSession(oldLoaded) : null;
+
+      expect(oldSession?.messages.map(messageText)).toEqual([
+        "q1",
+        "a1",
+        "q2 old",
+        "a2 old",
+        "q3 old",
+        "a3 old",
+      ]);
+      expect(oldSession?.branchState?.activeBranchId).toBe("u2-new");
+      expect(oldSession?.branchState?.selectedBranchId).toBe("u2-old");
+      const oldPrompt = oldSession?.messages.find(
+        (message) => message.uuid === "u2-old",
+      );
+      expect(oldPrompt?.branch).toMatchObject({
+        branchId: "u2-old",
+        siblingIndex: 1,
+        siblingCount: 2,
+      });
     });
 
     it("marks orphaned tool calls with orphanedToolUseIds", async () => {

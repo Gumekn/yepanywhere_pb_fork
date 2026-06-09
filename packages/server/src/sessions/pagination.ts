@@ -45,11 +45,17 @@ function isCompactBoundary(m: Message): boolean {
  * @param tailCompactions - Number of compact boundaries to include from the end
  * @param beforeMessageId - Optional cursor: only consider messages before this ID
  *                          (used for loading progressively older chunks)
+ * @param maxMessages - Optional hard cap on the number of returned messages. When
+ *                      the compact-boundary slice still exceeds this count (e.g.
+ *                      a long session that was never compacted), only the last
+ *                      `maxMessages` are returned. Older messages remain reachable
+ *                      via the "load older" cursor.
  */
 export function sliceAtCompactBoundaries(
   messages: Message[],
   tailCompactions: number,
   beforeMessageId?: string,
+  maxMessages?: number,
 ): SliceResult {
   const totalMessageCount = messages.length;
 
@@ -76,16 +82,19 @@ export function sliceAtCompactBoundaries(
 
   // If fewer or equal compactions than requested, return everything
   if (compactIndices.length <= tailCompactions) {
-    return {
-      messages: workingMessages,
-      pagination: {
-        hasOlderMessages: false,
-        totalMessageCount,
-        returnedMessageCount: workingMessages.length,
-        truncatedBeforeMessageId: undefined,
-        totalCompactions,
+    return capByCount(
+      {
+        messages: workingMessages,
+        pagination: {
+          hasOlderMessages: false,
+          totalMessageCount,
+          returnedMessageCount: workingMessages.length,
+          truncatedBeforeMessageId: undefined,
+          totalCompactions,
+        },
       },
-    };
+      maxMessages,
+    );
   }
 
   // Slice starting from the Nth-from-last compact boundary (inclusive)
@@ -96,14 +105,45 @@ export function sliceAtCompactBoundaries(
     ? getMessageId(slicedMessages[0])
     : undefined;
 
+  return capByCount(
+    {
+      messages: slicedMessages,
+      pagination: {
+        hasOlderMessages: true,
+        totalMessageCount,
+        returnedMessageCount: slicedMessages.length,
+        truncatedBeforeMessageId: firstId,
+        totalCompactions,
+      },
+    },
+    maxMessages,
+  );
+}
+
+/**
+ * Apply a hard message-count cap to an already-sliced result. Keeps only the
+ * last `maxMessages` entries so a long, never-compacted session doesn't ship
+ * (and re-render) thousands of messages on first load. The dropped prefix stays
+ * reachable through the "load older" cursor.
+ *
+ * No-op when `maxMessages` is unset or the slice already fits — preserving the
+ * original compact-boundary behavior for callers that don't pass a cap.
+ */
+function capByCount(result: SliceResult, maxMessages?: number): SliceResult {
+  if (maxMessages === undefined || result.messages.length <= maxMessages) {
+    return result;
+  }
+
+  const capped = result.messages.slice(-maxMessages);
   return {
-    messages: slicedMessages,
+    messages: capped,
     pagination: {
+      ...result.pagination,
       hasOlderMessages: true,
-      totalMessageCount,
-      returnedMessageCount: slicedMessages.length,
-      truncatedBeforeMessageId: firstId,
-      totalCompactions,
+      returnedMessageCount: capped.length,
+      truncatedBeforeMessageId: capped[0]
+        ? getMessageId(capped[0])
+        : result.pagination.truncatedBeforeMessageId,
     },
   };
 }

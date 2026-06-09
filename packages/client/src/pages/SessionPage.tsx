@@ -47,7 +47,7 @@ import { useNavigationLayout } from "../layouts";
 import { getMessageId } from "../lib/mergeMessages";
 import { preprocessMessages } from "../lib/preprocessMessages";
 import { generateUUID } from "../lib/uuid";
-import type { Message } from "../types";
+import type { Message, Session } from "../types";
 import { getSessionDisplayTitle } from "../utils";
 
 export function SessionPage() {
@@ -101,6 +101,13 @@ function calculateCodexRollbackNumTurns(
   return rollbackNumTurns > 0 ? rollbackNumTurns : null;
 }
 
+function hasBranchChoices(session: Session | null | undefined): boolean {
+  const branchState = session?.branchState ?? session?.codexBranchState;
+  return (
+    branchState?.branches.some((branch) => branch.siblingCount > 1) ?? false
+  );
+}
+
 function SessionPageContent({
   projectId,
   sessionId,
@@ -125,6 +132,8 @@ function SessionPageContent({
     initialTitle?: string;
     initialModel?: string;
     initialProvider?: ProviderName;
+    /** Message id to scroll to + highlight (set by search deep-links). */
+    targetMessageId?: string;
   } | null;
   const initialStatus = navState?.initialStatus;
   const initialTitle = navState?.initialTitle;
@@ -185,6 +194,7 @@ function SessionPageContent({
     loadOlderMessages,
     reconnectStream,
     truncateMessagesBefore,
+    refreshSessionMessages,
   } = useSession(
     projectId,
     sessionId,
@@ -238,14 +248,28 @@ function SessionPageContent({
   const [pendingBranchFocusId, setPendingBranchFocusId] = useState<
     string | null
   >(null);
+  const [pendingEditBranchRefresh, setPendingEditBranchRefresh] =
+    useState(false);
+  const editBranchRefreshAttemptsRef = useRef(0);
+  const editBranchRefreshTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  // Deep-link target message (from search). Seeded from navigation state once.
+  const [targetMessageId, setTargetMessageId] = useState<string | null>(
+    navState?.targetMessageId ?? null,
+  );
+  const handleTargetFocused = useCallback(() => {
+    setTargetMessageId(null);
+  }, []);
 
-  const isViewingHistoricalCodexBranch = useMemo(() => {
-    if (!selectedBranchId || session?.provider !== "codex") return false;
-    const selectedBranch = session.codexBranchState?.branches.find(
+  const sessionBranchState = session?.branchState ?? session?.codexBranchState;
+  const isViewingHistoricalBranch = useMemo(() => {
+    if (!selectedBranchId || !sessionBranchState) return false;
+    const selectedBranch = sessionBranchState.branches.find(
       (branch) => branch.id === selectedBranchId,
     );
     return selectedBranch ? !selectedBranch.isActive : false;
-  }, [selectedBranchId, session?.provider, session?.codexBranchState]);
+  }, [selectedBranchId, sessionBranchState]);
 
   const handleEditUserPrompt = useCallback(
     ({
@@ -253,7 +277,7 @@ function SessionPageContent({
       uuid,
       parentUuid,
     }: { text: string; uuid: string; parentUuid: string | null }) => {
-      if (isViewingHistoricalCodexBranch) return;
+      if (isViewingHistoricalBranch) return;
       const rollbackNumTurns = isCodexAppServerProvider(effectiveProvider)
         ? calculateCodexRollbackNumTurns(messages, uuid)
         : null;
@@ -261,10 +285,10 @@ function SessionPageContent({
       draftControlsRef.current?.setText(text);
       setScrollTrigger((prev) => prev + 1);
     },
-    [effectiveProvider, isViewingHistoricalCodexBranch, messages],
+    [effectiveProvider, isViewingHistoricalBranch, messages],
   );
 
-  const handleSelectCodexBranch = useCallback(
+  const handleSelectBranch = useCallback(
     (branchId: string) => {
       setPendingBranchFocusId(branchId);
       setSearchParams(
@@ -279,9 +303,76 @@ function SessionPageContent({
     [setSearchParams],
   );
 
-  const handleCodexBranchFocused = useCallback(() => {
+  const handleBranchFocused = useCallback(() => {
     setPendingBranchFocusId(null);
   }, []);
+
+  const clearEditBranchRefreshTimer = useCallback(() => {
+    if (editBranchRefreshTimerRef.current) {
+      clearTimeout(editBranchRefreshTimerRef.current);
+      editBranchRefreshTimerRef.current = null;
+    }
+  }, []);
+
+  const queueEditBranchRefresh = useCallback(() => {
+    editBranchRefreshAttemptsRef.current = 0;
+    clearEditBranchRefreshTimer();
+    setPendingEditBranchRefresh(true);
+  }, [clearEditBranchRefreshTimer]);
+
+  const clearSelectedBranchAfterEdit = useCallback(() => {
+    setPendingBranchFocusId(null);
+    if (!selectedBranchId) return;
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("branch");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [selectedBranchId, setSearchParams]);
+
+  useEffect(() => clearEditBranchRefreshTimer, [clearEditBranchRefreshTimer]);
+
+  useEffect(() => {
+    if (!pendingEditBranchRefresh) return;
+    if (processState !== "idle" && status.owner === "self") return;
+
+    let cancelled = false;
+    const refreshActiveBranch = async () => {
+      clearSelectedBranchAfterEdit();
+      const refreshedSession = await refreshSessionMessages({ branchId: null });
+      if (cancelled) return;
+
+      const attempt = editBranchRefreshAttemptsRef.current;
+      if (
+        (hasBranchChoices(refreshedSession) && attempt >= 1) ||
+        attempt >= 2
+      ) {
+        setPendingEditBranchRefresh(false);
+        return;
+      }
+
+      editBranchRefreshAttemptsRef.current = attempt + 1;
+      editBranchRefreshTimerRef.current = setTimeout(refreshActiveBranch, 600);
+    };
+
+    clearEditBranchRefreshTimer();
+    editBranchRefreshTimerRef.current = setTimeout(refreshActiveBranch, 150);
+
+    return () => {
+      cancelled = true;
+      clearEditBranchRefreshTimer();
+    };
+  }, [
+    clearEditBranchRefreshTimer,
+    clearSelectedBranchAfterEdit,
+    pendingEditBranchRefresh,
+    processState,
+    refreshSessionMessages,
+    status.owner,
+  ]);
 
   const handleCancelEdit = useCallback(() => {
     setEditRewind(null);
@@ -502,6 +593,7 @@ function SessionPageContent({
           );
           draftControlsRef.current?.clearDraft();
           setStatus({ owner: "self", processId: result.processId });
+          queueEditBranchRefresh();
           reconnectStream();
         } else if (editRewind.parentUuid) {
           truncateMessagesBefore(editRewind.uuid);
@@ -516,6 +608,7 @@ function SessionPageContent({
           );
           draftControlsRef.current?.clearDraft();
           setStatus({ owner: "self", processId: result.processId });
+          queueEditBranchRefresh();
           reconnectStream();
         } else {
           // Edited the first message — no parent to rewind to; start fresh.
@@ -1309,16 +1402,18 @@ function SessionPageContent({
                   loadingOlder={loadingOlder}
                   onLoadOlderMessages={loadOlderMessages}
                   onEditUserPrompt={
-                    !isViewingHistoricalCodexBranch &&
+                    !isViewingHistoricalBranch &&
                     (session?.provider === "claude" ||
                       session?.provider === "codex" ||
                       !session?.provider)
                       ? handleEditUserPrompt
                       : undefined
                   }
-                  onSelectCodexBranch={handleSelectCodexBranch}
-                  focusCodexBranchId={pendingBranchFocusId}
-                  onCodexBranchFocused={handleCodexBranchFocused}
+                  onSelectBranch={handleSelectBranch}
+                  focusBranchId={pendingBranchFocusId}
+                  onBranchFocused={handleBranchFocused}
+                  targetMessageId={targetMessageId}
+                  onTargetFocused={handleTargetFocused}
                 />
               </AgentContentProvider>
             </SessionMetadataProvider>

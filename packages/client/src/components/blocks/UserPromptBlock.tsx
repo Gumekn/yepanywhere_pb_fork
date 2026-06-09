@@ -5,7 +5,11 @@ import {
   getFilename,
   parseUserPrompt,
 } from "../../lib/parseUserPrompt";
-import type { CodexBranchOption, ContentBlock } from "../../types";
+import type {
+  CodexBranchOption,
+  ContentBlock,
+  SessionBranchOption,
+} from "../../types";
 import { MessageActions } from "../MessageActions";
 import { Modal } from "../ui/Modal";
 
@@ -16,7 +20,18 @@ interface Props {
   content: string | ContentBlock[];
   /** ISO timestamp from the source JSONL entry, used for hover-revealed time. */
   timestamp?: string;
-  /** Codex-only branch metadata derived from thread_rolled_back markers. */
+  /** Provider-agnostic branch metadata for editable conversation history. */
+  branch?: {
+    sessionId: string;
+    branchId: string;
+    activeBranchId: string | null;
+    selectedBranchId: string | null;
+    parentId: string | null;
+    siblingIndex: number;
+    siblingCount: number;
+    alternatives: SessionBranchOption[];
+  };
+  /** Codex-only compatibility alias for branch metadata. */
   codexBranch?: {
     sessionId: string;
     branchId: string;
@@ -27,7 +42,9 @@ interface Props {
     siblingCount: number;
     alternatives: CodexBranchOption[];
   };
-  /** Codex-only: switch the rendered derived branch. */
+  /** Switch the rendered derived branch. */
+  onSelectBranch?: (branchId: string) => void;
+  /** Codex-only compatibility alias for branch switching. */
   onSelectCodexBranch?: (branchId: string) => void;
   /**
    * When provided, show an edit button on the prompt. Called with the parsed
@@ -297,11 +314,11 @@ function UploadedFilesMetadata({ files }: { files: UploadedFileInfo[] }) {
   );
 }
 
-function CodexBranchControls({
+function BranchControls({
   branch,
   onSelect,
 }: {
-  branch: NonNullable<Props["codexBranch"]>;
+  branch: NonNullable<Props["branch"]>;
   onSelect?: (branchId: string) => void;
 }) {
   if (branch.alternatives.length <= 1) return null;
@@ -317,11 +334,14 @@ function CodexBranchControls({
 
   return (
     <div className="codex-branch-panel">
-      <div className="codex-branch-switcher" aria-label="Codex branch switcher">
+      <div
+        className="codex-branch-switcher"
+        aria-label="Conversation branch switcher"
+      >
         <button
           type="button"
           className="codex-branch-nav"
-          aria-label="Previous Codex branch"
+          aria-label="Previous conversation branch"
           disabled={!previousBranch || !onSelect}
           onClick={() => previousBranch && onSelect?.(previousBranch.id)}
         >
@@ -333,7 +353,7 @@ function CodexBranchControls({
         <button
           type="button"
           className="codex-branch-nav"
-          aria-label="Next Codex branch"
+          aria-label="Next conversation branch"
           disabled={!nextBranch || !onSelect}
           onClick={() => nextBranch && onSelect?.(nextBranch.id)}
         >
@@ -400,10 +420,15 @@ function CollapsibleText({ text }: { text: string }) {
 export const UserPromptBlock = memo(function UserPromptBlock({
   content,
   timestamp,
+  branch,
   codexBranch,
+  onSelectBranch,
   onSelectCodexBranch,
   onEdit,
 }: Props) {
+  const branchMetadata = branch ?? codexBranch;
+  const handleSelectBranch = onSelectBranch ?? onSelectCodexBranch;
+
   if (typeof content === "string") {
     const { text, openedFiles, uploadedFiles } = parseUserPrompt(content);
 
@@ -431,10 +456,10 @@ export const UserPromptBlock = memo(function UserPromptBlock({
             <UploadedFilesMetadata files={uploadedFiles} />
           </div>
         </div>
-        {codexBranch && (
-          <CodexBranchControls
-            branch={codexBranch}
-            onSelect={onSelectCodexBranch}
+        {branchMetadata && (
+          <BranchControls
+            branch={branchMetadata}
+            onSelect={handleSelectBranch}
           />
         )}
         <OpenedFilesMetadata files={openedFiles} />
@@ -486,11 +511,8 @@ export const UserPromptBlock = memo(function UserPromptBlock({
           <UploadedFilesMetadata files={allUploadedFiles} />
         </div>
       </div>
-      {codexBranch && (
-        <CodexBranchControls
-          branch={codexBranch}
-          onSelect={onSelectCodexBranch}
-        />
+      {branchMetadata && (
+        <BranchControls branch={branchMetadata} onSelect={handleSelectBranch} />
       )}
       <OpenedFilesMetadata files={openedFiles} />
     </div>

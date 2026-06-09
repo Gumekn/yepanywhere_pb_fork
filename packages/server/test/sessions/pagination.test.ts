@@ -281,4 +281,100 @@ describe("sliceAtCompactBoundaries", () => {
     expect(result.pagination.totalCompactions).toBe(2);
     expect(result.pagination.hasOlderMessages).toBe(true);
   });
+
+  describe("maxMessages count cap", () => {
+    it("caps a long never-compacted session to the last N messages", () => {
+      const messages = Array.from({ length: 250 }, (_, i) =>
+        msg(i % 2 === 0 ? "user" : "assistant", `m${i}`),
+      );
+
+      const result = sliceAtCompactBoundaries(messages, 2, undefined, 100);
+
+      expect(result.messages.length).toBe(100);
+      // Last 100 → m150..m249
+      expect(result.messages[0]?.uuid).toBe("m150");
+      expect(result.messages[99]?.uuid).toBe("m249");
+      expect(result.pagination).toEqual({
+        hasOlderMessages: true,
+        totalMessageCount: 250,
+        returnedMessageCount: 100,
+        truncatedBeforeMessageId: "m150",
+        totalCompactions: 0,
+      } satisfies PaginationInfo);
+    });
+
+    it("is a no-op when the compact slice already fits under the cap", () => {
+      const messages = [
+        msg("user", "u1"),
+        compactBoundary("cb1"),
+        msg("assistant", "a1"),
+        compactBoundary("cb2"),
+        msg("user", "u2"),
+      ];
+
+      const withCap = sliceAtCompactBoundaries(messages, 1, undefined, 100);
+      const withoutCap = sliceAtCompactBoundaries(messages, 1);
+
+      // Compact slice (cb2, u2) is well under 100 → cap changes nothing
+      expect(withCap).toEqual(withoutCap);
+    });
+
+    it("preserves existing behavior when no cap is passed", () => {
+      const messages = Array.from({ length: 250 }, (_, i) =>
+        msg(i % 2 === 0 ? "user" : "assistant", `m${i}`),
+      );
+
+      const result = sliceAtCompactBoundaries(messages, 2);
+
+      // No cap → all 250 returned, no truncation (the pre-existing bug this
+      // change mitigates, kept here to lock in backward compatibility)
+      expect(result.messages.length).toBe(250);
+      expect(result.pagination.hasOlderMessages).toBe(false);
+    });
+
+    it("caps each older chunk loaded via beforeMessageId", () => {
+      // 300 messages, no compactions. First load returns last 100; the older
+      // chunk before that cursor must also be capped to 100.
+      const messages = Array.from({ length: 300 }, (_, i) =>
+        msg(i % 2 === 0 ? "user" : "assistant", `m${i}`),
+      );
+
+      const first = sliceAtCompactBoundaries(messages, 2, undefined, 100);
+      expect(first.messages[0]?.uuid).toBe("m200");
+
+      const older = sliceAtCompactBoundaries(
+        messages,
+        2,
+        first.pagination.truncatedBeforeMessageId,
+        100,
+      );
+
+      // Working set is m0..m199; capped to last 100 → m100..m199
+      expect(older.messages.length).toBe(100);
+      expect(older.messages[0]?.uuid).toBe("m100");
+      expect(older.messages[99]?.uuid).toBe("m199");
+      expect(older.pagination.hasOlderMessages).toBe(true);
+      expect(older.pagination.truncatedBeforeMessageId).toBe("m100");
+    });
+
+    it("applies the cap after a compact-boundary slice that still exceeds it", () => {
+      // Last compaction is early, leaving a huge tail after it.
+      const messages = [
+        msg("user", "u0"),
+        compactBoundary("cb1"),
+        ...Array.from({ length: 200 }, (_, i) =>
+          msg(i % 2 === 0 ? "user" : "assistant", `t${i}`),
+        ),
+      ];
+
+      const result = sliceAtCompactBoundaries(messages, 1, undefined, 100);
+
+      // Slice from cb1 = 201 messages, then capped to last 100 → t100..t199
+      expect(result.messages.length).toBe(100);
+      expect(result.messages[0]?.uuid).toBe("t100");
+      expect(result.pagination.hasOlderMessages).toBe(true);
+      expect(result.pagination.truncatedBeforeMessageId).toBe("t100");
+      expect(result.pagination.totalCompactions).toBe(1);
+    });
+  });
 });

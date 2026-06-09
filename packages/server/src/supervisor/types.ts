@@ -8,6 +8,7 @@ import type {
   PendingInputType,
   PermissionRules,
   ProviderName,
+  SessionBranchState,
   ThinkingConfig,
   UrlProjectId,
 } from "@yep-anywhere/shared";
@@ -111,6 +112,8 @@ export interface SessionSummary {
   approvalPolicy?: string;
   /** Sandbox policy from turn_context */
   sandboxPolicy?: SessionSandboxPolicy;
+  /** Provider-agnostic branch state for sessions with editable DAG/rollback history. */
+  branchState?: SessionBranchState;
   /** Codex-only branch state derived from thread_rolled_back markers. */
   codexBranchState?: CodexBranchState;
 }

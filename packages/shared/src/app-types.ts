@@ -104,6 +104,12 @@ export interface AppMessageExtensions {
    */
   isSubagent?: boolean;
 
+  /** Provider-agnostic branch metadata for editable conversation history. */
+  branch?: SessionBranchMetadata;
+
+  /** Codex-only compatibility alias for branch metadata. */
+  codexBranch?: SessionBranchMetadata;
+
   /**
    * Allow any additional fields from JSONL.
    * This makes the type compatible with pass-through of unknown fields.
@@ -341,7 +347,7 @@ export interface SessionSandboxPolicy {
   excludeSlashTmp?: boolean;
 }
 
-export interface CodexBranchOption {
+export interface SessionBranchOption {
   id: string;
   sessionId: string;
   parentId: string | null;
@@ -353,14 +359,30 @@ export interface CodexBranchOption {
   siblingCount: number;
   isActive: boolean;
   createdAt?: string;
+  provider?: ProviderName;
 }
 
-export interface CodexBranchState {
+export interface SessionBranchState {
   sessionId: string;
   activeBranchId: string | null;
   selectedBranchId: string | null;
-  branches: CodexBranchOption[];
+  provider?: ProviderName;
+  branches: SessionBranchOption[];
 }
+
+export interface SessionBranchMetadata {
+  sessionId: string;
+  branchId: string;
+  activeBranchId: string | null;
+  selectedBranchId: string | null;
+  parentId: string | null;
+  siblingIndex: number;
+  siblingCount: number;
+  alternatives: SessionBranchOption[];
+}
+
+export type CodexBranchOption = SessionBranchOption;
+export type CodexBranchState = SessionBranchState;
 
 /**
  * Recent session entry with enriched data from the server.
@@ -415,6 +437,8 @@ export interface AppSessionSummary {
   approvalPolicy?: string;
   /** Sandbox policy from turn_context */
   sandboxPolicy?: SessionSandboxPolicy;
+  /** Provider-agnostic branch state for sessions with editable DAG/rollback history. */
+  branchState?: SessionBranchState;
   /** Codex-only branch state derived from thread_rolled_back markers. */
   codexBranchState?: CodexBranchState;
 }
