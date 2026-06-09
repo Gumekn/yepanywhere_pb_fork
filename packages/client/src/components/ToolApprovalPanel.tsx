@@ -14,9 +14,42 @@ const EDIT_TOOLS = ["Edit", "Write", "NotebookEdit"];
 const isExitPlanMode = (toolName: string | undefined) =>
   toolName === "ExitPlanMode";
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function requestSupportsPersistentApproval(request: InputRequest): boolean {
+  const input = asRecord(request.toolInput);
+  if (!input) return false;
+
+  const availableDecisions = Array.isArray(input.availableDecisions)
+    ? input.availableDecisions
+    : [];
+  if (
+    availableDecisions.some((decision) => {
+      if (decision === "acceptForSession") return true;
+      const decisionRecord = asRecord(decision);
+      return (
+        !!decisionRecord?.acceptWithExecpolicyAmendment ||
+        !!decisionRecord?.applyNetworkPolicyAmendment
+      );
+    })
+  ) {
+    return true;
+  }
+
+  return (
+    input.proposedExecpolicyAmendment !== undefined ||
+    input.proposedNetworkPolicyAmendments !== undefined
+  );
+}
+
 interface Props {
   request: InputRequest;
   sessionId: string;
+  agentName?: string;
   onApprove: () => Promise<void>;
   onDeny: () => Promise<void>;
   onApproveAcceptEdits?: () => Promise<void>;
@@ -33,6 +66,7 @@ const CLICK_PROTECTION_MS = 150;
 export function ToolApprovalPanel({
   request,
   sessionId,
+  agentName = "Claude",
   onApprove,
   onDeny,
   onApproveAcceptEdits,
@@ -59,6 +93,8 @@ export function ToolApprovalPanel({
   }, [request.id]);
 
   const isEditTool = request.toolName && EDIT_TOOLS.includes(request.toolName);
+  const canApprovePersistently =
+    isEditTool || requestSupportsPersistentApproval(request);
 
   const handleApprove = useCallback(async () => {
     setSubmitting(true);
@@ -147,16 +183,20 @@ export function ToolApprovalPanel({
           handleDeny();
         }
       } else {
-        // Standard tool approval: 1=yes, 2=yes+auto (edit tools), 2/3=no
+        // Standard tool approval: 1=yes, 2=yes+persistent, 2/3=no
         if (e.key === "1") {
           e.preventDefault();
           handleApprove();
-        } else if (e.key === "2" && isEditTool && onApproveAcceptEdits) {
+        } else if (
+          e.key === "2" &&
+          canApprovePersistently &&
+          onApproveAcceptEdits
+        ) {
           e.preventDefault();
           handleApproveAcceptEdits();
         } else if (
           e.key === "3" ||
-          (e.key === "2" && (!isEditTool || !onApproveAcceptEdits))
+          (e.key === "2" && (!canApprovePersistently || !onApproveAcceptEdits))
         ) {
           e.preventDefault();
           handleDeny();
@@ -182,7 +222,7 @@ export function ToolApprovalPanel({
     showFeedback,
     feedback,
     clearFeedback,
-    isEditTool,
+    canApprovePersistently,
     onApproveAcceptEdits,
     request.toolName,
   ]);
@@ -330,7 +370,7 @@ export function ToolApprovalPanel({
                   <span>{t("toolApprovalYes")}</span>
                 </button>
 
-                {isEditTool && onApproveAcceptEdits && (
+                {canApprovePersistently && onApproveAcceptEdits && (
                   <button
                     type="button"
                     className="tool-approval-option"
@@ -348,7 +388,9 @@ export function ToolApprovalPanel({
                   onClick={handleDeny}
                   disabled={!armed || submitting}
                 >
-                  <kbd>{isEditTool && onApproveAcceptEdits ? "3" : "2"}</kbd>
+                  <kbd>
+                    {canApprovePersistently && onApproveAcceptEdits ? "3" : "2"}
+                  </kbd>
                   <span>{t("toolApprovalNo")}</span>
                 </button>
               </>
@@ -361,7 +403,9 @@ export function ToolApprovalPanel({
                 onClick={() => setShowFeedback(true)}
                 disabled={!armed || submitting}
               >
-                <span>{t("toolApprovalTellInstead")}</span>
+                <span>
+                  {t("toolApprovalTellInstead", { agent: agentName })}
+                </span>
               </button>
             )}
 
@@ -370,7 +414,9 @@ export function ToolApprovalPanel({
                 <input
                   ref={feedbackInputRef}
                   type="text"
-                  placeholder={t("toolApprovalFeedbackPlaceholder")}
+                  placeholder={t("toolApprovalFeedbackPlaceholder", {
+                    agent: agentName,
+                  })}
                   value={feedback}
                   onChange={(e) => setFeedback(e.target.value)}
                   disabled={!armed || submitting}

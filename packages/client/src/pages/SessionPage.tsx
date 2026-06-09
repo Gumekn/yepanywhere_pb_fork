@@ -85,6 +85,23 @@ function isCodexAppServerProvider(
   return provider === "codex";
 }
 
+function getApprovalAgentName(
+  provider: ProviderName | string | undefined | null,
+): string {
+  switch (provider) {
+    case "codex":
+    case "codex-oss":
+      return "Codex";
+    case "gemini":
+    case "gemini-acp":
+      return "Gemini";
+    case "opencode":
+      return "OpenCode";
+    default:
+      return "Claude";
+  }
+}
+
 function calculateCodexRollbackNumTurns(
   messages: Message[],
   editedUuid: string,
@@ -195,6 +212,7 @@ function SessionPageContent({
     reconnectStream,
     truncateMessagesBefore,
     refreshSessionMessages,
+    markPendingInputResolved,
   } = useSession(
     projectId,
     sessionId,
@@ -226,6 +244,7 @@ function SessionPageContent({
   // Effective provider/model for immediate display before session data loads
   const effectiveProvider = session?.provider ?? initialProvider;
   const effectiveModel = session?.model ?? initialModel;
+  const approvalAgentName = getApprovalAgentName(effectiveProvider);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
   const draftControlsRef = useRef<DraftControls | null>(null);
@@ -795,17 +814,33 @@ function SessionPageContent({
     }
   };
 
+  const handleStalePendingInput = useCallback(() => {
+    markPendingInputResolved("waiting-input");
+  }, [markPendingInputResolved]);
+
   const handleApprove = useCallback(async () => {
     if (pendingInputRequest) {
       try {
         await api.respondToInput(sessionId, pendingInputRequest.id, "approve");
+        markPendingInputResolved("in-turn");
       } catch (err) {
         const status = (err as { status?: number }).status;
+        if (status === 404) {
+          handleStalePendingInput();
+          return;
+        }
         const msg = status ? `Error ${status}` : t("sessionApproveFailed");
         showToast(msg, "error");
       }
     }
-  }, [sessionId, pendingInputRequest, showToast, t]);
+  }, [
+    sessionId,
+    pendingInputRequest,
+    markPendingInputResolved,
+    handleStalePendingInput,
+    showToast,
+    t,
+  ]);
 
   const handleApproveAcceptEdits = useCallback(async () => {
     if (pendingInputRequest) {
@@ -818,25 +853,50 @@ function SessionPageContent({
         );
         // Update local permission mode
         setPermissionMode("acceptEdits");
+        markPendingInputResolved("in-turn");
       } catch (err) {
         const status = (err as { status?: number }).status;
+        if (status === 404) {
+          handleStalePendingInput();
+          return;
+        }
         const msg = status ? `Error ${status}` : t("sessionApproveFailed");
         showToast(msg, "error");
       }
     }
-  }, [sessionId, pendingInputRequest, setPermissionMode, showToast, t]);
+  }, [
+    sessionId,
+    pendingInputRequest,
+    setPermissionMode,
+    markPendingInputResolved,
+    handleStalePendingInput,
+    showToast,
+    t,
+  ]);
 
   const handleDeny = useCallback(async () => {
     if (pendingInputRequest) {
       try {
         await api.respondToInput(sessionId, pendingInputRequest.id, "deny");
+        markPendingInputResolved("in-turn");
       } catch (err) {
         const status = (err as { status?: number }).status;
+        if (status === 404) {
+          handleStalePendingInput();
+          return;
+        }
         const msg = status ? `Error ${status}` : t("sessionDenyFailed");
         showToast(msg, "error");
       }
     }
-  }, [sessionId, pendingInputRequest, showToast, t]);
+  }, [
+    sessionId,
+    pendingInputRequest,
+    markPendingInputResolved,
+    handleStalePendingInput,
+    showToast,
+    t,
+  ]);
 
   const handleDenyWithFeedback = useCallback(
     async (feedback: string) => {
@@ -849,14 +909,26 @@ function SessionPageContent({
             undefined,
             feedback,
           );
+          markPendingInputResolved("in-turn");
         } catch (err) {
           const status = (err as { status?: number }).status;
+          if (status === 404) {
+            handleStalePendingInput();
+            return;
+          }
           const msg = status ? `Error ${status}` : t("sessionFeedbackFailed");
           showToast(msg, "error");
         }
       }
     },
-    [sessionId, pendingInputRequest, showToast, t],
+    [
+      sessionId,
+      pendingInputRequest,
+      markPendingInputResolved,
+      handleStalePendingInput,
+      showToast,
+      t,
+    ],
   );
 
   const handleQuestionSubmit = useCallback(
@@ -869,14 +941,26 @@ function SessionPageContent({
             "approve",
             answers,
           );
+          markPendingInputResolved("in-turn");
         } catch (err) {
           const status = (err as { status?: number }).status;
+          if (status === 404) {
+            handleStalePendingInput();
+            return;
+          }
           const msg = status ? `Error ${status}` : t("sessionAnswerFailed");
           showToast(msg, "error");
         }
       }
     },
-    [sessionId, pendingInputRequest, showToast, t],
+    [
+      sessionId,
+      pendingInputRequest,
+      markPendingInputResolved,
+      handleStalePendingInput,
+      showToast,
+      t,
+    ],
   );
 
   // Handle file attachment uploads
@@ -1445,6 +1529,7 @@ function SessionPageContent({
                   <ToolApprovalPanel
                     request={pendingInputRequest}
                     sessionId={actualSessionId}
+                    agentName={approvalAgentName}
                     onApprove={handleApprove}
                     onDeny={handleDeny}
                     onApproveAcceptEdits={handleApproveAcceptEdits}

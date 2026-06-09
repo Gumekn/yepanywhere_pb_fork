@@ -202,11 +202,13 @@ export function useSession(
           result.status.modeVersion,
         );
       }
-      // Set pending input request from API response immediately
-      // This fixes race condition where stream connection is delayed but tool approval is pending
-      if (result.pendingInputRequest) {
-        setPendingInputRequest(result.pendingInputRequest as InputRequest);
-      }
+      // Set pending input request from API response immediately. This also
+      // clears stale prompts after another client already approved/denied them.
+      setPendingInputRequest(
+        result.pendingInputRequest
+          ? (result.pendingInputRequest as InputRequest)
+          : null,
+      );
       // Set slash commands from API response so the "/" button appears reliably
       // (the SSE init message that normally carries these is discarded after ~30s)
       if (result.slashCommands?.length) {
@@ -532,21 +534,20 @@ export function useSession(
         setProcessState(event.activity);
       }
 
-      // If activity bus says waiting-input but we don't have the request,
-      // fetch it via REST as a backup
+      // Always refresh the current request on waiting-input. Codex can emit
+      // multiple approvals in one turn, and the latest event may represent a
+      // different queued request than the one currently shown.
       if (event.activity === "waiting-input" && event.pendingInputType) {
-        setPendingInputRequest((current) => {
-          if (current) return current; // Already have it, don't fetch
-
-          // Fetch pending request in background (can't return promise from setState)
-          api.getSessionMetadata(projectId, sessionId).then((result) => {
-            if (result.pendingInputRequest) {
-              setPendingInputRequest(result.pendingInputRequest);
-            }
+        api
+          .getSessionMetadata(projectId, sessionId)
+          .then((result) => {
+            setPendingInputRequest(result.pendingInputRequest ?? null);
+          })
+          .catch(() => {
+            // Non-critical. A later activity event or reconnect will refresh it.
           });
-
-          return current; // Return unchanged for now, will update when fetch completes
-        });
+      } else if (event.activity !== "waiting-input") {
+        setPendingInputRequest(null);
       }
     },
     [projectId, sessionId],
@@ -562,9 +563,9 @@ export function useSession(
     try {
       const data = await api.getSessionMetadata(projectId, sessionId);
       setStatus(data.ownership);
+      setPendingInputRequest(data.pendingInputRequest ?? null);
       if (data.ownership.owner === "none") {
         setProcessState("idle");
-        setPendingInputRequest(null);
       }
     } catch {
       // Silent fail - non-critical
@@ -1039,6 +1040,29 @@ export function useSession(
     { onMessage: handleStreamMessage, onError: handleStreamError },
   );
 
+  const markPendingInputResolved = useCallback(
+    (nextState: ProcessState = "in-turn") => {
+      setPendingInputRequest(null);
+      setProcessState((current) =>
+        current === "waiting-input" ? nextState : current,
+      );
+      fetchNewMessages();
+      api
+        .getSessionMetadata(projectId, sessionId)
+        .then((data) => {
+          setStatus(data.ownership);
+          setPendingInputRequest(data.pendingInputRequest ?? null);
+          if (data.ownership.owner === "none") {
+            setProcessState("idle");
+          }
+        })
+        .catch(() => {
+          // Non-critical. Stream/activity events will continue to update state.
+        });
+    },
+    [projectId, sessionId, fetchNewMessages],
+  );
+
   const sessionUpdatesConnected =
     status.owner === "self"
       ? connected
@@ -1094,5 +1118,6 @@ export function useSession(
     reconnectStream, // Force session stream reconnection (e.g., after process restart)
     truncateMessagesBefore, // Rewind/edit: drop a uuid and everything after it
     refreshSessionMessages, // Reload authoritative JSONL/session snapshot
+    markPendingInputResolved, // Clear a resolved approval/question immediately
   };
 }
