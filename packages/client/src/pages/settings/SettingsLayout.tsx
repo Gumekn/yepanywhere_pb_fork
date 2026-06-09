@@ -97,7 +97,7 @@ export function SettingsLayout() {
       getEmulatorCategory((key) => t(key as never)),
     );
   }
-  if (isManualReloadMode) {
+  if (isManualReloadMode || capabilities.includes("deployment")) {
     categories.push(getDevelopmentCategory((key) => t(key as never)));
   }
 

@@ -164,6 +164,8 @@ export interface VersionRouteOptions {
   installId?: string;
   /** Whether voice input is enabled (default: true). */
   voiceInputEnabled?: boolean;
+  /** Whether local deploy actions can be triggered through the server. */
+  isDeploymentAvailable?: () => boolean;
 }
 
 export interface ServerCompatibilityInfo {
@@ -203,6 +205,9 @@ export function getServerCapabilities(options?: VersionRouteOptions): string[] {
   if (options?.voiceInputEnabled !== false) {
     capabilities.push("voiceInput");
   }
+  if (options?.isDeploymentAvailable?.()) {
+    capabilities.push("deployment");
+  }
   const deviceBridgeState = options?.getDeviceBridgeState?.() ?? "unavailable";
   const enabled = options?.isDeviceBridgeEnabled?.() ?? false;
   capabilities.push(
@@ -236,6 +241,7 @@ export function createVersionRoutes(options?: VersionRouteOptions): Hono {
     const capabilities = [
       ...BASE_CAPABILITIES,
       ...(options?.voiceInputEnabled !== false ? ["voiceInput"] : []),
+      ...(options?.isDeploymentAvailable?.() ? ["deployment"] : []),
       ...getCapabilitiesForDeviceBridgeState(deviceBridgeStatus.state, enabled),
     ];
 

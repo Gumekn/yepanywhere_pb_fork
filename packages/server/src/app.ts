@@ -38,6 +38,10 @@ import { createBrowserProfilesRoutes } from "./routes/browser-profiles.js";
 import { createClientLogsRoutes } from "./routes/client-logs.js";
 import { createConnectionsRoutes } from "./routes/connections.js";
 import { createDebugStreamingRoutes } from "./routes/debug-streaming.js";
+import {
+  createDeployRoutes,
+  getDeploymentAvailability,
+} from "./routes/deploy.js";
 import { createDevRoutes } from "./routes/dev.js";
 import { createDeviceRoutes } from "./routes/devices.js";
 import { createFilesRoutes } from "./routes/files.js";
@@ -430,6 +434,8 @@ export function createApp(options: AppOptions): AppResult {
         false,
       installId: options.installId,
       voiceInputEnabled: options.voiceInputEnabled,
+      isDeploymentAvailable: () =>
+        getDeploymentAvailability({ dataDir: options.dataDir }).available,
     }),
   );
 
@@ -452,6 +458,14 @@ export function createApp(options: AppOptions): AppResult {
     createServerAdminRoutes({
       supervisor,
       notificationService: options.notificationService,
+      dataDir: options.dataDir,
+    }),
+  );
+
+  app.route(
+    "/api/deploy",
+    createDeployRoutes({
+      dataDir: options.dataDir,
     }),
   );
 

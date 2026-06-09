@@ -136,6 +136,35 @@ if $DO_RESTART; then
     sleep 0.25
   done
 
+  LISTEN_PIDS="$(lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+  if [[ -n "$LISTEN_PIDS" ]]; then
+    warn "Port ${SERVER_PORT} is still held by PID(s): ${LISTEN_PIDS//$'\n'/, }. Sending SIGTERM ..."
+    kill $LISTEN_PIDS 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      if ! lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.25
+    done
+  fi
+
+  LISTEN_PIDS="$(lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+  if [[ -n "$LISTEN_PIDS" ]]; then
+    warn "Port ${SERVER_PORT} did not release after SIGTERM. Sending SIGKILL to PID(s): ${LISTEN_PIDS//$'\n'/, }"
+    kill -9 $LISTEN_PIDS 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      if ! lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.25
+    done
+  fi
+
+  if lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
+    err "Port ${SERVER_PORT} is still in use after stopping the old server."
+    exit 1
+  fi
+
   log "Starting yepanywhere in background (logs: /tmp/yep-server.log) ..."
   # Mount under /yep so Caddy at air.yueyuan.uk/yep/* reverse-proxies into us
   # cleanly (see INFRA.md). The Hono app + client bundle both pick up BASE_PATH.

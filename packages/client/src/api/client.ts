@@ -278,6 +278,16 @@ export interface VersionInfo {
   current: string;
   latest: string | null;
   updateAvailable: boolean;
+  /** Build metadata for the server process currently handling requests. */
+  build?: {
+    version: string;
+    buildId: string;
+    gitCommit?: string | null;
+    gitDescribe?: string | null;
+    gitDirty?: boolean;
+    builtAt: string;
+    source: "bundle" | "dev";
+  };
   /** Session resume protocol version supported by server (undefined on older servers). */
   resumeProtocolVersion?: number;
   /** Feature capabilities supported by the server. Undefined on older servers. */
@@ -344,6 +354,76 @@ export interface UpdateBindingResponse {
   redirectUrl?: string;
 }
 
+export type DeploymentActionId =
+  | "full"
+  | "server"
+  | "server-restart"
+  | "server-build"
+  | "apk"
+  | "apk-build"
+  | "apk-install-existing";
+
+export type DeploymentJobStatus = "running" | "succeeded" | "failed";
+
+export interface DeploymentAction {
+  id: DeploymentActionId;
+  args: string[];
+  requiresDevice: boolean;
+  supportsBuildType: boolean;
+  supportsInstall: boolean;
+  supportsSkipChecks: boolean;
+}
+
+export interface AdbDevice {
+  id: string;
+  state: string;
+  model?: string;
+  product?: string;
+}
+
+export interface DeploymentJob {
+  id: string;
+  action: DeploymentActionId;
+  args: string[];
+  command: string;
+  status: DeploymentJobStatus;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+  pid?: number;
+  exitCode?: number | null;
+  signal?: string | null;
+  log?: string;
+}
+
+export interface DeploymentStatusResponse {
+  available: boolean;
+  reason?: string;
+  repoRoot?: string;
+  scriptPath?: string;
+  packageVersion?: string | null;
+  stagedBuild?: {
+    version: string;
+    buildId: string;
+    builtAt: string;
+  } | null;
+  actions: DeploymentAction[];
+  adb: {
+    available: boolean;
+    devices: AdbDevice[];
+    error?: string;
+  };
+  currentJob: DeploymentJob | null;
+}
+
+export interface StartDeploymentRequest {
+  action: DeploymentActionId;
+  buildType?: "debug" | "release";
+  install?: boolean;
+  deviceId?: string;
+  skipChecks?: boolean;
+}
+
 export interface GetVersionOptions {
   /** Bypass the server's routine version cache and refresh from the update service. */
   fresh?: boolean;
@@ -376,6 +456,18 @@ export const api = {
     fetchJSON<{ ok: boolean; message: string }>("/server/restart", {
       method: "POST",
     }),
+
+  getDeploymentStatus: () =>
+    fetchJSON<DeploymentStatusResponse>("/deploy/status"),
+
+  startDeployment: (request: StartDeploymentRequest) =>
+    fetchJSON<{ job: DeploymentJob }>("/deploy/jobs", {
+      method: "POST",
+      body: JSON.stringify(request),
+    }),
+
+  getDeploymentJob: (id: string) =>
+    fetchJSON<{ job: DeploymentJob }>(`/deploy/jobs/${id}`),
 
   // Provider API
   getProviders: () => fetchJSON<{ providers: ProviderInfo[] }>("/providers"),

@@ -1,0 +1,628 @@
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { Hono } from "hono";
+
+const execFileAsync = promisify(execFile);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const MAX_LOG_BYTES = 96 * 1024;
+const MAX_JOBS = 20;
+
+export type DeploymentActionId =
+  | "full"
+  | "server"
+  | "server-restart"
+  | "server-build"
+  | "apk"
+  | "apk-build"
+  | "apk-install-existing";
+
+export type DeploymentJobStatus = "running" | "succeeded" | "failed";
+
+export interface DeploymentAction {
+  id: DeploymentActionId;
+  args: string[];
+  requiresDevice: boolean;
+  supportsBuildType: boolean;
+  supportsInstall: boolean;
+  supportsSkipChecks: boolean;
+}
+
+export interface AdbDevice {
+  id: string;
+  state: string;
+  model?: string;
+  product?: string;
+}
+
+export interface DeploymentJob {
+  id: string;
+  action: DeploymentActionId;
+  args: string[];
+  command: string;
+  status: DeploymentJobStatus;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+  pid?: number;
+  exitCode?: number | null;
+  signal?: string | null;
+  log?: string;
+}
+
+interface DeploymentJobRecord extends Omit<DeploymentJob, "log"> {
+  logPath: string;
+}
+
+export interface DeploymentStatusResponse {
+  available: boolean;
+  reason?: string;
+  repoRoot?: string;
+  scriptPath?: string;
+  packageVersion?: string | null;
+  stagedBuild?: {
+    version: string;
+    buildId: string;
+    builtAt: string;
+  } | null;
+  actions: DeploymentAction[];
+  adb: {
+    available: boolean;
+    devices: AdbDevice[];
+    error?: string;
+  };
+  currentJob: DeploymentJob | null;
+}
+
+export interface StartDeploymentRequest {
+  action?: DeploymentActionId;
+  buildType?: "debug" | "release";
+  install?: boolean;
+  deviceId?: string;
+  skipChecks?: boolean;
+}
+
+export interface DeployRoutesOptions {
+  dataDir?: string;
+  repoRoot?: string;
+}
+
+const DEPLOYMENT_ACTIONS: DeploymentAction[] = [
+  {
+    id: "server",
+    args: ["--server-only"],
+    requiresDevice: false,
+    supportsBuildType: false,
+    supportsInstall: false,
+    supportsSkipChecks: true,
+  },
+  {
+    id: "server-restart",
+    args: ["--server-only", "--restart-only"],
+    requiresDevice: false,
+    supportsBuildType: false,
+    supportsInstall: false,
+    supportsSkipChecks: false,
+  },
+  {
+    id: "server-build",
+    args: ["--server-only", "--server-build-only"],
+    requiresDevice: false,
+    supportsBuildType: false,
+    supportsInstall: false,
+    supportsSkipChecks: true,
+  },
+  {
+    id: "apk",
+    args: ["--apk-only"],
+    requiresDevice: false,
+    supportsBuildType: true,
+    supportsInstall: true,
+    supportsSkipChecks: false,
+  },
+  {
+    id: "apk-build",
+    args: ["--apk-only", "--no-install"],
+    requiresDevice: false,
+    supportsBuildType: true,
+    supportsInstall: false,
+    supportsSkipChecks: false,
+  },
+  {
+    id: "apk-install-existing",
+    args: ["--apk-only", "--no-build"],
+    requiresDevice: false,
+    supportsBuildType: true,
+    supportsInstall: false,
+    supportsSkipChecks: false,
+  },
+  {
+    id: "full",
+    args: [],
+    requiresDevice: false,
+    supportsBuildType: true,
+    supportsInstall: true,
+    supportsSkipChecks: true,
+  },
+];
+
+function uniq(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function defaultDataDir(): string {
+  return (
+    process.env.YEP_ANYWHERE_DATA_DIR ||
+    path.join(os.homedir(), ".yep-anywhere")
+  );
+}
+
+function getCandidateRepoRoots(explicit?: string): string[] {
+  return uniq([
+    explicit ?? "",
+    process.env.YEP_DEPLOY_REPO_ROOT ?? "",
+    process.cwd(),
+    path.resolve(__dirname, "../../../.."),
+  ]);
+}
+
+export function getDeploymentAvailability(options?: DeployRoutesOptions): {
+  available: boolean;
+  reason?: string;
+  repoRoot?: string;
+  scriptPath?: string;
+} {
+  for (const repoRoot of getCandidateRepoRoots(options?.repoRoot)) {
+    const scriptPath = path.join(repoRoot, "scripts", "deploy.sh");
+    if (fs.existsSync(scriptPath)) {
+      return {
+        available: true,
+        repoRoot,
+        scriptPath,
+      };
+    }
+  }
+
+  return {
+    available: false,
+    reason:
+      "scripts/deploy.sh was not found. Set YEP_DEPLOY_REPO_ROOT to the repository root to enable remote deploy actions.",
+  };
+}
+
+function validateDeviceId(deviceId: unknown): string | undefined {
+  if (deviceId === undefined || deviceId === null || deviceId === "") {
+    return undefined;
+  }
+  if (typeof deviceId !== "string") {
+    throw new Error("deviceId must be a string.");
+  }
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(deviceId)) {
+    throw new Error("deviceId contains unsupported characters.");
+  }
+  return deviceId;
+}
+
+function getAction(actionId: unknown): DeploymentAction {
+  const action = DEPLOYMENT_ACTIONS.find((item) => item.id === actionId);
+  if (!action) {
+    throw new Error("Unknown deploy action.");
+  }
+  return action;
+}
+
+function buildDeployArgs(input: StartDeploymentRequest): {
+  action: DeploymentAction;
+  args: string[];
+} {
+  const action = getAction(input.action);
+  const args = [...action.args];
+  const buildType = input.buildType === "debug" ? "debug" : "release";
+  const deviceId = validateDeviceId(input.deviceId);
+
+  if (action.supportsSkipChecks && input.skipChecks) {
+    args.push("--skip-checks");
+  }
+
+  if (action.supportsBuildType || action.id === "apk-install-existing") {
+    args.push(buildType === "debug" ? "--debug" : "--release");
+  }
+
+  if (action.supportsInstall && input.install === false) {
+    args.push("--no-install");
+  }
+
+  if (deviceId) {
+    args.push("--device", deviceId);
+  }
+
+  return { action, args };
+}
+
+function quoteCommandArg(arg: string): string {
+  return /[\s"']/u.test(arg) ? JSON.stringify(arg) : arg;
+}
+
+function getDeployDir(dataDir?: string): string {
+  return path.join(dataDir ?? defaultDataDir(), "deploy");
+}
+
+function getJobsDir(dataDir?: string): string {
+  return path.join(getDeployDir(dataDir), "jobs");
+}
+
+function getLogsDir(dataDir?: string): string {
+  return path.join(getDeployDir(dataDir), "logs");
+}
+
+async function ensureDeployDirs(dataDir?: string): Promise<void> {
+  await Promise.all([
+    fsp.mkdir(getJobsDir(dataDir), { recursive: true }),
+    fsp.mkdir(getLogsDir(dataDir), { recursive: true }),
+  ]);
+}
+
+function getJobPath(dataDir: string | undefined, id: string): string {
+  return path.join(getJobsDir(dataDir), `${id}.json`);
+}
+
+async function readJobRecord(
+  dataDir: string | undefined,
+  id: string,
+): Promise<DeploymentJobRecord | null> {
+  try {
+    const raw = await fsp.readFile(getJobPath(dataDir, id), "utf-8");
+    return JSON.parse(raw) as DeploymentJobRecord;
+  } catch {
+    return null;
+  }
+}
+
+async function writeJobRecord(
+  dataDir: string | undefined,
+  record: DeploymentJobRecord,
+): Promise<void> {
+  await ensureDeployDirs(dataDir);
+  await fsp.writeFile(
+    getJobPath(dataDir, record.id),
+    JSON.stringify(record, null, 2),
+  );
+}
+
+function isProcessRunning(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readLogTail(logPath: string): Promise<string> {
+  try {
+    const stat = await fsp.stat(logPath);
+    const start = Math.max(0, stat.size - MAX_LOG_BYTES);
+    const length = stat.size - start;
+    const handle = await fsp.open(logPath, "r");
+    try {
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, start);
+      return buffer.toString("utf-8");
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return "";
+  }
+}
+
+async function hydrateJob(
+  dataDir: string | undefined,
+  record: DeploymentJobRecord,
+): Promise<DeploymentJob> {
+  let current = record;
+  const log = await readLogTail(record.logPath);
+
+  if (record.status === "running" && !isProcessRunning(record.pid)) {
+    const now = new Date().toISOString();
+    current = {
+      ...record,
+      status: log.includes("Deploy complete.") ? "succeeded" : "failed",
+      updatedAt: now,
+      finishedAt: now,
+      exitCode: null,
+      signal: null,
+    };
+    await writeJobRecord(dataDir, current);
+  }
+
+  const { logPath: _logPath, ...job } = current;
+  return { ...job, log };
+}
+
+async function listJobRecords(
+  dataDir: string | undefined,
+): Promise<DeploymentJobRecord[]> {
+  try {
+    await ensureDeployDirs(dataDir);
+    const files = await fsp.readdir(getJobsDir(dataDir));
+    const records = await Promise.all(
+      files
+        .filter((file) => file.endsWith(".json"))
+        .map((file) => readJobRecord(dataDir, file.replace(/\.json$/u, ""))),
+    );
+    return records.filter((record): record is DeploymentJobRecord => !!record);
+  } catch {
+    return [];
+  }
+}
+
+async function findCurrentJob(
+  dataDir: string | undefined,
+): Promise<DeploymentJob | null> {
+  const records = await listJobRecords(dataDir);
+  records.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  for (const record of records) {
+    const job = await hydrateJob(dataDir, record);
+    if (job.status === "running") return job;
+  }
+  return null;
+}
+
+async function pruneOldJobs(dataDir: string | undefined): Promise<void> {
+  const records = await listJobRecords(dataDir);
+  records.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  for (const stale of records.slice(MAX_JOBS)) {
+    await Promise.allSettled([
+      fsp.unlink(getJobPath(dataDir, stale.id)),
+      fsp.unlink(stale.logPath),
+    ]);
+  }
+}
+
+async function readPackageVersion(repoRoot?: string): Promise<string | null> {
+  if (!repoRoot) return null;
+  try {
+    const raw = await fsp.readFile(
+      path.join(repoRoot, "package.json"),
+      "utf-8",
+    );
+    const pkg = JSON.parse(raw) as { version?: string };
+    return pkg.version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function readStagedBuildInfo(
+  repoRoot?: string,
+): Promise<DeploymentStatusResponse["stagedBuild"]> {
+  if (!repoRoot) return null;
+  try {
+    const raw = await fsp.readFile(
+      path.join(repoRoot, "dist", "npm-package", "build-info.json"),
+      "utf-8",
+    );
+    const info = JSON.parse(raw) as {
+      version?: string;
+      buildId?: string;
+      builtAt?: string;
+    };
+    if (!info.version || !info.buildId || !info.builtAt) return null;
+    return {
+      version: info.version,
+      buildId: info.buildId,
+      builtAt: info.builtAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getAdbPath(): string {
+  if (process.env.ADB_PATH) return process.env.ADB_PATH;
+  const androidHome =
+    process.env.ANDROID_HOME || "/opt/homebrew/share/android-commandlinetools";
+  return path.join(androidHome, "platform-tools", "adb");
+}
+
+function parseAdbDevices(stdout: string): AdbDevice[] {
+  return stdout
+    .split(/\r?\n/u)
+    .slice(1)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [id = "", state = "", ...rest] = line.split(/\s+/u);
+      const fields = new Map(
+        rest
+          .map((part) => part.split(":"))
+          .filter((part): part is [string, string] => part.length === 2),
+      );
+      return {
+        id,
+        state,
+        model: fields.get("model"),
+        product: fields.get("product"),
+      };
+    })
+    .filter((device) => device.id && device.state);
+}
+
+async function getAdbStatus(): Promise<DeploymentStatusResponse["adb"]> {
+  const adbPath = getAdbPath();
+  try {
+    const { stdout } = await execFileAsync(adbPath, ["devices", "-l"], {
+      encoding: "utf-8",
+      timeout: 3000,
+    });
+    return {
+      available: true,
+      devices: parseAdbDevices(stdout),
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      available: false,
+      devices: [],
+      error: message,
+    };
+  }
+}
+
+async function buildStatus(
+  options?: DeployRoutesOptions,
+): Promise<DeploymentStatusResponse> {
+  const availability = getDeploymentAvailability(options);
+  const [adb, currentJob, packageVersion, stagedBuild] = await Promise.all([
+    getAdbStatus(),
+    findCurrentJob(options?.dataDir),
+    readPackageVersion(availability.repoRoot),
+    readStagedBuildInfo(availability.repoRoot),
+  ]);
+
+  return {
+    ...availability,
+    packageVersion,
+    stagedBuild,
+    actions: DEPLOYMENT_ACTIONS,
+    adb,
+    currentJob,
+  };
+}
+
+export async function startDeploymentJob(
+  options: DeployRoutesOptions | undefined,
+  input: StartDeploymentRequest,
+): Promise<DeploymentJob> {
+  const availability = getDeploymentAvailability(options);
+  if (
+    !availability.available ||
+    !availability.repoRoot ||
+    !availability.scriptPath
+  ) {
+    throw new Error(availability.reason ?? "Remote deploy is not available.");
+  }
+
+  const currentJob = await findCurrentJob(options?.dataDir);
+  if (currentJob) {
+    const error = new Error("A deploy job is already running.") as Error & {
+      status?: number;
+    };
+    error.status = 409;
+    throw error;
+  }
+
+  const { action, args } = buildDeployArgs(input);
+  await ensureDeployDirs(options?.dataDir);
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const logPath = path.join(getLogsDir(options?.dataDir), `${id}.log`);
+  const command = ["scripts/deploy.sh", ...args].map(quoteCommandArg).join(" ");
+  await fsp.writeFile(
+    logPath,
+    `$ ${command}\nstartedAt=${now}\nrepoRoot=${availability.repoRoot}\n\n`,
+  );
+
+  const record: DeploymentJobRecord = {
+    id,
+    action: action.id,
+    args,
+    command,
+    status: "running",
+    startedAt: now,
+    updatedAt: now,
+    logPath,
+  };
+  await writeJobRecord(options?.dataDir, record);
+
+  const logFd = fs.openSync(logPath, "a");
+  const child = spawn(availability.scriptPath, args, {
+    cwd: availability.repoRoot,
+    detached: true,
+    env: process.env,
+    stdio: ["ignore", logFd, logFd],
+  });
+  fs.closeSync(logFd);
+
+  const spawnedRecord: DeploymentJobRecord = {
+    ...record,
+    pid: child.pid,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeJobRecord(options?.dataDir, spawnedRecord);
+  await pruneOldJobs(options?.dataDir);
+
+  child.on("exit", (exitCode, signal) => {
+    const finishedAt = new Date().toISOString();
+    void writeJobRecord(options?.dataDir, {
+      ...spawnedRecord,
+      status: exitCode === 0 ? "succeeded" : "failed",
+      exitCode,
+      signal,
+      updatedAt: finishedAt,
+      finishedAt,
+    });
+  });
+
+  child.on("error", (err) => {
+    const finishedAt = new Date().toISOString();
+    fs.appendFileSync(logPath, `\n[deploy-api] spawn error: ${err.message}\n`);
+    void writeJobRecord(options?.dataDir, {
+      ...spawnedRecord,
+      status: "failed",
+      exitCode: null,
+      signal: null,
+      updatedAt: finishedAt,
+      finishedAt,
+    });
+  });
+
+  child.unref();
+
+  return hydrateJob(options?.dataDir, spawnedRecord);
+}
+
+export function createDeployRoutes(options?: DeployRoutesOptions): Hono {
+  const routes = new Hono();
+
+  routes.get("/status", async (c) => {
+    return c.json(await buildStatus(options));
+  });
+
+  routes.get("/jobs/:id", async (c) => {
+    const id = c.req.param("id");
+    const record = await readJobRecord(options?.dataDir, id);
+    if (!record) {
+      return c.json({ error: "Deploy job not found" }, 404);
+    }
+    return c.json({ job: await hydrateJob(options?.dataDir, record) });
+  });
+
+  routes.post("/jobs", async (c) => {
+    try {
+      const body = await c.req.json<StartDeploymentRequest>().catch(() => ({}));
+      const job = await startDeploymentJob(options, body);
+      return c.json({ job }, 202);
+    } catch (err) {
+      const status =
+        typeof (err as { status?: unknown }).status === "number"
+          ? ((err as { status: number }).status as 400 | 409 | 500)
+          : 400;
+      const message = err instanceof Error ? err.message : String(err);
+      return c.json({ error: message }, status);
+    }
+  });
+
+  return routes;
+}
