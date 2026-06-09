@@ -371,6 +371,80 @@ describe("Codex Normalization", () => {
     });
   });
 
+  it("projects Codex external agent Read markers into a completed tool row", () => {
+    const entries: CodexSessionEntry[] = [
+      codexAssistantMessage(
+        "[external_agent_tool_call: Read]\nfile: CLAUDE.md\n[/external_agent_tool_call]",
+        1,
+      ),
+      codexAssistantMessage(
+        "[external_agent_tool_result]\n220\tfirst line\n221\tsecond line\n[/external_agent_tool_result]",
+        2,
+      ),
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const readItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "Read",
+    );
+
+    expect(readItem?.type).toBe("tool_call");
+    if (readItem?.type !== "tool_call") {
+      throw new Error("Expected Read render item");
+    }
+
+    expect(readItem.status).toBe("complete");
+    expect(readItem.toolInput).toMatchObject({
+      file_path: "CLAUDE.md",
+    });
+    expect(readItem.toolResult?.structured).toMatchObject({
+      type: "text",
+      file: {
+        filePath: "CLAUDE.md",
+        content: "first line\nsecond line",
+        numLines: 2,
+        startLine: 220,
+        totalLines: 221,
+      },
+    });
+  });
+
+  it("projects Codex external agent JSON tool results into the matching tool row", () => {
+    const entries: CodexSessionEntry[] = [
+      codexAssistantMessage(
+        "[external_agent_tool_call: TaskCreate]\ndescription: 汇总风险点与回归关注\n[/external_agent_tool_call]",
+        1,
+      ),
+      codexAssistantMessage(
+        '[external_agent_tool_result]\n{"task":{"id":"8","subject":"汇总风险点与回归关注"}}\n[/external_agent_tool_result]',
+        2,
+      ),
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const taskItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "TaskCreate",
+    );
+
+    expect(taskItem?.type).toBe("tool_call");
+    if (taskItem?.type !== "tool_call") {
+      throw new Error("Expected TaskCreate render item");
+    }
+
+    expect(taskItem.status).toBe("complete");
+    expect(taskItem.toolInput).toMatchObject({
+      description: "汇总风险点与回归关注",
+    });
+    expect(taskItem.toolResult?.structured).toMatchObject({
+      task: {
+        id: "8",
+        subject: "汇总风险点与回归关注",
+      },
+    });
+  });
+
   it("normalizes exec_command input.cmd into Bash input.command", () => {
     const entries: CodexSessionEntry[] = [
       {

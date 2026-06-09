@@ -1137,7 +1137,6 @@ export class CodexProvider implements AgentProvider {
         cwd: options.cwd,
         approvalPolicy: policy.approvalPolicy,
         sandbox: policy.sandbox,
-        experimentalRawEvents: false,
       };
       const threadResult: ThreadResumeResponse | ThreadStartResponse =
         options.resumeSessionId

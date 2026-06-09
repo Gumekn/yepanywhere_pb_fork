@@ -47,6 +47,11 @@ interface CodexToolUseConversion {
   context: CodexToolCallContext;
 }
 
+interface PendingExternalCodexToolCall {
+  callId: string;
+  context: CodexToolCallContext;
+}
+
 function normalizeClaudeQueueOperationContent(content: unknown): string {
   if (content === undefined) {
     return "";
@@ -227,6 +232,7 @@ function convertCodexEntries(
   let messageIndex = 0;
   const hasResponseItemUser = hasCodexResponseItemUserMessages(entries);
   const toolCallContexts = new Map<string, CodexToolCallContext>();
+  const externalToolCalls: PendingExternalCodexToolCall[] = [];
 
   for (const entry of entries) {
     if (entry.type === "response_item") {
@@ -234,6 +240,7 @@ function convertCodexEntries(
         entry,
         messageIndex++,
         toolCallContexts,
+        externalToolCalls,
       );
       const convertedMessages = Array.isArray(converted)
         ? converted
@@ -485,6 +492,7 @@ function convertCodexResponseItem(
   entry: CodexResponseItemEntry,
   index: number,
   toolCallContexts: Map<string, CodexToolCallContext>,
+  externalToolCalls: PendingExternalCodexToolCall[],
 ): Message | Message[] | null {
   const payload = entry.payload;
   const uuid = `codex-${index}-${entry.timestamp}`;
@@ -494,7 +502,12 @@ function convertCodexResponseItem(
       if (payload.role === "developer") {
         return null;
       }
-      return convertCodexMessagePayload(payload, uuid, entry.timestamp);
+      return convertCodexMessagePayload(
+        payload,
+        uuid,
+        entry.timestamp,
+        externalToolCalls,
+      );
 
     case "reasoning":
       return convertCodexReasoningPayload(payload, uuid, entry.timestamp);
@@ -554,7 +567,20 @@ function convertCodexMessagePayload(
   payload: CodexMessagePayload,
   uuid: string,
   timestamp: string,
-): Message {
+  externalToolCalls: PendingExternalCodexToolCall[],
+): Message | null {
+  if (payload.role === "assistant") {
+    const externalToolMessage = convertExternalAgentToolMarkerPayload(
+      payload,
+      uuid,
+      timestamp,
+      externalToolCalls,
+    );
+    if (externalToolMessage) {
+      return externalToolMessage;
+    }
+  }
+
   const content: ContentBlock[] = [];
 
   const fullText = payload.content
@@ -681,6 +707,189 @@ function isDataUrl(value: string): boolean {
 function parseDataUrlMimeType(dataUrl: string): string | null {
   const match = /^data:([^;,]+)[;,]/i.exec(dataUrl);
   return match?.[1] ?? null;
+}
+
+function convertExternalAgentToolMarkerPayload(
+  payload: CodexMessagePayload,
+  uuid: string,
+  timestamp: string,
+  externalToolCalls: PendingExternalCodexToolCall[],
+): Message | null {
+  const text = payload.content
+    .map((block) =>
+      "text" in block && typeof block.text === "string" ? block.text : "",
+    )
+    .join("");
+
+  const toolCall = parseExternalAgentToolCallText(text);
+  if (toolCall) {
+    const converted = convertExternalAgentToolCall(toolCall, uuid, timestamp);
+    externalToolCalls.push({
+      callId: converted.callId,
+      context: converted.context,
+    });
+    return converted.message;
+  }
+
+  const toolResult = parseExternalAgentToolResultText(text);
+  if (!toolResult) {
+    return null;
+  }
+
+  const pendingCall = externalToolCalls.shift();
+  if (!pendingCall) {
+    return null;
+  }
+
+  return convertCodexToolCallOutputPayload(
+    pendingCall.callId,
+    toolResult.output,
+    uuid,
+    timestamp,
+    pendingCall.context,
+    toolResult.isError,
+  );
+}
+
+function parseExternalAgentToolCallText(
+  text: string,
+): { toolName: string; input: unknown } | null {
+  const match =
+    /^\[external_agent_tool_call:\s*([^\]\n]+)\]\n?([\s\S]*?)\n?\[\/external_agent_tool_call\]$/.exec(
+      text.trim(),
+    );
+  if (!match?.[1]) {
+    return null;
+  }
+
+  return {
+    toolName: match[1].trim(),
+    input: parseExternalAgentToolInput(match[2] ?? ""),
+  };
+}
+
+function parseExternalAgentToolResultText(
+  text: string,
+): { output: string; isError: boolean } | null {
+  const match =
+    /^\[external_agent_tool_result(?::\s*([^\]\n]+))?\]\n?([\s\S]*?)\n?\[\/external_agent_tool_result\]$/.exec(
+      text.trim(),
+    );
+  if (!match) {
+    return null;
+  }
+
+  const status = match[1]?.trim().toLowerCase();
+  return {
+    output: match[2] ?? "",
+    isError: status === "error",
+  };
+}
+
+function parseExternalAgentToolInput(body: string): unknown {
+  const trimmed = body.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  const inputMatch = /^input:\s*([\s\S]*)$/.exec(trimmed);
+  if (inputMatch?.[1]) {
+    return parseExternalAgentToolValue(inputMatch[1].trim());
+  }
+
+  const lines = trimmed.split("\n");
+  const input: Record<string, unknown> = {};
+  let sawField = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    const fieldMatch = /^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/.exec(line);
+    if (!fieldMatch?.[1]) {
+      continue;
+    }
+
+    sawField = true;
+    const key = normalizeExternalAgentToolInputKey(fieldMatch[1]);
+    const value = fieldMatch[2] ?? "";
+
+    if (key === "command") {
+      input.command = [value, ...lines.slice(i + 1)].join("\n").trimEnd();
+      break;
+    }
+
+    input[key] = parseExternalAgentToolValue(value.trim());
+  }
+
+  return sawField ? input : { content: trimmed };
+}
+
+function normalizeExternalAgentToolInputKey(key: string): string {
+  const normalized = key.trim();
+  if (normalized === "file" || normalized === "path") {
+    return "file_path";
+  }
+  return normalized;
+}
+
+function parseExternalAgentToolValue(value: string): unknown {
+  if (!value) {
+    return "";
+  }
+
+  if (/^(?:\{|\[|"|-?\d|true$|false$|null$)/.test(value)) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  }
+
+  return value;
+}
+
+function convertExternalAgentToolCall(
+  marker: { toolName: string; input: unknown },
+  uuid: string,
+  timestamp: string,
+): CodexToolUseConversion {
+  const rawToolName = marker.toolName;
+  const canonicalToolName = canonicalizeCodexToolName(rawToolName);
+  const normalizedInvocation = normalizeCodexToolInvocation(
+    canonicalToolName,
+    marker.input,
+  );
+  const callId = `${uuid}-external-tool`;
+
+  const content: ContentBlock[] = [
+    {
+      type: "tool_use",
+      id: callId,
+      name: normalizedInvocation.toolName,
+      input: normalizedInvocation.input,
+    },
+  ];
+
+  const message: Message = {
+    uuid,
+    type: "assistant",
+    message: {
+      role: "assistant",
+      content,
+    },
+    codexToolName: rawToolName,
+    timestamp,
+  };
+
+  return {
+    callId,
+    message,
+    context: {
+      toolName: normalizedInvocation.toolName,
+      input: normalizedInvocation.input,
+      readShellInfo: normalizedInvocation.readShellInfo,
+      writeShellInfo: normalizedInvocation.writeShellInfo,
+    },
+  };
 }
 
 function convertCodexFunctionCallPayload(
@@ -934,11 +1143,12 @@ function convertCodexToolCallOutputPayload(
   uuid: string,
   timestamp: string,
   context?: CodexToolCallContext,
+  forceError = false,
 ): Message {
   const normalized = normalizeCodexToolOutputWithContext(output, context);
   const content = normalized.content;
   const structured = normalized.structured;
-  const isError = normalized.isError;
+  const isError = forceError || normalized.isError;
 
   const toolResult: ContentBlock = {
     type: "tool_result",

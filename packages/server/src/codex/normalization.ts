@@ -70,6 +70,20 @@ export function normalizeCodexToolInvocation(
   toolName: string,
   input: unknown,
 ): NormalizedCodexToolInvocation {
+  if (toolName === "Read") {
+    const readShellInfo = createReadShellInfoFromInput(input);
+    return readShellInfo
+      ? { toolName, input, readShellInfo }
+      : { toolName, input };
+  }
+
+  if (toolName === "Write") {
+    const writeShellInfo = createWriteShellInfoFromInput(input);
+    return writeShellInfo
+      ? { toolName, input, writeShellInfo }
+      : { toolName, input };
+  }
+
   if (toolName !== "Bash") {
     return { toolName, input };
   }
@@ -121,6 +135,58 @@ export function normalizeCodexToolInvocation(
   }
 
   return { toolName: "Bash", input: normalizedInput };
+}
+
+function createReadShellInfoFromInput(
+  input: unknown,
+): CodexReadShellInfo | null {
+  if (!isRecord(input) || typeof input.file_path !== "string") {
+    return null;
+  }
+
+  const filePath = input.file_path.trim();
+  if (!filePath) {
+    return null;
+  }
+
+  const startLine = parsePositiveInteger(input.offset ?? input.start_line);
+  const limit = parsePositiveInteger(input.limit);
+  const endLine =
+    startLine !== undefined && limit !== undefined
+      ? startLine + Math.max(limit - 1, 0)
+      : undefined;
+
+  return {
+    filePath,
+    ...(startLine !== undefined && { startLine }),
+    ...(endLine !== undefined && { endLine }),
+    // External Codex Read rows usually include `nl`-style prefixes. This is
+    // harmless for unnumbered output because normalizeReadOutput only strips
+    // lines that actually start with a line number.
+    stripLineNumbers: true,
+  };
+}
+
+function createWriteShellInfoFromInput(
+  input: unknown,
+): CodexWriteShellInfo | null {
+  if (
+    !isRecord(input) ||
+    typeof input.file_path !== "string" ||
+    typeof input.content !== "string"
+  ) {
+    return null;
+  }
+
+  const filePath = input.file_path.trim();
+  if (!filePath) {
+    return null;
+  }
+
+  return {
+    filePath,
+    content: input.content,
+  };
 }
 
 export function normalizeCodexToolOutputWithContext(
@@ -613,6 +679,14 @@ function parseNumericExitCode(value: unknown): number | undefined {
     return Number.parseInt(value, 10);
   }
   return undefined;
+}
+
+function parsePositiveInteger(value: unknown): number | undefined {
+  const parsed = parseNumericExitCode(value);
+  if (parsed === undefined || parsed < 1) {
+    return undefined;
+  }
+  return parsed;
 }
 
 function extractExitCodeFromRecord(
