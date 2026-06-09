@@ -6,6 +6,9 @@
 #   scripts/redeploy-server.sh           # full rebuild + restart
 #   scripts/redeploy-server.sh --restart # restart only (skip rebuild)
 #   scripts/redeploy-server.sh --no-restart # rebuild only (skip restart)
+#   scripts/redeploy-server.sh --preserve-codex-bridge
+#                                      # restart the web server without stopping
+#                                      # an already-independent Codex bridge
 #
 # Assumes:
 #   - Global `yepanywhere` command is pnpm-linked to dist/npm-package
@@ -40,6 +43,7 @@ dim()  { echo -e "${C_DIM}    $*${C_RESET}"; }
 # ----- args -----
 DO_BUILD=true
 DO_RESTART=true
+PRESERVE_CODEX_BRIDGE=false
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
 SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
 if [[ "$SERVER_BASE_PATH" == "/" ]]; then
@@ -53,6 +57,7 @@ for arg in "$@"; do
   case "$arg" in
     --restart)    DO_BUILD=false ;;
     --no-restart) DO_RESTART=false ;;
+    --preserve-codex-bridge) PRESERVE_CODEX_BRIDGE=true ;;
     -h|--help)
       sed -n '2,20p' "$0"
       exit 0
@@ -78,6 +83,51 @@ if $DO_RESTART; then
     warn "About to kill the running yepanywhere server. ${SDK_COUNT} active SDK claude subprocess(es) will be terminated."
   fi
 fi
+
+pid_sets_overlap() {
+  local a="$1"
+  local b="$2"
+  local left right
+  for left in $a; do
+    for right in $b; do
+      if [[ "$left" == "$right" ]]; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+wait_port_released() {
+  local port="$1"
+  for _ in $(seq 1 20); do
+    if ! lsof -iTCP:"${port}" -sTCP:LISTEN -t >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+start_codex_bridge_sidecar() {
+  local bridge_port="$1"
+  local bridge_url="$2"
+
+  log "Starting Codex bridge sidecar on ${bridge_url} (logs: /tmp/yep-codex-bridge.log) ..."
+  YEP_CODEX_BRIDGE_PORT="$bridge_port" nohup yepanywhere --codex-bridge-only >/tmp/yep-codex-bridge.log 2>&1 & disown
+
+  for _ in $(seq 1 60); do
+    if curl -fsS "${bridge_url}/status" >/dev/null 2>&1; then
+      log "Codex bridge sidecar is up."
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  err "Codex bridge sidecar didn't answer ${bridge_url}/status within 15s."
+  tail -20 /tmp/yep-codex-bridge.log >&2 || true
+  return 1
+}
 
 # ----- build -----
 if $DO_BUILD; then
@@ -123,18 +173,38 @@ fi
 
 # ----- restart -----
 if $DO_RESTART; then
+  CODEX_BRIDGE_PORT="${YEP_CODEX_BRIDGE_PORT:-${CODEX_BRIDGE_PORT:-4510}}"
+  CODEX_BRIDGE_HTTP_URL="${YEP_CODEX_BRIDGE_CONTROL_URL:-${CODEX_BRIDGE_CONTROL_URL:-http://127.0.0.1:${CODEX_BRIDGE_PORT}}}"
+  START_CODEX_BRIDGE_AFTER_STOP=false
+  SERVER_LISTEN_PIDS="$(lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+  CODEX_BRIDGE_LISTEN_PIDS="$(lsof -iTCP:"${CODEX_BRIDGE_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+
+  if $PRESERVE_CODEX_BRIDGE; then
+    if [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]] && ! pid_sets_overlap "$SERVER_LISTEN_PIDS" "$CODEX_BRIDGE_LISTEN_PIDS"; then
+      dim "preserving Codex bridge on port ${CODEX_BRIDGE_PORT} (PID ${CODEX_BRIDGE_LISTEN_PIDS//$'\n'/, })"
+    else
+      START_CODEX_BRIDGE_AFTER_STOP=true
+      if [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]]; then
+        warn "Codex bridge port ${CODEX_BRIDGE_PORT} is currently owned by the web server process. This deploy will migrate it to a sidecar; existing cf sessions will disconnect once."
+      else
+        dim "Codex bridge sidecar is not running; it will be started after the web server stops."
+      fi
+    fi
+  fi
+
   log "Stopping running yepanywhere ..."
-  # `node ... yepanywhere` is the actual process; pkill matches against the
-  # full command line. Suppress error if nothing was running.
-  pkill -f "node.*yepanywhere" || true
+  if $PRESERVE_CODEX_BRIDGE; then
+    if [[ -n "$SERVER_LISTEN_PIDS" ]]; then
+      kill $SERVER_LISTEN_PIDS 2>/dev/null || true
+    fi
+  else
+    # `node ... yepanywhere` is the actual process; pkill matches against the
+    # full command line. Suppress error if nothing was running.
+    pkill -f "node.*yepanywhere" || true
+  fi
 
   # Wait briefly for the old process to release the port.
-  for _ in $(seq 1 20); do
-    if ! lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
-      break
-    fi
-    sleep 0.25
-  done
+  wait_port_released "$SERVER_PORT" || true
 
   LISTEN_PIDS="$(lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
   if [[ -n "$LISTEN_PIDS" ]]; then
@@ -165,12 +235,29 @@ if $DO_RESTART; then
     exit 1
   fi
 
+  if $PRESERVE_CODEX_BRIDGE && $START_CODEX_BRIDGE_AFTER_STOP; then
+    wait_port_released "$CODEX_BRIDGE_PORT" || true
+    if lsof -iTCP:"${CODEX_BRIDGE_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
+      err "Codex bridge port ${CODEX_BRIDGE_PORT} is still in use; cannot start sidecar."
+      exit 1
+    fi
+    start_codex_bridge_sidecar "$CODEX_BRIDGE_PORT" "$CODEX_BRIDGE_HTTP_URL"
+  fi
+
   log "Starting yepanywhere in background (logs: /tmp/yep-server.log) ..."
   # Mount under /yep so Caddy at air.yueyuan.uk/yep/* reverse-proxies into us
   # cleanly (see INFRA.md). The Hono app + client bundle both pick up BASE_PATH.
   # APK / direct-mode tcp tunnel callers are unaffected — they hit ws://host:8022
   # which still serves /yep/api/ws; only the URL prefix changes, not the port.
-  BASE_PATH="${SERVER_BASE_PATH:-/}" nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
+  if $PRESERVE_CODEX_BRIDGE; then
+    BASE_PATH="${SERVER_BASE_PATH:-/}" \
+      YEP_CODEX_BRIDGE_MODE=external \
+      YEP_CODEX_BRIDGE_CONTROL_URL="$CODEX_BRIDGE_HTTP_URL" \
+      YEP_CODEX_BRIDGE_PORT="$CODEX_BRIDGE_PORT" \
+      nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
+  else
+    BASE_PATH="${SERVER_BASE_PATH:-/}" nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
+  fi
 
   # Health-check loop. Tries up to 15s; the server usually answers within 2s
   # but Tauri activity / large data dirs can stretch first-boot.
