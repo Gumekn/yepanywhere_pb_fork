@@ -39,6 +39,20 @@ export interface Config {
   geminiSessionsDir: string;
   /** Codex sessions directory (~/.codex/sessions) */
   codexSessionsDir: string;
+  /** Whether to run the local Codex CLI bridge for `codex --remote ws://...`. */
+  codexBridgeEnabled: boolean;
+  /** How the Codex CLI bridge is hosted. */
+  codexBridgeMode: "embedded" | "external" | "disabled";
+  /** Host/interface for the Codex bridge. Defaults to localhost for safety. */
+  codexBridgeHost: string;
+  /** Port for the Codex bridge WebSocket listener. */
+  codexBridgePort: number;
+  /** HTTP control URL for an externally managed Codex bridge sidecar. */
+  codexBridgeControlUrl: string;
+  /** Optional fixed upstream app-server URL. Defaults to a managed local app-server. */
+  codexBridgeUpstreamUrl?: string;
+  /** First port to try for the managed upstream app-server. */
+  codexBridgeUpstreamStartPort: number;
   /**
    * Periodic full-tree rescan interval for codex session watcher (ms).
    * Helps recover from missed fs.watch events on macOS. 0 disables it.
@@ -153,6 +167,16 @@ export function loadConfig(): Config {
     path.join(os.homedir(), ".gemini", "tmp");
   const codexSessionsDir =
     process.env.CODEX_SESSIONS_DIR ?? getDefaultCodexSessionsDir();
+  const codexBridgePort = parseIntOrDefault(
+    process.env.YEP_CODEX_BRIDGE_PORT ?? process.env.CODEX_BRIDGE_PORT,
+    4510,
+  );
+  const codexBridgeMode = parseCodexBridgeMode(
+    process.env.YEP_CODEX_BRIDGE_MODE ??
+      process.env.CODEX_BRIDGE_MODE ??
+      process.env.YEP_CODEX_BRIDGE ??
+      process.env.CODEX_BRIDGE,
+  );
   // Enable periodic rescan on macOS (fs.watch misses deep file writes)
   // and Windows (fs.watch({ recursive: true }) can be unreliable for deep trees)
   const defaultCodexWatchPeriodicRescanMs =
@@ -194,6 +218,25 @@ export function loadConfig(): Config {
     claudeSessionsDir,
     geminiSessionsDir,
     codexSessionsDir,
+    codexBridgeEnabled: codexBridgeMode !== "disabled",
+    codexBridgeMode,
+    codexBridgeHost:
+      process.env.YEP_CODEX_BRIDGE_HOST ??
+      process.env.CODEX_BRIDGE_HOST ??
+      "127.0.0.1",
+    codexBridgePort,
+    codexBridgeControlUrl:
+      process.env.YEP_CODEX_BRIDGE_CONTROL_URL ??
+      process.env.CODEX_BRIDGE_CONTROL_URL ??
+      `http://127.0.0.1:${codexBridgePort}`,
+    codexBridgeUpstreamUrl:
+      process.env.YEP_CODEX_BRIDGE_UPSTREAM_URL ??
+      process.env.CODEX_BRIDGE_UPSTREAM_URL,
+    codexBridgeUpstreamStartPort: parseIntOrDefault(
+      process.env.YEP_CODEX_BRIDGE_UPSTREAM_START_PORT ??
+        process.env.CODEX_BRIDGE_UPSTREAM_START_PORT,
+      codexBridgePort + 1,
+    ),
     codexWatchPeriodicRescanMs,
     sessionIndexFullValidationMs,
     sessionIndexWriteLockTimeoutMs,
@@ -343,6 +386,25 @@ function parsePermissionMode(value: string | undefined): PermissionMode {
     return value;
   }
   return "default";
+}
+
+function parseCodexBridgeMode(
+  value: string | undefined,
+): "embedded" | "external" | "disabled" {
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === "false" ||
+    normalized === "0" ||
+    normalized === "off" ||
+    normalized === "disabled" ||
+    normalized === "disable"
+  ) {
+    return "disabled";
+  }
+  if (normalized === "external" || normalized === "sidecar") {
+    return "external";
+  }
+  return "embedded";
 }
 
 /**

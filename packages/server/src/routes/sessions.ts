@@ -15,6 +15,7 @@ import {
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
 import { augmentTextBlocks } from "../augments/markdown-augments.js";
+import type { CodexBridgeController } from "../codex-bridge/types.js";
 import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
@@ -148,6 +149,8 @@ export interface SessionsDeps {
   modelInfoService?: ModelInfoService;
   /** RecentsService for repairing stale projectId entries on resume */
   recentsService?: RecentsService;
+  /** Codex bridge for externally launched `codex --remote` TUI sessions. */
+  codexBridgeService?: CodexBridgeController;
 }
 
 interface StartSessionBody {
@@ -466,9 +469,18 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Check if session is actively owned by a process
     const process = deps.supervisor.getProcessForSession(sessionId);
+    const bridgeView =
+      (await deps.codexBridgeService?.getSessionView(sessionId)) ?? null;
+    const bridgedSession =
+      bridgeView?.session.projectId === projectId ? bridgeView : null;
+    const isBridgeSessionActive = bridgedSession
+      ? ((await deps.codexBridgeService?.isSessionActive(sessionId)) ?? false)
+      : false;
 
     // Check if session is being controlled by an external program
-    const isExternal = deps.externalTracker?.isExternal(sessionId) ?? false;
+    const isExternal =
+      (deps.externalTracker?.isExternal(sessionId) ?? false) ||
+      (bridgedSession !== null && isBridgeSessionActive);
 
     // Determine the session ownership
     const ownership = process
@@ -492,7 +504,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Get pending input request from active process
     const pendingInputRequest =
-      process?.state.type === "waiting-input" ? process.state.request : null;
+      process?.state.type === "waiting-input"
+        ? process.state.request
+        : ((await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
+          null);
 
     // Get available slash commands from active process
     const slashCommands = process?.supportsDynamicCommands
@@ -517,7 +532,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       },
       metadataProvider ?? process?.provider,
     );
-    const sessionSummary = sessionSummaryResult?.summary ?? null;
+    const sessionSummary =
+      sessionSummaryResult?.summary ?? bridgedSession?.session ?? null;
 
     if (!sessionSummary && !process) {
       return c.json({ error: "Session not found" }, 404);
@@ -777,9 +793,18 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Check if session is actively owned by a process
     const process = deps.supervisor.getProcessForSession(sessionId);
+    const bridgeView =
+      (await deps.codexBridgeService?.getSessionView(sessionId)) ?? null;
+    const bridgedSession =
+      bridgeView?.session.projectId === projectId ? bridgeView : null;
+    const isBridgeSessionActive = bridgedSession
+      ? ((await deps.codexBridgeService?.isSessionActive(sessionId)) ?? false)
+      : false;
 
     // Check if session is being controlled by an external program
-    const isExternal = deps.externalTracker?.isExternal(sessionId) ?? false;
+    const isExternal =
+      (deps.externalTracker?.isExternal(sessionId) ?? false) ||
+      (bridgedSession !== null && isBridgeSessionActive);
 
     // Check if we've ever owned this session (for orphan detection)
     // Only mark tools as "aborted" if we owned the session and know it terminated
@@ -869,7 +894,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     // Get pending input request from active process (for tool approval prompts)
     // This ensures clients get pending requests immediately without waiting for SSE
     const pendingInputRequest =
-      process?.state.type === "waiting-input" ? process.state.request : null;
+      process?.state.type === "waiting-input"
+        ? process.state.request
+        : ((await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
+          null);
 
     // Get available slash commands from active process (for "/" button in toolbar)
     // The init message that normally carries these gets discarded from the SSE buffer
@@ -935,6 +963,31 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             contextUsage,
           },
           messages: processMessages,
+          ownership,
+          pendingInputRequest,
+          slashCommands,
+        });
+      }
+      if (bridgedSession) {
+        const metadata = deps.sessionMetadataService?.getMetadata(sessionId);
+        const lastSeenEntry = deps.notificationService?.getLastSeen(sessionId);
+        const hasUnread = deps.notificationService
+          ? deps.notificationService.hasUnread(
+              sessionId,
+              bridgedSession.session.updatedAt,
+            )
+          : undefined;
+        return c.json({
+          session: {
+            ...bridgedSession.session,
+            messages: [],
+            customTitle: metadata?.customTitle,
+            isArchived: metadata?.isArchived,
+            isStarred: metadata?.isStarred,
+            lastSeenAt: lastSeenEntry?.timestamp,
+            hasUnread,
+          },
+          messages: [],
           ownership,
           pendingInputRequest,
           slashCommands,
@@ -1686,7 +1739,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     const process = deps.supervisor.getProcessForSession(sessionId);
     if (!process) {
-      return c.json({ request: null });
+      return c.json({
+        request:
+          (await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
+          null,
+      });
     }
 
     // Use getPendingInputRequest which works for both mock and real SDK
@@ -1712,7 +1769,33 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     const process = deps.supervisor.getProcessForSession(sessionId);
     if (!process) {
-      return c.json({ error: "No active process for session" }, 404);
+      let bridgeBody: InputResponseBody;
+      try {
+        bridgeBody = await c.req.json<InputResponseBody>();
+      } catch {
+        return c.json({ error: "Invalid JSON body" }, 400);
+      }
+
+      if (!bridgeBody.requestId || !bridgeBody.response) {
+        return c.json({ error: "requestId and response are required" }, 400);
+      }
+      const bridgeResponse =
+        bridgeBody.response === "approve" ||
+        bridgeBody.response === "approve_accept_edits"
+          ? bridgeBody.response
+          : "deny";
+
+      const accepted =
+        (await deps.codexBridgeService?.respondToInput(
+          sessionId,
+          bridgeBody.requestId,
+          bridgeResponse,
+          bridgeBody.answers,
+        )) ?? false;
+      if (!accepted) {
+        return c.json({ error: "No active process for session" }, 404);
+      }
+      return c.json({ accepted: true });
     }
 
     if (process.state.type !== "waiting-input") {

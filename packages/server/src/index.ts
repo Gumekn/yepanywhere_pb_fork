@@ -10,6 +10,9 @@ import { createNodeWebSocket } from "@hono/node-ws";
 import { createApp } from "./app.js";
 import { AuthService } from "./auth/AuthService.js";
 import { getRuntimeBuildInfo } from "./build-info.js";
+import { CodexBridgeHttpClient } from "./codex-bridge/CodexBridgeHttpClient.js";
+import { CodexBridgeService } from "./codex-bridge/CodexBridgeService.js";
+import type { CodexBridgeController } from "./codex-bridge/types.js";
 import {
   closeCodexCorrelationDebugLogger,
   initCodexCorrelationDebugLogger,
@@ -110,6 +113,7 @@ let supervisorForShutdown:
   | Awaited<ReturnType<typeof createApp>>["supervisor"]
   | null = null;
 let deviceBridgeForShutdown: DeviceBridgeService | null = null;
+let codexBridgeForShutdown: CodexBridgeController | null = null;
 let isShuttingDown = false;
 
 /**
@@ -154,6 +158,15 @@ async function gracefulShutdown(signal: string): Promise<void> {
       console.log("[Shutdown] Device bridge shut down");
     } catch (error) {
       console.error("[Shutdown] Error shutting down emulator bridge:", error);
+    }
+  }
+
+  if (codexBridgeForShutdown) {
+    try {
+      await codexBridgeForShutdown.shutdown?.();
+      console.log("[Shutdown] Codex bridge shut down");
+    } catch (error) {
+      console.error("[Shutdown] Error shutting down Codex bridge:", error);
     }
   }
 
@@ -278,6 +291,29 @@ const realSdk = new RealClaudeSDK();
 // Create EventBus and FileWatchers for all provider directories
 const eventBus = new EventBus();
 const fileWatchers: FileWatcher[] = [];
+const codexBridgeService: CodexBridgeController | undefined =
+  config.codexBridgeMode === "disabled"
+    ? undefined
+    : config.codexBridgeMode === "external"
+      ? new CodexBridgeHttpClient({
+          baseUrl: config.codexBridgeControlUrl,
+          eventBus,
+        })
+      : new CodexBridgeService({
+          enabled: config.codexBridgeEnabled,
+          host: config.codexBridgeHost,
+          port: config.codexBridgePort,
+          upstreamUrl: config.codexBridgeUpstreamUrl,
+          upstreamStartPort: config.codexBridgeUpstreamStartPort,
+          eventBus,
+        });
+console.log(
+  `[CodexBridge] mode=${config.codexBridgeMode}${
+    config.codexBridgeMode === "external"
+      ? ` control=${config.codexBridgeControlUrl}`
+      : ""
+  }`,
+);
 
 // Helper to create watcher if directory exists
 function createWatcherIfExists(
@@ -402,6 +438,7 @@ async function startServer() {
   await sharingService.initialize();
   await modelInfoService.initialize();
   await networkBindingService.initialize();
+  await codexBridgeService?.start?.();
 
   // Seed allowed hosts middleware from persisted settings
   updateAllowedHosts(serverSettingsService.getSetting("allowedHosts"));
@@ -523,6 +560,7 @@ async function startServer() {
     serverSettingsService,
     sharingService,
     deviceBridgeService,
+    codexBridgeService,
     modelInfoService,
     enabledProviders: config.enabledProviders,
     voiceInputEnabled: config.voiceInputEnabled,
@@ -543,6 +581,7 @@ async function startServer() {
   // Set service references for graceful shutdown
   supervisorForShutdown = supervisor;
   deviceBridgeForShutdown = deviceBridgeService ?? null;
+  codexBridgeForShutdown = codexBridgeService ?? null;
 
   // Set up debug context for maintenance server
   setDebugContext({

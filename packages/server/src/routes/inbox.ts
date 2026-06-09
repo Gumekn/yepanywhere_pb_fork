@@ -11,6 +11,7 @@
 
 import { getSessionDisplayTitle } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import type { CodexBridgeController } from "../codex-bridge/types.js";
 import type { SessionIndexService } from "../indexes/index.js";
 import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
@@ -44,6 +45,7 @@ export interface InboxDeps {
   geminiScanner?: GeminiSessionScanner;
   geminiSessionsDir?: string;
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
+  codexBridgeService?: CodexBridgeController;
 }
 
 export interface InboxItem {
@@ -155,6 +157,13 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
           if (state === "in-turn" || state === "waiting-input") {
             activity = state;
           }
+        } else {
+          const bridgedSession =
+            (await deps.codexBridgeService?.getSessionView(session.id)) ?? null;
+          if (bridgedSession) {
+            pendingInputType = bridgedSession.pendingInputType;
+            activity = bridgedSession.activity;
+          }
         }
 
         const hasUnread = deps.notificationService
@@ -170,6 +179,39 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
           customTitle: metadata?.customTitle ?? session.customTitle,
         });
       }
+    }
+
+    const knownSessionIds = new Set(allSessions.map((item) => item.session.id));
+    const bridgeSessionViews =
+      (await deps.codexBridgeService?.listSessionViews()) ?? [];
+    for (const item of bridgeSessionViews) {
+      if (knownSessionIds.has(item.session.id)) continue;
+      if (filterProjectId && item.session.projectId !== filterProjectId) {
+        continue;
+      }
+
+      const metadata = deps.sessionMetadataService?.getMetadata(
+        item.session.id,
+      );
+      const isArchived =
+        metadata?.isArchived ?? item.session.isArchived ?? false;
+      if (isArchived) continue;
+
+      const hasUnread = deps.notificationService
+        ? deps.notificationService.hasUnread(
+            item.session.id,
+            item.session.updatedAt,
+          )
+        : undefined;
+
+      allSessions.push({
+        session: item.session,
+        projectName: item.projectName,
+        pendingInputType: item.pendingInputType,
+        activity: item.activity,
+        hasUnread,
+        customTitle: metadata?.customTitle ?? item.session.customTitle,
+      });
     }
 
     // Build the inbox response by categorizing into tiers

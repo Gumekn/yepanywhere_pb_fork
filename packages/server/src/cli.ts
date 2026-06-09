@@ -88,6 +88,7 @@ OPTIONS:
   --open                Open the dashboard in your default browser on startup
   --auth-disable        Disable authentication (bypass auth even if enabled in settings)
                         Emergency recovery mode; re-enable auth after fixing config
+  --codex-bridge-only   Start only the Codex CLI bridge sidecar
 
 SETUP OPTIONS (for headless installation):
   --setup-auth <password>
@@ -237,6 +238,13 @@ if (authDisableIndex !== -1) {
   args.splice(authDisableIndex, 1);
 }
 
+// Parse --codex-bridge-only flag
+const codexBridgeOnlyIndex = args.indexOf("--codex-bridge-only");
+const codexBridgeOnly = codexBridgeOnlyIndex !== -1;
+if (codexBridgeOnlyIndex !== -1) {
+  args.splice(codexBridgeOnlyIndex, 1);
+}
+
 // Parse --setup-auth flag
 const setupAuthIndex = args.indexOf("--setup-auth");
 let setupAuthPassword: string | undefined;
@@ -269,6 +277,8 @@ if (!process.env.NODE_ENV) {
 // Handle setup commands (exit after completion)
 if (setupAuthPassword) {
   runSetup(setupAuthPassword);
+} else if (codexBridgeOnly) {
+  runCodexBridgeOnly();
 } else {
   // Only check for Claude CLI when starting the server (not for setup commands)
   checkClaudeCli();
@@ -302,4 +312,13 @@ function runServer(): void {
     console.error("Failed to start server:", error);
     process.exit(1);
   });
+}
+
+function runCodexBridgeOnly(): void {
+  import("./codex-bridge/standalone.js")
+    .then(({ runCodexBridgeOnly }) => runCodexBridgeOnly())
+    .catch((error) => {
+      console.error("Failed to start Codex bridge:", error);
+      process.exit(1);
+    });
 }

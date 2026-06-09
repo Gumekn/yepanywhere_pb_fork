@@ -11,6 +11,7 @@ import {
   getSessionDisplayTitle,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import type { CodexBridgeController } from "../codex-bridge/types.js";
 import type { SessionIndexService } from "../indexes/index.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { NotificationService } from "../notifications/index.js";
@@ -55,6 +56,8 @@ export interface GlobalSessionsDeps {
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
   /** Event bus for cache invalidation */
   eventBus?: EventBus;
+  /** Codex bridge for externally launched `codex --remote` TUI sessions. */
+  codexBridgeService?: CodexBridgeController;
 }
 
 export interface GlobalSessionItem {
@@ -191,10 +194,12 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       codexScanner: deps.codexScanner,
       geminiScanner: deps.geminiScanner,
     });
+    const seenSessionIds = new Set<string>();
 
     for (const project of projects) {
       const sessions = await listSessionsForProject(project, providerCatalog);
       for (const session of sessions) {
+        seenSessionIds.add(session.id);
         const metadata = deps.sessionMetadataService?.getMetadata(session.id);
         const isArchived = metadata?.isArchived ?? session.isArchived ?? false;
         const isStarred = metadata?.isStarred ?? session.isStarred ?? false;
@@ -219,6 +224,34 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         }
         if (isStarred) stats.starredCount++;
       }
+    }
+
+    const statsBridgeSessionViews =
+      (await deps.codexBridgeService?.listSessionViews()) ?? [];
+    for (const item of statsBridgeSessionViews) {
+      if (seenSessionIds.has(item.session.id)) continue;
+      const metadata = deps.sessionMetadataService?.getMetadata(
+        item.session.id,
+      );
+      const isArchived =
+        metadata?.isArchived ?? item.session.isArchived ?? false;
+      const isStarred = metadata?.isStarred ?? item.session.isStarred ?? false;
+      const hasUnread = deps.notificationService
+        ? deps.notificationService.hasUnread(
+            item.session.id,
+            item.session.updatedAt,
+          )
+        : false;
+
+      if (isArchived) {
+        stats.archivedCount++;
+      } else {
+        stats.totalCount++;
+        if (hasUnread) stats.unreadCount++;
+        stats.providerCounts.codex = (stats.providerCounts.codex ?? 0) + 1;
+        stats.executorCounts.local = (stats.executorCounts.local ?? 0) + 1;
+      }
+      if (isStarred) stats.starredCount++;
     }
 
     return stats;
@@ -292,6 +325,19 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
     const projectOptions: ProjectOption[] = allProjects
       .map((p) => ({ id: p.id, name: p.name }))
       .sort((a, b) => a.name.localeCompare(b.name));
+    const bridgeSessionViews =
+      (await deps.codexBridgeService?.listSessionViews()) ?? [];
+    for (const item of bridgeSessionViews) {
+      if (
+        !projectOptions.some((project) => project.id === item.session.projectId)
+      ) {
+        projectOptions.push({
+          id: item.session.projectId,
+          name: item.projectName,
+        });
+      }
+    }
+    projectOptions.sort((a, b) => a.name.localeCompare(b.name));
 
     // Collect all sessions with enriched data
     const allSessions: GlobalSessionItem[] = [];
@@ -326,8 +372,15 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
         // Compute status
         const process = deps.supervisor?.getProcessForSession(session.id);
+        const bridgedSession =
+          (await deps.codexBridgeService?.getSessionView(session.id)) ?? null;
+        const isBridgeSessionActive = bridgedSession
+          ? ((await deps.codexBridgeService?.isSessionActive(session.id)) ??
+            false)
+          : false;
         const isExternal =
-          deps.externalTracker?.isExternal(session.id) ?? false;
+          (deps.externalTracker?.isExternal(session.id) ?? false) ||
+          isBridgeSessionActive;
 
         const ownership: SessionOwnership = process
           ? {
@@ -355,6 +408,9 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           if (state === "in-turn" || state === "waiting-input") {
             activity = state;
           }
+        } else if (bridgedSession) {
+          pendingInputType = bridgedSession.pendingInputType;
+          activity = bridgedSession.activity;
         }
 
         // Apply search filter
@@ -393,6 +449,59 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           model: session.model,
         });
       }
+    }
+
+    const knownSessionIds = new Set(allSessions.map((session) => session.id));
+    for (const item of bridgeSessionViews) {
+      const session = item.session;
+      if (knownSessionIds.has(session.id)) continue;
+      if (filterProjectId && session.projectId !== filterProjectId) continue;
+
+      const metadata = deps.sessionMetadataService?.getMetadata(session.id);
+      const isArchived = metadata?.isArchived ?? session.isArchived ?? false;
+      const isStarred = metadata?.isStarred ?? session.isStarred ?? false;
+      const customTitle = metadata?.customTitle ?? session.customTitle;
+
+      if (isArchived && !includeArchived) continue;
+      if (starredOnly && !isStarred) continue;
+
+      if (searchQuery) {
+        const title = session.title ?? "";
+        const custom = customTitle ?? "";
+        const projectName = item.projectName;
+        if (
+          !title.toLowerCase().includes(searchQuery) &&
+          !custom.toLowerCase().includes(searchQuery) &&
+          !projectName.toLowerCase().includes(searchQuery)
+        ) {
+          continue;
+        }
+      }
+
+      const hasUnread = deps.notificationService
+        ? deps.notificationService.hasUnread(session.id, session.updatedAt)
+        : undefined;
+
+      allSessions.push({
+        id: session.id,
+        title: session.title,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        messageCount: session.messageCount,
+        provider: session.provider,
+        projectId: session.projectId,
+        projectName: item.projectName,
+        ownership: session.ownership,
+        pendingInputType: item.pendingInputType,
+        activity: item.activity,
+        hasUnread,
+        customTitle,
+        isArchived,
+        isStarred,
+        executor: metadata?.executor,
+        contextUsage: session.contextUsage,
+        model: session.model,
+      });
     }
 
     // Sort by updatedAt descending (most recent first)

@@ -3,6 +3,7 @@ import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { Hono } from "hono";
 import type { AuthService } from "./auth/AuthService.js";
 import { createAuthRoutes } from "./auth/routes.js";
+import type { CodexBridgeController } from "./codex-bridge/types.js";
 import type { DeviceBridgeService } from "./device/DeviceBridgeService.js";
 import type { FrontendProxy } from "./frontend/index.js";
 import type {
@@ -36,6 +37,7 @@ import type { RecentsService } from "./recents/index.js";
 import { createActivityRoutes } from "./routes/activity.js";
 import { createBrowserProfilesRoutes } from "./routes/browser-profiles.js";
 import { createClientLogsRoutes } from "./routes/client-logs.js";
+import { createCodexBridgeRoutes } from "./routes/codex-bridge.js";
 import { createConnectionsRoutes } from "./routes/connections.js";
 import { createDebugStreamingRoutes } from "./routes/debug-streaming.js";
 import {
@@ -167,6 +169,8 @@ export interface AppOptions {
   sharingService?: SharingService;
   /** DeviceBridgeService for Android emulator streaming */
   deviceBridgeService?: DeviceBridgeService;
+  /** Codex bridge for externally launched `codex --remote` TUI sessions. */
+  codexBridgeService?: CodexBridgeController;
   /** If non-empty, only these provider names are exposed via the API. */
   enabledProviders?: string[];
   /** Whether voice input is enabled. Default: true */
@@ -516,6 +520,15 @@ export function createApp(options: AppOptions): AppResult {
     );
   }
 
+  if (options.codexBridgeService) {
+    app.route(
+      "/api/codex-bridge",
+      createCodexBridgeRoutes({
+        codexBridgeService: options.codexBridgeService,
+      }),
+    );
+  }
+
   // Mount API routes
   app.route(
     "/api/projects",
@@ -554,6 +567,7 @@ export function createApp(options: AppOptions): AppResult {
       geminiReaderFactory,
       serverSettingsService: options.serverSettingsService,
       modelInfoService: options.modelInfoService,
+      codexBridgeService: options.codexBridgeService,
     }),
   );
   app.route(
@@ -608,6 +622,7 @@ export function createApp(options: AppOptions): AppResult {
       geminiScanner,
       geminiSessionsDir: GEMINI_TMP_DIR,
       geminiReaderFactory,
+      codexBridgeService: options.codexBridgeService,
     }),
   );
 
@@ -629,6 +644,7 @@ export function createApp(options: AppOptions): AppResult {
       geminiSessionsDir: GEMINI_TMP_DIR,
       geminiReaderFactory,
       eventBus: options.eventBus,
+      codexBridgeService: options.codexBridgeService,
     }),
   );
 
