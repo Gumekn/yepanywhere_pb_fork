@@ -5,7 +5,10 @@ import type { AuthService } from "./auth/AuthService.js";
 import { createAuthRoutes } from "./auth/routes.js";
 import type { DeviceBridgeService } from "./device/DeviceBridgeService.js";
 import type { FrontendProxy } from "./frontend/index.js";
-import type { SessionIndexService } from "./indexes/index.js";
+import type {
+  SessionContentIndexService,
+  SessionIndexService,
+} from "./indexes/index.js";
 import type {
   ProjectMetadataService,
   SessionMetadataService,
@@ -48,6 +51,7 @@ import { createProcessesRoutes } from "./routes/processes.js";
 import { createProjectsRoutes } from "./routes/projects.js";
 import { createProvidersRoutes } from "./routes/providers.js";
 import { createRecentsRoutes } from "./routes/recents.js";
+import { createSearchRoutes } from "./routes/search.js";
 import { createServerAdminRoutes } from "./routes/server-admin.js";
 import { createServerInfoRoutes } from "./routes/server-info.js";
 import { createSessionsRoutes } from "./routes/sessions.js";
@@ -101,6 +105,8 @@ export interface AppOptions {
   projectMetadataService?: ProjectMetadataService;
   /** SessionIndexService for caching session summaries */
   sessionIndexService?: SessionIndexService;
+  /** SessionContentIndexService for full-text content search */
+  sessionContentIndexService?: SessionContentIndexService;
   /** Project scanner cache TTL in ms (0 = rescan every request). */
   projectScanCacheTtlMs?: number;
   /** Maximum concurrent workers. 0 = unlimited (default) */
@@ -611,6 +617,25 @@ export function createApp(options: AppOptions): AppResult {
       eventBus: options.eventBus,
     }),
   );
+
+  // Search routes (full-text content search across sessions)
+  if (options.sessionContentIndexService) {
+    app.route(
+      "/api/search",
+      createSearchRoutes({
+        scanner,
+        readerFactory,
+        sessionContentIndexService: options.sessionContentIndexService,
+        sessionMetadataService: options.sessionMetadataService,
+        codexScanner,
+        codexSessionsDir: CODEX_SESSIONS_DIR,
+        codexReaderFactory,
+        geminiScanner,
+        geminiSessionsDir: GEMINI_TMP_DIR,
+        geminiReaderFactory,
+      }),
+    );
+  }
 
   // Files routes (file browser)
   app.route("/api/projects", createFilesRoutes({ scanner }));

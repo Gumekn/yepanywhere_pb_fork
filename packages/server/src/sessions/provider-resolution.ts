@@ -266,3 +266,16 @@ export async function findSessionSummaryAcrossProviders(
 
   return null;
 }
+
+/**
+ * Resolve the de-duplicated session sources (Claude/Codex/Gemini) for a project.
+ * Exposed so callers like the search route can iterate each provider's session
+ * directory + reader directly (e.g. to build/query a content index per source).
+ */
+export function resolveSessionSources(
+  project: Project,
+  deps: ProviderResolutionDeps,
+  catalog?: ProviderProjectCatalog,
+): SessionSource[] {
+  return getSessionSources(project, deps, undefined, catalog);
+}

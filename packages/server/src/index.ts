@@ -23,7 +23,10 @@ import {
   createStaticRoutes,
 } from "./frontend/index.js";
 import { ensureSelfSignedCertificate } from "./https/self-signed.js";
-import { SessionIndexService } from "./indexes/index.js";
+import {
+  SessionContentIndexService,
+  SessionIndexService,
+} from "./indexes/index.js";
 import {
   getLogFilePath,
   initLogger,
@@ -331,6 +334,13 @@ const sessionIndexService = new SessionIndexService({
   writeLockStaleMs: config.sessionIndexWriteLockStaleMs,
   eventBus,
 });
+const sessionContentIndexService = new SessionContentIndexService({
+  projectsDir: config.claudeProjectsDir,
+  dataDir: path.join(config.dataDir, "indexes", "content"),
+  writeLockTimeoutMs: config.sessionIndexWriteLockTimeoutMs,
+  writeLockStaleMs: config.sessionIndexWriteLockStaleMs,
+  eventBus,
+});
 const pushService = new PushService({ dataDir: config.dataDir });
 const browserProfileService = new BrowserProfileService({
   dataDir: config.dataDir,
@@ -383,6 +393,7 @@ async function startServer() {
   await sessionMetadataService.initialize();
   await projectMetadataService.initialize();
   await sessionIndexService.initialize();
+  await sessionContentIndexService.initialize();
   await pushService.initialize();
   await browserProfileService.initialize();
   await recentsService.initialize();
@@ -491,6 +502,7 @@ async function startServer() {
     sessionMetadataService,
     projectMetadataService,
     sessionIndexService,
+    sessionContentIndexService,
     projectScanCacheTtlMs: config.projectScanCacheTtlMs,
     maxWorkers: config.maxWorkers,
     idlePreemptThresholdMs: config.idlePreemptThresholdMs,
