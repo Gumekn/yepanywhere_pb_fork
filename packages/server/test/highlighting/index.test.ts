@@ -6,7 +6,7 @@ import {
   highlightFile,
 } from "../../src/highlighting/index.js";
 
-const { MAX_LINES, EXTENSION_TO_LANG } = __test__;
+const { MAX_LINES, EXTENSION_TO_LANG, highlightCache } = __test__;
 
 describe("getLanguageForPath", () => {
   describe("common file extensions", () => {
@@ -410,5 +410,42 @@ describe("MAX_LINES constant", () => {
   it("is exactly 10000", () => {
     // Document the actual value for regression detection
     expect(MAX_LINES).toBe(10000);
+  });
+});
+
+describe("highlightCode caching", () => {
+  it("caches results by code + language", async () => {
+    highlightCache.clear();
+    const code = "const cached = 1;";
+
+    const first = await highlightCode(code, "typescript");
+    expect(highlightCache.size).toBe(1);
+
+    const second = await highlightCode(code, "typescript");
+    // Same cache entry returned (no re-highlight).
+    expect(highlightCache.size).toBe(1);
+    expect(second).toBe(first);
+  });
+
+  it("keys distinct languages separately", async () => {
+    highlightCache.clear();
+    const code = "x = 1";
+
+    await highlightCode(code, "python");
+    await highlightCode(code, "ruby");
+
+    expect(highlightCache.size).toBe(2);
+  });
+
+  it("caches the null result for unsupported languages", async () => {
+    highlightCache.clear();
+
+    const first = await highlightCode("whatever", "not-a-real-language");
+    expect(first).toBeNull();
+    expect(highlightCache.size).toBe(1);
+
+    const second = await highlightCode("whatever", "not-a-real-language");
+    expect(second).toBeNull();
+    expect(highlightCache.size).toBe(1);
   });
 });

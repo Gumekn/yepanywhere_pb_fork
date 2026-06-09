@@ -6,6 +6,7 @@
  * to ensure identical rendering to the streaming path.
  */
 
+import { memoizeAsyncByString } from "../utils/charBudgetLruCache.js";
 import {
   type AugmentGenerator,
   type AugmentGeneratorConfig,
@@ -57,6 +58,10 @@ async function getGenerator(): Promise<AugmentGenerator> {
  * This uses the same BlockDetector and AugmentGenerator as the streaming
  * path, ensuring identical output for the same input.
  *
+ * Results are memoized by input text (see CACHE_MAX_CHARS): assistant text
+ * blocks, ExitPlanMode plans, and .md write previews are deterministic, so a
+ * cache hit returns byte-identical HTML while skipping the shiki render.
+ *
  * @param markdown - The markdown text to render
  * @returns The rendered HTML string
  */
@@ -64,7 +69,18 @@ export async function renderMarkdownToHtml(markdown: string): Promise<string> {
   if (!markdown.trim()) {
     return "";
   }
+  return cachedRenderMarkdownToHtml(markdown);
+}
 
+/** ~8M chars (≈16MB UTF-16) of distinct markdown inputs retained. */
+const CACHE_MAX_CHARS = 8_000_000;
+
+const cachedRenderMarkdownToHtml = memoizeAsyncByString(
+  renderMarkdownToHtmlUncached,
+  { maxChars: CACHE_MAX_CHARS },
+);
+
+async function renderMarkdownToHtmlUncached(markdown: string): Promise<string> {
   const generator = await getGenerator();
   const detector = new BlockDetector();
 

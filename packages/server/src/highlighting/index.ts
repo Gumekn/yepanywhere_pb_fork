@@ -12,6 +12,7 @@ import {
   createHighlighter,
 } from "shiki";
 import { createCssVariablesTheme } from "shiki/core";
+import { CharBudgetLruCache } from "../utils/charBudgetLruCache.js";
 
 /** Maximum lines to highlight (avoid blocking on huge files) */
 const MAX_LINES = 10000;
@@ -131,6 +132,18 @@ let highlighterPromise: Promise<Highlighter> | null = null;
 let loadedLanguages: Set<string> = new Set();
 
 /**
+ * Memoize highlight results by `${language}\n${code}`. Highlighting is
+ * deterministic and CPU-heavy; caching lets reopened sessions, "load older"
+ * chunks, and branch switches reuse identical output instead of re-running
+ * shiki. `null` (unsupported language) is cached too — it's a stable result.
+ * ~8M chars (≈16MB UTF-16) of distinct inputs retained.
+ */
+const HIGHLIGHT_CACHE_MAX_CHARS = 8_000_000;
+const highlightCache = new CharBudgetLruCache<HighlightResult | null>(
+  HIGHLIGHT_CACHE_MAX_CHARS,
+);
+
+/**
  * Get or create the singleton highlighter instance.
  */
 async function getHighlighter(): Promise<Highlighter> {
@@ -176,6 +189,19 @@ export interface HighlightResult {
  * @returns Highlighted HTML or null if language is unsupported
  */
 export async function highlightCode(
+  code: string,
+  language: string,
+): Promise<HighlightResult | null> {
+  const cacheKey = `${language}\n${code}`;
+  if (highlightCache.has(cacheKey)) {
+    return highlightCache.get(cacheKey) ?? null;
+  }
+  const result = await highlightCodeUncached(code, language);
+  highlightCache.set(cacheKey, result);
+  return result;
+}
+
+async function highlightCodeUncached(
   code: string,
   language: string,
 ): Promise<HighlightResult | null> {
@@ -253,4 +279,5 @@ export async function highlightFile(
 export const __test__ = {
   MAX_LINES,
   EXTENSION_TO_LANG,
+  highlightCache,
 };
