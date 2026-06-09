@@ -359,6 +359,13 @@ export function Sidebar({
               basePath={basePath}
             />
             <SidebarNavItem
+              to="/search"
+              icon={SidebarIcons.search}
+              label={t("sidebarSearch")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
+            <SidebarNavItem
               to="/projects"
               icon={SidebarIcons.projects}
               label={t("sidebarProjects")}

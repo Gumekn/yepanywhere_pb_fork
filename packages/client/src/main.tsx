@@ -22,6 +22,7 @@ import { InboxPage } from "./pages/InboxPage";
 import { LoginPage } from "./pages/LoginPage";
 import { NewSessionPage } from "./pages/NewSessionPage";
 import { ProjectsPage } from "./pages/ProjectsPage";
+import { SearchPage } from "./pages/SearchPage";
 import { SessionPage } from "./pages/SessionPage";
 import { TerminalPage } from "./pages/TerminalPage";
 import { SettingsLayout } from "./pages/settings";
@@ -57,6 +58,7 @@ createRoot(rootElement).render(
             <Route element={<NavigationLayout />}>
               <Route path="/projects" element={<ProjectsPage />} />
               <Route path="/sessions" element={<GlobalSessionsPage />} />
+              <Route path="/search" element={<SearchPage />} />
               <Route path="/agents" element={<AgentsPage />} />
               <Route path="/inbox" element={<InboxPage />} />
               <Route path="/settings" element={<SettingsLayout />} />

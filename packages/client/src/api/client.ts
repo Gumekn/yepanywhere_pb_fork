@@ -119,6 +119,39 @@ export interface GlobalSessionsResponse {
   projects: ProjectOption[];
 }
 
+/** A single snippet match within a session message (for content search). */
+export interface SearchMatch {
+  messageId: string;
+  role: string;
+  /** Snippet of surrounding context containing the match. */
+  snippet: string;
+  /** Char offset of the match start within the snippet (for highlight). */
+  matchStart: number;
+  /** Char length of the matched substring. */
+  matchLength: number;
+}
+
+/** One session's grouped search results. */
+export interface SearchResultSession {
+  sessionId: string;
+  projectId: string;
+  projectName: string;
+  provider: ProviderName;
+  title: string;
+  customTitle?: string;
+  updatedAt: string;
+  matchCount: number;
+  matches: SearchMatch[];
+}
+
+export interface SearchResponse {
+  query: string;
+  results: SearchResultSession[];
+  totalSessions: number;
+  totalMatches: number;
+  searchDurationMs: number;
+}
+
 export interface SessionOptions {
   mode?: PermissionMode;
   /** Model ID (e.g., "sonnet", "opus", "qwen2.5-coder:0.5b") */
@@ -855,6 +888,15 @@ export const api = {
     fetchJSON<{
       stats: GlobalSessionStats;
     }>("/sessions/stats"),
+
+  /** Full-text content search across sessions (global or per-project). */
+  search: (params: { q: string; project?: string; limit?: number }) => {
+    const searchParams = new URLSearchParams();
+    searchParams.set("q", params.q);
+    if (params.project) searchParams.set("project", params.project);
+    if (params.limit) searchParams.set("limit", String(params.limit));
+    return fetchJSON<SearchResponse>(`/search?${searchParams.toString()}`);
+  },
 
   // Auth API
   getAuthStatus: () => fetchJSON<AuthStatus>("/auth/status"),
