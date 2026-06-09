@@ -40,10 +40,23 @@ function getGitVersion(): string {
   }
 }
 
+function getDevBuildId(): string {
+  try {
+    const commit = execSync("git rev-parse HEAD", {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    return `dev-${commit.slice(0, 12)}`;
+  } catch {
+    return "dev-nogit";
+  }
+}
+
 export default defineConfig({
   clearScreen: false,
   base: basePath,
   define: {
+    __BUILD_ID__: JSON.stringify(process.env.YEP_BUILD_ID ?? getDevBuildId()),
     __APP_VERSION__: JSON.stringify(
       process.env.YEP_BUILD_VERSION ??
         process.env.YEP_BUILD_GIT_DESCRIBE ??

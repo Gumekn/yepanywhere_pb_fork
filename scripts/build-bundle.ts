@@ -153,6 +153,7 @@ step("Build client", () => {
   );
   execStep("pnpm --filter @yep-anywhere/client build", undefined, {
     BASE_PATH: clientBasePath,
+    YEP_BUILD_ID: BUILD_INFO.buildId,
     YEP_BUILD_VERSION: BUILD_INFO.version,
     YEP_BUILD_DATE: BUILD_INFO.builtAt,
     YEP_BUILD_GIT_DESCRIBE: BUILD_INFO.gitDescribe ?? BUILD_INFO.version,

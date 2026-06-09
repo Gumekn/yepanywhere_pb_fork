@@ -8,6 +8,7 @@ import { InboxProvider } from "./contexts/InboxContext";
 import { SchemaValidationProvider } from "./contexts/SchemaValidationContext";
 import { ToastProvider } from "./contexts/ToastContext";
 import { useActivityBusConnection } from "./hooks/useActivityBusConnection";
+import { useBuildRefresh } from "./hooks/useBuildRefresh";
 import { useNeedsAttentionBadge } from "./hooks/useNeedsAttentionBadge";
 import { useSyncNotifyInAppSetting } from "./hooks/useNotifyInApp";
 import { useOnboarding } from "./hooks/useOnboarding";
@@ -25,6 +26,9 @@ interface Props {
 function AppContent({ children }: Props) {
   // Manage SSE connection based on auth state (prevents 401s on login page)
   useActivityBusConnection();
+
+  // Auto-refresh already-open production tabs after a server-only deploy.
+  useBuildRefresh();
 
   // Client-side log collection for connection diagnostics
   useEffect(() => initClientLogCollection(), []);
