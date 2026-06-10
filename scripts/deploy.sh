@@ -7,6 +7,7 @@
 # Usage:
 #   scripts/deploy.sh                         # interactive wizard
 #   scripts/deploy.sh --server-only           # non-interactive server deploy
+#   scripts/deploy.sh --codex-bridge-only     # non-interactive 4510 bridge deploy
 #   scripts/deploy.sh --apk-only --debug
 #   scripts/deploy.sh --restart-only --no-apk
 #   scripts/deploy.sh --skip-checks --no-install
@@ -34,13 +35,18 @@ usage() {
 
 Options:
   --server-only       Deploy only the server bundle
+  --codex-bridge-only Deploy only the 4510 Codex bridge sidecar
   --apk-only          Build/install only the APK
   --no-server         Skip server deploy
   --no-apk            Skip APK build/install
   --restart-only      Restart existing server bundle without rebuilding it
   --server-build-only Build server bundle but do not restart
   --preserve-codex-bridge
-                      Keep the Codex bridge sidecar alive while restarting the web server
+                      Keep the Codex bridge sidecar alive while restarting the web server (default)
+  --restart-codex-bridge
+                      Restart the Codex bridge sidecar too; disconnects active cf sessions
+  --embedded-codex-bridge
+                      Legacy mode: run the Codex bridge inside the web server
   --skip-checks       Skip pnpm lint/typecheck preflight
 
 APK options passed through:
@@ -49,6 +55,7 @@ EOF
 }
 
 DO_SERVER=true
+DO_CODEX_BRIDGE=false
 DO_APK=true
 RUN_CHECKS=true
 SERVER_ARGS=()
@@ -107,6 +114,7 @@ choose_apk_build_type() {
 
 configure_interactive() {
   DO_SERVER=false
+  DO_CODEX_BRIDGE=false
   DO_APK=false
   RUN_CHECKS=false
   SERVER_ARGS=()
@@ -123,15 +131,17 @@ configure_interactive() {
   if ask_yes_no "Redeploy 8022 web/API server?" "yes"; then
     DO_SERVER=true
     RUN_CHECKS=true
+  fi
 
-    echo
-    log "4510 Codex bridge"
-    dim "4510 is the local WebSocket bridge used by cf / codex --remote sessions."
-    dim "Restarting it disconnects active Codex CLI TUI sessions and pending approval flows."
-    dim "Preserving it keeps or migrates it to a sidecar so 8022 can restart without dropping those sessions."
-    if ask_yes_no "Preserve 4510 Codex bridge while restarting 8022?" "yes"; then
-      SERVER_ARGS+=(--preserve-codex-bridge)
-    fi
+  echo
+  log "4510 Codex bridge"
+  dim "4510 is the local WebSocket bridge used by cf / codex --remote sessions."
+  dim "Choosing no leaves the existing 4510 process untouched."
+  dim "Choosing yes restarts 4510 and disconnects active cf / codex --remote sessions."
+  if ask_yes_no "Redeploy 4510 Codex bridge service?" "no"; then
+    DO_CODEX_BRIDGE=true
+    RUN_CHECKS=true
+    SERVER_ARGS+=(--restart-codex-bridge)
   fi
 
   echo
@@ -157,11 +167,20 @@ else
     case "$1" in
       --server-only)
         DO_SERVER=true
+        DO_CODEX_BRIDGE=false
         DO_APK=false
+        shift
+        ;;
+      --codex-bridge-only)
+        DO_SERVER=false
+        DO_CODEX_BRIDGE=true
+        DO_APK=false
+        SERVER_ARGS+=(--restart-codex-bridge)
         shift
         ;;
       --apk-only)
         DO_SERVER=false
+        DO_CODEX_BRIDGE=false
         DO_APK=true
         RUN_CHECKS=false
         shift
@@ -185,6 +204,15 @@ else
         ;;
       --preserve-codex-bridge)
         SERVER_ARGS+=(--preserve-codex-bridge)
+        shift
+        ;;
+      --restart-codex-bridge)
+        DO_CODEX_BRIDGE=true
+        SERVER_ARGS+=(--restart-codex-bridge)
+        shift
+        ;;
+      --embedded-codex-bridge|--no-preserve-codex-bridge)
+        SERVER_ARGS+=("$1")
         shift
         ;;
       --skip-checks)
@@ -216,31 +244,36 @@ else
   done
 fi
 
-if ! $DO_SERVER && ! $DO_APK; then
-  err "Nothing to deploy: both server and APK are disabled."
+if ! $DO_SERVER && ! $DO_CODEX_BRIDGE && ! $DO_APK; then
+  err "Nothing to deploy: 8022 server, 4510 bridge, and APK are all disabled."
   exit 2
 fi
 
 log "Deploy plan"
-dim "server: $DO_SERVER ${SERVER_ARGS[*]:-}"
-dim "apk:    $DO_APK ${APK_ARGS[*]:-}"
-dim "checks: $RUN_CHECKS"
+dim "8022 web/API:      $DO_SERVER"
+dim "4510 Codex bridge: $DO_CODEX_BRIDGE"
+dim "server args:       ${SERVER_ARGS[*]:-}"
+dim "apk:               $DO_APK ${APK_ARGS[*]:-}"
+dim "checks:            $RUN_CHECKS"
 
-if $RUN_CHECKS && $DO_SERVER; then
+if $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE; }; then
   log "Running preflight checks ..."
   pnpm lint
   pnpm typecheck
 fi
 
-if $DO_SERVER; then
-  log "Deploying server ..."
+if $DO_SERVER || $DO_CODEX_BRIDGE; then
+  log "Deploying server services ..."
+  if ! $DO_SERVER; then
+    SERVER_ARGS+=(--no-restart)
+  fi
   if [[ ${#SERVER_ARGS[@]} -gt 0 ]]; then
     scripts/redeploy-server.sh "${SERVER_ARGS[@]}"
   else
     scripts/redeploy-server.sh
   fi
 else
-  warn "Skipping server deploy."
+  warn "Skipping server services deploy."
 fi
 
 if $DO_APK; then

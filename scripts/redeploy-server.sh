@@ -3,12 +3,17 @@
 # running server process so the new code takes effect.
 #
 # Usage:
-#   scripts/redeploy-server.sh           # full rebuild + restart
+#   scripts/redeploy-server.sh           # full rebuild + restart 8022, preserve 4510
 #   scripts/redeploy-server.sh --restart # restart only (skip rebuild)
 #   scripts/redeploy-server.sh --no-restart # rebuild only (skip restart)
 #   scripts/redeploy-server.sh --preserve-codex-bridge
-#                                      # restart the web server without stopping
-#                                      # an already-independent Codex bridge
+#                                      # explicit default: keep 4510 as sidecar
+#   scripts/redeploy-server.sh --restart-codex-bridge
+#                                      # restart the 4510 Codex bridge sidecar too
+#   scripts/redeploy-server.sh --no-restart --restart-codex-bridge
+#                                      # rebuild + restart only the 4510 sidecar
+#   scripts/redeploy-server.sh --embedded-codex-bridge
+#                                      # legacy: run 4510 inside 8022
 #
 # Assumes:
 #   - Global `yepanywhere` command is pnpm-linked to dist/npm-package
@@ -19,6 +24,9 @@
 # Side effects of restart:
 #   - APK / web clients disconnect for ~3-5s (auto-reconnect, no relogin).
 #   - In-progress SDK sessions (running claude subprocesses) are killed.
+#   - 4510 Codex bridge sessions are preserved by default. If 4510 is still
+#     embedded in the 8022 process, preserving it while restarting 8022 is
+#     impossible; choose --restart-codex-bridge to migrate/restart it.
 #   - Persisted session jsonl is unaffected.
 
 set -euo pipefail
@@ -43,7 +51,8 @@ dim()  { echo -e "${C_DIM}    $*${C_RESET}"; }
 # ----- args -----
 DO_BUILD=true
 DO_RESTART=true
-PRESERVE_CODEX_BRIDGE=false
+USE_CODEX_BRIDGE_SIDECAR=true
+RESTART_CODEX_BRIDGE=false
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
 SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
 if [[ "$SERVER_BASE_PATH" == "/" ]]; then
@@ -57,9 +66,20 @@ for arg in "$@"; do
   case "$arg" in
     --restart)    DO_BUILD=false ;;
     --no-restart) DO_RESTART=false ;;
-    --preserve-codex-bridge) PRESERVE_CODEX_BRIDGE=true ;;
+    --preserve-codex-bridge)
+      USE_CODEX_BRIDGE_SIDECAR=true
+      RESTART_CODEX_BRIDGE=false
+      ;;
+    --restart-codex-bridge)
+      USE_CODEX_BRIDGE_SIDECAR=true
+      RESTART_CODEX_BRIDGE=true
+      ;;
+    --embedded-codex-bridge|--no-preserve-codex-bridge)
+      USE_CODEX_BRIDGE_SIDECAR=false
+      RESTART_CODEX_BRIDGE=true
+      ;;
     -h|--help)
-      sed -n '2,20p' "$0"
+      sed -n '2,30p' "$0"
       exit 0
       ;;
     *)
@@ -109,6 +129,22 @@ wait_port_released() {
   return 1
 }
 
+server_process_pids() {
+  local port="$1"
+  pgrep -f "${REPO_ROOT}/dist/npm-package/dist/cli.js --port ${port}" 2>/dev/null | sort -u || true
+}
+
+wait_server_processes_stopped() {
+  local port="$1"
+  for _ in $(seq 1 20); do
+    if [[ -z "$(server_process_pids "$port")" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 start_codex_bridge_sidecar() {
   local bridge_port="$1"
   local bridge_url="$2"
@@ -149,6 +185,7 @@ if $DO_BUILD; then
   # it ourselves, otherwise `yepanywhere` boots with ERR_MODULE_NOT_FOUND.
   log "Installing runtime dependencies in dist/npm-package ..."
   (cd dist/npm-package && npm install --omit=dev --no-audit --no-fund --silent)
+  chmod +x dist/npm-package/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true
 
   # Sanity-check the linked global command resolves to our bundle.
   GLOBAL_BIN="$(command -v yepanywhere 2>/dev/null || true)"
@@ -172,39 +209,63 @@ if $DO_BUILD; then
 fi
 
 # ----- restart -----
-if $DO_RESTART; then
+if $DO_RESTART || $RESTART_CODEX_BRIDGE; then
   CODEX_BRIDGE_PORT="${YEP_CODEX_BRIDGE_PORT:-${CODEX_BRIDGE_PORT:-4510}}"
   CODEX_BRIDGE_HTTP_URL="${YEP_CODEX_BRIDGE_CONTROL_URL:-${CODEX_BRIDGE_CONTROL_URL:-http://127.0.0.1:${CODEX_BRIDGE_PORT}}}"
-  START_CODEX_BRIDGE_AFTER_STOP=false
   SERVER_LISTEN_PIDS="$(lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+  SERVER_PROCESS_PIDS="$(server_process_pids "$SERVER_PORT")"
   CODEX_BRIDGE_LISTEN_PIDS="$(lsof -iTCP:"${CODEX_BRIDGE_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+else
+  CODEX_BRIDGE_PORT=""
+  CODEX_BRIDGE_HTTP_URL=""
+  SERVER_LISTEN_PIDS=""
+  SERVER_PROCESS_PIDS=""
+  CODEX_BRIDGE_LISTEN_PIDS=""
+fi
 
-  if $PRESERVE_CODEX_BRIDGE; then
-    if [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]] && ! pid_sets_overlap "$SERVER_LISTEN_PIDS" "$CODEX_BRIDGE_LISTEN_PIDS"; then
-      dim "preserving Codex bridge on port ${CODEX_BRIDGE_PORT} (PID ${CODEX_BRIDGE_LISTEN_PIDS//$'\n'/, })"
-    else
+if $DO_RESTART; then
+  START_CODEX_BRIDGE_AFTER_STOP=false
+
+  if $USE_CODEX_BRIDGE_SIDECAR; then
+    if $RESTART_CODEX_BRIDGE; then
       START_CODEX_BRIDGE_AFTER_STOP=true
       if [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]]; then
-        warn "Codex bridge port ${CODEX_BRIDGE_PORT} is currently owned by the web server process. This deploy will migrate it to a sidecar; existing cf sessions will disconnect once."
+        warn "Restarting Codex bridge on port ${CODEX_BRIDGE_PORT}; active cf / codex --remote sessions will disconnect."
       else
+        dim "Codex bridge sidecar is not running; it will be started."
+      fi
+    elif [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]] && ! pid_sets_overlap "$SERVER_LISTEN_PIDS" "$CODEX_BRIDGE_LISTEN_PIDS"; then
+      dim "preserving Codex bridge on port ${CODEX_BRIDGE_PORT} (PID ${CODEX_BRIDGE_LISTEN_PIDS//$'\n'/, })"
+    else
+      if [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]]; then
+        err "Cannot restart 8022 without affecting 4510: port ${CODEX_BRIDGE_PORT} is owned by the web server process."
+        err "Run again with --restart-codex-bridge to migrate/restart 4510, or start a 4510 sidecar first."
+        exit 1
+      else
+        START_CODEX_BRIDGE_AFTER_STOP=true
         dim "Codex bridge sidecar is not running; it will be started after the web server stops."
       fi
     fi
+  elif [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]]; then
+    warn "Starting Codex bridge embedded in the web server; active cf / codex --remote sessions will disconnect."
   fi
 
   log "Stopping running yepanywhere ..."
-  if $PRESERVE_CODEX_BRIDGE; then
-    if [[ -n "$SERVER_LISTEN_PIDS" ]]; then
-      kill $SERVER_LISTEN_PIDS 2>/dev/null || true
-    fi
-  else
-    # `node ... yepanywhere` is the actual process; pkill matches against the
-    # full command line. Suppress error if nothing was running.
-    pkill -f "node.*yepanywhere" || true
+  if [[ -n "$SERVER_LISTEN_PIDS" ]]; then
+    kill $SERVER_LISTEN_PIDS 2>/dev/null || true
+  fi
+  if [[ -n "$SERVER_PROCESS_PIDS" ]]; then
+    kill $SERVER_PROCESS_PIDS 2>/dev/null || true
+  fi
+  if { ! $USE_CODEX_BRIDGE_SIDECAR || $RESTART_CODEX_BRIDGE; } &&
+    [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]] &&
+    ! pid_sets_overlap "$SERVER_LISTEN_PIDS" "$CODEX_BRIDGE_LISTEN_PIDS"; then
+    kill $CODEX_BRIDGE_LISTEN_PIDS 2>/dev/null || true
   fi
 
   # Wait briefly for the old process to release the port.
   wait_port_released "$SERVER_PORT" || true
+  wait_server_processes_stopped "$SERVER_PORT" || true
 
   LISTEN_PIDS="$(lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
   if [[ -n "$LISTEN_PIDS" ]]; then
@@ -216,6 +277,13 @@ if $DO_RESTART; then
       fi
       sleep 0.25
     done
+  fi
+
+  SERVER_PROCESS_PIDS="$(server_process_pids "$SERVER_PORT")"
+  if [[ -n "$SERVER_PROCESS_PIDS" ]]; then
+    warn "Yep Anywhere server process(es) for port ${SERVER_PORT} are still running: ${SERVER_PROCESS_PIDS//$'\n'/, }. Sending SIGTERM ..."
+    kill $SERVER_PROCESS_PIDS 2>/dev/null || true
+    wait_server_processes_stopped "$SERVER_PORT" || true
   fi
 
   LISTEN_PIDS="$(lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
@@ -230,12 +298,24 @@ if $DO_RESTART; then
     done
   fi
 
+  SERVER_PROCESS_PIDS="$(server_process_pids "$SERVER_PORT")"
+  if [[ -n "$SERVER_PROCESS_PIDS" ]]; then
+    warn "Yep Anywhere server process(es) for port ${SERVER_PORT} did not stop after SIGTERM. Sending SIGKILL to PID(s): ${SERVER_PROCESS_PIDS//$'\n'/, }"
+    kill -9 $SERVER_PROCESS_PIDS 2>/dev/null || true
+    wait_server_processes_stopped "$SERVER_PORT" || true
+  fi
+
   if lsof -iTCP:"${SERVER_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
     err "Port ${SERVER_PORT} is still in use after stopping the old server."
     exit 1
   fi
+  SERVER_PROCESS_PIDS="$(server_process_pids "$SERVER_PORT")"
+  if [[ -n "$SERVER_PROCESS_PIDS" ]]; then
+    err "Yep Anywhere server process(es) for port ${SERVER_PORT} are still running after stop: ${SERVER_PROCESS_PIDS//$'\n'/, }"
+    exit 1
+  fi
 
-  if $PRESERVE_CODEX_BRIDGE && $START_CODEX_BRIDGE_AFTER_STOP; then
+  if $USE_CODEX_BRIDGE_SIDECAR && $START_CODEX_BRIDGE_AFTER_STOP; then
     wait_port_released "$CODEX_BRIDGE_PORT" || true
     if lsof -iTCP:"${CODEX_BRIDGE_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
       err "Codex bridge port ${CODEX_BRIDGE_PORT} is still in use; cannot start sidecar."
@@ -249,7 +329,7 @@ if $DO_RESTART; then
   # cleanly (see INFRA.md). The Hono app + client bundle both pick up BASE_PATH.
   # APK / direct-mode tcp tunnel callers are unaffected — they hit ws://host:8022
   # which still serves /yep/api/ws; only the URL prefix changes, not the port.
-  if $PRESERVE_CODEX_BRIDGE; then
+  if $USE_CODEX_BRIDGE_SIDECAR; then
     BASE_PATH="${SERVER_BASE_PATH:-/}" \
       YEP_CODEX_BRIDGE_MODE=external \
       YEP_CODEX_BRIDGE_CONTROL_URL="$CODEX_BRIDGE_HTTP_URL" \
@@ -298,6 +378,36 @@ if $DO_RESTART; then
     tail -20 /tmp/yep-server.log >&2 || true
     exit 1
   fi
+fi
+
+if ! $DO_RESTART && $RESTART_CODEX_BRIDGE; then
+  log "Restarting Codex bridge sidecar on port ${CODEX_BRIDGE_PORT} ..."
+  if [[ -n "$SERVER_LISTEN_PIDS" ]] &&
+    [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]] &&
+    pid_sets_overlap "$SERVER_LISTEN_PIDS" "$CODEX_BRIDGE_LISTEN_PIDS"; then
+    err "Cannot restart only 4510: port ${CODEX_BRIDGE_PORT} is owned by the 8022 web/API process."
+    err "Redeploy 8022 with --restart-codex-bridge once to split it into a sidecar."
+    exit 1
+  fi
+
+  if [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]]; then
+    kill $CODEX_BRIDGE_LISTEN_PIDS 2>/dev/null || true
+    wait_port_released "$CODEX_BRIDGE_PORT" || true
+  fi
+
+  LISTEN_PIDS="$(lsof -iTCP:"${CODEX_BRIDGE_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+  if [[ -n "$LISTEN_PIDS" ]]; then
+    warn "Codex bridge port ${CODEX_BRIDGE_PORT} is still held by PID(s): ${LISTEN_PIDS//$'\n'/, }. Sending SIGKILL ..."
+    kill -9 $LISTEN_PIDS 2>/dev/null || true
+    wait_port_released "$CODEX_BRIDGE_PORT" || true
+  fi
+
+  if lsof -iTCP:"${CODEX_BRIDGE_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1; then
+    err "Codex bridge port ${CODEX_BRIDGE_PORT} is still in use after stopping the old sidecar."
+    exit 1
+  fi
+
+  start_codex_bridge_sidecar "$CODEX_BRIDGE_PORT" "$CODEX_BRIDGE_HTTP_URL"
 fi
 
 log "Done."

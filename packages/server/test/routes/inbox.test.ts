@@ -188,9 +188,9 @@ describe("Inbox Routes", () => {
       expect(result.active[0].activity).toBe("in-turn");
     });
 
-    it("categorizes session updated in last 30 minutes into recentActivity", async () => {
+    it("categorizes session updated in last hour into recentActivity", async () => {
       const project = createProject("proj1", "myproject", "/sessions/proj1");
-      const session = createSession("sess1", "proj1", minutesAgo(15)); // 15 minutes ago
+      const session = createSession("sess1", "proj1", minutesAgo(45)); // 45 minutes ago
 
       vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
       sessionsByDir.set("/sessions/proj1", [session]);
@@ -378,7 +378,7 @@ describe("Inbox Routes", () => {
         sessionIndexService: mockSessionIndexService,
       });
 
-      // All should be in recentActivity (< 30 min)
+      // All should be in recentActivity (< 1 hour)
       expect(result.recentActivity).toHaveLength(3);
       // Most recent first
       expect(result.recentActivity[0].sessionId).toBe("sess-newest");

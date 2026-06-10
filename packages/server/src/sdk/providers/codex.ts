@@ -999,7 +999,7 @@ export class CodexProvider implements AgentProvider {
 
     return applyOverrides({
       approvalPolicy: "on-request",
-      sandbox: "workspace-write",
+      sandbox: "danger-full-access",
     });
   }
 

@@ -67,6 +67,25 @@ function codexUserMessage(text: string, second: number): CodexSessionEntry {
   };
 }
 
+function codexTurnAbortedPseudoUser(second: number): CodexSessionEntry {
+  return codexUserMessage(
+    "<turn_aborted>\nThe user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.\n</turn_aborted>",
+    second,
+  );
+}
+
+function codexTurnAbortedEvent(second: number): CodexSessionEntry {
+  return {
+    type: "event_msg",
+    timestamp: `2024-01-01T00:00:${String(second).padStart(2, "0")}Z`,
+    payload: {
+      type: "turn_aborted",
+      reason:
+        "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
+    },
+  };
+}
+
 function codexAssistantMessage(
   text: string,
   second: number,
@@ -274,6 +293,44 @@ describe("Codex Normalization", () => {
     expect(
       editedPrompt?.codexBranch?.alternatives.map((branch) => branch.prompt),
     ).toEqual(["q2", "q2-1"]);
+  });
+
+  it("does not expose turn_aborted pseudo user messages as prompts or branches", () => {
+    const entries: CodexSessionEntry[] = [
+      codexUserMessage("q1", 1),
+      codexAssistantMessage("a1", 2),
+      codexTurnAbortedPseudoUser(3),
+      codexTurnAbortedEvent(4),
+      codexUserMessage("q2", 5),
+      codexAssistantMessage("a2", 6),
+    ];
+
+    const branchView = buildCodexBranchView(entries, "test-session");
+    expect(
+      branchView.branchState.branches.map((branch) => branch.prompt),
+    ).toEqual(["q1", "q2"]);
+    expect(branchView.entries.map(firstEntryText).filter(Boolean)).toEqual([
+      "q1",
+      "a1",
+      "q2",
+      "a2",
+    ]);
+
+    const result = normalizeSession(
+      buildLoadedSession(branchView.entries, branchView.branchState),
+    );
+    const visibleText = result.messages.map((message) =>
+      message.type === "system" ? message.content : firstMessageText(message),
+    );
+
+    expect(JSON.stringify(result.messages)).not.toContain("<turn_aborted>");
+    expect(visibleText).toEqual([
+      "q1",
+      "a1",
+      "Conversation stopped by user",
+      "q2",
+      "a2",
+    ]);
   });
 
   it("normalizes function_call_output into user tool_result blocks", () => {
@@ -1172,14 +1229,15 @@ describe("Codex Normalization", () => {
     expect(result.messages[0]?.message?.role).toBe("assistant");
   });
 
-  it("emits turn_aborted as a visible system entry", () => {
+  it("emits turn_aborted as a concise visible system entry", () => {
     const entries: CodexSessionEntry[] = [
       {
         type: "event_msg",
         timestamp: "2024-01-01T00:00:02Z",
         payload: {
           type: "turn_aborted",
-          reason: "approval denied",
+          reason:
+            "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
         },
       },
     ];
@@ -1189,7 +1247,7 @@ describe("Codex Normalization", () => {
     expect(result.messages[0]).toMatchObject({
       type: "system",
       subtype: "turn_aborted",
-      content: "approval denied",
+      content: "Conversation stopped by user",
     });
   });
 

@@ -66,6 +66,7 @@ import {
   SharingService,
 } from "./services/index.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
+import { TerminalService } from "./terminal/TerminalService.js";
 import { UploadManager } from "./uploads/manager.js";
 import {
   EventBus,
@@ -114,6 +115,7 @@ let supervisorForShutdown:
   | null = null;
 let deviceBridgeForShutdown: DeviceBridgeService | null = null;
 let codexBridgeForShutdown: CodexBridgeController | null = null;
+let terminalServiceForShutdown: TerminalService | null = null;
 let isShuttingDown = false;
 
 /**
@@ -167,6 +169,15 @@ async function gracefulShutdown(signal: string): Promise<void> {
       console.log("[Shutdown] Codex bridge shut down");
     } catch (error) {
       console.error("[Shutdown] Error shutting down Codex bridge:", error);
+    }
+  }
+
+  if (terminalServiceForShutdown) {
+    try {
+      terminalServiceForShutdown.shutdown();
+      console.log("[Shutdown] Terminal service shut down");
+    } catch (error) {
+      console.error("[Shutdown] Error shutting down terminal service:", error);
     }
   }
 
@@ -619,6 +630,8 @@ async function startServer() {
   const wsUploadManager = new UploadManager({
     maxUploadSizeBytes: config.maxUploadSizeBytes,
   });
+  const terminalService = new TerminalService();
+  terminalServiceForShutdown = terminalService;
   const wsHandler = createWsRoutes({
     upgradeWebSocket,
     app,
@@ -631,6 +644,7 @@ async function startServer() {
     browserProfileService,
     focusedSessionWatchManager,
     deviceBridgeService,
+    terminalService,
   });
   app.get("/api/ws", wsHandler);
 
@@ -738,6 +752,45 @@ async function startServer() {
     return server;
   }
 
+  async function waitForServerListening(
+    server: ReturnType<typeof serve>,
+    listenUrl: string,
+  ): Promise<void> {
+    if (server.listening) {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let timeout: NodeJS.Timeout | null = null;
+      const cleanup = () => {
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+        server.off("listening", onListening);
+        server.off("error", onError);
+      };
+      const onListening = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error: unknown) => {
+        cleanup();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+
+      server.once("listening", onListening);
+      server.once("error", onError);
+      timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Timed out waiting for ${listenUrl} to listen`));
+      }, 5000);
+
+      if (server.listening) {
+        onListening();
+      }
+    });
+  }
+
   // Callback for localhost port changes (test-first pattern)
   async function onLocalhostPortChange(
     newPort: number,
@@ -769,6 +822,10 @@ async function startServer() {
 
       // If we got here, the port is available
       // Close the test server and the old server
+      await waitForServerListening(
+        testServer,
+        `${serverProtocol}://127.0.0.1:${newPort}`,
+      );
       testServer.close();
 
       // Close old localhost server
@@ -784,6 +841,10 @@ async function startServer() {
           );
         },
         { fatalOnError: true },
+      );
+      await waitForServerListening(
+        localhostServer,
+        `${serverProtocol}://127.0.0.1:${newPort}`,
       );
 
       return {
@@ -835,6 +896,10 @@ async function startServer() {
           },
           { fatalOnError: true },
         );
+        await waitForServerListening(
+          localhostServer,
+          `${serverProtocol}://127.0.0.1:${localhostPort}`,
+        );
         boundToAllInterfaces = false;
       }
 
@@ -861,11 +926,17 @@ async function startServer() {
               );
             },
           );
+          await waitForServerListening(
+            networkServer,
+            `${serverProtocol}://${bindConfig.host}:${bindConfig.port}`,
+          );
           // Only set this flag after successful binding
           if (needsLocalhostClose) {
             boundToAllInterfaces = true;
           }
         } catch (bindError) {
+          networkServer?.close();
+          networkServer = null;
           // If we closed localhost but failed to bind network, recover localhost
           if (needsLocalhostClose) {
             console.log(
@@ -880,6 +951,10 @@ async function startServer() {
                 );
               },
               { fatalOnError: true },
+            );
+            await waitForServerListening(
+              localhostServer,
+              `${serverProtocol}://127.0.0.1:${localhostPort}`,
             );
           }
           throw bindError;
@@ -962,6 +1037,10 @@ async function startServer() {
     },
     { fatalOnError: true },
   );
+  await waitForServerListening(
+    localhostServer,
+    `${serverProtocol}://127.0.0.1:${effectivePort}`,
+  );
 
   // Start network socket if enabled in saved settings (and not CLI-overridden)
   const networkConfig = networkBindingService.getNetworkConfig();
@@ -971,10 +1050,13 @@ async function startServer() {
     !networkBindingService.isNetworkOverridden()
   ) {
     const networkPort = networkConfig.port ?? effectivePort;
-    await onNetworkBindingChange({
+    const result = await onNetworkBindingChange({
       host: networkConfig.host,
       port: networkPort,
     });
+    if (!result.success) {
+      throw new Error(result.error ?? "Failed to bind saved network socket");
+    }
   }
 
   // If CLI host override was specified (not localhost), also bind to that interface
@@ -984,7 +1066,13 @@ async function startServer() {
     config.host !== "127.0.0.1" &&
     config.host !== "localhost"
   ) {
-    await onNetworkBindingChange({ host: config.host, port: effectivePort });
+    const result = await onNetworkBindingChange({
+      host: config.host,
+      port: effectivePort,
+    });
+    if (!result.success) {
+      throw new Error(result.error ?? "Failed to bind CLI network socket");
+    }
   }
 
   // Start maintenance server on separate port (for out-of-band diagnostics)

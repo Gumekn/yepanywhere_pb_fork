@@ -1,6 +1,7 @@
 import type {
   DeviceServerMessage,
   RemoteClientMessage,
+  TerminalServerMessage,
   UploadedFile,
   YepMessage,
 } from "@yep-anywhere/shared";
@@ -251,6 +252,10 @@ export class WebSocketConnection implements Connection {
 
   onDeviceMessage(handler: (msg: DeviceServerMessage) => void): () => void {
     return this.protocol.onDeviceMessage(handler);
+  }
+
+  onTerminalMessage(handler: (msg: TerminalServerMessage) => void): () => void {
+    return this.protocol.onTerminalMessage(handler);
   }
 
   close(): void {

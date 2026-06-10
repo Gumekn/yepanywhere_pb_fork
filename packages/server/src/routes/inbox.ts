@@ -4,7 +4,7 @@
  * Tiers (in priority order):
  * 1. needsAttention - Sessions with pendingInputType set (tool-approval or user-question)
  * 2. active - Sessions with processState === 'running' but no pending input
- * 3. recentActivity - Sessions updated in the last 30 minutes (not in tiers 1-2)
+ * 3. recentActivity - Sessions updated in the last hour (not in tiers 1-2)
  * 4. unread8h - Sessions with hasUnread and updatedAt within 8 hours (not in tiers 1-3)
  * 5. unread24h - Sessions with hasUnread and updatedAt within 24 hours (not in tiers 1-4)
  */
@@ -71,7 +71,7 @@ export interface InboxResponse {
 const MAX_ITEMS_PER_TIER = 20;
 
 /** Time thresholds in milliseconds */
-const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+const ONE_HOUR_MS = 60 * 60 * 1000;
 const EIGHT_HOURS_MS = 8 * 60 * 60 * 1000;
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 
@@ -256,11 +256,11 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       }
     }
 
-    // Tier 3: recentActivity - updated in last 30 minutes
+    // Tier 3: recentActivity - updated in last hour
     for (const item of allSessions) {
       if (assignedSessionIds.has(item.session.id)) continue;
       const updatedAt = new Date(item.session.updatedAt).getTime();
-      if (now - updatedAt <= THIRTY_MINUTES_MS) {
+      if (now - updatedAt <= ONE_HOUR_MS) {
         recentActivity.push(toInboxItem(item));
         assignedSessionIds.add(item.session.id);
       }

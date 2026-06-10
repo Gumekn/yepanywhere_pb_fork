@@ -39,6 +39,10 @@ import {
 import type { ContentBlock, Message, Session } from "../supervisor/types.js";
 import { collectVisibleClaudeEntries } from "./claude-messages.js";
 import { applyCodexRollbackMarkers } from "./codex-rollback.js";
+import {
+  CODEX_TURN_ABORTED_DISPLAY_TEXT,
+  isCodexTurnAbortedNoticeText,
+} from "./codex-turn-aborted.js";
 import type { LoadedSession } from "./types.js";
 
 interface CodexToolUseConversion {
@@ -588,6 +592,15 @@ function convertCodexMessagePayload(
       "text" in block && typeof block.text === "string" ? block.text : "",
     )
     .join("");
+
+  if (
+    payload.role === "user" &&
+    fullText.trim() &&
+    isCodexTurnAbortedNoticeText(fullText)
+  ) {
+    return null;
+  }
+
   if (fullText.trim()) {
     content.push({
       type: "text",
@@ -1235,7 +1248,7 @@ function convertCodexEventMsg(
         uuid,
         type: "system",
         subtype: "turn_aborted",
-        content: payload.reason ?? payload.message ?? "Turn aborted",
+        content: CODEX_TURN_ABORTED_DISPLAY_TEXT,
         timestamp: entry.timestamp,
       };
 

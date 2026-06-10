@@ -3,6 +3,7 @@ import type {
   CodexBranchState,
   CodexSessionEntry,
 } from "@yep-anywhere/shared";
+import { isCodexTurnAbortedNoticeText } from "./codex-turn-aborted.js";
 
 interface CodexBranchNode {
   id: string;
@@ -260,6 +261,10 @@ export function buildCodexBranchView(
 
     const userText = getUserTurnText(entry, hasResponseItemUser);
     if (userText !== null) {
+      if (isCodexTurnAbortedNoticeText(userText)) {
+        continue;
+      }
+
       if (isSessionSetupText(userText)) {
         if (sawConversationTurn) {
           pendingSetupEntries.push(entry);

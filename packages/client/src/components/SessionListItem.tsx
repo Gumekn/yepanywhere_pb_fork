@@ -448,31 +448,48 @@ export function SessionListItem({
               </span>
             </>
           ) : (
-            // Compact mode: single line with badges
+            // Compact mode: sidebar summary with title and metadata
             <>
-              <span className="session-list-item__title-row">
-                {isStarred && <StarIcon filled />}
-                <span className="session-list-item__title-text">
+              <span className="session-list-item__compact-content">
+                <span className="session-list-item__title-row">
+                  {isStarred && <StarIcon filled />}
                   {isNewSession && <ThinkingIndicator />}
-                  {displayTitle}
+                  <span className="session-list-item__title-text">
+                    {displayTitle}
+                  </span>
+                  {hasDraft && (
+                    <span className="session-draft-badge">Draft</span>
+                  )}
                 </span>
-                {hasDraft && <span className="session-draft-badge">Draft</span>}
-                {provider && (
-                  <ProviderBadge
-                    provider={provider}
-                    model={model}
-                    isThinking={activity === "in-turn"}
-                    compact
-                    className="session-list-item__provider"
-                  />
-                )}
+                <span className="session-list-item__meta session-list-item__meta--compact">
+                  {showProjectName && projectName && (
+                    <span className="session-list-item__project-compact">
+                      {projectName}
+                    </span>
+                  )}
+                  {showTimestamp && updatedAt && (
+                    <span
+                      className="session-list-item__time"
+                      title={new Date(updatedAt).toLocaleString(locale)}
+                    >
+                      {formatSmartTime(updatedAt, locale)}
+                    </span>
+                  )}
+                  {provider && (
+                    <ProviderBadge
+                      provider={provider}
+                      model={model}
+                      isThinking={activity === "in-turn"}
+                      compact
+                      className="session-list-item__provider"
+                    />
+                  )}
+                  {getCompactActivityIndicator()}
+                  {isArchived && (
+                    <span className="session-archived-badge">Archived</span>
+                  )}
+                </span>
               </span>
-              {showProjectName && projectName && (
-                <span className="session-list-item__project-compact">
-                  {projectName}
-                </span>
-              )}
-              {getCompactActivityIndicator()}
             </>
           )}
         </Link>

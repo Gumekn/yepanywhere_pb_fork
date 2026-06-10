@@ -8,6 +8,14 @@
 /** Pattern for all IDE metadata tags */
 const IDE_TAG_PATTERN = /<ide_(opened_file|selection)>[\s\S]*?<\/ide_\1>/g;
 
+/** Pattern for bridge-injected system context at the start of a user message. */
+const SYSTEM_CONTEXT_PATTERN =
+  /^\s*\[System Context\][\s\S]*?\[\/System Context\]\s*/;
+
+/** Pattern for bridge-injected local timestamp prefixes after system context. */
+const BRIDGE_TIMESTAMP_PREFIX_PATTERN =
+  /^\s*\[\d{4}[/-]\d{1,2}[/-]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?\]\s*/;
+
 /** Pattern specifically for ide_opened_file tags */
 const OPENED_FILE_TAG_PATTERN =
   /<ide_opened_file>([\s\S]*?)<\/ide_opened_file>/g;
@@ -30,6 +38,20 @@ export function isIdeMetadata(text: string): boolean {
  */
 export function stripIdeMetadata(text: string): string {
   return text.replace(IDE_TAG_PATTERN, "").trim();
+}
+
+/**
+ * Strip metadata prepended by chat bridges before forwarding user messages.
+ *
+ * Matrix Lark Bridge prefixes messages with a `[System Context]` block and
+ * local timestamp. Those values are useful to the agent, but should not become
+ * the session title.
+ */
+export function stripBridgeMetadata(text: string): string {
+  return text
+    .replace(SYSTEM_CONTEXT_PATTERN, "")
+    .replace(BRIDGE_TIMESTAMP_PREFIX_PATTERN, "")
+    .trim();
 }
 
 /**

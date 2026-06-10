@@ -9,6 +9,7 @@ import {
   escalateContextWindow,
   getModelContextWindow,
   isIdeMetadata,
+  stripBridgeMetadata,
   stripIdeMetadata,
 } from "@yep-anywhere/shared";
 import type {
@@ -280,7 +281,7 @@ export class ClaudeSessionReader implements ISessionReader {
 
       const stats = await stat(filePath);
       const firstUserMessage = this.findFirstUserMessage(messages);
-      const fullTitle = firstUserMessage?.trim() || null;
+      const fullTitle = firstUserMessage || null;
       const model = this.extractModel(conversationMessages);
 
       // claude-ollama sessions use the same JSONL format but have non-Claude
@@ -812,7 +813,7 @@ export class ClaudeSessionReader implements ISessionReader {
     content: string | Array<{ type: string; text?: string }>,
   ): string {
     if (typeof content === "string") {
-      return stripIdeMetadata(content);
+      return stripBridgeMetadata(stripIdeMetadata(content));
     }
     return content
       .filter(
@@ -821,7 +822,8 @@ export class ClaudeSessionReader implements ISessionReader {
           typeof block.text === "string" &&
           !isIdeMetadata(block.text),
       )
-      .map((block) => block.text)
+      .map((block) => stripBridgeMetadata(stripIdeMetadata(block.text)))
+      .filter(Boolean)
       .join("\n");
   }
 

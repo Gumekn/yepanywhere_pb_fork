@@ -1,0 +1,700 @@
+import type { MarkdownAugment, ProviderName } from "@yep-anywhere/shared";
+import type { ReactNode } from "react";
+import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
+import { useGitStatus } from "../hooks/useGitStatus";
+import { useI18n } from "../i18n";
+import { formatSmartTime } from "../lib/datetime";
+import {
+  type ActiveToolApproval,
+  preprocessMessages,
+} from "../lib/preprocessMessages";
+import type { ContentBlock, Message, SessionStatus } from "../types";
+import type { RenderItem, ToolCallItem } from "../types/renderItems";
+import { ProviderBadge } from "./ProviderBadge";
+
+type InspectorPresentation = "sidebar" | "drawer";
+type InspectorTab = "questions" | "files" | "checks" | "git";
+type FileActivityKind = "modified" | "read" | "searched" | "other";
+type CheckStatus = "passed" | "failed" | "running" | "pending";
+type TFunction = ReturnType<typeof useI18n>["t"];
+
+interface SessionInspectorProps {
+  presentation: InspectorPresentation;
+  isOpen?: boolean;
+  onClose?: () => void;
+  messages: Message[];
+  markdownAugments?: Record<string, MarkdownAugment>;
+  activeToolApproval?: ActiveToolApproval;
+  projectId: string;
+  basePath?: string;
+  provider?: ProviderName;
+  model?: string;
+  status: SessionStatus;
+  processState?: string;
+  onSelectMessage: (messageId: string) => void;
+}
+
+interface QuestionItem {
+  id: string;
+  text: string;
+  timestamp?: string;
+}
+
+interface FileActivity {
+  path: string;
+  kind: FileActivityKind;
+  tools: Set<string>;
+  count: number;
+  messageId: string;
+  lastIndex: number;
+}
+
+interface CheckItem {
+  id: string;
+  command: string;
+  label: string;
+  status: CheckStatus;
+  messageId: string;
+  timestamp?: string;
+  lastIndex: number;
+}
+
+const TAB_KEYS: InspectorTab[] = ["questions", "files", "checks", "git"];
+
+const MUTATING_FILE_TOOLS = new Set([
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+  "Write",
+  "apply_patch",
+  "applyPatch",
+]);
+const READ_FILE_TOOLS = new Set(["Read"]);
+const SEARCH_FILE_TOOLS = new Set(["Glob", "Grep"]);
+const CHECK_COMMAND_RE =
+  /\b((pnpm|npm|yarn|bun)\s+(--filter\s+\S+\s+)?(run\s+)?(lint|typecheck|test(?::e2e)?|build)\b|tsc\b|vitest\b|playwright\s+test\b|biome\s+check\b)/i;
+
+export function SessionInspector({
+  presentation,
+  isOpen = true,
+  onClose,
+  messages,
+  markdownAugments,
+  activeToolApproval,
+  projectId,
+  basePath = "",
+  provider,
+  model,
+  status,
+  processState,
+  onSelectMessage,
+}: SessionInspectorProps) {
+  const { t, locale } = useI18n();
+  const [activeTab, setActiveTab] = useState<InspectorTab>("questions");
+  const {
+    gitStatus,
+    loading: gitLoading,
+    error: gitError,
+  } = useGitStatus(projectId);
+
+  const renderItems = useMemo(
+    () =>
+      preprocessMessages(messages, {
+        markdown: markdownAugments,
+        activeToolApproval,
+      }),
+    [activeToolApproval, markdownAugments, messages],
+  );
+
+  const questions = useMemo(
+    () => buildQuestionItems(renderItems),
+    [renderItems],
+  );
+  const fileActivities = useMemo(
+    () => buildFileActivities(renderItems),
+    [renderItems],
+  );
+  const checks = useMemo(() => buildCheckItems(renderItems), [renderItems]);
+
+  const handleSelect = (messageId: string) => {
+    onSelectMessage(messageId);
+    if (presentation === "drawer") {
+      onClose?.();
+    }
+  };
+
+  const body = (
+    <>
+      <div className="session-inspector-header">
+        <div>
+          <h2 className="session-inspector-title">
+            {t("sessionInspectorTitle")}
+          </h2>
+          <div className="session-inspector-subtitle">
+            {questions.length} {t("sessionInspectorQuestions").toLowerCase()}
+          </div>
+        </div>
+        {presentation === "drawer" && (
+          <button
+            type="button"
+            className="session-inspector-close"
+            onClick={onClose}
+            aria-label={t("sessionInspectorClose")}
+          >
+            <CloseIcon />
+          </button>
+        )}
+      </div>
+
+      <div className="session-inspector-status-card">
+        <div className="session-inspector-status-top">
+          {provider ? (
+            <ProviderBadge
+              provider={provider}
+              model={model}
+              isThinking={processState === "in-turn"}
+            />
+          ) : (
+            <span className="session-inspector-muted">
+              {t("sessionInspectorStatus")}
+            </span>
+          )}
+          <span className="session-inspector-pill">
+            {getStatusLabel(t, status, processState)}
+          </span>
+        </div>
+      </div>
+
+      {presentation === "drawer" && (
+        <div className="session-inspector-tabs" role="tablist">
+          {TAB_KEYS.map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              className={`session-inspector-tab ${activeTab === tab ? "active" : ""}`}
+              onClick={() => setActiveTab(tab)}
+              role="tab"
+              aria-selected={activeTab === tab}
+            >
+              {getTabLabel(t, tab)}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="session-inspector-content">
+        {presentation === "sidebar" || activeTab === "questions" ? (
+          <InspectorSection
+            title={t("sessionInspectorQuestions")}
+            count={questions.length}
+          >
+            {questions.length > 0 ? (
+              <ol className="session-inspector-list">
+                {questions.slice(-12).map((question, index) => (
+                  <li key={question.id}>
+                    <button
+                      type="button"
+                      className="session-inspector-row session-inspector-question"
+                      onClick={() => handleSelect(question.id)}
+                      title={question.text}
+                    >
+                      <span className="session-inspector-index">
+                        {questions.length -
+                          questions.slice(-12).length +
+                          index +
+                          1}
+                      </span>
+                      <span className="session-inspector-row-main">
+                        <span className="session-inspector-row-title">
+                          {question.text}
+                        </span>
+                        {question.timestamp && (
+                          <span className="session-inspector-row-meta">
+                            {formatSmartTime(question.timestamp, locale)}
+                          </span>
+                        )}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <EmptyState text={t("sessionInspectorNoQuestions")} />
+            )}
+          </InspectorSection>
+        ) : null}
+
+        {presentation === "sidebar" || activeTab === "files" ? (
+          <InspectorSection
+            title={t("sessionInspectorFiles")}
+            count={fileActivities.length}
+          >
+            {fileActivities.length > 0 ? (
+              <ul className="session-inspector-list">
+                {fileActivities.slice(0, 10).map((activity) => (
+                  <li key={activity.path}>
+                    <button
+                      type="button"
+                      className="session-inspector-row"
+                      onClick={() => handleSelect(activity.messageId)}
+                      title={activity.path}
+                    >
+                      <span
+                        className={`session-inspector-file-dot kind-${activity.kind}`}
+                      />
+                      <span className="session-inspector-row-main">
+                        <span className="session-inspector-row-title">
+                          {shortPath(activity.path)}
+                        </span>
+                        <span className="session-inspector-row-meta">
+                          {getFileKindLabel(t, activity.kind)} -{" "}
+                          {[...activity.tools].slice(0, 3).join(", ")}
+                          {activity.count > 1 ? ` - ${activity.count}` : ""}
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <EmptyState text={t("sessionInspectorNoFiles")} />
+            )}
+          </InspectorSection>
+        ) : null}
+
+        {presentation === "sidebar" || activeTab === "checks" ? (
+          <InspectorSection
+            title={t("sessionInspectorChecks")}
+            count={checks.length}
+          >
+            {checks.length > 0 ? (
+              <ul className="session-inspector-list">
+                {checks.slice(0, 8).map((check) => (
+                  <li key={check.id}>
+                    <button
+                      type="button"
+                      className="session-inspector-row"
+                      onClick={() => handleSelect(check.messageId)}
+                      title={check.command}
+                    >
+                      <span
+                        className={`session-inspector-check-dot status-${check.status}`}
+                      />
+                      <span className="session-inspector-row-main">
+                        <span className="session-inspector-row-title">
+                          {check.label}
+                        </span>
+                        <span className="session-inspector-row-meta">
+                          {getCheckStatusLabel(t, check.status)}
+                          {check.timestamp
+                            ? ` - ${formatSmartTime(check.timestamp, locale)}`
+                            : ""}
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <EmptyState text={t("sessionInspectorNoChecks")} />
+            )}
+          </InspectorSection>
+        ) : null}
+
+        {presentation === "sidebar" || activeTab === "git" ? (
+          <InspectorSection
+            title={t("sessionInspectorGit")}
+            count={gitStatus?.files.length}
+            action={
+              <Link
+                className="session-inspector-section-link"
+                to={`${basePath}/git-status?projectId=${encodeURIComponent(projectId)}`}
+              >
+                {t("gitStatusTitle")}
+              </Link>
+            }
+          >
+            {gitLoading ? (
+              <EmptyState text={t("sessionInspectorGitLoading")} />
+            ) : gitError ? (
+              <EmptyState text={t("sessionInspectorGitUnavailable")} />
+            ) : gitStatus && !gitStatus.isGitRepo ? (
+              <EmptyState text={t("sessionInspectorGitNotRepo")} />
+            ) : gitStatus?.isClean ? (
+              <EmptyState text={t("sessionInspectorGitClean")} />
+            ) : gitStatus ? (
+              <div className="session-inspector-git">
+                <div className="session-inspector-git-branch">
+                  <span>{gitStatus.branch ?? "HEAD"}</span>
+                  {(gitStatus.ahead > 0 || gitStatus.behind > 0) && (
+                    <span className="session-inspector-row-meta">
+                      {gitStatus.ahead > 0 ? `+${gitStatus.ahead}` : ""}
+                      {gitStatus.behind > 0 ? ` -${gitStatus.behind}` : ""}
+                    </span>
+                  )}
+                </div>
+                <ul className="session-inspector-list">
+                  {gitStatus.files.slice(0, 8).map((file) => (
+                    <li key={`${file.path}-${file.staged}`}>
+                      <Link
+                        className="session-inspector-row"
+                        to={`${basePath}/git-status?projectId=${encodeURIComponent(projectId)}`}
+                        title={file.path}
+                      >
+                        <span className="session-inspector-git-status">
+                          {file.status}
+                        </span>
+                        <span className="session-inspector-row-main">
+                          <span className="session-inspector-row-title">
+                            {shortPath(file.path)}
+                          </span>
+                          <span className="session-inspector-row-meta">
+                            {file.staged ? "staged" : "working"}
+                            {formatLineDelta(file)}
+                          </span>
+                        </span>
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </InspectorSection>
+        ) : null}
+      </div>
+    </>
+  );
+
+  if (presentation === "drawer") {
+    if (!isOpen) return null;
+    return (
+      <div
+        className="session-inspector-overlay"
+        role="presentation"
+        onClick={onClose}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            onClose?.();
+          }
+        }}
+      >
+        <aside
+          className="session-inspector session-inspector--drawer"
+          aria-label={t("sessionInspectorTitle")}
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          {body}
+        </aside>
+      </div>
+    );
+  }
+
+  return (
+    <aside
+      className="session-inspector session-inspector--sidebar"
+      aria-label={t("sessionInspectorTitle")}
+    >
+      {body}
+    </aside>
+  );
+}
+
+function InspectorSection({
+  title,
+  count,
+  action,
+  children,
+}: {
+  title: string;
+  count?: number;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="session-inspector-section">
+      <div className="session-inspector-section-header">
+        <h3>
+          {title}
+          {count !== undefined && (
+            <span className="session-inspector-count">{count}</span>
+          )}
+        </h3>
+        {action}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function EmptyState({ text }: { text: string }) {
+  return <div className="session-inspector-empty">{text}</div>;
+}
+
+function buildQuestionItems(items: RenderItem[]): QuestionItem[] {
+  return items
+    .filter((item): item is RenderItem & { type: "user_prompt" } => {
+      return item.type === "user_prompt";
+    })
+    .map((item) => ({
+      id: item.id,
+      text: compactText(contentToText(item.content), 140) || "Untitled",
+      timestamp: item.sourceMessages[0]?.timestamp,
+    }));
+}
+
+function buildFileActivities(items: RenderItem[]): FileActivity[] {
+  const grouped = new Map<string, FileActivity>();
+
+  items.forEach((item, index) => {
+    if (item.type !== "tool_call") return;
+    const paths = extractToolPaths(item);
+    if (paths.length === 0) return;
+    const kind = getFileActivityKind(item.toolName);
+    const messageId = item.sourceMessages[0]
+      ? getMessageIdLike(item.sourceMessages[0])
+      : item.id;
+
+    for (const path of paths) {
+      const existing = grouped.get(path);
+      if (existing) {
+        existing.count += 1;
+        existing.tools.add(item.toolName);
+        if (index >= existing.lastIndex) {
+          existing.kind = prioritizeFileKind(existing.kind, kind);
+          existing.messageId = messageId;
+          existing.lastIndex = index;
+        }
+      } else {
+        grouped.set(path, {
+          path,
+          kind,
+          tools: new Set([item.toolName]),
+          count: 1,
+          messageId,
+          lastIndex: index,
+        });
+      }
+    }
+  });
+
+  return [...grouped.values()].sort((a, b) => b.lastIndex - a.lastIndex);
+}
+
+function buildCheckItems(items: RenderItem[]): CheckItem[] {
+  return items
+    .flatMap((item, index) => {
+      if (item.type !== "tool_call") return [];
+      const command = extractCommand(item.toolInput);
+      if (!command || !CHECK_COMMAND_RE.test(command)) return [];
+      const messageId = item.sourceMessages[0]
+        ? getMessageIdLike(item.sourceMessages[0])
+        : item.id;
+      return [
+        {
+          id: item.id,
+          command,
+          label: compactText(command, 80),
+          status: getCheckStatus(item),
+          messageId,
+          timestamp: item.sourceMessages[0]?.timestamp,
+          lastIndex: index,
+        },
+      ];
+    })
+    .sort((a, b) => b.lastIndex - a.lastIndex);
+}
+
+function getMessageIdLike(message: Message): string {
+  return message.uuid ?? message.id ?? "";
+}
+
+function contentToText(content: string | ContentBlock[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .map((block) => {
+      if (block.type === "text" && typeof block.text === "string") {
+        return block.text;
+      }
+      if (block.type === "input_image" || block.type === "image")
+        return "[image]";
+      if (block.type === "document") return "[document]";
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function compactText(text: string, maxLength: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1)}...`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function extractToolPaths(item: ToolCallItem): string[] {
+  if (!isRecord(item.toolInput)) return [];
+  const input = item.toolInput;
+  const candidates = [
+    input.file_path,
+    input.filePath,
+    input.path,
+    input.notebook_path,
+    input.notebookPath,
+    input.old_path,
+    input.oldPath,
+    input.new_path,
+    input.newPath,
+  ];
+  return uniqueStrings(candidates).filter(
+    (path) => !looksLikeShellCommand(path),
+  );
+}
+
+function uniqueStrings(values: unknown[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+function looksLikeShellCommand(value: string): boolean {
+  return /\s(&&|\|\||\||;)\s/.test(value) || /^\w+=/.test(value);
+}
+
+function getFileActivityKind(toolName: string): FileActivityKind {
+  if (MUTATING_FILE_TOOLS.has(toolName)) return "modified";
+  if (READ_FILE_TOOLS.has(toolName)) return "read";
+  if (SEARCH_FILE_TOOLS.has(toolName)) return "searched";
+  return "other";
+}
+
+function prioritizeFileKind(
+  previous: FileActivityKind,
+  next: FileActivityKind,
+): FileActivityKind {
+  if (previous === "modified" || next === "modified") return "modified";
+  if (previous === "searched" || next === "searched") return "searched";
+  if (previous === "read" || next === "read") return "read";
+  return "other";
+}
+
+function extractCommand(input: unknown): string | null {
+  if (!isRecord(input)) return null;
+  for (const key of ["command", "cmd", "script"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  const args = input.args;
+  if (Array.isArray(args) && args.every((arg) => typeof arg === "string")) {
+    return args.join(" ");
+  }
+  return null;
+}
+
+function getCheckStatus(item: ToolCallItem): CheckStatus {
+  if (item.status === "pending") return "pending";
+  if (item.status === "error" || item.toolResult?.isError) return "failed";
+  const content = item.toolResult?.content ?? "";
+  if (/exit (?:code|status)\s+[1-9]\d*/i.test(content)) return "failed";
+  if (/command failed|tests? failed|failed/i.test(content)) return "failed";
+  if (/exit (?:code|status)\s+0/i.test(content)) return "passed";
+  return item.status === "complete" ? "passed" : "running";
+}
+
+function shortPath(path: string): string {
+  const normalized = path.replaceAll("\\", "/");
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length <= 2) return normalized;
+  return `${parts.at(-2)}/${parts.at(-1)}`;
+}
+
+function formatLineDelta(file: {
+  linesAdded: number | null;
+  linesDeleted: number | null;
+}): string {
+  const added = file.linesAdded ?? 0;
+  const deleted = file.linesDeleted ?? 0;
+  if (added === 0 && deleted === 0) return "";
+  return ` - +${added} -${deleted}`;
+}
+
+function getTabLabel(t: TFunction, tab: InspectorTab): string {
+  switch (tab) {
+    case "questions":
+      return t("sessionInspectorQuestions");
+    case "files":
+      return t("sessionInspectorFiles");
+    case "checks":
+      return t("sessionInspectorChecks");
+    case "git":
+      return t("sessionInspectorGit");
+  }
+}
+
+function getFileKindLabel(t: TFunction, kind: FileActivityKind): string {
+  switch (kind) {
+    case "modified":
+      return t("sessionInspectorModified");
+    case "read":
+      return t("sessionInspectorRead");
+    case "searched":
+      return t("sessionInspectorSearched");
+    case "other":
+      return t("sessionInspectorOther");
+  }
+}
+
+function getCheckStatusLabel(t: TFunction, status: CheckStatus): string {
+  switch (status) {
+    case "passed":
+      return t("sessionInspectorPassed");
+    case "failed":
+      return t("sessionInspectorFailed");
+    case "running":
+      return t("sessionInspectorRunning");
+    case "pending":
+      return t("sessionInspectorPending");
+  }
+}
+
+function getStatusLabel(
+  t: TFunction,
+  status: SessionStatus,
+  processState?: string,
+): string {
+  if (status.owner === "external") return t("sessionInspectorExternal");
+  if (status.owner === "self") {
+    return processState === "in-turn"
+      ? t("statusProcessing")
+      : t("sessionInspectorSelf");
+  }
+  return t("sessionInspectorIdle");
+}
+
+function CloseIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      aria-hidden="true"
+    >
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}

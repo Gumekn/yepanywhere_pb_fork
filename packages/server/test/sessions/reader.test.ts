@@ -137,6 +137,43 @@ describe("SessionReader", () => {
       expect(summary?.title).toBe("What is this?");
     });
 
+    it("strips bridge system context and timestamp from titles", async () => {
+      const sessionId = "test-session-bridge-context";
+      const userInput =
+        "https://vrfi1sk8a0.feishu.cn/wiki/BzXJwNJgfiHYKSksrNjcHV45nUh分析一下文档写一份测试点";
+      const jsonl = JSON.stringify({
+        type: "user",
+        message: {
+          content: `[System Context] | User OpenID: ou_31154c68aa8af9fda1131980e4ac8b2d | Chat ID: oc_f756f60110c80e36dd6588374e1ddc49 | Chat Type: p2p | [/System Context]\n[2026/6/2 10:57:43] ${userInput}`,
+        },
+        uuid: "msg-1",
+        timestamp: new Date().toISOString(),
+      });
+      await writeFile(join(testDir, `${sessionId}.jsonl`), `${jsonl}\n`);
+
+      const summary = await reader.getSessionSummary(sessionId, "test-project");
+      expect(summary?.title).toBe(userInput);
+      expect(summary?.fullTitle).toBe(userInput);
+    });
+
+    it("returns null title for bridge messages without user input", async () => {
+      const sessionId = "test-session-bridge-context-only";
+      const jsonl = JSON.stringify({
+        type: "user",
+        message: {
+          content:
+            "[System Context]\nplatform: wechat\nuser_id: user-1\ntime: 2026/6/2 10:57:43\n[/System Context]\n[2026/6/2 10:57:43] ",
+        },
+        uuid: "msg-1",
+        timestamp: new Date().toISOString(),
+      });
+      await writeFile(join(testDir, `${sessionId}.jsonl`), `${jsonl}\n`);
+
+      const summary = await reader.getSessionSummary(sessionId, "test-project");
+      expect(summary?.title).toBeNull();
+      expect(summary?.fullTitle).toBeNull();
+    });
+
     it("truncates long titles to 120 chars with ellipsis", async () => {
       const sessionId = "test-session-5";
       const longMessage =

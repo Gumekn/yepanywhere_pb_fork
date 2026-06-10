@@ -5,7 +5,7 @@ import {
   type UrlProjectId,
   asDirProjectId,
 } from "@yep-anywhere/shared";
-import { encodeProjectId } from "../projects/paths.js";
+import { decodeProjectId, encodeProjectId } from "../projects/paths.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import { readFirstLine } from "../utils/jsonl.js";
 import { BatchProcessor } from "../watcher/BatchProcessor.js";
@@ -19,8 +19,13 @@ import type {
   SessionUpdatedEvent,
 } from "../watcher/EventBus.js";
 import type { Supervisor } from "./Supervisor.js";
+import {
+  type ExternalProcessProbe,
+  hasActiveExternalProviderProcess,
+} from "./externalProcessProbe.js";
 import type {
   ContextUsage,
+  Project,
   SessionOwnership,
   SessionSummary,
 } from "./types.js";
@@ -35,6 +40,7 @@ interface ExternalSessionInfo {
   /** Session provider */
   provider: FileChangeEvent["provider"];
   timeoutId: ReturnType<typeof setTimeout>;
+  validationTimeoutId: ReturnType<typeof setTimeout> | null;
 }
 
 /** Default grace period after abort before external detection resumes (30 seconds) */
@@ -48,6 +54,10 @@ export interface ExternalSessionTrackerOptions {
   decayMs?: number;
   /** Grace period in ms after abort before external detection resumes (default: 30000) */
   abortGraceMs?: number;
+  /** How often to re-check that an external provider process is still alive (default: 3000) */
+  processValidationMs?: number;
+  /** Optional process probe override for tests/platform-specific integrations */
+  externalProcessProbe?: ExternalProcessProbe;
   /** Optional callback to get session summary for new external sessions */
   getSessionSummary?: (
     sessionId: string,
@@ -56,11 +66,13 @@ export interface ExternalSessionTrackerOptions {
 }
 
 /**
- * Tracks sessions that are being modified by external programs (not owned by this app).
+ * Tracks sessions that are actively controlled by external programs (not owned by this app).
  *
  * Uses file change events to detect when a session file is modified, then checks
- * if we own that session via Supervisor. If not owned, marks as "external" until
- * the decay timeout passes with no activity.
+ * if we own that session via Supervisor. If not owned, best-effort process
+ * probing decides whether an external provider process is still alive for the
+ * project. If probing is unavailable, it falls back to the historical
+ * recent-file-activity window.
  */
 export class ExternalSessionTracker {
   private externalSessions: Map<string, ExternalSessionInfo> = new Map();
@@ -71,6 +83,8 @@ export class ExternalSessionTracker {
   private scanner: ProjectScanner;
   private decayMs: number;
   private abortGraceMs: number;
+  private processValidationMs: number;
+  private externalProcessProbe: ExternalProcessProbe;
   private unsubscribe: (() => void) | null = null;
   private getSessionSummary?: (
     sessionId: string,
@@ -98,6 +112,9 @@ export class ExternalSessionTracker {
     this.scanner = options.scanner;
     this.decayMs = options.decayMs ?? 30000;
     this.abortGraceMs = options.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS;
+    this.processValidationMs = options.processValidationMs ?? 3000;
+    this.externalProcessProbe =
+      options.externalProcessProbe ?? hasActiveExternalProviderProcess;
     this.getSessionSummary = options.getSessionSummary;
 
     // Initialize batch processor for session parsing
@@ -113,14 +130,16 @@ export class ExternalSessionTracker {
 
         // Check if supervisor owns this session
         const isOwned = !!this.supervisor.getProcessForSession(sessionId);
+        const isExternal = this.externalSessions.has(sessionId);
 
         // Clean up external tracking if owned
         if (isOwned) {
           this.removeExternal(sessionId);
         }
 
-        // For owned sessions, we only emit session-updated (supervisor handles session-created)
-        // For external sessions, we emit both session-created (first time) and session-updated
+        // For owned sessions, we only emit session-updated (supervisor handles session-created).
+        // For unowned sessions discovered from files, emit session-created the first time,
+        // but only mark ownership external when the active external tracker still has it.
         if (!this.createdSessions.has(sessionId)) {
           if (isOwned) {
             // Owned session - supervisor already emitted session-created with title: null
@@ -156,8 +175,12 @@ export class ExternalSessionTracker {
               this.eventBus.emit(event);
             }
           } else {
-            // New external session - emit session-created
-            summary.ownership = { owner: "external" };
+            // New unowned session - emit session-created. This may be a still-active
+            // external terminal session, or just a session file created by a process
+            // that has already exited.
+            summary.ownership = isExternal
+              ? { owner: "external" }
+              : { owner: "none" };
 
             const event: SessionCreatedEvent = {
               type: "session-created",
@@ -340,6 +363,9 @@ export class ExternalSessionTracker {
     // Clear all timeouts
     for (const info of this.externalSessions.values()) {
       clearTimeout(info.timeoutId);
+      if (info.validationTimeoutId) {
+        clearTimeout(info.validationTimeoutId);
+      }
     }
     this.externalSessions.clear();
     this.recentlyAborted.clear();
@@ -385,8 +411,12 @@ export class ExternalSessionTracker {
       return;
     }
 
-    // We don't own it and it's not in grace period - mark as external
-    this.markExternal(sessionId, { provider: event.provider, dirProjectId });
+    // We don't own it and it's not in grace period - decide whether it is
+    // still actively controlled by an external provider process.
+    await this.handleUnownedSessionActivity(sessionId, {
+      provider: event.provider,
+      dirProjectId,
+    });
   }
 
   private parseSessionPath(
@@ -451,7 +481,10 @@ export class ExternalSessionTracker {
     const projectId = await this.readCodexProjectIdFromFile(event.path);
     if (!projectId) return;
 
-    this.markExternal(sessionId, { provider: event.provider, projectId });
+    await this.handleUnownedSessionActivity(sessionId, {
+      provider: event.provider,
+      projectId,
+    });
     await this.ensureCodexSessionCreated(sessionId, event.path, projectId);
   }
 
@@ -520,7 +553,9 @@ export class ExternalSessionTracker {
         createdAt: meta.timestamp,
         updatedAt: stats.mtime.toISOString(),
         messageCount: 0,
-        ownership: { owner: "external" },
+        ownership: this.externalSessions.has(sessionId)
+          ? { owner: "external" }
+          : { owner: "none" },
         provider: "codex",
         model: meta.model,
       };
@@ -537,6 +572,45 @@ export class ExternalSessionTracker {
     }
   }
 
+  private async handleUnownedSessionActivity(
+    sessionId: string,
+    info: {
+      provider: FileChangeEvent["provider"];
+      dirProjectId?: DirProjectId;
+      projectId?: UrlProjectId;
+    },
+  ): Promise<void> {
+    const activeExternalProcess = await this.checkExternalProcessForInfo(info);
+
+    if (activeExternalProcess === false) {
+      this.removeExternal(sessionId);
+      this.enqueueSessionParse(sessionId, info);
+      return;
+    }
+
+    // If probing is unavailable (null), keep the previous behavior and treat
+    // recent external file activity as active until the decay timeout expires.
+    this.markExternal(sessionId, info);
+  }
+
+  private enqueueSessionParse(
+    sessionId: string,
+    info: {
+      provider: FileChangeEvent["provider"];
+      dirProjectId?: DirProjectId;
+      projectId?: UrlProjectId;
+    },
+  ): void {
+    if (!this.getSessionSummary) return;
+
+    const getSessionSummary = this.getSessionSummary;
+    this.sessionParser.enqueue(sessionId, async () => {
+      const project = await this.resolveProjectForSession(info);
+      if (!project) return null;
+      return getSessionSummary(sessionId, project.id as UrlProjectId);
+    });
+  }
+
   private markExternal(
     sessionId: string,
     info: {
@@ -551,17 +625,15 @@ export class ExternalSessionTracker {
     if (existing) {
       // Update last activity and reset timer
       clearTimeout(existing.timeoutId);
+      if (existing.validationTimeoutId) {
+        clearTimeout(existing.validationTimeoutId);
+      }
       existing.lastActivity = now;
       existing.timeoutId = this.createDecayTimeout(sessionId);
+      existing.validationTimeoutId =
+        this.createProcessValidationTimeout(sessionId);
       // Always parse to detect changes (title, messageCount)
-      if (this.getSessionSummary) {
-        const getSessionSummary = this.getSessionSummary;
-        this.sessionParser.enqueue(sessionId, async () => {
-          const project = await this.resolveProjectForSession(info);
-          if (!project) return null;
-          return getSessionSummary(sessionId, project.id as UrlProjectId);
-        });
-      }
+      this.enqueueSessionParse(sessionId, info);
     } else {
       // New external session
       const externalInfo: ExternalSessionInfo = {
@@ -571,18 +643,14 @@ export class ExternalSessionTracker {
         projectId: info.projectId,
         provider: info.provider,
         timeoutId: this.createDecayTimeout(sessionId),
+        validationTimeoutId: null,
       };
+      externalInfo.validationTimeoutId =
+        this.createProcessValidationTimeout(sessionId);
       this.externalSessions.set(sessionId, externalInfo);
 
       // Queue session parsing - batched to prevent OOM from bulk file operations
-      if (this.getSessionSummary) {
-        const getSessionSummary = this.getSessionSummary;
-        this.sessionParser.enqueue(sessionId, async () => {
-          const project = await this.resolveProjectForSession(externalInfo);
-          if (!project) return null;
-          return getSessionSummary(sessionId, project.id as UrlProjectId);
-        });
-      }
+      this.enqueueSessionParse(sessionId, externalInfo);
 
       // Emit ownership change event
       void this.emitOwnershipChangeByInfo(sessionId, externalInfo, {
@@ -595,6 +663,9 @@ export class ExternalSessionTracker {
     const existing = this.externalSessions.get(sessionId);
     if (existing) {
       clearTimeout(existing.timeoutId);
+      if (existing.validationTimeoutId) {
+        clearTimeout(existing.validationTimeoutId);
+      }
       this.externalSessions.delete(sessionId);
 
       // Emit ownership change event
@@ -606,13 +677,69 @@ export class ExternalSessionTracker {
 
   private createDecayTimeout(sessionId: string): ReturnType<typeof setTimeout> {
     return setTimeout(() => {
-      const info = this.externalSessions.get(sessionId);
-      if (info) {
-        this.externalSessions.delete(sessionId);
-        // Emit ownership change to none
-        void this.emitOwnershipChangeByInfo(sessionId, info, { owner: "none" });
-      }
+      void this.handleDecayTimeout(sessionId);
     }, this.decayMs);
+  }
+
+  private async handleDecayTimeout(sessionId: string): Promise<void> {
+    const info = this.externalSessions.get(sessionId);
+    if (!info) return;
+
+    const activeExternalProcess = await this.checkExternalProcessForInfo(info);
+    if (activeExternalProcess === true) {
+      info.timeoutId = this.createDecayTimeout(sessionId);
+      return;
+    }
+
+    this.removeExternal(sessionId);
+  }
+
+  private createProcessValidationTimeout(
+    sessionId: string,
+  ): ReturnType<typeof setTimeout> | null {
+    if (this.processValidationMs <= 0) return null;
+
+    return setTimeout(() => {
+      void this.validateExternalProcess(sessionId);
+    }, this.processValidationMs);
+  }
+
+  private async validateExternalProcess(sessionId: string): Promise<void> {
+    const info = this.externalSessions.get(sessionId);
+    if (!info) return;
+
+    const activeExternalProcess = await this.checkExternalProcessForInfo(info);
+    if (activeExternalProcess === false) {
+      this.removeExternal(sessionId);
+      return;
+    }
+
+    if (
+      activeExternalProcess === true &&
+      this.externalSessions.has(sessionId)
+    ) {
+      info.validationTimeoutId = this.createProcessValidationTimeout(sessionId);
+    }
+  }
+
+  private async checkExternalProcessForInfo(info: {
+    provider: FileChangeEvent["provider"];
+    dirProjectId?: DirProjectId;
+    projectId?: UrlProjectId;
+  }): Promise<boolean | null> {
+    const project = await this.resolveProjectForSession(info);
+    if (!project?.path) return null;
+
+    const excludePids = this.supervisor
+      .getAllProcesses()
+      .map((process) => process.pid)
+      .filter((pid): pid is number => typeof pid === "number");
+
+    return this.externalProcessProbe({
+      provider: info.provider,
+      projectPath: project.path,
+      excludePids,
+    });
   }
 
   private async emitOwnershipChangeByInfo(
@@ -661,9 +788,20 @@ export class ExternalSessionTracker {
     provider: FileChangeEvent["provider"];
     dirProjectId?: DirProjectId;
     projectId?: UrlProjectId;
-  }): Promise<{ id: UrlProjectId } | null> {
+  }): Promise<Pick<Project, "id" | "path"> | null> {
     if (info.projectId) {
-      return { id: info.projectId };
+      const project = await this.scanner.getProject(info.projectId);
+      if (project) {
+        return { id: project.id as UrlProjectId, path: project.path };
+      }
+      try {
+        return {
+          id: info.projectId,
+          path: decodeProjectId(info.projectId),
+        };
+      } catch {
+        return null;
+      }
     }
     if (!info.dirProjectId) return null;
     const project = await this.scanner.getProjectBySessionDirSuffix(
@@ -675,6 +813,6 @@ export class ExternalSessionTracker {
       );
       return null;
     }
-    return { id: project.id as UrlProjectId };
+    return { id: project.id as UrlProjectId, path: project.path };
   }
 }

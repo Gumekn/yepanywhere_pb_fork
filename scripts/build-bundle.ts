@@ -339,6 +339,10 @@ step("Generate package.json for npm", () => {
     bin: {
       yepanywhere: "./dist/cli.js",
     },
+    scripts: {
+      postinstall:
+        "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper node_modules/.pnpm/node-pty@*/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
+    },
     main: "./dist/index.js",
     exports: {
       ".": "./dist/index.js",

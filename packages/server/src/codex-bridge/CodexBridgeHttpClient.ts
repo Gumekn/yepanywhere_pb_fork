@@ -87,7 +87,12 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
     const data = await this.fetchJson<{ sessions?: CodexBridgeSessionView[] }>(
       "/session-views",
     );
-    return data?.sessions ?? [];
+    return (data?.sessions ?? []).filter((view) =>
+      this.isDisplayableBridgeSession(view.session, {
+        activity: view.activity,
+        pendingInputType: view.pendingInputType,
+      }),
+    );
   }
 
   async getSessionView(
@@ -96,7 +101,17 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
     const data = await this.fetchJson<{
       sessionView?: CodexBridgeSessionView | null;
     }>(`/sessions/${encodeURIComponent(sessionId)}/view`);
-    return data?.sessionView ?? null;
+    const view = data?.sessionView ?? null;
+    if (
+      view &&
+      !this.isDisplayableBridgeSession(view.session, {
+        activity: view.activity,
+        pendingInputType: view.pendingInputType,
+      })
+    ) {
+      return null;
+    }
+    return view;
   }
 
   async isSessionActive(sessionId: string): Promise<boolean> {
@@ -162,9 +177,9 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
       const nextIds = new Set<string>();
 
       for (const session of sessions) {
-        nextIds.add(session.id);
         const view = viewsById.get(session.id);
         if (!view) continue;
+        nextIds.add(session.id);
         this.emitChanges(session, view);
       }
 
@@ -259,5 +274,18 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
         timestamp,
       });
     }
+  }
+
+  private isDisplayableBridgeSession(
+    session: SessionSummary,
+    state?: { activity?: AgentActivity; pendingInputType?: PendingInputType },
+  ): boolean {
+    return (
+      session.messageCount > 0 ||
+      state?.activity === "in-turn" ||
+      state?.activity === "waiting-input" ||
+      !!state?.pendingInputType ||
+      !!session.pendingInputType
+    );
   }
 }

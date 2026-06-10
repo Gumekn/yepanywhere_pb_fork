@@ -132,7 +132,7 @@ interface InboxContextValue {
   needsAttention: InboxItem[];
   /** Sessions with running processes (no pending input) */
   active: InboxItem[];
-  /** Sessions updated in the last 30 minutes */
+  /** Sessions updated in the last hour */
   recentActivity: InboxItem[];
   /** Unread sessions from the last 8 hours */
   unread8h: InboxItem[];

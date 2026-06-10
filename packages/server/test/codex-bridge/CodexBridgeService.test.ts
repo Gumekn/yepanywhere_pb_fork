@@ -118,6 +118,81 @@ describe("CodexBridgeService", () => {
     }
   });
 
+  it("keeps idle empty thread records out of displayable session views", async () => {
+    const client = await connect(`ws://127.0.0.1:${bridgePort}`);
+    try {
+      client.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "thread/read",
+          params: { threadId: "empty-thread" },
+        }),
+      );
+      await waitFor(() => upstreamMessages.length === 1);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            model: "gpt-5.3-codex",
+            cwd: "/tmp/project-empty",
+            thread: {
+              id: "empty-thread",
+              createdAt: 1_780_000_000,
+              updatedAt: 1_780_000_001,
+              cwd: "/tmp/project-empty",
+              status: { type: "idle" },
+              turns: [],
+            },
+          },
+        }),
+      );
+
+      await waitFor(() => bridge.listSessions().length === 1);
+      expect(bridge.listSessionViews()).toEqual([]);
+      expect(bridge.getSessionView("empty-thread")).toBeNull();
+      expect(
+        emittedEvents.some(
+          (event) =>
+            (event as { type?: string; session?: { id?: string } }).type ===
+              "session-created" &&
+            (event as { session?: { id?: string } }).session?.id ===
+              "empty-thread",
+        ),
+      ).toBe(false);
+
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "turn/started",
+          params: { threadId: "empty-thread" },
+        }),
+      );
+
+      await waitFor(() => bridge.listSessionViews().length === 1);
+      expect(bridge.getSessionView("empty-thread")).toMatchObject({
+        session: {
+          id: "empty-thread",
+          messageCount: 0,
+          ownership: { owner: "external" },
+        },
+        activity: "in-turn",
+      });
+      expect(
+        emittedEvents.some(
+          (event) =>
+            (event as { type?: string; session?: { id?: string } }).type ===
+              "session-created" &&
+            (event as { session?: { id?: string } }).session?.id ===
+              "empty-thread",
+        ),
+      ).toBe(true);
+    } finally {
+      client.close();
+    }
+  });
+
   it("records approval requests and answers them from Yep", async () => {
     const client = await connect(`ws://127.0.0.1:${bridgePort}`);
     try {

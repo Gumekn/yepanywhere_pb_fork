@@ -16,6 +16,7 @@ import { ProcessInfoModal } from "../components/ProcessInfoModal";
 import { ProviderBadge } from "../components/ProviderBadge";
 import { QuestionAnswerPanel } from "../components/QuestionAnswerPanel";
 import { RecentSessionsDropdown } from "../components/RecentSessionsDropdown";
+import { SessionInspector } from "../components/SessionInspector";
 import { SessionMenu } from "../components/SessionMenu";
 import { SessionMessagesSkeleton } from "../components/Skeleton";
 import { ToolApprovalPanel } from "../components/ToolApprovalPanel";
@@ -277,8 +278,13 @@ function SessionPageContent({
   const [targetMessageId, setTargetMessageId] = useState<string | null>(
     navState?.targetMessageId ?? null,
   );
+  const [isInspectorOpen, setInspectorOpen] = useState(false);
   const handleTargetFocused = useCallback(() => {
     setTargetMessageId(null);
+  }, []);
+  const handleInspectorSelectMessage = useCallback((messageId: string) => {
+    if (!messageId) return;
+    setTargetMessageId(messageId);
   }, []);
 
   const sessionBranchState = session?.branchState ?? session?.codexBranchState;
@@ -1241,9 +1247,31 @@ function SessionPageContent({
     </svg>
   );
 
+  const SessionOutlineIcon = () => (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <line x1="4" y1="6" x2="20" y2="6" />
+      <line x1="4" y1="12" x2="14" y2="12" />
+      <line x1="4" y1="18" x2="18" y2="18" />
+    </svg>
+  );
+
   return (
     <div
-      className={isWideScreen ? "main-content-wrapper" : "main-content-mobile"}
+      className={
+        isWideScreen
+          ? "main-content-wrapper session-main-wrapper"
+          : "main-content-mobile"
+      }
     >
       <div
         className={
@@ -1388,6 +1416,17 @@ function SessionPageContent({
               </div>
             </div>
             <div className="session-header-right">
+              {!isWideScreen && (
+                <button
+                  type="button"
+                  className="session-inspector-toggle"
+                  onClick={() => setInspectorOpen(true)}
+                  title={t("sessionInspectorOpen")}
+                  aria-label={t("sessionInspectorOpen")}
+                >
+                  <SessionOutlineIcon />
+                </button>
+              )}
               {!loading && effectiveProvider && (
                 <button
                   type="button"
@@ -1632,6 +1671,37 @@ function SessionPageContent({
           </div>
         </footer>
       </div>
+      {isWideScreen ? (
+        <SessionInspector
+          presentation="sidebar"
+          messages={messages}
+          markdownAugments={markdownAugments}
+          activeToolApproval={activeToolApproval}
+          projectId={projectId}
+          basePath={basePath}
+          provider={effectiveProvider}
+          model={effectiveModel}
+          status={status}
+          processState={processState}
+          onSelectMessage={handleInspectorSelectMessage}
+        />
+      ) : (
+        <SessionInspector
+          presentation="drawer"
+          isOpen={isInspectorOpen}
+          onClose={() => setInspectorOpen(false)}
+          messages={messages}
+          markdownAugments={markdownAugments}
+          activeToolApproval={activeToolApproval}
+          projectId={projectId}
+          basePath={basePath}
+          provider={effectiveProvider}
+          model={effectiveModel}
+          status={status}
+          processState={processState}
+          onSelectMessage={handleInspectorSelectMessage}
+        />
+      )}
     </div>
   );
 }

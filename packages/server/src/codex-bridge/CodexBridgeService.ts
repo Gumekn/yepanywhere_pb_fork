@@ -217,12 +217,14 @@ export class CodexBridgeService implements CodexBridgeController {
   }
 
   listSessionViews(): CodexBridgeSessionView[] {
-    return this.listSessions().map((session) => ({
-      session: this.toSessionSummary(session),
-      projectName: session.projectName,
-      activity: session.activity,
-      pendingInputType: session.pendingInputType,
-    }));
+    return this.listSessions()
+      .filter((session) => this.isDisplayableBridgeSession(session))
+      .map((session) => ({
+        session: this.toSessionSummary(session),
+        projectName: session.projectName,
+        activity: session.activity,
+        pendingInputType: session.pendingInputType,
+      }));
   }
 
   listSessions(): CodexBridgeSession[] {
@@ -238,6 +240,7 @@ export class CodexBridgeService implements CodexBridgeController {
     const record = this.sessions.get(sessionId);
     if (!record) return null;
     const session = this.toBridgeSession(record);
+    if (!this.isDisplayableBridgeSession(session)) return null;
     return {
       session: this.toSessionSummary(session),
       projectName: session.projectName,
@@ -640,6 +643,7 @@ export class CodexBridgeService implements CodexBridgeController {
         const record = this.ensureSessionRecord(threadId, {});
         record.activity = "in-turn";
         record.updatedAt = new Date().toISOString();
+        this.emitSessionCreated(record);
         this.emitProcessState(record, "in-turn");
         break;
       }
@@ -650,6 +654,7 @@ export class CodexBridgeService implements CodexBridgeController {
         if (!record) break;
         record.messageCount += 1;
         record.updatedAt = new Date().toISOString();
+        this.emitSessionCreated(record);
         this.emitSessionUpdated(record);
         break;
       }
@@ -723,6 +728,7 @@ export class CodexBridgeService implements CodexBridgeController {
     record.activity = "waiting-input";
     record.pendingInputType = pendingInputType;
     record.updatedAt = createdAt;
+    this.emitSessionCreated(record);
     this.emitProcessState(record, "waiting-input", pendingInputType);
   }
 
@@ -1125,13 +1131,17 @@ export class CodexBridgeService implements CodexBridgeController {
   }
 
   private emitSessionCreated(record: SessionRecord): void {
+    const session = this.toBridgeSession(record);
+    if (!this.isDisplayableBridgeSession(session)) {
+      return;
+    }
     if (this.emittedSessionIds.has(record.id)) {
       return;
     }
     this.emittedSessionIds.add(record.id);
     this.eventBus?.emit({
       type: "session-created",
-      session: this.toSessionSummary(this.toBridgeSession(record)),
+      session: this.toSessionSummary(session),
       timestamp: new Date().toISOString(),
     });
   }
@@ -1215,6 +1225,15 @@ export class CodexBridgeService implements CodexBridgeController {
       originator: "Yep Codex Bridge",
       source: "codex-bridge",
     };
+  }
+
+  private isDisplayableBridgeSession(session: CodexBridgeSession): boolean {
+    return (
+      session.messageCount > 0 ||
+      session.activity === "in-turn" ||
+      session.activity === "waiting-input" ||
+      !!session.pendingInputType
+    );
   }
 
   private async ensureUpstreamUrl(): Promise<string> {

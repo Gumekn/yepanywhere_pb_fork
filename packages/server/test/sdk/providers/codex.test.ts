@@ -514,6 +514,24 @@ describe("CodexProvider Event Normalization", () => {
 });
 
 describe("CodexProvider Configuration", () => {
+  it("maps the default permission mode to cf-style Codex policy", () => {
+    const provider = new CodexProvider() as unknown as {
+      mapPermissionModeToThreadPolicy: (permissionMode?: string) => {
+        approvalPolicy: string;
+        sandbox: string;
+      };
+    };
+
+    expect(provider.mapPermissionModeToThreadPolicy()).toEqual({
+      approvalPolicy: "on-request",
+      sandbox: "danger-full-access",
+    });
+    expect(provider.mapPermissionModeToThreadPolicy("default")).toEqual({
+      approvalPolicy: "on-request",
+      sandbox: "danger-full-access",
+    });
+  });
+
   it("should accept custom timeout", () => {
     const config: CodexProviderConfig = {
       timeout: 60000,

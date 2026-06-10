@@ -8,7 +8,10 @@
  *   surfaces them via onOutput callback.
  */
 
-import type { TerminalServerMessage } from "@yep-anywhere/shared";
+import type {
+  TerminalClientMessage,
+  TerminalServerMessage,
+} from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getWebSocketConnection } from "../lib/connection/WebSocketConnection";
 import type { Connection } from "../lib/connection/types";
@@ -78,6 +81,10 @@ function getWsConnection(): Connection | null {
 
 const encoder = new TextEncoder();
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export function useRemoteTerminal(
   opts: UseRemoteTerminalOptions,
 ): UseRemoteTerminalResult {
@@ -96,12 +103,20 @@ export function useRemoteTerminal(
 
   const [state, setState] = useState<TerminalConnectionState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
 
   // Latest callbacks (avoid re-subscribing when consumers pass new fns).
   const cbRef = useRef({ onOutput, onOpened, onExit });
   useEffect(() => {
     cbRef.current = { onOutput, onOpened, onExit };
   }, [onOutput, onOpened, onExit]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const sendOpen = useCallback(() => {
     const conn = getWsConnection();
@@ -112,14 +127,38 @@ export function useRemoteTerminal(
     }
     setState("connecting");
     setError(null);
-    conn.sendMessage({
+
+    const msg: TerminalClientMessage = {
       type: "terminal_open",
       terminalId,
       cwd,
       cols,
       rows,
       shell,
-    });
+    };
+    const send = () => {
+      if (!mountedRef.current) return;
+      try {
+        conn.sendMessage?.(msg);
+      } catch (err) {
+        if (!mountedRef.current) return;
+        setError(`Connection failed: ${errorMessage(err)}`);
+        setState("error");
+      }
+    };
+    const ensureConnected = (
+      conn as unknown as { ensureConnected?: () => Promise<void> }
+    ).ensureConnected?.bind(conn);
+
+    if (ensureConnected) {
+      ensureConnected().then(send, (err: unknown) => {
+        if (!mountedRef.current) return;
+        setError(`Connection failed: ${errorMessage(err)}`);
+        setState("error");
+      });
+    } else {
+      send();
+    }
   }, [terminalId, cwd, cols, rows, shell]);
 
   // Subscribe to terminal_* messages for this terminalId. Consumer-provided
@@ -176,11 +215,15 @@ export function useRemoteTerminal(
     if (autoOpen) sendOpen();
     return () => {
       const conn = getWsConnection();
-      conn?.sendMessage?.({
-        type: "terminal_close",
-        terminalId,
-        kill: killOnUnmount,
-      });
+      try {
+        conn?.sendMessage?.({
+          type: "terminal_close",
+          terminalId,
+          kill: killOnUnmount,
+        });
+      } catch {
+        // Best-effort detach on unmount; the server also detaches on WS close.
+      }
     };
   }, []);
 
@@ -188,11 +231,16 @@ export function useRemoteTerminal(
     (text: string) => {
       const conn = getWsConnection();
       if (!conn?.sendMessage) return;
-      conn.sendMessage({
-        type: "terminal_input",
-        terminalId,
-        data: bytesToBase64(encoder.encode(text)),
-      });
+      try {
+        conn.sendMessage({
+          type: "terminal_input",
+          terminalId,
+          data: bytesToBase64(encoder.encode(text)),
+        });
+      } catch (err) {
+        setError(`Connection failed: ${errorMessage(err)}`);
+        setState("error");
+      }
     },
     [terminalId],
   );
@@ -201,12 +249,16 @@ export function useRemoteTerminal(
     (newCols: number, newRows: number) => {
       const conn = getWsConnection();
       if (!conn?.sendMessage) return;
-      conn.sendMessage({
-        type: "terminal_resize",
-        terminalId,
-        cols: newCols,
-        rows: newRows,
-      });
+      try {
+        conn.sendMessage({
+          type: "terminal_resize",
+          terminalId,
+          cols: newCols,
+          rows: newRows,
+        });
+      } catch {
+        // Resize is advisory; input/open paths surface connection errors.
+      }
     },
     [terminalId],
   );

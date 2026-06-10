@@ -10,6 +10,8 @@ import type {
 } from "../types/renderItems";
 import { getMessageId } from "./mergeMessages";
 
+const CODEX_TURN_ABORTED_DISPLAY_TEXT = "Conversation stopped by user";
+
 /**
  * When true, indicates the session has an active tool approval request.
  * All orphaned tools will be treated as pending (not interrupted).
@@ -208,10 +210,10 @@ function processMessage(
         id: msgId,
         subtype,
         content:
-          typeof msg.content === "string"
-            ? msg.content
-            : subtype === "turn_aborted"
-              ? "Turn aborted"
+          subtype === "turn_aborted"
+            ? CODEX_TURN_ABORTED_DISPLAY_TEXT
+            : typeof msg.content === "string"
+              ? msg.content
               : "Context compacted",
         sourceMessages: [msg],
       };

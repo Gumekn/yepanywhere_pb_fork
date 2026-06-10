@@ -816,13 +816,14 @@ describe("preprocessMessages", () => {
     }
   });
 
-  it("renders turn_aborted system messages", () => {
+  it("renders turn_aborted system messages as a concise marker", () => {
     const messages: Message[] = [
       {
         id: "msg-1",
         type: "system",
         subtype: "turn_aborted",
-        content: "approval denied",
+        content:
+          "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
         timestamp: "2024-01-01T00:00:00Z",
       },
     ];
@@ -832,7 +833,7 @@ describe("preprocessMessages", () => {
     expect(items[0]).toMatchObject({
       type: "system",
       subtype: "turn_aborted",
-      content: "approval denied",
+      content: "Conversation stopped by user",
     });
   });
 

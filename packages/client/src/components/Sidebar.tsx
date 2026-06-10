@@ -424,7 +424,9 @@ export function Sidebar({
                       projectId={session.projectId}
                       title={getSessionDisplayTitle(session)}
                       fullTitle={getSessionDisplayTitle(session)}
+                      updatedAt={session.updatedAt}
                       provider={session.provider}
+                      model={session.model}
                       status={session.ownership}
                       pendingInputType={session.pendingInputType}
                       hasUnread={session.hasUnread}
@@ -478,7 +480,9 @@ export function Sidebar({
                       projectId={session.projectId}
                       title={getSessionDisplayTitle(session)}
                       fullTitle={getSessionDisplayTitle(session)}
+                      updatedAt={session.updatedAt}
                       provider={session.provider}
+                      model={session.model}
                       status={session.ownership}
                       pendingInputType={session.pendingInputType}
                       hasUnread={session.hasUnread}
@@ -530,7 +534,9 @@ export function Sidebar({
                     projectId={session.projectId}
                     title={getSessionDisplayTitle(session)}
                     fullTitle={getSessionDisplayTitle(session)}
+                    updatedAt={session.updatedAt}
                     provider={session.provider}
+                    model={session.model}
                     status={session.ownership}
                     pendingInputType={session.pendingInputType}
                     hasUnread={session.hasUnread}
