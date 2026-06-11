@@ -55,6 +55,27 @@ function getDevBuildId(): string {
 export default defineConfig({
   clearScreen: false,
   base: basePath,
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return;
+          if (id.includes("/@xterm/")) return "vendor-xterm";
+          if (id.includes("/react/") || id.includes("/react-dom/")) {
+            return "vendor-react";
+          }
+          if (
+            id.includes("/react-router/") ||
+            id.includes("/react-router-dom/")
+          ) {
+            return "vendor-router";
+          }
+          if (id.includes("/zod/")) return "vendor-zod";
+          return "vendor";
+        },
+      },
+    },
+  },
   define: {
     __BUILD_ID__: JSON.stringify(process.env.YEP_BUILD_ID ?? getDevBuildId()),
     __APP_VERSION__: JSON.stringify(

@@ -1,4 +1,4 @@
-import { Fragment, StrictMode } from "react";
+import { Fragment, StrictMode, Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
 
 // Toggle to disable StrictMode for easier debugging (avoids double renders)
@@ -12,21 +12,76 @@ import { initializeTabSize } from "./hooks/useTabSize";
 import { initializeTheme } from "./hooks/useTheme";
 import { NavigationLayout } from "./layouts";
 import { armSplashSafety } from "./lib/splash";
-import { ActivityPage } from "./pages/ActivityPage";
-import { AgentsPage } from "./pages/AgentsPage";
-import { EmulatorPage } from "./pages/EmulatorPage";
-import { FilePage } from "./pages/FilePage";
-import { GitStatusPage } from "./pages/GitStatusPage";
-import { GlobalSessionsPage } from "./pages/GlobalSessionsPage";
-import { InboxPage } from "./pages/InboxPage";
-import { LoginPage } from "./pages/LoginPage";
-import { NewSessionPage } from "./pages/NewSessionPage";
-import { ProjectsPage } from "./pages/ProjectsPage";
-import { SearchPage } from "./pages/SearchPage";
-import { SessionPage } from "./pages/SessionPage";
-import { TerminalPage } from "./pages/TerminalPage";
-import { SettingsLayout } from "./pages/settings";
 import "./styles/index.css";
+
+const ActivityPage = lazy(() =>
+  import("./pages/ActivityPage").then((module) => ({
+    default: module.ActivityPage,
+  })),
+);
+const AgentsPage = lazy(() =>
+  import("./pages/AgentsPage").then((module) => ({
+    default: module.AgentsPage,
+  })),
+);
+const EmulatorPage = lazy(() =>
+  import("./pages/EmulatorPage").then((module) => ({
+    default: module.EmulatorPage,
+  })),
+);
+const FilePage = lazy(() =>
+  import("./pages/FilePage").then((module) => ({ default: module.FilePage })),
+);
+const GitStatusPage = lazy(() =>
+  import("./pages/GitStatusPage").then((module) => ({
+    default: module.GitStatusPage,
+  })),
+);
+const GlobalSessionsPage = lazy(() =>
+  import("./pages/GlobalSessionsPage").then((module) => ({
+    default: module.GlobalSessionsPage,
+  })),
+);
+const InboxPage = lazy(() =>
+  import("./pages/InboxPage").then((module) => ({
+    default: module.InboxPage,
+  })),
+);
+const LoginPage = lazy(() =>
+  import("./pages/LoginPage").then((module) => ({
+    default: module.LoginPage,
+  })),
+);
+const NewSessionPage = lazy(() =>
+  import("./pages/NewSessionPage").then((module) => ({
+    default: module.NewSessionPage,
+  })),
+);
+const ProjectsPage = lazy(() =>
+  import("./pages/ProjectsPage").then((module) => ({
+    default: module.ProjectsPage,
+  })),
+);
+const SearchPage = lazy(() =>
+  import("./pages/SearchPage").then((module) => ({
+    default: module.SearchPage,
+  })),
+);
+const SessionPage = lazy(() =>
+  import("./pages/SessionPage").then((module) => ({
+    default: module.SessionPage,
+  })),
+);
+const TerminalPage = lazy(() =>
+  import("./pages/TerminalPage").then((module) => ({
+    default: module.TerminalPage,
+  })),
+);
+const SettingsLayout = lazy(() =>
+  import("./pages/settings").then((module) => ({
+    default: module.SettingsLayout,
+  })),
+);
 
 // Apply saved preferences before React renders to avoid flash
 initializeTheme();
@@ -50,40 +105,48 @@ createRoot(rootElement).render(
     <ErrorBoundary>
       <BrowserRouter basename={basename}>
         <App>
-          <Routes>
-            <Route path="/" element={<Navigate to="/projects" replace />} />
-            {/* Login page (no layout wrapper) */}
-            <Route path="/login" element={<LoginPage />} />
-            {/* IMPORTANT: Keep routes in sync with remote-main.tsx — adding a route here? Add it there too! */}
-            <Route element={<NavigationLayout />}>
-              <Route path="/projects" element={<ProjectsPage />} />
-              <Route path="/sessions" element={<GlobalSessionsPage />} />
-              <Route path="/search" element={<SearchPage />} />
-              <Route path="/agents" element={<AgentsPage />} />
-              <Route path="/inbox" element={<InboxPage />} />
-              <Route path="/settings" element={<SettingsLayout />} />
-              <Route path="/settings/:category" element={<SettingsLayout />} />
-              {/* Project-scoped pages */}
-              <Route
-                path="/projects/:projectId"
-                element={<Navigate to="/sessions" replace />}
-              />
-              <Route path="/git-status" element={<GitStatusPage />} />
-              <Route path="/devices" element={<EmulatorPage />} />
-              <Route path="/devices/:deviceId" element={<EmulatorPage />} />
-              <Route path="/terminal" element={<TerminalPage />} />
-              <Route path="/terminal/:terminalId" element={<TerminalPage />} />
-              <Route path="/new-session" element={<NewSessionPage />} />
-              <Route
-                path="/projects/:projectId/sessions/:sessionId"
-                element={<SessionPage />}
-              />
-            </Route>
-            {/* File page has its own layout (no sidebar) */}
-            <Route path="/projects/:projectId/file" element={<FilePage />} />
-            {/* Activity page has its own layout */}
-            <Route path="/activity" element={<ActivityPage />} />
-          </Routes>
+          <Suspense fallback={null}>
+            <Routes>
+              <Route path="/" element={<Navigate to="/projects" replace />} />
+              {/* Login page (no layout wrapper) */}
+              <Route path="/login" element={<LoginPage />} />
+              {/* IMPORTANT: Keep routes in sync with remote-main.tsx — adding a route here? Add it there too! */}
+              <Route element={<NavigationLayout />}>
+                <Route path="/projects" element={<ProjectsPage />} />
+                <Route path="/sessions" element={<GlobalSessionsPage />} />
+                <Route path="/search" element={<SearchPage />} />
+                <Route path="/agents" element={<AgentsPage />} />
+                <Route path="/inbox" element={<InboxPage />} />
+                <Route path="/settings" element={<SettingsLayout />} />
+                <Route
+                  path="/settings/:category"
+                  element={<SettingsLayout />}
+                />
+                {/* Project-scoped pages */}
+                <Route
+                  path="/projects/:projectId"
+                  element={<Navigate to="/sessions" replace />}
+                />
+                <Route path="/git-status" element={<GitStatusPage />} />
+                <Route path="/devices" element={<EmulatorPage />} />
+                <Route path="/devices/:deviceId" element={<EmulatorPage />} />
+                <Route path="/terminal" element={<TerminalPage />} />
+                <Route
+                  path="/terminal/:terminalId"
+                  element={<TerminalPage />}
+                />
+                <Route path="/new-session" element={<NewSessionPage />} />
+                <Route
+                  path="/projects/:projectId/sessions/:sessionId"
+                  element={<SessionPage />}
+                />
+              </Route>
+              {/* File page has its own layout (no sidebar) */}
+              <Route path="/projects/:projectId/file" element={<FilePage />} />
+              {/* Activity page has its own layout */}
+              <Route path="/activity" element={<ActivityPage />} />
+            </Routes>
+          </Suspense>
         </App>
       </BrowserRouter>
     </ErrorBoundary>
