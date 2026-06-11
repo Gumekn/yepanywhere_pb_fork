@@ -294,6 +294,9 @@ export class ClaudeSessionReader implements ISessionReader {
         model,
         provider,
       );
+      const runtimeConfig = this.extractRuntimeConfig(
+        activeBranch.map((node) => node.raw),
+      );
 
       const cumulativeUsage = this.extractCumulativeTokenUsage(
         activeBranch.map((node) => node.raw),
@@ -312,6 +315,7 @@ export class ClaudeSessionReader implements ISessionReader {
         cumulativeUsage,
         provider,
         model,
+        serviceTier: runtimeConfig.serviceTier,
       };
     } catch {
       return null;
@@ -782,6 +786,28 @@ export class ClaudeSessionReader implements ISessionReader {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Extract provider runtime settings from the latest assistant usage block.
+   */
+  private extractRuntimeConfig(messages: ClaudeSessionEntry[]): {
+    serviceTier?: string;
+  } {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (!msg || msg.type !== "assistant") continue;
+
+      const usage = msg.message.usage as
+        | { service_tier?: string | null; speed?: string | null }
+        | undefined;
+      const serviceTier = usage?.speed ?? usage?.service_tier ?? undefined;
+      if (serviceTier) {
+        return { serviceTier };
+      }
+    }
+
+    return {};
   }
 
   private extractTitle(content: string | null): string | null {

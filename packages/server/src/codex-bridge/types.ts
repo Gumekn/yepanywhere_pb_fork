@@ -49,6 +49,8 @@ export interface CodexBridgeSession {
   messageCount: number;
   provider: "codex";
   model?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
   activity?: AgentActivity;
   pendingInputType?: PendingInputType;
   connectionIds: number[];

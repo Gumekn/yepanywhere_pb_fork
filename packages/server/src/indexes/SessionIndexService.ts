@@ -45,15 +45,19 @@ export interface CachedSessionSummary {
   provider: ProviderName;
   /** Model used for this session (e.g. "gemini-2.5-pro") */
   model?: string;
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
+  reasoningEffort?: string;
+  /** Provider-specific service tier / speed label (e.g. "fast") */
+  serviceTier?: string;
 }
 
 export interface SessionIndexState {
-  version: 2;
+  version: 3;
   projectId: string;
   sessions: Record<string, CachedSessionSummary>;
 }
 
-const CURRENT_VERSION = 2;
+const CURRENT_VERSION = 3;
 
 export interface SessionIndexServiceOptions {
   /** Directory to store index files (defaults to ~/.yep-anywhere/indexes) */
@@ -461,6 +465,8 @@ export class SessionIndexService implements ISessionIndexService {
         contextUsage: cached.contextUsage,
         provider: cached.provider ?? DEFAULT_PROVIDER,
         model: cached.model,
+        reasoningEffort: cached.reasoningEffort,
+        serviceTier: cached.serviceTier,
       });
     }
 
@@ -488,6 +494,8 @@ export class SessionIndexService implements ISessionIndexService {
       fileMtime: mtime,
       provider: summary.provider,
       model: summary.model,
+      reasoningEffort: summary.reasoningEffort,
+      serviceTier: summary.serviceTier,
     };
   }
 
@@ -740,6 +748,8 @@ export class SessionIndexService implements ISessionIndexService {
             contextUsage: cached.contextUsage,
             provider: cached.provider ?? DEFAULT_PROVIDER,
             model: cached.model,
+            reasoningEffort: cached.reasoningEffort,
+            serviceTier: cached.serviceTier,
           });
         } else {
           cacheMisses.push({ sessionId, mtime, size });

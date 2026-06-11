@@ -563,6 +563,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           process?.provider ??
           project.provider,
         model: sessionSummary?.model,
+        reasoningEffort:
+          sessionSummary?.reasoningEffort ?? process?.resolvedReasoningEffort,
+        serviceTier: sessionSummary?.serviceTier ?? process?.serviceTier,
         originator: sessionSummary?.originator,
         cliVersion: sessionSummary?.cliVersion,
         source: sessionSummary?.source,
@@ -960,6 +963,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             hasUnread,
             provider: process.provider,
             model: process.resolvedModel,
+            reasoningEffort: process.resolvedReasoningEffort,
+            serviceTier: process.serviceTier,
             contextUsage,
           },
           messages: processMessages,

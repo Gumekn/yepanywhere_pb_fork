@@ -482,13 +482,31 @@ export const CodexSandboxPolicySchema = z.object({
 /**
  * Turn context payload - sent at the start/end of turns.
  */
-export const CodexTurnContextPayloadSchema = z.object({
-  cwd: z.string(),
-  approval_policy: z.string(),
-  sandbox_policy: CodexSandboxPolicySchema.optional(),
-  model: z.string().optional(),
-  summary: z.string().optional(),
-});
+export const CodexTurnContextPayloadSchema = z
+  .object({
+    cwd: z.string(),
+    approval_policy: z.string(),
+    sandbox_policy: CodexSandboxPolicySchema.optional(),
+    model: z.string().optional(),
+    effort: z.string().nullable().optional(),
+    service_tier: z.string().nullable().optional(),
+    serviceTier: z.string().nullable().optional(),
+    collaboration_mode: z
+      .object({
+        mode: z.string().optional(),
+        settings: z
+          .object({
+            model: z.string().nullable().optional(),
+            reasoning_effort: z.string().nullable().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
+    summary: z.string().optional(),
+  })
+  .passthrough();
 
 export type CodexTurnContextPayload = z.infer<
   typeof CodexTurnContextPayloadSchema

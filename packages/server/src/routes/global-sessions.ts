@@ -87,6 +87,10 @@ export interface GlobalSessionItem {
   contextUsage?: ContextUsage;
   /** Model name from the session summary (matches contextUsage's scope). */
   model?: string;
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
+  reasoningEffort?: string;
+  /** Provider-specific service tier / speed label (e.g. "fast") */
+  serviceTier?: string;
 }
 
 /** Stats about all sessions (computed during full scan) */
@@ -447,6 +451,8 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           executor,
           contextUsage: session.contextUsage,
           model: session.model,
+          reasoningEffort: session.reasoningEffort,
+          serviceTier: session.serviceTier,
         });
       }
     }
@@ -501,6 +507,8 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         executor: metadata?.executor,
         contextUsage: session.contextUsage,
         model: session.model,
+        reasoningEffort: session.reasoningEffort,
+        serviceTier: session.serviceTier,
       });
     }
 

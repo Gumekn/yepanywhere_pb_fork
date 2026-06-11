@@ -1208,6 +1208,9 @@ export class CodexProvider implements AgentProvider {
           subtype: "init",
           session_id: sessionId,
           cwd: options.cwd,
+          model: threadResult.model,
+          reasoningEffort: threadResult.reasoningEffort,
+          serviceTier: threadResult.serviceTier,
         } as SDKMessage),
       );
 

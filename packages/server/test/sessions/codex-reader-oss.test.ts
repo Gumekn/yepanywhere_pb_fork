@@ -214,6 +214,66 @@ describe("CodexSessionReader - OSS Support", () => {
     expect(summary?.provider).toBe("codex");
   });
 
+  it("extracts runtime config from the latest turn context", async () => {
+    const sessionId = "runtime-config-session";
+    const now = new Date().toISOString();
+    const lines = [
+      JSON.stringify({
+        type: "session_meta",
+        timestamp: now,
+        payload: {
+          id: sessionId,
+          cwd: "/test/project",
+          timestamp: now,
+          model_provider: "openai",
+        },
+      }),
+      JSON.stringify({
+        type: "turn_context",
+        timestamp: now,
+        payload: {
+          cwd: "/test/project",
+          approval_policy: "on-request",
+          model: "gpt-5.5",
+          effort: "medium",
+          service_tier: "standard",
+        },
+      }),
+      JSON.stringify({
+        type: "turn_context",
+        timestamp: now,
+        payload: {
+          cwd: "/test/project",
+          approval_policy: "on-request",
+          model: "gpt-5.5",
+          effort: "xhigh",
+          service_tier: "fast",
+        },
+      }),
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: now,
+        payload: {
+          type: "user_message",
+          message: "Hello world",
+        },
+      }),
+    ];
+
+    await writeFile(
+      join(testDir, `${sessionId}.jsonl`),
+      `${lines.join("\n")}\n`,
+    );
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+    expect(summary?.model).toBe("gpt-5.5");
+    expect(summary?.reasoningEffort).toBe("xhigh");
+    expect(summary?.serviceTier).toBe("fast");
+  });
+
   it("falls back to codex-oss based on model name (llama)", async () => {
     const sessionId = "heuristic-session-1";
     await createSessionFile(sessionId, undefined, "llama-3-8b");

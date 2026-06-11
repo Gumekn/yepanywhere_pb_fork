@@ -102,6 +102,10 @@ export interface SessionSummary {
   provider: ProviderName;
   /** Model used for this session (extracted from JSONL, e.g. "claude-opus-4-5-20251101") */
   model?: string;
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
+  reasoningEffort?: string;
+  /** Provider-specific service tier / speed label (e.g. "fast") */
+  serviceTier?: string;
   /** Launcher identifier from session metadata (e.g. "Codex Desktop", "yep-anywhere") */
   originator?: string;
   /** CLI version from session metadata (e.g. "0.101.0") */
@@ -210,6 +214,10 @@ export interface ProcessInfo {
   effort?: EffortLevel;
   /** Model used for this session (e.g., "claude-opus-4-5-20251101") */
   model?: string;
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
+  reasoningEffort?: string;
+  /** Provider-specific service tier / speed label (e.g. "fast") */
+  serviceTier?: string;
   /** Context window usage from the last assistant message */
   contextUsage?: ContextUsage;
   /** SSH host for remote execution (undefined = local) */

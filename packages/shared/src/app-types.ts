@@ -415,6 +415,10 @@ export interface AppSessionSummary {
   provider: ProviderName;
   // Model used for this session (resolved, not "default")
   model?: string;
+  // Provider-specific reasoning effort for this session (e.g. "max", "xhigh")
+  reasoningEffort?: string;
+  // Provider-specific service tier / speed label (e.g. "fast")
+  serviceTier?: string;
   // Notification fields
   pendingInputType?: PendingInputType;
   activity?: AgentActivity;

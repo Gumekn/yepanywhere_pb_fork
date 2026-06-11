@@ -35,6 +35,7 @@ export const AssistantMessageSchema = z.object({
       })
       .optional(),
     output_tokens: z.number(),
+    speed: z.string().nullable().optional(),
     service_tier: z.string().nullable().optional(),
     server_tool_use: z
       .object({

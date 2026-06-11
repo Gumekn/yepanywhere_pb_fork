@@ -162,6 +162,7 @@ export class CodexSessionReader implements ISessionReader {
       const model = this.extractModel(visibleEntries);
       const provider = this.determineProvider(metaEntry, model);
       const turnContext = this.extractTurnContext(visibleEntries);
+      const runtimeConfig = this.extractRuntimeConfig(visibleEntries);
       const contextUsage = this.extractContextUsage(
         visibleEntries,
         model,
@@ -183,6 +184,8 @@ export class CodexSessionReader implements ISessionReader {
         contextUsage,
         provider,
         model,
+        reasoningEffort: runtimeConfig.reasoningEffort,
+        serviceTier: runtimeConfig.serviceTier,
         originator: metaEntry.payload.originator,
         cliVersion: metaEntry.payload.cli_version,
         source: metaEntry.payload.source,
@@ -612,6 +615,33 @@ export class CodexSessionReader implements ISessionReader {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Extract provider runtime settings from the latest turn_context entry.
+   */
+  private extractRuntimeConfig(entries: CodexSessionEntry[]): {
+    reasoningEffort?: string;
+    serviceTier?: string;
+  } {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (!entry || entry.type !== "turn_context") continue;
+
+      const payload = entry.payload;
+      const reasoningEffort =
+        payload.effort ??
+        payload.collaboration_mode?.settings?.reasoning_effort ??
+        undefined;
+      const serviceTier = payload.service_tier ?? payload.serviceTier;
+
+      return {
+        reasoningEffort: reasoningEffort ?? undefined,
+        serviceTier: serviceTier ?? undefined,
+      };
+    }
+
+    return {};
   }
 
   /**

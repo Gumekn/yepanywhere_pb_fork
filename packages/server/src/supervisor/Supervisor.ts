@@ -1511,6 +1511,9 @@ export class Supervisor {
       messageCount: optimistic.messageCount,
       ownership,
       provider: process.provider,
+      model: process.resolvedModel,
+      reasoningEffort: process.resolvedReasoningEffort,
+      serviceTier: process.serviceTier,
     };
 
     const event: SessionCreatedEvent = {
@@ -1579,6 +1582,8 @@ export class Supervisor {
       updatedAt: summary.updatedAt,
       contextUsage: summary.contextUsage,
       model: summary.model,
+      reasoningEffort: summary.reasoningEffort,
+      serviceTier: summary.serviceTier,
       timestamp: new Date().toISOString(),
     };
     this.eventBus.emit(event);

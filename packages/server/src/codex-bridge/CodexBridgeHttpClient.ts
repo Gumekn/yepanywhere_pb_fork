@@ -22,6 +22,8 @@ interface SessionPollState {
   title: string | null;
   messageCount: number;
   model?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
   activity?: AgentActivity;
   pendingInputType?: PendingInputType;
   active: boolean;
@@ -214,6 +216,8 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
       title: session.title,
       messageCount: session.messageCount,
       model: session.model,
+      reasoningEffort: session.reasoningEffort,
+      serviceTier: session.serviceTier,
       activity: session.activity,
       pendingInputType: session.pendingInputType,
       active,
@@ -261,7 +265,9 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
       previous.updatedAt !== session.updatedAt ||
       previous.title !== session.title ||
       previous.messageCount !== session.messageCount ||
-      previous.model !== session.model
+      previous.model !== session.model ||
+      previous.reasoningEffort !== session.reasoningEffort ||
+      previous.serviceTier !== session.serviceTier
     ) {
       this.eventBus.emit({
         type: "session-updated",
@@ -271,6 +277,8 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
         messageCount: session.messageCount,
         updatedAt: session.updatedAt,
         model: session.model,
+        reasoningEffort: session.reasoningEffort,
+        serviceTier: session.serviceTier,
         timestamp,
       });
     }

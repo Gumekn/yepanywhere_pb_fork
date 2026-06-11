@@ -79,6 +79,8 @@ interface SessionRecord {
   updatedAt: string;
   messageCount: number;
   model?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
   activity?: "in-turn" | "idle" | "waiting-input";
   pendingInputType?: "tool-approval" | "user-question";
   connectionIds: Set<number>;
@@ -588,6 +590,8 @@ export class CodexBridgeService implements CodexBridgeController {
     this.upsertThread(connection, thread, {
       cwd: getString(result.cwd) ?? getString(thread.cwd),
       model: getString(result.model),
+      reasoningEffort: getString(result.reasoningEffort),
+      serviceTier: getString(result.serviceTier),
     });
   }
 
@@ -1021,7 +1025,12 @@ export class CodexBridgeService implements CodexBridgeController {
   private upsertThread(
     connection: BridgeConnection,
     thread: Record<string, unknown>,
-    extra: { cwd?: string; model?: string },
+    extra: {
+      cwd?: string;
+      model?: string;
+      reasoningEffort?: string;
+      serviceTier?: string;
+    },
   ): void {
     const id = getString(thread.id);
     if (!id) return;
@@ -1030,6 +1039,8 @@ export class CodexBridgeService implements CodexBridgeController {
     const record = this.ensureSessionRecord(id, {
       cwd,
       model: extra.model ?? getString(thread.modelProvider),
+      reasoningEffort: extra.reasoningEffort,
+      serviceTier: extra.serviceTier,
       title: getString(thread.name) ?? getString(thread.preview),
       createdAt: timestampFromThreadValue(thread.createdAt),
       updatedAt: timestampFromThreadValue(thread.updatedAt),
@@ -1059,6 +1070,8 @@ export class CodexBridgeService implements CodexBridgeController {
     values: {
       cwd?: string;
       model?: string;
+      reasoningEffort?: string;
+      serviceTier?: string;
       title?: string | null;
       createdAt?: string;
       updatedAt?: string;
@@ -1088,6 +1101,10 @@ export class CodexBridgeService implements CodexBridgeController {
       record.projectName = basename(values.cwd);
     }
     if (values.model) record.model = values.model;
+    if (values.reasoningEffort) {
+      record.reasoningEffort = values.reasoningEffort;
+    }
+    if (values.serviceTier) record.serviceTier = values.serviceTier;
     if (values.title !== undefined) {
       record.title = values.title;
       record.fullTitle = values.title;
@@ -1183,6 +1200,8 @@ export class CodexBridgeService implements CodexBridgeController {
       messageCount: record.messageCount,
       updatedAt: record.updatedAt,
       model: record.model,
+      reasoningEffort: record.reasoningEffort,
+      serviceTier: record.serviceTier,
       timestamp: new Date().toISOString(),
     });
   }
@@ -1200,6 +1219,8 @@ export class CodexBridgeService implements CodexBridgeController {
       messageCount: record.messageCount,
       provider: "codex",
       model: record.model,
+      reasoningEffort: record.reasoningEffort,
+      serviceTier: record.serviceTier,
       activity: record.activity,
       pendingInputType: record.pendingInputType,
       connectionIds: Array.from(record.connectionIds),
@@ -1222,6 +1243,8 @@ export class CodexBridgeService implements CodexBridgeController {
       pendingInputType: session.pendingInputType,
       provider: "codex",
       model: session.model,
+      reasoningEffort: session.reasoningEffort,
+      serviceTier: session.serviceTier,
       originator: "Yep Codex Bridge",
       source: "codex-bridge",
     };

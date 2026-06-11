@@ -103,6 +103,8 @@ export class ExternalSessionTracker {
       projectId: UrlProjectId;
       contextUsage?: ContextUsage;
       model?: string;
+      reasoningEffort?: string;
+      serviceTier?: string;
     }
   > = new Map();
 
@@ -150,6 +152,8 @@ export class ExternalSessionTracker {
               projectId,
               contextUsage: summary.contextUsage,
               model: summary.model,
+              reasoningEffort: summary.reasoningEffort,
+              serviceTier: summary.serviceTier,
             });
             this.createdSessions.add(sessionId);
 
@@ -170,6 +174,8 @@ export class ExternalSessionTracker {
                 updatedAt: summary.updatedAt,
                 contextUsage: summary.contextUsage,
                 model: summary.model,
+                reasoningEffort: summary.reasoningEffort,
+                serviceTier: summary.serviceTier,
                 timestamp: now,
               };
               this.eventBus.emit(event);
@@ -197,6 +203,8 @@ export class ExternalSessionTracker {
               projectId,
               contextUsage: summary.contextUsage,
               model: summary.model,
+              reasoningEffort: summary.reasoningEffort,
+              serviceTier: summary.serviceTier,
             });
           }
         } else {
@@ -210,12 +218,18 @@ export class ExternalSessionTracker {
             cached?.contextUsage?.inputTokens !==
             summary.contextUsage?.inputTokens;
           const modelChanged = cached?.model !== summary.model;
+          const reasoningEffortChanged =
+            cached?.reasoningEffort !== summary.reasoningEffort;
+          const serviceTierChanged =
+            cached?.serviceTier !== summary.serviceTier;
 
           if (
             titleChanged ||
             messageCountChanged ||
             contextUsageChanged ||
-            modelChanged
+            modelChanged ||
+            reasoningEffortChanged ||
+            serviceTierChanged
           ) {
             const event: SessionUpdatedEvent = {
               type: "session-updated",
@@ -226,6 +240,8 @@ export class ExternalSessionTracker {
               updatedAt: summary.updatedAt,
               contextUsage: summary.contextUsage,
               model: summary.model,
+              reasoningEffort: summary.reasoningEffort,
+              serviceTier: summary.serviceTier,
               timestamp: now,
             };
             this.eventBus.emit(event);
@@ -237,6 +253,8 @@ export class ExternalSessionTracker {
               projectId,
               contextUsage: summary.contextUsage,
               model: summary.model,
+              reasoningEffort: summary.reasoningEffort,
+              serviceTier: summary.serviceTier,
             });
           }
         }

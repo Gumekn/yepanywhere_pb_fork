@@ -33,6 +33,12 @@ export interface SDKMessage {
   uuid?: string;
   subtype?: string;
   session_id?: string;
+  /** Provider-specific resolved model from init events. */
+  model?: string;
+  /** Provider-specific reasoning effort from init events. */
+  reasoningEffort?: string | null;
+  /** Provider-specific service tier / speed from init events. */
+  serviceTier?: string | null;
   timestamp?: string;
   message?: {
     content: string | ContentBlock[];

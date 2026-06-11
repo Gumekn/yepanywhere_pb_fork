@@ -201,6 +201,10 @@ export class Process {
 
   /** Resolved model name from the first assistant message (e.g., "claude-sonnet-4-5-20250929") */
   private _resolvedModel: string | undefined;
+  /** Provider-specific resolved reasoning effort from init/session metadata. */
+  private _resolvedReasoningEffort: string | undefined;
+  /** Provider-specific service tier / speed label from init/session metadata. */
+  private _serviceTier: string | undefined;
   /** Context window size reported by SDK in result messages' modelUsage */
   private _contextWindow: number | undefined;
 
@@ -294,6 +298,14 @@ export class Process {
    */
   get resolvedModel(): string | undefined {
     return this._resolvedModel ?? this.model;
+  }
+
+  get resolvedReasoningEffort(): string | undefined {
+    return this._resolvedReasoningEffort ?? this._effort;
+  }
+
+  get serviceTier(): string | undefined {
+    return this._serviceTier;
   }
 
   /** Context window size reported by SDK (from result message modelUsage) */
@@ -771,6 +783,8 @@ export class Process {
       queueDepth: this.queueDepth,
       provider: this.provider,
       model: this._resolvedModel ?? this.model,
+      reasoningEffort: this.resolvedReasoningEffort,
+      serviceTier: this._serviceTier,
       thinking: this._thinking,
       effort: this._effort,
       executor: this.executor,
@@ -1563,6 +1577,18 @@ export class Process {
           const oldSessionId = this._sessionId;
           this._sessionId = message.session_id;
           this.sessionIdResolved = true;
+          if (typeof message.model === "string" && message.model) {
+            this._resolvedModel = message.model;
+          }
+          if (
+            typeof message.reasoningEffort === "string" &&
+            message.reasoningEffort
+          ) {
+            this._resolvedReasoningEffort = message.reasoningEffort;
+          }
+          if (typeof message.serviceTier === "string" && message.serviceTier) {
+            this._serviceTier = message.serviceTier;
+          }
 
           log.info(
             {

@@ -263,6 +263,67 @@ describe("SessionReader", () => {
     });
   });
 
+  describe("runtime config extraction", () => {
+    it("extracts service tier from the latest assistant usage speed", async () => {
+      const sessionId = "runtime-config-session";
+      const now = new Date().toISOString();
+      const lines = [
+        JSON.stringify({
+          type: "user",
+          message: { content: "Hello" },
+          uuid: "msg-1",
+          timestamp: now,
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            id: "msg-2",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-4-5-20251101",
+            content: [{ type: "text", text: "Older response" }],
+            usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              service_tier: "standard",
+            },
+          },
+          uuid: "msg-2",
+          timestamp: now,
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            id: "msg-3",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-4-5-20251101",
+            content: [{ type: "text", text: "Latest response" }],
+            usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              speed: "fast",
+              service_tier: "standard",
+            },
+          },
+          uuid: "msg-3",
+          timestamp: now,
+        }),
+      ];
+      await writeFile(
+        join(testDir, `${sessionId}.jsonl`),
+        `${lines.join("\n")}\n`,
+      );
+
+      const summary = await reader.getSessionSummary(
+        sessionId,
+        "test-project" as UrlProjectId,
+      );
+      expect(summary?.model).toBe("claude-opus-4-5-20251101");
+      expect(summary?.serviceTier).toBe("fast");
+    });
+  });
+
   describe("DAG handling", () => {
     it("returns only active branch messages, filtering dead branches", async () => {
       const sessionId = "dag-test-1";
