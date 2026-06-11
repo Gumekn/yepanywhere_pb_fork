@@ -31,6 +31,10 @@ interface ProviderBadgeProps {
   compact?: boolean;
   /** Model name to display alongside provider (e.g., "opus", "sonnet") */
   model?: string;
+  /** Provider-specific reasoning effort (e.g., Codex "xhigh", Claude "max") */
+  reasoningEffort?: string;
+  /** Provider-specific service tier / speed label (e.g., "fast") */
+  serviceTier?: string;
   /** Whether the session is actively thinking/processing */
   isThinking?: boolean;
   className?: string;
@@ -44,6 +48,8 @@ export function ProviderBadge({
   provider,
   compact = false,
   model,
+  reasoningEffort,
+  serviceTier,
   isThinking = false,
   className = "",
 }: ProviderBadgeProps) {
@@ -84,15 +90,41 @@ export function ProviderBadge({
     return isExtendedContext ? `${capitalized} 1M` : capitalized;
   };
 
+  const normalizeConfigLabel = (value: string | undefined): string | null => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : null;
+  };
+
+  const getReasoningEffortLabel = (
+    effort: string | undefined,
+  ): string | null => {
+    const normalized = normalizeConfigLabel(effort);
+    if (!normalized || normalized === "none") return null;
+    if (
+      (provider === "codex" || provider === "codex-oss") &&
+      normalized === "max"
+    ) {
+      return "xhigh";
+    }
+    return normalized;
+  };
+
   const modelLabel = getModelLabel(model);
+  const configLabel = [
+    modelLabel,
+    getReasoningEffortLabel(reasoningEffort),
+    normalizeConfigLabel(serviceTier),
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(" · ");
 
   if (compact) {
     return (
       <span
         className={`provider-badge-stripe ${className}`}
         style={{ backgroundColor: color }}
-        title={modelLabel ? `${label} (${modelLabel})` : label}
-        aria-label={`Provider: ${label}${modelLabel ? ` (${modelLabel})` : ""}`}
+        title={configLabel ? `${label} (${configLabel})` : label}
+        aria-label={`Provider: ${label}${configLabel ? ` (${configLabel})` : ""}`}
       />
     );
   }
@@ -112,7 +144,9 @@ export function ProviderBadge({
     >
       <span className={dotClass} style={dotStyle} />
       <span className="provider-badge-label">{label}</span>
-      {modelLabel && <span className="provider-badge-model">{modelLabel}</span>}
+      {configLabel && (
+        <span className="provider-badge-model">{configLabel}</span>
+      )}
     </span>
   );
 }

@@ -291,6 +291,10 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           customTitle: event.session.customTitle,
           isArchived: event.session.isArchived,
           isStarred: event.session.isStarred,
+          contextUsage: event.session.contextUsage,
+          model: event.session.model,
+          reasoningEffort: event.session.reasoningEffort,
+          serviceTier: event.session.serviceTier,
         };
 
         return [globalSession, ...prev];
@@ -356,6 +360,12 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
             contextUsage: event.contextUsage,
           }),
           ...(event.model !== undefined && { model: event.model }),
+          ...(event.reasoningEffort !== undefined && {
+            reasoningEffort: event.reasoningEffort,
+          }),
+          ...(event.serviceTier !== undefined && {
+            serviceTier: event.serviceTier,
+          }),
         };
       }),
     );

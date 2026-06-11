@@ -30,6 +30,8 @@ interface SessionInspectorProps {
   basePath?: string;
   provider?: ProviderName;
   model?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
   status: SessionStatus;
   processState?: string;
   onSelectMessage: (messageId: string) => void;
@@ -86,6 +88,8 @@ export function SessionInspector({
   basePath = "",
   provider,
   model,
+  reasoningEffort,
+  serviceTier,
   status,
   processState,
   onSelectMessage,
@@ -153,6 +157,8 @@ export function SessionInspector({
             <ProviderBadge
               provider={provider}
               model={model}
+              reasoningEffort={reasoningEffort}
+              serviceTier={serviceTier}
               isThinking={processState === "in-turn"}
             />
           ) : (

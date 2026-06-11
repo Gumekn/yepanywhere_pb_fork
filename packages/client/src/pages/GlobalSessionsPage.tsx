@@ -799,6 +799,8 @@ export function GlobalSessionsPage() {
                         status={session.ownership}
                         provider={session.provider}
                         model={session.model}
+                        reasoningEffort={session.reasoningEffort}
+                        serviceTier={session.serviceTier}
                         executor={session.executor}
                         isStarred={session.isStarred}
                         isArchived={session.isArchived}

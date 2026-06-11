@@ -87,6 +87,10 @@ export interface GlobalSessionItem {
   contextUsage?: ContextUsage;
   /** Model name from the session summary (e.g. "opus", "gpt-5.5"). */
   model?: string;
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh"). */
+  reasoningEffort?: string;
+  /** Provider-specific service tier / speed label (e.g. "fast"). */
+  serviceTier?: string;
 }
 
 /** Stats about all sessions (computed during full scan on server) */
@@ -740,6 +744,8 @@ export const api = {
         provider: string;
         thinking?: { type: string };
         effort?: string;
+        reasoningEffort?: string;
+        serviceTier?: string;
         model?: string;
       } | null;
     }>(`/sessions/${sessionId}/process`),

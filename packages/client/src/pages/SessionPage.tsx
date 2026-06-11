@@ -245,6 +245,8 @@ function SessionPageContent({
   // Effective provider/model for immediate display before session data loads
   const effectiveProvider = session?.provider ?? initialProvider;
   const effectiveModel = session?.model ?? initialModel;
+  const effectiveReasoningEffort = session?.reasoningEffort;
+  const effectiveServiceTier = session?.serviceTier;
   const approvalAgentName = getApprovalAgentName(effectiveProvider);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
@@ -1437,6 +1439,8 @@ function SessionPageContent({
                   <ProviderBadge
                     provider={effectiveProvider}
                     model={effectiveModel}
+                    reasoningEffort={effectiveReasoningEffort}
+                    serviceTier={effectiveServiceTier}
                     isThinking={processState === "in-turn"}
                   />
                 </button>
@@ -1681,6 +1685,8 @@ function SessionPageContent({
           basePath={basePath}
           provider={effectiveProvider}
           model={effectiveModel}
+          reasoningEffort={effectiveReasoningEffort}
+          serviceTier={effectiveServiceTier}
           status={status}
           processState={processState}
           onSelectMessage={handleInspectorSelectMessage}
@@ -1697,6 +1703,8 @@ function SessionPageContent({
           basePath={basePath}
           provider={effectiveProvider}
           model={effectiveModel}
+          reasoningEffort={effectiveReasoningEffort}
+          serviceTier={effectiveServiceTier}
           status={status}
           processState={processState}
           onSelectMessage={handleInspectorSelectMessage}

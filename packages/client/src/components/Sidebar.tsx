@@ -427,6 +427,8 @@ export function Sidebar({
                       updatedAt={session.updatedAt}
                       provider={session.provider}
                       model={session.model}
+                      reasoningEffort={session.reasoningEffort}
+                      serviceTier={session.serviceTier}
                       status={session.ownership}
                       pendingInputType={session.pendingInputType}
                       hasUnread={session.hasUnread}
@@ -483,6 +485,8 @@ export function Sidebar({
                       updatedAt={session.updatedAt}
                       provider={session.provider}
                       model={session.model}
+                      reasoningEffort={session.reasoningEffort}
+                      serviceTier={session.serviceTier}
                       status={session.ownership}
                       pendingInputType={session.pendingInputType}
                       hasUnread={session.hasUnread}
@@ -537,6 +541,8 @@ export function Sidebar({
                     updatedAt={session.updatedAt}
                     provider={session.provider}
                     model={session.model}
+                    reasoningEffort={session.reasoningEffort}
+                    serviceTier={session.serviceTier}
                     status={session.ownership}
                     pendingInputType={session.pendingInputType}
                     hasUnread={session.hasUnread}

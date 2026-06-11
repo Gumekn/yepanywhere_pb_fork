@@ -71,6 +71,10 @@ interface SessionListItemProps {
 
   /** Model identifier for provider badge display (e.g. "opus", "gpt-5.5") */
   model?: string;
+  /** Provider-specific reasoning effort for provider badge display. */
+  reasoningEffort?: string;
+  /** Provider-specific service tier / speed label for provider badge display. */
+  serviceTier?: string;
 
   /** When true (and `mode === "card"`), the card shows a "12 条 · 12.3K
    *  tokens" line below the timestamp. Used on the All Sessions page so users
@@ -136,6 +140,8 @@ export function SessionListItem({
   // New session detection
   messageCount,
   model,
+  reasoningEffort,
+  serviceTier,
   showSizeMeta = false,
 }: SessionListItemProps) {
   const { t, locale } = useI18n();
@@ -395,6 +401,8 @@ export function SessionListItem({
                   <ProviderBadge
                     provider={provider}
                     model={model}
+                    reasoningEffort={reasoningEffort}
+                    serviceTier={serviceTier}
                     isThinking={activity === "in-turn"}
                   />
                 )}
@@ -479,6 +487,8 @@ export function SessionListItem({
                     <ProviderBadge
                       provider={provider}
                       model={model}
+                      reasoningEffort={reasoningEffort}
+                      serviceTier={serviceTier}
                       isThinking={activity === "in-turn"}
                       compact
                       className="session-list-item__provider"

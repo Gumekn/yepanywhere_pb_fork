@@ -501,6 +501,12 @@ export function useSession(
             contextUsage: event.contextUsage,
           }),
           ...(event.model !== undefined && { model: event.model }),
+          ...(event.reasoningEffort !== undefined && {
+            reasoningEffort: event.reasoningEffort,
+          }),
+          ...(event.serviceTier !== undefined && {
+            serviceTier: event.serviceTier,
+          }),
         };
       });
     },
@@ -850,6 +856,8 @@ export function useSession(
           request?: InputRequest;
           provider?: ProviderName;
           model?: string;
+          reasoningEffort?: string;
+          serviceTier?: string;
           deferredMessages?: DeferredMessage[];
         };
 
@@ -894,15 +902,21 @@ export function useSession(
         // incomplete data (e.g., JSONL not yet written for new sessions)
         const sseProvider = connectedData.provider;
         const sseModel = connectedData.model;
-        if (sseProvider) {
+        const sseReasoningEffort = connectedData.reasoningEffort;
+        const sseServiceTier = connectedData.serviceTier;
+        if (sseProvider || sseModel || sseReasoningEffort || sseServiceTier) {
           setSession((prev) => {
             if (!prev) return prev;
             // Always update model if the connected event has a resolved model
             // (provider won't change, but model resolves from undefined/"Default" to actual name)
             return {
               ...prev,
-              provider: prev.provider || sseProvider,
+              ...(sseProvider && { provider: prev.provider || sseProvider }),
               ...(sseModel && { model: sseModel }),
+              ...(sseReasoningEffort && {
+                reasoningEffort: sseReasoningEffort,
+              }),
+              ...(sseServiceTier && { serviceTier: sseServiceTier }),
             };
           });
         }
