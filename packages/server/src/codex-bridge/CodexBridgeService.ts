@@ -757,6 +757,41 @@ export class CodexBridgeService implements CodexBridgeController {
     }
 
     if (method === "mcpServer/elicitation/request") {
+      if (isMcpToolApprovalElicitation(params)) {
+        const meta = getElicitationMeta(params);
+        const prompt = getString(params.message) ?? "Allow MCP tool execution?";
+        const serverName =
+          getString(params.serverName) ??
+          getString(meta?.connector_name) ??
+          getString(meta?.connector_id);
+        const mcpToolName =
+          getString(meta?.tool_name) ?? parseMcpToolNameFromPrompt(prompt);
+        const toolTitle = getString(meta?.tool_title) ?? mcpToolName;
+
+        return {
+          id,
+          sessionId: threadId,
+          type: "tool-approval",
+          prompt,
+          toolName: "MCP",
+          toolInput: {
+            approvalKind: "mcp_tool_call",
+            approvalPrompt: prompt,
+            serverName,
+            mcpToolName,
+            toolTitle,
+            toolDescription: meta?.tool_description,
+            toolParams: meta?.tool_params,
+            toolParamsDisplay: meta?.tool_params_display,
+            persistScopes: normalizeMcpPersistScopes(meta?.persist),
+            threadId,
+            turnId: params.turnId,
+            raw: params,
+          },
+          timestamp,
+        };
+      }
+
       return {
         id,
         sessionId: threadId,
@@ -845,12 +880,13 @@ export class CodexBridgeService implements CodexBridgeController {
 
   private buildServerRequestResponse(
     pending: PendingServerRequest,
-    response: "approve" | "approve_accept_edits" | "deny",
+    response: CodexBridgeInputResponse,
     answers?: Record<string, string>,
   ): unknown {
-    const approved =
-      response === "approve" || response === "approve_accept_edits";
-    const approveForSession = response === "approve_accept_edits";
+    const approved = response !== "deny";
+    const approveForSession =
+      response === "approve_accept_edits" || response === "approve_for_session";
+    const approveAlways = response === "approve_always";
 
     switch (pending.method) {
       case "item/commandExecution/requestApproval":
@@ -897,6 +933,17 @@ export class CodexBridgeService implements CodexBridgeController {
           ),
         };
       case "mcpServer/elicitation/request":
+        if (isMcpToolApprovalElicitation(pending.params)) {
+          if (!approved) {
+            return { action: "cancel" };
+          }
+          const content: Record<string, unknown> = {};
+          if (approveForSession) content.persist = "session";
+          if (approveAlways) content.persist = "always";
+          return Object.keys(content).length > 0
+            ? { action: "accept", content }
+            : { action: "accept" };
+        }
         return approved ? { values: answers ?? {} } : { values: {} };
       default:
         return {};
@@ -1403,6 +1450,8 @@ function parseBridgeInputResponse(
 ): CodexBridgeInputResponse | null {
   return value === "approve" ||
     value === "approve_accept_edits" ||
+    value === "approve_for_session" ||
+    value === "approve_always" ||
     value === "deny"
     ? value
     : null;
@@ -1424,6 +1473,31 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function getString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function getElicitationMeta(
+  params: Record<string, unknown>,
+): Record<string, unknown> | null {
+  return asRecord(params._meta) ?? asRecord(params.meta);
+}
+
+function isMcpToolApprovalElicitation(
+  params: Record<string, unknown>,
+): boolean {
+  const meta = getElicitationMeta(params);
+  return getString(meta?.codex_approval_kind) === "mcp_tool_call";
+}
+
+function normalizeMcpPersistScopes(value: unknown): string[] {
+  const rawScopes = Array.isArray(value) ? value : [value];
+  const scopes = rawScopes.filter(
+    (scope): scope is string => scope === "session" || scope === "always",
+  );
+  return Array.from(new Set(scopes));
+}
+
+function parseMcpToolNameFromPrompt(prompt: string): string | undefined {
+  return /run tool "([^"]+)"/.exec(prompt)?.[1];
 }
 
 function idKey(id: JsonRpcId): string {

@@ -75,6 +75,8 @@ export interface CodexBridgePendingInput {
 export type CodexBridgeInputResponse =
   | "approve"
   | "approve_accept_edits"
+  | "approve_for_session"
+  | "approve_always"
   | "deny";
 
 export type MaybePromise<T> = T | Promise<T>;

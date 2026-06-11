@@ -882,6 +882,62 @@ function SessionPageContent({
     t,
   ]);
 
+  const handleApproveForSession = useCallback(async () => {
+    if (pendingInputRequest) {
+      try {
+        await api.respondToInput(
+          sessionId,
+          pendingInputRequest.id,
+          "approve_for_session",
+        );
+        markPendingInputResolved("in-turn");
+      } catch (err) {
+        const status = (err as { status?: number }).status;
+        if (status === 404) {
+          handleStalePendingInput();
+          return;
+        }
+        const msg = status ? `Error ${status}` : t("sessionApproveFailed");
+        showToast(msg, "error");
+      }
+    }
+  }, [
+    sessionId,
+    pendingInputRequest,
+    markPendingInputResolved,
+    handleStalePendingInput,
+    showToast,
+    t,
+  ]);
+
+  const handleApproveAlways = useCallback(async () => {
+    if (pendingInputRequest) {
+      try {
+        await api.respondToInput(
+          sessionId,
+          pendingInputRequest.id,
+          "approve_always",
+        );
+        markPendingInputResolved("in-turn");
+      } catch (err) {
+        const status = (err as { status?: number }).status;
+        if (status === 404) {
+          handleStalePendingInput();
+          return;
+        }
+        const msg = status ? `Error ${status}` : t("sessionApproveFailed");
+        showToast(msg, "error");
+      }
+    }
+  }, [
+    sessionId,
+    pendingInputRequest,
+    markPendingInputResolved,
+    handleStalePendingInput,
+    showToast,
+    t,
+  ]);
+
   const handleDeny = useCallback(async () => {
     if (pendingInputRequest) {
       try {
@@ -1576,6 +1632,8 @@ function SessionPageContent({
                     onApprove={handleApprove}
                     onDeny={handleDeny}
                     onApproveAcceptEdits={handleApproveAcceptEdits}
+                    onApproveForSession={handleApproveForSession}
+                    onApproveAlways={handleApproveAlways}
                     onDenyWithFeedback={handleDenyWithFeedback}
                     collapsed={approvalCollapsed}
                     onCollapsedChange={setApprovalCollapsed}

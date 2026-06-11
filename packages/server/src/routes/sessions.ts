@@ -1786,7 +1786,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       }
       const bridgeResponse =
         bridgeBody.response === "approve" ||
-        bridgeBody.response === "approve_accept_edits"
+        bridgeBody.response === "approve_accept_edits" ||
+        bridgeBody.response === "approve_for_session" ||
+        bridgeBody.response === "approve_always"
           ? bridgeBody.response
           : "deny";
 

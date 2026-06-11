@@ -522,6 +522,190 @@ describe("CodexBridgeService", () => {
       client.close();
     }
   });
+
+  it("maps MCP tool approval elicitations to scoped tool approvals", async () => {
+    const client = await connect(`ws://127.0.0.1:${bridgePort}`);
+    try {
+      client.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "thread/read",
+          params: { threadId: "thread-mcp" },
+        }),
+      );
+      await waitFor(() => upstreamMessages.length === 1);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            model: "gpt-5.3-codex",
+            cwd: "/tmp/project-mcp",
+            thread: {
+              id: "thread-mcp",
+              preview: "MCP approval",
+              createdAt: 1_780_000_000,
+              updatedAt: 1_780_000_001,
+              cwd: "/tmp/project-mcp",
+              status: { type: "active", activeFlags: ["waitingOnApproval"] },
+              turns: [],
+            },
+          },
+        }),
+      );
+      await waitFor(() => bridge.listSessions().length === 1);
+
+      const forwardedApproval = waitForJson(client);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "mcp-approval-1",
+          method: "mcpServer/elicitation/request",
+          params: {
+            threadId: "thread-mcp",
+            turnId: "turn-1",
+            serverName: "chrome-devtools",
+            mode: "form",
+            _meta: {
+              codex_approval_kind: "mcp_tool_call",
+              persist: ["session", "always"],
+              tool_description: "Open a new tab.",
+              tool_params: {
+                timeout: 10000,
+                url: "http://127.0.0.1:5180/vibe/prompts/slash/kb-ingest-mrs/flow",
+              },
+              tool_params_display: [
+                { name: "timeout", value: 10000, display_name: "timeout" },
+                {
+                  name: "url",
+                  value:
+                    "http://127.0.0.1:5180/vibe/prompts/slash/kb-ingest-mrs/flow",
+                  display_name: "url",
+                },
+              ],
+            },
+            message:
+              'Allow the chrome-devtools MCP server to run tool "new_page"?',
+            requestedSchema: { type: "object", properties: {} },
+          },
+        }),
+      );
+      expect(await forwardedApproval).toMatchObject({
+        id: "mcp-approval-1",
+        method: "mcpServer/elicitation/request",
+      });
+
+      const pending = bridge.getPendingInputRequest("thread-mcp");
+      expect(pending).toMatchObject({
+        sessionId: "thread-mcp",
+        type: "tool-approval",
+        prompt: 'Allow the chrome-devtools MCP server to run tool "new_page"?',
+        toolName: "MCP",
+        toolInput: {
+          approvalKind: "mcp_tool_call",
+          approvalPrompt:
+            'Allow the chrome-devtools MCP server to run tool "new_page"?',
+          serverName: "chrome-devtools",
+          mcpToolName: "new_page",
+          persistScopes: ["session", "always"],
+        },
+      });
+      expect(bridge.listSessions()[0]?.pendingInputType).toBe("tool-approval");
+
+      const beforeSessionResponseCount = upstreamMessages.length;
+      const acceptedForSession = bridge.respondToInput(
+        "thread-mcp",
+        pending?.id ?? "",
+        "approve_for_session",
+      );
+      expect(acceptedForSession).toBe(true);
+      await waitFor(
+        () => upstreamMessages.length === beforeSessionResponseCount + 1,
+      );
+      expect(upstreamMessages.at(-1)).toMatchObject({
+        id: "mcp-approval-1",
+        result: { action: "accept", content: { persist: "session" } },
+      });
+
+      const forwardedAlwaysApproval = waitForJson(client);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "mcp-approval-2",
+          method: "mcpServer/elicitation/request",
+          params: {
+            threadId: "thread-mcp",
+            turnId: "turn-1",
+            serverName: "chrome-devtools",
+            _meta: {
+              codex_approval_kind: "mcp_tool_call",
+              persist: ["session", "always"],
+            },
+            message:
+              'Allow the chrome-devtools MCP server to run tool "new_page"?',
+            requestedSchema: { type: "object", properties: {} },
+          },
+        }),
+      );
+      expect(await forwardedAlwaysApproval).toMatchObject({
+        id: "mcp-approval-2",
+      });
+      const alwaysPending = bridge.getPendingInputRequest("thread-mcp");
+      const beforeAlwaysResponseCount = upstreamMessages.length;
+      const acceptedAlways = bridge.respondToInput(
+        "thread-mcp",
+        alwaysPending?.id ?? "",
+        "approve_always",
+      );
+      expect(acceptedAlways).toBe(true);
+      await waitFor(
+        () => upstreamMessages.length === beforeAlwaysResponseCount + 1,
+      );
+      expect(upstreamMessages.at(-1)).toMatchObject({
+        id: "mcp-approval-2",
+        result: { action: "accept", content: { persist: "always" } },
+      });
+
+      const forwardedCancelApproval = waitForJson(client);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "mcp-approval-3",
+          method: "mcpServer/elicitation/request",
+          params: {
+            threadId: "thread-mcp",
+            turnId: "turn-1",
+            serverName: "chrome-devtools",
+            _meta: { codex_approval_kind: "mcp_tool_call" },
+            message:
+              'Allow the chrome-devtools MCP server to run tool "new_page"?',
+            requestedSchema: { type: "object", properties: {} },
+          },
+        }),
+      );
+      expect(await forwardedCancelApproval).toMatchObject({
+        id: "mcp-approval-3",
+      });
+      const cancelPending = bridge.getPendingInputRequest("thread-mcp");
+      const beforeCancelResponseCount = upstreamMessages.length;
+      const cancelled = bridge.respondToInput(
+        "thread-mcp",
+        cancelPending?.id ?? "",
+        "deny",
+      );
+      expect(cancelled).toBe(true);
+      await waitFor(
+        () => upstreamMessages.length === beforeCancelResponseCount + 1,
+      );
+      expect(upstreamMessages.at(-1)).toMatchObject({
+        id: "mcp-approval-3",
+        result: { action: "cancel" },
+      });
+    } finally {
+      client.close();
+    }
+  });
 });
 
 async function findAvailablePort(): Promise<number> {

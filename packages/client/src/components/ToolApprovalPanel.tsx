@@ -20,6 +20,26 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function getString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function getStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function getMcpApprovalScopes(request: InputRequest): string[] {
+  const input = asRecord(request.toolInput);
+  if (input?.approvalKind !== "mcp_tool_call") return [];
+  return getStringArray(input.persistScopes);
+}
+
+function getApprovalPrompt(request: InputRequest): string | undefined {
+  return getString(asRecord(request.toolInput)?.approvalPrompt);
+}
+
 function requestSupportsPersistentApproval(request: InputRequest): boolean {
   const input = asRecord(request.toolInput);
   if (!input) return false;
@@ -53,6 +73,8 @@ interface Props {
   onApprove: () => Promise<void>;
   onDeny: () => Promise<void>;
   onApproveAcceptEdits?: () => Promise<void>;
+  onApproveForSession?: () => Promise<void>;
+  onApproveAlways?: () => Promise<void>;
   onDenyWithFeedback?: (feedback: string) => Promise<void>;
   /** Whether the panel is collapsed (controlled externally) */
   collapsed?: boolean;
@@ -70,6 +92,8 @@ export function ToolApprovalPanel({
   onApprove,
   onDeny,
   onApproveAcceptEdits,
+  onApproveForSession,
+  onApproveAlways,
   onDenyWithFeedback,
   collapsed = false,
   onCollapsedChange,
@@ -93,8 +117,13 @@ export function ToolApprovalPanel({
   }, [request.id]);
 
   const isEditTool = request.toolName && EDIT_TOOLS.includes(request.toolName);
+  const mcpApprovalScopes = getMcpApprovalScopes(request);
+  const isScopedMcpApproval = mcpApprovalScopes.length > 0;
+  const canApproveMcpForSession = mcpApprovalScopes.includes("session");
+  const canApproveMcpAlways = mcpApprovalScopes.includes("always");
   const canApprovePersistently =
-    isEditTool || requestSupportsPersistentApproval(request);
+    !isScopedMcpApproval &&
+    (isEditTool || requestSupportsPersistentApproval(request));
 
   const handleApprove = useCallback(async () => {
     setSubmitting(true);
@@ -114,6 +143,26 @@ export function ToolApprovalPanel({
       setSubmitting(false);
     }
   }, [onApproveAcceptEdits]);
+
+  const handleApproveForSession = useCallback(async () => {
+    if (!onApproveForSession) return;
+    setSubmitting(true);
+    try {
+      await onApproveForSession();
+    } finally {
+      setSubmitting(false);
+    }
+  }, [onApproveForSession]);
+
+  const handleApproveAlways = useCallback(async () => {
+    if (!onApproveAlways) return;
+    setSubmitting(true);
+    try {
+      await onApproveAlways();
+    } finally {
+      setSubmitting(false);
+    }
+  }, [onApproveAlways]);
 
   const handleDeny = useCallback(async () => {
     setSubmitting(true);
@@ -164,7 +213,28 @@ export function ToolApprovalPanel({
 
       const isPlanMode = isExitPlanMode(request.toolName);
 
-      if (isPlanMode) {
+      if (isScopedMcpApproval) {
+        if (e.key === "1") {
+          e.preventDefault();
+          handleApprove();
+        } else if (
+          e.key === "2" &&
+          canApproveMcpForSession &&
+          onApproveForSession
+        ) {
+          e.preventDefault();
+          handleApproveForSession();
+        } else if (e.key === "3" && canApproveMcpAlways && onApproveAlways) {
+          e.preventDefault();
+          handleApproveAlways();
+        } else if (e.key === "4" || e.key === "Escape") {
+          e.preventDefault();
+          handleDeny();
+        } else if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          handleApprove();
+        }
+      } else if (isPlanMode) {
         // ExitPlanMode: 1=auto-accept, 2=manual, 3=deny
         if (e.key === "1" && onApproveAcceptEdits) {
           e.preventDefault();
@@ -215,6 +285,8 @@ export function ToolApprovalPanel({
   }, [
     handleApprove,
     handleApproveAcceptEdits,
+    handleApproveAlways,
+    handleApproveForSession,
     handleDeny,
     handleDenyWithFeedback,
     submitting,
@@ -223,20 +295,27 @@ export function ToolApprovalPanel({
     feedback,
     clearFeedback,
     canApprovePersistently,
+    canApproveMcpAlways,
+    canApproveMcpForSession,
+    isScopedMcpApproval,
+    onApproveAlways,
     onApproveAcceptEdits,
+    onApproveForSession,
     request.toolName,
   ]);
 
   const summary = request.toolName
     ? getToolSummary(request.toolName, request.toolInput, undefined, "pending")
     : request.prompt;
+  const approvalPrompt = getApprovalPrompt(request);
 
   const [showPreviewModal, setShowPreviewModal] = useState(false);
 
   // Only show "View details" when the approval summary text itself is too
   // long to display inline. The full tool details (diffs, etc.) are already
   // visible in the session stream above.
-  const summaryText = `Allow ${request.toolName ?? ""} ${summary ?? ""}?`;
+  const summaryText =
+    approvalPrompt ?? `Allow ${request.toolName ?? ""} ${summary ?? ""}?`;
   const showViewDetails = summaryText.length > 120;
 
   const renderContext: RenderContext = useMemo(
@@ -292,10 +371,11 @@ export function ToolApprovalPanel({
               <>
                 <div className="tool-approval-question-row">
                   <span className="tool-approval-question">
-                    {t("toolApprovalAllow", {
-                      tool: request.toolName ?? "",
-                      summary: summary ?? "",
-                    })}
+                    {approvalPrompt ??
+                      t("toolApprovalAllow", {
+                        tool: request.toolName ?? "",
+                        summary: summary ?? "",
+                      })}
                   </span>
                   {showViewDetails && (
                     <button
@@ -328,7 +408,53 @@ export function ToolApprovalPanel({
           </div>
 
           <div className="tool-approval-options">
-            {isExitPlanMode(request.toolName) ? (
+            {isScopedMcpApproval ? (
+              <>
+                <button
+                  type="button"
+                  className="tool-approval-option primary"
+                  onClick={handleApprove}
+                  disabled={!armed || submitting}
+                >
+                  <kbd>1</kbd>
+                  <span>{t("toolApprovalAllowOnce")}</span>
+                </button>
+
+                {canApproveMcpForSession && onApproveForSession && (
+                  <button
+                    type="button"
+                    className="tool-approval-option"
+                    onClick={handleApproveForSession}
+                    disabled={!armed || submitting}
+                  >
+                    <kbd>2</kbd>
+                    <span>{t("toolApprovalAllowForSession")}</span>
+                  </button>
+                )}
+
+                {canApproveMcpAlways && onApproveAlways && (
+                  <button
+                    type="button"
+                    className="tool-approval-option"
+                    onClick={handleApproveAlways}
+                    disabled={!armed || submitting}
+                  >
+                    <kbd>3</kbd>
+                    <span>{t("toolApprovalAlwaysAllow")}</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  className="tool-approval-option"
+                  onClick={handleDeny}
+                  disabled={!armed || submitting}
+                >
+                  <kbd>4</kbd>
+                  <span>{t("toolApprovalCancel")}</span>
+                </button>
+              </>
+            ) : isExitPlanMode(request.toolName) ? (
               <>
                 <button
                   type="button"
@@ -396,7 +522,7 @@ export function ToolApprovalPanel({
               </>
             )}
 
-            {onDenyWithFeedback && !showFeedback && (
+            {onDenyWithFeedback && !isScopedMcpApproval && !showFeedback && (
               <button
                 type="button"
                 className="tool-approval-option feedback-toggle"
@@ -409,7 +535,7 @@ export function ToolApprovalPanel({
               </button>
             )}
 
-            {onDenyWithFeedback && showFeedback && (
+            {onDenyWithFeedback && !isScopedMcpApproval && showFeedback && (
               <div className="tool-approval-feedback">
                 <input
                   ref={feedbackInputRef}

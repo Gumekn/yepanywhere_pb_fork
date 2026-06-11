@@ -704,7 +704,12 @@ export const api = {
   respondToInput: (
     sessionId: string,
     requestId: string,
-    response: "approve" | "approve_accept_edits" | "deny",
+    response:
+      | "approve"
+      | "approve_accept_edits"
+      | "approve_for_session"
+      | "approve_always"
+      | "deny",
     answers?: Record<string, string>,
     feedback?: string,
   ) =>
