@@ -14,8 +14,18 @@
  */
 const BASE = (import.meta.env.BASE_URL ?? "/").replace(/\/$/, "");
 
+/** Client route prefix, e.g. "" or "/yep". */
+export const APP_BASE = BASE;
+
 /** Server URL prefix for direct HTTP fetches, e.g. "" or "/yep/api". */
 export const API_BASE = `${BASE}/api`;
+
+/** Build an app route that respects Vite's base path. */
+export function appPath(path = ""): string {
+  if (!path) return APP_BASE || "/";
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  return `${APP_BASE}${normalized}`;
+}
 
 /** Build an absolute API path. `apiPath("/foo")` → `"/yep/api/foo"`. */
 export function apiPath(path = ""): string {

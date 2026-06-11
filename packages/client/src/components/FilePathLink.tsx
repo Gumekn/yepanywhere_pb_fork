@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
+import { appPath } from "../lib/apiPath";
 import { FileViewer } from "./FileViewer";
 
 interface FilePathLinkProps {
@@ -52,7 +53,9 @@ export const FilePathLink = memo(function FilePathLink({
     (e: React.MouseEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      const url = `/projects/${projectId}/file?path=${encodeURIComponent(filePath)}`;
+      const url = appPath(
+        `/projects/${projectId}/file?path=${encodeURIComponent(filePath)}`,
+      );
       window.open(url, "_blank");
     },
     [projectId, filePath],
@@ -100,7 +103,7 @@ export const FilePathLink = memo(function FilePathLink({
 /**
  * Modal wrapper for FileViewer.
  */
-function FileViewerModal({
+export function FileViewerModal({
   projectId,
   filePath,
   lineNumber,

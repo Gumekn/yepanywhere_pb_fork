@@ -1,7 +1,15 @@
 import { memo, useCallback, useEffect, useState } from "react";
+import { createPortal } from "react-dom";
+import { useOptionalSessionMetadata } from "../../contexts/SessionMetadataContext";
 import { useStreamingMarkdownContext } from "../../contexts/StreamingMarkdownContext";
 import { useStreamingMarkdown } from "../../hooks/useStreamingMarkdown";
-import { LocalMediaModal, useLocalMediaClick } from "../LocalMediaModal";
+import { appPath } from "../../lib/apiPath";
+import { FileViewerModal } from "../FilePathLink";
+import {
+  LocalMediaModal,
+  extractPathFromLocalImageUrl,
+  useLocalMediaClick,
+} from "../LocalMediaModal";
 
 interface Props {
   text: string;
@@ -10,12 +18,28 @@ interface Props {
   augmentHtml?: string;
 }
 
+function getProjectRelativePath(
+  filePath: string,
+  projectPath: string | null | undefined,
+): string | null {
+  const root = projectPath?.replace(/\/+$/, "");
+  if (!root) return null;
+  if (!filePath.startsWith(`${root}/`)) return null;
+  return filePath.slice(root.length + 1);
+}
+
+function isModifiedClick(e: React.MouseEvent): boolean {
+  return e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
+}
+
 export const TextBlock = memo(function TextBlock({
   text,
   isStreaming = false,
   augmentHtml,
 }: Props) {
   const [copied, setCopied] = useState(false);
+  const [fileModal, setFileModal] = useState<{ filePath: string } | null>(null);
+  const sessionMetadata = useOptionalSessionMetadata();
 
   // Streaming markdown hook for server-rendered content
   const streamingMarkdown = useStreamingMarkdown();
@@ -61,7 +85,57 @@ export const TextBlock = memo(function TextBlock({
     }
   }, [text]);
 
-  const { modal, handleClick, closeModal } = useLocalMediaClick();
+  const {
+    modal,
+    handleClick: handleLocalMediaClick,
+    closeModal,
+  } = useLocalMediaClick();
+
+  const handleClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (handleLocalMediaClick(e)) return;
+
+      const target = (e.target as HTMLElement).closest?.(
+        "a[href]",
+      ) as HTMLAnchorElement | null;
+      if (!target) return;
+
+      const href = target.getAttribute("href");
+      if (!href) return;
+
+      const absoluteFilePath = extractPathFromLocalImageUrl(href);
+      if (!absoluteFilePath) return;
+
+      const relativePath = getProjectRelativePath(
+        absoluteFilePath,
+        sessionMetadata?.projectPath,
+      );
+      if (!relativePath || !sessionMetadata?.projectId) {
+        if (href.startsWith("/api/")) {
+          e.preventDefault();
+          e.stopPropagation();
+          window.location.assign(appPath(href));
+        }
+        return;
+      }
+
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (isModifiedClick(e)) {
+        window.open(
+          appPath(
+            `/projects/${sessionMetadata.projectId}/file?path=${encodeURIComponent(relativePath)}`,
+          ),
+          "_blank",
+        );
+        return;
+      }
+
+      setFileModal({ filePath: relativePath });
+    },
+    [handleLocalMediaClick, sessionMetadata],
+  );
 
   const showStreamingContent = isStreaming && useStreamingContent;
 
@@ -115,6 +189,16 @@ export const TextBlock = memo(function TextBlock({
           onClose={closeModal}
         />
       )}
+      {fileModal &&
+        sessionMetadata?.projectId &&
+        createPortal(
+          <FileViewerModal
+            projectId={sessionMetadata.projectId}
+            filePath={fileModal.filePath}
+            onClose={() => setFileModal(null)}
+          />,
+          document.body,
+        )}
     </div>
   );
 });

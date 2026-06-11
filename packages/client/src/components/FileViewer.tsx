@@ -2,6 +2,7 @@ import type { FileContentResponse } from "@yep-anywhere/shared";
 import { memo, useCallback, useEffect, useState } from "react";
 import { api } from "../api/client";
 import { useI18n } from "../i18n";
+import { appPath } from "../lib/apiPath";
 
 interface FileViewerProps {
   projectId: string;
@@ -176,7 +177,9 @@ export const FileViewer = memo(function FileViewer({
   }, [projectId, filePath]);
 
   const handleOpenInNewTab = useCallback(() => {
-    const url = `/projects/${projectId}/file?path=${encodeURIComponent(filePath)}`;
+    const url = appPath(
+      `/projects/${projectId}/file?path=${encodeURIComponent(filePath)}`,
+    );
     window.open(url, "_blank");
   }, [projectId, filePath]);
 

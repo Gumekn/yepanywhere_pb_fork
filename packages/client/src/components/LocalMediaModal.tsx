@@ -45,10 +45,11 @@ export function LocalMediaModal({
 /**
  * Extract the original file path from a local-image API URL.
  */
-function extractPathFromApiUrl(href: string): string | null {
+export function extractPathFromLocalImageUrl(href: string): string | null {
   try {
     // href is like "/api/local-image?path=%2Ftmp%2Ffoo.mp4"
     const url = new URL(href, "http://localhost");
+    if (!url.pathname.endsWith("/api/local-image")) return null;
     return url.searchParams.get("path");
   } catch {
     return null;
@@ -65,24 +66,25 @@ export function useLocalMediaClick() {
     mediaType: "image" | "video";
   } | null>(null);
 
-  const handleClick = (e: React.MouseEvent) => {
+  const handleClick = (e: React.MouseEvent): boolean => {
     const target = (e.target as HTMLElement).closest?.(
       "a.local-media-link",
     ) as HTMLAnchorElement | null;
-    if (!target) return;
+    if (!target) return false;
 
     e.preventDefault();
     e.stopPropagation();
 
     const href = target.getAttribute("href");
-    if (!href) return;
+    if (!href) return false;
 
-    const path = extractPathFromApiUrl(href);
-    if (!path) return;
+    const path = extractPathFromLocalImageUrl(href);
+    if (!path) return false;
 
     const mediaType =
       (target.getAttribute("data-media-type") as "image" | "video") ?? "image";
     setModal({ path, mediaType });
+    return true;
   };
 
   const closeModal = () => setModal(null);
