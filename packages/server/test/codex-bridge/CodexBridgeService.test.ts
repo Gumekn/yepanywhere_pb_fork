@@ -118,6 +118,46 @@ describe("CodexBridgeService", () => {
     }
   });
 
+  it("does not record thread.modelProvider as the session model", async () => {
+    const client = await connect(`ws://127.0.0.1:${bridgePort}`);
+    try {
+      client.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "thread/read",
+          params: { threadId: "thread-provider-only" },
+        }),
+      );
+
+      await waitFor(() => upstreamMessages.length === 1);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            cwd: "/tmp/project-provider-only",
+            thread: {
+              id: "thread-provider-only",
+              modelProvider: "openai",
+              preview: "Provider should not become model",
+              createdAt: 1_780_000_000,
+              updatedAt: 1_780_000_001,
+              cwd: "/tmp/project-provider-only",
+              status: { type: "idle" },
+              turns: [],
+            },
+          },
+        }),
+      );
+
+      await waitFor(() => bridge.listSessions().length === 1);
+      expect(bridge.listSessions()[0]?.model).toBeUndefined();
+    } finally {
+      client.close();
+    }
+  });
+
   it("keeps idle empty thread records out of displayable session views", async () => {
     const client = await connect(`ws://127.0.0.1:${bridgePort}`);
     try {

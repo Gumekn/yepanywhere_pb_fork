@@ -5,7 +5,14 @@
  * without requiring actual Codex CLI installation.
  */
 
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -113,6 +120,106 @@ describe("CodexProvider", () => {
             (m as { type?: string }).type === "result",
         ),
       ).toBe(true);
+    });
+
+    it("passes modelProvider separately and ignores provider names as model", async () => {
+      const tempDir = mkdtempSync(
+        join(require("node:os").tmpdir(), "codex-app-server-"),
+      );
+      const fakeCodexPath = join(tempDir, "fake-codex.js");
+      const capturePath = join(tempDir, "capture.json");
+      const previousCapturePath = process.env.CODEX_FAKE_CAPTURE;
+      let session: Awaited<ReturnType<CodexProvider["startSession"]>> | null =
+        null;
+
+      writeFileSync(
+        fakeCodexPath,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+let buffer = "";
+
+function send(id, result) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
+}
+
+function handle(message) {
+  if (message.method === "initialize") {
+    send(message.id, { userAgent: "fake-codex" });
+    return;
+  }
+  if (message.method !== "thread/start" && message.method !== "thread/resume") {
+    return;
+  }
+  fs.writeFileSync(
+    process.env.CODEX_FAKE_CAPTURE,
+    JSON.stringify({ method: message.method, params: message.params }),
+  );
+  send(message.id, {
+    thread: {
+      id: message.params.threadId || "thread-new",
+      cwd: message.params.cwd,
+      modelProvider: "openai",
+      status: { type: "idle" },
+    },
+    model: "gpt-5.5",
+    modelProvider: "openai",
+    serviceTier: null,
+    cwd: message.params.cwd,
+    reasoningEffort: null,
+  });
+}
+
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newlineIndex = buffer.indexOf("\\n");
+  while (newlineIndex !== -1) {
+    const line = buffer.slice(0, newlineIndex).trim();
+    buffer = buffer.slice(newlineIndex + 1);
+    if (line) {
+      handle(JSON.parse(line));
+    }
+    newlineIndex = buffer.indexOf("\\n");
+  }
+});
+`,
+      );
+      chmodSync(fakeCodexPath, 0o755);
+      process.env.CODEX_FAKE_CAPTURE = capturePath;
+
+      try {
+        const provider = new CodexProvider({ codexPath: fakeCodexPath });
+        session = await provider.startSession({
+          cwd: tempDir,
+          resumeSessionId: "thread-existing",
+          model: "openai",
+        });
+
+        const first = await session.iterator.next();
+        expect(first.value).toMatchObject({
+          type: "system",
+          subtype: "init",
+          session_id: "thread-existing",
+          model: "gpt-5.5",
+        });
+        expect(JSON.parse(readFileSync(capturePath, "utf8"))).toMatchObject({
+          method: "thread/resume",
+          params: {
+            threadId: "thread-existing",
+            model: null,
+            modelProvider: "openai",
+            cwd: tempDir,
+          },
+        });
+      } finally {
+        session?.abort();
+        if (previousCapturePath === undefined) {
+          process.env.CODEX_FAKE_CAPTURE = undefined;
+        } else {
+          process.env.CODEX_FAKE_CAPTURE = previousCapturePath;
+        }
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     });
   });
 });

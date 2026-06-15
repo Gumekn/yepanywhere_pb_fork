@@ -99,11 +99,24 @@ function withCodexTimestamp<T extends SDKMessage>(
   } as TimestampedSDKMessage<T>;
 }
 
+function normalizeCodexModelOption(model: string | undefined): string | null {
+  const trimmed = model?.trim();
+  if (!trimmed || trimmed === "default") {
+    return null;
+  }
+  if (CODEX_MODEL_PROVIDER_NAMES.has(trimmed.toLowerCase())) {
+    return null;
+  }
+  return trimmed;
+}
+
 const MODEL_CACHE_TTL_MS = 60 * 60 * 1000;
 const MODEL_LIST_TIMEOUT_MS = 8000;
 const APP_SERVER_INIT_REQUEST_ID = 1;
 const APP_SERVER_MODEL_LIST_REQUEST_ID = 2;
 const APP_SERVER_SHUTDOWN_GRACE_MS = 1500;
+const CODEX_CLOUD_MODEL_PROVIDER = "openai";
+const CODEX_MODEL_PROVIDER_NAMES = new Set(["openai", "azure"]);
 
 /**
  * Local debug knobs for Codex app-server policy behavior.
@@ -1124,16 +1137,29 @@ export class CodexProvider implements AgentProvider {
       const policy = this.mapPermissionModeToThreadPolicy(
         options.permissionMode,
       );
+      const requestedModel = normalizeCodexModelOption(options.model);
+      if (options.model && !requestedModel) {
+        log.warn(
+          {
+            sessionId: options.resumeSessionId ?? null,
+            requestedModel: options.model,
+            modelProvider: CODEX_CLOUD_MODEL_PROVIDER,
+          },
+          "Ignoring Codex model option that looks like a model provider",
+        );
+      }
 
       const threadResumeParams: ThreadResumeParams = {
         threadId: options.resumeSessionId ?? sessionId,
-        model: options.model ?? null,
+        model: requestedModel,
+        modelProvider: CODEX_CLOUD_MODEL_PROVIDER,
         cwd: options.cwd,
         approvalPolicy: policy.approvalPolicy,
         sandbox: policy.sandbox,
       };
       const threadStartParams: ThreadStartParams = {
-        model: options.model ?? null,
+        model: requestedModel,
+        modelProvider: CODEX_CLOUD_MODEL_PROVIDER,
         cwd: options.cwd,
         approvalPolicy: policy.approvalPolicy,
         sandbox: policy.sandbox,
@@ -1196,7 +1222,8 @@ export class CodexProvider implements AgentProvider {
             approvalPolicy: CODEX_POLICY_OVERRIDES.approvalPolicy,
             sandbox: CODEX_POLICY_OVERRIDES.sandbox,
           },
-          model: options.model ?? null,
+          model: requestedModel,
+          modelProvider: CODEX_CLOUD_MODEL_PROVIDER,
         },
         "Started Codex app-server session thread",
       );

@@ -1085,7 +1085,7 @@ export class CodexBridgeService implements CodexBridgeController {
     const cwd = extra.cwd ?? getString(thread.cwd);
     const record = this.ensureSessionRecord(id, {
       cwd,
-      model: extra.model ?? getString(thread.modelProvider),
+      model: extra.model ?? getString(thread.model),
       reasoningEffort: extra.reasoningEffort,
       serviceTier: extra.serviceTier,
       title: getString(thread.name) ?? getString(thread.preview),
