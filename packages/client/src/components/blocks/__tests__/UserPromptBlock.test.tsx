@@ -84,4 +84,43 @@ describe("UserPromptBlock", () => {
     expect(screen.queryByText("<image>")).toBeNull();
     expect(screen.getByText(/annotated-shot\.jpg/)).toBeDefined();
   });
+
+  it("renders injected skill blocks as clickable skill references", () => {
+    const content = `<skill>
+<name>git-commit-push</name>
+<path>/Users/yueyuan/.codex/skills/git-commit-push/SKILL.md</path>
+---
+name: git-commit-push
+description: Review repository changes and push them.
+---
+
+# Git Commit Push
+
+Commit and push current changes.
+</skill>`;
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    expect(screen.queryByText(/<skill>/)).toBeNull();
+    const skillLink = screen.getByRole("button", {
+      name: /Skill git-commit-push/i,
+    });
+    expect(skillLink).toBeDefined();
+
+    fireEvent.click(skillLink);
+
+    expect(screen.getByRole("dialog")).toBeDefined();
+    expect(screen.getByText("Skill: git-commit-push")).toBeDefined();
+    expect(
+      screen.getByText("/Users/yueyuan/.codex/skills/git-commit-push/SKILL.md"),
+    ).toBeDefined();
+    expect(
+      screen.getByText("Review repository changes and push them."),
+    ).toBeDefined();
+    expect(screen.getByText(/# Git Commit Push/)).toBeDefined();
+  });
 });

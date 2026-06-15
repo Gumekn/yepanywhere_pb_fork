@@ -1,6 +1,7 @@
 import { memo, useState } from "react";
 import { useRemoteImage } from "../../hooks/useRemoteImage";
 import {
+  type SkillInfo,
   type UploadedFileInfo,
   getFilename,
   parseUserPrompt,
@@ -314,6 +315,64 @@ function UploadedFilesMetadata({ files }: { files: UploadedFileInfo[] }) {
   );
 }
 
+function getSkillCopyText(skills: SkillInfo[]): string {
+  return skills.map((skill) => skill.raw).join("\n\n");
+}
+
+function SkillReferences({ skills }: { skills: SkillInfo[] }) {
+  const [selectedSkill, setSelectedSkill] = useState<SkillInfo | null>(null);
+
+  if (skills.length === 0) return null;
+
+  return (
+    <>
+      <div className="skill-reference-list">
+        {skills.map((skill, index) => (
+          <button
+            key={`${skill.path || skill.name}-${index}`}
+            type="button"
+            className="skill-reference-link"
+            title={skill.path || skill.name}
+            onClick={() => setSelectedSkill(skill)}
+          >
+            <span className="skill-reference-kind">Skill</span>
+            <span className="skill-reference-name">{skill.name}</span>
+          </button>
+        ))}
+      </div>
+      {selectedSkill && (
+        <Modal
+          title={`Skill: ${selectedSkill.name}`}
+          onClose={() => setSelectedSkill(null)}
+        >
+          <div className="skill-detail-modal">
+            {selectedSkill.path && (
+              <div className="skill-detail-row">
+                <div className="skill-detail-label">Path</div>
+                <code className="skill-detail-value">{selectedSkill.path}</code>
+              </div>
+            )}
+            {selectedSkill.description && (
+              <div className="skill-detail-row">
+                <div className="skill-detail-label">Description</div>
+                <div className="skill-detail-description">
+                  {selectedSkill.description}
+                </div>
+              </div>
+            )}
+            <div className="skill-detail-section">
+              <div className="skill-detail-label">Details</div>
+              <pre className="skill-detail-content">
+                {selectedSkill.markdown || selectedSkill.raw}
+              </pre>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
 function BranchControls({
   branch,
   onSelect,
@@ -430,10 +489,11 @@ export const UserPromptBlock = memo(function UserPromptBlock({
   const handleSelectBranch = onSelectBranch ?? onSelectCodexBranch;
 
   if (typeof content === "string") {
-    const { text, openedFiles, uploadedFiles } = parseUserPrompt(content);
+    const { text, openedFiles, uploadedFiles, skills } =
+      parseUserPrompt(content);
 
     // Don't render if there's no actual text content
-    if (!text) {
+    if (!text && skills.length === 0) {
       const hasMetadata = openedFiles.length > 0 || uploadedFiles.length > 0;
       return hasMetadata ? (
         <>
@@ -443,16 +503,19 @@ export const UserPromptBlock = memo(function UserPromptBlock({
       ) : null;
     }
 
+    const copyText = text || getSkillCopyText(skills);
+
     return (
       <div className="user-prompt-container">
         <MessageActions
           timestamp={timestamp}
-          copyText={text}
-          onEdit={onEdit ? () => onEdit(text) : undefined}
+          copyText={copyText}
+          onEdit={onEdit && text ? () => onEdit(text) : undefined}
         />
         <div className="message message-user-prompt">
           <div className="message-content">
-            <CollapsibleText text={text} />
+            {text && <CollapsibleText text={text} />}
+            <SkillReferences skills={skills} />
             <UploadedFilesMetadata files={uploadedFiles} />
           </div>
         </div>
@@ -479,10 +542,11 @@ export const UserPromptBlock = memo(function UserPromptBlock({
       : textContent;
 
   // Parse the combined text content for metadata
-  const { text, openedFiles, uploadedFiles } = parseUserPrompt(textForParsing);
+  const { text, openedFiles, uploadedFiles, skills } =
+    parseUserPrompt(textForParsing);
   const allUploadedFiles = mergeUploadedFiles(uploadedFiles, codexImageFiles);
 
-  if (!text) {
+  if (!text && skills.length === 0) {
     const hasMetadata = openedFiles.length > 0 || allUploadedFiles.length > 0;
     return hasMetadata ? (
       <>
@@ -498,16 +562,19 @@ export const UserPromptBlock = memo(function UserPromptBlock({
     );
   }
 
+  const copyText = text || getSkillCopyText(skills);
+
   return (
     <div className="user-prompt-container">
       <MessageActions
         timestamp={timestamp}
-        copyText={text}
-        onEdit={onEdit ? () => onEdit(text) : undefined}
+        copyText={copyText}
+        onEdit={onEdit && text ? () => onEdit(text) : undefined}
       />
       <div className="message message-user-prompt">
         <div className="message-content">
-          <CollapsibleText text={text} />
+          {text && <CollapsibleText text={text} />}
+          <SkillReferences skills={skills} />
           <UploadedFilesMetadata files={allUploadedFiles} />
         </div>
       </div>

@@ -17,6 +17,17 @@ export interface UploadedFileInfo {
 }
 
 /**
+ * Skill metadata injected by Codex when a named skill is loaded.
+ */
+export interface SkillInfo {
+  name: string;
+  path: string;
+  description?: string;
+  markdown: string;
+  raw: string;
+}
+
+/**
  * Parsed user prompt with metadata extracted
  */
 export interface ParsedUserPrompt {
@@ -26,6 +37,8 @@ export interface ParsedUserPrompt {
   openedFiles: string[];
   /** Uploaded file attachments */
   uploadedFiles: UploadedFileInfo[];
+  /** Skill references injected into the prompt */
+  skills: SkillInfo[];
 }
 
 /**
@@ -72,6 +85,56 @@ function parseUploadedFiles(content: string): {
   return { textWithoutUploads, uploadedFiles };
 }
 
+const SKILL_BLOCK_PATTERN = /<skill\b[^>]*>([\s\S]*?)<\/skill>/gi;
+
+function extractTagValue(content: string, tagName: string): string {
+  const pattern = new RegExp(
+    `<${tagName}\\b[^>]*>([\\s\\S]*?)</${tagName}>`,
+    "i",
+  );
+  return pattern.exec(content)?.[1]?.trim() ?? "";
+}
+
+function stripSkillXmlHeader(content: string): string {
+  return content
+    .replace(/<name\b[^>]*>[\s\S]*?<\/name>/i, "")
+    .replace(/<path\b[^>]*>[\s\S]*?<\/path>/i, "")
+    .trim();
+}
+
+function parseFrontmatterDescription(markdown: string): string | undefined {
+  const frontmatter = /^---\s*\n([\s\S]*?)\n---(?:\n|$)/.exec(markdown);
+  const description = frontmatter?.[1]?.match(/^description:\s*(.+)$/m)?.[1];
+  return description?.trim().replace(/^["']|["']$/g, "") || undefined;
+}
+
+function parseSkillReferences(content: string): {
+  textWithoutSkills: string;
+  skills: SkillInfo[];
+} {
+  const skills: SkillInfo[] = [];
+  const textWithoutSkills = content.replace(
+    SKILL_BLOCK_PATTERN,
+    (raw: string, inner: string) => {
+      const markdown = stripSkillXmlHeader(inner);
+      const name = extractTagValue(inner, "name") || "Unknown skill";
+      const path = extractTagValue(inner, "path");
+
+      skills.push({
+        name,
+        path,
+        description: parseFrontmatterDescription(markdown),
+        markdown,
+        raw: raw.trim(),
+      });
+
+      return "\n";
+    },
+  );
+
+  return { textWithoutSkills, skills };
+}
+
 /**
  * Parses user prompt content, extracting ide_opened_file metadata tags
  * and "User uploaded files:" sections.
@@ -82,11 +145,14 @@ function parseUploadedFiles(content: string): {
 export function parseUserPrompt(content: string): ParsedUserPrompt {
   // First extract uploaded files section
   const { textWithoutUploads, uploadedFiles } = parseUploadedFiles(content);
+  const { textWithoutSkills, skills } =
+    parseSkillReferences(textWithoutUploads);
 
   // Then process IDE metadata on the remaining text
   return {
-    text: stripIdeMetadata(textWithoutUploads),
-    openedFiles: parseOpenedFiles(textWithoutUploads),
+    text: stripIdeMetadata(textWithoutSkills),
+    openedFiles: parseOpenedFiles(textWithoutSkills),
     uploadedFiles,
+    skills,
   };
 }

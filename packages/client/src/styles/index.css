@@ -2324,6 +2324,122 @@ a.sidebar-nav-item {
   text-decoration: underline;
 }
 
+.skill-reference-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  max-width: 100%;
+}
+
+.collapsible-text + .skill-reference-list {
+  margin-top: var(--space-2);
+}
+
+.skill-reference-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-link);
+  font: inherit;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+}
+
+.skill-reference-link:hover {
+  text-decoration: underline;
+}
+
+.skill-reference-link:focus-visible {
+  outline: 2px solid var(--focus-border, var(--app-yep-green));
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.skill-reference-kind {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.skill-reference-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.skill-detail-modal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: min(720px, calc(100vw - 4rem));
+  max-width: 900px;
+}
+
+.skill-detail-row,
+.skill-detail-section {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.skill-detail-label {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.skill-detail-value {
+  min-width: 0;
+  padding: 0.125rem 0.25rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-code);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.skill-detail-description {
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.skill-detail-content {
+  min-width: 0;
+  max-height: min(62vh, 680px);
+  margin: 0;
+  padding: var(--space-3);
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-code);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .skill-detail-modal {
+    min-width: 0;
+  }
+
+  .skill-detail-row,
+  .skill-detail-section {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1);
+  }
+}
+
 .uploaded-image-modal {
   display: flex;
   justify-content: center;
