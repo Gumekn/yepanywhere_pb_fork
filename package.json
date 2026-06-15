@@ -8,6 +8,8 @@
     "codex:protocol:update": "node scripts/update-codex-protocol.mjs",
     "codex:protocol:check": "node scripts/update-codex-protocol.mjs --check",
     "deploy": "scripts/deploy.sh",
+    "launchd:install": "scripts/install-launchagents.sh",
+    "launchd:uninstall": "scripts/uninstall-launchagents.sh",
     "dev": "node scripts/dev.js",
     "staging": "node scripts/staging.js",
     "dev:auto": "pnpm --filter server dev & pnpm --filter client dev",

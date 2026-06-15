@@ -62,6 +62,8 @@ else
   SERVER_BASE_PATH="${SERVER_BASE_PATH%/}"
 fi
 SERVER_BASE_URL="http://127.0.0.1:${SERVER_PORT}${SERVER_BASE_PATH}"
+SERVER_LAUNCHD_LABEL="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
+CODEX_BRIDGE_LAUNCHD_LABEL="${YEP_LAUNCHD_BRIDGE_LABEL:-com.yueyuan.yepanywhere.codex-bridge}"
 for arg in "$@"; do
   case "$arg" in
     --restart)    DO_BUILD=false ;;
@@ -145,12 +147,35 @@ wait_server_processes_stopped() {
   return 1
 }
 
+launchd_domain() {
+  printf 'gui/%s' "$(id -u)"
+}
+
+launchd_label_loaded() {
+  local label="$1"
+
+  [[ "$(uname -s)" == "Darwin" ]] || return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl print "$(launchd_domain)/${label}" >/dev/null 2>&1
+}
+
+kickstart_launchd_label() {
+  local label="$1"
+
+  launchctl kickstart -k "$(launchd_domain)/${label}"
+}
+
 start_codex_bridge_sidecar() {
   local bridge_port="$1"
   local bridge_url="$2"
 
-  log "Starting Codex bridge sidecar on ${bridge_url} (logs: /tmp/yep-codex-bridge.log) ..."
-  YEP_CODEX_BRIDGE_PORT="$bridge_port" nohup yepanywhere --codex-bridge-only >/tmp/yep-codex-bridge.log 2>&1 & disown
+  if launchd_label_loaded "$CODEX_BRIDGE_LAUNCHD_LABEL"; then
+    log "Starting Codex bridge LaunchAgent ${CODEX_BRIDGE_LAUNCHD_LABEL} on ${bridge_url} ..."
+    kickstart_launchd_label "$CODEX_BRIDGE_LAUNCHD_LABEL"
+  else
+    log "Starting Codex bridge sidecar on ${bridge_url} (logs: /tmp/yep-codex-bridge.log) ..."
+    YEP_CODEX_BRIDGE_PORT="$bridge_port" nohup yepanywhere --codex-bridge-only >/tmp/yep-codex-bridge.log 2>&1 & disown
+  fi
 
   for _ in $(seq 1 60); do
     if curl -fsS "${bridge_url}/status" >/dev/null 2>&1; then
@@ -324,18 +349,23 @@ if $DO_RESTART; then
     start_codex_bridge_sidecar "$CODEX_BRIDGE_PORT" "$CODEX_BRIDGE_HTTP_URL"
   fi
 
-  log "Starting yepanywhere in background (logs: /tmp/yep-server.log) ..."
+  log "Starting yepanywhere ..."
   # Mount under /yep so Caddy at air.yueyuan.uk/yep/* reverse-proxies into us
   # cleanly (see INFRA.md). The Hono app + client bundle both pick up BASE_PATH.
   # APK / direct-mode tcp tunnel callers are unaffected — they hit ws://host:8022
   # which still serves /yep/api/ws; only the URL prefix changes, not the port.
-  if $USE_CODEX_BRIDGE_SIDECAR; then
+  if launchd_label_loaded "$SERVER_LAUNCHD_LABEL"; then
+    dim "using LaunchAgent ${SERVER_LAUNCHD_LABEL}; KeepAlive is not required"
+    kickstart_launchd_label "$SERVER_LAUNCHD_LABEL"
+  elif $USE_CODEX_BRIDGE_SIDECAR; then
+    dim "LaunchAgent ${SERVER_LAUNCHD_LABEL} is not loaded; falling back to nohup (logs: /tmp/yep-server.log)"
     BASE_PATH="${SERVER_BASE_PATH:-/}" \
       YEP_CODEX_BRIDGE_MODE=external \
       YEP_CODEX_BRIDGE_CONTROL_URL="$CODEX_BRIDGE_HTTP_URL" \
       YEP_CODEX_BRIDGE_PORT="$CODEX_BRIDGE_PORT" \
       nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
   else
+    dim "LaunchAgent ${SERVER_LAUNCHD_LABEL} is not loaded; falling back to nohup (logs: /tmp/yep-server.log)"
     BASE_PATH="${SERVER_BASE_PATH:-/}" nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
   fi
 
