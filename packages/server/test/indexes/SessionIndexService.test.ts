@@ -539,6 +539,15 @@ describe("SessionIndexService", () => {
       expect(sessions[0]?.title).toBe("Persistent session");
     });
 
+    it("writes compact JSON index files", async () => {
+      await createSession("session-1", "Compact session");
+
+      await service.getSessionsWithCache(sessionDir, projectId, reader);
+
+      const content = await readFile(service.getIndexPath(sessionDir), "utf-8");
+      expect(content).toBe(JSON.stringify(JSON.parse(content)));
+    });
+
     it("writes index atomically without leftover temp files", async () => {
       await createSession("session-1", "Atomic session");
 
@@ -574,6 +583,57 @@ describe("SessionIndexService", () => {
       expect(sessions).toHaveLength(1);
 
       await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  describe("full validation stats", () => {
+    it("stats every session file when file count exceeds the concurrency window", async () => {
+      const manySessionDir = join(projectsDir, "many-sessions");
+      await mkdir(manySessionDir, { recursive: true });
+
+      const sessionCount = 520;
+      const sessionFiles = Array.from({ length: sessionCount }, (_, index) => {
+        const sessionId = `session-${index.toString().padStart(3, "0")}`;
+        return {
+          sessionId,
+          filePath: join(manySessionDir, `${sessionId}.jsonl`),
+        };
+      });
+      await Promise.all(
+        sessionFiles.map((file) => writeFile(file.filePath, "{}\n")),
+      );
+
+      const manyReader: ISessionReader = {
+        listSessions: async () => [],
+        listSessionFiles: async () => sessionFiles,
+        getSessionSummary: async (
+          sessionId: string,
+          projectId: string,
+        ): Promise<SessionSummary> => ({
+          id: sessionId,
+          projectId,
+          title: sessionId,
+          fullTitle: sessionId,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          messageCount: 1,
+          ownership: { owner: "none" },
+          provider: "claude",
+        }),
+        getSession: async () => null,
+        getSessionSummaryIfChanged: async () => null,
+        getAgentMappings: async () => [],
+        getAgentSession: async () => null,
+      };
+
+      const sessions = await service.getSessionsWithCache(
+        manySessionDir,
+        projectId,
+        manyReader,
+      );
+
+      expect(sessions).toHaveLength(sessionCount);
+      expect(service.getDebugStats().statCalls).toBe(sessionCount);
     });
   });
 });

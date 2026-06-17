@@ -27,6 +27,7 @@ import type { ISessionIndexService } from "./types.js";
 
 const logger = getLogger();
 const LOG_CACHE_PERF = process.env.SESSION_INDEX_LOG_PERF === "true";
+const FULL_VALIDATION_STAT_CONCURRENCY = 512;
 
 export interface CachedSessionSummary {
   title: string | null;
@@ -311,7 +312,7 @@ export class SessionIndexService implements ISessionIndexService {
       // Ensure directory exists
       await fs.mkdir(path.dirname(indexPath), { recursive: true });
       await this.withWriteLock(lockPath, async () => {
-        const content = JSON.stringify(index, null, 2);
+        const content = JSON.stringify(index);
         await fs.writeFile(tempPath, content, "utf-8");
         await fs.rename(tempPath, indexPath);
       });
@@ -696,20 +697,8 @@ export class SessionIndexService implements ISessionIndexService {
           }));
       }
 
-      const STAT_BATCH = 100;
-      const allStats: (Stats | null)[] = new Array(sessionFiles.length);
-      for (let b = 0; b < sessionFiles.length; b += STAT_BATCH) {
-        const end = Math.min(b + STAT_BATCH, sessionFiles.length);
-        const batch = await Promise.all(
-          sessionFiles
-            .slice(b, end)
-            .map((f) => fs.stat(f.filePath).catch(() => null)),
-        );
-        statCalls += batch.length;
-        for (let j = 0; j < batch.length; j++) {
-          allStats[b + j] = batch[j] ?? null;
-        }
-      }
+      const allStats = await this.statSessionFilesForValidation(sessionFiles);
+      statCalls += sessionFiles.length;
 
       const cacheMisses: {
         sessionId: string;
@@ -798,6 +787,35 @@ export class SessionIndexService implements ISessionIndexService {
     } catch {
       return { summaries: [], statCalls, parseCalls };
     }
+  }
+
+  private async statSessionFilesForValidation(
+    sessionFiles: { sessionId: string; filePath: string }[],
+  ): Promise<(Stats | null)[]> {
+    const allStats: (Stats | null)[] = new Array(sessionFiles.length).fill(
+      null,
+    );
+    let nextIndex = 0;
+    const workerCount = Math.min(
+      FULL_VALIDATION_STAT_CONCURRENCY,
+      sessionFiles.length,
+    );
+
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (true) {
+          const index = nextIndex;
+          nextIndex += 1;
+          if (index >= sessionFiles.length) return;
+
+          const entry = sessionFiles[index];
+          if (!entry) continue;
+          allStats[index] = await fs.stat(entry.filePath).catch(() => null);
+        }
+      }),
+    );
+
+    return allStats;
   }
 
   getDebugStats(): {
