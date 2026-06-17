@@ -47,6 +47,10 @@ import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
 import { getMessageId } from "../lib/mergeMessages";
 import { preprocessMessages } from "../lib/preprocessMessages";
+import {
+  type PreprocessMessagesCache,
+  preprocessMessagesCached,
+} from "../lib/preprocessMessagesCache";
 import { generateUUID } from "../lib/uuid";
 import type { Message, Session } from "../types";
 import { getSessionDisplayTitle } from "../utils";
@@ -221,10 +225,13 @@ function SessionPageContent({
     streamingMarkdownCallbacks,
     selectedBranchId,
   );
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
 
   // Dismiss cold-start splash once the session has loaded (covers deep-link
   // launches that land directly on a session URL).
   useHideSplashOnReady(!loading || error !== null);
+  const preprocessCacheRef = useRef<PreprocessMessagesCache | null>(null);
 
   // Developer mode settings
   const { holdModeEnabled, showConnectionBars } = useDeveloperMode();
@@ -306,13 +313,13 @@ function SessionPageContent({
     }: { text: string; uuid: string; parentUuid: string | null }) => {
       if (isViewingHistoricalBranch) return;
       const rollbackNumTurns = isCodexAppServerProvider(effectiveProvider)
-        ? calculateCodexRollbackNumTurns(messages, uuid)
+        ? calculateCodexRollbackNumTurns(messagesRef.current, uuid)
         : null;
       setEditRewind({ parentUuid, uuid, preview: text, rollbackNumTurns });
       draftControlsRef.current?.setText(text);
       setScrollTrigger((prev) => prev + 1);
     },
-    [effectiveProvider, isViewingHistoricalBranch, messages],
+    [effectiveProvider, isViewingHistoricalBranch],
   );
 
   const handleSelectBranch = useCallback(
@@ -1114,16 +1121,28 @@ function SessionPageContent({
     processState === "waiting-input" ||
     (hasSessionUpdateStream && !sessionUpdatesConnected);
 
+  const renderItems = useMemo(() => {
+    const result = preprocessMessagesCached(
+      messages,
+      {
+        markdown: markdownAugments,
+        activeToolApproval,
+      },
+      preprocessCacheRef.current,
+    );
+    preprocessCacheRef.current = result.cache;
+    return result.renderItems;
+  }, [messages, markdownAugments, activeToolApproval]);
+
   // Detect if session has pending tool calls without results
   // This can happen when the session is unowned but was active in another process (VS Code, CLI)
   // that is waiting for user input (tool approval, question answer)
   const hasPendingToolCalls = useMemo(() => {
     if (status.owner !== "none") return false;
-    const items = preprocessMessages(messages);
-    return items.some(
+    return renderItems.some(
       (item) => item.type === "tool_call" && item.status === "pending",
     );
-  }, [messages, status.owner]);
+  }, [renderItems, status.owner]);
 
   // Compute display title - priority:
   // 1. Local custom title (user renamed in this session)
@@ -1568,6 +1587,7 @@ function SessionPageContent({
               >
                 <MessageList
                   messages={messages}
+                  preprocessedItems={renderItems}
                   provider={session?.provider}
                   isProcessing={
                     status.owner === "self" && processState === "in-turn"

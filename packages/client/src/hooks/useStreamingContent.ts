@@ -21,6 +21,12 @@ export interface StreamingMarkdownCallbacks {
   captureHtml?: () => string | null;
 }
 
+/** Streaming placeholder update emitted to session message state */
+export interface StreamingContentUpdate {
+  message: Message;
+  agentId?: string;
+}
+
 /** Context usage info for subagent progress tracking */
 export interface ContextUsage {
   inputTokens: number;
@@ -31,6 +37,8 @@ export interface ContextUsage {
 export interface UseStreamingContentOptions {
   /** Called when a streaming message needs to be updated in state */
   onUpdateMessage: (message: Message, agentId?: string) => void;
+  /** Called with all streaming messages flushed in the same throttle window */
+  onUpdateMessages?: (updates: StreamingContentUpdate[]) => void;
   /** Streaming markdown callbacks (passed through) */
   streamingMarkdownCallbacks?: StreamingMarkdownCallbacks;
   /** Callback when toolUseId→agentId mapping is discovered */
@@ -74,6 +82,7 @@ export function useStreamingContent(
 ): UseStreamingContentResult {
   const {
     onUpdateMessage,
+    onUpdateMessages,
     streamingMarkdownCallbacks,
     onToolUseMapping,
     onAgentContextUsage,
@@ -98,12 +107,10 @@ export function useStreamingContent(
     pendingIds: Set<string>;
   }>({ timer: null, pendingIds: new Set() });
 
-  // Update messages with streaming content
-  // Creates or updates a streaming placeholder message with accumulated content
-  const updateStreamingMessage = useCallback(
-    (messageId: string) => {
+  const buildStreamingUpdate = useCallback(
+    (messageId: string): StreamingContentUpdate | null => {
       const streaming = streamingContentRef.current.get(messageId);
-      if (!streaming) return;
+      if (!streaming) return null;
 
       const streamingMessage: Message = {
         id: messageId,
@@ -117,10 +124,39 @@ export function useStreamingContent(
         _source: "sdk",
       };
 
-      // Call the update callback with optional agentId for routing
-      onUpdateMessage(streamingMessage, streaming.agentId);
+      return { message: streamingMessage, agentId: streaming.agentId };
     },
-    [onUpdateMessage],
+    [],
+  );
+
+  const emitStreamingUpdates = useCallback(
+    (messageIds: Iterable<string>) => {
+      const updates: StreamingContentUpdate[] = [];
+      for (const id of messageIds) {
+        const update = buildStreamingUpdate(id);
+        if (update) updates.push(update);
+      }
+      if (updates.length === 0) return;
+
+      if (onUpdateMessages) {
+        onUpdateMessages(updates);
+        return;
+      }
+
+      for (const update of updates) {
+        onUpdateMessage(update.message, update.agentId);
+      }
+    },
+    [buildStreamingUpdate, onUpdateMessage, onUpdateMessages],
+  );
+
+  // Update messages with streaming content.
+  // Creates or updates a streaming placeholder message with accumulated content.
+  const updateStreamingMessage = useCallback(
+    (messageId: string) => {
+      emitStreamingUpdates([messageId]);
+    },
+    [emitStreamingUpdates],
   );
 
   // Throttled version of updateStreamingMessage for delta events
@@ -133,16 +169,15 @@ export function useStreamingContent(
       // If no timer running, start one
       if (!throttle.timer) {
         throttle.timer = setTimeout(() => {
-          // Flush all pending updates
-          for (const id of throttle.pendingIds) {
-            updateStreamingMessage(id);
-          }
+          // Flush all pending updates in one callback.
+          const pendingIds = Array.from(throttle.pendingIds);
           throttle.pendingIds.clear();
           throttle.timer = null;
+          emitStreamingUpdates(pendingIds);
         }, STREAMING_THROTTLE_MS);
       }
     },
-    [updateStreamingMessage],
+    [emitStreamingUpdates],
   );
 
   // Process a stream_event SSE message
@@ -297,6 +332,11 @@ export function useStreamingContent(
 
   // Clear all streaming state (called when assistant message arrives)
   const clearStreaming = useCallback(() => {
+    if (streamingThrottleRef.current.timer) {
+      clearTimeout(streamingThrottleRef.current.timer);
+      streamingThrottleRef.current.timer = null;
+    }
+    streamingThrottleRef.current.pendingIds.clear();
     streamingContentRef.current.clear();
     currentStreamingIdRef.current = null;
     currentStreamingAgentIdRef.current = null;
@@ -313,6 +353,7 @@ export function useStreamingContent(
       clearTimeout(streamingThrottleRef.current.timer);
       streamingThrottleRef.current.timer = null;
     }
+    streamingThrottleRef.current.pendingIds.clear();
   }, []);
 
   return {

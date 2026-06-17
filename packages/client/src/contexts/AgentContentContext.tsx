@@ -3,6 +3,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -54,6 +55,11 @@ export function AgentContentProvider({
   const [loadingAgents, setLoadingAgents] = useState<Set<string>>(new Set());
   // Track which agents have had their JSONL loaded (separate from SSE content)
   const loadedAgentsRef = useRef<Set<string>>(new Set());
+  const agentContentRef = useRef(agentContent);
+  const loadingAgentsRef = useRef(loadingAgents);
+
+  agentContentRef.current = agentContent;
+  loadingAgentsRef.current = loadingAgents;
 
   const loadAgentContent = useCallback(
     async (
@@ -63,18 +69,26 @@ export function AgentContentProvider({
     ): Promise<AgentContent> => {
       // Check if JSONL has already been loaded for this agent
       if (loadedAgentsRef.current.has(agentId)) {
-        return agentContent[agentId] ?? { messages: [], status: "pending" };
+        return (
+          agentContentRef.current[agentId] ?? {
+            messages: [],
+            status: "pending",
+          }
+        );
       }
 
       // Check if already loading
-      if (loadingAgents.has(agentId)) {
+      if (loadingAgentsRef.current.has(agentId)) {
         // Wait for existing load to complete
         return new Promise((resolve) => {
           const checkInterval = setInterval(() => {
             if (loadedAgentsRef.current.has(agentId)) {
               clearInterval(checkInterval);
               resolve(
-                agentContent[agentId] ?? { messages: [], status: "pending" },
+                agentContentRef.current[agentId] ?? {
+                  messages: [],
+                  status: "pending",
+                },
               );
             }
           }, 100);
@@ -147,7 +161,7 @@ export function AgentContentProvider({
         });
       }
     },
-    [agentContent, loadingAgents, setAgentContent],
+    [setAgentContent],
   );
 
   const isLoading = useCallback(
@@ -155,13 +169,16 @@ export function AgentContentProvider({
     [loadingAgents],
   );
 
-  const value: AgentContentContextValue = {
-    agentContent,
-    toolUseToAgent,
-    loadAgentContent,
-    isLoading,
-    projectId,
-  };
+  const value = useMemo<AgentContentContextValue>(
+    () => ({
+      agentContent,
+      toolUseToAgent,
+      loadAgentContent,
+      isLoading,
+      projectId,
+    }),
+    [agentContent, toolUseToAgent, loadAgentContent, isLoading, projectId],
+  );
 
   return (
     <AgentContentContext.Provider value={value}>

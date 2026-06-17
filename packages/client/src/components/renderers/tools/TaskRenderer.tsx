@@ -11,7 +11,10 @@ import { AgentContentContext } from "../../../contexts/AgentContentContext";
 import { useSchemaValidationContext } from "../../../contexts/SchemaValidationContext";
 import { useSessionMetadata } from "../../../contexts/SessionMetadataContext";
 import { classifyToolError } from "../../../lib/classifyToolError";
-import { preprocessMessages } from "../../../lib/preprocessMessages";
+import {
+  type PreprocessMessagesCache,
+  preprocessMessagesCached,
+} from "../../../lib/preprocessMessagesCache";
 import { validateToolResult } from "../../../lib/validateToolResult";
 import type { Message } from "../../../types";
 import { RenderItemComponent } from "../../RenderItemComponent";
@@ -135,11 +138,20 @@ function TaskNestedContent({
   isStreaming: boolean;
 }) {
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
+  const preprocessCacheRef = useRef<PreprocessMessagesCache | null>(null);
   const toggleThinkingExpanded = useCallback(() => {
     setThinkingExpanded((prev) => !prev);
   }, []);
 
-  const renderItems = useMemo(() => preprocessMessages(messages), [messages]);
+  const renderItems = useMemo(() => {
+    const result = preprocessMessagesCached(
+      messages,
+      undefined,
+      preprocessCacheRef.current,
+    );
+    preprocessCacheRef.current = result.cache;
+    return result.renderItems;
+  }, [messages]);
 
   return (
     <div className="task-nested-content">

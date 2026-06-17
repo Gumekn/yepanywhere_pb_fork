@@ -27,6 +27,12 @@ export interface AgentContent {
 /** Map of agentId → agent content */
 export type AgentContentMap = Record<string, AgentContent>;
 
+/** Streaming placeholder update from stream_event deltas */
+export interface StreamingMessageUpdate {
+  message: Message;
+  agentId?: string;
+}
+
 /** Result from initial session load */
 export interface SessionLoadResult {
   session: Session;
@@ -67,6 +73,8 @@ export interface UseSessionMessagesResult {
   setSession: React.Dispatch<React.SetStateAction<Session | null>>;
   /** Handle streaming content updates (for useStreamingContent) */
   handleStreamingUpdate: (message: Message, agentId?: string) => void;
+  /** Handle multiple streaming content updates in one React state pass */
+  handleStreamingUpdates: (updates: StreamingMessageUpdate[]) => void;
   /** Handle stream message event (buffered until initial load completes) */
   handleStreamMessageEvent: (incoming: Message) => void;
   /** Handle stream subagent message event */
@@ -157,6 +165,21 @@ function isEmptyAssistantContent(message: Message): boolean {
     }
     return false;
   });
+}
+
+function upsertMessageById(messages: Message[], message: Message): Message[] {
+  const messageId = getMessageId(message);
+  if (!messageId) return messages;
+
+  const existingIdx = messages.findIndex((m) => getMessageId(m) === messageId);
+  if (existingIdx >= 0) {
+    if (messages[existingIdx] === message) return messages;
+    const updated = [...messages];
+    updated[existingIdx] = message;
+    return updated;
+  }
+
+  return [...messages, message];
 }
 
 /**
@@ -410,52 +433,63 @@ export function useSessionMessages(
   ]);
 
   // Handle streaming content updates (from useStreamingContent)
-  const handleStreamingUpdate = useCallback(
-    (streamingMessage: Message, agentId?: string) => {
-      const messageId = getMessageId(streamingMessage);
-      if (!messageId) return;
+  const handleStreamingUpdates = useCallback(
+    (updates: StreamingMessageUpdate[]) => {
+      const mainUpdates: Message[] = [];
+      const agentUpdates = new Map<string, Message[]>();
 
-      if (agentId) {
-        // Route to agentContent
-        setAgentContent((prev) => {
-          const existing = prev[agentId] ?? {
-            messages: [],
-            status: "running" as const,
-          };
-          const existingIdx = existing.messages.findIndex(
-            (m) => getMessageId(m) === messageId,
-          );
+      for (const { message, agentId } of updates) {
+        const messageId = getMessageId(message);
+        if (!messageId) continue;
 
-          if (existingIdx >= 0) {
-            const updated = [...existing.messages];
-            updated[existingIdx] = streamingMessage;
-            return { ...prev, [agentId]: { ...existing, messages: updated } };
+        if (agentId) {
+          const existing = agentUpdates.get(agentId);
+          if (existing) {
+            existing.push(message);
+          } else {
+            agentUpdates.set(agentId, [message]);
           }
-          return {
-            ...prev,
-            [agentId]: {
-              ...existing,
-              messages: [...existing.messages, streamingMessage],
-            },
-          };
-        });
-        return;
+        } else {
+          mainUpdates.push(message);
+        }
       }
 
-      // Route to main messages
-      setMessages((prev) => {
-        const existingIdx = prev.findIndex(
-          (m) => getMessageId(m) === messageId,
-        );
-        if (existingIdx >= 0) {
-          const updated = [...prev];
-          updated[existingIdx] = streamingMessage;
-          return updated;
-        }
-        return [...prev, streamingMessage];
-      });
+      if (mainUpdates.length > 0) {
+        setMessages((prev) => mainUpdates.reduce(upsertMessageById, prev));
+      }
+
+      if (agentUpdates.size > 0) {
+        setAgentContent((prev) => {
+          let next = prev;
+
+          for (const [agentId, messages] of agentUpdates) {
+            const existing = next[agentId] ?? {
+              messages: [],
+              status: "running" as const,
+            };
+            const updatedMessages = messages.reduce(
+              upsertMessageById,
+              existing.messages,
+            );
+
+            if (updatedMessages !== existing.messages) {
+              if (next === prev) next = { ...prev };
+              next[agentId] = { ...existing, messages: updatedMessages };
+            }
+          }
+
+          return next;
+        });
+      }
     },
     [],
+  );
+
+  const handleStreamingUpdate = useCallback(
+    (message: Message, agentId?: string) => {
+      handleStreamingUpdates([{ message, agentId }]);
+    },
+    [handleStreamingUpdates],
   );
 
   // Handle stream message event (with buffering)
@@ -632,6 +666,7 @@ export function useSessionMessages(
     session,
     setSession,
     handleStreamingUpdate,
+    handleStreamingUpdates,
     handleStreamMessageEvent,
     handleStreamSubagentMessage,
     registerToolUseAgent,

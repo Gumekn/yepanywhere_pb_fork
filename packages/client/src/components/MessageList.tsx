@@ -67,6 +67,8 @@ interface DeferredMessage {
 
 interface Props {
   messages: Message[];
+  /** Preprocessed items shared with parent computations. Falls back to messages. */
+  preprocessedItems?: RenderItem[];
   provider?: string;
   isStreaming?: boolean;
   isProcessing?: boolean;
@@ -110,6 +112,7 @@ interface Props {
 
 export const MessageList = memo(function MessageList({
   messages,
+  preprocessedItems,
   provider,
   isStreaming = false,
   isProcessing = false,
@@ -171,11 +174,12 @@ export const MessageList = memo(function MessageList({
   // Preprocess messages into render items and group into turns
   const renderItems = useMemo(
     () =>
+      preprocessedItems ??
       preprocessMessages(messages, {
         markdown: markdownAugments,
         activeToolApproval,
       }),
-    [messages, markdownAugments, activeToolApproval],
+    [preprocessedItems, messages, markdownAugments, activeToolApproval],
   );
   const turnGroups = useMemo(
     () => groupItemsIntoTurns(renderItems),

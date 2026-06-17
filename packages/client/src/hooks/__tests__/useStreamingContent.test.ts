@@ -226,6 +226,99 @@ describe("useStreamingContent", () => {
       );
     });
 
+    it("batches throttled updates when a batch callback is provided", () => {
+      const onUpdateMessages = vi.fn();
+      const { result } = renderHook(() =>
+        useStreamingContent({ ...defaultOptions(), onUpdateMessages }),
+      );
+
+      act(() => {
+        result.current.handleStreamEvent({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { id: "msg-1" },
+          },
+        });
+        result.current.handleStreamEvent({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          },
+        });
+        result.current.handleStreamEvent({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { id: "msg-2" },
+          },
+        });
+        result.current.handleStreamEvent({
+          type: "stream_event",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          },
+        });
+      });
+
+      onUpdateMessage.mockClear();
+      onUpdateMessages.mockClear();
+
+      act(() => {
+        result.current.handleStreamEvent({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { id: "msg-1" },
+          },
+        });
+        result.current.handleStreamEvent({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "One" },
+          },
+        });
+        result.current.handleStreamEvent({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: { id: "msg-2" },
+          },
+        });
+        result.current.handleStreamEvent({
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "Two" },
+          },
+        });
+      });
+
+      expect(onUpdateMessages).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(50);
+      });
+
+      expect(onUpdateMessages).toHaveBeenCalledTimes(1);
+      expect(onUpdateMessages.mock.calls[0]?.[0]).toEqual([
+        expect.objectContaining({
+          message: expect.objectContaining({ id: "msg-1" }),
+        }),
+        expect.objectContaining({
+          message: expect.objectContaining({ id: "msg-2" }),
+        }),
+      ]);
+      expect(onUpdateMessage).not.toHaveBeenCalled();
+    });
+
     it("handles thinking deltas", () => {
       const { result } = renderHook(() =>
         useStreamingContent(defaultOptions()),

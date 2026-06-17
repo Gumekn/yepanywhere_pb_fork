@@ -232,6 +232,7 @@ export function useSession(
     session,
     setSession,
     handleStreamingUpdate,
+    handleStreamingUpdates,
     handleStreamMessageEvent,
     handleStreamSubagentMessage,
     registerToolUseAgent,
@@ -640,6 +641,7 @@ export function useSession(
     cleanup: cleanupStreaming,
   } = useStreamingContent({
     onUpdateMessage: handleStreamingUpdate,
+    onUpdateMessages: handleStreamingUpdates,
     onToolUseMapping: registerToolUseAgent,
     onAgentContextUsage: handleAgentContextUsage,
     contextWindowSize: getModelContextWindow(session?.model, session?.provider),
