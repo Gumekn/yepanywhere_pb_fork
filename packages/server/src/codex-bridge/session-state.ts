@@ -19,12 +19,16 @@ export function isLiveBridgeSession(
     "connectionIds" | "activity" | "pendingInputType"
   >,
 ): boolean {
-  return session.connectionIds.length > 0 && hasLiveBridgeActivity(session);
+  return session.connectionIds.length > 0;
 }
 
 export function isLiveBridgeSessionView(
-  view: Pick<CodexBridgeSessionView, "activity" | "pendingInputType">,
+  view: Pick<
+    CodexBridgeSessionView,
+    "session" | "activity" | "pendingInputType"
+  >,
 ): boolean {
+  if (view.session.ownership.owner === "external") return true;
   return hasLiveBridgeActivity(view);
 }
 

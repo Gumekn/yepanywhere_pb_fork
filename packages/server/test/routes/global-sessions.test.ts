@@ -745,7 +745,7 @@ describe("Global Sessions Routes", () => {
       expect(result.sessions[0].ownership).toEqual({ owner: "external" });
     });
 
-    it("does not mark idle bridged sessions as external", async () => {
+    it("marks idle bridged sessions with open connections as external", async () => {
       const project = createProject("proj1", "project", "/sessions/proj1");
       const session = createSession("sess1", "proj1", minutesAgo(5), {
         provider: "codex",
@@ -774,7 +774,7 @@ describe("Global Sessions Routes", () => {
       expect(response.status).toBe(200);
       const result = (await response.json()) as GlobalSessionsResponse;
 
-      expect(result.sessions[0].ownership).toEqual({ owner: "none" });
+      expect(result.sessions[0].ownership).toEqual({ owner: "external" });
       expect(result.sessions[0].activity).toBe("idle");
     });
 

@@ -68,7 +68,7 @@ describe("CodexBridgeHttpClient", () => {
         activity: "in-turn",
       },
       {
-        session: { id: "has-messages", ownership: { owner: "none" } },
+        session: { id: "has-messages", ownership: { owner: "external" } },
         activity: "idle",
       },
     ]);
@@ -78,7 +78,7 @@ describe("CodexBridgeHttpClient", () => {
       activity: "in-turn",
     });
     await expect(client.getSessionView("has-messages")).resolves.toMatchObject({
-      session: { id: "has-messages", ownership: { owner: "none" } },
+      session: { id: "has-messages", ownership: { owner: "external" } },
       activity: "idle",
     });
   });

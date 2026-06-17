@@ -130,7 +130,7 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
       ),
       this.getSessionView(sessionId),
     ]);
-    return Boolean(data?.active && view && isLiveBridgeSessionView(view));
+    return Boolean(data?.active && view);
   }
 
   async getPendingInputRequest(

@@ -668,7 +668,10 @@ export class CodexBridgeService implements CodexBridgeController {
         record.updatedAt = new Date().toISOString();
         this.emitSessionCreated(record);
         this.emitSessionUpdated(record);
-        this.emitSessionStatus(record, { owner: "none" });
+        this.emitSessionStatus(
+          record,
+          bridgeOwnership(this.isSessionActive(threadId)),
+        );
         this.emitProcessState(record, "idle");
         break;
       }

@@ -190,7 +190,7 @@ describe("CodexBridgeService", () => {
       );
 
       await waitFor(() => bridge.listSessions().length === 1);
-      expect(bridge.isSessionActive("empty-thread")).toBe(false);
+      expect(bridge.isSessionActive("empty-thread")).toBe(true);
       expect(bridge.listSessionViews()).toEqual([]);
       expect(bridge.getSessionView("empty-thread")).toBeNull();
       expect(
@@ -239,6 +239,19 @@ describe("CodexBridgeService", () => {
         }),
       );
 
+      await waitFor(() => {
+        const view = bridge.getSessionView("empty-thread");
+        return view?.session.messageCount === 1 && view.activity === "idle";
+      });
+      expect(bridge.getSessionView("empty-thread")).toMatchObject({
+        session: {
+          id: "empty-thread",
+          messageCount: 1,
+          ownership: { owner: "external" },
+        },
+        activity: "idle",
+      });
+      client.close();
       await waitFor(() => bridge.isSessionActive("empty-thread") === false);
       expect(bridge.getSessionView("empty-thread")).toMatchObject({
         session: {
@@ -253,7 +266,7 @@ describe("CodexBridgeService", () => {
     }
   });
 
-  it("reports idle bridge sessions with messages as unowned", async () => {
+  it("reports idle bridge sessions with open connections as external", async () => {
     const client = await connect(`ws://127.0.0.1:${bridgePort}`);
     try {
       client.send(
@@ -286,7 +299,17 @@ describe("CodexBridgeService", () => {
       );
 
       await waitFor(() => bridge.listSessionViews().length === 1);
-      expect(bridge.isSessionActive("idle-thread")).toBe(false);
+      expect(bridge.isSessionActive("idle-thread")).toBe(true);
+      expect(bridge.getSessionView("idle-thread")).toMatchObject({
+        session: {
+          id: "idle-thread",
+          messageCount: 1,
+          ownership: { owner: "external" },
+        },
+        activity: "idle",
+      });
+      client.close();
+      await waitFor(() => bridge.isSessionActive("idle-thread") === false);
       expect(bridge.getSessionView("idle-thread")).toMatchObject({
         session: {
           id: "idle-thread",
