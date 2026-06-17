@@ -1,5 +1,6 @@
+import { gzipSync } from "node:zlib";
 import type { RemoteClientMessage } from "@yep-anywhere/shared";
-import { BinaryFormat } from "@yep-anywhere/shared";
+import { BinaryFormat, encodeCompressedJsonFrame } from "@yep-anywhere/shared";
 import { describe, expect, it, vi } from "vitest";
 import { createConnectionState } from "../../src/routes/ws-handlers.js";
 import {
@@ -24,6 +25,15 @@ function createDecodeDeps() {
 }
 
 describe("WebSocket Message Router", () => {
+  it("defaults outbound connection state to binary frames", () => {
+    expect(createConnectionState().useBinaryFrames).toBe(true);
+    expect(createConnectionState().useCompressedJsonFrames).toBe(false);
+    expect(
+      createConnectionState({ useCompressedJsonFrames: true })
+        .useCompressedJsonFrames,
+    ).toBe(true);
+  });
+
   it("decodes text JSON frames", async () => {
     const connState = createConnectionState();
     const ws = createMockWs();
@@ -61,6 +71,26 @@ describe("WebSocket Message Router", () => {
 
     expect(parsed).toEqual({ type: "ping", id: "p2" });
     expect(connState.useBinaryFrames).toBe(true);
+  });
+
+  it("decodes compressed binary JSON frames", async () => {
+    const connState = createConnectionState();
+    const ws = createMockWs();
+    const deps = createDecodeDeps();
+    const compressed = gzipSync(
+      JSON.stringify({ type: "ping", id: "compressed" }),
+    );
+
+    const parsed = await decodeFrameToParsedMessage(
+      ws,
+      encodeCompressedJsonFrame(compressed),
+      { isBinary: true },
+      connState,
+      deps,
+    );
+
+    expect(parsed).toEqual({ type: "ping", id: "compressed" });
+    expect(connState.useCompressedJsonFrames).toBe(true);
   });
 
   it("closes unknown plaintext binary formats with code 4002", async () => {

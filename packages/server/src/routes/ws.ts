@@ -128,7 +128,9 @@ export function createWsRoutes(
     // Message queue to serialize async message handling
     let messageQueue: Promise<void> = Promise.resolve();
     // Per-connection state
-    const connState: ConnectionState = createConnectionState();
+    const connState: ConnectionState = createConnectionState({
+      useCompressedJsonFrames: c.req.query("compression") === "gzip",
+    });
     // Ping interval for dead connection detection (set in onOpen, cleared in onClose)
     let pingInterval: ReturnType<typeof setInterval> | null = null;
     // Send function (created on open, captures connState)

@@ -1,7 +1,9 @@
+import { gunzipSync } from "node:zlib";
 import type { RemoteClientMessage } from "@yep-anywhere/shared";
 import {
   BinaryFormat,
   BinaryFrameError,
+  decodeCompressedJsonFrame,
   isBinaryData,
 } from "@yep-anywhere/shared";
 import type { UploadManager } from "../uploads/manager.js";
@@ -63,7 +65,8 @@ export async function decodeFrameToParsedMessage(
       const format = bytes[0] as number;
       if (
         format !== BinaryFormat.JSON &&
-        format !== BinaryFormat.BINARY_UPLOAD
+        format !== BinaryFormat.BINARY_UPLOAD &&
+        format !== BinaryFormat.COMPRESSED_JSON
       ) {
         throw new BinaryFrameError(
           `Unknown format byte: 0x${format.toString(16).padStart(2, "0")}`,
@@ -76,6 +79,13 @@ export async function decodeFrameToParsedMessage(
       if (format === BinaryFormat.BINARY_UPLOAD) {
         await handleBinaryUploadChunk(uploads, payload, send, uploadManager);
         return null;
+      }
+
+      if (format === BinaryFormat.COMPRESSED_JSON) {
+        connState.useCompressedJsonFrames = true;
+        const compressedPayload = decodeCompressedJsonFrame(bytes);
+        const json = gunzipSync(compressedPayload).toString("utf-8");
+        return JSON.parse(json);
       }
 
       const decoder = new TextDecoder("utf-8", { fatal: true });

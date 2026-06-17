@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gunzipSync } from "node:zlib";
 import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import type {
@@ -20,6 +21,7 @@ import type {
 } from "@yep-anywhere/shared";
 import {
   BinaryFormat,
+  decodeCompressedJsonFrame,
   decodeJsonFrame,
   encodeJsonFrame,
   encodeUploadChunkFrame,
@@ -71,6 +73,9 @@ describe("WebSocket Transport E2E", () => {
       projectsDir: testDir,
       eventBus,
     });
+    app.get("/api/test-large-response", (c) =>
+      c.json({ text: "large response ".repeat(8192) }),
+    );
 
     // Add WebSocket support
     const { upgradeWebSocket, wss } = createNodeWebSocket({ app });
@@ -116,13 +121,44 @@ describe("WebSocket Transport E2E", () => {
   /**
    * Helper to create a WebSocket connection.
    */
-  function connectWebSocket(): Promise<WebSocket> {
+  function connectWebSocket(options?: {
+    compression?: boolean;
+  }): Promise<WebSocket> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://localhost:${serverPort}/api/ws`);
+      const query = options?.compression ? "?compression=gzip" : "";
+      const ws = new WebSocket(`ws://localhost:${serverPort}/api/ws${query}`);
       ws.on("open", () => resolve(ws));
       ws.on("error", reject);
       setTimeout(() => reject(new Error("WebSocket connection timeout")), 5000);
     });
+  }
+
+  function getRawBytes(data: WebSocket.RawData): Uint8Array | null {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (Buffer.isBuffer(data)) return data;
+    if (Array.isArray(data)) return Buffer.concat(data);
+    return null;
+  }
+
+  function isBinaryJsonFrame(data: WebSocket.RawData): boolean {
+    const bytes = getRawBytes(data);
+    return Boolean(bytes && bytes[0] === BinaryFormat.JSON);
+  }
+
+  function parseWsMessage(data: WebSocket.RawData): YepMessage {
+    const bytes = getRawBytes(data);
+    if (bytes) {
+      if (bytes[0] === BinaryFormat.JSON) {
+        return decodeJsonFrame<YepMessage>(bytes);
+      }
+      if (bytes[0] === BinaryFormat.COMPRESSED_JSON) {
+        const compressedPayload = decodeCompressedJsonFrame(bytes);
+        const json = gunzipSync(compressedPayload).toString("utf-8");
+        return JSON.parse(json) as YepMessage;
+      }
+      return JSON.parse(Buffer.from(bytes).toString("utf-8")) as YepMessage;
+    }
+    return JSON.parse(String(data)) as YepMessage;
   }
 
   /**
@@ -139,7 +175,7 @@ describe("WebSocket Transport E2E", () => {
       );
 
       const handler = (data: WebSocket.RawData) => {
-        const msg = JSON.parse(data.toString()) as YepMessage;
+        const msg = parseWsMessage(data);
         if (msg.type === "response" && msg.id === request.id) {
           clearTimeout(timeout);
           ws.off("message", handler);
@@ -170,7 +206,7 @@ describe("WebSocket Transport E2E", () => {
       }, timeoutMs);
 
       const handler = (data: WebSocket.RawData) => {
-        const msg = JSON.parse(data.toString()) as YepMessage;
+        const msg = parseWsMessage(data);
         if (msg.type === "event" && msg.subscriptionId === subscriptionId) {
           events.push(msg);
           if (events.length >= count) {
@@ -498,7 +534,7 @@ describe("WebSocket Transport E2E", () => {
         // Listen for response (error will come as a response)
         const responsePromise = new Promise<WireResponse>((resolve) => {
           const handler = (data: WebSocket.RawData) => {
-            const msg = JSON.parse(data.toString()) as YepMessage;
+            const msg = parseWsMessage(data);
             if (msg.type === "response" && msg.id === subscriptionId) {
               ws.off("message", handler);
               resolve(msg);
@@ -592,7 +628,7 @@ describe("WebSocket Transport E2E", () => {
         }, timeoutMs);
 
         const handler = (data: WebSocket.RawData) => {
-          const msg = JSON.parse(data.toString()) as YepMessage;
+          const msg = parseWsMessage(data);
           if (
             (msg.type === "upload_progress" ||
               msg.type === "upload_complete" ||
@@ -898,24 +934,8 @@ describe("WebSocket Transport E2E", () => {
         );
 
         const handler = (data: WebSocket.RawData) => {
-          // Expect binary response
-          if (!(data instanceof Buffer)) {
-            // If we get a string, the server might have fallen back to text
-            clearTimeout(timeout);
-            ws.off("message", handler);
-            try {
-              const msg = JSON.parse(data.toString()) as YepMessage;
-              if (msg.type === "response" && msg.id === request.id) {
-                resolve(msg);
-              }
-            } catch {
-              reject(new Error("Unexpected non-binary response"));
-            }
-            return;
-          }
-
           try {
-            const msg = decodeJsonFrame<YepMessage>(data);
+            const msg = parseWsMessage(data);
             if (msg.type === "response" && msg.id === request.id) {
               clearTimeout(timeout);
               ws.off("message", handler);
@@ -954,7 +974,7 @@ describe("WebSocket Transport E2E", () => {
       }
     });
 
-    it("should handle text frame fallback for backwards compat", async () => {
+    it("should handle text frame input and respond with binary by default", async () => {
       const ws = await connectWebSocket();
 
       try {
@@ -966,10 +986,73 @@ describe("WebSocket Transport E2E", () => {
         };
 
         // Send as text (JSON string)
-        const response = await sendRequest(ws, request);
+        let receivedBinary = false;
+        const response = await new Promise<WireResponse>((resolve, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("Request timeout")),
+            5000,
+          );
+
+          const handler = (data: WebSocket.RawData) => {
+            receivedBinary = isBinaryJsonFrame(data);
+            const msg = parseWsMessage(data);
+            if (msg.type === "response" && msg.id === request.id) {
+              clearTimeout(timeout);
+              ws.off("message", handler);
+              resolve(msg);
+            }
+          };
+
+          ws.on("message", handler);
+          ws.send(JSON.stringify(request));
+        });
 
         expect(response.status).toBe(200);
         expect((response.body as { status: string }).status).toBe("ok");
+        expect(receivedBinary).toBe(true);
+      } finally {
+        ws.close();
+      }
+    });
+
+    it("should compress large responses when the client advertises gzip support", async () => {
+      const ws = await connectWebSocket({ compression: true });
+
+      try {
+        const request: WireRequest = {
+          type: "request",
+          id: randomUUID(),
+          method: "GET",
+          path: "/api/test-large-response",
+        };
+
+        let receivedCompressed = false;
+        const response = await new Promise<WireResponse>((resolve, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("Request timeout")),
+            5000,
+          );
+
+          const handler = (data: WebSocket.RawData) => {
+            const bytes = getRawBytes(data);
+            receivedCompressed = bytes?.[0] === BinaryFormat.COMPRESSED_JSON;
+            const msg = parseWsMessage(data);
+            if (msg.type === "response" && msg.id === request.id) {
+              clearTimeout(timeout);
+              ws.off("message", handler);
+              resolve(msg);
+            }
+          };
+
+          ws.on("message", handler);
+          ws.send(encodeJsonFrame(request));
+        });
+
+        expect(response.status).toBe(200);
+        expect((response.body as { text: string }).text.length).toBeGreaterThan(
+          16 * 1024,
+        );
+        expect(receivedCompressed).toBe(true);
       } finally {
         ws.close();
       }
@@ -1057,31 +1140,19 @@ describe("WebSocket Transport E2E", () => {
           );
 
           const handler = (data: WebSocket.RawData) => {
-            if (data instanceof Buffer) {
-              receivedBinary = true;
-              try {
-                const msg = decodeJsonFrame<YepMessage>(data);
-                if (msg.type === "response" && msg.id === request.id) {
-                  clearTimeout(timeout);
-                  ws.off("message", handler);
-                  resolve(msg);
-                }
-              } catch (err) {
+            receivedBinary = isBinaryJsonFrame(data);
+            try {
+              const msg = parseWsMessage(data);
+              if (msg.type === "response" && msg.id === request.id) {
+                clearTimeout(timeout);
+                ws.off("message", handler);
+                resolve(msg);
+              }
+            } catch (err) {
+              if (receivedBinary) {
                 clearTimeout(timeout);
                 ws.off("message", handler);
                 reject(err);
-              }
-            } else {
-              // Text frame - still accept but note it
-              try {
-                const msg = JSON.parse(data.toString()) as YepMessage;
-                if (msg.type === "response" && msg.id === request.id) {
-                  clearTimeout(timeout);
-                  ws.off("message", handler);
-                  resolve(msg);
-                }
-              } catch {
-                // ignore
               }
             }
           };
@@ -1119,12 +1190,7 @@ describe("WebSocket Transport E2E", () => {
 
           const handler = (data: WebSocket.RawData) => {
             try {
-              let msg: YepMessage;
-              if (data instanceof Buffer) {
-                msg = decodeJsonFrame<YepMessage>(data);
-              } else {
-                msg = JSON.parse(data.toString()) as YepMessage;
-              }
+              const msg = parseWsMessage(data);
               if (
                 msg.type === "event" &&
                 msg.subscriptionId === subscriptionId
@@ -1210,11 +1276,7 @@ describe("WebSocket Transport E2E", () => {
         const handler = (data: WebSocket.RawData) => {
           let msg: YepMessage;
           try {
-            if (data instanceof Buffer) {
-              msg = decodeJsonFrame<YepMessage>(data);
-            } else {
-              msg = JSON.parse(data.toString()) as YepMessage;
-            }
+            msg = parseWsMessage(data);
           } catch {
             return; // Ignore parse errors
           }

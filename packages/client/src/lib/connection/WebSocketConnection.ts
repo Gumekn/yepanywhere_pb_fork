@@ -6,11 +6,15 @@ import type {
   YepMessage,
 } from "@yep-anywhere/shared";
 import {
+  BinaryFormat,
   BinaryFrameError,
+  decodeCompressedJsonFrame,
   decodeJsonFrame,
+  decompressToString,
   encodeJsonFrame,
   encodeUploadChunkFrame,
   isBinaryData,
+  isCompressionSupported,
 } from "@yep-anywhere/shared";
 import { getDesktopAuthToken } from "../../api/client";
 import { API_BASE } from "../apiPath";
@@ -35,6 +39,7 @@ export class WebSocketConnection implements Connection {
 
   private ws: WebSocket | null = null;
   private connectionPromise: Promise<void> | null = null;
+  private messageQueue: Promise<void> = Promise.resolve();
   private protocol: WireProtocol;
 
   constructor() {
@@ -59,12 +64,17 @@ export class WebSocketConnection implements Connection {
     // API_BASE encodes vite's BASE_URL so this works whether the server is
     // mounted at "/" or behind a reverse-proxy prefix like "/yep".
     const base = `${protocol}//${window.location.host}${API_BASE}/ws`;
+    const params = new URLSearchParams();
+    if (isCompressionSupported()) {
+      params.set("compression", "gzip");
+    }
     // Pass desktop token as query param since WebSocket can't set custom headers
     const token = getDesktopAuthToken();
     if (token) {
-      return `${base}?desktop_token=${encodeURIComponent(token)}`;
+      params.set("desktop_token", token);
     }
-    return base;
+    const query = params.toString();
+    return query ? `${base}?${query}` : base;
   }
 
   private async ensureConnected(): Promise<void> {
@@ -106,7 +116,14 @@ export class WebSocketConnection implements Connection {
       };
 
       ws.onmessage = (event) => {
-        this.handleMessage(event.data);
+        this.messageQueue = this.messageQueue
+          .then(() => this.handleMessage(event.data))
+          .catch((err) => {
+            console.warn(
+              "[WebSocketConnection] Failed to handle message:",
+              err,
+            );
+          });
       };
 
       const timeout = setTimeout(() => {
@@ -129,12 +146,25 @@ export class WebSocketConnection implements Connection {
    * Handle incoming WebSocket messages.
    * Supports both text frames (JSON) and binary frames (format byte + payload).
    */
-  private handleMessage(data: unknown): void {
+  private async handleMessage(data: unknown): Promise<void> {
     let msg: YepMessage;
 
     if (isBinaryData(data)) {
       try {
-        msg = decodeJsonFrame<YepMessage>(data);
+        const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+        if (bytes[0] === BinaryFormat.COMPRESSED_JSON) {
+          const compressedPayload = decodeCompressedJsonFrame(bytes);
+          const json = await decompressToString(compressedPayload);
+          if (json === null) {
+            console.warn(
+              "[WebSocketConnection] Cannot decode compressed frame: compression API unavailable",
+            );
+            return;
+          }
+          msg = JSON.parse(json) as YepMessage;
+        } else {
+          msg = decodeJsonFrame<YepMessage>(bytes);
+        }
       } catch (err) {
         if (err instanceof BinaryFrameError) {
           console.warn(

@@ -6,6 +6,7 @@
  * the connection is trusted at the HTTP-upgrade layer (cookie/local policy).
  */
 
+import { gzipSync } from "node:zlib";
 import type { HttpBindings } from "@hono/node-server";
 import type {
   RemoteClientMessage,
@@ -19,9 +20,10 @@ import type {
   YepMessage,
 } from "@yep-anywhere/shared";
 import {
+  BinaryFormat,
   UploadChunkError,
   decodeUploadChunkPayload,
-  encodeJsonFrame,
+  encodeCompressedJsonFrame,
 } from "@yep-anywhere/shared";
 import type { Hono } from "hono";
 import type { DeviceBridgeService } from "../device/DeviceBridgeService.js";
@@ -46,11 +48,16 @@ import {
 
 /** Progress report interval in bytes (64KB) */
 export const PROGRESS_INTERVAL = 64 * 1024;
+export const WS_JSON_COMPRESSION_THRESHOLD_BYTES = 16 * 1024;
+
+const textEncoder = new TextEncoder();
 
 /** Per-connection state for the WebSocket connection. */
 export interface ConnectionState {
-  /** Whether client sent binary frames (respond with binary if true) */
+  /** Whether outbound JSON messages should use binary frames. */
   useBinaryFrames: boolean;
+  /** Whether the peer advertised support for compressed JSON frames. */
+  useCompressedJsonFrames: boolean;
 }
 
 /** Tracks an active upload over the WebSocket */
@@ -121,9 +128,12 @@ export interface WsHandlerDeps {
 /**
  * Create an initial connection state.
  */
-export function createConnectionState(): ConnectionState {
+export function createConnectionState(options?: {
+  useCompressedJsonFrames?: boolean;
+}): ConnectionState {
   return {
-    useBinaryFrames: false,
+    useBinaryFrames: true,
+    useCompressedJsonFrames: options?.useCompressedJsonFrames ?? false,
   };
 }
 
@@ -133,7 +143,7 @@ export function cleanupConnectionState(_connState: ConnectionState): void {
 
 /**
  * Create a send function for a connection.
- * Uses binary frames when the client has sent binary frames; otherwise text.
+ * Uses binary JSON frames by default while preserving text-frame input support.
  */
 export function createSendFn(
   ws: WSAdapter,
@@ -142,10 +152,8 @@ export function createSendFn(
   return (msg: YepMessage) => {
     try {
       if (connState.useBinaryFrames) {
-        // Client sent binary frames, respond with binary
-        ws.send(encodeJsonFrame(msg));
+        ws.send(encodeJsonMessageFrame(msg, connState.useCompressedJsonFrames));
       } else {
-        // Text frame
         ws.send(JSON.stringify(msg));
       }
     } catch (err) {
@@ -157,6 +165,33 @@ export function createSendFn(
       }
     }
   };
+}
+
+function encodeJsonMessageFrame(
+  msg: YepMessage,
+  allowCompression: boolean,
+): ArrayBuffer {
+  const jsonBytes = textEncoder.encode(JSON.stringify(msg));
+
+  if (
+    allowCompression &&
+    jsonBytes.length >= WS_JSON_COMPRESSION_THRESHOLD_BYTES
+  ) {
+    try {
+      const compressed = gzipSync(jsonBytes);
+      if (compressed.length < jsonBytes.length) {
+        return encodeCompressedJsonFrame(compressed);
+      }
+    } catch (err) {
+      console.warn("[WS] Failed to compress JSON frame:", err);
+    }
+  }
+
+  const buffer = new ArrayBuffer(1 + jsonBytes.length);
+  const view = new Uint8Array(buffer);
+  view[0] = BinaryFormat.JSON;
+  view.set(jsonBytes, 1);
+  return buffer;
 }
 
 /**
