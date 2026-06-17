@@ -63,13 +63,23 @@ describe("CodexBridgeHttpClient", () => {
     const client = new CodexBridgeHttpClient({ baseUrl });
 
     await expect(client.listSessionViews()).resolves.toMatchObject([
-      { session: { id: "active-empty" }, activity: "in-turn" },
-      { session: { id: "has-messages" }, activity: "idle" },
+      {
+        session: { id: "active-empty", ownership: { owner: "external" } },
+        activity: "in-turn",
+      },
+      {
+        session: { id: "has-messages", ownership: { owner: "none" } },
+        activity: "idle",
+      },
     ]);
     await expect(client.getSessionView("empty-idle")).resolves.toBeNull();
     await expect(client.getSessionView("active-empty")).resolves.toMatchObject({
-      session: { id: "active-empty" },
+      session: { id: "active-empty", ownership: { owner: "external" } },
       activity: "in-turn",
+    });
+    await expect(client.getSessionView("has-messages")).resolves.toMatchObject({
+      session: { id: "has-messages", ownership: { owner: "none" } },
+      activity: "idle",
     });
   });
 });

@@ -190,6 +190,7 @@ describe("CodexBridgeService", () => {
       );
 
       await waitFor(() => bridge.listSessions().length === 1);
+      expect(bridge.isSessionActive("empty-thread")).toBe(false);
       expect(bridge.listSessionViews()).toEqual([]);
       expect(bridge.getSessionView("empty-thread")).toBeNull();
       expect(
@@ -211,6 +212,7 @@ describe("CodexBridgeService", () => {
       );
 
       await waitFor(() => bridge.listSessionViews().length === 1);
+      expect(bridge.isSessionActive("empty-thread")).toBe(true);
       expect(bridge.getSessionView("empty-thread")).toMatchObject({
         session: {
           id: "empty-thread",
@@ -228,6 +230,71 @@ describe("CodexBridgeService", () => {
               "empty-thread",
         ),
       ).toBe(true);
+
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "turn/completed",
+          params: { threadId: "empty-thread" },
+        }),
+      );
+
+      await waitFor(() => bridge.isSessionActive("empty-thread") === false);
+      expect(bridge.getSessionView("empty-thread")).toMatchObject({
+        session: {
+          id: "empty-thread",
+          messageCount: 1,
+          ownership: { owner: "none" },
+        },
+        activity: "idle",
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  it("reports idle bridge sessions with messages as unowned", async () => {
+    const client = await connect(`ws://127.0.0.1:${bridgePort}`);
+    try {
+      client.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "thread/read",
+          params: { threadId: "idle-thread" },
+        }),
+      );
+      await waitFor(() => upstreamMessages.length === 1);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            model: "gpt-5.3-codex",
+            cwd: "/tmp/project-idle",
+            thread: {
+              id: "idle-thread",
+              preview: "Idle but has history",
+              createdAt: 1_780_000_000,
+              updatedAt: 1_780_000_001,
+              cwd: "/tmp/project-idle",
+              status: { type: "idle" },
+              turns: [{}],
+            },
+          },
+        }),
+      );
+
+      await waitFor(() => bridge.listSessionViews().length === 1);
+      expect(bridge.isSessionActive("idle-thread")).toBe(false);
+      expect(bridge.getSessionView("idle-thread")).toMatchObject({
+        session: {
+          id: "idle-thread",
+          messageCount: 1,
+          ownership: { owner: "none" },
+        },
+        activity: "idle",
+      });
     } finally {
       client.close();
     }

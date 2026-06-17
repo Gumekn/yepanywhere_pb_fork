@@ -11,6 +11,7 @@ import {
   getSessionDisplayTitle,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
 import type { SessionIndexService } from "../indexes/index.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
@@ -382,9 +383,11 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           ? ((await deps.codexBridgeService?.isSessionActive(session.id)) ??
             false)
           : false;
+        const isBridgeSessionLive =
+          bridgedSession !== null && isLiveBridgeSessionView(bridgedSession);
         const isExternal =
           (deps.externalTracker?.isExternal(session.id) ?? false) ||
-          isBridgeSessionActive;
+          (isBridgeSessionLive && isBridgeSessionActive);
 
         const ownership: SessionOwnership = process
           ? {

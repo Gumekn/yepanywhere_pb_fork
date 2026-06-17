@@ -1,6 +1,11 @@
 import type { AgentActivity, PendingInputType } from "@yep-anywhere/shared";
 import type { SessionSummary } from "../supervisor/types.js";
 import type { EventBus } from "../watcher/index.js";
+import {
+  bridgeOwnership,
+  isLiveBridgeSession,
+  isLiveBridgeSessionView,
+} from "./session-state.js";
 import type {
   CodexBridgeController,
   CodexBridgeInputResponse,
@@ -89,12 +94,14 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
     const data = await this.fetchJson<{ sessions?: CodexBridgeSessionView[] }>(
       "/session-views",
     );
-    return (data?.sessions ?? []).filter((view) =>
-      this.isDisplayableBridgeSession(view.session, {
-        activity: view.activity,
-        pendingInputType: view.pendingInputType,
-      }),
-    );
+    return (data?.sessions ?? [])
+      .filter((view) =>
+        this.isDisplayableBridgeSession(view.session, {
+          activity: view.activity,
+          pendingInputType: view.pendingInputType,
+        }),
+      )
+      .map((view) => this.normalizeSessionView(view));
   }
 
   async getSessionView(
@@ -113,14 +120,17 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
     ) {
       return null;
     }
-    return view;
+    return view ? this.normalizeSessionView(view) : null;
   }
 
   async isSessionActive(sessionId: string): Promise<boolean> {
-    const data = await this.fetchJson<{ active?: boolean }>(
-      `/sessions/${encodeURIComponent(sessionId)}/active`,
-    );
-    return data?.active ?? false;
+    const [data, view] = await Promise.all([
+      this.fetchJson<{ active?: boolean }>(
+        `/sessions/${encodeURIComponent(sessionId)}/active`,
+      ),
+      this.getSessionView(sessionId),
+    ]);
+    return Boolean(data?.active && view && isLiveBridgeSessionView(view));
   }
 
   async getPendingInputRequest(
@@ -208,7 +218,7 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
   ): void {
     if (!this.eventBus) return;
 
-    const active = session.connectionIds.length > 0;
+    const active = isLiveBridgeSession(session);
     const previous = this.knownSessions.get(session.id);
     const next: SessionPollState = {
       projectId: session.projectId,
@@ -295,5 +305,17 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
       !!state?.pendingInputType ||
       !!session.pendingInputType
     );
+  }
+
+  private normalizeSessionView(
+    view: CodexBridgeSessionView,
+  ): CodexBridgeSessionView {
+    return {
+      ...view,
+      session: {
+        ...view.session,
+        ownership: bridgeOwnership(isLiveBridgeSessionView(view)),
+      },
+    };
   }
 }

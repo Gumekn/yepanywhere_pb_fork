@@ -15,6 +15,7 @@ import {
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
 import { augmentTextBlocks } from "../augments/markdown-augments.js";
+import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
 import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/index.js";
@@ -476,11 +477,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     const isBridgeSessionActive = bridgedSession
       ? ((await deps.codexBridgeService?.isSessionActive(sessionId)) ?? false)
       : false;
+    const isBridgeSessionLive =
+      bridgedSession !== null && isLiveBridgeSessionView(bridgedSession);
 
     // Check if session is being controlled by an external program
     const isExternal =
       (deps.externalTracker?.isExternal(sessionId) ?? false) ||
-      (bridgedSession !== null && isBridgeSessionActive);
+      (isBridgeSessionLive && isBridgeSessionActive);
 
     // Determine the session ownership
     const ownership = process
@@ -803,11 +806,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     const isBridgeSessionActive = bridgedSession
       ? ((await deps.codexBridgeService?.isSessionActive(sessionId)) ?? false)
       : false;
+    const isBridgeSessionLive =
+      bridgedSession !== null && isLiveBridgeSessionView(bridgedSession);
 
     // Check if session is being controlled by an external program
     const isExternal =
       (deps.externalTracker?.isExternal(sessionId) ?? false) ||
-      (bridgedSession !== null && isBridgeSessionActive);
+      (isBridgeSessionLive && isBridgeSessionActive);
 
     // Check if we've ever owned this session (for orphan detection)
     // Only mark tools as "aborted" if we owned the session and know it terminated

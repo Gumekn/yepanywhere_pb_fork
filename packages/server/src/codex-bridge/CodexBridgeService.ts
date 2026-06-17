@@ -8,6 +8,7 @@ import { encodeProjectId } from "../projects/paths.js";
 import { findCodexCliPath } from "../sdk/cli-detection.js";
 import type { SessionSummary } from "../supervisor/types.js";
 import type { EventBus } from "../watcher/index.js";
+import { bridgeOwnership, isLiveBridgeSession } from "./session-state.js";
 import type {
   CodexBridgeController,
   CodexBridgeInputResponse,
@@ -253,7 +254,7 @@ export class CodexBridgeService implements CodexBridgeController {
 
   isSessionActive(sessionId: string): boolean {
     const record = this.sessions.get(sessionId);
-    return !!record && record.connectionIds.size > 0;
+    return !!record && isLiveBridgeSession(this.toBridgeSession(record));
   }
 
   getPendingInputRequest(
@@ -623,6 +624,10 @@ export class CodexBridgeService implements CodexBridgeController {
           record.pendingInputType = undefined;
         }
         record.updatedAt = new Date().toISOString();
+        this.emitSessionStatus(
+          record,
+          bridgeOwnership(this.isSessionActive(threadId)),
+        );
         this.emitProcessState(record, activity, record.pendingInputType);
         break;
       }
@@ -648,6 +653,7 @@ export class CodexBridgeService implements CodexBridgeController {
         record.activity = "in-turn";
         record.updatedAt = new Date().toISOString();
         this.emitSessionCreated(record);
+        this.emitSessionStatus(record, { owner: "external" });
         this.emitProcessState(record, "in-turn");
         break;
       }
@@ -657,9 +663,13 @@ export class CodexBridgeService implements CodexBridgeController {
         const record = this.sessions.get(threadId);
         if (!record) break;
         record.messageCount += 1;
+        record.activity = "idle";
+        record.pendingInputType = undefined;
         record.updatedAt = new Date().toISOString();
         this.emitSessionCreated(record);
         this.emitSessionUpdated(record);
+        this.emitSessionStatus(record, { owner: "none" });
+        this.emitProcessState(record, "idle");
         break;
       }
       case "serverRequest/resolved": {
@@ -733,6 +743,7 @@ export class CodexBridgeService implements CodexBridgeController {
     record.pendingInputType = pendingInputType;
     record.updatedAt = createdAt;
     this.emitSessionCreated(record);
+    this.emitSessionStatus(record, { owner: "external" });
     this.emitProcessState(record, "waiting-input", pendingInputType);
   }
 
@@ -1106,7 +1117,7 @@ export class CodexBridgeService implements CodexBridgeController {
     }
 
     this.emitSessionCreated(record);
-    this.emitSessionStatus(record, { owner: "external" });
+    this.emitSessionStatus(record, bridgeOwnership(this.isSessionActive(id)));
     if (record.activity) {
       this.emitProcessState(record, record.activity, record.pendingInputType);
     }
@@ -1283,10 +1294,7 @@ export class CodexBridgeService implements CodexBridgeController {
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       messageCount: session.messageCount,
-      ownership:
-        session.connectionIds.length > 0
-          ? { owner: "external" as const }
-          : { owner: "none" as const },
+      ownership: bridgeOwnership(isLiveBridgeSession(session)),
       pendingInputType: session.pendingInputType,
       provider: "codex",
       model: session.model,

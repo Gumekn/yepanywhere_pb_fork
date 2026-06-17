@@ -1,5 +1,6 @@
 import type { UrlProjectId } from "@yep-anywhere/shared";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { CodexBridgeController } from "../../src/codex-bridge/types.js";
 import type { SessionIndexService } from "../../src/indexes/index.js";
 import type { SessionMetadataService } from "../../src/metadata/SessionMetadataService.js";
 import type { NotificationService } from "../../src/notifications/index.js";
@@ -742,6 +743,39 @@ describe("Global Sessions Routes", () => {
       const result = await makeRequest();
 
       expect(result.sessions[0].ownership).toEqual({ owner: "external" });
+    });
+
+    it("does not mark idle bridged sessions as external", async () => {
+      const project = createProject("proj1", "project", "/sessions/proj1");
+      const session = createSession("sess1", "proj1", minutesAgo(5), {
+        provider: "codex",
+      });
+      const codexBridgeService = {
+        listSessionViews: vi.fn(async () => []),
+        getSessionView: vi.fn(async () => ({
+          session: {
+            ...session,
+            ownership: { owner: "external" },
+            source: "codex-bridge",
+          },
+          projectName: "project",
+          activity: "idle",
+        })),
+        isSessionActive: vi.fn(async () => true),
+      } as unknown as CodexBridgeController;
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+
+      const routes = createGlobalSessionsRoutes(
+        getDeps({ codexBridgeService }),
+      );
+      const response = await routes.request("/");
+      expect(response.status).toBe(200);
+      const result = (await response.json()) as GlobalSessionsResponse;
+
+      expect(result.sessions[0].ownership).toEqual({ owner: "none" });
+      expect(result.sessions[0].activity).toBe("idle");
     });
 
     it("enriches with pendingInputType", async () => {
