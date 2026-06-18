@@ -28,6 +28,27 @@ describe("getMessageId", () => {
     const msg: Message = { id: "temp-1234567890" };
     expect(getMessageId(msg)).toBe("temp-1234567890");
   });
+
+  it("assigns a stable fallback when uuid and id are missing", () => {
+    const msg: Message = { content: "malformed" };
+    const first = getMessageId(msg);
+
+    expect(first).toMatch(/^missing-message-id-\d+$/);
+    expect(getMessageId(msg)).toBe(first);
+  });
+
+  it("assigns unique fallbacks for distinct messages with missing ids", () => {
+    const first: Message = { content: "first" };
+    const second: Message = { content: "second" };
+
+    expect(getMessageId(first)).not.toBe(getMessageId(second));
+  });
+
+  it("treats empty string identifiers as missing", () => {
+    const msg: Message = { id: "", uuid: "" };
+
+    expect(getMessageId(msg)).toMatch(/^missing-message-id-\d+$/);
+  });
 });
 
 describe("getMessageContent", () => {
@@ -106,6 +127,23 @@ describe("mergeMessage", () => {
 
 describe("mergeJSONLMessages", () => {
   describe("merging by ID", () => {
+    it("does not collapse distinct messages that both lack ids", () => {
+      const incoming: Message[] = [
+        { content: "first malformed message" },
+        { content: "second malformed message" },
+      ];
+
+      const result = mergeJSONLMessages([], incoming, {
+        skipDagOrdering: true,
+      });
+
+      expect(result.messages).toHaveLength(2);
+      expect(result.messages.map((m) => m.content)).toEqual([
+        "first malformed message",
+        "second malformed message",
+      ]);
+    });
+
     it("merges existing message by ID", () => {
       const existing: Message[] = [
         {

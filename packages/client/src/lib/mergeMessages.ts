@@ -3,10 +3,27 @@ import type { Message } from "../types";
 
 /**
  * Get the message ID, preferring uuid over id.
- * Messages should always have at least one identifier; returns empty string as fallback.
+ * Messages should always have at least one identifier; assigns an object-local
+ * fallback for malformed messages so missing IDs do not collapse together.
  */
+const missingMessageIds = new WeakMap<Message, string>();
+let nextMissingMessageId = 0;
+
 export function getMessageId(m: Message): string {
-  return m.uuid ?? m.id ?? "";
+  if (typeof m.uuid === "string" && m.uuid.length > 0) {
+    return m.uuid;
+  }
+  if (typeof m.id === "string" && m.id.length > 0) {
+    return m.id;
+  }
+
+  let fallback = missingMessageIds.get(m);
+  if (!fallback) {
+    nextMissingMessageId += 1;
+    fallback = `missing-message-id-${nextMissingMessageId}`;
+    missingMessageIds.set(m, fallback);
+  }
+  return fallback;
 }
 
 /**
