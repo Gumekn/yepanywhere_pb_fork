@@ -485,6 +485,7 @@ export class WireProtocol {
     sessionId: string,
     handlers: StreamHandlers,
     lastEventId?: string,
+    lastMessageId?: string,
   ): Subscription {
     const subscriptionId = generateId();
 
@@ -499,6 +500,7 @@ export class WireProtocol {
           channel: "session",
           sessionId,
           lastEventId,
+          lastMessageId,
         };
         this.transport.sendMessage(msg);
       })

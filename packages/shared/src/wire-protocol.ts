@@ -88,6 +88,8 @@ export interface WireSubscribe {
   provider?: string;
   /** Last event ID for resumption */
   lastEventId?: string;
+  /** Last replayable session message ID received by the client */
+  lastMessageId?: string;
   /** Browser profile identifier for connection tracking (stored in localStorage, shared across tabs) */
   browserProfileId?: string;
   /** Origin metadata for connection tracking */

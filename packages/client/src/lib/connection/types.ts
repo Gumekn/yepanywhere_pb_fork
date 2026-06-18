@@ -147,12 +147,14 @@ export interface Connection {
    * @param sessionId - Session to subscribe to
    * @param handlers - Event callbacks
    * @param lastEventId - Resume from this event ID (optional)
+   * @param lastMessageId - Replay only session messages after this message ID (optional)
    * @returns Subscription handle with close() method
    */
   subscribeSession(
     sessionId: string,
     handlers: StreamHandlers,
     lastEventId?: string,
+    lastMessageId?: string,
   ): Subscription;
 
   /**

@@ -154,6 +154,50 @@ describe("createSessionSubscription", () => {
     ).toBe(true);
   });
 
+  it("replays only message history after replayAfterMessageId", () => {
+    const messages = [
+      { type: "user", uuid: "msg-1", message: { content: "One" } },
+      { type: "assistant", uuid: "msg-2", message: { content: "Two" } },
+      { type: "user", id: "msg-3", message: { content: "Three" } },
+    ];
+    const { process } = createMockProcess({
+      getMessageHistory: vi.fn(() => messages),
+    });
+    const { emit, events } = collectEmit();
+
+    createSessionSubscription(process, emit, {
+      replayAfterMessageId: "msg-2",
+    });
+
+    const messageEvents = events.filter(([type]) => type === "message");
+    expect(messageEvents).toHaveLength(1);
+    expect(messageEvents[0]?.[1]).toMatchObject({
+      id: "msg-3",
+      isReplay: true,
+    });
+  });
+
+  it("falls back to full replay when replayAfterMessageId is not in history", () => {
+    const messages = [
+      { type: "user", uuid: "msg-1", message: { content: "One" } },
+      { type: "assistant", uuid: "msg-2", message: { content: "Two" } },
+    ];
+    const { process } = createMockProcess({
+      getMessageHistory: vi.fn(() => messages),
+    });
+    const { emit, events } = collectEmit();
+
+    createSessionSubscription(process, emit, {
+      replayAfterMessageId: "missing",
+    });
+
+    const messageEvents = events.filter(([type]) => type === "message");
+    expect(messageEvents).toHaveLength(2);
+    expect(
+      messageEvents.map(([, data]) => (data as { uuid?: string }).uuid),
+    ).toEqual(["msg-1", "msg-2"]);
+  });
+
   it("forwards state-change events", async () => {
     const { process, fireEvent } = createMockProcess();
     const { emit, events } = collectEmit();

@@ -8,6 +8,7 @@ import { api } from "../api/client";
 import { getMessageId } from "../lib/mergeMessages";
 import { findPendingTasks } from "../lib/pendingTasks";
 import { extractSessionIdFromFileEvent } from "../lib/sessionFile";
+import { generateUUID } from "../lib/uuid";
 import type {
   InputRequest,
   Message,
@@ -312,7 +313,7 @@ export function useSession(
   // Add a message to the pending queue
   // Generates a tempId that will be sent to the server and echoed back in stream
   const addPendingMessage = useCallback((content: string): string => {
-    const tempId = `temp-${Date.now()}`;
+    const tempId = `temp-${generateUUID()}`;
     setPendingMessages((prev) => [
       ...prev,
       { tempId, content, timestamp: new Date().toISOString() },
@@ -655,6 +656,40 @@ export function useSession(
     };
   }, [cleanupStreaming]);
 
+  const clearStreamingPlaceholders = useCallback(
+    (options?: { agentId?: string; allAgents?: boolean; main?: boolean }) => {
+      clearStreaming();
+
+      const shouldClearMain = options?.main ?? !options?.agentId;
+      if (shouldClearMain) {
+        setMessages((prev) => {
+          const filtered = prev.filter((m) => !m._isStreaming);
+          return filtered.length === prev.length ? prev : filtered;
+        });
+      }
+
+      const agentId = options?.agentId;
+      if (!options?.allAgents && !agentId) return;
+
+      setAgentContent((prev) => {
+        let next: AgentContentMap | null = null;
+
+        for (const [currentAgentId, existing] of Object.entries(prev)) {
+          if (agentId && currentAgentId !== agentId) continue;
+
+          const filtered = existing.messages.filter((m) => !m._isStreaming);
+          if (filtered.length === existing.messages.length) continue;
+
+          if (!next) next = { ...prev };
+          next[currentAgentId] = { ...existing, messages: filtered };
+        }
+
+        return next ?? prev;
+      });
+    },
+    [clearStreaming, setAgentContent, setMessages],
+  );
+
   // Subscribe to live updates
   const handleStreamMessage = useCallback(
     (data: { eventType: string; [key: string]: unknown }) => {
@@ -674,9 +709,11 @@ export function useSession(
         const rawUuid = sdkMessage.uuid;
         const rawId = sdkMessage.id;
         const id: string =
-          (typeof rawUuid === "string" ? rawUuid : null) ??
-          (typeof rawId === "string" ? rawId : null) ??
-          `msg-${Date.now()}`;
+          (typeof rawUuid === "string" && rawUuid.length > 0
+            ? rawUuid
+            : null) ??
+          (typeof rawId === "string" && rawId.length > 0 ? rawId : null) ??
+          `msg-${generateUUID()}`;
 
         // Extract type and role
         const msgType =
@@ -691,7 +728,7 @@ export function useSession(
           }
         }
 
-        // For assistant messages, clear streaming state and remove ALL streaming placeholders
+        // For assistant messages, clear the matching streaming placeholder.
         if (msgType === "assistant") {
           // Check if this is a subagent message
           // Use parentToolUseId as the routing key (it's the Task tool_use id)
@@ -702,24 +739,12 @@ export function useSession(
             ? (sdkMessage.parentToolUseId as string)
             : undefined;
 
-          // Clear streaming state via hook
-          clearStreaming();
-
           if (msgAgentId) {
-            // Remove streaming placeholders from this agent's content
-            setAgentContent((prev) => {
-              const existing = prev[msgAgentId];
-              if (!existing) return prev;
-              const filtered = existing.messages.filter((m) => !m._isStreaming);
-              if (filtered.length === existing.messages.length) return prev;
-              return {
-                ...prev,
-                [msgAgentId]: { ...existing, messages: filtered },
-              };
-            });
+            // Remove streaming placeholders from this agent's content.
+            clearStreamingPlaceholders({ agentId: msgAgentId });
           } else {
-            // Remove ALL streaming placeholder messages from main messages
-            setMessages((prev) => prev.filter((m) => !m._isStreaming));
+            // Remove streaming placeholder messages from main messages.
+            clearStreamingPlaceholders();
           }
         }
 
@@ -843,10 +868,13 @@ export function useSession(
         };
         setDeferredMessages(deferredData.messages ?? []);
       } else if (data.eventType === "complete") {
+        clearStreamingPlaceholders({ main: true, allAgents: true });
         setProcessState("idle");
         setStatus({ owner: "none" });
         setPendingInputRequest(null);
         setDeferredMessages([]);
+      } else if (data.eventType === "error") {
+        clearStreamingPlaceholders({ main: true, allAgents: true });
       } else if (data.eventType === "connected") {
         // Sync state and permission mode from connected event
         const connectedData = data as {
@@ -1018,14 +1046,12 @@ export function useSession(
       applyServerModeUpdate,
       sessionId,
       handleStreamEvent,
-      clearStreaming,
+      clearStreamingPlaceholders,
       removePendingMessage,
       streamingMarkdownCallbacks,
       handleStreamMessageEvent,
       handleStreamSubagentMessage,
       registerToolUseAgent,
-      setAgentContent,
-      setMessages,
       setSession,
       fetchNewMessages,
       session?.provider,

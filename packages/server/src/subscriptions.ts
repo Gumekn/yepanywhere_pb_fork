@@ -22,11 +22,53 @@ import type { BusEvent, EventBus } from "./watcher/index.js";
 
 export type Emit = (eventType: string, data: unknown) => void;
 
+type ReplayHistoryMessage = Record<string, unknown> & {
+  parent_tool_use_id?: string | null;
+  agentId?: string | null;
+  isSidechain?: boolean;
+  isReplay?: boolean;
+};
+
 export interface SubscriptionOptions {
   /** Called when an internal error occurs (e.g. augmentation failure). */
   onError?: (err: unknown) => void;
   /** Optional label for debug logs (e.g., subscription id). */
   logLabel?: string;
+  /** Replay only buffered session messages after this message ID. */
+  replayAfterMessageId?: string;
+}
+
+function getReplayMessageId(message: Record<string, unknown>): string | null {
+  const uuid = message.uuid;
+  if (typeof uuid === "string" && uuid.length > 0) {
+    return uuid;
+  }
+
+  const id = message.id;
+  if (typeof id === "string" && id.length > 0) {
+    return id;
+  }
+
+  return null;
+}
+
+function getReplayMessages(
+  history: ReplayHistoryMessage[],
+  replayAfterMessageId?: string,
+): ReplayHistoryMessage[] {
+  if (!replayAfterMessageId) {
+    return history;
+  }
+
+  let cursorIndex = -1;
+  for (let index = 0; index < history.length; index += 1) {
+    const message = history[index];
+    if (message && getReplayMessageId(message) === replayAfterMessageId) {
+      cursorIndex = index;
+    }
+  }
+
+  return cursorIndex >= 0 ? history.slice(cursorIndex + 1) : history;
 }
 
 /**
@@ -200,7 +242,10 @@ export function createSessionSubscription(
   });
 
   // Replay buffered messages for late-joining clients
-  for (const message of process.getMessageHistory()) {
+  for (const message of getReplayMessages(
+    process.getMessageHistory() as ReplayHistoryMessage[],
+    options?.replayAfterMessageId,
+  )) {
     emit(
       "message",
       markSubagent({

@@ -12,6 +12,32 @@ interface UseSessionStreamOptions {
   onOpen?: () => void;
 }
 
+function getReplayCursorMessageId(
+  eventType: string,
+  data: unknown,
+): string | null {
+  if (eventType !== "message" || !data || typeof data !== "object") {
+    return null;
+  }
+
+  const message = data as Record<string, unknown>;
+  if (message.type === "stream_event") {
+    return null;
+  }
+
+  const uuid = message.uuid;
+  if (typeof uuid === "string" && uuid.length > 0) {
+    return uuid;
+  }
+
+  const id = message.id;
+  if (typeof id === "string" && id.length > 0) {
+    return id;
+  }
+
+  return null;
+}
+
 export function useSessionStream(
   sessionId: string | null,
   options: UseSessionStreamOptions,
@@ -19,6 +45,8 @@ export function useSessionStream(
   const [connected, setConnected] = useState(false);
   const wsSubscriptionRef = useRef<Subscription | null>(null);
   const lastEventIdRef = useRef<string | null>(null);
+  const lastMessageIdRef = useRef<string | null>(null);
+  const cursorSessionIdRef = useRef<string | null>(null);
   const optionsRef = useRef(options);
   optionsRef.current = options;
   // Track connected sessionId to skip StrictMode double-mount (not reset in cleanup)
@@ -31,7 +59,16 @@ export function useSessionStream(
       // Reset tracking when sessionId becomes null so we can reconnect later
       // (e.g., when status goes idle → owned again for the same session)
       mountedSessionIdRef.current = null;
+      cursorSessionIdRef.current = null;
+      lastEventIdRef.current = null;
+      lastMessageIdRef.current = null;
       return;
+    }
+
+    if (cursorSessionIdRef.current !== sessionId) {
+      cursorSessionIdRef.current = sessionId;
+      lastEventIdRef.current = null;
+      lastMessageIdRef.current = null;
     }
 
     // Don't create duplicate connections
@@ -64,6 +101,7 @@ export function useSessionStream(
             onClose?: () => void;
           },
           lastEventId?: string,
+          lastMessageId?: string,
         ) => Subscription;
       },
     ) => {
@@ -96,6 +134,13 @@ export function useSessionStream(
           }
           if (eventId) {
             lastEventIdRef.current = eventId;
+          }
+          const replayCursorMessageId = getReplayCursorMessageId(
+            eventType,
+            data,
+          );
+          if (replayCursorMessageId) {
+            lastMessageIdRef.current = replayCursorMessageId;
           }
           optionsRef.current.onMessage({
             ...(data as Record<string, unknown>),
@@ -138,6 +183,7 @@ export function useSessionStream(
         sessionId,
         handlers,
         lastEventIdRef.current ?? undefined,
+        lastMessageIdRef.current ?? undefined,
       );
       wsSubscriptionRef.current = sub;
     },

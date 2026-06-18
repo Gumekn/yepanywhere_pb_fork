@@ -79,6 +79,7 @@ export class DirectConnection implements Connection {
     _sessionId: string,
     _handlers: StreamHandlers,
     _lastEventId?: string,
+    _lastMessageId?: string,
   ): Subscription {
     throw new Error("Use WebSocket subscriptions");
   }

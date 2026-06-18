@@ -213,8 +213,14 @@ export class WebSocketConnection implements Connection {
     sessionId: string,
     handlers: StreamHandlers,
     lastEventId?: string,
+    lastMessageId?: string,
   ): Subscription {
-    return this.protocol.subscribeSession(sessionId, handlers, lastEventId);
+    return this.protocol.subscribeSession(
+      sessionId,
+      handlers,
+      lastEventId,
+      lastMessageId,
+    );
   }
 
   subscribeActivity(handlers: StreamHandlers): Subscription {

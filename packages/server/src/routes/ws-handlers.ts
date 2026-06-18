@@ -6,7 +6,8 @@
  * the connection is trusted at the HTTP-upgrade layer (cookie/local policy).
  */
 
-import { gzipSync } from "node:zlib";
+import { promisify } from "node:util";
+import { gzip } from "node:zlib";
 import type { HttpBindings } from "@hono/node-server";
 import type {
   RemoteClientMessage,
@@ -51,6 +52,7 @@ export const PROGRESS_INTERVAL = 64 * 1024;
 export const WS_JSON_COMPRESSION_THRESHOLD_BYTES = 16 * 1024;
 
 const textEncoder = new TextEncoder();
+const gzipAsync = promisify(gzip);
 
 /** Per-connection state for the WebSocket connection. */
 export interface ConnectionState {
@@ -149,14 +151,22 @@ export function createSendFn(
   ws: WSAdapter,
   connState: ConnectionState,
 ): SendFn {
-  return (msg: YepMessage) => {
+  let sendQueue = Promise.resolve();
+  let sendFailed = false;
+
+  const sendOne = async (msg: YepMessage): Promise<void> => {
+    if (sendFailed) return;
+
     try {
       if (connState.useBinaryFrames) {
-        ws.send(encodeJsonMessageFrame(msg, connState.useCompressedJsonFrames));
+        ws.send(
+          await encodeJsonMessageFrame(msg, connState.useCompressedJsonFrames),
+        );
       } else {
         ws.send(JSON.stringify(msg));
       }
     } catch (err) {
+      sendFailed = true;
       console.warn("[WS] Failed to send message, closing socket:", err);
       try {
         ws.close(1011, "Send failed");
@@ -165,12 +175,19 @@ export function createSendFn(
       }
     }
   };
+
+  return (msg: YepMessage) => {
+    sendQueue = sendQueue.then(
+      () => sendOne(msg),
+      () => sendOne(msg),
+    );
+  };
 }
 
-function encodeJsonMessageFrame(
+async function encodeJsonMessageFrame(
   msg: YepMessage,
   allowCompression: boolean,
-): ArrayBuffer {
+): Promise<ArrayBuffer> {
   const jsonBytes = textEncoder.encode(JSON.stringify(msg));
 
   if (
@@ -178,7 +195,7 @@ function encodeJsonMessageFrame(
     jsonBytes.length >= WS_JSON_COMPRESSION_THRESHOLD_BYTES
   ) {
     try {
-      const compressed = gzipSync(jsonBytes);
+      const compressed = await gzipAsync(jsonBytes);
       if (compressed.length < jsonBytes.length) {
         return encodeCompressedJsonFrame(compressed);
       }
@@ -337,6 +354,7 @@ export function handleSessionSubscribe(
   };
 
   const { cleanup } = createSessionSubscription(process, sendEvent, {
+    replayAfterMessageId: msg.lastMessageId,
     onError: (err) => {
       console.error("[WS] Error in session subscription:", err);
     },
