@@ -21,14 +21,25 @@
  */
 
 const MAX_HOLD_MS = 6000;
+const MOBILE_SHELL_READY_MESSAGE = "yep-anywhere:app-ready";
 
 let hideRequested = false;
 let safetyTimer: number | null = null;
+let mobileShellReadySent = false;
+
+function notifyMobileShellReady(): void {
+  if (mobileShellReadySent) return;
+  mobileShellReadySent = true;
+  if (window.parent === window) return;
+
+  window.parent.postMessage({ type: MOBILE_SHELL_READY_MESSAGE }, "*");
+}
 
 /** Internal: actually fade and remove the splash element. Idempotent. */
 function performHide(): void {
   if (hideRequested) return;
   hideRequested = true;
+  notifyMobileShellReady();
   if (safetyTimer !== null) {
     window.clearTimeout(safetyTimer);
     safetyTimer = null;

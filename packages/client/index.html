@@ -36,6 +36,7 @@
       }
       html[data-theme="light"] #splash { background: #faf9f5; color: #555; }
       html[data-theme="dark"] #splash { background: #2f2f2f; color: #b8b8b8; }
+      html[data-mobile-shell="true"] #splash { display: none; }
       #splash.is-hiding { opacity: 0; pointer-events: none; }
       #splash-spinner {
         width: 36px;
@@ -59,8 +60,20 @@
       }
     </style>
     <script>
-      // Apply theme before page renders to prevent flash
+      // Apply theme before page renders to prevent flash.
       (function() {
+        var params = new URLSearchParams(window.location.search);
+        if (params.get('yep-mobile-shell') === '1') {
+          document.documentElement.setAttribute('data-mobile-shell', 'true');
+          params.delete('yep-mobile-shell');
+          var query = params.toString();
+          window.history.replaceState(
+            null,
+            '',
+            window.location.pathname + (query ? '?' + query : '') + window.location.hash
+          );
+        }
+
         var stored = localStorage.getItem('yep-anywhere-theme');
         var theme = stored || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'verydark');
         document.documentElement.setAttribute('data-theme', theme);
