@@ -15,6 +15,9 @@ export interface StaticServeOptions {
   basePath?: string;
 }
 
+const IMMUTABLE_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
+const REVALIDATED_ASSET_CACHE_CONTROL = "public, max-age=0, must-revalidate";
+
 /**
  * Create Hono routes for serving static files.
  *
@@ -62,15 +65,21 @@ export function createStaticRoutes(options: StaticServeOptions): Hono {
         const ext = path.extname(filePath).toLowerCase();
         const contentType = getContentType(ext);
 
-        // Cache static assets (they have hashed filenames)
-        const cacheControl = isHashedAsset(reqPath)
-          ? "public, max-age=31536000, immutable"
-          : "public, max-age=0, must-revalidate";
+        const isImmutableAsset = isHashedAsset(reqPath);
+        const cacheControl = isImmutableAsset
+          ? IMMUTABLE_ASSET_CACHE_CONTROL
+          : REVALIDATED_ASSET_CACHE_CONTROL;
 
         const headers: Record<string, string> = {
           "Content-Type": contentType,
           "Cache-Control": cacheControl,
         };
+
+        if (isImmutableAsset) {
+          headers["CDN-Cache-Control"] = IMMUTABLE_ASSET_CACHE_CONTROL;
+          headers["Cloudflare-CDN-Cache-Control"] =
+            IMMUTABLE_ASSET_CACHE_CONTROL;
+        }
 
         // Add CSP frame-ancestors for HTML files (must be HTTP header, not meta tag)
         if (ext === ".html") {
@@ -145,6 +154,6 @@ function getContentType(ext: string): string {
  * Vite adds hashes to filenames like: index-abc123.js
  */
 function isHashedAsset(reqPath: string): boolean {
-  // Match patterns like: /assets/index-abc123.js or /assets/style-xyz789.css
-  return /\/assets\/[^/]+-[a-f0-9]+\.[a-z]+$/i.test(reqPath);
+  // Vite uses base64url-ish hashes, e.g. index-CREDb_As.js.
+  return /\/assets\/[^/]+-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/.test(reqPath);
 }
