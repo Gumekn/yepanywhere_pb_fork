@@ -568,7 +568,19 @@ export class CodexSessionReader implements ISessionReader {
           // not cumulative totals and not cached-input totals.
           const usage = info.last_token_usage ?? info.total_token_usage;
           if (!usage) continue;
-          const inputTokens = usage.input_tokens;
+          let inputTokens = usage.input_tokens;
+
+          // After /compact, Codex writes a token_count with input_tokens=0 and
+          // total_tokens set to the compacted summary size. Treat that as the
+          // current context fill instead of falling through to pre-compaction
+          // token_count values.
+          if (
+            inputTokens === 0 &&
+            usage.total_tokens > 0 &&
+            this.isTokenCountImmediatelyAfterCompaction(entries, i)
+          ) {
+            inputTokens = usage.total_tokens;
+          }
 
           if (inputTokens === 0) continue;
 
@@ -588,6 +600,22 @@ export class CodexSessionReader implements ISessionReader {
     }
 
     return undefined;
+  }
+
+  private isTokenCountImmediatelyAfterCompaction(
+    entries: CodexSessionEntry[],
+    tokenCountIndex: number,
+  ): boolean {
+    for (let i = tokenCountIndex - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (!entry) continue;
+      if (entry.type === "compacted") return true;
+      if (entry.type === "event_msg" && entry.payload.type === "token_count") {
+        return false;
+      }
+    }
+
+    return false;
   }
 
   /**

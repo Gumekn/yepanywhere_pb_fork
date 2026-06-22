@@ -1270,4 +1270,32 @@ describe("Codex Normalization", () => {
       content: "Compacted 12 messages",
     });
   });
+
+  it("deduplicates context_compacted events next to compacted entries", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "compacted",
+        timestamp: "2024-01-01T00:00:03.000Z",
+        payload: {
+          message: "",
+          replacement_history: [],
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:03.014Z",
+        payload: {
+          type: "context_compacted",
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toMatchObject({
+      type: "system",
+      subtype: "compact_boundary",
+      content: "Context compacted",
+    });
+  });
 });

@@ -227,6 +227,28 @@ function convertClaudeMessage(
 
 // --- Codex Conversion Logic ---
 
+const CODEX_COMPACTION_EVENT_DEDUPE_WINDOW_MS = 5_000;
+
+function timestampToMs(timestamp: string | undefined): number | null {
+  if (!timestamp) return null;
+  const ms = Date.parse(timestamp);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function hasNearbyCodexCompactedEntry(
+  compactedTimestamps: number[],
+  timestamp: string | undefined,
+): boolean {
+  const eventTimestamp = timestampToMs(timestamp);
+  if (eventTimestamp === null) return false;
+
+  return compactedTimestamps.some(
+    (compactedTimestamp) =>
+      Math.abs(compactedTimestamp - eventTimestamp) <=
+      CODEX_COMPACTION_EVENT_DEDUPE_WINDOW_MS,
+  );
+}
+
 function convertCodexEntries(
   entries: CodexSessionEntry[],
   sessionId: string,
@@ -235,6 +257,10 @@ function convertCodexEntries(
   const messages: Message[] = [];
   let messageIndex = 0;
   const hasResponseItemUser = hasCodexResponseItemUserMessages(entries);
+  const compactedTimestamps = entries
+    .filter((entry) => entry.type === "compacted")
+    .map((entry) => timestampToMs(entry.timestamp))
+    .filter((timestamp): timestamp is number => timestamp !== null);
   const toolCallContexts = new Map<string, CodexToolCallContext>();
   const externalToolCalls: PendingExternalCodexToolCall[] = [];
 
@@ -287,7 +313,8 @@ function convertCodexEntries(
         entry.payload.type === "user_message" && !hasResponseItemUser;
       const shouldIncludeTurnAborted = entry.payload.type === "turn_aborted";
       const shouldIncludeContextCompacted =
-        entry.payload.type === "context_compacted";
+        entry.payload.type === "context_compacted" &&
+        !hasNearbyCodexCompactedEntry(compactedTimestamps, entry.timestamp);
       // Skip agent_message and agent_reasoning events when response_item exists;
       // those are streaming artifacts that duplicate full response data.
       if (

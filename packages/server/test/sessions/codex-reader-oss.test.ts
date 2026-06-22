@@ -401,6 +401,104 @@ describe("CodexSessionReader - OSS Support", () => {
     expect(summary?.contextUsage?.percentage).toBe(33);
   });
 
+  it("uses compacted total_tokens when post-compaction input_tokens is zero", async () => {
+    const sessionId = "context-post-compact-total";
+    const now = new Date().toISOString();
+    const lines: CodexSessionEntry[] = [
+      {
+        type: "session_meta",
+        timestamp: now,
+        payload: {
+          id: sessionId,
+          cwd: "/test/project",
+          timestamp: now,
+          model_provider: "openai",
+        },
+      },
+      {
+        type: "turn_context",
+        timestamp: now,
+        payload: { model: "gpt-5.3-codex" },
+      },
+      {
+        type: "event_msg",
+        timestamp: now,
+        payload: {
+          type: "user_message",
+          message: "Hello world",
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:01.000Z",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: 227_243,
+              cached_input_tokens: 0,
+              output_tokens: 100,
+              total_tokens: 227_343,
+            },
+            last_token_usage: {
+              input_tokens: 227_243,
+              cached_input_tokens: 0,
+              output_tokens: 100,
+              total_tokens: 227_343,
+            },
+            model_context_window: 258_000,
+          },
+          rate_limits: null,
+        },
+      },
+      {
+        type: "compacted",
+        timestamp: "2024-01-01T00:00:02.000Z",
+        payload: {
+          message: "",
+          replacement_history: [],
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:02.010Z",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: 0,
+              cached_input_tokens: 0,
+              output_tokens: 0,
+              total_tokens: 7_945,
+            },
+            last_token_usage: {
+              input_tokens: 0,
+              cached_input_tokens: 0,
+              output_tokens: 0,
+              total_tokens: 7_945,
+            },
+            model_context_window: 258_000,
+          },
+          rate_limits: null,
+        },
+      },
+    ];
+
+    await writeFile(
+      join(testDir, `${sessionId}.jsonl`),
+      `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+    );
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+
+    expect(summary?.contextUsage?.inputTokens).toBe(7_945);
+    expect(summary?.contextUsage?.percentage).toBe(3);
+    expect(summary?.contextUsage?.contextWindow).toBe(258_000);
+  });
+
   it("excludes developer messages from messageCount", async () => {
     const sessionId = "developer-filter";
     const now = new Date().toISOString();
