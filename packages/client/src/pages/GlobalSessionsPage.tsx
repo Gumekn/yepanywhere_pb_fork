@@ -16,7 +16,7 @@ import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
-import { getSessionDisplayTitle, toUrlProjectId } from "../utils";
+import { toUrlProjectId } from "../utils";
 
 // Long-press threshold for entering selection mode on mobile
 const LONG_PRESS_MS = 500;
@@ -37,6 +37,9 @@ const PROVIDER_COLORS: Record<ProviderName, string> = {
   "gemini-acp": "#4285f4", // Same as gemini
   opencode: "#9333ea", // Purple for OpenCode
 };
+
+const getSessionListTitle = (session: GlobalSessionItem): string | null =>
+  session.customTitle ?? session.title ?? null;
 
 /**
  * Global sessions page showing all sessions across all projects.
@@ -790,8 +793,8 @@ export function GlobalSessionsPage() {
                       <SessionListItem
                         sessionId={session.id}
                         projectId={session.projectId}
-                        title={getSessionDisplayTitle(session)}
-                        fullTitle={getSessionDisplayTitle(session)}
+                        title={getSessionListTitle(session)}
+                        fullTitle={getSessionListTitle(session)}
                         updatedAt={session.updatedAt}
                         hasUnread={session.hasUnread}
                         activity={session.activity}

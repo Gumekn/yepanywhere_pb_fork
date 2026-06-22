@@ -643,7 +643,9 @@ describe("Global Sessions Routes", () => {
 
       expect(
         vi.mocked(sessionIndexService.getSessionsWithCache),
-      ).toHaveBeenCalledWith("/codex/sessions", project.id, codexReader);
+      ).toHaveBeenCalledWith("/codex/sessions", project.id, codexReader, {
+        allowStale: true,
+      });
       expect(codexReader.listSessions).not.toHaveBeenCalled();
       expect(result.sessions.some((s) => s.id === "codex-sess-1")).toBe(true);
     });
@@ -700,7 +702,9 @@ describe("Global Sessions Routes", () => {
 
       expect(
         vi.mocked(sessionIndexService.getSessionsWithCache),
-      ).toHaveBeenCalledWith("/gemini/tmp", project.id, geminiReader);
+      ).toHaveBeenCalledWith("/gemini/tmp", project.id, geminiReader, {
+        allowStale: true,
+      });
       expect(geminiReader.listSessions).not.toHaveBeenCalled();
       expect(result.sessions.some((s) => s.id === "gemini-sess-1")).toBe(true);
     });

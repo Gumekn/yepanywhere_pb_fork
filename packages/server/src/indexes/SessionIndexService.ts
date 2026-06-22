@@ -23,7 +23,10 @@ import { getLogger } from "../logging/logger.js";
 import type { ISessionReader } from "../sessions/types.js";
 import type { SessionSummary } from "../supervisor/types.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
-import type { ISessionIndexService } from "./types.js";
+import type {
+  GetSessionsWithCacheOptions,
+  ISessionIndexService,
+} from "./types.js";
 
 const logger = getLogger();
 const LOG_CACHE_PERF = process.env.SESSION_INDEX_LOG_PERF === "true";
@@ -852,7 +855,12 @@ export class SessionIndexService implements ISessionIndexService {
     sessionDir: string,
     projectId: UrlProjectId,
     reader: ISessionReader,
+    options: GetSessionsWithCacheOptions = {},
   ): Promise<SessionSummary[]> {
+    if (options.allowStale) {
+      return this.getSessionsWithStaleCache(sessionDir, projectId, reader);
+    }
+
     const loadKey = this.getScopedLoadKey(sessionDir, projectId, reader);
     const inFlight = this.inFlightSessionLoads.get(loadKey);
     if (inFlight) {
@@ -873,6 +881,92 @@ export class SessionIndexService implements ISessionIndexService {
         this.inFlightSessionLoads.delete(loadKey);
       }
     }
+  }
+
+  private refreshSessionsInBackground(
+    sessionDir: string,
+    projectId: UrlProjectId,
+    reader: ISessionReader,
+  ): void {
+    const loadKey = this.getScopedLoadKey(sessionDir, projectId, reader);
+    if (this.inFlightSessionLoads.has(loadKey)) {
+      return;
+    }
+
+    const promise = this.getSessionsWithCacheInternal(
+      sessionDir,
+      projectId,
+      reader,
+    );
+    this.inFlightSessionLoads.set(loadKey, promise);
+
+    promise
+      .catch((error) => {
+        logger.warn(
+          { err: error },
+          `[SessionIndexService] Background validation failed for ${sessionDir}`,
+        );
+      })
+      .finally(() => {
+        if (this.inFlightSessionLoads.get(loadKey) === promise) {
+          this.inFlightSessionLoads.delete(loadKey);
+        }
+      });
+  }
+
+  private async getSessionsWithStaleCache(
+    sessionDir: string,
+    projectId: UrlProjectId,
+    reader: ISessionReader,
+  ): Promise<SessionSummary[]> {
+    const start = Date.now();
+    const scopeKey = this.getScopeKey(sessionDir, reader);
+    const index = await this.loadIndex(sessionDir, projectId, reader);
+
+    if (Object.keys(index.sessions).length === 0) {
+      return this.getSessionsWithCache(sessionDir, projectId, reader);
+    }
+
+    const now = Date.now();
+    const lastFullValidation = this.lastFullValidationAt.get(scopeKey) ?? 0;
+    const hasDirDirty = this.dirtyDirs.has(scopeKey);
+    const dirtySessions = this.dirtySessionsByDir.get(scopeKey);
+    const hasDirtySessions = Boolean(dirtySessions && dirtySessions.size > 0);
+    const fullValidationDue =
+      this.fullValidationIntervalMs <= 0 ||
+      lastFullValidation === 0 ||
+      now - lastFullValidation >= this.fullValidationIntervalMs;
+
+    let statCalls = 0;
+    let parseCalls = 0;
+
+    if (!hasDirDirty && hasDirtySessions) {
+      const incremental = await this.applyIncrementalDirtyUpdates(
+        sessionDir,
+        projectId,
+        reader,
+        index,
+      );
+      statCalls += incremental.statCalls;
+      parseCalls += incremental.parseCalls;
+      if (incremental.indexChanged) {
+        await this.saveIndex(sessionDir, reader);
+      }
+    }
+
+    if (hasDirDirty || fullValidationDue) {
+      this.refreshSessionsInBackground(sessionDir, projectId, reader);
+    }
+
+    const summaries = this.buildSummariesFromIndex(index, projectId);
+    this.recordCallStats(
+      hasDirtySessions && !hasDirDirty ? "incremental" : "fast",
+      Date.now() - start,
+      statCalls,
+      parseCalls,
+      sessionDir,
+    );
+    return summaries;
   }
 
   private async getSessionsWithCacheInternal(

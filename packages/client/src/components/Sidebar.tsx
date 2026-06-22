@@ -9,7 +9,7 @@ import { useRecentProjects } from "../hooks/useRecentProjects";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useVersion } from "../hooks/useVersion";
 import { useI18n } from "../i18n";
-import { getSessionDisplayTitle, toUrlProjectId } from "../utils";
+import { toUrlProjectId } from "../utils";
 import { AgentsNavItem } from "./AgentsNavItem";
 import { SessionListItem } from "./SessionListItem";
 import {
@@ -24,6 +24,9 @@ const SWIPE_THRESHOLD = 50; // Minimum distance to trigger close
 const SWIPE_ENGAGE_THRESHOLD = 15; // Minimum horizontal distance before swipe engages
 const RECENT_SESSIONS_INITIAL = 12; // Initial number of recent sessions to show
 const RECENT_SESSIONS_INCREMENT = 10; // How many more to show on each expand
+
+const getSessionListTitle = (session: GlobalSessionItem): string | null =>
+  session.customTitle ?? session.title ?? null;
 
 interface SidebarProps {
   isOpen: boolean;
@@ -422,8 +425,8 @@ export function Sidebar({
                       key={session.id}
                       sessionId={session.id}
                       projectId={session.projectId}
-                      title={getSessionDisplayTitle(session)}
-                      fullTitle={getSessionDisplayTitle(session)}
+                      title={getSessionListTitle(session)}
+                      fullTitle={getSessionListTitle(session)}
                       updatedAt={session.updatedAt}
                       provider={session.provider}
                       model={session.model}
@@ -480,8 +483,8 @@ export function Sidebar({
                       key={session.id}
                       sessionId={session.id}
                       projectId={session.projectId}
-                      title={getSessionDisplayTitle(session)}
-                      fullTitle={getSessionDisplayTitle(session)}
+                      title={getSessionListTitle(session)}
+                      fullTitle={getSessionListTitle(session)}
                       updatedAt={session.updatedAt}
                       provider={session.provider}
                       model={session.model}
@@ -536,8 +539,8 @@ export function Sidebar({
                     key={session.id}
                     sessionId={session.id}
                     projectId={session.projectId}
-                    title={getSessionDisplayTitle(session)}
-                    fullTitle={getSessionDisplayTitle(session)}
+                    title={getSessionListTitle(session)}
+                    fullTitle={getSessionListTitle(session)}
                     updatedAt={session.updatedAt}
                     provider={session.provider}
                     model={session.model}

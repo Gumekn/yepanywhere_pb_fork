@@ -23,6 +23,7 @@ export interface ProviderResolutionDeps {
   geminiSessionsDir?: string;
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
   geminiHashToCwd?: Promise<Map<string, string>>;
+  allowStaleSessionCache?: boolean;
 }
 
 export interface SessionSource {
@@ -210,6 +211,7 @@ async function listSessionsForSource(
     source.sessionDir,
     project.id,
     source.reader,
+    { allowStale: deps.allowStaleSessionCache },
   );
 
   if (
@@ -222,6 +224,7 @@ async function listSessionsForSource(
         dir,
         project.id,
         mergedReader,
+        { allowStale: deps.allowStaleSessionCache },
       );
       sessions = [...sessions, ...merged];
     }

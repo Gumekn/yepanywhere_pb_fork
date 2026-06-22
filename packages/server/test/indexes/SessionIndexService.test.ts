@@ -346,6 +346,55 @@ describe("SessionIndexService", () => {
       );
       expect(third[0]?.title).toBe("Updated content");
     });
+
+    it("serves stale summaries immediately while refreshing in the background", async () => {
+      const fastService = new SessionIndexService({
+        dataDir,
+        projectsDir,
+        fullValidationIntervalMs: 1,
+      });
+      await fastService.initialize();
+
+      await createSession("session-1", "Original content");
+      const first = await fastService.getSessionsWithCache(
+        sessionDir,
+        projectId,
+        reader,
+      );
+      expect(first[0]?.title).toBe("Original content");
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const updatedJsonl = JSON.stringify({
+        type: "user",
+        message: { content: "Updated content with a different length" },
+        uuid: "msg-updated",
+        timestamp: new Date().toISOString(),
+      });
+      await writeFile(join(sessionDir, "session-1.jsonl"), `${updatedJsonl}\n`);
+
+      const stale = await fastService.getSessionsWithCache(
+        sessionDir,
+        projectId,
+        reader,
+        { allowStale: true },
+      );
+      expect(stale[0]?.title).toBe("Original content");
+
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const refreshed = await fastService.getSessionsWithCache(
+          sessionDir,
+          projectId,
+          reader,
+          { allowStale: true },
+        );
+        if (refreshed[0]?.title === "Updated content with a different length") {
+          return;
+        }
+      }
+
+      throw new Error("Background validation did not refresh the stale index");
+    });
   });
 
   describe("invalidation", () => {

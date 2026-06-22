@@ -16,6 +16,22 @@ import {
 } from "./useFileActivity";
 
 const REFETCH_DEBOUNCE_MS = 500;
+const PENDING_TITLE_REFETCH_DELAYS_MS = [1500, 4000, 8000] as const;
+
+function hasResolvedTitle(session: {
+  customTitle?: string | null;
+  title?: string | null;
+}): boolean {
+  return Boolean((session.customTitle ?? session.title)?.trim());
+}
+
+function needsPendingTitleRefetch(session: {
+  customTitle?: string | null;
+  title?: string | null;
+  messageCount?: number;
+}): boolean {
+  return !hasResolvedTitle(session) || session.messageCount === 0;
+}
 
 export interface UseGlobalSessionsOptions {
   projectId?: string | null;
@@ -52,6 +68,10 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   const [error, setError] = useState<Error | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const refetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingTitleRefetchTimersRef = useRef<
+    Map<string, Set<ReturnType<typeof setTimeout>>>
+  >(new Map());
+  const latestFetchRef = useRef<(() => Promise<void>) | null>(null);
   const hasInitialLoadRef = useRef(false);
   const sessionsRef = useRef<GlobalSessionItem[]>([]);
   sessionsRef.current = sessions;
@@ -67,6 +87,16 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     starred?: boolean;
     includeStats?: boolean;
   }>({});
+
+  const clearPendingTitleRefetch = useCallback((sessionId: string) => {
+    const timers = pendingTitleRefetchTimersRef.current.get(sessionId);
+    if (!timers) return;
+
+    for (const timer of timers) {
+      clearTimeout(timer);
+    }
+    pendingTitleRefetchTimersRef.current.delete(sessionId);
+  }, []);
 
   const fetch = useCallback(async () => {
     // Reset initial load flag when options change
@@ -97,21 +127,20 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     setError(null);
 
     try {
-      const sessionsPromise = api.getGlobalSessions({
+      const data = await api.getGlobalSessions({
         project: projectId ?? undefined,
         q: searchQuery || undefined,
         limit,
         includeArchived,
         starred,
-        includeStats: false,
+        includeStats,
       });
-      const statsPromise =
-        includeStats && !projectId ? api.getGlobalSessionStats() : null;
 
-      const [data, statsResponse] = await Promise.all([
-        sessionsPromise,
-        statsPromise,
-      ]);
+      for (const session of data.sessions) {
+        if (hasResolvedTitle(session)) {
+          clearPendingTitleRefetch(session.id);
+        }
+      }
 
       if (!hasInitialLoadRef.current || optionsChanged) {
         setSessions(data.sessions);
@@ -141,14 +170,41 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       }
 
       setHasMore(data.hasMore);
-      setStats(statsResponse?.stats ?? DEFAULT_STATS);
+      setStats(data.stats ?? DEFAULT_STATS);
       setProjects(data.projects);
     } catch (err) {
       setError(err instanceof Error ? err : new Error(String(err)));
     } finally {
       setLoading(false);
     }
-  }, [projectId, searchQuery, limit, includeArchived, starred, includeStats]);
+  }, [
+    projectId,
+    searchQuery,
+    limit,
+    includeArchived,
+    starred,
+    includeStats,
+    clearPendingTitleRefetch,
+  ]);
+  latestFetchRef.current = fetch;
+
+  const schedulePendingTitleRefetch = useCallback((sessionId: string) => {
+    if (pendingTitleRefetchTimersRef.current.has(sessionId)) return;
+
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    pendingTitleRefetchTimersRef.current.set(sessionId, timers);
+
+    for (const delayMs of PENDING_TITLE_REFETCH_DELAYS_MS) {
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        if (timers.size === 0) {
+          pendingTitleRefetchTimersRef.current.delete(sessionId);
+        }
+        void latestFetchRef.current?.();
+      }, delayMs);
+      timers.add(timer);
+    }
+  }, []);
 
   // Load more sessions (pagination)
   const loadMore = useCallback(async () => {
@@ -262,6 +318,10 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         return;
       }
 
+      if (needsPendingTitleRefetch(event.session)) {
+        schedulePendingTitleRefetch(event.session.id);
+      }
+
       setSessions((prev) => {
         // Check for duplicates
         if (prev.some((s) => s.id === event.session.id)) {
@@ -300,7 +360,13 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         return [globalSession, ...prev];
       });
     },
-    [projectId, searchQuery, starred, debouncedRefetch],
+    [
+      projectId,
+      searchQuery,
+      starred,
+      debouncedRefetch,
+      schedulePendingTitleRefetch,
+    ],
   );
 
   // Handle session metadata changes
@@ -344,32 +410,43 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   }, []);
 
   // Handle session content updates (auto-generated title, messageCount, contextUsage)
-  const handleSessionUpdated = useCallback((event: SessionUpdatedEvent) => {
-    setSessions((prev) =>
-      prev.map((session) => {
-        if (session.id !== event.sessionId) return session;
+  const handleSessionUpdated = useCallback(
+    (event: SessionUpdatedEvent) => {
+      if (event.title?.trim()) {
+        clearPendingTitleRefetch(event.sessionId);
+      } else if (event.title === null || event.messageCount === 0) {
+        schedulePendingTitleRefetch(event.sessionId);
+      }
 
-        return {
-          ...session,
-          ...(event.title !== undefined && { title: event.title }),
-          ...(event.messageCount !== undefined && {
-            messageCount: event.messageCount,
-          }),
-          ...(event.updatedAt !== undefined && { updatedAt: event.updatedAt }),
-          ...(event.contextUsage !== undefined && {
-            contextUsage: event.contextUsage,
-          }),
-          ...(event.model !== undefined && { model: event.model }),
-          ...(event.reasoningEffort !== undefined && {
-            reasoningEffort: event.reasoningEffort,
-          }),
-          ...(event.serviceTier !== undefined && {
-            serviceTier: event.serviceTier,
-          }),
-        };
-      }),
-    );
-  }, []);
+      setSessions((prev) =>
+        prev.map((session) => {
+          if (session.id !== event.sessionId) return session;
+
+          return {
+            ...session,
+            ...(event.title !== undefined && { title: event.title }),
+            ...(event.messageCount !== undefined && {
+              messageCount: event.messageCount,
+            }),
+            ...(event.updatedAt !== undefined && {
+              updatedAt: event.updatedAt,
+            }),
+            ...(event.contextUsage !== undefined && {
+              contextUsage: event.contextUsage,
+            }),
+            ...(event.model !== undefined && { model: event.model }),
+            ...(event.reasoningEffort !== undefined && {
+              reasoningEffort: event.reasoningEffort,
+            }),
+            ...(event.serviceTier !== undefined && {
+              serviceTier: event.serviceTier,
+            }),
+          };
+        }),
+      );
+    },
+    [clearPendingTitleRefetch, schedulePendingTitleRefetch],
+  );
 
   // Subscribe to SSE events
   useFileActivity({
@@ -393,6 +470,12 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       if (refetchTimerRef.current) {
         clearTimeout(refetchTimerRef.current);
       }
+      for (const timers of pendingTitleRefetchTimersRef.current.values()) {
+        for (const timer of timers) {
+          clearTimeout(timer);
+        }
+      }
+      pendingTitleRefetchTimersRef.current.clear();
     };
   }, []);
 

@@ -9,6 +9,15 @@ import type { UrlProjectId } from "@yep-anywhere/shared";
 import type { ISessionReader } from "../sessions/types.js";
 import type { SessionSummary } from "../supervisor/types.js";
 
+export interface GetSessionsWithCacheOptions {
+  /**
+   * Return the last persisted index immediately when a full validation is due,
+   * and refresh the index in the background. If no index exists yet, the call
+   * still falls back to a blocking validation.
+   */
+  allowStale?: boolean;
+}
+
 /**
  * Common interface for session index services across providers.
  *
@@ -33,6 +42,7 @@ export interface ISessionIndexService {
     sessionDir: string,
     projectId: UrlProjectId,
     reader: ISessionReader,
+    options?: GetSessionsWithCacheOptions,
   ): Promise<SessionSummary[]>;
 
   /**

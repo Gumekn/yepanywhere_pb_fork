@@ -5,11 +5,7 @@
  * this returns a flat list suitable for navigation/sidebar use.
  */
 
-import {
-  type ContextUsage,
-  type ProviderName,
-  getSessionDisplayTitle,
-} from "@yep-anywhere/shared";
+import type { ContextUsage, ProviderName } from "@yep-anywhere/shared";
 import { Hono } from "hono";
 import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
@@ -140,6 +136,74 @@ function createEmptyStats(): GlobalSessionStats {
   };
 }
 
+function addSessionToStats(
+  stats: GlobalSessionStats,
+  session: Pick<SessionSummary, "provider">,
+  options: {
+    isArchived: boolean;
+    isStarred: boolean;
+    executor?: string;
+    hasUnread?: boolean;
+  },
+): void {
+  if (options.isArchived) {
+    stats.archivedCount++;
+  } else {
+    stats.totalCount++;
+    if (options.hasUnread) stats.unreadCount++;
+    stats.providerCounts[session.provider] =
+      (stats.providerCounts[session.provider] ?? 0) + 1;
+    const executorKey = options.executor ?? "local";
+    stats.executorCounts[executorKey] =
+      (stats.executorCounts[executorKey] ?? 0) + 1;
+  }
+  if (options.isStarred) stats.starredCount++;
+}
+
+function updatedAtMs(session: Pick<GlobalSessionItem, "updatedAt">): number {
+  return new Date(session.updatedAt).getTime();
+}
+
+function addTopSession(
+  sessions: GlobalSessionItem[],
+  session: GlobalSessionItem,
+  maxCount: number,
+): void {
+  if (maxCount <= 0) return;
+
+  const timestamp = updatedAtMs(session);
+  const last = sessions.at(-1);
+  if (sessions.length >= maxCount && last && timestamp <= updatedAtMs(last)) {
+    return;
+  }
+
+  let insertAt = sessions.length;
+  for (let i = 0; i < sessions.length; i++) {
+    const candidate = sessions[i];
+    if (candidate && timestamp > updatedAtMs(candidate)) {
+      insertAt = i;
+      break;
+    }
+  }
+
+  sessions.splice(insertAt, 0, session);
+  if (sessions.length > maxCount) {
+    sessions.pop();
+  }
+}
+
+function canEnterTopSessions(
+  sessions: GlobalSessionItem[],
+  session: Pick<GlobalSessionItem, "updatedAt">,
+  maxCount: number,
+): boolean {
+  if (maxCount <= 0) return false;
+  if (sessions.length < maxCount) return true;
+
+  const last = sessions.at(-1);
+  return !last || updatedAtMs(session) > updatedAtMs(last);
+}
+
 export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
   const routes = new Hono();
   let cachedStats: { value: GlobalSessionStats; timestamp: number } | null =
@@ -186,6 +250,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         geminiSessionsDir: deps.geminiSessionsDir,
         geminiReaderFactory: deps.geminiReaderFactory,
         geminiHashToCwd: providerCatalog.geminiHashToCwd,
+        allowStaleSessionCache: true,
       },
       providerCatalog,
     );
@@ -214,20 +279,12 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           ? deps.notificationService.hasUnread(session.id, session.updatedAt)
           : false;
 
-        if (isArchived) {
-          stats.archivedCount++;
-        } else {
-          stats.totalCount++;
-          if (hasUnread) stats.unreadCount++;
-          if (session.provider) {
-            stats.providerCounts[session.provider] =
-              (stats.providerCounts[session.provider] ?? 0) + 1;
-          }
-          const executorKey = executor ?? "local";
-          stats.executorCounts[executorKey] =
-            (stats.executorCounts[executorKey] ?? 0) + 1;
-        }
-        if (isStarred) stats.starredCount++;
+        addSessionToStats(stats, session, {
+          isArchived,
+          isStarred,
+          executor,
+          hasUnread,
+        });
       }
     }
 
@@ -248,15 +305,11 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           )
         : false;
 
-      if (isArchived) {
-        stats.archivedCount++;
-      } else {
-        stats.totalCount++;
-        if (hasUnread) stats.unreadCount++;
-        stats.providerCounts.codex = (stats.providerCounts.codex ?? 0) + 1;
-        stats.executorCounts.local = (stats.executorCounts.local ?? 0) + 1;
-      }
-      if (isStarred) stats.starredCount++;
+      addSessionToStats(stats, item.session, {
+        isArchived,
+        isStarred,
+        hasUnread,
+      });
     }
 
     return stats;
@@ -344,8 +397,15 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
     }
     projectOptions.sort((a, b) => a.name.localeCompare(b.name));
 
-    // Collect all sessions with enriched data
-    const allSessions: GlobalSessionItem[] = [];
+    const bridgedSessionById = new Map(
+      bridgeSessionViews.map((item) => [item.session.id, item]),
+    );
+    const shouldCollectStats = includeStats && !filterProjectId;
+    const stats = createEmptyStats();
+    const afterTime = afterCursor ? new Date(afterCursor).getTime() : null;
+    const maxCandidates = limit + 1;
+    const topSessions: GlobalSessionItem[] = [];
+    const knownSessionIds = new Set<string>();
     const providerCatalog = await buildProviderProjectCatalog({
       projects: allProjects,
       codexScanner: deps.codexScanner,
@@ -357,6 +417,8 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
       // Enrich each session
       for (const session of sessions) {
+        knownSessionIds.add(session.id);
+
         // Get session metadata
         const metadata = deps.sessionMetadataService?.getMetadata(session.id);
         const isArchived = metadata?.isArchived ?? session.isArchived ?? false;
@@ -369,16 +431,54 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           ? deps.notificationService.hasUnread(session.id, session.updatedAt)
           : undefined;
 
+        if (shouldCollectStats) {
+          addSessionToStats(stats, session, {
+            isArchived,
+            isStarred,
+            executor,
+            hasUnread,
+          });
+        }
+
         // Skip archived sessions unless explicitly requested
         if (isArchived && !includeArchived) continue;
 
         // Skip non-starred sessions if starred filter is active
         if (starredOnly && !isStarred) continue;
 
+        if (
+          afterTime !== null &&
+          new Date(session.updatedAt).getTime() >= afterTime
+        ) {
+          continue;
+        }
+
+        // Apply search filter before expensive enrichment so older matching
+        // sessions are not displaced by newer non-matching sessions.
+        if (searchQuery) {
+          const titleMatch = session.title?.toLowerCase().includes(searchQuery);
+          const customTitleMatch = customTitle
+            ?.toLowerCase()
+            .includes(searchQuery);
+          const projectNameMatch = project.name
+            .toLowerCase()
+            .includes(searchQuery);
+
+          if (!titleMatch && !customTitleMatch && !projectNameMatch) {
+            continue;
+          }
+        }
+
+        if (!canEnterTopSessions(topSessions, session, maxCandidates)) {
+          continue;
+        }
+
         // Compute status
         const process = deps.supervisor?.getProcessForSession(session.id);
         const bridgedSession =
-          (await deps.codexBridgeService?.getSessionView(session.id)) ?? null;
+          bridgedSessionById.get(session.id) ??
+          (await deps.codexBridgeService?.getSessionView(session.id)) ??
+          null;
         const isBridgeSessionActive = bridgedSession
           ? ((await deps.codexBridgeService?.isSessionActive(session.id)) ??
             false)
@@ -420,47 +520,35 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           activity = bridgedSession.activity;
         }
 
-        // Apply search filter
-        if (searchQuery) {
-          const titleMatch = session.title?.toLowerCase().includes(searchQuery);
-          const customTitleMatch = customTitle
-            ?.toLowerCase()
-            .includes(searchQuery);
-          const projectNameMatch = project.name
-            .toLowerCase()
-            .includes(searchQuery);
-
-          if (!titleMatch && !customTitleMatch && !projectNameMatch) {
-            continue;
-          }
-        }
-
-        allSessions.push({
-          id: session.id,
-          title: session.title,
-          createdAt: session.createdAt,
-          updatedAt: session.updatedAt,
-          messageCount: session.messageCount,
-          provider: session.provider,
-          projectId: session.projectId,
-          projectName: project.name,
-          ownership,
-          pendingInputType,
-          activity,
-          hasUnread,
-          customTitle,
-          isArchived,
-          isStarred,
-          executor,
-          contextUsage: session.contextUsage,
-          model: session.model,
-          reasoningEffort: session.reasoningEffort,
-          serviceTier: session.serviceTier,
-        });
+        addTopSession(
+          topSessions,
+          {
+            id: session.id,
+            title: session.title,
+            createdAt: session.createdAt,
+            updatedAt: session.updatedAt,
+            messageCount: session.messageCount,
+            provider: session.provider,
+            projectId: session.projectId,
+            projectName: project.name,
+            ownership,
+            pendingInputType,
+            activity,
+            hasUnread,
+            customTitle,
+            isArchived,
+            isStarred,
+            executor,
+            contextUsage: session.contextUsage,
+            model: session.model,
+            reasoningEffort: session.reasoningEffort,
+            serviceTier: session.serviceTier,
+          },
+          maxCandidates,
+        );
       }
     }
 
-    const knownSessionIds = new Set(allSessions.map((session) => session.id));
     for (const item of bridgeSessionViews) {
       const session = item.session;
       if (knownSessionIds.has(session.id)) continue;
@@ -470,9 +558,30 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       const isArchived = metadata?.isArchived ?? session.isArchived ?? false;
       const isStarred = metadata?.isStarred ?? session.isStarred ?? false;
       const customTitle = metadata?.customTitle ?? session.customTitle;
+      const executor = metadata?.executor;
+
+      const hasUnread = deps.notificationService
+        ? deps.notificationService.hasUnread(session.id, session.updatedAt)
+        : undefined;
+
+      if (shouldCollectStats) {
+        addSessionToStats(stats, session, {
+          isArchived,
+          isStarred,
+          executor,
+          hasUnread,
+        });
+      }
 
       if (isArchived && !includeArchived) continue;
       if (starredOnly && !isStarred) continue;
+
+      if (
+        afterTime !== null &&
+        new Date(session.updatedAt).getTime() >= afterTime
+      ) {
+        continue;
+      }
 
       if (searchQuery) {
         const title = session.title ?? "";
@@ -487,57 +596,46 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         }
       }
 
-      const hasUnread = deps.notificationService
-        ? deps.notificationService.hasUnread(session.id, session.updatedAt)
-        : undefined;
+      if (!canEnterTopSessions(topSessions, session, maxCandidates)) {
+        continue;
+      }
 
-      allSessions.push({
-        id: session.id,
-        title: session.title,
-        createdAt: session.createdAt,
-        updatedAt: session.updatedAt,
-        messageCount: session.messageCount,
-        provider: session.provider,
-        projectId: session.projectId,
-        projectName: item.projectName,
-        ownership: session.ownership,
-        pendingInputType: item.pendingInputType,
-        activity: item.activity,
-        hasUnread,
-        customTitle,
-        isArchived,
-        isStarred,
-        executor: metadata?.executor,
-        contextUsage: session.contextUsage,
-        model: session.model,
-        reasoningEffort: session.reasoningEffort,
-        serviceTier: session.serviceTier,
-      });
-    }
-
-    // Sort by updatedAt descending (most recent first)
-    allSessions.sort(
-      (a, b) =>
-        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-    );
-
-    // Apply cursor pagination
-    let filteredSessions = allSessions;
-    if (afterCursor) {
-      const afterTime = new Date(afterCursor).getTime();
-      filteredSessions = allSessions.filter(
-        (s) => new Date(s.updatedAt).getTime() < afterTime,
+      addTopSession(
+        topSessions,
+        {
+          id: session.id,
+          title: session.title,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+          messageCount: session.messageCount,
+          provider: session.provider,
+          projectId: session.projectId,
+          projectName: item.projectName,
+          ownership: session.ownership,
+          pendingInputType: item.pendingInputType,
+          activity: item.activity,
+          hasUnread,
+          customTitle,
+          isArchived,
+          isStarred,
+          executor,
+          contextUsage: session.contextUsage,
+          model: session.model,
+          reasoningEffort: session.reasoningEffort,
+          serviceTier: session.serviceTier,
+        },
+        maxCandidates,
       );
     }
 
     // Get one extra to determine hasMore
-    const sessionsWithExtra = filteredSessions.slice(0, limit + 1);
-    const hasMore = sessionsWithExtra.length > limit;
-    const sessions = sessionsWithExtra.slice(0, limit);
-    const stats =
-      includeStats && !filterProjectId
-        ? await getCachedGlobalStats()
-        : createEmptyStats();
+    const hasMore = topSessions.length > limit;
+    const sessions = topSessions.slice(0, limit);
+
+    if (shouldCollectStats) {
+      cachedStats = { value: stats, timestamp: Date.now() };
+      statsDirty = false;
+    }
 
     const response: GlobalSessionsResponse = {
       sessions,
