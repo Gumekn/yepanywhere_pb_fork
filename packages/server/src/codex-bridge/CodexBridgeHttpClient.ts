@@ -75,9 +75,29 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
         url: this.baseUrl.replace(/^http:/, "ws:"),
         upstreamUrl: null,
         upstreamRunning: false,
+        upstreamMode: "managed",
+        upstreams: {
+          light: {
+            profile: "light",
+            url: null,
+            running: false,
+            starting: false,
+            pid: null,
+            args: [],
+          },
+          full: {
+            profile: "full",
+            url: null,
+            running: false,
+            starting: false,
+            pid: null,
+            args: [],
+          },
+        },
         connectionCount: 0,
         sessionCount: 0,
         pendingInputCount: 0,
+        recentMcpStartupEvents: [],
         lastError: "Codex bridge sidecar is unavailable",
       }
     );

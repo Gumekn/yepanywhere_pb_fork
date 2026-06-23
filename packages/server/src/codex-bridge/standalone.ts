@@ -9,6 +9,8 @@ export async function runCodexBridgeOnly(): Promise<void> {
     port: config.codexBridgePort,
     upstreamUrl: config.codexBridgeUpstreamUrl,
     upstreamStartPort: config.codexBridgeUpstreamStartPort,
+    lightUpstreamArgs: config.codexBridgeLightUpstreamArgs,
+    fullUpstreamArgs: config.codexBridgeFullUpstreamArgs,
   });
 
   let shuttingDown = false;

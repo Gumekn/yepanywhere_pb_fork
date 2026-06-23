@@ -53,6 +53,10 @@ export interface Config {
   codexBridgeUpstreamUrl?: string;
   /** First port to try for the managed upstream app-server. */
   codexBridgeUpstreamStartPort: number;
+  /** Extra args passed to the managed light `codex app-server` upstream. */
+  codexBridgeLightUpstreamArgs: string[];
+  /** Extra args passed to the managed full `codex app-server` upstream. */
+  codexBridgeFullUpstreamArgs: string[];
   /**
    * Periodic full-tree rescan interval for codex session watcher (ms).
    * Helps recover from missed fs.watch events on macOS. 0 disables it.
@@ -177,6 +181,9 @@ export function loadConfig(): Config {
       process.env.YEP_CODEX_BRIDGE ??
       process.env.CODEX_BRIDGE,
   );
+  const legacyCodexBridgeUpstreamArgs =
+    process.env.YEP_CODEX_BRIDGE_UPSTREAM_ARGS ??
+    process.env.CODEX_BRIDGE_UPSTREAM_ARGS;
   // Enable periodic rescan on macOS (fs.watch misses deep file writes)
   // and Windows (fs.watch({ recursive: true }) can be unreliable for deep trees)
   const defaultCodexWatchPeriodicRescanMs =
@@ -236,6 +243,15 @@ export function loadConfig(): Config {
       process.env.YEP_CODEX_BRIDGE_UPSTREAM_START_PORT ??
         process.env.CODEX_BRIDGE_UPSTREAM_START_PORT,
       codexBridgePort + 1,
+    ),
+    codexBridgeLightUpstreamArgs: parseCodexBridgeUpstreamArgs(
+      process.env.YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS ??
+        legacyCodexBridgeUpstreamArgs,
+      DEFAULT_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS,
+    ),
+    codexBridgeFullUpstreamArgs: parseCodexBridgeUpstreamArgs(
+      process.env.YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS,
+      [],
     ),
     codexWatchPeriodicRescanMs,
     sessionIndexFullValidationMs,
@@ -405,6 +421,43 @@ function parseCodexBridgeMode(
     return "external";
   }
   return "embedded";
+}
+
+const DEFAULT_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS = [
+  "--disable",
+  "apps",
+  "--disable",
+  "plugins",
+  "-c",
+  "mcp_servers.chrome-devtools.enabled=false",
+];
+
+function parseCodexBridgeUpstreamArgs(
+  value: string | undefined,
+  defaultValue: string[],
+): string[] {
+  if (value === undefined) {
+    return [...defaultValue];
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (
+        Array.isArray(parsed) &&
+        parsed.every((item) => typeof item === "string")
+      ) {
+        return parsed;
+      }
+    } catch {
+      // Fall through to whitespace parsing below.
+    }
+  }
+
+  return trimmed.split(/\s+/).filter(Boolean);
 }
 
 /**

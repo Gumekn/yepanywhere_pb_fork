@@ -316,6 +316,8 @@ const codexBridgeService: CodexBridgeController | undefined =
           port: config.codexBridgePort,
           upstreamUrl: config.codexBridgeUpstreamUrl,
           upstreamStartPort: config.codexBridgeUpstreamStartPort,
+          lightUpstreamArgs: config.codexBridgeLightUpstreamArgs,
+          fullUpstreamArgs: config.codexBridgeFullUpstreamArgs,
           eventBus,
         });
 console.log(

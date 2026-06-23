@@ -7,6 +7,7 @@ import type {
 import type { SessionSummary } from "../supervisor/types.js";
 
 export type JsonRpcId = string | number;
+export type CodexBridgeUpstreamProfile = "light" | "full";
 
 export interface JsonRpcError {
   code?: number;
@@ -31,10 +32,32 @@ export interface CodexBridgeStatus {
   url: string;
   upstreamUrl: string | null;
   upstreamRunning: boolean;
+  upstreamMode: "managed" | "external";
+  upstreams: Record<CodexBridgeUpstreamProfile, CodexBridgeUpstreamStatus>;
   connectionCount: number;
   sessionCount: number;
   pendingInputCount: number;
+  recentMcpStartupEvents: CodexBridgeMcpStartupEvent[];
   lastError: string | null;
+}
+
+export interface CodexBridgeUpstreamStatus {
+  profile: CodexBridgeUpstreamProfile;
+  url: string | null;
+  running: boolean;
+  starting: boolean;
+  pid: number | null;
+  args: string[];
+}
+
+export interface CodexBridgeMcpStartupEvent {
+  timestamp: string;
+  profile: CodexBridgeUpstreamProfile;
+  connectionId: number;
+  threadId?: string;
+  name?: string;
+  status?: string;
+  error: string | null;
 }
 
 export interface CodexBridgeSession {

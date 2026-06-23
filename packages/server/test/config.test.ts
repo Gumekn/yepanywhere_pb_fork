@@ -59,4 +59,56 @@ describe("loadConfig codex paths", () => {
       "/var/tmp",
     ]);
   });
+
+  it("uses light Codex bridge upstream args by default and keeps full profile unrestricted", async () => {
+    vi.stubEnv("YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS", undefined);
+    vi.stubEnv("YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS", undefined);
+    vi.stubEnv("YEP_CODEX_BRIDGE_UPSTREAM_ARGS", undefined);
+    vi.stubEnv("CODEX_BRIDGE_UPSTREAM_ARGS", undefined);
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.codexBridgeLightUpstreamArgs).toEqual([
+      "--disable",
+      "apps",
+      "--disable",
+      "plugins",
+      "-c",
+      "mcp_servers.chrome-devtools.enabled=false",
+    ]);
+    expect(config.codexBridgeFullUpstreamArgs).toEqual([]);
+  });
+
+  it("parses profile-specific Codex bridge upstream args from env", async () => {
+    vi.stubEnv("YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS", "");
+    vi.stubEnv(
+      "YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS",
+      '["--enable","apps","-c","x.y=true"]',
+    );
+    vi.stubEnv("YEP_CODEX_BRIDGE_UPSTREAM_ARGS", "--legacy ignored");
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.codexBridgeLightUpstreamArgs).toEqual([]);
+    expect(config.codexBridgeFullUpstreamArgs).toEqual([
+      "--enable",
+      "apps",
+      "-c",
+      "x.y=true",
+    ]);
+  });
+
+  it("keeps legacy Codex bridge upstream args as a light-profile override only", async () => {
+    vi.stubEnv("YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS", undefined);
+    vi.stubEnv("YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS", undefined);
+    vi.stubEnv("YEP_CODEX_BRIDGE_UPSTREAM_ARGS", "--disable apps");
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.codexBridgeLightUpstreamArgs).toEqual(["--disable", "apps"]);
+    expect(config.codexBridgeFullUpstreamArgs).toEqual([]);
+  });
 });

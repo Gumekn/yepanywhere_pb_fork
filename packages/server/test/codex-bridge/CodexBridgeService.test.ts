@@ -158,6 +158,95 @@ describe("CodexBridgeService", () => {
     }
   });
 
+  it("records and suppresses MCP startup notifications", async () => {
+    const client = await connect(`ws://127.0.0.1:${bridgePort}`);
+    try {
+      await waitFor(() => upstreamSocket !== null);
+
+      let forwarded = false;
+      const onMessage = () => {
+        forwarded = true;
+      };
+      client.on("message", onMessage);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "mcpServer/startupStatus/updated",
+          params: {
+            threadId: "thread-mcp-startup",
+            name: "feishu-mcp",
+            status: "ready",
+            error: null,
+          },
+        }),
+      );
+
+      await delay(100);
+      client.off("message", onMessage);
+      expect(forwarded).toBe(false);
+
+      await waitFor(
+        () => bridge.getStatus().recentMcpStartupEvents.length === 1,
+      );
+      expect(bridge.getStatus().recentMcpStartupEvents[0]).toMatchObject({
+        profile: "light",
+        threadId: "thread-mcp-startup",
+        name: "feishu-mcp",
+        status: "ready",
+        error: null,
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  it("filters MCP startup notifications from batched server frames", async () => {
+    const client = await connect(`ws://127.0.0.1:${bridgePort}`);
+    try {
+      await waitFor(() => upstreamSocket !== null);
+
+      const forwardedFrame = waitForJsonFrame(client);
+      upstreamSocket?.send(
+        JSON.stringify([
+          {
+            jsonrpc: "2.0",
+            method: "mcpServer/startupStatus/updated",
+            params: {
+              threadId: "thread-mcp-startup",
+              name: "feishu-mcp",
+              status: "ready",
+              error: null,
+            },
+          },
+          {
+            jsonrpc: "2.0",
+            method: "thread/name/updated",
+            params: {
+              threadId: "thread-mcp-startup",
+              threadName: "Ready thread",
+            },
+          },
+        ]),
+      );
+
+      expect((await forwardedFrame).message).toEqual([
+        {
+          jsonrpc: "2.0",
+          method: "thread/name/updated",
+          params: {
+            threadId: "thread-mcp-startup",
+            threadName: "Ready thread",
+          },
+        },
+      ]);
+      await waitFor(
+        () => bridge.getStatus().recentMcpStartupEvents.length === 1,
+      );
+    } finally {
+      client.close();
+    }
+  });
+
   it("keeps idle empty thread records out of displayable session views", async () => {
     const client = await connect(`ws://127.0.0.1:${bridgePort}`);
     try {

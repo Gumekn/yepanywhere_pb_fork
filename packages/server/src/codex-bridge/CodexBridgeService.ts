@@ -12,10 +12,12 @@ import { bridgeOwnership, isLiveBridgeSession } from "./session-state.js";
 import type {
   CodexBridgeController,
   CodexBridgeInputResponse,
+  CodexBridgeMcpStartupEvent,
   CodexBridgePendingInput,
   CodexBridgeSession,
   CodexBridgeSessionView,
   CodexBridgeStatus,
+  CodexBridgeUpstreamProfile,
   JsonRpcId,
   JsonRpcMessage,
 } from "./types.js";
@@ -26,6 +28,9 @@ interface CodexBridgeServiceOptions {
   port: number;
   upstreamUrl?: string;
   upstreamStartPort?: number;
+  lightUpstreamArgs?: string[];
+  fullUpstreamArgs?: string[];
+  upstreamArgs?: string[];
   codexPath?: string;
   eventBus?: EventBus;
   startupTimeoutMs?: number;
@@ -38,6 +43,7 @@ interface ClientRequestRecord {
 
 interface BridgeConnection {
   id: number;
+  profile: CodexBridgeUpstreamProfile;
   downstream: WebSocket;
   upstream: WebSocket | null;
   downstreamQueue: QueuedFrame[];
@@ -49,6 +55,11 @@ interface BridgeConnection {
 }
 
 interface QueuedFrame {
+  data: RawData;
+  isBinary: boolean;
+}
+
+interface ForwardedFrame {
   data: RawData;
   isBinary: boolean;
 }
@@ -89,6 +100,13 @@ interface SessionRecord {
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
 const JSON_RPC_VERSION = "2.0";
+const MAX_MCP_STARTUP_EVENTS = 50;
+
+interface CodexBridgeUpstreamState {
+  process: ChildProcess | null;
+  url: string | null;
+  startPromise: Promise<string> | null;
+}
 
 export class CodexBridgeService implements CodexBridgeController {
   private readonly enabled: boolean;
@@ -96,6 +114,10 @@ export class CodexBridgeService implements CodexBridgeController {
   private readonly port: number;
   private readonly upstreamUrlOverride?: string;
   private readonly upstreamStartPort?: number;
+  private readonly upstreamArgsByProfile: Record<
+    CodexBridgeUpstreamProfile,
+    string[]
+  >;
   private readonly codexPathOverride?: string;
   private readonly eventBus?: EventBus;
   private readonly startupTimeoutMs: number;
@@ -110,9 +132,12 @@ export class CodexBridgeService implements CodexBridgeController {
   private emittedSessionIds = new Set<string>();
   private pendingByInputId = new Map<string, PendingServerRequest>();
   private pendingIdsByThread = new Map<string, Set<string>>();
-  private upstreamProcess: ChildProcess | null = null;
-  private managedUpstreamUrl: string | null = null;
-  private upstreamStartPromise: Promise<string> | null = null;
+  private recentMcpStartupEvents: CodexBridgeMcpStartupEvent[] = [];
+  private upstreams = new Map<
+    CodexBridgeUpstreamProfile,
+    CodexBridgeUpstreamState
+  >();
+  private reservedUpstreamPorts = new Set<number>();
 
   constructor(options: CodexBridgeServiceOptions) {
     this.enabled = options.enabled;
@@ -120,6 +145,10 @@ export class CodexBridgeService implements CodexBridgeController {
     this.port = options.port;
     this.upstreamUrlOverride = options.upstreamUrl;
     this.upstreamStartPort = options.upstreamStartPort;
+    this.upstreamArgsByProfile = {
+      light: options.lightUpstreamArgs ?? options.upstreamArgs ?? [],
+      full: options.fullUpstreamArgs ?? [],
+    };
     this.codexPathOverride = options.codexPath;
     this.eventBus = options.eventBus;
     this.startupTimeoutMs =
@@ -210,11 +239,19 @@ export class CodexBridgeService implements CodexBridgeController {
       host: this.host,
       port: this.port,
       url: `ws://${this.host}:${this.port}`,
-      upstreamUrl: this.upstreamUrlOverride ?? this.managedUpstreamUrl,
-      upstreamRunning: this.isManagedUpstreamRunning(),
+      upstreamUrl: this.upstreamUrlOverride ?? this.getManagedUpstreamUrl(),
+      upstreamRunning: this.isAnyManagedUpstreamRunning(),
+      upstreamMode: this.upstreamUrlOverride ? "external" : "managed",
+      upstreams: {
+        light: this.getUpstreamStatus("light"),
+        full: this.getUpstreamStatus("full"),
+      },
       connectionCount: this.connections.size,
       sessionCount: this.sessions.size,
       pendingInputCount: this.pendingByInputId.size,
+      recentMcpStartupEvents: this.recentMcpStartupEvents.map((event) => ({
+        ...event,
+      })),
       lastError: this.lastError,
     };
   }
@@ -394,8 +431,10 @@ export class CodexBridgeService implements CodexBridgeController {
       return;
     }
 
+    const profile = parseMcpProfile(req.url, req.headers.authorization);
     const connection: BridgeConnection = {
       id: this.nextConnectionId++,
+      profile,
       downstream,
       upstream: null,
       downstreamQueue: [],
@@ -406,6 +445,9 @@ export class CodexBridgeService implements CodexBridgeController {
       closed: false,
     };
     this.connections.set(connection.id, connection);
+    console.log(
+      `[CodexBridge] Connection ${connection.id} profile=${profile} request=${req.url ?? "/"}`,
+    );
 
     downstream.on("message", (data, isBinary) => {
       if (!this.observeClientData(connection, data)) {
@@ -435,7 +477,7 @@ export class CodexBridgeService implements CodexBridgeController {
   }
 
   private async connectUpstream(connection: BridgeConnection): Promise<void> {
-    const upstreamUrl = await this.ensureUpstreamUrl();
+    const upstreamUrl = await this.ensureUpstreamUrl(connection.profile);
     if (connection.closed) return;
 
     await new Promise<void>((resolve, reject) => {
@@ -443,6 +485,9 @@ export class CodexBridgeService implements CodexBridgeController {
       connection.upstream = upstream;
 
       upstream.on("open", () => {
+        console.log(
+          `[CodexBridge] Connection ${connection.id} profile=${connection.profile} upstream=${upstreamUrl}`,
+        );
         while (
           connection.downstreamQueue.length > 0 &&
           upstream.readyState === WebSocket.OPEN
@@ -456,9 +501,19 @@ export class CodexBridgeService implements CodexBridgeController {
       });
 
       upstream.on("message", (data, isBinary) => {
-        this.observeServerData(connection, data);
+        const forwardedFrame = this.observeServerData(
+          connection,
+          data,
+          isBinary,
+        );
         if (connection.downstream.readyState === WebSocket.OPEN) {
-          sendFrame(connection.downstream, data, isBinary);
+          if (forwardedFrame) {
+            sendFrame(
+              connection.downstream,
+              forwardedFrame.data,
+              forwardedFrame.isBinary,
+            );
+          }
         }
       });
 
@@ -538,15 +593,22 @@ export class CodexBridgeService implements CodexBridgeController {
     return shouldForward;
   }
 
-  private observeServerData(connection: BridgeConnection, data: RawData): void {
-    const messages = parseJsonRpcData(data);
+  private observeServerData(
+    connection: BridgeConnection,
+    data: RawData,
+    isBinary: boolean,
+  ): ForwardedFrame | null {
+    const envelope = parseJsonRpcEnvelope(data);
+    const messages = envelope?.messages;
     if (!messages) {
-      return;
+      return { data, isBinary };
     }
 
+    const messagesToForward: JsonRpcMessage[] = [];
     for (const message of messages) {
       if (message.method && message.id !== undefined) {
         this.recordServerRequest(connection, message);
+        messagesToForward.push(message);
         continue;
       }
 
@@ -556,6 +618,9 @@ export class CodexBridgeService implements CodexBridgeController {
           message.method,
           message.params,
         );
+        if (message.method !== "mcpServer/startupStatus/updated") {
+          messagesToForward.push(message);
+        }
         continue;
       }
 
@@ -566,7 +631,25 @@ export class CodexBridgeService implements CodexBridgeController {
           this.handleClientRequestResponse(connection, request, message);
         }
       }
+      messagesToForward.push(message);
     }
+
+    if (messagesToForward.length === messages.length) {
+      return { data, isBinary };
+    }
+
+    if (messagesToForward.length === 0) {
+      return null;
+    }
+
+    return {
+      data: Buffer.from(
+        JSON.stringify(
+          envelope.isBatch ? messagesToForward : messagesToForward[0],
+        ),
+      ),
+      isBinary: false,
+    };
   }
 
   private handleClientRequestResponse(
@@ -686,7 +769,51 @@ export class CodexBridgeService implements CodexBridgeController {
         }
         break;
       }
+      case "mcpServer/startupStatus/updated": {
+        this.recordMcpStartupStatus(connection, p);
+        break;
+      }
     }
+  }
+
+  private recordMcpStartupStatus(
+    connection: BridgeConnection,
+    params: Record<string, unknown> | null,
+  ): void {
+    const event: CodexBridgeMcpStartupEvent = {
+      timestamp: new Date().toISOString(),
+      profile: connection.profile,
+      connectionId: connection.id,
+      error: formatDiagnosticValue(params?.error),
+    };
+    const threadId = getString(params?.threadId);
+    const name = getString(params?.name);
+    const status = getString(params?.status);
+    if (threadId) event.threadId = threadId;
+    if (name) event.name = name;
+    if (status) event.status = status;
+
+    this.recentMcpStartupEvents.push(event);
+    if (this.recentMcpStartupEvents.length > MAX_MCP_STARTUP_EVENTS) {
+      this.recentMcpStartupEvents.splice(
+        0,
+        this.recentMcpStartupEvents.length - MAX_MCP_STARTUP_EVENTS,
+      );
+    }
+
+    console.log(
+      [
+        "[CodexBridge] MCP startup",
+        `profile=${event.profile}`,
+        `connection=${event.connectionId}`,
+        event.threadId ? `thread=${event.threadId}` : null,
+        event.name ? `server=${event.name}` : null,
+        event.status ? `status=${event.status}` : null,
+        event.error ? `error=${event.error}` : null,
+      ]
+        .filter((part): part is string => typeof part === "string")
+        .join(" "),
+    );
   }
 
   private recordServerRequest(
@@ -1317,65 +1444,106 @@ export class CodexBridgeService implements CodexBridgeController {
     );
   }
 
-  private async ensureUpstreamUrl(): Promise<string> {
+  private async ensureUpstreamUrl(
+    profile: CodexBridgeUpstreamProfile,
+  ): Promise<string> {
     if (this.upstreamUrlOverride) return this.upstreamUrlOverride;
-    if (this.managedUpstreamUrl && this.isManagedUpstreamRunning()) {
-      return this.managedUpstreamUrl;
+    const state = this.getUpstreamState(profile);
+    if (state.url && this.isManagedUpstreamRunning(profile)) {
+      return state.url;
     }
-    if (this.upstreamStartPromise) {
-      return this.upstreamStartPromise;
+    if (state.startPromise) {
+      return state.startPromise;
     }
 
-    this.upstreamStartPromise = this.startManagedUpstream().finally(() => {
-      this.upstreamStartPromise = null;
+    state.startPromise = this.startManagedUpstream(profile).finally(() => {
+      state.startPromise = null;
     });
-    return this.upstreamStartPromise;
+    return state.startPromise;
   }
 
-  private async startManagedUpstream(): Promise<string> {
+  private async startManagedUpstream(
+    profile: CodexBridgeUpstreamProfile,
+  ): Promise<string> {
     const codexPath = this.codexPathOverride ?? (await findCodexCliPath());
     if (!codexPath) {
       throw new Error("Codex CLI not found");
     }
 
     const startPort = this.upstreamStartPort ?? this.port + 1;
-    const port = await findAvailablePort("127.0.0.1", startPort);
+    const port = await this.findAvailableManagedPort(startPort);
     const url = `ws://127.0.0.1:${port}`;
-    const child = spawn(codexPath, ["app-server", "--listen", url], {
+    const state = this.getUpstreamState(profile);
+    const args = this.upstreamArgsByProfile[profile];
+    const spawnArgs = ["app-server", ...args, "--listen", url];
+    console.log(
+      `[CodexBridge] Starting managed Codex app-server profile=${profile} path=${codexPath} args=${JSON.stringify(spawnArgs)}`,
+    );
+    const child = spawn(codexPath, spawnArgs, {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
       env: process.env,
     });
-    this.upstreamProcess = child;
-    this.managedUpstreamUrl = url;
+    state.process = child;
+    state.url = url;
 
     child.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8").trim();
-      if (text) console.debug(`[CodexBridge upstream] ${text}`);
+      if (text) console.debug(`[CodexBridge upstream:${profile}] ${text}`);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8").trim();
-      if (text) console.debug(`[CodexBridge upstream] ${text}`);
+      if (text) console.debug(`[CodexBridge upstream:${profile}] ${text}`);
     });
     child.once("exit", (code, signal) => {
-      if (this.upstreamProcess === child) {
-        this.upstreamProcess = null;
-        this.managedUpstreamUrl = null;
+      this.reservedUpstreamPorts.delete(port);
+      if (state.process === child) {
+        state.process = null;
+        state.url = null;
       }
       console.log(
-        `[CodexBridge] Managed app-server exited code=${String(code)} signal=${String(signal)}`,
+        `[CodexBridge] Managed app-server profile=${profile} exited code=${String(code)} signal=${String(signal)}`,
       );
     });
 
-    await waitForWebSocket(url, this.startupTimeoutMs);
-    console.log(`[CodexBridge] Managed Codex app-server ready at ${url}`);
+    try {
+      await waitForWebSocket(url, this.startupTimeoutMs);
+    } catch (error) {
+      this.reservedUpstreamPorts.delete(port);
+      if (state.process === child) {
+        state.process = null;
+        state.url = null;
+      }
+      if (child.pid && child.exitCode === null && !child.killed) {
+        try {
+          process.kill(process.platform !== "win32" ? -child.pid : child.pid);
+        } catch {}
+      }
+      throw error;
+    }
+
+    console.log(
+      `[CodexBridge] Managed Codex app-server profile=${profile} ready at ${url}`,
+    );
     return url;
   }
 
   private async stopManagedUpstream(): Promise<void> {
-    const child = this.upstreamProcess;
-    this.upstreamProcess = null;
-    this.managedUpstreamUrl = null;
+    await Promise.all(
+      Array.from(this.upstreams.values()).map((state) =>
+        this.stopManagedUpstreamState(state),
+      ),
+    );
+    this.reservedUpstreamPorts.clear();
+  }
+
+  private async stopManagedUpstreamState(
+    state: CodexBridgeUpstreamState,
+  ): Promise<void> {
+    const child = state.process;
+    state.process = null;
+    state.url = null;
+    state.startPromise = null;
     if (!child?.pid || child.exitCode !== null || child.killed) {
       return;
     }
@@ -1401,9 +1569,66 @@ export class CodexBridgeService implements CodexBridgeController {
     });
   }
 
-  private isManagedUpstreamRunning(): boolean {
-    const child = this.upstreamProcess;
+  private getUpstreamState(
+    profile: CodexBridgeUpstreamProfile,
+  ): CodexBridgeUpstreamState {
+    let state = this.upstreams.get(profile);
+    if (!state) {
+      state = { process: null, url: null, startPromise: null };
+      this.upstreams.set(profile, state);
+    }
+    return state;
+  }
+
+  private async findAvailableManagedPort(startPort: number): Promise<number> {
+    for (let port = Math.max(1, startPort); port < startPort + 100; port++) {
+      if (this.reservedUpstreamPorts.has(port)) continue;
+      this.reservedUpstreamPorts.add(port);
+      const available = await isPortAvailable("127.0.0.1", port);
+      if (available) {
+        return port;
+      }
+      this.reservedUpstreamPorts.delete(port);
+    }
+    throw new Error(`No available port found near ${startPort}`);
+  }
+
+  private getManagedUpstreamUrl(): string | null {
+    return (
+      this.upstreams.get("light")?.url ??
+      this.upstreams.get("full")?.url ??
+      null
+    );
+  }
+
+  private getUpstreamStatus(profile: CodexBridgeUpstreamProfile) {
+    const state = this.upstreams.get(profile);
+    const process = state?.process ?? null;
+    const running = this.isManagedUpstreamRunning(profile);
+    return {
+      profile,
+      url: this.upstreamUrlOverride ?? state?.url ?? null,
+      running: this.upstreamUrlOverride ? false : running,
+      starting: this.upstreamUrlOverride
+        ? false
+        : !!state?.startPromise && !running,
+      pid: this.upstreamUrlOverride ? null : (process?.pid ?? null),
+      args: [...this.upstreamArgsByProfile[profile]],
+    };
+  }
+
+  private isManagedUpstreamRunning(
+    profile: CodexBridgeUpstreamProfile,
+  ): boolean {
+    const child = this.upstreams.get(profile)?.process;
     return !!child && !child.killed && child.exitCode === null;
+  }
+
+  private isAnyManagedUpstreamRunning(): boolean {
+    return (
+      this.isManagedUpstreamRunning("light") ||
+      this.isManagedUpstreamRunning("full")
+    );
   }
 
   private isLocalAddress(address: string): boolean {
@@ -1416,16 +1641,47 @@ export class CodexBridgeService implements CodexBridgeController {
   }
 }
 
+interface JsonRpcEnvelope {
+  messages: JsonRpcMessage[];
+  isBatch: boolean;
+}
+
 function parseJsonRpcData(data: RawData): JsonRpcMessage[] | null {
+  return parseJsonRpcEnvelope(data)?.messages ?? null;
+}
+
+function parseJsonRpcEnvelope(data: RawData): JsonRpcEnvelope | null {
   try {
     const parsed = JSON.parse(rawDataToString(data)) as unknown;
     if (Array.isArray(parsed)) {
-      return parsed.filter(isJsonRpcMessage);
+      return { messages: parsed.filter(isJsonRpcMessage), isBatch: true };
     }
-    return isJsonRpcMessage(parsed) ? [parsed] : null;
+    return isJsonRpcMessage(parsed)
+      ? { messages: [parsed], isBatch: false }
+      : null;
   } catch {
     return null;
   }
+}
+
+function parseMcpProfile(
+  url: string | undefined,
+  authorization: string | undefined,
+): CodexBridgeUpstreamProfile {
+  const token = authorization
+    ?.replace(/^Bearer\s+/i, "")
+    .trim()
+    .toLowerCase();
+  if (token === "full" || token === "mcp=full" || token === "profile:full") {
+    return "full";
+  }
+
+  const requested = new URL(url ?? "/", "http://127.0.0.1").searchParams
+    .getAll("mcp")
+    .at(-1)
+    ?.trim()
+    .toLowerCase();
+  return requested === "full" ? "full" : "light";
 }
 
 function rawDataToString(data: RawData): string {
@@ -1484,6 +1740,22 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function getString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function formatDiagnosticValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.message;
+
+  const record = asRecord(value);
+  const message = getString(record?.message);
+  if (message) return message;
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function getElicitationMeta(
@@ -1587,17 +1859,6 @@ function timestampFromThreadValue(value: unknown): string | undefined {
   }
   const ms = value > 1_000_000_000_000 ? value : value * 1000;
   return new Date(ms).toISOString();
-}
-
-async function findAvailablePort(
-  host: string,
-  startPort: number,
-): Promise<number> {
-  for (let port = Math.max(1, startPort); port < startPort + 100; port++) {
-    const available = await isPortAvailable(host, port);
-    if (available) return port;
-  }
-  throw new Error(`No available port found near ${startPort}`);
 }
 
 async function isPortAvailable(host: string, port: number): Promise<boolean> {
