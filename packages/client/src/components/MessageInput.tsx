@@ -4,6 +4,7 @@ import {
   type KeyboardEvent,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -34,6 +35,56 @@ function formatSize(bytes: number): string {
   if (bytes < 1024 * 1024 * 1024)
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+type CommandPrefix = "/" | "$";
+
+interface ActiveCommandToken {
+  start: number;
+  end: number;
+  query: string;
+}
+
+function findActiveCommandToken(
+  text: string,
+  cursorPosition: number,
+  prefix: CommandPrefix,
+): ActiveCommandToken | null {
+  if (cursorPosition < 0 || cursorPosition > text.length) return null;
+
+  const beforeCursor = text.slice(0, cursorPosition);
+  const tokenStart = Math.max(
+    beforeCursor.lastIndexOf(" "),
+    beforeCursor.lastIndexOf("\n"),
+    beforeCursor.lastIndexOf("\t"),
+  );
+  const start = tokenStart + 1;
+  const token = beforeCursor.slice(start);
+
+  if (!token.startsWith(prefix)) return null;
+  if (token.length > 1 && token.includes(prefix, 1)) return null;
+
+  return {
+    start,
+    end: cursorPosition,
+    query: token.slice(prefix.length),
+  };
+}
+
+function filterCommands(commands: string[], query: string): string[] {
+  const normalizedQuery = query.toLowerCase();
+  const deduped = Array.from(new Set(commands)).filter(Boolean);
+
+  if (!normalizedQuery) return deduped;
+
+  return deduped
+    .filter((command) => command.toLowerCase().includes(normalizedQuery))
+    .sort((a, b) => {
+      const aStarts = a.toLowerCase().startsWith(normalizedQuery);
+      const bStarts = b.toLowerCase().startsWith(normalizedQuery);
+      if (aStarts !== bStarts) return aStarts ? -1 : 1;
+      return a.localeCompare(b);
+    });
 }
 
 interface Props {
@@ -72,9 +123,13 @@ interface Props {
   supportsPermissionMode?: boolean;
   /** Whether the provider supports thinking toggle (default: true) */
   supportsThinkingToggle?: boolean;
-  /** Available slash commands (without "/" prefix) */
-  slashCommands?: string[];
-  /** Callback for custom client-side commands (e.g., "model"). Return true if handled. */
+  /** Active command prefix for this provider */
+  commandPrefix?: CommandPrefix;
+  /** Available commands (without prefix) */
+  commands?: string[];
+  /** Accessible label for the active command menu */
+  commandLabel?: string;
+  /** Callback for custom client-side "/" commands (e.g., "model"). Return true if handled. */
   onCustomCommand?: (command: string) => boolean;
 }
 
@@ -102,7 +157,9 @@ export function MessageInput({
   uploadProgress = [],
   supportsPermissionMode = true,
   supportsThinkingToggle = true,
-  slashCommands = [],
+  commandPrefix = "/",
+  commands = [],
+  commandLabel = "Commands",
   onCustomCommand,
 }: Props) {
   const { t } = useI18n();
@@ -113,6 +170,11 @@ export function MessageInput({
   // User-controlled collapse state (independent of external collapse from approval panel)
   const [userCollapsed, setUserCollapsed] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState("");
+  const [cursorPosition, setCursorPosition] = useState(0);
+  const [activeCommandIndex, setActiveCommandIndex] = useState(0);
+  const [dismissedCompletionKey, setDismissedCompletionKey] = useState<
+    string | null
+  >(null);
 
   // Combined display text: committed text + interim transcript
   const displayText = interimTranscript
@@ -134,6 +196,97 @@ export function MessageInput({
   const collapsed = userCollapsed || externalCollapsed;
 
   const canAttach = !!(projectId && sessionId && onAttach);
+
+  const updateCursorPosition = useCallback(() => {
+    const textarea = textareaRef.current;
+    setCursorPosition(textarea?.selectionStart ?? text.length);
+  }, [text.length]);
+
+  const activeCommandToken = useMemo(() => {
+    if (commands.length === 0) return null;
+    return findActiveCommandToken(text, cursorPosition, commandPrefix);
+  }, [commands.length, commandPrefix, cursorPosition, text]);
+
+  const filteredCommands = useMemo(
+    () =>
+      activeCommandToken
+        ? filterCommands(commands, activeCommandToken.query)
+        : [],
+    [activeCommandToken, commands],
+  );
+
+  const completionKey = activeCommandToken
+    ? `${commandPrefix}:${activeCommandToken.start}:${activeCommandToken.end}:${activeCommandToken.query}`
+    : null;
+  const isCommandCompletionOpen =
+    !!completionKey &&
+    dismissedCompletionKey !== completionKey &&
+    filteredCommands.length > 0;
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset selection when the active command token changes.
+  useEffect(() => {
+    setActiveCommandIndex(0);
+  }, [completionKey]);
+
+  const insertCommand = useCallback(
+    (command: string) => {
+      const prefix = command.startsWith("$") ? "$" : "/";
+      const bare =
+        command.startsWith("/") || command.startsWith("$")
+          ? command.slice(1)
+          : command;
+      const activeToken = prefix === commandPrefix ? activeCommandToken : null;
+
+      if (prefix === "/" && onCustomCommand?.(bare)) {
+        if (activeToken) {
+          const nextText =
+            text.slice(0, activeToken.start) + text.slice(activeToken.end);
+          setText(nextText);
+          setCursorPosition(activeToken.start);
+          setTimeout(() => {
+            const textarea = textareaRef.current;
+            textarea?.focus();
+            textarea?.setSelectionRange(activeToken.start, activeToken.start);
+          }, 0);
+        }
+        setDismissedCompletionKey(null);
+        textareaRef.current?.focus();
+        return;
+      }
+
+      const fullCommand = `${prefix}${bare}`;
+      let nextText: string;
+      let nextCursor: number;
+
+      if (activeToken) {
+        nextText = `${text.slice(
+          0,
+          activeToken.start,
+        )}${fullCommand} ${text.slice(activeToken.end)}`;
+        nextCursor = activeToken.start + fullCommand.length + 1;
+      } else {
+        const textarea = textareaRef.current;
+        const cursor = textarea?.selectionStart ?? text.length;
+        const before = text.slice(0, cursor);
+        const after = text.slice(cursor);
+        const leading = before.length > 0 && !/\s$/.test(before) ? " " : "";
+        const trailing = after.length > 0 && !/^\s/.test(after) ? " " : " ";
+
+        nextText = `${before}${leading}${fullCommand}${trailing}${after}`;
+        nextCursor = before.length + leading.length + fullCommand.length + 1;
+      }
+
+      setText(nextText);
+      setCursorPosition(nextCursor);
+      setDismissedCompletionKey(null);
+      setTimeout(() => {
+        const textarea = textareaRef.current;
+        textarea?.focus();
+        textarea?.setSelectionRange(nextCursor, nextCursor);
+      }, 0);
+    },
+    [activeCommandToken, commandPrefix, onCustomCommand, setText, text],
+  );
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -197,6 +350,55 @@ export function MessageInput({
         voiceButtonRef.current.toggle();
       }
       return;
+    }
+
+    if (isCommandCompletionOpen) {
+      const selectedCommand = filteredCommands[activeCommandIndex];
+      const hasExactMatch =
+        activeCommandToken !== null &&
+        filteredCommands.some(
+          (command) =>
+            command.toLowerCase() === activeCommandToken.query.toLowerCase(),
+        );
+
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActiveCommandIndex((index) => (index + 1) % filteredCommands.length);
+        return;
+      }
+
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActiveCommandIndex(
+          (index) =>
+            (index - 1 + filteredCommands.length) % filteredCommands.length,
+        );
+        return;
+      }
+
+      if (e.key === "Tab" && selectedCommand) {
+        e.preventDefault();
+        insertCommand(`${commandPrefix}${selectedCommand}`);
+        return;
+      }
+
+      if (
+        e.key === "Enter" &&
+        !hasExactMatch &&
+        !e.shiftKey &&
+        !e.ctrlKey &&
+        selectedCommand
+      ) {
+        e.preventDefault();
+        insertCommand(`${commandPrefix}${selectedCommand}`);
+        return;
+      }
+
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setDismissedCompletionKey(completionKey);
+        return;
+      }
     }
 
     if (e.key === "Enter") {
@@ -303,23 +505,9 @@ export function MessageInput({
   // Handle slash command selection - insert command into text
   const handleSlashCommand = useCallback(
     (command: string) => {
-      // Check if this is a custom client-side command (strip leading "/")
-      const bare = command.startsWith("/") ? command.slice(1) : command;
-      if (onCustomCommand?.(bare)) {
-        return; // Custom command handled, don't insert text
-      }
-      // If text is empty or ends with whitespace, just append the command
-      // Otherwise, add a space before it
-      const trimmed = text.trimEnd();
-      if (trimmed) {
-        setText(`${trimmed} ${command} `);
-      } else {
-        setText(`${command} `);
-      }
-      // Focus the textarea so user can continue typing
-      textareaRef.current?.focus();
+      insertCommand(command);
     },
-    [text, setText, onCustomCommand],
+    [insertCommand],
   );
 
   return (
@@ -354,6 +542,31 @@ export function MessageInput({
       <div
         className={`message-input ${collapsed ? "message-input-collapsed" : ""} ${interimTranscript ? "voice-recording" : ""}`}
       >
+        {isCommandCompletionOpen && (
+          <div
+            className="command-completion-menu"
+            role="listbox"
+            tabIndex={-1}
+            aria-label={commandLabel}
+          >
+            {filteredCommands.map((command, index) => (
+              <button
+                key={command}
+                type="button"
+                className={`command-completion-item ${index === activeCommandIndex ? "active" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => insertCommand(`${commandPrefix}${command}`)}
+                role="option"
+                aria-selected={index === activeCommandIndex}
+              >
+                <span className="command-completion-name">
+                  {commandPrefix}
+                  {command}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
         <textarea
           ref={textareaRef}
           value={displayText}
@@ -361,9 +574,14 @@ export function MessageInput({
             // If user edits while recording, only update committed text
             // This clears interim since they're now typing
             setInterimTranscript("");
+            setDismissedCompletionKey(null);
+            setCursorPosition(e.target.selectionStart);
             setText(e.target.value);
           }}
           onKeyDown={handleKeyDown}
+          onKeyUp={updateCursorPosition}
+          onClick={updateCursorPosition}
+          onSelect={updateCursorPosition}
           onPaste={handlePaste}
           placeholder={
             externalCollapsed ? t("messageInputContinueAbove") : placeholder
@@ -435,8 +653,10 @@ export function MessageInput({
             onInterimTranscript={handleInterimTranscript}
             onListeningStart={() => textareaRef.current?.focus()}
             voiceDisabled={disabled}
-            slashCommands={slashCommands}
-            onSelectSlashCommand={handleSlashCommand}
+            commandPrefix={commandPrefix}
+            commandLabel={commandLabel}
+            commands={commands}
+            onSelectCommand={handleSlashCommand}
             contextUsage={contextUsage}
             projectId={projectId}
             sessionId={sessionId}

@@ -98,6 +98,21 @@ function isSessionSetupPrompt(item: UserPromptItem): boolean {
   return SESSION_SETUP_PREFIXES.some((prefix) => text.startsWith(prefix));
 }
 
+function isStrongSessionSetupPrompt(item: UserPromptItem): boolean {
+  const text = getPromptText(item.content).trimStart();
+  const lowerText = text.toLowerCase();
+
+  if (lowerText.startsWith("<environment_context>")) {
+    return true;
+  }
+
+  return (
+    lowerText.startsWith("# agents.md instructions") &&
+    (lowerText.includes("<instructions") ||
+      lowerText.includes("<environment_context>"))
+  );
+}
+
 function dedupeSessionSetupItems(items: UserPromptItem[]): UserPromptItem[] {
   const seen = new Set<string>();
   const deduped: UserPromptItem[] = [];
@@ -110,6 +125,85 @@ function dedupeSessionSetupItems(items: UserPromptItem[]): UserPromptItem[] {
   }
 
   return deduped;
+}
+
+function getUserPromptDedupeKey(item: UserPromptItem): string | null {
+  if (isSessionSetupPrompt(item)) {
+    return null;
+  }
+
+  const text = getPromptText(item.content).trim();
+  return text.length > 0 ? text : null;
+}
+
+function hasJsonlSource(item: UserPromptItem): boolean {
+  return item.sourceMessages.some((message) => message._source === "jsonl");
+}
+
+function preferUserPromptItem(
+  existing: UserPromptItem,
+  incoming: UserPromptItem,
+): UserPromptItem {
+  const existingIsJsonl = hasJsonlSource(existing);
+  const incomingIsJsonl = hasJsonlSource(incoming);
+
+  if (existingIsJsonl && !incomingIsJsonl) {
+    return existing;
+  }
+  if (incomingIsJsonl && !existingIsJsonl) {
+    return incoming;
+  }
+
+  return incoming;
+}
+
+function dedupeUserPromptsSeparatedOnlyBySetup(
+  items: RenderItem[],
+): RenderItem[] {
+  const result: RenderItem[] = [];
+
+  for (const item of items) {
+    if (item.type !== "user_prompt") {
+      result.push(item);
+      continue;
+    }
+
+    const itemKey = getUserPromptDedupeKey(item);
+    if (!itemKey) {
+      result.push(item);
+      continue;
+    }
+
+    let priorUserPromptIndex: number | null = null;
+    for (let index = result.length - 1; index >= 0; index -= 1) {
+      const candidate = result[index];
+      if (!candidate) {
+        continue;
+      }
+      if (candidate.type === "session_setup") {
+        continue;
+      }
+      if (candidate.type === "user_prompt") {
+        priorUserPromptIndex = index;
+      }
+      break;
+    }
+
+    if (priorUserPromptIndex !== null) {
+      const prior = result[priorUserPromptIndex];
+      if (
+        prior?.type === "user_prompt" &&
+        getUserPromptDedupeKey(prior) === itemKey
+      ) {
+        result[priorUserPromptIndex] = preferUserPromptItem(prior, item);
+        continue;
+      }
+    }
+
+    result.push(item);
+  }
+
+  return result;
 }
 
 function collapseSessionSetupRuns(items: RenderItem[]): RenderItem[] {
@@ -140,8 +234,12 @@ function collapseSessionSetupRuns(items: RenderItem[]): RenderItem[] {
     }
 
     // Preserve likely user-authored single setup-like messages mid-session.
-    // Collapse any run at session start and any multi-item run (typical resume preamble).
-    const shouldCollapse = setupItems.length > 1 || index === 0;
+    // Collapse start-of-session runs, multi-item resume preambles, and full
+    // Codex setup payloads that include real instructions/environment tags.
+    const shouldCollapse =
+      setupItems.length > 1 ||
+      index === 0 ||
+      setupItems.some(isStrongSessionSetupPrompt);
     if (shouldCollapse) {
       const dedupedSetupItems = dedupeSessionSetupItems(setupItems);
       const firstSetupItem = dedupedSetupItems[0];
@@ -170,7 +268,7 @@ function collapseSessionSetupRuns(items: RenderItem[]): RenderItem[] {
     index = runIndex;
   }
 
-  return result;
+  return dedupeUserPromptsSeparatedOnlyBySetup(result);
 }
 
 function processMessage(

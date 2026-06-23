@@ -1,24 +1,27 @@
 import { memo } from "react";
 import type { ContentBlock } from "../../types";
-import { UserPromptBlock } from "./UserPromptBlock";
 
 interface Props {
   title: string;
   prompts: Array<string | ContentBlock[]>;
 }
 
-function getPromptKey(prompt: string | ContentBlock[]): string {
+function getPromptText(prompt: string | ContentBlock[]): string {
   if (typeof prompt === "string") {
-    return `s:${prompt.length}:${prompt.slice(0, 80)}`;
+    return prompt;
   }
 
-  const text = prompt
+  return prompt
     .filter(
       (block): block is ContentBlock & { type: "text"; text: string } =>
         block.type === "text" && typeof block.text === "string",
     )
     .map((block) => block.text)
     .join("\n");
+}
+
+function getPromptKey(prompt: string | ContentBlock[]): string {
+  const text = getPromptText(prompt);
 
   return `a:${prompt.length}:${text.length}:${text.slice(0, 80)}`;
 }
@@ -34,6 +37,9 @@ export const SessionSetupBlock = memo(function SessionSetupBlock({
       <summary className="collapsible__summary">
         <span className="collapsible__icon">▸</span>
         <span>{title}</span>
+        {prompts.length > 1 && (
+          <span className="session-setup-count">{prompts.length}</span>
+        )}
       </summary>
       <div className="collapsible__content">
         {prompts.map((prompt) => {
@@ -42,7 +48,7 @@ export const SessionSetupBlock = memo(function SessionSetupBlock({
           promptKeyCounts.set(baseKey, count);
           return (
             <div className="session-setup-entry" key={`${baseKey}:${count}`}>
-              <UserPromptBlock content={prompt} />
+              <pre className="session-setup-text">{getPromptText(prompt)}</pre>
             </div>
           );
         })}

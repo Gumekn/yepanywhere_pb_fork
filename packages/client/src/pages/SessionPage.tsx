@@ -84,6 +84,62 @@ function SessionPageInvalidRoute() {
   return <div className="error">{t("sessionInvalidUrl")}</div>;
 }
 
+const CODEX_DOLLAR_COMMANDS = [
+  "permissions",
+  "ide",
+  "keymap",
+  "vim",
+  "sandbox-add-read-dir",
+  "agent",
+  "apps",
+  "plugins",
+  "hooks",
+  "clear",
+  "archive",
+  "delete",
+  "compact",
+  "copy",
+  "diff",
+  "exit",
+  "experimental",
+  "approve",
+  "memories",
+  "skills",
+  "import",
+  "feedback",
+  "init",
+  "logout",
+  "mcp",
+  "mention",
+  "model",
+  "fast",
+  "plan",
+  "goal",
+  "personality",
+  "ps",
+  "stop",
+  "fork",
+  "side",
+  "btw",
+  "raw",
+  "resume",
+  "new",
+  "quit",
+  "review",
+  "status",
+  "usage",
+  "debug-config",
+  "statusline",
+  "title",
+  "theme",
+];
+
+function isCodexCommandProvider(
+  provider: ProviderName | string | undefined | null,
+): provider is "codex" | "codex-oss" {
+  return provider === "codex" || provider === "codex-oss";
+}
+
 function isCodexAppServerProvider(
   provider: ProviderName | string | undefined | null,
 ): provider is "codex" {
@@ -438,9 +494,9 @@ function SessionPageContent({
   // Get provider capabilities based on session's provider
   const { providers } = useProviders();
   const currentProviderInfo = useMemo(() => {
-    if (!session?.provider) return null;
-    return providers.find((p) => p.name === session.provider) ?? null;
-  }, [providers, session?.provider]);
+    if (!effectiveProvider) return null;
+    return providers.find((p) => p.name === effectiveProvider) ?? null;
+  }, [effectiveProvider, providers]);
   // Default to true for backwards compatibility (except slash commands)
   const supportsPermissionMode =
     currentProviderInfo?.supportsPermissionMode ?? true;
@@ -448,6 +504,21 @@ function SessionPageContent({
     currentProviderInfo?.supportsThinkingToggle ?? true;
   const supportsSlashCommands =
     currentProviderInfo?.supportsSlashCommands ?? false;
+  const commandPrefix = isCodexCommandProvider(effectiveProvider) ? "$" : "/";
+  const commandLabel = isCodexCommandProvider(effectiveProvider)
+    ? "Codex commands"
+    : "Slash commands";
+  const activeCommands = useMemo(() => {
+    if (status.owner !== "self") return [];
+    if (isCodexCommandProvider(effectiveProvider)) return CODEX_DOLLAR_COMMANDS;
+    if (supportsSlashCommands) return allSlashCommands;
+    return [];
+  }, [
+    allSlashCommands,
+    effectiveProvider,
+    status.owner,
+    supportsSlashCommands,
+  ]);
 
   // Inline title editing state
   const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -1746,7 +1817,9 @@ function SessionPageContent({
                 onAttach={handleAttach}
                 onRemoveAttachment={handleRemoveAttachment}
                 uploadProgress={uploadProgress}
-                slashCommands={status.owner === "self" ? allSlashCommands : []}
+                commandPrefix={commandPrefix}
+                commandLabel={commandLabel}
+                commands={activeCommands}
                 onCustomCommand={handleCustomCommand}
               />
             )}

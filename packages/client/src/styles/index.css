@@ -944,6 +944,63 @@ h2 {
   align-items: center;
 }
 
+.new-session-effort-control {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  min-width: 0;
+}
+
+.new-session-effort-label {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+}
+
+.new-session-effort-options {
+  display: inline-grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  min-width: 220px;
+}
+
+.new-session-effort-option {
+  height: 32px;
+  min-width: 0;
+  padding: 0 var(--space-2);
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--border-input);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  text-align: center;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.new-session-effort-option:last-child {
+  border-right: 0;
+}
+
+.new-session-effort-option:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.new-session-effort-option.selected {
+  background: rgba(217, 119, 87, 0.12);
+  color: var(--app-yep-green);
+}
+
+.new-session-effort-option:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Toolbar button (attach, voice) */
 .toolbar-button {
   display: flex;
@@ -2507,6 +2564,8 @@ a.sidebar-nav-item {
 
 .session-setup-block .collapsible__summary {
   display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
   padding: 0.25rem 0.5rem;
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
@@ -2517,8 +2576,37 @@ a.sidebar-nav-item {
   margin-top: var(--space-2);
 }
 
-.session-setup-entry .message-user-prompt {
-  max-width: 100%;
+.session-setup-count {
+  min-width: 1.25rem;
+  padding: 0 0.25rem;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
+  text-align: center;
+}
+
+.session-setup-entry {
+  max-width: min(100%, 900px);
+  margin-bottom: var(--space-2);
+}
+
+.session-setup-text {
+  margin: 0;
+  padding: var(--space-2);
+  max-height: 18rem;
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-code);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* All other messages (assistant responses, tool results) - indented, no background */
@@ -2719,9 +2807,52 @@ a.sidebar-nav-item {
 
 /* Message input */
 .message-input {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+
+.command-completion-menu {
+  position: absolute;
+  bottom: calc(100% + var(--space-1));
+  left: 0;
+  width: min(360px, 100%);
+  max-height: min(280px, 45vh);
+  overflow-y: auto;
+  z-index: 120;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: var(--space-1);
+}
+
+.command-completion-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 32px;
+  padding: var(--space-2) var(--space-3);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.command-completion-item:hover,
+.command-completion-item.active {
+  background: var(--bg-hover);
+}
+
+.command-completion-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .message-input textarea {
@@ -6841,6 +6972,16 @@ button.context-usage-indicator--button:focus-visible {
   .new-session-defaults-bar {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .new-session-effort-control {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .new-session-effort-options {
+    width: 100%;
+    min-width: 0;
   }
 
   .new-session-defaults-button {

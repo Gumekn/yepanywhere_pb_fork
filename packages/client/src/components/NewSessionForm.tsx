@@ -21,8 +21,11 @@ import { useToastContext } from "../contexts/ToastContext";
 import { useConnection } from "../hooks/useConnection";
 import { useDraftPersistence } from "../hooks/useDraftPersistence";
 import {
+  EFFORT_LEVEL_OPTIONS,
+  type EffortLevel,
+  type ThinkingMode,
+  type ThinkingOption,
   getModelSetting,
-  getThinkingSetting,
   useModelSettings,
 } from "../hooks/useModelSettings";
 import {
@@ -52,6 +55,28 @@ const MODE_ORDER: PermissionMode[] = [
   "plan",
   "bypassPermissions",
 ];
+
+const EFFORT_LABEL_KEYS: Record<
+  EffortLevel,
+  | "newSessionEffortLow"
+  | "newSessionEffortMedium"
+  | "newSessionEffortHigh"
+  | "newSessionEffortMax"
+> = {
+  low: "newSessionEffortLow",
+  medium: "newSessionEffortMedium",
+  high: "newSessionEffortHigh",
+  max: "newSessionEffortMax",
+};
+
+function getThinkingOption(
+  mode: ThinkingMode,
+  effort: EffortLevel,
+): ThinkingOption {
+  if (mode === "off") return "off";
+  if (mode === "auto") return "auto";
+  return `on:${effort}`;
+}
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -130,7 +155,13 @@ export function NewSessionForm({
   const hasInitializedDefaultsRef = useRef(false);
 
   // Thinking toggle state
-  const { thinkingMode, cycleThinkingMode, thinkingLevel } = useModelSettings();
+  const {
+    thinkingMode,
+    setThinkingMode,
+    cycleThinkingMode,
+    thinkingLevel,
+    setEffortLevel,
+  } = useModelSettings();
 
   // Connection for uploads (uses WebSocket when enabled)
   const connection = useConnection();
@@ -323,6 +354,27 @@ export function NewSessionForm({
     setMode(selectedMode);
   };
 
+  const getEffortLabel = useCallback(
+    (effort: EffortLevel): string => {
+      if (
+        (selectedProvider === "codex" || selectedProvider === "codex-oss") &&
+        effort === "max"
+      ) {
+        return "xhigh";
+      }
+      return t(EFFORT_LABEL_KEYS[effort]);
+    },
+    [selectedProvider, t],
+  );
+
+  const handleSelectEffort = useCallback(
+    (effort: EffortLevel) => {
+      setEffortLevel(effort);
+      setThinkingMode("on");
+    },
+    [setEffortLevel, setThinkingMode],
+  );
+
   const handleSaveDefaults = useCallback(async () => {
     setIsSavingDefaults(true);
     try {
@@ -376,7 +428,7 @@ export function NewSessionForm({
       const uploadedFiles: UploadedFile[] = [];
 
       // Get model and thinking settings
-      const thinking = getThinkingSetting();
+      const thinking = getThinkingOption(thinkingMode, thinkingLevel);
       const sessionOptions = {
         mode,
         model: selectedModel ?? undefined,
@@ -698,7 +750,9 @@ export function NewSessionForm({
                   ? t("newSessionThinkingOff")
                   : thinkingMode === "auto"
                     ? t("newSessionThinkingAuto")
-                    : t("newSessionThinkingOn", { level: thinkingLevel })
+                    : t("newSessionThinkingOn", {
+                        level: getEffortLabel(thinkingLevel),
+                      })
               }
               aria-label={t("newSessionThinkingMode", { mode: thinkingMode })}
             >
@@ -757,6 +811,33 @@ export function NewSessionForm({
           )}
         </button>
       </div>
+      {supportsThinkingToggle && (
+        <div className="new-session-effort-control">
+          <span className="new-session-effort-label">
+            {t("newSessionEffortTitle")}
+          </span>
+          <div className="new-session-effort-options">
+            {EFFORT_LEVEL_OPTIONS.map((option) => {
+              const label = getEffortLabel(option.value);
+              const selected =
+                thinkingMode === "on" && thinkingLevel === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`new-session-effort-option ${selected ? "selected" : ""}`}
+                  onClick={() => handleSelectEffort(option.value)}
+                  disabled={isStarting}
+                  aria-pressed={selected}
+                  aria-label={`${t("newSessionEffortTitle")}: ${label}`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {pendingFiles.length > 0 && (
         <div className="pending-files-list">
           {pendingFiles.map((pf) => {

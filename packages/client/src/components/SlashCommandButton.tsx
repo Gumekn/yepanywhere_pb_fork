@@ -1,22 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 interface SlashCommandButtonProps {
-  /** Available slash commands (without the "/" prefix) */
+  /** Available commands (without the prefix) */
   commands: string[];
   /** Callback when a command is selected */
   onSelectCommand: (command: string) => void;
   /** Whether the button should be disabled */
   disabled?: boolean;
+  /** Prefix to display and insert before commands */
+  prefix?: "/" | "$";
+  /** Accessible label for the command menu */
+  label?: string;
 }
 
 /**
- * Button that shows available slash commands in a dropdown menu.
- * Selecting a command inserts "/{command}" into the message input.
+ * Button that shows available agent commands in a dropdown menu.
+ * Selecting a command inserts "{prefix}{command}" into the message input.
  */
 export function SlashCommandButton({
   commands,
   onSelectCommand,
   disabled,
+  prefix = "/",
+  label = "Commands",
 }: SlashCommandButtonProps) {
   const [isOpen, setIsOpen] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -58,10 +64,10 @@ export function SlashCommandButton({
 
   const handleCommandClick = useCallback(
     (command: string) => {
-      onSelectCommand(`/${command}`);
+      onSelectCommand(`${prefix}${command}`);
       setIsOpen(false);
     },
-    [onSelectCommand],
+    [onSelectCommand, prefix],
   );
 
   // Don't render if no commands available
@@ -77,19 +83,19 @@ export function SlashCommandButton({
         className={`slash-command-button ${isOpen ? "active" : ""}`}
         onClick={() => setIsOpen(!isOpen)}
         disabled={disabled}
-        title="Slash commands"
-        aria-label="Show slash commands"
+        title={label}
+        aria-label={`Show ${label.toLowerCase()}`}
         aria-expanded={isOpen}
         aria-haspopup="menu"
       >
-        <span className="slash-icon">/</span>
+        <span className="slash-icon">{prefix}</span>
       </button>
       {isOpen && (
         <div
           ref={menuRef}
           className="slash-command-menu"
           role="menu"
-          aria-label="Slash commands"
+          aria-label={label}
         >
           {commands.map((command) => (
             <button
@@ -99,7 +105,8 @@ export function SlashCommandButton({
               onClick={() => handleCommandClick(command)}
               role="menuitem"
             >
-              /{command}
+              {prefix}
+              {command}
             </button>
           ))}
         </div>

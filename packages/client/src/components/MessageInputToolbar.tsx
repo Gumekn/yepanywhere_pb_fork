@@ -32,9 +32,11 @@ export interface MessageInputToolbarProps {
   onListeningStart?: () => void;
   voiceDisabled?: boolean;
 
-  // Slash commands
-  slashCommands?: string[];
-  onSelectSlashCommand?: (command: string) => void;
+  // Agent commands
+  commandPrefix?: "/" | "$";
+  commandLabel?: string;
+  commands?: string[];
+  onSelectCommand?: (command: string) => void;
 
   // Context usage
   contextUsage?: ContextUsage;
@@ -75,8 +77,10 @@ export function MessageInputToolbar({
   onInterimTranscript,
   onListeningStart,
   voiceDisabled,
-  slashCommands = [],
-  onSelectSlashCommand,
+  commandPrefix = "/",
+  commandLabel = "Commands",
+  commands = [],
+  onSelectCommand,
   contextUsage,
   projectId,
   sessionId,
@@ -191,11 +195,13 @@ export function MessageInputToolbar({
             disabled={voiceDisabled}
           />
         )}
-        {onSelectSlashCommand && (
+        {onSelectCommand && (
           <SlashCommandButton
-            commands={slashCommands}
-            onSelectCommand={onSelectSlashCommand}
+            commands={commands}
+            onSelectCommand={onSelectCommand}
             disabled={voiceDisabled}
+            prefix={commandPrefix}
+            label={commandLabel}
           />
         )}
       </div>

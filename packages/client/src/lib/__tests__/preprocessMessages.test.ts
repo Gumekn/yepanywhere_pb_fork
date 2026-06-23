@@ -576,6 +576,48 @@ describe("preprocessMessages", () => {
     });
   });
 
+  it("collapses strong setup prompts between duplicate initial user prompts", () => {
+    const setupContent =
+      "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nfoo\n</INSTRUCTIONS><environment_context>\n  <cwd>/repo</cwd>\n</environment_context>";
+    const prompt = "Implement the requested change";
+    const messages: Message[] = [
+      {
+        id: "msg-user-sdk",
+        role: "user",
+        content: prompt,
+        timestamp: "2024-01-01T00:00:00Z",
+        _source: "sdk",
+      },
+      {
+        id: "msg-setup",
+        role: "user",
+        content: setupContent,
+        timestamp: "2024-01-01T00:00:01Z",
+      },
+      {
+        id: "msg-user-jsonl",
+        role: "user",
+        content: prompt,
+        timestamp: "2024-01-01T00:00:02Z",
+        _source: "jsonl",
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({
+      type: "user_prompt",
+      id: "msg-user-jsonl",
+      content: prompt,
+    });
+    expect(items[1]).toMatchObject({
+      type: "session_setup",
+      title: "Session setup",
+      prompts: [setupContent],
+    });
+  });
+
   it("collapses repeated setup prompts inserted after resume", () => {
     const messages: Message[] = [
       {
