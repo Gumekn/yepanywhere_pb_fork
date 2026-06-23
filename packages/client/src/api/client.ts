@@ -12,6 +12,8 @@ import type {
   PendingInputType,
   ProviderInfo,
   ProviderName,
+  ReportDocumentResponse,
+  ReportsListResponse,
   SlashCommand,
   ThinkingOption,
   UploadedFile,
@@ -900,6 +902,16 @@ export const api = {
     const params = new URLSearchParams({ path });
     if (download) params.set("download", "true");
     return `${API_BASE}/projects/${projectId}/files/raw?${params.toString()}`;
+  },
+
+  // Reports API
+  getReports: () => fetchJSON<ReportsListResponse>("/reports"),
+
+  getReport: (path: string) => {
+    const params = new URLSearchParams({ path });
+    return fetchJSON<ReportDocumentResponse>(
+      `/reports/document?${params.toString()}`,
+    );
   },
 
   /**

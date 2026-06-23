@@ -57,6 +57,7 @@ import { createProcessesRoutes } from "./routes/processes.js";
 import { createProjectsRoutes } from "./routes/projects.js";
 import { createProvidersRoutes } from "./routes/providers.js";
 import { createRecentsRoutes } from "./routes/recents.js";
+import { createReportsRoutes } from "./routes/reports.js";
 import { createSearchRoutes } from "./routes/search.js";
 import { createServerAdminRoutes } from "./routes/server-admin.js";
 import { createServerInfoRoutes } from "./routes/server-info.js";
@@ -177,6 +178,8 @@ export interface AppOptions {
   voiceInputEnabled?: boolean;
   /** Allowed directory prefixes for serving local images. Default: ["/tmp"] */
   allowedImagePaths?: string[];
+  /** Directory containing Markdown report documents for the Reports page. */
+  reportsDir?: string;
   /**
    * Optional reverse-proxy URL prefix (e.g. "/yep" when Caddy mounts us at
    * https://host/yep/...). Empty string / omitted = serve at root.
@@ -691,6 +694,12 @@ export function createApp(options: AppOptions): AppResult {
       }),
     );
   }
+
+  // Reports routes (read-only Markdown documents)
+  app.route(
+    "/api/reports",
+    createReportsRoutes({ reportsDir: options.reportsDir }),
+  );
 
   // Provider routes (multi-provider detection)
   app.route(

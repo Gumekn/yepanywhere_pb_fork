@@ -268,6 +268,41 @@ export interface FileContentResponse {
 }
 
 /**
+ * Markdown report document surfaced by the Reports page.
+ */
+export interface ReportDocument {
+  /** Path relative to the configured reports directory */
+  path: string;
+  /** Display title, usually the first H1/H2 in the document */
+  title: string;
+  /** File size in bytes */
+  size: number;
+  /** Last modified timestamp */
+  modifiedAt: string;
+}
+
+/**
+ * Response from the report document listing API.
+ */
+export interface ReportsListResponse {
+  /** Configured root directory for report markdown files */
+  rootPath: string;
+  /** Markdown documents found under the root directory */
+  documents: ReportDocument[];
+}
+
+/**
+ * Rendered Markdown report returned by the report document API.
+ */
+export interface ReportDocumentResponse {
+  metadata: ReportDocument;
+  /** Raw markdown content */
+  content: string;
+  /** Server-rendered safe HTML */
+  renderedHtml: string;
+}
+
+/**
  * A hunk from a unified diff patch.
  * Contains line numbers and the actual diff lines with prefixes.
  */

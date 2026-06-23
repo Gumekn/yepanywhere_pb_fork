@@ -62,6 +62,11 @@ const ProjectsPage = lazy(() =>
     default: module.ProjectsPage,
   })),
 );
+const ReportsPage = lazy(() =>
+  import("./pages/ReportsPage").then((module) => ({
+    default: module.ReportsPage,
+  })),
+);
 const SearchPage = lazy(() =>
   import("./pages/SearchPage").then((module) => ({
     default: module.SearchPage,
@@ -115,6 +120,7 @@ createRoot(rootElement).render(
                 <Route path="/projects" element={<ProjectsPage />} />
                 <Route path="/sessions" element={<GlobalSessionsPage />} />
                 <Route path="/search" element={<SearchPage />} />
+                <Route path="/reports" element={<ReportsPage />} />
                 <Route path="/agents" element={<AgentsPage />} />
                 <Route path="/inbox" element={<InboxPage />} />
                 <Route path="/settings" element={<SettingsLayout />} />
