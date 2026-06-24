@@ -1,13 +1,15 @@
-import { render, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  type InboxItem,
   InboxProvider,
   type InboxResponse,
   useInboxContext,
 } from "../InboxContext";
 
-const { mockGetInbox } = vi.hoisted(() => ({
+const { mockGetInbox, mockUseFileActivity } = vi.hoisted(() => ({
   mockGetInbox: vi.fn<() => Promise<InboxResponse>>(),
+  mockUseFileActivity: vi.fn(),
 }));
 
 vi.mock("../../api/client", () => ({
@@ -17,7 +19,7 @@ vi.mock("../../api/client", () => ({
 }));
 
 vi.mock("../../hooks/useFileActivity", () => ({
-  useFileActivity: vi.fn(),
+  useFileActivity: mockUseFileActivity,
 }));
 
 function InboxConsumer() {
@@ -31,21 +33,50 @@ function InboxConsumer() {
   );
 }
 
+function InboxTitleConsumer() {
+  const { unread24h } = useInboxContext();
+  return <span data-testid="title">{unread24h[0]?.sessionTitle ?? ""}</span>;
+}
+
+function emptyInbox(overrides: Partial<InboxResponse> = {}): InboxResponse {
+  return {
+    needsAttention: [],
+    active: [],
+    recentActivity: [],
+    unread8h: [],
+    unread24h: [],
+    ...overrides,
+  };
+}
+
+const inboxItem: InboxItem = {
+  sessionId: "session-1",
+  projectId: "project-1",
+  projectName: "Project 1",
+  sessionTitle: "Existing session title",
+  updatedAt: "2026-06-22T08:00:00.000Z",
+  hasUnread: true,
+};
+
 describe("InboxProvider", () => {
+  let activityHandlers: {
+    onSessionStatusChange?: (event: unknown) => void;
+  };
+
   beforeEach(() => {
     mockGetInbox.mockReset();
-    mockGetInbox.mockResolvedValue({
-      needsAttention: [],
-      active: [],
-      recentActivity: [],
-      unread8h: [],
-      unread24h: [],
+    mockUseFileActivity.mockReset();
+    activityHandlers = {};
+    mockUseFileActivity.mockImplementation((handlers) => {
+      activityHandlers = handlers;
     });
+    mockGetInbox.mockResolvedValue(emptyInbox());
     window.history.replaceState({}, "", "/inbox");
   });
 
   afterEach(() => {
     vi.clearAllMocks();
+    vi.useRealTimers();
   });
 
   it("fetches on mount when enabled", async () => {
@@ -72,5 +103,48 @@ describe("InboxProvider", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mockGetInbox).not.toHaveBeenCalled();
+  });
+
+  it("keeps an existing inbox title when a refetch returns Untitled", async () => {
+    mockGetInbox
+      .mockResolvedValueOnce(emptyInbox({ unread24h: [inboxItem] }))
+      .mockResolvedValueOnce(
+        emptyInbox({
+          unread24h: [{ ...inboxItem, sessionTitle: "Untitled" }],
+        }),
+      );
+
+    render(
+      <InboxProvider>
+        <InboxTitleConsumer />
+      </InboxProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("title").textContent).toBe(
+        "Existing session title",
+      );
+    });
+
+    vi.useFakeTimers();
+    act(() => {
+      activityHandlers.onSessionStatusChange?.({
+        type: "session-status-changed",
+        sessionId: "session-1",
+        projectId: "project-1",
+        ownership: { owner: "none" },
+        timestamp: "2026-06-22T08:00:01.000Z",
+      });
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+      await Promise.resolve();
+    });
+
+    expect(mockGetInbox).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("title").textContent).toBe(
+      "Existing session title",
+    );
   });
 });

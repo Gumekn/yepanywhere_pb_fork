@@ -86,6 +86,7 @@ describe("useGlobalSessions", () => {
   let activityHandlers: {
     onSessionCreated?: (event: SessionCreatedEvent) => void;
     onSessionUpdated?: (event: SessionUpdatedEvent) => void;
+    onReconnect?: () => void;
   };
 
   beforeEach(() => {
@@ -168,6 +169,61 @@ describe("useGlobalSessions", () => {
 
     expect(result.current.sessions[0]?.title).toBe("Title from event");
     expect(mockGetGlobalSessions).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an existing title when session-updated reports a transient null title", async () => {
+    const resolvedSession = {
+      ...baseSession,
+      title: "Existing session title",
+      messageCount: 3,
+    };
+    mockGetGlobalSessions.mockResolvedValue(response([resolvedSession]));
+
+    const { result } = renderHook(() => useGlobalSessions({ limit: 50 }));
+    await flushPromises();
+
+    act(() => {
+      activityHandlers.onSessionUpdated?.({
+        type: "session-updated",
+        sessionId: baseSession.id,
+        projectId,
+        title: null,
+        messageCount: 4,
+        updatedAt: "2026-06-22T08:00:01.000Z",
+        timestamp: "2026-06-22T08:00:01.000Z",
+      });
+    });
+
+    expect(result.current.sessions[0]?.title).toBe("Existing session title");
+    expect(result.current.sessions[0]?.messageCount).toBe(4);
+  });
+
+  it("keeps an existing title when a refetch returns a transient null title", async () => {
+    const resolvedSession = {
+      ...baseSession,
+      title: "Existing session title",
+      messageCount: 3,
+    };
+    const transientUntitledSession = {
+      ...baseSession,
+      title: null,
+      messageCount: 4,
+      updatedAt: "2026-06-22T08:00:01.000Z",
+    };
+    mockGetGlobalSessions
+      .mockResolvedValueOnce(response([resolvedSession]))
+      .mockResolvedValueOnce(response([transientUntitledSession]));
+
+    const { result } = renderHook(() => useGlobalSessions({ limit: 50 }));
+    await flushPromises();
+
+    await act(async () => {
+      await activityHandlers.onReconnect?.();
+    });
+    await flushPromises();
+
+    expect(result.current.sessions[0]?.title).toBe("Existing session title");
+    expect(result.current.sessions[0]?.messageCount).toBe(4);
   });
 
   it("uses the latest filters when a pending title refetch fires", async () => {

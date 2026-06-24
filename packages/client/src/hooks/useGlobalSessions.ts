@@ -33,6 +33,21 @@ function needsPendingTitleRefetch(session: {
   return !hasResolvedTitle(session) || session.messageCount === 0;
 }
 
+function mergeFetchedSession(
+  existing: GlobalSessionItem,
+  incoming: GlobalSessionItem,
+): GlobalSessionItem {
+  if (hasResolvedTitle(existing) && !hasResolvedTitle(incoming)) {
+    return {
+      ...incoming,
+      title: existing.title,
+      customTitle: existing.customTitle ?? incoming.customTitle,
+    };
+  }
+
+  return incoming;
+}
+
 export interface UseGlobalSessionsOptions {
   projectId?: string | null;
   searchQuery?: string;
@@ -153,7 +168,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           // Update existing sessions in their current order
           const updated = prev.map((existing) => {
             const newData = newDataMap.get(existing.id);
-            return newData ?? existing;
+            return newData ? mergeFetchedSession(existing, newData) : existing;
           });
 
           // Filter out sessions that no longer exist
@@ -421,10 +436,15 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       setSessions((prev) =>
         prev.map((session) => {
           if (session.id !== event.sessionId) return session;
+          const ignoreUnresolvedTitle =
+            event.title !== undefined &&
+            !event.title?.trim() &&
+            hasResolvedTitle(session);
 
           return {
             ...session,
-            ...(event.title !== undefined && { title: event.title }),
+            ...(event.title !== undefined &&
+              !ignoreUnresolvedTitle && { title: event.title }),
             ...(event.messageCount !== undefined && {
               messageCount: event.messageCount,
             }),

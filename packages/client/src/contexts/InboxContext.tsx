@@ -42,6 +42,42 @@ export type InboxTier = (typeof INBOX_TIERS)[number];
  */
 type TierOrder = Record<InboxTier, string[]>;
 
+function isFallbackSessionTitle(title: string | null | undefined): boolean {
+  const normalized = title?.trim().toLowerCase() ?? "";
+  return (
+    normalized === "" ||
+    normalized === "untitled" ||
+    normalized === "untitled session"
+  );
+}
+
+function collectInboxItemsBySessionId(
+  data: InboxResponse,
+): Map<string, InboxItem> {
+  const items = new Map<string, InboxItem>();
+  for (const tier of INBOX_TIERS) {
+    for (const item of data[tier]) {
+      items.set(item.sessionId, item);
+    }
+  }
+  return items;
+}
+
+function preserveResolvedTitle(
+  next: InboxItem,
+  current: InboxItem | undefined,
+): InboxItem {
+  if (
+    current &&
+    !isFallbackSessionTitle(current.sessionTitle) &&
+    isFallbackSessionTitle(next.sessionTitle)
+  ) {
+    return { ...next, sessionTitle: current.sessionTitle };
+  }
+
+  return next;
+}
+
 /**
  * Merges new inbox data with existing tier order for UI stability.
  *
@@ -54,6 +90,7 @@ type TierOrder = Record<InboxTier, string[]>;
 function mergeWithStableOrder(
   newData: InboxResponse,
   currentOrder: TierOrder,
+  currentData: InboxResponse,
 ): InboxResponse {
   const result: InboxResponse = {
     needsAttention: [],
@@ -62,6 +99,7 @@ function mergeWithStableOrder(
     unread8h: [],
     unread24h: [],
   };
+  const currentItemsBySessionId = collectInboxItemsBySessionId(currentData);
 
   for (const tier of INBOX_TIERS) {
     const newItems = newData[tier];
@@ -75,7 +113,9 @@ function mergeWithStableOrder(
     for (const sessionId of existingOrder) {
       const item = newItemsMap.get(sessionId);
       if (item) {
-        orderedItems.push(item);
+        orderedItems.push(
+          preserveResolvedTitle(item, currentItemsBySessionId.get(sessionId)),
+        );
       }
     }
 
@@ -83,7 +123,12 @@ function mergeWithStableOrder(
     const existingSet = new Set(existingOrder);
     for (const item of newItems) {
       if (!existingSet.has(item.sessionId)) {
-        orderedItems.push(item);
+        orderedItems.push(
+          preserveResolvedTitle(
+            item,
+            currentItemsBySessionId.get(item.sessionId),
+          ),
+        );
       }
     }
 
@@ -212,10 +257,16 @@ export function InboxProvider({
         hasInitialLoadRef.current = true;
       } else {
         // Subsequent fetches: merge with stable ordering
-        const mergedData = mergeWithStableOrder(data, tierOrderRef.current);
-        setInbox(mergedData);
-        // Update tier order to include any new items
-        tierOrderRef.current = extractTierOrder(mergedData);
+        setInbox((currentInbox) => {
+          const mergedData = mergeWithStableOrder(
+            data,
+            tierOrderRef.current,
+            currentInbox,
+          );
+          // Update tier order to include any new items
+          tierOrderRef.current = extractTierOrder(mergedData);
+          return mergedData;
+        });
       }
 
       setError(null);
