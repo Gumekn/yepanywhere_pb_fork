@@ -1,9 +1,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+  ALL_PERMISSION_MODES,
+  DEFAULT_PERMISSION_MODE,
+  type PermissionMode,
+} from "@yep-anywhere/shared";
 import type { Level as LogLevel } from "pino";
+import { CODEX_STANDARD_MCP_APP_SERVER_ARGS } from "./codex/mcp-profile.js";
 import { getDefaultCodexSessionsDir } from "./projects/codex-scanner.js";
-import type { PermissionMode } from "./sdk/types.js";
 
 /**
  * Get the data directory for yep-anywhere state files.
@@ -398,10 +403,14 @@ function parseBooleanOrDefault(
  * Parse permission mode from string or return default.
  */
 function parsePermissionMode(value: string | undefined): PermissionMode {
-  if (value === "bypassPermissions" || value === "acceptEdits") {
-    return value;
+  const normalized = value?.trim();
+  if (
+    normalized &&
+    ALL_PERMISSION_MODES.includes(normalized as PermissionMode)
+  ) {
+    return normalized as PermissionMode;
   }
-  return "default";
+  return DEFAULT_PERMISSION_MODE;
 }
 
 function parseCodexBridgeMode(
@@ -424,12 +433,7 @@ function parseCodexBridgeMode(
 }
 
 const DEFAULT_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS = [
-  "--disable",
-  "apps",
-  "--disable",
-  "plugins",
-  "-c",
-  "mcp_servers.chrome-devtools.enabled=false",
+  ...CODEX_STANDARD_MCP_APP_SERVER_ARGS,
 ];
 
 function parseCodexBridgeUpstreamArgs(

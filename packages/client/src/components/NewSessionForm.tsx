@@ -1,4 +1,6 @@
 import {
+  type CodexMcpMode,
+  DEFAULT_PERMISSION_MODE,
   type ModelInfo,
   type ProviderInfo,
   type ProviderName,
@@ -50,11 +52,13 @@ interface PendingFile {
 }
 
 const MODE_ORDER: PermissionMode[] = [
+  "auto",
   "default",
   "acceptEdits",
   "plan",
   "bypassPermissions",
 ];
+const CODEX_MCP_MODE_ORDER: CodexMcpMode[] = ["standard", "full"];
 
 const EFFORT_LABEL_KEYS: Record<
   EffortLevel,
@@ -131,11 +135,13 @@ export function NewSessionForm({
   const [message, setMessage, draftControls] = useDraftPersistence(
     `draft-new-session-${projectId}`,
   );
-  const [mode, setMode] = useState<PermissionMode>("default");
+  const [mode, setMode] = useState<PermissionMode>(DEFAULT_PERMISSION_MODE);
   const [selectedProvider, setSelectedProvider] = useState<ProviderName | null>(
     null,
   );
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [selectedCodexMcpMode, setSelectedCodexMcpMode] =
+    useState<CodexMcpMode>("standard");
   // null = local, string = remote host
   const [selectedExecutor, setSelectedExecutor] = useState<string | null>(null);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
@@ -183,16 +189,26 @@ export function NewSessionForm({
   const availableProviders = getAvailableProviders(providers);
   const resolvedPlaceholder = placeholder ?? t("newSessionPlaceholder");
   const modeLabels: Record<PermissionMode, string> = {
+    auto: t("modeAutoLabel"),
     default: t("modeDefaultLabel"),
     acceptEdits: t("modeAcceptEditsLabel"),
     plan: t("modePlanLabel"),
     bypassPermissions: t("modeBypassPermissionsLabel"),
   };
   const modeDescriptions: Record<PermissionMode, string> = {
+    auto: t("modeAutoDescription"),
     default: t("modeDefaultDescription"),
     acceptEdits: t("modeAcceptEditsDescription"),
     plan: t("modePlanDescription"),
     bypassPermissions: t("modeBypassPermissionsDescription"),
+  };
+  const codexMcpModeLabels: Record<CodexMcpMode, string> = {
+    standard: t("newSessionCodexMcpStandardLabel"),
+    full: t("newSessionCodexMcpFullLabel"),
+  };
+  const codexMcpModeDescriptions: Record<CodexMcpMode, string> = {
+    standard: t("newSessionCodexMcpStandardDescription"),
+    full: t("newSessionCodexMcpFullDescription"),
   };
 
   // Get models and capabilities for the currently selected provider
@@ -239,7 +255,8 @@ export function NewSessionForm({
     setSelectedModel(
       getPreferredModelId(initialProvider.models ?? [], savedDefaults?.model),
     );
-    setMode(savedDefaults?.permissionMode ?? "default");
+    setSelectedCodexMcpMode(savedDefaults?.codexMcpMode ?? "standard");
+    setMode(savedDefaults?.permissionMode ?? DEFAULT_PERMISSION_MODE);
   }, [
     availableProviders,
     providers,
@@ -354,6 +371,10 @@ export function NewSessionForm({
     setMode(selectedMode);
   };
 
+  const handleCodexMcpModeSelect = (selectedMode: CodexMcpMode) => {
+    setSelectedCodexMcpMode(selectedMode);
+  };
+
   const getEffortLabel = useCallback(
     (effort: EffortLevel): string => {
       if (
@@ -382,6 +403,8 @@ export function NewSessionForm({
         provider: selectedProvider ?? undefined,
         model: selectedModel ?? undefined,
         permissionMode: mode,
+        codexMcpMode:
+          selectedProvider === "codex" ? selectedCodexMcpMode : undefined,
       });
       showToast(t("newSessionDefaultsSaved"), "success");
     } catch (err) {
@@ -395,6 +418,7 @@ export function NewSessionForm({
     }
   }, [
     mode,
+    selectedCodexMcpMode,
     selectedModel,
     selectedProvider,
     showToast,
@@ -434,6 +458,8 @@ export function NewSessionForm({
         model: selectedModel ?? undefined,
         thinking,
         provider: selectedProvider ?? undefined,
+        codexMcpMode:
+          selectedProvider === "codex" ? selectedCodexMcpMode : undefined,
         executor: selectedExecutor ?? undefined,
       };
 
@@ -633,11 +659,16 @@ export function NewSessionForm({
 
   const hasContent = message.trim() || pendingFiles.length > 0;
   const savedDefaults = settings?.newSessionDefaults;
+  const codexMcpDefaultsMatch =
+    selectedProvider === "codex"
+      ? (savedDefaults?.codexMcpMode ?? "standard") === selectedCodexMcpMode
+      : true;
   const defaultsMatchCurrent =
     (savedDefaults?.provider ?? undefined) ===
       (selectedProvider ?? undefined) &&
     (savedDefaults?.model ?? undefined) === (selectedModel ?? undefined) &&
-    (savedDefaults?.permissionMode ?? "default") === mode;
+    (savedDefaults?.permissionMode ?? DEFAULT_PERMISSION_MODE) === mode &&
+    codexMcpDefaultsMatch;
 
   // Split providers into available vs unavailable so the unavailable ones can
   // be tucked behind a toggle (keeps the grid from looking ragged).
@@ -953,6 +984,38 @@ export function NewSessionForm({
             multiSelect={false}
             placeholder={t("newSessionModelPlaceholder")}
           />
+        </div>
+      )}
+
+      {/* Codex MCP Profile - matches cf / cf -mcp launch modes */}
+      {selectedProvider === "codex" && (
+        <div className="new-session-codex-mcp-section">
+          <h3>{t("newSessionCodexMcpTitle")}</h3>
+          <div className="codex-mcp-options">
+            {CODEX_MCP_MODE_ORDER.map((mcpMode) => (
+              <button
+                key={mcpMode}
+                type="button"
+                className={`mode-option codex-mcp-option ${selectedCodexMcpMode === mcpMode ? "selected" : ""}`}
+                onClick={() => handleCodexMcpModeSelect(mcpMode)}
+                disabled={isStarting}
+                aria-pressed={selectedCodexMcpMode === mcpMode}
+              >
+                <span
+                  className={`mode-option-dot codex-mcp-${mcpMode}`}
+                  aria-hidden="true"
+                />
+                <div className="mode-option-content">
+                  <span className="mode-option-label">
+                    {codexMcpModeLabels[mcpMode]}
+                  </span>
+                  <span className="mode-option-desc">
+                    {codexMcpModeDescriptions[mcpMode]}
+                  </span>
+                </div>
+              </button>
+            ))}
+          </div>
         </div>
       )}
 

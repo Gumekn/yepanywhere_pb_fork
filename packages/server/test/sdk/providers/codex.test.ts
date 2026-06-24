@@ -85,6 +85,68 @@ describe("CodexProvider", () => {
   });
 
   describe("startSession", () => {
+    function writeFakeCodexAppServer(tempDir: string): string {
+      const fakeCodexPath = join(tempDir, "fake-codex.js");
+      writeFileSync(
+        fakeCodexPath,
+        `#!/usr/bin/env node
+const fs = require("node:fs");
+let buffer = "";
+
+function send(id, result) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
+}
+
+function handle(message) {
+  if (message.method === "initialize") {
+    send(message.id, { userAgent: "fake-codex" });
+    return;
+  }
+  if (message.method !== "thread/start" && message.method !== "thread/resume") {
+    return;
+  }
+  fs.writeFileSync(
+    process.env.CODEX_FAKE_CAPTURE,
+    JSON.stringify({
+      argv: process.argv.slice(2),
+      method: message.method,
+      params: message.params,
+    }),
+  );
+  send(message.id, {
+    thread: {
+      id: message.params.threadId || "thread-new",
+      cwd: message.params.cwd,
+      modelProvider: "openai",
+      status: { type: "idle" },
+    },
+    model: "gpt-5.5",
+    modelProvider: "openai",
+    serviceTier: null,
+    cwd: message.params.cwd,
+    reasoningEffort: null,
+  });
+}
+
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newlineIndex = buffer.indexOf("\\n");
+  while (newlineIndex !== -1) {
+    const line = buffer.slice(0, newlineIndex).trim();
+    buffer = buffer.slice(newlineIndex + 1);
+    if (line) {
+      handle(JSON.parse(line));
+    }
+    newlineIndex = buffer.indexOf("\\n");
+  }
+});
+`,
+      );
+      chmodSync(fakeCodexPath, 0o755);
+      return fakeCodexPath;
+    }
+
     it("should return session object with required methods", async () => {
       const session = await provider.startSession({
         cwd: "/tmp",
@@ -126,65 +188,12 @@ describe("CodexProvider", () => {
       const tempDir = mkdtempSync(
         join(require("node:os").tmpdir(), "codex-app-server-"),
       );
-      const fakeCodexPath = join(tempDir, "fake-codex.js");
+      const fakeCodexPath = writeFakeCodexAppServer(tempDir);
       const capturePath = join(tempDir, "capture.json");
       const previousCapturePath = process.env.CODEX_FAKE_CAPTURE;
       let session: Awaited<ReturnType<CodexProvider["startSession"]>> | null =
         null;
 
-      writeFileSync(
-        fakeCodexPath,
-        `#!/usr/bin/env node
-const fs = require("node:fs");
-let buffer = "";
-
-function send(id, result) {
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
-}
-
-function handle(message) {
-  if (message.method === "initialize") {
-    send(message.id, { userAgent: "fake-codex" });
-    return;
-  }
-  if (message.method !== "thread/start" && message.method !== "thread/resume") {
-    return;
-  }
-  fs.writeFileSync(
-    process.env.CODEX_FAKE_CAPTURE,
-    JSON.stringify({ method: message.method, params: message.params }),
-  );
-  send(message.id, {
-    thread: {
-      id: message.params.threadId || "thread-new",
-      cwd: message.params.cwd,
-      modelProvider: "openai",
-      status: { type: "idle" },
-    },
-    model: "gpt-5.5",
-    modelProvider: "openai",
-    serviceTier: null,
-    cwd: message.params.cwd,
-    reasoningEffort: null,
-  });
-}
-
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  buffer += chunk;
-  let newlineIndex = buffer.indexOf("\\n");
-  while (newlineIndex !== -1) {
-    const line = buffer.slice(0, newlineIndex).trim();
-    buffer = buffer.slice(newlineIndex + 1);
-    if (line) {
-      handle(JSON.parse(line));
-    }
-    newlineIndex = buffer.indexOf("\\n");
-  }
-});
-`,
-      );
-      chmodSync(fakeCodexPath, 0o755);
       process.env.CODEX_FAKE_CAPTURE = capturePath;
 
       try {
@@ -203,9 +212,67 @@ process.stdin.on("data", (chunk) => {
           model: "gpt-5.5",
         });
         expect(JSON.parse(readFileSync(capturePath, "utf8"))).toMatchObject({
+          argv: [
+            "app-server",
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            "-c",
+            "mcp_servers.chrome-devtools.enabled=false",
+            "--listen",
+            "stdio://",
+          ],
           method: "thread/resume",
           params: {
             threadId: "thread-existing",
+            model: null,
+            modelProvider: "openai",
+            cwd: tempDir,
+          },
+        });
+      } finally {
+        session?.abort();
+        if (previousCapturePath === undefined) {
+          process.env.CODEX_FAKE_CAPTURE = undefined;
+        } else {
+          process.env.CODEX_FAKE_CAPTURE = previousCapturePath;
+        }
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("uses full Codex MCP profile without the cf default disable args", async () => {
+      const tempDir = mkdtempSync(
+        join(require("node:os").tmpdir(), "codex-app-server-"),
+      );
+      const fakeCodexPath = writeFakeCodexAppServer(tempDir);
+      const capturePath = join(tempDir, "capture.json");
+      const previousCapturePath = process.env.CODEX_FAKE_CAPTURE;
+      let session: Awaited<ReturnType<CodexProvider["startSession"]>> | null =
+        null;
+
+      process.env.CODEX_FAKE_CAPTURE = capturePath;
+
+      try {
+        const provider = new CodexProvider({ codexPath: fakeCodexPath });
+        session = await provider.startSession({
+          cwd: tempDir,
+          initialMessage: { text: "hello" },
+          codexMcpMode: "full",
+        });
+
+        const first = await session.iterator.next();
+        expect(first.value).toMatchObject({
+          type: "system",
+          subtype: "init",
+          session_id: "thread-new",
+          model: "gpt-5.5",
+        });
+        expect(JSON.parse(readFileSync(capturePath, "utf8"))).toMatchObject({
+          argv: ["app-server", "--listen", "stdio://"],
+          method: "thread/start",
+          params: {
             model: null,
             modelProvider: "openai",
             cwd: tempDir,
@@ -664,5 +731,48 @@ describe("CodexProvider Configuration", () => {
 
     expect(provider.name).toBe("codex");
     expect(provider.displayName).toBe("Codex");
+  });
+
+  describe("normalizeModelList", () => {
+    type AppServerModel = {
+      id: string;
+      model?: string;
+      displayName?: string;
+      hidden?: boolean;
+      isDefault?: boolean;
+      upgrade?: string | null;
+    };
+    const normalize = (models: AppServerModel[]) =>
+      (
+        new CodexProvider() as unknown as {
+          normalizeModelList: (m: AppServerModel[]) => Array<{ id: string }>;
+        }
+      ).normalizeModelList(models);
+
+    it("ranks the account default model first", () => {
+      const result = normalize([
+        { id: "gpt-5.4", model: "gpt-5.4", displayName: "GPT-5.4" },
+        {
+          id: "gpt-5.5",
+          model: "gpt-5.5",
+          displayName: "GPT-5.5",
+          isDefault: true,
+        },
+      ]);
+      expect(result[0]?.id).toBe("gpt-5.5");
+    });
+
+    it("filters out hidden models", () => {
+      const result = normalize([
+        { id: "gpt-5.5", model: "gpt-5.5", displayName: "GPT-5.5" },
+        {
+          id: "gpt-5.3-codex",
+          model: "gpt-5.3-codex",
+          displayName: "GPT-5.3-Codex",
+          hidden: true,
+        },
+      ]);
+      expect(result.map((m) => m.id)).toEqual(["gpt-5.5"]);
+    });
   });
 });

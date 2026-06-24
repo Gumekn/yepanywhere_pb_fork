@@ -1,6 +1,7 @@
 import type {
   AgentActivity,
   BrowserProfilesResponse,
+  CodexMcpMode,
   ConnectionsResponse,
   ContextStatusResponse,
   ContextUsage,
@@ -164,6 +165,7 @@ export interface SessionOptions {
   model?: string;
   thinking?: ThinkingOption;
   provider?: ProviderName;
+  codexMcpMode?: CodexMcpMode;
   /** SSH host alias for remote execution (undefined = local) */
   executor?: string;
 }
@@ -584,6 +586,7 @@ export const api = {
         model: options?.model,
         thinking: options?.thinking,
         provider: options?.provider,
+        codexMcpMode: options?.codexMcpMode,
         executor: options?.executor,
         attachments,
       }),
@@ -606,6 +609,7 @@ export const api = {
         model: options?.model,
         thinking: options?.thinking,
         provider: options?.provider,
+        codexMcpMode: options?.codexMcpMode,
         executor: options?.executor,
       }),
     }),
@@ -641,6 +645,7 @@ export const api = {
         model: options?.model,
         thinking: options?.thinking,
         provider: options?.provider,
+        codexMcpMode: options?.codexMcpMode,
         executor: options?.executor,
         attachments,
         tempId,

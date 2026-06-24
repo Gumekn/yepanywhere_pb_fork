@@ -172,7 +172,7 @@ describe("Sessions API", () => {
       expect(json.modeVersion).toBe(0);
     });
 
-    it("returns default permissionMode when not specified", async () => {
+    it("returns auto permissionMode when not specified", async () => {
       mockSdk.addScenario(createMockScenario("new-session", "Hello!"));
       const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
 
@@ -187,7 +187,7 @@ describe("Sessions API", () => {
 
       expect(res.status).toBe(200);
       const json = await res.json();
-      expect(json.permissionMode).toBe("default");
+      expect(json.permissionMode).toBe("auto");
       expect(json.modeVersion).toBe(0);
     });
   });

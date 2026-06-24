@@ -11,6 +11,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   type ContextStatusSdkPayload,
+  DEFAULT_PERMISSION_MODE,
   type ModelInfo,
   type SlashCommand,
   getModelContextWindow,
@@ -492,7 +493,7 @@ export class ClaudeProvider implements AgentProvider {
           permissionMode:
             options.permissionMode === "bypassPermissions"
               ? "default"
-              : (options.permissionMode ?? "default"),
+              : (options.permissionMode ?? DEFAULT_PERMISSION_MODE),
           canUseTool,
           systemPrompt: this.getSystemPrompt(options.globalInstructions),
           settingSources: ["user", "project", "local"],

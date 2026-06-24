@@ -3002,6 +3002,10 @@ a.sidebar-nav-item {
 }
 
 /* Mode-specific dot colors */
+.mode-dot.mode-auto {
+  background: var(--primary-color);
+}
+
 .mode-dot.mode-default {
   background: var(--timeline-dot-default);
 }
@@ -7056,6 +7060,34 @@ button.context-usage-indicator--button:focus-visible {
   margin: 0 0 var(--space-3);
 }
 
+/* Codex MCP Profile Section */
+.new-session-codex-mcp-section {
+  margin-bottom: 1.5rem;
+}
+
+.new-session-codex-mcp-section h3 {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0 0 var(--space-3);
+}
+
+.codex-mcp-options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.codex-mcp-standard {
+  background: var(--provider-codex);
+}
+
+.codex-mcp-full {
+  background: var(--warning-color);
+}
+
 /* Permission Mode Section */
 .new-session-mode-section {
   margin-bottom: 2rem;
@@ -7114,6 +7146,10 @@ button.context-usage-indicator--button:focus-visible {
 
 .mode-option-dot.mode-default {
   background: var(--timeline-dot-default);
+}
+
+.mode-option-dot.mode-auto {
+  background: var(--primary-color);
 }
 
 .mode-option-dot.mode-acceptEdits {

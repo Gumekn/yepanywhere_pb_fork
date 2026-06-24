@@ -1,4 +1,5 @@
 import {
+  DEFAULT_PERMISSION_MODE,
   type MarkdownAugment,
   type ProviderName,
   getModelContextWindow,
@@ -138,8 +139,12 @@ export function useSession(
   >({});
 
   // Permission mode state: localMode is UI-selected, serverMode is confirmed by server
-  const [localMode, setLocalMode] = useState<PermissionMode>("default");
-  const [serverMode, setServerMode] = useState<PermissionMode>("default");
+  const [localMode, setLocalMode] = useState<PermissionMode>(
+    DEFAULT_PERMISSION_MODE,
+  );
+  const [serverMode, setServerMode] = useState<PermissionMode>(
+    DEFAULT_PERMISSION_MODE,
+  );
   const [modeVersion, setModeVersion] = useState<number>(0);
   // Track whether we've already processed a stream "connected" event in this mount.
   // For Codex providers, the first connected-event catch-up fetch can duplicate
@@ -430,6 +435,16 @@ export function useSession(
     setToolUseToAgent,
   ]);
 
+  const fetchPersistedSessionChanges = useCallback(() => {
+    const provider = session?.provider;
+    if (provider === "codex" || provider === "codex-oss") {
+      void refreshSessionMessages();
+      return;
+    }
+
+    void fetchNewMessages();
+  }, [fetchNewMessages, refreshSessionMessages, session?.provider]);
+
   // Leading + trailing edge throttle:
   // - Leading: fires immediately on first call
   // - Trailing: fires again after timeout if events came during window
@@ -439,7 +454,7 @@ export function useSession(
 
     if (!ref.timer) {
       // No active throttle - fire immediately (LEADING EDGE)
-      fetchNewMessages();
+      fetchPersistedSessionChanges();
       ref.timer = setTimeout(() => {
         ref.timer = null;
         if (ref.pending) {
@@ -451,7 +466,7 @@ export function useSession(
       // Throttled - mark as pending for trailing edge
       ref.pending = true;
     }
-  }, [fetchNewMessages]);
+  }, [fetchPersistedSessionChanges]);
 
   // Handle file changes - for non-owned sessions only
   // For owned sessions, stream provides real-time messages and session-updated events
@@ -565,9 +580,9 @@ export function useSession(
   // Catches up on messages and ownership changes that occurred while disconnected.
   // Without this, a session that completed while the screen was off would show stale
   // data because the session stream unsubscribes when ownership becomes "none" and
-  // nobody triggers fetchNewMessages().
+  // nobody triggers a persisted-session refresh.
   const handleActivityReconnect = useCallback(async () => {
-    fetchNewMessages();
+    fetchPersistedSessionChanges();
     try {
       const data = await api.getSessionMetadata(projectId, sessionId);
       setStatus(data.ownership);
@@ -578,7 +593,7 @@ export function useSession(
     } catch {
       // Silent fail - non-critical
     }
-  }, [projectId, sessionId, fetchNewMessages]);
+  }, [projectId, sessionId, fetchPersistedSessionChanges]);
 
   useFileActivity({
     onSessionStatusChange: handleSessionStatusChange,

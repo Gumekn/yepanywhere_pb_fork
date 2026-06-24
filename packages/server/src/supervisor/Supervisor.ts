@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
+  type CodexMcpMode,
+  DEFAULT_PERMISSION_MODE,
   type EffortLevel,
   type PermissionRules,
   type ProviderName,
@@ -76,6 +78,8 @@ export interface ModelSettings {
   thinking?: ThinkingConfig;
   /** Effort level for response quality. undefined = SDK default */
   effort?: EffortLevel;
+  /** Codex MCP profile. Only consumed by the Codex provider. */
+  codexMcpMode?: CodexMcpMode;
   /** Provider to use for this session. undefined = use default (Claude) */
   providerName?: ProviderName;
   /** SSH host for remote execution (undefined = local) */
@@ -180,7 +184,8 @@ export class Supervisor {
     this.sdk = options.sdk ?? null;
     this.realSdk = options.realSdk ?? null;
     this.idleTimeoutMs = options.idleTimeoutMs;
-    this.defaultPermissionMode = options.defaultPermissionMode ?? "default";
+    this.defaultPermissionMode =
+      options.defaultPermissionMode ?? DEFAULT_PERMISSION_MODE;
     this.eventBus = options.eventBus;
     this.maxWorkers = options.maxWorkers ?? 0; // 0 = unlimited
     this.idlePreemptThresholdMs =
@@ -579,6 +584,7 @@ export class Supervisor {
       model: modelSettings?.model,
       thinking: modelSettings?.thinking,
       effort: modelSettings?.effort,
+      codexMcpMode: modelSettings?.codexMcpMode,
       executor: modelSettings?.executor,
       remoteEnv: modelSettings?.remoteEnv,
       globalInstructions: modelSettings?.globalInstructions,
@@ -686,6 +692,7 @@ export class Supervisor {
         resumeSessionId: resumeSessionId ?? null,
         permissionMode: effectiveMode,
         model: modelSettings?.model ?? null,
+        codexMcpMode: modelSettings?.codexMcpMode ?? null,
         resumeSessionAt: rewind.resumeSessionAt,
         rollbackNumTurns: rewind.rollbackNumTurns,
       },
@@ -700,6 +707,7 @@ export class Supervisor {
       model: modelSettings?.model,
       thinking: modelSettings?.thinking,
       effort: modelSettings?.effort,
+      codexMcpMode: modelSettings?.codexMcpMode,
       executor: modelSettings?.executor,
       remoteEnv: modelSettings?.remoteEnv,
       globalInstructions: modelSettings?.globalInstructions,

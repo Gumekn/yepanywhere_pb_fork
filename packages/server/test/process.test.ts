@@ -309,7 +309,7 @@ describe("Process", () => {
   });
 
   describe("permission mode", () => {
-    it("defaults to 'default' mode", async () => {
+    it("defaults to auto mode", async () => {
       const iterator = createMockIterator([]);
       const process = new Process(iterator, {
         projectPath: "/test",
@@ -318,7 +318,7 @@ describe("Process", () => {
         idleTimeoutMs: 100,
       });
 
-      expect(process.permissionMode).toBe("default");
+      expect(process.permissionMode).toBe("auto");
     });
 
     it("accepts initial permission mode", async () => {
@@ -592,8 +592,8 @@ describe("Process", () => {
 
       const result = await approvalPromise;
       expect(result.behavior).toBe("allow");
-      // After approval, should switch back to default mode
-      expect(process.permissionMode).toBe("default");
+      // After approval, should switch back to the app's default mode
+      expect(process.permissionMode).toBe("auto");
     });
 
     it("handleToolApproval prompts user for AskUserQuestion in plan mode (not auto-deny)", async () => {

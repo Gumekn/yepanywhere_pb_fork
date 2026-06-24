@@ -1,4 +1,6 @@
 import {
+  ALL_CODEX_MCP_MODES,
+  type CodexMcpMode,
   type ContextCumulativeUsage,
   type ContextStatusResponse,
   type ContextUsage,
@@ -101,6 +103,22 @@ function parseOptionalExecutor(rawExecutor: unknown): {
   return { executor };
 }
 
+function parseOptionalCodexMcpMode(rawMode: unknown): {
+  codexMcpMode: CodexMcpMode | undefined;
+  error?: string;
+} {
+  if (rawMode === undefined || rawMode === null || rawMode === "") {
+    return { codexMcpMode: undefined };
+  }
+  if (
+    typeof rawMode === "string" &&
+    ALL_CODEX_MCP_MODES.includes(rawMode as CodexMcpMode)
+  ) {
+    return { codexMcpMode: rawMode as CodexMcpMode };
+  }
+  return { codexMcpMode: undefined, error: "codexMcpMode is invalid" };
+}
+
 function isCodexProviderName(
   provider: ProviderName | string | undefined,
 ): provider is "codex" | "codex-oss" {
@@ -163,6 +181,8 @@ interface StartSessionBody {
   model?: ModelOption;
   thinking?: ThinkingOption;
   provider?: ProviderName;
+  /** Codex MCP profile. Only used when provider resolves to Codex. */
+  codexMcpMode?: CodexMcpMode;
   /** Client-generated temp ID for optimistic UI tracking */
   tempId?: string;
   /** SSH host alias for remote execution (undefined = local) */
@@ -188,6 +208,8 @@ interface CreateSessionBody {
   model?: ModelOption;
   thinking?: ThinkingOption;
   provider?: ProviderName;
+  /** Codex MCP profile. Only used when provider resolves to Codex. */
+  codexMcpMode?: CodexMcpMode;
   /** SSH host alias for remote execution (undefined = local) */
   executor?: string;
   /** Permission rules for tool filtering (deny/allow patterns) */
@@ -1138,6 +1160,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     if (executorError) {
       return c.json({ error: executorError }, 400);
     }
+    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
+    if (parsedCodexMcpMode.error) {
+      return c.json({ error: parsedCodexMcpMode.error }, 400);
+    }
 
     const userMessage: UserMessage = {
       text: body.message,
@@ -1176,6 +1202,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         thinking,
         effort,
         providerName: body.provider,
+        codexMcpMode: parsedCodexMcpMode.codexMcpMode,
         executor,
         globalInstructions,
         permissions: body.permissions,
@@ -1207,6 +1234,12 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         await deps.sessionMetadataService.setExecutor(
           result.sessionId,
           executor,
+        );
+      }
+      if (result.provider === "codex" && parsedCodexMcpMode.codexMcpMode) {
+        await deps.sessionMetadataService.setCodexMcpMode?.(
+          result.sessionId,
+          parsedCodexMcpMode.codexMcpMode,
         );
       }
     }
@@ -1248,6 +1281,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     if (executorError) {
       return c.json({ error: executorError }, 400);
     }
+    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
+    if (parsedCodexMcpMode.error) {
+      return c.json({ error: parsedCodexMcpMode.error }, 400);
+    }
 
     // Convert thinking option to SDK config
     const { thinking, effort } = body.thinking
@@ -1269,6 +1306,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         thinking,
         effort,
         providerName: body.provider,
+        codexMcpMode: parsedCodexMcpMode.codexMcpMode,
         executor,
         globalInstructions,
         permissions: body.permissions,
@@ -1300,6 +1338,12 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         await deps.sessionMetadataService.setExecutor(
           result.sessionId,
           executor,
+        );
+      }
+      if (result.provider === "codex" && parsedCodexMcpMode.codexMcpMode) {
+        await deps.sessionMetadataService.setCodexMcpMode?.(
+          result.sessionId,
+          parsedCodexMcpMode.codexMcpMode,
         );
       }
     }
@@ -1380,6 +1424,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     );
     if (parsedRollbackNumTurns.error) {
       return c.json({ error: parsedRollbackNumTurns.error }, 400);
+    }
+    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
+    if (parsedCodexMcpMode.error) {
+      return c.json({ error: parsedCodexMcpMode.error }, 400);
     }
 
     const userMessage: UserMessage = {
@@ -1478,6 +1526,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         bodyProvider: body.provider ?? null,
         metadataProvider: metadataProvider ?? null,
         executor: executor ?? null,
+        codexMcpMode:
+          parsedCodexMcpMode.codexMcpMode ??
+          deps.sessionMetadataService?.getCodexMcpMode?.(sessionId) ??
+          null,
         resumeSessionAt:
           providerName === "claude" ? (body.resumeSessionAt ?? null) : null,
         rollbackNumTurns:
@@ -1506,6 +1558,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         thinking,
         effort,
         providerName,
+        codexMcpMode:
+          providerName === "codex"
+            ? (parsedCodexMcpMode.codexMcpMode ??
+              deps.sessionMetadataService?.getCodexMcpMode?.(sessionId))
+            : undefined,
         executor,
         globalInstructions,
         permissions: body.permissions,
@@ -1522,6 +1579,17 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           providerName === "codex" ? parsedRollbackNumTurns.value : undefined,
       },
     );
+
+    if (
+      deps.sessionMetadataService &&
+      providerName === "codex" &&
+      parsedCodexMcpMode.codexMcpMode
+    ) {
+      await deps.sessionMetadataService.setCodexMcpMode?.(
+        sessionId,
+        parsedCodexMcpMode.codexMcpMode,
+      );
+    }
 
     // Check if queue is full
     if (isQueueFullResponse(result)) {
@@ -1586,6 +1654,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     if (!body.message) {
       return c.json({ error: "Message is required" }, 400);
     }
+    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
+    if (parsedCodexMcpMode.error) {
+      return c.json({ error: parsedCodexMcpMode.error }, 400);
+    }
 
     const userMessage: UserMessage = {
       text: body.message,
@@ -1638,6 +1710,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       body.model && body.model !== "default"
         ? body.model
         : (process.resolvedModel ?? process.model);
+    const providerName = metadataProvider ?? body.provider ?? process.provider;
 
     // Use queueMessageToSession which handles thinking mode changes
     // If thinking mode changed, it will restart the process automatically
@@ -1652,7 +1725,12 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         model,
         thinking,
         effort,
-        providerName: metadataProvider ?? body.provider ?? process.provider,
+        providerName,
+        codexMcpMode:
+          providerName === "codex"
+            ? (parsedCodexMcpMode.codexMcpMode ??
+              deps.sessionMetadataService?.getCodexMcpMode?.(sessionId))
+            : undefined,
         executor:
           executor ??
           metadataExecutor.executor ??

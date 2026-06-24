@@ -93,16 +93,20 @@ export interface ProviderInfo {
 
 /**
  * Permission mode for tool approvals.
+ * - "auto": Use Claude Code's classifier to approve/deny permission prompts
  * - "default": Auto-approve read-only tools (Read, Glob, Grep, etc.), ask for mutating tools
  * - "acceptEdits": Auto-approve file editing tools (Edit, Write, NotebookEdit), ask for others
  * - "plan": Auto-approve read-only tools, ask for others (planning/analysis mode)
  * - "bypassPermissions": Auto-approve all tools (full autonomous mode)
  */
 export type PermissionMode =
+  | "auto"
   | "default"
   | "bypassPermissions"
   | "acceptEdits"
   | "plan";
+
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "auto";
 
 /**
  * All permission modes in canonical order.
@@ -110,10 +114,26 @@ export type PermissionMode =
  * Keep in sync with PermissionMode above.
  */
 export const ALL_PERMISSION_MODES: readonly PermissionMode[] = [
+  "auto",
   "default",
   "acceptEdits",
   "plan",
   "bypassPermissions",
+] as const;
+
+/**
+ * Codex MCP profile for app-server-backed sessions.
+ * - "standard": Matches `cf` light profile (apps/plugins disabled).
+ * - "full": Matches `cf -mcp` full profile (load all configured MCP/apps/plugins).
+ */
+export type CodexMcpMode = "standard" | "full";
+
+/**
+ * All Codex MCP modes in canonical order.
+ */
+export const ALL_CODEX_MCP_MODES: readonly CodexMcpMode[] = [
+  "standard",
+  "full",
 ] as const;
 
 /**
@@ -123,6 +143,7 @@ export interface NewSessionDefaults {
   provider?: ProviderName;
   model?: string;
   permissionMode?: PermissionMode;
+  codexMcpMode?: CodexMcpMode;
 }
 
 /**

@@ -13,6 +13,7 @@ import {
   logCodexCorrelationDebug,
   summarizeCodexNormalizedMessage,
 } from "../../codex/correlationDebugLogger.js";
+import { getCodexMcpAppServerArgs } from "../../codex/mcp-profile.js";
 import {
   type CodexToolCallContext,
   normalizeCodexCommandExecutionOutput,
@@ -110,8 +111,12 @@ function normalizeCodexModelOption(model: string | undefined): string | null {
   return trimmed;
 }
 
-const MODEL_CACHE_TTL_MS = 60 * 60 * 1000;
-const MODEL_LIST_TIMEOUT_MS = 8000;
+// Keep the cache short enough that a one-off fallback (slow cold start, codex
+// upgrade in progress) does not pin a stale/incorrect model list for an hour.
+const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+// Codex app-server cold start can take a few seconds; give model/list enough
+// time so we use the live list instead of silently dropping to the fallback.
+const MODEL_LIST_TIMEOUT_MS = 15000;
 const APP_SERVER_INIT_REQUEST_ID = 1;
 const APP_SERVER_MODEL_LIST_REQUEST_ID = 2;
 const APP_SERVER_SHUTDOWN_GRACE_MS = 1500;
@@ -140,7 +145,15 @@ const CODEX_POLICY_OVERRIDES: {
 const DECLARE_CODEX_ORIGINATOR = true;
 const DECLARED_CODEX_ORIGINATOR = "Codex Desktop";
 
+// Static fallback used only when the live `model/list` query fails. Keep this in
+// sync with the models Codex actually offers, and list a ChatGPT-account-safe
+// default first: `-codex` models are rejected by OpenAI for ChatGPT-account auth
+// ("model is not supported when using Codex with a ChatGPT account"), so they
+// must never be the default the picker preselects.
 const PREFERRED_MODEL_ORDER = [
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
   "gpt-5.3-codex",
   "gpt-5.2-codex",
   "gpt-5.1-codex-max",
@@ -149,11 +162,9 @@ const PREFERRED_MODEL_ORDER = [
 ] as const;
 
 const FALLBACK_CODEX_MODELS: ModelInfo[] = [
-  { id: "gpt-5.3-codex", name: "GPT-5.3-Codex" },
-  { id: "gpt-5.2-codex", name: "GPT-5.2-Codex" },
-  { id: "gpt-5.1-codex-max", name: "GPT-5.1-Codex-Max" },
-  { id: "gpt-5.2", name: "GPT-5.2" },
-  { id: "gpt-5.1-codex-mini", name: "GPT-5.1-Codex-Mini" },
+  { id: "gpt-5.5", name: "GPT-5.5" },
+  { id: "gpt-5.4", name: "GPT-5.4" },
+  { id: "gpt-5.4-mini", name: "GPT-5.4-Mini" },
 ];
 
 type JsonRpcId = string | number;
@@ -185,6 +196,10 @@ interface AppServerModel {
   displayName?: string;
   description?: string;
   upgrade?: string | null;
+  /** Models hidden from the default picker (e.g. deprecated/internal). */
+  hidden?: boolean;
+  /** The model Codex itself selects by default for this account. */
+  isDefault?: boolean;
 }
 
 interface TokenUsageSnapshot {
@@ -404,6 +419,7 @@ class CodexAppServerClient {
     private readonly command: string,
     private readonly cwd: string,
     private readonly env: NodeJS.ProcessEnv,
+    private readonly appServerArgs: string[] = [],
   ) {}
 
   setServerRequestHandler(handler: AppServerRequestHandler): void {
@@ -415,13 +431,17 @@ class CodexAppServerClient {
       throw new Error("Codex app-server already connected");
     }
 
-    const child = spawn(this.command, ["app-server", "--listen", "stdio://"], {
-      cwd: this.cwd,
-      detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "pipe"],
-      env: this.env,
-      shell: process.platform === "win32",
-    });
+    const child = spawn(
+      this.command,
+      ["app-server", ...this.appServerArgs, "--listen", "stdio://"],
+      {
+        cwd: this.cwd,
+        detached: process.platform !== "win32",
+        stdio: ["pipe", "pipe", "pipe"],
+        env: this.env,
+        shell: process.platform === "win32",
+      },
+    );
 
     this.process = child;
 
@@ -770,7 +790,12 @@ export class CodexProvider implements AgentProvider {
     return new Promise((resolve, reject) => {
       const child = spawn(
         codexCommand,
-        ["app-server", "--listen", "stdio://"],
+        [
+          "app-server",
+          ...getCodexMcpAppServerArgs("standard"),
+          "--listen",
+          "stdio://",
+        ],
         {
           detached: process.platform !== "win32",
           stdio: ["pipe", "pipe", "pipe"],
@@ -912,11 +937,21 @@ export class CodexProvider implements AgentProvider {
     const orderLookup = new Map<string, number>(
       PREFERRED_MODEL_ORDER.map((id, idx) => [id, idx]),
     );
+    // Track the account's own default so it sorts to the front of the picker
+    // (it is guaranteed to be valid for the current auth mode).
+    const defaultIds = new Set<string>();
     const deduped = new Map<string, ModelInfo>();
 
     for (const model of models) {
+      // Skip models Codex hides from its own picker (deprecated/internal).
+      if (model.hidden === true) continue;
+
       const modelId = (model.model || model.id || "").trim();
       if (!modelId) continue;
+
+      if (model.isDefault === true) {
+        defaultIds.add(modelId);
+      }
 
       deduped.set(modelId, {
         id: modelId,
@@ -937,7 +972,9 @@ export class CodexProvider implements AgentProvider {
       .map((model, index) => ({
         model,
         index,
-        rank: orderLookup.get(model.id) ?? PREFERRED_MODEL_ORDER.length + index,
+        rank: defaultIds.has(model.id)
+          ? -1
+          : (orderLookup.get(model.id) ?? PREFERRED_MODEL_ORDER.length + index),
       }))
       .sort((a, b) => a.rank - b.rank)
       .map((entry) => entry.model);
@@ -1104,6 +1141,7 @@ export class CodexProvider implements AgentProvider {
       codexCommand,
       options.cwd,
       this.getCodexEnv(),
+      getCodexMcpAppServerArgs(options.codexMcpMode),
     );
     setActiveClient(appServer);
 
@@ -1218,6 +1256,7 @@ export class CodexProvider implements AgentProvider {
           permissionMode: options.permissionMode ?? "default",
           approvalPolicy: policy.approvalPolicy,
           sandbox: policy.sandbox,
+          codexMcpMode: options.codexMcpMode ?? "standard",
           policyOverrides: {
             approvalPolicy: CODEX_POLICY_OVERRIDES.approvalPolicy,
             sandbox: CODEX_POLICY_OVERRIDES.sandbox,

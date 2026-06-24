@@ -3,8 +3,10 @@
  */
 
 import {
+  ALL_CODEX_MCP_MODES,
   ALL_PERMISSION_MODES,
   ALL_PROVIDERS,
+  type CodexMcpMode,
   type NewSessionDefaults,
   type PermissionMode,
   type ProviderName,
@@ -111,6 +113,23 @@ function parseNewSessionDefaults(
       input.permissionMode.length > 0
     ) {
       parsed.permissionMode = input.permissionMode as PermissionMode;
+    }
+  }
+
+  if ("codexMcpMode" in input) {
+    if (
+      input.codexMcpMode !== undefined &&
+      input.codexMcpMode !== null &&
+      input.codexMcpMode !== "" &&
+      !ALL_CODEX_MCP_MODES.includes(input.codexMcpMode as CodexMcpMode)
+    ) {
+      return null;
+    }
+    if (
+      typeof input.codexMcpMode === "string" &&
+      input.codexMcpMode.length > 0
+    ) {
+      parsed.codexMcpMode = input.codexMcpMode as CodexMcpMode;
     }
   }
 

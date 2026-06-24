@@ -23,6 +23,7 @@ export type {
   ModelInfo,
   SlashCommand,
   PermissionMode,
+  CodexMcpMode,
   NewSessionDefaults,
   ModelOption,
   ThinkingMode,
@@ -41,7 +42,9 @@ export type {
 } from "./types.js";
 export {
   ALL_PROVIDERS,
+  DEFAULT_PERMISSION_MODE,
   ALL_PERMISSION_MODES,
+  ALL_CODEX_MCP_MODES,
   thinkingOptionToConfig,
   resolveModel,
   DEFAULT_MODEL,

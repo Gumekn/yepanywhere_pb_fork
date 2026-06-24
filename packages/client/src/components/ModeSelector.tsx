@@ -1,9 +1,11 @@
+import { DEFAULT_PERMISSION_MODE } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import type { PermissionMode } from "../types";
 
 const MODE_ORDER: PermissionMode[] = [
+  DEFAULT_PERMISSION_MODE,
   "default",
   "acceptEdits",
   "plan",
@@ -11,6 +13,7 @@ const MODE_ORDER: PermissionMode[] = [
 ];
 
 const MODE_LABELS: Record<PermissionMode, string> = {
+  auto: "Auto mode",
   default: "Ask before edits",
   acceptEdits: "Edit automatically",
   plan: "Plan mode",

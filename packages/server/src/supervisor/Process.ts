@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { DEFAULT_PERMISSION_MODE } from "@yep-anywhere/shared";
 import type {
   ContextStatusSdkPayload,
   EffortLevel,
@@ -139,7 +140,7 @@ export class Process {
   private pendingToolApprovalQueue: string[] = [];
 
   /** Current permission mode for tool approvals */
-  private _permissionMode: PermissionMode = "default";
+  private _permissionMode: PermissionMode = DEFAULT_PERMISSION_MODE;
 
   /** Permission rules for tool filtering (deny/allow patterns from API caller) */
   private _permissions: PermissionRules | undefined;
@@ -236,7 +237,7 @@ export class Process {
     // Real SDK provides these, mock SDK doesn't
     this.messageQueue = options.queue ?? null;
     this.abortFn = options.abortFn ?? null;
-    this._permissionMode = options.permissionMode ?? "default";
+    this._permissionMode = options.permissionMode ?? DEFAULT_PERMISSION_MODE;
     this._permissions = options.permissions;
     this.provider = options.provider;
     this.model = options.model;
@@ -1426,9 +1427,9 @@ export class Process {
       this.setPermissionMode("plan");
     }
 
-    // If ExitPlanMode is approved, switch back to default mode
+    // If ExitPlanMode is approved, switch back to the app's default mode.
     if (response === "approve" && pending.request.toolName === "ExitPlanMode") {
-      this.setPermissionMode("default");
+      this.setPermissionMode(DEFAULT_PERMISSION_MODE);
     }
 
     // Resolve the promise and remove from tracking

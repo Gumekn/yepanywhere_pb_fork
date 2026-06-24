@@ -1,5 +1,6 @@
 // Provider abstraction types for multi-provider support
 import type {
+  CodexMcpMode,
   ContextStatusSdkPayload,
   ModelInfo,
   PermissionMode,
@@ -67,6 +68,8 @@ export interface StartSessionOptions {
   thinking?: import("@yep-anywhere/shared").ThinkingConfig;
   /** Effort level for response quality (undefined = SDK default) */
   effort?: import("@yep-anywhere/shared").EffortLevel;
+  /** Codex MCP profile. Only consumed by the Codex provider. */
+  codexMcpMode?: CodexMcpMode;
   /** Tool approval callback */
   onToolApproval?: CanUseTool;
   /** SSH host for remote execution (undefined = local) */

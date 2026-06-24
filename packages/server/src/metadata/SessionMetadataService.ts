@@ -7,7 +7,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { ProviderName } from "@yep-anywhere/shared";
+import type { CodexMcpMode, ProviderName } from "@yep-anywhere/shared";
 
 export interface SessionMetadata {
   /** Custom title that overrides auto-generated title */
@@ -22,6 +22,8 @@ export interface SessionMetadata {
   provider?: ProviderName;
   /** SSH host alias for remote execution (undefined = local) */
   executor?: string;
+  /** Codex MCP profile for app-server sessions. */
+  codexMcpMode?: CodexMcpMode;
 }
 
 export interface SessionMetadataState {
@@ -177,6 +179,21 @@ export class SessionMetadataService {
   }
 
   /**
+   * Set the Codex MCP profile for a session.
+   * Used to keep Codex app-server resumes aligned with the original launch.
+   */
+  async setCodexMcpMode(
+    sessionId: string,
+    codexMcpMode: CodexMcpMode | undefined,
+  ): Promise<void> {
+    this.updateSessionMetadata(sessionId, (metadata) => ({
+      ...metadata,
+      codexMcpMode: codexMcpMode || undefined,
+    }));
+    await this.save();
+  }
+
+  /**
    * Get the provider for a session.
    * Returns undefined if the provider was never explicitly saved.
    */
@@ -190,6 +207,14 @@ export class SessionMetadataService {
    */
   getExecutor(sessionId: string): string | undefined {
     return this.state.sessions[sessionId]?.executor;
+  }
+
+  /**
+   * Get the Codex MCP profile for a session.
+   * Returns undefined when the session should use provider defaults.
+   */
+  getCodexMcpMode(sessionId: string): CodexMcpMode | undefined {
+    return this.state.sessions[sessionId]?.codexMcpMode;
   }
 
   /**
@@ -241,6 +266,7 @@ export class SessionMetadataService {
     if (updated.model) cleaned.model = updated.model;
     if (updated.provider) cleaned.provider = updated.provider;
     if (updated.executor) cleaned.executor = updated.executor;
+    if (updated.codexMcpMode) cleaned.codexMcpMode = updated.codexMcpMode;
 
     if (Object.keys(cleaned).length === 0) {
       // Remove the entry entirely if empty
