@@ -2,10 +2,55 @@ import { useState } from "react";
 import { api } from "../../api/client";
 import { FilterDropdown } from "../../components/FilterDropdown";
 import { useOptionalAuth } from "../../contexts/AuthContext";
+import {
+  type MobileShellChannel,
+  useMobileShellChannel,
+} from "../../hooks/useMobileShellChannel";
 import { useNetworkBinding } from "../../hooks/useNetworkBinding";
 import { useServerInfo } from "../../hooks/useServerInfo";
 import { useServerSettings } from "../../hooks/useServerSettings";
 import { useI18n } from "../../i18n";
+
+const MOBILE_CHANNELS: MobileShellChannel[] = ["tcp", "http"];
+
+function MobileShellChannelSettings() {
+  const { t } = useI18n();
+  const { isMobileShell, channel, setChannel } = useMobileShellChannel();
+
+  if (!isMobileShell) return null;
+
+  return (
+    <div className="settings-group">
+      <div className="settings-item">
+        <div className="settings-item-info">
+          <strong>{t("localAccessMobileChannelTitle")}</strong>
+          <p>{t("localAccessMobileChannelDescription")}</p>
+        </div>
+        <div
+          className="settings-segmented-control"
+          role="group"
+          aria-label={t("localAccessMobileChannelTitle")}
+        >
+          {MOBILE_CHANNELS.map((value) => (
+            <button
+              key={value}
+              type="button"
+              className={`settings-segmented-option ${channel === value ? "active" : ""}`}
+              aria-pressed={channel === value}
+              onClick={() => {
+                if (channel !== value) setChannel(value);
+              }}
+            >
+              {value === "tcp"
+                ? t("localAccessMobileChannelTcp")
+                : t("localAccessMobileChannelHttp")}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export function LocalAccessSettings() {
   const { t } = useI18n();
@@ -251,6 +296,8 @@ export function LocalAccessSettings() {
         <p className="settings-section-description">
           {t("localAccessDescription")}
         </p>
+
+        <MobileShellChannelSettings />
 
         {/* Current status */}
         <div className="settings-group">
