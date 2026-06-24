@@ -1,6 +1,5 @@
 import { useNavigate, useParams } from "react-router-dom";
 import { PageHeader } from "../../components/PageHeader";
-import { useReloadNotifications } from "../../hooks/useReloadNotifications";
 import { useRemoteBasePath } from "../../hooks/useRemoteBasePath";
 import { useVersion } from "../../hooks/useVersion";
 import { useI18n } from "../../i18n";
@@ -76,7 +75,6 @@ export function SettingsLayout() {
   const basePath = useRemoteBasePath();
   const { openSidebar, isWideScreen, toggleSidebar, isSidebarCollapsed } =
     useNavigationLayout();
-  const { isManualReloadMode } = useReloadNotifications();
   const { version: versionInfo } = useVersion();
   const capabilities = versionInfo?.capabilities ?? [];
 
@@ -97,9 +95,7 @@ export function SettingsLayout() {
       getEmulatorCategory((key) => t(key as never)),
     );
   }
-  if (isManualReloadMode || capabilities.includes("deployment")) {
-    categories.push(getDevelopmentCategory((key) => t(key as never)));
-  }
+  categories.push(getDevelopmentCategory((key) => t(key as never)));
 
   // On wide screen, default to first category if none selected
   const effectiveCategory =

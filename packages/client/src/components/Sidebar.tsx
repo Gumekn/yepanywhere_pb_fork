@@ -10,7 +10,6 @@ import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useVersion } from "../hooks/useVersion";
 import { useI18n } from "../i18n";
 import { toUrlProjectId } from "../utils";
-import { AgentsNavItem } from "./AgentsNavItem";
 import { SessionListItem } from "./SessionListItem";
 import {
   SidebarIcons,
@@ -408,7 +407,6 @@ export function Sidebar({
               onClick={onNavigate}
               basePath={basePath}
             />
-            <AgentsNavItem onClick={onNavigate} basePath={basePath} />
             <SidebarNavItem
               to="/settings"
               icon={SidebarIcons.settings}

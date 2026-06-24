@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   type DeploymentActionId,
   type DeploymentJob,
@@ -7,6 +8,7 @@ import {
 } from "../../api/client";
 import { useSchemaValidationContext } from "../../contexts/SchemaValidationContext";
 import { useDeveloperMode } from "../../hooks/useDeveloperMode";
+import { useGlobalActiveAgents } from "../../hooks/useGlobalActiveAgents";
 import { useReloadNotifications } from "../../hooks/useReloadNotifications";
 import { useSchemaValidation } from "../../hooks/useSchemaValidation";
 import { useServerSettings } from "../../hooks/useServerSettings";
@@ -35,6 +37,7 @@ export function DevelopmentSettings() {
   } = useReloadNotifications();
   const { settings: validationSettings, setEnabled: setValidationEnabled } =
     useSchemaValidation();
+  const activeAgentsCount = useGlobalActiveAgents();
   const { holdModeEnabled, setHoldModeEnabled } = useDeveloperMode();
   const { ignoredTools, clearIgnoredTools } = useSchemaValidationContext();
   const { settings: serverSettings, updateSetting: updateServerSetting } =
@@ -62,6 +65,8 @@ export function DevelopmentSettings() {
   const deploymentCapable =
     versionInfo?.capabilities?.includes("deployment") ?? false;
   const shouldShowDeployment = deploymentCapable || deployStatus?.available;
+  const shouldProbeDeployment =
+    deploymentCapable || isManualReloadMode || deployJob?.status === "running";
 
   useEffect(() => {
     if (restarting && connected) {
@@ -110,8 +115,9 @@ export function DevelopmentSettings() {
   }, [deployJob?.id, deployJob?.status, refetchVersionFresh]);
 
   useEffect(() => {
+    if (!shouldProbeDeployment) return;
     void refreshDeployment();
-  }, [refreshDeployment]);
+  }, [refreshDeployment, shouldProbeDeployment]);
 
   useEffect(() => {
     if (deployJob?.status !== "running") return;
@@ -149,13 +155,28 @@ export function DevelopmentSettings() {
   const runningBuildId = versionInfo?.build?.buildId?.slice(0, 12);
   const stagedBuildId = deployStatus?.stagedBuild?.buildId?.slice(0, 12);
 
-  if (!isManualReloadMode && !shouldShowDeployment) {
-    return null;
-  }
-
   return (
     <section className="settings-section">
       <h2>{t("developmentSectionTitle")}</h2>
+
+      <div className="settings-group">
+        <div className="settings-item">
+          <div className="settings-item-info">
+            <strong>{t("developmentAgentRuntimeTitle")}</strong>
+            <p>{t("developmentAgentRuntimeDescription")}</p>
+            {activeAgentsCount > 0 && (
+              <p className="settings-pending">
+                {t("developmentAgentRuntimeActive", {
+                  count: activeAgentsCount,
+                })}
+              </p>
+            )}
+          </div>
+          <Link to="/agents" className="settings-button">
+            {t("developmentOpenAgentRuntime")}
+          </Link>
+        </div>
+      </div>
 
       {shouldShowDeployment && (
         <div className="settings-group">
