@@ -1,9 +1,10 @@
-import { memo, useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useOptionalSessionMetadata } from "../../contexts/SessionMetadataContext";
 import { useStreamingMarkdownContext } from "../../contexts/StreamingMarkdownContext";
 import { useStreamingMarkdown } from "../../hooks/useStreamingMarkdown";
 import { appPath } from "../../lib/apiPath";
+import { getSelectionAwareCopyText } from "../../lib/clipboard";
 import { FileViewerModal } from "../FilePathLink";
 import {
   LocalMediaModal,
@@ -39,6 +40,7 @@ export const TextBlock = memo(function TextBlock({
 }: Props) {
   const [copied, setCopied] = useState(false);
   const [fileModal, setFileModal] = useState<{ filePath: string } | null>(null);
+  const blockRef = useRef<HTMLDivElement | null>(null);
   const sessionMetadata = useOptionalSessionMetadata();
 
   // Streaming markdown hook for server-rendered content
@@ -77,7 +79,9 @@ export const TextBlock = memo(function TextBlock({
 
   const handleCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(
+        getSelectionAwareCopyText(text, blockRef.current),
+      );
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
@@ -146,6 +150,7 @@ export const TextBlock = memo(function TextBlock({
   return (
     // biome-ignore lint/a11y/useKeyWithClickEvents: click handler intercepts local media links only
     <div
+      ref={blockRef}
       className={`text-block timeline-item${isStreaming ? " streaming" : ""}`}
       onClick={handleClick}
     >

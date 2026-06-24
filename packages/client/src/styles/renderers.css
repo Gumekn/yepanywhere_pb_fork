@@ -55,6 +55,9 @@
   opacity: 0;
   transition: opacity 0.15s, background 0.15s, color 0.15s;
   z-index: 10;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .text-block:hover .text-block-copy,

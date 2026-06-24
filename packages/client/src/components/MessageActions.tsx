@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { getSelectionAwareCopyText } from "../lib/clipboard";
 
 interface MessageActionsProps {
   /** ISO timestamp string from the source message; shown on hover. */
@@ -29,6 +30,7 @@ export function MessageActions({
 }: MessageActionsProps) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
+  const actionsRef = useRef<HTMLSpanElement | null>(null);
 
   // Reset the "Copied!" pulse after a short window.
   useEffect(() => {
@@ -39,13 +41,19 @@ export function MessageActions({
 
   const handleCopy = useCallback(async () => {
     if (!copyText) return;
+
+    const selectionRoot =
+      actionsRef.current?.closest(".assistant-turn, .user-prompt-container") ??
+      actionsRef.current;
+    const textToCopy = getSelectionAwareCopyText(copyText, selectionRoot);
+
     try {
       if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(copyText);
+        await navigator.clipboard.writeText(textToCopy);
       } else {
         // Legacy fallback for non-secure contexts (HTTP without TLS).
         const textarea = document.createElement("textarea");
-        textarea.value = copyText;
+        textarea.value = textToCopy;
         textarea.setAttribute("readonly", "");
         textarea.style.position = "fixed";
         textarea.style.left = "-9999px";
@@ -65,6 +73,7 @@ export function MessageActions({
 
   return (
     <span
+      ref={actionsRef}
       className={`message-actions${copied ? " is-active" : ""}`}
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => e.stopPropagation()}

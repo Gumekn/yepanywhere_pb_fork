@@ -14,6 +14,7 @@ import { useSyncNotifyInAppSetting } from "./hooks/useNotifyInApp";
 import { useOnboarding } from "./hooks/useOnboarding";
 import { useReloadNotifications } from "./hooks/useReloadNotifications";
 import { I18nProvider } from "./i18n";
+import { initTextSelectionTracking } from "./lib/clipboard";
 import { initClientLogCollection } from "./lib/diagnostics";
 
 interface Props {
@@ -32,6 +33,10 @@ function AppContent({ children }: Props) {
 
   // Client-side log collection for connection diagnostics
   useEffect(() => initClientLogCollection(), []);
+
+  // Preserve native text selections long enough for copy controls to respect
+  // them even when a tap briefly moves focus on mobile WebViews.
+  useEffect(() => initTextSelectionTracking(), []);
 
   // Sync notifyInApp setting to service worker on app startup and SW restarts
   useSyncNotifyInAppSetting();
