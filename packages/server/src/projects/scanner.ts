@@ -343,6 +343,14 @@ export class ProjectScanner {
         );
         if (existing) {
           existing.hasCodexSessions = true;
+          existing.sessionCount += codexProject.sessionCount;
+          if (
+            codexProject.lastActivity &&
+            (!existing.lastActivity ||
+              codexProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = codexProject.lastActivity;
+          }
           continue;
         }
         seenPaths.add(projectPath);
@@ -370,6 +378,14 @@ export class ProjectScanner {
         );
         if (existing) {
           existing.hasGeminiSessions = true;
+          existing.sessionCount += geminiProject.sessionCount;
+          if (
+            geminiProject.lastActivity &&
+            (!existing.lastActivity ||
+              geminiProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = geminiProject.lastActivity;
+          }
           continue;
         }
         seenPaths.add(projectPath);
@@ -587,10 +603,6 @@ export class ProjectScanner {
         (f) => !f.startsWith("agent-"),
       ).length;
 
-      // Use directory mtime as lastActivity (updated when files are added/removed)
-      const dirStat = await stat(projectDirPath);
-      const lastActivity = new Date(dirStat.mtimeMs).toISOString();
-
       // Sort jsonl files by mtime descending. The newest file carries the
       // most recent `cwd` the SDK wrote — older jsonls may still record the
       // project's original location from before the user moved it on disk.
@@ -606,6 +618,9 @@ export class ProjectScanner {
         }
       }
       withMtime.sort((a, b) => b.mtime - a.mtime);
+      const lastActivity = withMtime[0]
+        ? new Date(withMtime[0].mtime).toISOString()
+        : null;
 
       for (const { file } of withMtime) {
         const filePath = join(projectDirPath, file);

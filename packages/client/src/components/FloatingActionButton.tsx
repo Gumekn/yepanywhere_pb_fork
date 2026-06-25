@@ -53,12 +53,13 @@ export function FloatingActionButton() {
   const [message, setMessage, draftControls] =
     useDraftPersistence(FAB_DRAFT_KEY);
   const [interimTranscript, setInterimTranscript] = useState("");
-  const { projects } = useProjects();
+  const projectIdFromUrl = extractProjectIdFromPath(location.pathname);
+  const isOnNewSessionPage = location.pathname.endsWith("/new-session");
+  const shouldLoadProjects =
+    Boolean(fabVisibility) && !isOnNewSessionPage && !projectIdFromUrl;
+  const { projects } = useProjects({ enabled: shouldLoadProjects });
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-
-  // Extract projectId from current URL if we're in a project context
-  const projectIdFromUrl = extractProjectIdFromPath(location.pathname);
 
   // Update recent project when navigating to a project page
   useEffect(() => {
@@ -167,7 +168,7 @@ export function FloatingActionButton() {
 
   // Hide (but don't unmount) when not visible or on new-session page
   // This preserves expanded state and draft across navigation
-  const isHidden = !fabVisibility || location.pathname.endsWith("/new-session");
+  const isHidden = !fabVisibility || isOnNewSessionPage;
 
   const { right, bottom, maxWidth } = fabVisibility ?? {
     right: 24,

@@ -61,6 +61,7 @@ export class CodexSessionScanner {
   private sessionsDir: string;
   private cachedScan: { result: CodexSessionInfo[]; timestamp: number } | null =
     null;
+  private inFlightScan: Promise<CodexSessionInfo[]> | null = null;
 
   constructor(options: CodexScannerOptions = {}) {
     this.sessionsDir = options.sessionsDir ?? CODEX_SESSIONS_DIR;
@@ -68,6 +69,7 @@ export class CodexSessionScanner {
 
   invalidateCache(): void {
     this.cachedScan = null;
+    this.inFlightScan = null;
   }
 
   /**
@@ -152,13 +154,32 @@ export class CodexSessionScanner {
       return this.cachedScan.result;
     }
 
+    if (this.inFlightScan) {
+      return this.inFlightScan;
+    }
+
+    const scanPromise = this.scanAllSessionsFromDisk()
+      .then((sessions) => {
+        this.cachedScan = { result: sessions, timestamp: Date.now() };
+        return sessions;
+      })
+      .finally(() => {
+        if (this.inFlightScan === scanPromise) {
+          this.inFlightScan = null;
+        }
+      });
+
+    this.inFlightScan = scanPromise;
+    return scanPromise;
+  }
+
+  private async scanAllSessionsFromDisk(): Promise<CodexSessionInfo[]> {
     const sessions: CodexSessionInfo[] = [];
 
     try {
       await stat(this.sessionsDir);
     } catch {
       // Sessions directory doesn't exist
-      this.cachedScan = { result: [], timestamp: Date.now() };
       return [];
     }
 
@@ -196,7 +217,6 @@ export class CodexSessionScanner {
       );
     }
 
-    this.cachedScan = { result: sessions, timestamp: Date.now() };
     return sessions;
   }
 

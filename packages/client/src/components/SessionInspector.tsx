@@ -1,6 +1,6 @@
 import type { MarkdownAugment, ProviderName } from "@yep-anywhere/shared";
 import type { ReactNode } from "react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useGitStatus } from "../hooks/useGitStatus";
 import { useI18n } from "../i18n";
@@ -27,6 +27,7 @@ interface SessionInspectorProps {
   markdownAugments?: Record<string, MarkdownAugment>;
   activeToolApproval?: ActiveToolApproval;
   projectId: string;
+  sessionId: string;
   basePath?: string;
   provider?: ProviderName;
   model?: string;
@@ -85,6 +86,7 @@ export function SessionInspector({
   markdownAugments,
   activeToolApproval,
   projectId,
+  sessionId,
   basePath = "",
   provider,
   model,
@@ -96,6 +98,7 @@ export function SessionInspector({
 }: SessionInspectorProps) {
   const { t, locale } = useI18n();
   const [activeTab, setActiveTab] = useState<InspectorTab>("questions");
+  const [copiedSessionId, setCopiedSessionId] = useState(false);
   const {
     gitStatus,
     loading: gitLoading,
@@ -125,6 +128,21 @@ export function SessionInspector({
     onSelectMessage(messageId);
     if (presentation === "drawer") {
       onClose?.();
+    }
+  };
+
+  useEffect(() => {
+    if (!copiedSessionId) return;
+    const timeout = window.setTimeout(() => setCopiedSessionId(false), 1500);
+    return () => window.clearTimeout(timeout);
+  }, [copiedSessionId]);
+
+  const handleCopySessionId = async () => {
+    try {
+      await writeClipboardText(sessionId);
+      setCopiedSessionId(true);
+    } catch (error) {
+      console.error("Failed to copy session ID:", error);
     }
   };
 
@@ -169,6 +187,34 @@ export function SessionInspector({
           <span className="session-inspector-pill">
             {getStatusLabel(t, status, processState)}
           </span>
+        </div>
+        <div className="session-inspector-session-id">
+          <span className="session-inspector-session-id-label">
+            {t("sessionInspectorSessionId")}
+          </span>
+          <code
+            className="session-inspector-session-id-value"
+            title={sessionId}
+          >
+            {sessionId}
+          </code>
+          <button
+            type="button"
+            className={`session-inspector-copy-id${copiedSessionId ? " is-copied" : ""}`}
+            onClick={handleCopySessionId}
+            title={
+              copiedSessionId
+                ? t("sessionInspectorSessionIdCopied")
+                : t("sessionInspectorCopySessionId")
+            }
+            aria-label={
+              copiedSessionId
+                ? t("sessionInspectorSessionIdCopied")
+                : t("sessionInspectorCopySessionId")
+            }
+          >
+            {copiedSessionId ? <CopiedIcon /> : <CopyIcon />}
+          </button>
         </div>
       </div>
 
@@ -688,6 +734,28 @@ function getStatusLabel(
   return t("sessionInspectorIdle");
 }
 
+async function writeClipboardText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  try {
+    document.execCommand("copy");
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
 function CloseIcon() {
   return (
     <svg
@@ -701,6 +769,43 @@ function CloseIcon() {
     >
       <line x1="18" y1="6" x2="6" y2="18" />
       <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function CopyIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  );
+}
+
+function CopiedIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="20 6 9 17 4 12" />
     </svg>
   );
 }

@@ -70,6 +70,7 @@ describe("ExternalSessionTracker", () => {
 
   afterEach(() => {
     tracker?.dispose();
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
@@ -93,6 +94,79 @@ describe("ExternalSessionTracker", () => {
       getSessionSummary: vi.fn(async (sessionId) => createSummary(sessionId)),
     });
   }
+
+  it("tracks top-level sessions in hostname-scoped Claude project dirs", async () => {
+    const externalProcessProbe = vi.fn(async () => true);
+    const getProjectBySessionDirSuffix = vi.fn(async () => project);
+    tracker = new ExternalSessionTracker({
+      eventBus,
+      supervisor: {
+        getProcessForSession: vi.fn(() => undefined),
+        getAllProcesses: vi.fn(() => []),
+      } as unknown as Supervisor,
+      scanner: {
+        getProject: vi.fn(async () => project),
+        getProjectBySessionDirSuffix,
+      } as never,
+      decayMs: 10000,
+      processValidationMs: 0,
+      externalProcessProbe,
+      getSessionSummary: vi.fn(async (sessionId) => createSummary(sessionId)),
+    });
+
+    eventBus.emit({
+      ...createFileChange("sess-hosted"),
+      path: "/tmp/claude/projects/host/-tmp-project/sess-hosted.jsonl",
+      relativePath: "projects/host/-tmp-project/sess-hosted.jsonl",
+    });
+    await flushTrackerWork();
+
+    expect(externalProcessProbe).toHaveBeenCalledTimes(1);
+    expect(getProjectBySessionDirSuffix).toHaveBeenCalledWith(
+      "host/-tmp-project",
+    );
+    expect(tracker.isExternal("sess-hosted")).toBe(true);
+  });
+
+  it("ignores nested workflow session files under subagents", async () => {
+    const externalProcessProbe = vi.fn(async () => true);
+    const getProjectBySessionDirSuffix = vi.fn(async () => project);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    tracker = new ExternalSessionTracker({
+      eventBus,
+      supervisor: {
+        getProcessForSession: vi.fn(() => undefined),
+        getAllProcesses: vi.fn(() => []),
+      } as unknown as Supervisor,
+      scanner: {
+        getProject: vi.fn(async () => project),
+        getProjectBySessionDirSuffix,
+      } as never,
+      decayMs: 10000,
+      processValidationMs: 100,
+      externalProcessProbe,
+      getSessionSummary: vi.fn(async (sessionId) => createSummary(sessionId)),
+    });
+
+    eventBus.emit({
+      ...createFileChange("workflow-session"),
+      path: "/tmp/claude/projects/-tmp-project/subagents/workflows/wf_123/workflow-session.jsonl",
+      relativePath:
+        "projects/-tmp-project/subagents/workflows/wf_123/workflow-session.jsonl",
+    });
+    await flushTrackerWork();
+
+    expect(externalProcessProbe).not.toHaveBeenCalled();
+    expect(getProjectBySessionDirSuffix).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(
+      events.some(
+        (event) =>
+          event.type === "session-created" &&
+          event.session.id === "workflow-session",
+      ),
+    ).toBe(false);
+  });
 
   it("creates unowned sessions without external ownership when no provider process is active", async () => {
     tracker = createTracker(vi.fn(async () => false));

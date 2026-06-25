@@ -75,6 +75,22 @@ const ONE_HOUR_MS = 60 * 60 * 1000;
 const EIGHT_HOURS_MS = 8 * 60 * 60 * 1000;
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 
+function timestampMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function compareProjectsByLastActivityDesc(
+  a: Pick<Project, "lastActivity">,
+  b: Pick<Project, "lastActivity">,
+): number {
+  return (
+    (timestampMs(b.lastActivity) ?? Number.NEGATIVE_INFINITY) -
+    (timestampMs(a.lastActivity) ?? Number.NEGATIVE_INFINITY)
+  );
+}
+
 export function createInboxRoutes(deps: InboxDeps): Hono {
   const routes = new Hono();
 
@@ -89,6 +105,23 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
     const projects = filterProjectId
       ? allProjects.filter((p) => p.id === filterProjectId)
       : allProjects;
+    const activeProcessProjectIds = new Set(
+      deps.supervisor
+        ?.getAllProcesses?.()
+        .map((process) => process.projectId) ?? [],
+    );
+    const oldestInboxActivityTime = now - TWENTY_FOUR_HOURS_MS;
+    const projectsForInboxScan = filterProjectId
+      ? projects
+      : projects
+          .filter((project) => {
+            if (activeProcessProjectIds.has(project.id)) return true;
+            const lastActivity = timestampMs(project.lastActivity);
+            return (
+              lastActivity === null || lastActivity >= oldestInboxActivityTime
+            );
+          })
+          .sort(compareProjectsByLastActivityDesc);
 
     // Collect all sessions with enriched data
     const allSessions: Array<{
@@ -105,10 +138,15 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       codexScanner: deps.codexScanner,
       geminiScanner: deps.geminiScanner,
     });
+    const bridgeSessionViews =
+      (await deps.codexBridgeService?.listSessionViews()) ?? [];
+    const bridgedSessionById = new Map(
+      bridgeSessionViews.map((item) => [item.session.id, item]),
+    );
 
     // Fetch sessions from all projects in parallel
     const projectSessionResults = await Promise.all(
-      projects.map(async (project) => {
+      projectsForInboxScan.map(async (project) => {
         try {
           const sessions = await listSessionsAcrossProviders(
             project,
@@ -120,6 +158,7 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
               geminiSessionsDir: deps.geminiSessionsDir,
               geminiReaderFactory: deps.geminiReaderFactory,
               geminiHashToCwd: providerCatalog.geminiHashToCwd,
+              allowStaleSessionCache: true,
             },
             providerCatalog,
           );
@@ -158,8 +197,7 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
             activity = state;
           }
         } else {
-          const bridgedSession =
-            (await deps.codexBridgeService?.getSessionView(session.id)) ?? null;
+          const bridgedSession = bridgedSessionById.get(session.id) ?? null;
           if (bridgedSession) {
             pendingInputType = bridgedSession.pendingInputType;
             activity = bridgedSession.activity;
@@ -182,8 +220,6 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
     }
 
     const knownSessionIds = new Set(allSessions.map((item) => item.session.id));
-    const bridgeSessionViews =
-      (await deps.codexBridgeService?.listSessionViews()) ?? [];
     for (const item of bridgeSessionViews) {
       if (knownSessionIds.has(item.session.id)) continue;
       if (filterProjectId && item.session.projectId !== filterProjectId) {

@@ -130,6 +130,43 @@ describe("Inbox Routes", () => {
   }
 
   describe("tier categorization", () => {
+    it("skips inactive projects older than the inbox time window", async () => {
+      const recentProject = {
+        ...createProject("proj1", "recent-project", "/sessions/recent"),
+        lastActivity: minutesAgo(10),
+      };
+      const oldProject = {
+        ...createProject("proj2", "old-project", "/sessions/old"),
+        lastActivity: hoursAgo(48),
+      };
+      const recentSession = createSession("sess1", "proj1", minutesAgo(10));
+      const oldSession = createSession("sess2", "proj2", hoursAgo(48));
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([
+        oldProject,
+        recentProject,
+      ]);
+      sessionsByDir.set("/sessions/recent", [recentSession]);
+      sessionsByDir.set("/sessions/old", [oldSession]);
+
+      const result = await makeRequest({
+        scanner: mockScanner,
+        readerFactory: mockReaderFactory,
+        supervisor: mockSupervisor,
+        notificationService: mockNotificationService,
+        sessionIndexService: mockSessionIndexService,
+      });
+
+      expect(result.recentActivity.map((item) => item.sessionId)).toEqual([
+        "sess1",
+      ]);
+      expect(
+        vi
+          .mocked(mockSessionIndexService.getSessionsWithCache)
+          .mock.calls.map((call) => call[0]),
+      ).toEqual(["/sessions/recent"]);
+    });
+
     it("categorizes session with pendingInputType into needsAttention", async () => {
       const project = createProject("proj1", "myproject", "/sessions/proj1");
       const session = createSession("sess1", "proj1", minutesAgo(5));

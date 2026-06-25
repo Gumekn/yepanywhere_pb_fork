@@ -99,7 +99,7 @@ export function NavigationLayout() {
       )}
 
       {/* Mobile sidebar - modal overlay (also used for constrained desktop overlay) */}
-      {(!isWideScreen || sidebarOpen) && (
+      {sidebarOpen && (
         <Sidebar
           isOpen={sidebarOpen}
           onClose={() => setSidebarOpen(false)}

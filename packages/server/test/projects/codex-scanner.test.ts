@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexSessionScanner } from "../../src/projects/codex-scanner.js";
 
 function makeSessionMeta(
@@ -25,6 +25,7 @@ describe("CodexSessionScanner", () => {
   const tempDirs: string[] = [];
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await Promise.all(
       tempDirs
         .splice(0)
@@ -213,5 +214,36 @@ describe("CodexSessionScanner", () => {
     );
     expect(sessions).toHaveLength(1);
     expect(sessions[0].id).toBe(id1);
+  });
+
+  it("coalesces concurrent full-tree scans", async () => {
+    const sessionsDir = join(tmpdir(), `codex-scan-${randomUUID()}`);
+    tempDirs.push(sessionsDir);
+
+    const dateDir = join(sessionsDir, "2026", "02", "03");
+    await mkdir(dateDir, { recursive: true });
+
+    const id = randomUUID();
+    await writeFile(
+      join(dateDir, `rollout-${id}.jsonl`),
+      `${makeSessionMeta(id, "/home/user/project-a")}\n`,
+    );
+
+    const scanner = new CodexSessionScanner({ sessionsDir });
+    const internals = scanner as unknown as {
+      findJsonlFiles: (dir: string) => Promise<string[]>;
+    };
+    const findSpy = vi.spyOn(internals, "findJsonlFiles");
+
+    const [projects, sessions] = await Promise.all([
+      scanner.listProjects(),
+      scanner.getSessionsForProject("/home/user/project-a"),
+    ]);
+
+    expect(projects).toHaveLength(1);
+    expect(sessions).toHaveLength(1);
+    expect(
+      findSpy.mock.calls.filter(([dir]) => dir === sessionsDir),
+    ).toHaveLength(1);
   });
 });

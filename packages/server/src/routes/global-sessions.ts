@@ -164,6 +164,12 @@ function updatedAtMs(session: Pick<GlobalSessionItem, "updatedAt">): number {
   return new Date(session.updatedAt).getTime();
 }
 
+function timestampMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
 function addTopSession(
   sessions: GlobalSessionItem[],
   session: GlobalSessionItem,
@@ -202,6 +208,32 @@ function canEnterTopSessions(
 
   const last = sessions.at(-1);
   return !last || updatedAtMs(session) > updatedAtMs(last);
+}
+
+function canStopBeforeProject(
+  topSessions: GlobalSessionItem[],
+  project: Pick<Project, "lastActivity">,
+  maxCount: number,
+): boolean {
+  if (topSessions.length < maxCount) return false;
+
+  const projectLastActivity = timestampMs(project.lastActivity);
+  if (projectLastActivity === null) return false;
+
+  const currentBottom = topSessions.at(-1);
+  if (!currentBottom) return false;
+
+  return projectLastActivity <= updatedAtMs(currentBottom);
+}
+
+function compareProjectsByLastActivityDesc(
+  a: Pick<Project, "lastActivity">,
+  b: Pick<Project, "lastActivity">,
+): number {
+  return (
+    (timestampMs(b.lastActivity) ?? Number.NEGATIVE_INFINITY) -
+    (timestampMs(a.lastActivity) ?? Number.NEGATIVE_INFINITY)
+  );
 }
 
 export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
@@ -412,7 +444,18 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       geminiScanner: deps.geminiScanner,
     });
 
-    for (const project of projects) {
+    const projectsForSessionScan = shouldCollectStats
+      ? projects
+      : [...projects].sort(compareProjectsByLastActivityDesc);
+
+    for (const project of projectsForSessionScan) {
+      if (
+        !shouldCollectStats &&
+        canStopBeforeProject(topSessions, project, maxCandidates)
+      ) {
+        break;
+      }
+
       const sessions = await listSessionsForProject(project, providerCatalog);
 
       // Enrich each session

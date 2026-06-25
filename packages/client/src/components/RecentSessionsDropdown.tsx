@@ -135,12 +135,19 @@ export function RecentSessionsDropdown({
   // Position dropdown below trigger
   const triggerRect = triggerRef.current?.getBoundingClientRect();
   const style: React.CSSProperties = triggerRect
-    ? {
-        position: "fixed",
-        top: triggerRect.bottom + 4,
-        left: Math.max(8, triggerRect.left - 100), // Offset left to align better
-        width: "min(830px, calc(100vw - 32px))",
-      }
+    ? (() => {
+        const gutter = 8;
+        const viewportWidth = window.innerWidth;
+        const width = Math.min(830, Math.max(0, viewportWidth - gutter * 2));
+        const preferredLeft = triggerRect.left - 100;
+        const maxLeft = Math.max(gutter, viewportWidth - width - gutter);
+        return {
+          position: "fixed",
+          top: triggerRect.bottom + 4,
+          left: Math.min(Math.max(gutter, preferredLeft), maxLeft),
+          width,
+        };
+      })()
     : {};
 
   const dropdown = (

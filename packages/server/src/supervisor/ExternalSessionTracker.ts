@@ -45,6 +45,7 @@ interface ExternalSessionInfo {
 
 /** Default grace period after abort before external detection resumes (30 seconds) */
 const DEFAULT_ABORT_GRACE_MS = 30000;
+const MISSING_PROJECT_WARNING_INTERVAL_MS = 60_000;
 
 export interface ExternalSessionTrackerOptions {
   eventBus: EventBus;
@@ -107,6 +108,7 @@ export class ExternalSessionTracker {
       serviceTier?: string;
     }
   > = new Map();
+  private missingProjectWarningTimestamps: Map<string, number> = new Map();
 
   constructor(options: ExternalSessionTrackerOptions) {
     this.eventBus = options.eventBus;
@@ -387,6 +389,7 @@ export class ExternalSessionTracker {
     }
     this.externalSessions.clear();
     this.recentlyAborted.clear();
+    this.missingProjectWarningTimestamps.clear();
   }
 
   private async handleFileChange(event: FileChangeEvent): Promise<void> {
@@ -445,7 +448,7 @@ export class ExternalSessionTracker {
     // - projects/<hostname>/<projectId>/<sessionId>.jsonl
     // - <projectId>/<sessionId>.jsonl (when watchDir is already ~/.claude/projects)
     // - <hostname>/<projectId>/<sessionId>.jsonl (same case with hostname)
-    const parts = relativePath.split(path.sep).filter(Boolean);
+    const parts = relativePath.split(/[\\/]+/).filter(Boolean);
     if (parts.length < 2) return null;
 
     const startIdx = parts[0] === "projects" ? 1 : 0;
@@ -461,17 +464,32 @@ export class ExternalSessionTracker {
     // Skip agent sessions (they start with 'agent-')
     if (sessionId.startsWith("agent-")) return null;
 
-    // ProjectId is everything between 'projects/' and the filename
-    // For: projects/aG9tZS.../.../session.jsonl
-    // ProjectId could be single part or multiple parts (hostname + encoded path)
-    const projectParts = parts.slice(startIdx, -1);
-    if (projectParts.length === 0) return null;
+    const projectAndNestedParts = parts.slice(startIdx, -1);
+    if (projectAndNestedParts.length === 0) return null;
 
-    // Use the first part as projectId (encoded project path)
-    // In the hostname case, use hostname/encodedPath format
-    const dirProjectId = asDirProjectId(projectParts.join("/"));
+    const projectPartCount =
+      projectAndNestedParts.length >= 2 &&
+      this.isClaudeProjectDirName(projectAndNestedParts[1])
+        ? 2
+        : 1;
+    const nestedParts = projectAndNestedParts.slice(projectPartCount);
+
+    // Ignore nested files such as subagents/workflows/*.jsonl. They are not
+    // top-level user-visible sessions and should not trigger external
+    // ownership state.
+    if (nestedParts.length > 0) return null;
+
+    const dirProjectId = asDirProjectId(
+      projectAndNestedParts.slice(0, projectPartCount).join("/"),
+    );
 
     return { sessionId, dirProjectId };
+  }
+
+  private isClaudeProjectDirName(value: string | undefined): boolean {
+    return Boolean(
+      value && (value.startsWith("-") || /^[a-zA-Z]--/.test(value)),
+    );
   }
 
   private async handleCodexFileChange(event: FileChangeEvent): Promise<void> {
@@ -784,8 +802,9 @@ export class ExternalSessionTracker {
       info.dirProjectId,
     );
     if (!project) {
-      console.warn(
-        `[ExternalSessionTracker] Cannot emit ownership change - project not found: ${info.dirProjectId}`,
+      this.warnMissingProject(
+        "Cannot emit ownership change",
+        info.dirProjectId,
       );
       return;
     }
@@ -826,11 +845,21 @@ export class ExternalSessionTracker {
       info.dirProjectId,
     );
     if (!project) {
-      console.warn(
-        `[ExternalSessionTracker] Cannot emit session-created - project not found: ${info.dirProjectId}`,
-      );
+      this.warnMissingProject("Cannot emit session-created", info.dirProjectId);
       return null;
     }
     return { id: project.id as UrlProjectId, path: project.path };
+  }
+
+  private warnMissingProject(reason: string, dirProjectId: DirProjectId): void {
+    const key = `${reason}:${dirProjectId}`;
+    const now = Date.now();
+    const lastWarnedAt = this.missingProjectWarningTimestamps.get(key) ?? 0;
+    if (now - lastWarnedAt < MISSING_PROJECT_WARNING_INTERVAL_MS) return;
+
+    this.missingProjectWarningTimestamps.set(key, now);
+    console.warn(
+      `[ExternalSessionTracker] ${reason} - project not found: ${dirProjectId}`,
+    );
   }
 }

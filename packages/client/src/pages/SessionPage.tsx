@@ -1833,6 +1833,7 @@ function SessionPageContent({
           markdownAugments={markdownAugments}
           activeToolApproval={activeToolApproval}
           projectId={projectId}
+          sessionId={actualSessionId}
           basePath={basePath}
           provider={effectiveProvider}
           model={effectiveModel}
@@ -1851,6 +1852,7 @@ function SessionPageContent({
           markdownAugments={markdownAugments}
           activeToolApproval={activeToolApproval}
           projectId={projectId}
+          sessionId={actualSessionId}
           basePath={basePath}
           provider={effectiveProvider}
           model={effectiveModel}

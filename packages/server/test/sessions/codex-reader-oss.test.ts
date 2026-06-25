@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CodexSessionEntry, UrlProjectId } from "@yep-anywhere/shared";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeProjectId } from "../../src/projects/paths.js";
 import { CodexSessionReader } from "../../src/sessions/codex-reader.js";
 
@@ -21,6 +21,7 @@ describe("CodexSessionReader - OSS Support", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(testDir, { recursive: true, force: true });
   });
 
@@ -109,6 +110,27 @@ describe("CodexSessionReader - OSS Support", () => {
       `${lines.join("\n")}\n`,
     );
   };
+
+  it("coalesces concurrent session file scans", async () => {
+    const sessionId = randomUUID();
+    await createSessionFile(sessionId, "openai", "gpt-5");
+
+    const internals = reader as unknown as {
+      findJsonlFiles: (dir: string) => Promise<string[]>;
+    };
+    const findSpy = vi.spyOn(internals, "findJsonlFiles");
+
+    const [first, second] = await Promise.all([
+      reader.listSessionFiles(testDir),
+      reader.listSessionFiles(testDir),
+    ]);
+
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(1);
+    expect(first[0]?.sessionId).toBe(sessionId);
+    expect(second[0]?.sessionId).toBe(sessionId);
+    expect(findSpy).toHaveBeenCalledTimes(1);
+  });
 
   const createRollbackSessionFile = async (sessionId: string) => {
     const now = new Date().toISOString();

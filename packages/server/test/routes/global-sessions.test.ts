@@ -213,6 +213,43 @@ describe("Global Sessions Routes", () => {
       expect(result.sessions[1].projectName).toBe("project-two");
     });
 
+    it("stops scanning older projects once the requested page is full", async () => {
+      const project1 = {
+        ...createProject("proj1", "project-one", "/sessions/proj1"),
+        lastActivity: minutesAgo(1),
+      };
+      const project2 = {
+        ...createProject("proj2", "project-two", "/sessions/proj2"),
+        lastActivity: minutesAgo(2),
+      };
+      const project3 = {
+        ...createProject("proj3", "project-three", "/sessions/proj3"),
+        lastActivity: minutesAgo(3),
+      };
+      const session1 = createSession("sess1", "proj1", minutesAgo(1));
+      const session2 = createSession("sess2", "proj2", minutesAgo(2));
+      const session3 = createSession("sess3", "proj3", minutesAgo(3));
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([
+        project3,
+        project1,
+        project2,
+      ]);
+      sessionsByDir.set("/sessions/proj1", [session1]);
+      sessionsByDir.set("/sessions/proj2", [session2]);
+      sessionsByDir.set("/sessions/proj3", [session3]);
+
+      const result = await makeRequest("?limit=1");
+
+      expect(result.sessions.map((session) => session.id)).toEqual(["sess1"]);
+      expect(result.hasMore).toBe(true);
+      expect(
+        vi
+          .mocked(mockSessionIndexService.getSessionsWithCache)
+          .mock.calls.map((call) => call[0]),
+      ).toEqual(["/sessions/proj1", "/sessions/proj2"]);
+    });
+
     it("only computes global stats when includeStats=true", async () => {
       const project = createProject("proj1", "project-one", "/sessions/proj1");
       const session = createSession("sess1", "proj1", minutesAgo(5));

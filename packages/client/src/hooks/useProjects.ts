@@ -56,15 +56,27 @@ export function useProject(projectId: string | undefined) {
 
 const REFETCH_DEBOUNCE_MS = 500;
 
-export function useProjects() {
+export interface UseProjectsOptions {
+  /** Skip project fetches while the consuming UI is hidden. */
+  enabled?: boolean;
+}
+
+export function useProjects(options: UseProjectsOptions = {}) {
+  const { enabled = true } = options;
   const [projects, setProjects] = useState<Project[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(enabled);
   const [error, setError] = useState<Error | null>(null);
   const refetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasFetchedRef = useRef(false);
   const hasResolvedInitialFetchRef = useRef(false);
 
   const fetch = useCallback(async () => {
+    if (!enabled) {
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
     // Preserve existing UI during background refetches triggered by activity
     // events so pages don't bounce back to their initial loading state.
     setLoading(!hasResolvedInitialFetchRef.current);
@@ -78,24 +90,30 @@ export function useProjects() {
       hasResolvedInitialFetchRef.current = true;
       setLoading(false);
     }
-  }, []);
+  }, [enabled]);
 
   // Initial fetch - only once (avoid StrictMode double-fetch)
   useEffect(() => {
+    if (!enabled) {
+      setLoading(false);
+      return;
+    }
     if (hasFetchedRef.current) return;
     hasFetchedRef.current = true;
     fetch();
-  }, [fetch]);
+  }, [enabled, fetch]);
 
   // Debounced refetch for status change events
   const debouncedRefetch = useCallback(() => {
+    if (!enabled) return;
+
     if (refetchTimerRef.current) {
       clearTimeout(refetchTimerRef.current);
     }
     refetchTimerRef.current = setTimeout(() => {
       fetch();
     }, REFETCH_DEBOUNCE_MS);
-  }, [fetch]);
+  }, [fetch, enabled]);
 
   // Handle session status changes - refetch to update active counts
   const handleSessionStatusChange = useCallback(
@@ -106,9 +124,13 @@ export function useProjects() {
   );
 
   // Subscribe to session status changes
-  useFileActivity({
-    onSessionStatusChange: handleSessionStatusChange,
-  });
+  useFileActivity(
+    enabled
+      ? {
+          onSessionStatusChange: handleSessionStatusChange,
+        }
+      : {},
+  );
 
   // Cleanup debounce timer
   useEffect(() => {

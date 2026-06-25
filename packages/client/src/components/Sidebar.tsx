@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { GlobalSessionItem } from "../api/client";
+import { useInboxContext } from "../contexts/InboxContext";
 import { useDrafts } from "../hooks/useDrafts";
 import { useGlobalSessions } from "../hooks/useGlobalSessions";
-import { useNeedsAttentionBadge } from "../hooks/useNeedsAttentionBadge";
 import { resolvePreferredProjectId } from "../hooks/useRecentProject";
 import { useRecentProjects } from "../hooks/useRecentProjects";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
@@ -68,10 +68,15 @@ export function Sidebar({
   const { t } = useI18n();
   // Base path for navigation links (empty — app is served at its own root).
   const basePath = useRemoteBasePath();
+  const shouldLoadSessionLists = isDesktop ? !isCollapsed : isOpen;
 
   // Fetch global sessions for sidebar (non-starred only for recent/older sections)
   const { sessions: globalSessions, loading: globalLoading } =
-    useGlobalSessions({ limit: 50, includeStats: false });
+    useGlobalSessions({
+      limit: 50,
+      includeStats: false,
+      enabled: shouldLoadSessionLists,
+    });
 
   // Fetch starred sessions separately to ensure we get ALL starred sessions
   const { sessions: starredSessions, loading: starredLoading } =
@@ -79,6 +84,7 @@ export function Sidebar({
       starred: true,
       limit: 100,
       includeStats: false,
+      enabled: shouldLoadSessionLists,
     });
 
   const sessionsLoading = globalLoading || starredLoading;
@@ -88,8 +94,10 @@ export function Sidebar({
   const capabilities = versionInfo?.capabilities ?? [];
 
   // Global inbox count
-  const inboxCount = useNeedsAttentionBadge();
-  const { recentProjects, projects } = useRecentProjects();
+  const { totalNeedsAttention: inboxCount } = useInboxContext();
+  const { recentProjects, projects } = useRecentProjects({
+    enabled: shouldLoadSessionLists,
+  });
   const newSessionProjectId = resolvePreferredProjectId(
     projects,
     recentProjects[0]?.id,

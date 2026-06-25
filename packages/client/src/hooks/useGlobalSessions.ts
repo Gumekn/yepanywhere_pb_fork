@@ -55,6 +55,8 @@ export interface UseGlobalSessionsOptions {
   includeArchived?: boolean;
   starred?: boolean;
   includeStats?: boolean;
+  /** Skip initial fetch and live refetches while the consuming UI is hidden. */
+  enabled?: boolean;
 }
 
 /** Default stats when no data loaded */
@@ -75,6 +77,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     includeArchived,
     starred,
     includeStats = false,
+    enabled = true,
   } = options;
   const [sessions, setSessions] = useState<GlobalSessionItem[]>([]);
   const [stats, setStats] = useState<GlobalSessionStats>(DEFAULT_STATS);
@@ -101,6 +104,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     includeArchived?: boolean;
     starred?: boolean;
     includeStats?: boolean;
+    enabled?: boolean;
   }>({});
 
   const clearPendingTitleRefetch = useCallback((sessionId: string) => {
@@ -114,13 +118,20 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   }, []);
 
   const fetch = useCallback(async () => {
+    if (!enabled) {
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
     // Reset initial load flag when options change
     const optionsChanged =
       lastFetchOptionsRef.current.projectId !== projectId ||
       lastFetchOptionsRef.current.searchQuery !== searchQuery ||
       lastFetchOptionsRef.current.includeArchived !== includeArchived ||
       lastFetchOptionsRef.current.starred !== starred ||
-      lastFetchOptionsRef.current.includeStats !== includeStats;
+      lastFetchOptionsRef.current.includeStats !== includeStats ||
+      lastFetchOptionsRef.current.enabled !== enabled;
 
     if (optionsChanged) {
       hasInitialLoadRef.current = false;
@@ -133,6 +144,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       includeArchived,
       starred,
       includeStats,
+      enabled,
     };
 
     // Only show loading state on initial load
@@ -199,6 +211,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     includeArchived,
     starred,
     includeStats,
+    enabled,
     clearPendingTitleRefetch,
   ]);
   latestFetchRef.current = fetch;
@@ -223,7 +236,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
 
   // Load more sessions (pagination)
   const loadMore = useCallback(async () => {
-    if (!hasMore || sessions.length === 0) return;
+    if (!enabled || !hasMore || sessions.length === 0) return;
 
     const lastSession = sessions[sessions.length - 1];
     if (!lastSession) return;
@@ -258,6 +271,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     limit,
     includeArchived,
     starred,
+    enabled,
   ]);
 
   // Debounced refetch
@@ -321,6 +335,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   // Handle new session created
   const handleSessionCreated = useCallback(
     (event: SessionCreatedEvent) => {
+      if (!enabled) return;
+
       // If we have a project filter, only add sessions from that project
       if (projectId && event.session.projectId !== projectId) return;
 
@@ -379,6 +395,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       projectId,
       searchQuery,
       starred,
+      enabled,
       debouncedRefetch,
       schedulePendingTitleRefetch,
     ],
@@ -387,6 +404,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   // Handle session metadata changes
   const handleSessionMetadataChange = useCallback(
     (event: SessionMetadataChangedEvent) => {
+      if (!enabled) return;
+
       setSessions((prev) => {
         const updated = prev.map((session) => {
           if (session.id !== event.sessionId) return session;
@@ -407,7 +426,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         return updated;
       });
     },
-    [starred],
+    [starred, enabled],
   );
 
   // Handle session seen events
@@ -427,6 +446,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   // Handle session content updates (auto-generated title, messageCount, contextUsage)
   const handleSessionUpdated = useCallback(
     (event: SessionUpdatedEvent) => {
+      if (!enabled) return;
+
       if (event.title?.trim()) {
         clearPendingTitleRefetch(event.sessionId);
       } else if (event.title === null || event.messageCount === 0) {
@@ -465,24 +486,32 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         }),
       );
     },
-    [clearPendingTitleRefetch, schedulePendingTitleRefetch],
+    [clearPendingTitleRefetch, schedulePendingTitleRefetch, enabled],
   );
 
   // Subscribe to SSE events
-  useFileActivity({
-    onSessionStatusChange: handleSessionStatusChange,
-    onSessionCreated: handleSessionCreated,
-    onProcessStateChange: handleProcessStateChange,
-    onSessionMetadataChange: handleSessionMetadataChange,
-    onSessionSeen: handleSessionSeen,
-    onSessionUpdated: handleSessionUpdated,
-    onReconnect: fetch,
-  });
+  useFileActivity(
+    enabled
+      ? {
+          onSessionStatusChange: handleSessionStatusChange,
+          onSessionCreated: handleSessionCreated,
+          onProcessStateChange: handleProcessStateChange,
+          onSessionMetadataChange: handleSessionMetadataChange,
+          onSessionSeen: handleSessionSeen,
+          onSessionUpdated: handleSessionUpdated,
+          onReconnect: fetch,
+        }
+      : {},
+  );
 
   // Initial fetch and refetch when options change
   useEffect(() => {
+    if (!enabled) {
+      setLoading(false);
+      return;
+    }
     fetch();
-  }, [fetch]);
+  }, [enabled, fetch]);
 
   // Cleanup debounce timer
   useEffect(() => {
