@@ -1916,6 +1916,127 @@ a.sidebar-nav-item {
   position: relative;
 }
 
+.sidebar-project-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-project-group {
+  min-width: 0;
+}
+
+.sidebar-project-row {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  transition: background 0.15s, color 0.15s;
+}
+
+.sidebar-project-row:hover,
+.sidebar-project-row:focus-within,
+.sidebar-project-group.is-current .sidebar-project-row {
+  background: color-mix(in srgb, var(--bg-hover) 55%, transparent);
+  color: var(--text-primary);
+}
+
+.sidebar-project-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  padding: 0.45rem 0.875rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-project-new-session {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 30px;
+  width: 30px;
+  margin: 0.25rem 0.5rem 0.25rem 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: background 0.15s, color 0.15s;
+}
+
+.sidebar-project-row:hover .sidebar-project-new-session,
+.sidebar-project-row:focus-within .sidebar-project-new-session,
+.sidebar-project-group.is-current .sidebar-project-new-session,
+.sidebar-project-new-session:hover {
+  color: var(--text-primary);
+}
+
+.sidebar-project-new-session:focus-visible {
+  outline: 2px solid var(--focus-border);
+  outline-offset: 2px;
+}
+
+.sidebar-project-chevron {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  transform: rotate(0deg);
+  transition: transform 0.15s ease;
+}
+
+.sidebar-project-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.sidebar-project-main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.sidebar-project-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+}
+
+.sidebar-project-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.sidebar-project-session-list {
+  margin-left: 1.35rem;
+  padding-left: 0.25rem;
+  border-left: 1px solid var(--border-subtle);
+}
+
+.sidebar-project-session-list
+  .session-list-item--compact
+  .session-list-item__link {
+  padding-left: var(--space-2);
+}
+
 .sidebar-show-more {
   display: block;
   width: 100%;

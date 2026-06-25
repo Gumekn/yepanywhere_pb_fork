@@ -465,9 +465,6 @@ export function SessionListItem({
                   <span className="session-list-item__title-text">
                     {displayTitle}
                   </span>
-                  {hasDraft && (
-                    <span className="session-draft-badge">Draft</span>
-                  )}
                 </span>
                 <span className="session-list-item__meta session-list-item__meta--compact">
                   {showProjectName && projectName && (
@@ -493,6 +490,9 @@ export function SessionListItem({
                       compact
                       className="session-list-item__provider"
                     />
+                  )}
+                  {hasDraft && (
+                    <span className="session-draft-badge">Draft</span>
                   )}
                   {getCompactActivityIndicator()}
                   {isArchived && (

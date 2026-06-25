@@ -83,6 +83,12 @@ export function getSettingsCategories(
       description: t("settingsAgentContextDescription"),
     },
     {
+      id: "library",
+      label: t("settingsLibraryTitle"),
+      icon: "🗂️",
+      description: t("settingsLibraryDescription"),
+    },
+    {
       id: "notifications",
       label: t("settingsNotificationsTitle"),
       icon: "🔔",

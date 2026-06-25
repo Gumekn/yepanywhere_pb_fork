@@ -2,14 +2,13 @@ import { SLASH_COMMAND_SESSION_KIND } from "@yep-anywhere/shared";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { GlobalSessionItem } from "../api/client";
-import { useInboxContext } from "../contexts/InboxContext";
 import { useDrafts } from "../hooks/useDrafts";
 import { useGlobalSessions } from "../hooks/useGlobalSessions";
 import { resolvePreferredProjectId } from "../hooks/useRecentProject";
 import { useRecentProjects } from "../hooks/useRecentProjects";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
-import { toUrlProjectId } from "../utils";
+import { formatSmartTime } from "../lib/datetime";
 import { SessionListItem } from "./SessionListItem";
 import {
   SidebarIcons,
@@ -33,6 +32,41 @@ const sortSessionsByUpdatedAtDesc = (
   [...sessions].sort(
     (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
   );
+
+interface SessionProjectGroup {
+  key: string;
+  projectId: string;
+  projectName: string;
+  sessions: GlobalSessionItem[];
+  latestUpdatedAt: string;
+}
+
+function groupSessionsByProject(
+  sectionKey: string,
+  sessions: GlobalSessionItem[],
+): SessionProjectGroup[] {
+  const groupsByProject = new Map<string, SessionProjectGroup>();
+
+  for (const session of sessions) {
+    const groupKey = `${sectionKey}:${session.projectId}`;
+    const group = groupsByProject.get(groupKey);
+
+    if (group) {
+      group.sessions.push(session);
+      continue;
+    }
+
+    groupsByProject.set(groupKey, {
+      key: groupKey,
+      projectId: session.projectId,
+      projectName: session.projectName || session.projectId,
+      sessions: [session],
+      latestUpdatedAt: session.updatedAt,
+    });
+  }
+
+  return Array.from(groupsByProject.values());
+}
 
 interface SidebarProps {
   isOpen: boolean;
@@ -72,7 +106,7 @@ export function Sidebar({
   onResize,
   onResizeEnd,
 }: SidebarProps) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   // Base path for navigation links (empty — app is served at its own root).
   const basePath = useRemoteBasePath();
   const shouldLoadSessionLists = isDesktop ? !isCollapsed : isOpen;
@@ -98,8 +132,6 @@ export function Sidebar({
 
   const sessionsLoading = globalLoading || starredLoading;
 
-  // Global inbox count
-  const { totalNeedsAttention: inboxCount } = useInboxContext();
   const { recentProjects, projects } = useRecentProjects({
     enabled: shouldLoadSessionLists,
   });
@@ -116,15 +148,18 @@ export function Sidebar({
   const [isResizing, setIsResizing] = useState(false);
   const resizeStartX = useRef<number | null>(null);
   const resizeStartWidth = useRef<number | null>(null);
-  const [recentSessionsLimit, setRecentSessionsLimit] = useState(
+  const [recentProjectGroupsLimit, setRecentProjectGroupsLimit] = useState(
     RECENT_SESSIONS_INITIAL,
   );
-  const [olderSessionsLimit, setOlderSessionsLimit] = useState(
+  const [olderProjectGroupsLimit, setOlderProjectGroupsLimit] = useState(
     RECENT_SESSIONS_INITIAL,
   );
   const [starredSessionsLimit, setStarredSessionsLimit] = useState(
     RECENT_SESSIONS_INITIAL,
   );
+  const [expandedProjectGroups, setExpandedProjectGroups] = useState<
+    Set<string>
+  >(() => new Set());
 
   const handleTouchStart = (e: React.TouchEvent) => {
     touchStartX.current = e.touches[0]?.clientX ?? null;
@@ -254,6 +289,181 @@ export function Sidebar({
   // Track which sessions have unsent drafts in localStorage
   const drafts = useDrafts();
 
+  const allRecentProjectGroups = useMemo(
+    () => groupSessionsByProject("recent", recentDaySessions),
+    [recentDaySessions],
+  );
+
+  const recentProjectGroups = useMemo(
+    () => allRecentProjectGroups.slice(0, recentProjectGroupsLimit),
+    [allRecentProjectGroups, recentProjectGroupsLimit],
+  );
+
+  const allOlderProjectGroups = useMemo(
+    () => groupSessionsByProject("older", olderSessions),
+    [olderSessions],
+  );
+
+  const olderProjectGroups = useMemo(
+    () => allOlderProjectGroups.slice(0, olderProjectGroupsLimit),
+    [allOlderProjectGroups, olderProjectGroupsLimit],
+  );
+
+  useEffect(() => {
+    if (!currentSessionId) return;
+
+    const currentGroupKeys = [
+      ...allRecentProjectGroups,
+      ...allOlderProjectGroups,
+    ]
+      .filter((group) =>
+        group.sessions.some((session) => session.id === currentSessionId),
+      )
+      .map((group) => group.key);
+
+    if (currentGroupKeys.length === 0) return;
+
+    setExpandedProjectGroups((current) => {
+      let changed = false;
+      const next = new Set(current);
+
+      for (const key of currentGroupKeys) {
+        if (!next.has(key)) {
+          next.add(key);
+          changed = true;
+        }
+      }
+
+      return changed ? next : current;
+    });
+  }, [currentSessionId, allRecentProjectGroups, allOlderProjectGroups]);
+
+  const toggleProjectGroup = (groupKey: string) => {
+    setExpandedProjectGroups((current) => {
+      const next = new Set(current);
+      if (next.has(groupKey)) {
+        next.delete(groupKey);
+      } else {
+        next.add(groupKey);
+      }
+      return next;
+    });
+  };
+
+  const renderSessionListItem = (
+    session: GlobalSessionItem,
+    showProjectName: boolean,
+  ) => (
+    <SessionListItem
+      key={session.id}
+      sessionId={session.id}
+      projectId={session.projectId}
+      title={getSessionListTitle(session)}
+      fullTitle={getSessionListTitle(session)}
+      updatedAt={session.updatedAt}
+      provider={session.provider}
+      model={session.model}
+      reasoningEffort={session.reasoningEffort}
+      serviceTier={session.serviceTier}
+      status={session.ownership}
+      pendingInputType={session.pendingInputType}
+      hasUnread={session.hasUnread}
+      isStarred={session.isStarred}
+      isArchived={session.isArchived}
+      mode="compact"
+      isCurrent={session.id === currentSessionId}
+      activity={session.activity}
+      onNavigate={onNavigate}
+      showProjectName={showProjectName}
+      projectName={session.projectName}
+      basePath={basePath}
+      messageCount={session.messageCount}
+      hasDraft={drafts.has(session.id)}
+    />
+  );
+
+  const renderProjectGroups = (groups: SessionProjectGroup[]) => (
+    <div className="sidebar-project-groups">
+      {groups.map((group) => {
+        const isExpanded = expandedProjectGroups.has(group.key);
+        const isCurrentGroup = group.sessions.some(
+          (session) => session.id === currentSessionId,
+        );
+
+        return (
+          <div
+            key={group.key}
+            className={`sidebar-project-group${isCurrentGroup ? " is-current" : ""}`}
+          >
+            <div className="sidebar-project-row">
+              <button
+                type="button"
+                className="sidebar-project-toggle"
+                onClick={() => toggleProjectGroup(group.key)}
+                aria-expanded={isExpanded}
+                title={group.projectName}
+              >
+                <span
+                  className={`sidebar-project-chevron${isExpanded ? " expanded" : ""}`}
+                  aria-hidden="true"
+                >
+                  ›
+                </span>
+                <span className="sidebar-project-main">
+                  <span className="sidebar-project-name">
+                    {group.projectName}
+                  </span>
+                  <span className="sidebar-project-meta">
+                    {t("projectSelectorSessionsCount", {
+                      count: group.sessions.length,
+                    })}
+                    <span aria-hidden="true">·</span>
+                    <span
+                      title={new Date(group.latestUpdatedAt).toLocaleString(
+                        locale,
+                      )}
+                    >
+                      {formatSmartTime(group.latestUpdatedAt, locale)}
+                    </span>
+                  </span>
+                </span>
+              </button>
+              <Link
+                to={`${basePath}/new-session?projectId=${encodeURIComponent(group.projectId)}`}
+                className="sidebar-project-new-session"
+                onClick={onNavigate}
+                title={t("sidebarNewSession")}
+                aria-label={`${t("sidebarNewSession")}: ${group.projectName}`}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </Link>
+            </div>
+            {isExpanded && (
+              <ul className="sidebar-session-list sidebar-project-session-list">
+                {group.sessions.map((session) =>
+                  renderSessionListItem(session, false),
+                )}
+              </ul>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+
   // In desktop mode, always render. In mobile mode, only render when open.
   if (!isDesktop && !isOpen) return null;
 
@@ -365,34 +575,12 @@ export function Sidebar({
           {/* Navigation items that scroll with content */}
           <SidebarNavSection>
             <SidebarNavItem
-              to="/inbox"
-              icon={SidebarIcons.inbox}
-              label={t("sidebarInbox")}
-              badge={inboxCount}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
               to="/sessions"
               icon={SidebarIcons.allSessions}
               label={t("sidebarAllSessions")}
               onClick={onNavigate}
               basePath={basePath}
               inactiveWhenSearchParams={["kind"]}
-            />
-            <SidebarNavItem
-              to="/archive"
-              icon={SidebarIcons.archive}
-              label={t("sidebarArchive")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to={`/sessions?kind=${SLASH_COMMAND_SESSION_KIND}`}
-              icon={SidebarIcons.slashCommands}
-              label={t("sidebarSlashCommands")}
-              onClick={onNavigate}
-              basePath={basePath}
             />
             <SidebarNavItem
               to="/search"
@@ -454,34 +642,7 @@ export function Sidebar({
               <ul className="sidebar-session-list">
                 {filteredStarredSessions
                   .slice(0, starredSessionsLimit)
-                  .map((session) => (
-                    <SessionListItem
-                      key={session.id}
-                      sessionId={session.id}
-                      projectId={session.projectId}
-                      title={getSessionListTitle(session)}
-                      fullTitle={getSessionListTitle(session)}
-                      updatedAt={session.updatedAt}
-                      provider={session.provider}
-                      model={session.model}
-                      reasoningEffort={session.reasoningEffort}
-                      serviceTier={session.serviceTier}
-                      status={session.ownership}
-                      pendingInputType={session.pendingInputType}
-                      hasUnread={session.hasUnread}
-                      isStarred={session.isStarred}
-                      isArchived={session.isArchived}
-                      mode="compact"
-                      isCurrent={session.id === currentSessionId}
-                      activity={session.activity}
-                      onNavigate={onNavigate}
-                      showProjectName
-                      projectName={session.projectName}
-                      basePath={basePath}
-                      messageCount={session.messageCount}
-                      hasDraft={drafts.has(session.id)}
-                    />
-                  ))}
+                  .map((session) => renderSessionListItem(session, true))}
               </ul>
               {filteredStarredSessions.length > starredSessionsLimit && (
                 <button
@@ -509,44 +670,13 @@ export function Sidebar({
               <h3 className="sidebar-section-title">
                 {t("sidebarSectionLast24Hours")}
               </h3>
-              <ul className="sidebar-session-list">
-                {recentDaySessions
-                  .slice(0, recentSessionsLimit)
-                  .map((session) => (
-                    <SessionListItem
-                      key={session.id}
-                      sessionId={session.id}
-                      projectId={session.projectId}
-                      title={getSessionListTitle(session)}
-                      fullTitle={getSessionListTitle(session)}
-                      updatedAt={session.updatedAt}
-                      provider={session.provider}
-                      model={session.model}
-                      reasoningEffort={session.reasoningEffort}
-                      serviceTier={session.serviceTier}
-                      status={session.ownership}
-                      pendingInputType={session.pendingInputType}
-                      hasUnread={session.hasUnread}
-                      isStarred={session.isStarred}
-                      isArchived={session.isArchived}
-                      mode="compact"
-                      isCurrent={session.id === currentSessionId}
-                      activity={session.activity}
-                      onNavigate={onNavigate}
-                      showProjectName
-                      projectName={session.projectName}
-                      basePath={basePath}
-                      messageCount={session.messageCount}
-                      hasDraft={drafts.has(session.id)}
-                    />
-                  ))}
-              </ul>
-              {recentDaySessions.length > recentSessionsLimit && (
+              {renderProjectGroups(recentProjectGroups)}
+              {allRecentProjectGroups.length > recentProjectGroupsLimit && (
                 <button
                   type="button"
                   className="sidebar-show-more"
                   onClick={() =>
-                    setRecentSessionsLimit(
+                    setRecentProjectGroupsLimit(
                       (prev) => prev + RECENT_SESSIONS_INCREMENT,
                     )
                   }
@@ -554,7 +684,7 @@ export function Sidebar({
                   {t("actionShowMore", {
                     count: Math.min(
                       RECENT_SESSIONS_INCREMENT,
-                      recentDaySessions.length - recentSessionsLimit,
+                      allRecentProjectGroups.length - recentProjectGroupsLimit,
                     ),
                   })}
                 </button>
@@ -567,42 +697,13 @@ export function Sidebar({
               <h3 className="sidebar-section-title">
                 {t("sidebarSectionOlder")}
               </h3>
-              <ul className="sidebar-session-list">
-                {olderSessions.slice(0, olderSessionsLimit).map((session) => (
-                  <SessionListItem
-                    key={session.id}
-                    sessionId={session.id}
-                    projectId={session.projectId}
-                    title={getSessionListTitle(session)}
-                    fullTitle={getSessionListTitle(session)}
-                    updatedAt={session.updatedAt}
-                    provider={session.provider}
-                    model={session.model}
-                    reasoningEffort={session.reasoningEffort}
-                    serviceTier={session.serviceTier}
-                    status={session.ownership}
-                    pendingInputType={session.pendingInputType}
-                    hasUnread={session.hasUnread}
-                    isStarred={session.isStarred}
-                    isArchived={session.isArchived}
-                    mode="compact"
-                    isCurrent={session.id === currentSessionId}
-                    activity={session.activity}
-                    onNavigate={onNavigate}
-                    showProjectName
-                    projectName={session.projectName}
-                    basePath={basePath}
-                    messageCount={session.messageCount}
-                    hasDraft={drafts.has(session.id)}
-                  />
-                ))}
-              </ul>
-              {olderSessions.length > olderSessionsLimit && (
+              {renderProjectGroups(olderProjectGroups)}
+              {allOlderProjectGroups.length > olderProjectGroupsLimit && (
                 <button
                   type="button"
                   className="sidebar-show-more"
                   onClick={() =>
-                    setOlderSessionsLimit(
+                    setOlderProjectGroupsLimit(
                       (prev) => prev + RECENT_SESSIONS_INCREMENT,
                     )
                   }
@@ -610,7 +711,7 @@ export function Sidebar({
                   {t("actionShowMore", {
                     count: Math.min(
                       RECENT_SESSIONS_INCREMENT,
-                      olderSessions.length - olderSessionsLimit,
+                      allOlderProjectGroups.length - olderProjectGroupsLimit,
                     ),
                   })}
                 </button>
