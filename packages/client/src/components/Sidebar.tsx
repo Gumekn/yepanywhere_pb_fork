@@ -1,3 +1,4 @@
+import { SLASH_COMMAND_SESSION_KIND } from "@yep-anywhere/shared";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { GlobalSessionItem } from "../api/client";
@@ -75,6 +76,7 @@ export function Sidebar({
     useGlobalSessions({
       limit: 50,
       includeStats: false,
+      excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
       enabled: shouldLoadSessionLists,
     });
 
@@ -84,8 +86,16 @@ export function Sidebar({
       starred: true,
       limit: 100,
       includeStats: false,
+      excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
       enabled: shouldLoadSessionLists,
     });
+
+  const { sessions: slashCommandSessions } = useGlobalSessions({
+    sessionKind: SLASH_COMMAND_SESSION_KIND,
+    limit: 1,
+    includeStats: false,
+    enabled: shouldLoadSessionLists,
+  });
 
   const sessionsLoading = globalLoading || starredLoading;
 
@@ -367,7 +377,17 @@ export function Sidebar({
               label={t("sidebarAllSessions")}
               onClick={onNavigate}
               basePath={basePath}
+              inactiveWhenSearchParams={["kind"]}
             />
+            {slashCommandSessions.length > 0 && (
+              <SidebarNavItem
+                to={`/sessions?kind=${SLASH_COMMAND_SESSION_KIND}`}
+                icon={SidebarIcons.slashCommands}
+                label={t("sidebarSlashCommands")}
+                onClick={onNavigate}
+                basePath={basePath}
+              />
+            )}
             <SidebarNavItem
               to="/search"
               icon={SidebarIcons.search}

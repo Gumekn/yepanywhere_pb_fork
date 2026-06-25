@@ -1,3 +1,4 @@
+import { type SessionKind, sessionMatchesKind } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type GlobalSessionItem,
@@ -33,6 +34,30 @@ function needsPendingTitleRefetch(session: {
   return !hasResolvedTitle(session) || session.messageCount === 0;
 }
 
+function matchesSessionKindFilters(
+  session: { customTitle?: string | null; title?: string | null },
+  options: {
+    sessionKind?: SessionKind | null;
+    excludeSessionKind?: SessionKind | null;
+  },
+): boolean {
+  if (
+    options.sessionKind &&
+    !sessionMatchesKind(session, options.sessionKind)
+  ) {
+    return false;
+  }
+
+  if (
+    options.excludeSessionKind &&
+    sessionMatchesKind(session, options.excludeSessionKind)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 function mergeFetchedSession(
   existing: GlobalSessionItem,
   incoming: GlobalSessionItem,
@@ -54,6 +79,8 @@ export interface UseGlobalSessionsOptions {
   limit?: number;
   includeArchived?: boolean;
   starred?: boolean;
+  sessionKind?: SessionKind | null;
+  excludeSessionKind?: SessionKind | null;
   includeStats?: boolean;
   /** Skip initial fetch and live refetches while the consuming UI is hidden. */
   enabled?: boolean;
@@ -76,6 +103,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     limit,
     includeArchived,
     starred,
+    sessionKind,
+    excludeSessionKind,
     includeStats = false,
     enabled = true,
   } = options;
@@ -90,6 +119,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     Map<string, Set<ReturnType<typeof setTimeout>>>
   >(new Map());
   const latestFetchRef = useRef<(() => Promise<void>) | null>(null);
+  const latestRefreshStatsRef = useRef<(() => Promise<void>) | null>(null);
   const hasInitialLoadRef = useRef(false);
   const sessionsRef = useRef<GlobalSessionItem[]>([]);
   sessionsRef.current = sessions;
@@ -103,6 +133,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     limit?: number;
     includeArchived?: boolean;
     starred?: boolean;
+    sessionKind?: SessionKind | null;
+    excludeSessionKind?: SessionKind | null;
     includeStats?: boolean;
     enabled?: boolean;
   }>({});
@@ -117,6 +149,22 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     pendingTitleRefetchTimersRef.current.delete(sessionId);
   }, []);
 
+  const refreshStats = useCallback(async () => {
+    if (!enabled || !includeStats || projectId) {
+      setStats(DEFAULT_STATS);
+      return;
+    }
+
+    try {
+      const data = await api.getGlobalSessionStats();
+      setStats(data.stats ?? DEFAULT_STATS);
+    } catch {
+      // Keep the sessions list usable if the non-critical counts request fails.
+      setStats(DEFAULT_STATS);
+    }
+  }, [enabled, includeStats, projectId]);
+  latestRefreshStatsRef.current = refreshStats;
+
   const fetch = useCallback(async () => {
     if (!enabled) {
       setLoading(false);
@@ -130,6 +178,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       lastFetchOptionsRef.current.searchQuery !== searchQuery ||
       lastFetchOptionsRef.current.includeArchived !== includeArchived ||
       lastFetchOptionsRef.current.starred !== starred ||
+      lastFetchOptionsRef.current.sessionKind !== sessionKind ||
+      lastFetchOptionsRef.current.excludeSessionKind !== excludeSessionKind ||
       lastFetchOptionsRef.current.includeStats !== includeStats ||
       lastFetchOptionsRef.current.enabled !== enabled;
 
@@ -143,6 +193,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       limit,
       includeArchived,
       starred,
+      sessionKind,
+      excludeSessionKind,
       includeStats,
       enabled,
     };
@@ -160,7 +212,9 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         limit,
         includeArchived,
         starred,
-        includeStats,
+        includeStats: false,
+        kind: sessionKind ?? undefined,
+        excludeKind: excludeSessionKind ?? undefined,
       });
 
       for (const session of data.sessions) {
@@ -197,7 +251,9 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       }
 
       setHasMore(data.hasMore);
-      setStats(data.stats ?? DEFAULT_STATS);
+      if (!includeStats || projectId) {
+        setStats(DEFAULT_STATS);
+      }
       setProjects(data.projects);
     } catch (err) {
       setError(err instanceof Error ? err : new Error(String(err)));
@@ -210,6 +266,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     limit,
     includeArchived,
     starred,
+    sessionKind,
+    excludeSessionKind,
     includeStats,
     enabled,
     clearPendingTitleRefetch,
@@ -250,6 +308,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         includeArchived,
         starred,
         includeStats: false,
+        kind: sessionKind ?? undefined,
+        excludeKind: excludeSessionKind ?? undefined,
       });
 
       setSessions((prev) => {
@@ -271,6 +331,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     limit,
     includeArchived,
     starred,
+    sessionKind,
+    excludeSessionKind,
     enabled,
   ]);
 
@@ -282,6 +344,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     refetchTimerRef.current = setTimeout(() => {
       fetch();
     }, REFETCH_DEBOUNCE_MS);
+  }, [fetch]);
+
+  const handleReconnect = useCallback(() => {
+    void latestRefreshStatsRef.current?.();
+    return fetch();
   }, [fetch]);
 
   // Handle session ownership changes
@@ -343,6 +410,15 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       // If we have a starred filter, only add starred sessions
       if (starred && !event.session.isStarred) return;
 
+      if (
+        !matchesSessionKindFilters(event.session, {
+          sessionKind,
+          excludeSessionKind,
+        })
+      ) {
+        return;
+      }
+
       // If we have a search query, refetch to let server filter
       if (searchQuery) {
         debouncedRefetch();
@@ -395,6 +471,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       projectId,
       searchQuery,
       starred,
+      sessionKind,
+      excludeSessionKind,
       enabled,
       debouncedRefetch,
       schedulePendingTitleRefetch,
@@ -418,15 +496,26 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           };
         });
 
+        const filtered = updated.filter((session) =>
+          matchesSessionKindFilters(session, {
+            sessionKind,
+            excludeSessionKind,
+          }),
+        );
+
         // If this hook has a starred filter, remove sessions that are no longer starred
         if (starred && event.starred === false) {
-          return updated.filter((s) => s.id !== event.sessionId);
+          return filtered.filter((s) => s.id !== event.sessionId);
         }
 
-        return updated;
+        return filtered;
       });
+
+      if (sessionKind || excludeSessionKind) {
+        debouncedRefetch();
+      }
     },
-    [starred, enabled],
+    [starred, sessionKind, excludeSessionKind, enabled, debouncedRefetch],
   );
 
   // Handle session seen events
@@ -454,8 +543,8 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         schedulePendingTitleRefetch(event.sessionId);
       }
 
-      setSessions((prev) =>
-        prev.map((session) => {
+      setSessions((prev) => {
+        const updated = prev.map((session) => {
           if (session.id !== event.sessionId) return session;
           const ignoreUnresolvedTitle =
             event.title !== undefined &&
@@ -483,10 +572,28 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
               serviceTier: event.serviceTier,
             }),
           };
-        }),
-      );
+        });
+
+        return updated.filter((session) =>
+          matchesSessionKindFilters(session, {
+            sessionKind,
+            excludeSessionKind,
+          }),
+        );
+      });
+
+      if (sessionKind || excludeSessionKind) {
+        debouncedRefetch();
+      }
     },
-    [clearPendingTitleRefetch, schedulePendingTitleRefetch, enabled],
+    [
+      clearPendingTitleRefetch,
+      schedulePendingTitleRefetch,
+      sessionKind,
+      excludeSessionKind,
+      enabled,
+      debouncedRefetch,
+    ],
   );
 
   // Subscribe to SSE events
@@ -499,7 +606,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           onSessionMetadataChange: handleSessionMetadataChange,
           onSessionSeen: handleSessionSeen,
           onSessionUpdated: handleSessionUpdated,
-          onReconnect: fetch,
+          onReconnect: handleReconnect,
         }
       : {},
   );
@@ -512,6 +619,12 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     }
     fetch();
   }, [enabled, fetch]);
+
+  // Global counts are fetched independently so the sessions list can use the
+  // server's early-stop path instead of forcing a full stats scan.
+  useEffect(() => {
+    void refreshStats();
+  }, [refreshStats]);
 
   // Cleanup debounce timer
   useEffect(() => {

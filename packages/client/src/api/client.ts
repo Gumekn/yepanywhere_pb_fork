@@ -15,6 +15,7 @@ import type {
   ProviderName,
   ReportDocumentResponse,
   ReportsListResponse,
+  SessionKind,
   SlashCommand,
   ThinkingOption,
   UploadedFile,
@@ -990,6 +991,8 @@ export const api = {
     includeArchived?: boolean;
     starred?: boolean;
     includeStats?: boolean;
+    kind?: SessionKind;
+    excludeKind?: SessionKind;
   }) => {
     const searchParams = new URLSearchParams();
     if (params?.project) searchParams.set("project", params.project);
@@ -999,6 +1002,9 @@ export const api = {
     if (params?.includeArchived) searchParams.set("includeArchived", "true");
     if (params?.starred) searchParams.set("starred", "true");
     if (params?.includeStats) searchParams.set("includeStats", "true");
+    if (params?.kind) searchParams.set("kind", params.kind);
+    if (params?.excludeKind)
+      searchParams.set("excludeKind", params.excludeKind);
     const query = searchParams.toString();
     return fetchJSON<GlobalSessionsResponse>(
       query ? `/sessions?${query}` : "/sessions",

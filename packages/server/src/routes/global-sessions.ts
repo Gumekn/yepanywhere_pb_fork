@@ -5,7 +5,13 @@
  * this returns a flat list suitable for navigation/sidebar use.
  */
 
-import type { ContextUsage, ProviderName } from "@yep-anywhere/shared";
+import {
+  type ContextUsage,
+  type ProviderName,
+  type SessionKind,
+  isSessionKind,
+  sessionMatchesKind,
+} from "@yep-anywhere/shared";
 import { Hono } from "hono";
 import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
@@ -236,6 +242,27 @@ function compareProjectsByLastActivityDesc(
   );
 }
 
+function matchesSessionKindFilters(
+  session: Pick<SessionSummary, "title"> & { customTitle?: string | null },
+  options: {
+    includeKind?: SessionKind;
+    excludeKind?: SessionKind;
+  },
+): boolean {
+  if (
+    options.includeKind &&
+    !sessionMatchesKind(session, options.includeKind)
+  ) {
+    return false;
+  }
+
+  if (options.excludeKind && sessionMatchesKind(session, options.excludeKind)) {
+    return false;
+  }
+
+  return true;
+}
+
 export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
   const routes = new Hono();
   let cachedStats: { value: GlobalSessionStats; timestamp: number } | null =
@@ -393,6 +420,12 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
     // Parse query params
     const filterProjectId = c.req.query("project");
     const searchQuery = c.req.query("q")?.toLowerCase();
+    const kindQuery = c.req.query("kind");
+    const excludeKindQuery = c.req.query("excludeKind");
+    const includeKind = isSessionKind(kindQuery) ? kindQuery : undefined;
+    const excludeKind = isSessionKind(excludeKindQuery)
+      ? excludeKindQuery
+      : undefined;
     const afterCursor = c.req.query("after");
     const includeArchived = c.req.query("includeArchived") === "true";
     const starredOnly = c.req.query("starred") === "true";
@@ -488,6 +521,15 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
         // Skip non-starred sessions if starred filter is active
         if (starredOnly && !isStarred) continue;
+
+        if (
+          !matchesSessionKindFilters(
+            { title: session.title, customTitle },
+            { includeKind, excludeKind },
+          )
+        ) {
+          continue;
+        }
 
         if (
           afterTime !== null &&
@@ -618,6 +660,14 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
       if (isArchived && !includeArchived) continue;
       if (starredOnly && !isStarred) continue;
+      if (
+        !matchesSessionKindFilters(
+          { title: session.title, customTitle },
+          { includeKind, excludeKind },
+        )
+      ) {
+        continue;
+      }
 
       if (
         afterTime !== null &&

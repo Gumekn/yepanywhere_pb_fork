@@ -51,6 +51,16 @@ export {
   DEFAULT_PROVIDER,
 } from "./types.js";
 
+export type { SessionKind } from "./session-kind.js";
+export {
+  COMMAND_MESSAGE_SESSION_TITLE,
+  SLASH_COMMAND_SESSION_KIND,
+  isSessionKind,
+  isSlashCommandSession,
+  isSlashCommandSessionTitle,
+  sessionMatchesKind,
+} from "./session-kind.js";
+
 export type { GitStatusInfo, GitFileChange } from "./git-status.js";
 
 export {

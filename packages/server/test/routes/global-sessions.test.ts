@@ -372,6 +372,91 @@ describe("Global Sessions Routes", () => {
 
       expect(result.sessions).toHaveLength(2);
     });
+
+    it("filters command-message sessions with ?kind=slash-command", async () => {
+      const project = createProject("proj1", "project", "/sessions/proj1");
+      const commandSession = createSession(
+        "sess-command",
+        "proj1",
+        minutesAgo(5),
+        {
+          title:
+            "<command-message>kb-map-repo-capabilities</command-message> done",
+        },
+      );
+      const dollarCommandSession = createSession(
+        "sess-dollar-command",
+        "proj1",
+        minutesAgo(7),
+        {
+          title: "$git commit push",
+        },
+      );
+      const normalSession = createSession(
+        "sess-normal",
+        "proj1",
+        minutesAgo(10),
+        {
+          title: "Normal session",
+        },
+      );
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [
+        commandSession,
+        dollarCommandSession,
+        normalSession,
+      ]);
+
+      const result = await makeRequest("?kind=slash-command");
+
+      expect(result.sessions.map((session) => session.id)).toEqual([
+        "sess-command",
+        "sess-dollar-command",
+      ]);
+    });
+
+    it("excludes command-message sessions with ?excludeKind=slash-command", async () => {
+      const project = createProject("proj1", "project", "/sessions/proj1");
+      const commandSession = createSession(
+        "sess-command",
+        "proj1",
+        minutesAgo(5),
+        {
+          title:
+            "<command-message>kb-map-repo-capabilities</command-message> done",
+        },
+      );
+      const dollarCommandSession = createSession(
+        "sess-dollar-command",
+        "proj1",
+        minutesAgo(7),
+        {
+          title: "$git commit push",
+        },
+      );
+      const normalSession = createSession(
+        "sess-normal",
+        "proj1",
+        minutesAgo(10),
+        {
+          title: "Normal session",
+        },
+      );
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [
+        commandSession,
+        dollarCommandSession,
+        normalSession,
+      ]);
+
+      const result = await makeRequest("?excludeKind=slash-command");
+
+      expect(result.sessions.map((session) => session.id)).toEqual([
+        "sess-normal",
+      ]);
+    });
   });
 
   describe("search", () => {

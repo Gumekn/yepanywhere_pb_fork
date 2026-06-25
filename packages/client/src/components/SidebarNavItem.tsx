@@ -67,6 +67,24 @@ export const SidebarIcons = {
       <line x1="9" y1="21" x2="9" y2="9" />
     </svg>
   ),
+  slashCommands: (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M4 17L10 7" />
+      <path d="M13 8h5" />
+      <path d="M13 12h7" />
+      <path d="M13 16h4" />
+    </svg>
+  ),
   search: (
     <svg
       width="16"
@@ -218,6 +236,35 @@ export interface SidebarNavItemProps {
   hasActivityIndicator?: boolean;
   /** Base path prefix for navigation links */
   basePath?: string;
+  /** Search params that should keep this item from rendering as active. */
+  inactiveWhenSearchParams?: string[];
+}
+
+function matchesLocationTarget(
+  location: ReturnType<typeof useLocation>,
+  target: string,
+): boolean {
+  const queryStart = target.indexOf("?");
+  const targetPath = queryStart >= 0 ? target.slice(0, queryStart) : target;
+  const targetSearch = queryStart >= 0 ? target.slice(queryStart + 1) : "";
+
+  if (location.pathname !== targetPath) {
+    return false;
+  }
+
+  if (!targetSearch) {
+    return true;
+  }
+
+  const currentParams = new URLSearchParams(location.search);
+  const targetParams = new URLSearchParams(targetSearch);
+  for (const [key, value] of targetParams) {
+    if (currentParams.get(key) !== value) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 /**
@@ -234,11 +281,18 @@ export function SidebarNavItem({
   hasDraft,
   hasActivityIndicator,
   basePath = "",
+  inactiveWhenSearchParams = [],
 }: SidebarNavItemProps) {
   const location = useLocation();
   const fullPath = `${basePath}${to}`;
+  const hasInactiveSearchParam = inactiveWhenSearchParams.some((param) =>
+    new URLSearchParams(location.search).has(param),
+  );
   // Check if current path matches (with or without basePath prefix)
-  const isActive = location.pathname === fullPath || location.pathname === to;
+  const isActive =
+    !hasInactiveSearchParam &&
+    (matchesLocationTarget(location, fullPath) ||
+      matchesLocationTarget(location, to));
 
   return (
     <Link

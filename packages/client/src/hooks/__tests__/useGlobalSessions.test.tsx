@@ -226,6 +226,43 @@ describe("useGlobalSessions", () => {
     expect(result.current.sessions[0]?.messageCount).toBe(4);
   });
 
+  it("fetches global stats separately from the sessions list", async () => {
+    const globalStats: GlobalSessionStats = {
+      totalCount: 7,
+      unreadCount: 2,
+      starredCount: 1,
+      archivedCount: 3,
+      providerCounts: { codex: 5, claude: 2 },
+      executorCounts: { local: 6, remote: 1 },
+    };
+    mockGetGlobalSessionStats.mockResolvedValue({ stats: globalStats });
+    mockGetGlobalSessions.mockResolvedValue(response([]));
+
+    const { result } = renderHook(() =>
+      useGlobalSessions({ includeStats: true, limit: 50 }),
+    );
+    await flushPromises();
+
+    expect(mockGetGlobalSessions).toHaveBeenCalledWith(
+      expect.objectContaining({ includeStats: false }),
+    );
+    expect(mockGetGlobalSessionStats).toHaveBeenCalledTimes(1);
+    expect(result.current.stats).toEqual(globalStats);
+  });
+
+  it("does not fetch global stats for a project-scoped list", async () => {
+    const { result } = renderHook(() =>
+      useGlobalSessions({ projectId, includeStats: true, limit: 50 }),
+    );
+    await flushPromises();
+
+    expect(mockGetGlobalSessions).toHaveBeenCalledWith(
+      expect.objectContaining({ project: projectId, includeStats: false }),
+    );
+    expect(mockGetGlobalSessionStats).not.toHaveBeenCalled();
+    expect(result.current.stats).toEqual(stats);
+  });
+
   it("uses the latest filters when a pending title refetch fires", async () => {
     const project2Session: GlobalSessionItem = {
       ...baseSession,

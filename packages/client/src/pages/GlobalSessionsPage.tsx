@@ -1,4 +1,10 @@
-import { ALL_PROVIDERS, type ProviderName } from "@yep-anywhere/shared";
+import {
+  ALL_PROVIDERS,
+  type ProviderName,
+  SLASH_COMMAND_SESSION_KIND,
+  type SessionKind,
+  isSessionKind,
+} from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { type GlobalSessionItem, api } from "../api/client";
@@ -56,6 +62,10 @@ export function GlobalSessionsPage() {
   // Get filter params from URL
   const searchQuery = searchParams.get("q") || "";
   const projectFilter = searchParams.get("project") || undefined;
+  const sessionKind = useMemo((): SessionKind | undefined => {
+    const param = searchParams.get("kind");
+    return isSessionKind(param) ? param : undefined;
+  }, [searchParams]);
 
   // Local state for search input (instant feedback)
   const [searchInput, setSearchInput] = useState(searchQuery);
@@ -160,7 +170,7 @@ export function GlobalSessionsPage() {
   useEffect(() => {
     if (hasAppliedDefaultAgeRef.current) return;
     hasAppliedDefaultAgeRef.current = true;
-    if (!searchParams.get("age")) {
+    if (!sessionKind && !searchParams.get("age")) {
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -170,7 +180,7 @@ export function GlobalSessionsPage() {
         { replace: true },
       );
     }
-  }, [searchParams, setSearchParams]);
+  }, [sessionKind, searchParams, setSearchParams]);
 
   // Include archived sessions when archived filter is selected
   const includeArchived = statusFilters.includes("archived");
@@ -181,6 +191,7 @@ export function GlobalSessionsPage() {
       searchQuery,
       includeArchived,
       includeStats: !projectFilter,
+      sessionKind,
     });
 
   // Dismiss cold-start splash once the first sessions fetch resolves.
@@ -605,7 +616,12 @@ export function GlobalSessionsPage() {
     statusFilters.length > 0 ||
     providerFilters.length > 0 ||
     executorFilters.length > 0 ||
-    ageFilter;
+    ageFilter ||
+    sessionKind;
+  const pageTitle =
+    sessionKind === SLASH_COMMAND_SESSION_KIND
+      ? t("slashCommandSessionsTitle")
+      : t("globalSessionsTitle");
 
   return (
     <div
@@ -619,7 +635,7 @@ export function GlobalSessionsPage() {
         }
       >
         <PageHeader
-          title={t("globalSessionsTitle")}
+          title={pageTitle}
           onOpenSidebar={openSidebar}
           onToggleSidebar={toggleSidebar}
           isWideScreen={isWideScreen}
