@@ -8176,6 +8176,134 @@ button.context-usage-indicator--button:focus-visible {
 }
 
 /* ==========================================================================
+   Archive Page
+   ========================================================================== */
+
+.archive-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.archive-search {
+  flex: 1 1 260px;
+  max-width: none;
+}
+
+.archive-refresh {
+  flex-shrink: 0;
+}
+
+.archive-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-4);
+  color: var(--text-dimmed);
+  font-size: var(--font-size-sm);
+}
+
+.archive-summary span {
+  min-width: 0;
+}
+
+.archive-summary-path {
+  max-width: min(100%, 520px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted);
+}
+
+.archive-session-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+}
+
+.archive-session-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+}
+
+.archive-session-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  flex: 1;
+}
+
+.archive-session-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.archive-session-title {
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+  overflow-wrap: anywhere;
+}
+
+.archive-session-meta,
+.archive-session-dates {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.archive-session-dates {
+  color: var(--text-dimmed);
+  font-size: var(--font-size-xs);
+}
+
+.archive-session-path {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dimmed);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono, monospace);
+}
+
+.archive-restore-button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .archive-session-card {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .archive-restore-button {
+    width: 100%;
+  }
+}
+
+/* ==========================================================================
    Login Page
    ========================================================================== */
 

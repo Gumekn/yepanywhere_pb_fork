@@ -8,7 +8,6 @@ import { useGlobalSessions } from "../hooks/useGlobalSessions";
 import { resolvePreferredProjectId } from "../hooks/useRecentProject";
 import { useRecentProjects } from "../hooks/useRecentProjects";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
-import { useVersion } from "../hooks/useVersion";
 import { useI18n } from "../i18n";
 import { toUrlProjectId } from "../utils";
 import { SessionListItem } from "./SessionListItem";
@@ -27,6 +26,13 @@ const RECENT_SESSIONS_INCREMENT = 10; // How many more to show on each expand
 
 const getSessionListTitle = (session: GlobalSessionItem): string | null =>
   session.customTitle ?? session.title ?? null;
+
+const sortSessionsByUpdatedAtDesc = (
+  sessions: GlobalSessionItem[],
+): GlobalSessionItem[] =>
+  [...sessions].sort(
+    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+  );
 
 interface SidebarProps {
   isOpen: boolean;
@@ -90,18 +96,7 @@ export function Sidebar({
       enabled: shouldLoadSessionLists,
     });
 
-  const { sessions: slashCommandSessions } = useGlobalSessions({
-    sessionKind: SLASH_COMMAND_SESSION_KIND,
-    limit: 1,
-    includeStats: false,
-    enabled: shouldLoadSessionLists,
-  });
-
   const sessionsLoading = globalLoading || starredLoading;
-
-  // Server capabilities for feature gating
-  const { version: versionInfo } = useVersion();
-  const capabilities = versionInfo?.capabilities ?? [];
 
   // Global inbox count
   const { totalNeedsAttention: inboxCount } = useInboxContext();
@@ -231,9 +226,13 @@ export function Sidebar({
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const isWithinLastDay = (date: Date) => date.getTime() >= oneDayAgo;
 
-    return globalSessions.filter(
-      (s) =>
-        !s.isStarred && !s.isArchived && isWithinLastDay(new Date(s.updatedAt)),
+    return sortSessionsByUpdatedAtDesc(
+      globalSessions.filter(
+        (s) =>
+          !s.isStarred &&
+          !s.isArchived &&
+          isWithinLastDay(new Date(s.updatedAt)),
+      ),
     );
   }, [globalSessions]);
 
@@ -242,11 +241,13 @@ export function Sidebar({
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const isOlderThanOneDay = (date: Date) => date.getTime() < oneDayAgo;
 
-    return globalSessions.filter(
-      (s) =>
-        !s.isStarred &&
-        !s.isArchived &&
-        isOlderThanOneDay(new Date(s.updatedAt)),
+    return sortSessionsByUpdatedAtDesc(
+      globalSessions.filter(
+        (s) =>
+          !s.isStarred &&
+          !s.isArchived &&
+          isOlderThanOneDay(new Date(s.updatedAt)),
+      ),
     );
   }, [globalSessions]);
 
@@ -379,15 +380,20 @@ export function Sidebar({
               basePath={basePath}
               inactiveWhenSearchParams={["kind"]}
             />
-            {slashCommandSessions.length > 0 && (
-              <SidebarNavItem
-                to={`/sessions?kind=${SLASH_COMMAND_SESSION_KIND}`}
-                icon={SidebarIcons.slashCommands}
-                label={t("sidebarSlashCommands")}
-                onClick={onNavigate}
-                basePath={basePath}
-              />
-            )}
+            <SidebarNavItem
+              to="/archive"
+              icon={SidebarIcons.archive}
+              label={t("sidebarArchive")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
+            <SidebarNavItem
+              to={`/sessions?kind=${SLASH_COMMAND_SESSION_KIND}`}
+              icon={SidebarIcons.slashCommands}
+              label={t("sidebarSlashCommands")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
             <SidebarNavItem
               to="/search"
               icon={SidebarIcons.search}
@@ -409,29 +415,24 @@ export function Sidebar({
               onClick={onNavigate}
               basePath={basePath}
             />
-            {capabilities.includes("git-status") && (
-              <SidebarNavItem
-                to="/git-status"
-                icon={SidebarIcons.sourceControl}
-                label={t("sidebarSourceControl")}
-                onClick={onNavigate}
-                basePath={basePath}
-              />
-            )}
-            {(capabilities.includes("deviceBridge") ||
-              capabilities.includes("deviceBridge-download")) && (
-              <SidebarNavItem
-                to="/devices"
-                icon={SidebarIcons.emulator}
-                label={t("sidebarDevices")}
-                onClick={onNavigate}
-                basePath={basePath}
-              />
-            )}
             <SidebarNavItem
               to="/terminal"
               icon={SidebarIcons.terminal}
               label={t("sidebarTerminal")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
+            <SidebarNavItem
+              to="/git-status"
+              icon={SidebarIcons.sourceControl}
+              label={t("sidebarSourceControl")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
+            <SidebarNavItem
+              to="/devices"
+              icon={SidebarIcons.emulator}
+              label={t("sidebarDevices")}
               onClick={onNavigate}
               basePath={basePath}
             />

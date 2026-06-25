@@ -8,6 +8,7 @@ import { serve } from "@hono/node-server";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { createApp } from "./app.js";
+import { SessionArchiveService } from "./archive/index.js";
 import { AuthService } from "./auth/AuthService.js";
 import { getRuntimeBuildInfo } from "./build-info.js";
 import { CodexBridgeHttpClient } from "./codex-bridge/CodexBridgeHttpClient.js";
@@ -116,6 +117,7 @@ let supervisorForShutdown:
 let deviceBridgeForShutdown: DeviceBridgeService | null = null;
 let codexBridgeForShutdown: CodexBridgeController | null = null;
 let terminalServiceForShutdown: TerminalService | null = null;
+let sessionArchiveServiceForShutdown: SessionArchiveService | null = null;
 let isShuttingDown = false;
 
 /**
@@ -178,6 +180,18 @@ async function gracefulShutdown(signal: string): Promise<void> {
       console.log("[Shutdown] Terminal service shut down");
     } catch (error) {
       console.error("[Shutdown] Error shutting down terminal service:", error);
+    }
+  }
+
+  if (sessionArchiveServiceForShutdown) {
+    try {
+      sessionArchiveServiceForShutdown.stopDailyScheduler();
+      console.log("[Shutdown] Session archive scheduler stopped");
+    } catch (error) {
+      console.error(
+        "[Shutdown] Error stopping session archive scheduler:",
+        error,
+      );
     }
   }
 
@@ -418,6 +432,9 @@ const sharingService = new SharingService({
   dataDir: config.dataDir,
 });
 const modelInfoService = new ModelInfoService({ dataDir: config.dataDir });
+const sessionArchiveService = new SessionArchiveService({
+  dataDir: config.dataDir,
+});
 
 async function startServer() {
   let tlsOptions: { key: Buffer; cert: Buffer } | undefined;
@@ -444,6 +461,7 @@ async function startServer() {
   await projectMetadataService.initialize();
   await sessionIndexService.initialize();
   await sessionContentIndexService.initialize();
+  await sessionArchiveService.initialize();
   await pushService.initialize();
   await browserProfileService.initialize();
   await recentsService.initialize();
@@ -554,6 +572,7 @@ async function startServer() {
     projectMetadataService,
     sessionIndexService,
     sessionContentIndexService,
+    sessionArchiveService,
     projectScanCacheTtlMs: config.projectScanCacheTtlMs,
     maxWorkers: config.maxWorkers,
     idlePreemptThresholdMs: config.idlePreemptThresholdMs,
@@ -596,6 +615,7 @@ async function startServer() {
   supervisorForShutdown = supervisor;
   deviceBridgeForShutdown = deviceBridgeService ?? null;
   codexBridgeForShutdown = codexBridgeService ?? null;
+  sessionArchiveServiceForShutdown = sessionArchiveService;
 
   // Set up debug context for maintenance server
   setDebugContext({

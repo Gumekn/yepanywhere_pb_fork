@@ -24,6 +24,11 @@ const AgentsPage = lazy(() =>
     default: module.AgentsPage,
   })),
 );
+const ArchivePage = lazy(() =>
+  import("./pages/ArchivePage").then((module) => ({
+    default: module.ArchivePage,
+  })),
+);
 const EmulatorPage = lazy(() =>
   import("./pages/EmulatorPage").then((module) => ({
     default: module.EmulatorPage,
@@ -119,6 +124,7 @@ createRoot(rootElement).render(
               <Route element={<NavigationLayout />}>
                 <Route path="/projects" element={<ProjectsPage />} />
                 <Route path="/sessions" element={<GlobalSessionsPage />} />
+                <Route path="/archive" element={<ArchivePage />} />
                 <Route path="/search" element={<SearchPage />} />
                 <Route path="/reports" element={<ReportsPage />} />
                 <Route path="/agents" element={<AgentsPage />} />

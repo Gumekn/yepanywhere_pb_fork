@@ -1,5 +1,6 @@
 import type { DeviceInfo } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { EmulatorNavButtons } from "../components/EmulatorNavButtons";
 import { EmulatorStream } from "../components/EmulatorStream";
@@ -7,6 +8,7 @@ import { PageHeader } from "../components/PageHeader";
 import { useEmulatorSettings } from "../hooks/useEmulatorSettings";
 import { useEmulatorStream } from "../hooks/useEmulatorStream";
 import { useEmulators } from "../hooks/useEmulators";
+import { useServerSettings } from "../hooks/useServerSettings";
 import { useVersion } from "../hooks/useVersion";
 import { useNavigationLayout } from "../layouts";
 
@@ -171,6 +173,73 @@ function DeviceList({
           </section>
         );
       })}
+    </div>
+  );
+}
+
+function DeviceBridgeUsageGuide() {
+  return (
+    <ol className="emulator-usage-guide">
+      <li>Enable Device Bridge.</li>
+      <li>Download the bridge runtime when prompted.</li>
+      <li>
+        Start an Android emulator or connect an Android device that appears in{" "}
+        <code>adb devices</code>. For ChromeOS, add an SSH host alias in
+        Settings.
+      </li>
+      <li>Return to this page, choose the device, and click Connect.</li>
+    </ol>
+  );
+}
+
+function DeviceBridgeDisabledPrompt({
+  busy,
+  error,
+  onEnable,
+}: {
+  busy: boolean;
+  error: string | null;
+  onEnable: () => void;
+}) {
+  return (
+    <div className="emulator-download-prompt">
+      <h2>Device Bridge is off</h2>
+      <p>
+        This page streams Android emulators, Android devices, and ChromeOS
+        testbeds from this machine to your browser over WebRTC.
+      </p>
+      <DeviceBridgeUsageGuide />
+      {error && <div className="emulator-error">{error}</div>}
+      <div className="emulator-setup-actions">
+        <button
+          type="button"
+          className="emulator-btn emulator-btn-primary"
+          onClick={onEnable}
+          disabled={busy}
+        >
+          {busy ? "Enabling..." : "Enable Device Bridge"}
+        </button>
+        <Link
+          to="/settings/emulator"
+          className="emulator-btn emulator-btn-secondary"
+        >
+          Open Settings
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+function DeviceBridgeUnavailablePrompt() {
+  return (
+    <div className="emulator-download-prompt">
+      <h2>Device Bridge is unavailable</h2>
+      <p>
+        Yep did not detect <code>adb</code> when the server started. Install
+        Android Platform Tools, make sure <code>adb</code> is on PATH, then
+        restart Yep Anywhere.
+      </p>
+      <DeviceBridgeUsageGuide />
     </div>
   );
 }
@@ -426,6 +495,7 @@ export function BridgeRuntimePrompt({
           </>
         )}
       </p>
+      <DeviceBridgeUsageGuide />
       {error && <div className="emulator-error">{error}</div>}
       <button
         type="button"
@@ -448,29 +518,68 @@ export function BridgeRuntimePrompt({
 export function EmulatorPage() {
   const { openSidebar, isWideScreen, toggleSidebar, isSidebarCollapsed } =
     useNavigationLayout();
-  const { version: versionInfo, refetch: refetchVersion } = useVersion();
+  const {
+    version: versionInfo,
+    loading: versionLoading,
+    error: versionError,
+    refetch: refetchVersion,
+  } = useVersion();
+  const {
+    settings,
+    isLoading: settingsLoading,
+    error: settingsError,
+    updateSetting,
+  } = useServerSettings();
+  const [enableBridgeBusy, setEnableBridgeBusy] = useState(false);
+  const [enableBridgeError, setEnableBridgeError] = useState<string | null>(
+    null,
+  );
   const capabilities = versionInfo?.capabilities ?? [];
+  const deviceBridgeEnabled = settings?.deviceBridgeEnabled ?? false;
+  const deviceBridgeState = versionInfo?.deviceBridgeState;
   const bridgeRuntimeMode =
-    versionInfo?.deviceBridgeState === "update-available"
+    deviceBridgeEnabled && deviceBridgeState === "update-available"
       ? "update"
-      : capabilities.includes("deviceBridge-download") &&
-          !capabilities.includes("deviceBridge")
+      : deviceBridgeEnabled &&
+          (deviceBridgeState === "downloadable" ||
+            (capabilities.includes("deviceBridge-download") &&
+              !capabilities.includes("deviceBridge")))
         ? "download"
         : null;
   const needsDownload = bridgeRuntimeMode !== null;
+  const bridgeReady =
+    deviceBridgeEnabled &&
+    !needsDownload &&
+    (deviceBridgeState === "available" ||
+      capabilities.includes("deviceBridge"));
+  const canLoadDevices =
+    !!versionInfo && !versionLoading && !settingsLoading && bridgeReady;
 
   const { emulators, loading, error, startEmulator, stopEmulator } =
-    useEmulators({ enabled: !needsDownload });
+    useEmulators({ enabled: canLoadDevices });
   const [activeDevice, setActiveDevice] = useState<DeviceInfo | null>(null);
+
+  const handleEnableBridge = useCallback(async () => {
+    setEnableBridgeBusy(true);
+    setEnableBridgeError(null);
+    try {
+      await updateSetting("deviceBridgeEnabled", true);
+      await refetchVersion();
+    } catch (err) {
+      setEnableBridgeError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setEnableBridgeBusy(false);
+    }
+  }, [refetchVersion, updateSetting]);
 
   // ?auto — auto-connect to the first streamable running device.
   useEffect(() => {
-    if (activeDevice || loading || needsDownload) return;
+    if (activeDevice || loading || !canLoadDevices) return;
     const params = new URLSearchParams(window.location.search);
     if (!params.has("auto")) return;
     const streamable = emulators.find((d) => hasAction(d, "stream"));
     if (streamable) setActiveDevice(streamable);
-  }, [emulators, loading, activeDevice, needsDownload]);
+  }, [emulators, loading, activeDevice, canLoadDevices]);
 
   if (activeDevice) {
     return (
@@ -497,14 +606,44 @@ export function EmulatorPage() {
         />
         <main className="page-scroll-container">
           <div className="page-content-inner">
-            {bridgeRuntimeMode ? (
+            {(versionLoading || settingsLoading) && (
+              <div className="emulator-loading">Loading device bridge...</div>
+            )}
+            {!versionLoading && versionError && (
+              <div className="emulator-error">
+                Failed to load device bridge status: {versionError.message}
+              </div>
+            )}
+            {!settingsLoading && settingsError && (
+              <div className="emulator-error">
+                Failed to load device bridge settings: {settingsError}
+              </div>
+            )}
+            {!versionLoading &&
+            !settingsLoading &&
+            !versionError &&
+            deviceBridgeState === "unavailable" ? (
+              <DeviceBridgeUnavailablePrompt />
+            ) : !versionLoading &&
+              !settingsLoading &&
+              !versionError &&
+              !deviceBridgeEnabled ? (
+              <DeviceBridgeDisabledPrompt
+                busy={enableBridgeBusy}
+                error={enableBridgeError}
+                onEnable={handleEnableBridge}
+              />
+            ) : !versionLoading &&
+              !settingsLoading &&
+              !versionError &&
+              bridgeRuntimeMode ? (
               <BridgeRuntimePrompt
                 mode={bridgeRuntimeMode}
                 installedVersion={versionInfo?.deviceBridgeVersion}
                 latestVersion={versionInfo?.latestDeviceBridgeVersion}
                 onDownloaded={refetchVersion}
               />
-            ) : (
+            ) : canLoadDevices ? (
               <>
                 {loading && <div className="emulator-loading">Loading...</div>}
                 {error && <div className="emulator-error">{error}</div>}
@@ -523,7 +662,7 @@ export function EmulatorPage() {
                   />
                 )}
               </>
-            )}
+            ) : null}
           </div>
         </main>
       </div>

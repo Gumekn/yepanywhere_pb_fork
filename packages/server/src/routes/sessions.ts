@@ -1,3 +1,5 @@
+import { stat } from "node:fs/promises";
+import { join, relative } from "node:path";
 import {
   ALL_CODEX_MCP_MODES,
   type CodexMcpMode,
@@ -16,6 +18,11 @@ import {
   thinkingOptionToConfig,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import {
+  ArchiveError,
+  type ArchivedSessionRecord,
+  type SessionArchiveService,
+} from "../archive/index.js";
 import { augmentTextBlocks } from "../augments/markdown-augments.js";
 import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
@@ -53,7 +60,12 @@ import type {
   Supervisor,
 } from "../supervisor/Supervisor.js";
 import type { QueuedResponse } from "../supervisor/WorkerQueue.js";
-import type { ContentBlock, Message, Project } from "../supervisor/types.js";
+import type {
+  ContentBlock,
+  Message,
+  Project,
+  SessionSummary,
+} from "../supervisor/types.js";
 import {
   isValidSshHostAlias,
   normalizeSshHostAlias,
@@ -170,6 +182,10 @@ export interface SessionsDeps {
   recentsService?: RecentsService;
   /** Codex bridge for externally launched `codex --remote` TUI sessions. */
   codexBridgeService?: CodexBridgeController;
+  /** Physical cold-archive service for moving old provider JSONL files away from hot scan paths. */
+  sessionArchiveService?: SessionArchiveService;
+  /** Claude projects directory, used to synthesize file-change invalidation events after moves. */
+  claudeProjectsDir?: string;
 }
 
 interface StartSessionBody {
@@ -410,6 +426,129 @@ function extractContextUsageFromSDKMessages(
   return undefined;
 }
 
+interface ArchiveTarget {
+  project: Project;
+  summary: SessionSummary | null;
+  provider: ProviderName | string | undefined;
+  sessionFilePath: string;
+}
+
+async function resolveArchiveTarget(
+  deps: SessionsDeps,
+  sessionId: string,
+): Promise<ArchiveTarget | null> {
+  const projects = await deps.scanner.listProjects();
+  const preferredProvider = deps.sessionMetadataService?.getProvider(sessionId);
+
+  for (const project of projects) {
+    const resolved = await findSessionSummaryAcrossProviders(
+      project,
+      sessionId,
+      project.id,
+      {
+        readerFactory: deps.readerFactory,
+        codexSessionsDir: deps.codexSessionsDir,
+        codexReaderFactory: deps.codexReaderFactory,
+        geminiSessionsDir: deps.geminiSessionsDir,
+        geminiReaderFactory: deps.geminiReaderFactory,
+        geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
+      },
+      preferredProvider,
+    );
+    if (!resolved) continue;
+
+    const sessionFilePath = await findArchiveSessionFilePath(
+      project,
+      resolved.source.reader,
+      resolved.source.sessionDir,
+      sessionId,
+    );
+    if (!sessionFilePath) continue;
+
+    return {
+      project,
+      summary: resolved.summary,
+      provider: resolved.summary.provider ?? resolved.source.provider,
+      sessionFilePath,
+    };
+  }
+
+  return null;
+}
+
+async function findArchiveSessionFilePath(
+  project: Project,
+  reader: ISessionReader,
+  sourceSessionDir: string,
+  sessionId: string,
+): Promise<string | null> {
+  const direct = await reader.getSessionFilePath?.(sessionId);
+  if (direct) return direct;
+
+  const dirs = [
+    sourceSessionDir,
+    project.sessionDir,
+    ...(project.mergedSessionDirs ?? []),
+  ];
+  const seen = new Set<string>();
+  for (const dir of dirs) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const candidate = join(dir, `${sessionId}.jsonl`);
+    try {
+      const stats = await stat(candidate);
+      if (stats.isFile()) return candidate;
+    } catch {
+      // Try next candidate.
+    }
+  }
+
+  return null;
+}
+
+function archiveHttpStatus(error: ArchiveError): 400 | 404 | 409 | 500 {
+  switch (error.code) {
+    case "unsupported_provider":
+      return 400;
+    case "session_not_found":
+    case "not_archived":
+      return 404;
+    case "already_archived":
+    case "restore_conflict":
+      return 409;
+    case "archive_failed":
+    case "restore_failed":
+      return 500;
+  }
+}
+
+function emitArchiveFileEvents(
+  deps: SessionsDeps,
+  record: ArchivedSessionRecord,
+  changeType: "create" | "delete",
+): void {
+  if (!deps.eventBus) return;
+
+  const providerRoot =
+    record.provider === "codex"
+      ? deps.codexSessionsDir
+      : deps.claudeProjectsDir;
+  if (!providerRoot) return;
+
+  for (const file of record.files) {
+    if (file.kind !== "session") continue;
+    deps.eventBus.emit({
+      type: "file-change",
+      provider: record.provider,
+      path: file.originalPath,
+      relativePath: relative(providerRoot, file.originalPath),
+      changeType,
+      timestamp: new Date().toISOString(),
+      fileType: "session",
+    });
+  }
+}
+
 export function createSessionsRoutes(deps: SessionsDeps): Hono {
   const routes = new Hono();
   const getCodexReader = (projectPath: string): CodexSessionReader | null =>
@@ -420,6 +559,31 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           projectPath,
         })
       : null);
+
+  // GET /api/archive/sessions - List physically archived sessions.
+  routes.get("/archive/sessions", (c) => {
+    if (!deps.sessionArchiveService) {
+      return c.json({ error: "Session archive service not available" }, 503);
+    }
+    return c.json({
+      archiveDir: deps.sessionArchiveService.getArchiveDir(),
+      sessions: deps.sessionArchiveService.listArchivedSessions(),
+    });
+  });
+
+  // GET /api/archive/sessions/:sessionId - Get one archived session manifest record.
+  routes.get("/archive/sessions/:sessionId", (c) => {
+    if (!deps.sessionArchiveService) {
+      return c.json({ error: "Session archive service not available" }, 503);
+    }
+    const record = deps.sessionArchiveService.getArchivedSession(
+      c.req.param("sessionId"),
+    );
+    if (!record) {
+      return c.json({ error: "Archived session not found" }, 404);
+    }
+    return c.json({ session: record });
+  });
 
   // GET /api/projects/:projectId/sessions/:sessionId/agents - Get agent mappings
   // Used to find agent sessions for pending Tasks on page reload
@@ -2044,6 +2208,90 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       );
     }
 
+    let archiveResult:
+      | {
+          physical: boolean;
+          action: "archive" | "restore" | "already_archived";
+          record?: ArchivedSessionRecord;
+        }
+      | undefined;
+
+    if (body.archived === true && deps.sessionArchiveService) {
+      const activeProcess = deps.supervisor.getProcessForSession(sessionId);
+      if (activeProcess) {
+        return c.json(
+          { error: "Active sessions must be stopped before archiving" },
+          409,
+        );
+      }
+      if (deps.externalTracker?.isExternal(sessionId)) {
+        return c.json(
+          { error: "External sessions must be idle before archiving" },
+          409,
+        );
+      }
+
+      const target = await resolveArchiveTarget(deps, sessionId);
+      if (!target) {
+        return c.json({ error: "Session file not found for archive" }, 404);
+      }
+
+      try {
+        const record = await deps.sessionArchiveService.archiveSession({
+          sessionId,
+          provider: target.provider,
+          project: target.project,
+          summary: target.summary,
+          sessionFilePath: target.sessionFilePath,
+          reason: "manual",
+        });
+        deps.scanner.invalidateCache();
+        deps.codexScanner?.invalidateCache();
+        emitArchiveFileEvents(deps, record, "delete");
+        archiveResult = { physical: true, action: "archive", record };
+      } catch (error) {
+        if (
+          error instanceof ArchiveError &&
+          error.code === "already_archived"
+        ) {
+          archiveResult = {
+            physical: true,
+            action: "already_archived",
+            record: deps.sessionArchiveService.getArchivedSession(sessionId),
+          };
+        } else if (error instanceof ArchiveError) {
+          return c.json(
+            { error: error.message, code: error.code },
+            archiveHttpStatus(error),
+          );
+        } else {
+          return c.json({ error: "Failed to archive session" }, 500);
+        }
+      }
+    }
+
+    if (body.archived === false && deps.sessionArchiveService) {
+      try {
+        const { record } =
+          await deps.sessionArchiveService.restoreSession(sessionId);
+        deps.scanner.invalidateCache();
+        deps.codexScanner?.invalidateCache();
+        emitArchiveFileEvents(deps, record, "create");
+        archiveResult = { physical: true, action: "restore", record };
+      } catch (error) {
+        if (error instanceof ArchiveError && error.code === "not_archived") {
+          // Existing metadata-only archives still unarchive normally.
+        } else if (error instanceof ArchiveError) {
+          return c.json(
+            { error: error.message, code: error.code },
+            archiveHttpStatus(error),
+          );
+        } else {
+          return c.json({ error: "Failed to restore archived session" }, 500);
+        }
+      }
+    }
+
     await deps.sessionMetadataService.updateMetadata(sessionId, {
       title: body.title,
       archived: body.archived,
@@ -2062,7 +2310,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       });
     }
 
-    return c.json({ updated: true });
+    return c.json({ updated: true, archive: archiveResult });
   });
 
   // POST /api/projects/:projectId/sessions/:sessionId/clone - Clone a session

@@ -1,6 +1,14 @@
+import { stat } from "node:fs/promises";
+import { join, relative } from "node:path";
 import type { HttpBindings } from "@hono/node-server";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { Hono } from "hono";
+import {
+  ArchiveError,
+  type ArchiveProvider,
+  type ArchivedSessionRecord,
+  type SessionArchiveService,
+} from "./archive/index.js";
 import type { AuthService } from "./auth/AuthService.js";
 import { createAuthRoutes } from "./auth/routes.js";
 import type { CodexBridgeController } from "./codex-bridge/types.js";
@@ -10,8 +18,10 @@ import type {
   SessionContentIndexService,
   SessionIndexService,
 } from "./indexes/index.js";
+import { getLogger } from "./logging/logger.js";
 import type {
   ProjectMetadataService,
+  SessionMetadata,
   SessionMetadataService,
 } from "./metadata/index.js";
 import { updateAllowedHosts } from "./middleware/allowed-hosts.js";
@@ -30,6 +40,7 @@ import {
   GEMINI_TMP_DIR,
   GeminiSessionScanner,
 } from "./projects/gemini-scanner.js";
+import { CLAUDE_PROJECTS_DIR } from "./projects/paths.js";
 import { ProjectScanner } from "./projects/scanner.js";
 import { PushNotifier, type PushService } from "./push/index.js";
 import { createPushRoutes } from "./push/routes.js";
@@ -55,6 +66,7 @@ import { createNetworkBindingRoutes } from "./routes/network-binding.js";
 import { createOnboardingRoutes } from "./routes/onboarding.js";
 import { createProcessesRoutes } from "./routes/processes.js";
 import { createProjectsRoutes } from "./routes/projects.js";
+import { buildProviderProjectCatalog } from "./routes/provider-catalog.js";
 import { createProvidersRoutes } from "./routes/providers.js";
 import { createRecentsRoutes } from "./routes/recents.js";
 import { createReportsRoutes } from "./routes/reports.js";
@@ -83,12 +95,15 @@ import type { SharingService } from "./services/SharingService.js";
 import { CodexSessionReader } from "./sessions/codex-reader.js";
 import { GeminiSessionReader } from "./sessions/gemini-reader.js";
 import { OpenCodeSessionReader } from "./sessions/opencode-reader.js";
-import { findSessionSummaryAcrossProviders } from "./sessions/provider-resolution.js";
+import {
+  findSessionSummaryAcrossProviders,
+  resolveSessionSources,
+} from "./sessions/provider-resolution.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
 import type { ISessionReader } from "./sessions/types.js";
 import { ExternalSessionTracker } from "./supervisor/ExternalSessionTracker.js";
 import { Supervisor } from "./supervisor/Supervisor.js";
-import type { Project } from "./supervisor/types.js";
+import type { Project, SessionSummary } from "./supervisor/types.js";
 import type { EventBus } from "./watcher/index.js";
 import { LifecycleWebhookService } from "./webhooks/LifecycleWebhookService.js";
 
@@ -114,6 +129,8 @@ export interface AppOptions {
   sessionIndexService?: SessionIndexService;
   /** SessionContentIndexService for full-text content search */
   sessionContentIndexService?: SessionContentIndexService;
+  /** Physical cold archive service for moving old provider JSONL files out of hot scan paths */
+  sessionArchiveService?: SessionArchiveService;
   /** Project scanner cache TTL in ms (0 = rescan every request). */
   projectScanCacheTtlMs?: number;
   /** Maximum concurrent workers. 0 = unlimited (default) */
@@ -195,6 +212,81 @@ export interface AppResult {
   scanner: ProjectScanner;
   /** Session reader factory for debug API access */
   readerFactory: (project: Project) => ISessionReader;
+}
+
+const AUTO_ARCHIVE_AGE_DAYS = 7;
+const AUTO_ARCHIVE_AGE_MS = AUTO_ARCHIVE_AGE_DAYS * 24 * 60 * 60 * 1000;
+
+function normalizeArchiveProviderName(
+  provider: string | undefined,
+): ArchiveProvider | null {
+  if (provider === "claude" || provider === "claude-ollama") return "claude";
+  if (provider === "codex" || provider === "codex-oss") return "codex";
+  return null;
+}
+
+async function findSessionFileForArchive(
+  project: Project,
+  reader: ISessionReader,
+  sourceSessionDir: string,
+  sessionId: string,
+): Promise<string | null> {
+  const direct = await reader.getSessionFilePath?.(sessionId);
+  if (direct) return direct;
+
+  const dirs = [
+    sourceSessionDir,
+    project.sessionDir,
+    ...(project.mergedSessionDirs ?? []),
+  ];
+  const seen = new Set<string>();
+  for (const dir of dirs) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const candidate = join(dir, `${sessionId}.jsonl`);
+    try {
+      const stats = await stat(candidate);
+      if (stats.isFile()) return candidate;
+    } catch {
+      // Try the next candidate.
+    }
+  }
+
+  return null;
+}
+
+function emitArchiveFileChange(
+  eventBus: EventBus | undefined,
+  record: ArchivedSessionRecord,
+  roots: { claudeProjectsDir: string; codexSessionsDir: string },
+  changeType: "create" | "delete",
+): void {
+  if (!eventBus) return;
+
+  const providerRoot =
+    record.provider === "codex"
+      ? roots.codexSessionsDir
+      : roots.claudeProjectsDir;
+
+  for (const file of record.files) {
+    if (file.kind !== "session") continue;
+    eventBus.emit({
+      type: "file-change",
+      provider: record.provider,
+      path: file.originalPath,
+      relativePath: relative(providerRoot, file.originalPath),
+      changeType,
+      timestamp: new Date().toISOString(),
+      fileType: "session",
+    });
+  }
+}
+
+export function shouldSkipAutoArchiveForStarredSession(
+  session: Pick<SessionSummary, "isStarred">,
+  metadata: Pick<SessionMetadata, "isStarred"> | undefined,
+): boolean {
+  return metadata?.isStarred ?? session.isStarred ?? false;
 }
 
 export function createApp(options: AppOptions): AppResult {
@@ -397,6 +489,156 @@ export function createApp(options: AppOptions): AppResult {
       })
     : undefined;
 
+  if (options.sessionArchiveService) {
+    const archiveService = options.sessionArchiveService;
+    archiveService.startDailyScheduler(async () => {
+      const cutoffMs = Date.now() - AUTO_ARCHIVE_AGE_MS;
+      const projects = await scanner.listProjects();
+      const providerCatalog = await buildProviderProjectCatalog({
+        projects,
+        codexScanner,
+        geminiScanner,
+      });
+      const roots = {
+        claudeProjectsDir: options.projectsDir ?? CLAUDE_PROJECTS_DIR,
+        codexSessionsDir: CODEX_SESSIONS_DIR,
+      };
+      const resolutionDeps = {
+        readerFactory,
+        codexSessionsDir: CODEX_SESSIONS_DIR,
+        codexReaderFactory,
+        geminiSessionsDir: GEMINI_TMP_DIR,
+        geminiReaderFactory,
+        geminiHashToCwd: geminiScanner.getHashToCwd(),
+      };
+      const seenSessionIds = new Set<string>();
+      let archivedCount = 0;
+      let skippedCount = 0;
+      let failedCount = 0;
+
+      getLogger().info(
+        `[SessionArchiveService] Auto-archive scan started (olderThanDays=${AUTO_ARCHIVE_AGE_DAYS})`,
+      );
+
+      for (const project of projects) {
+        const sources = resolveSessionSources(
+          project,
+          resolutionDeps,
+          providerCatalog,
+        );
+
+        for (const source of sources) {
+          const archiveProvider = normalizeArchiveProviderName(source.provider);
+          if (!archiveProvider) continue;
+
+          let sessions: SessionSummary[];
+          try {
+            sessions = options.sessionIndexService
+              ? await options.sessionIndexService.getSessionsWithCache(
+                  source.sessionDir,
+                  project.id,
+                  source.reader,
+                  { allowStale: true },
+                )
+              : await source.reader.listSessions(project.id);
+          } catch (error) {
+            failedCount++;
+            getLogger().warn(
+              { err: error, projectId: project.id, provider: source.provider },
+              "[SessionArchiveService] Failed to list sessions for auto-archive",
+            );
+            continue;
+          }
+
+          for (const session of sessions) {
+            if (seenSessionIds.has(session.id)) continue;
+            seenSessionIds.add(session.id);
+
+            const updatedAtMs = new Date(session.updatedAt).getTime();
+            if (!Number.isFinite(updatedAtMs) || updatedAtMs >= cutoffMs) {
+              skippedCount++;
+              continue;
+            }
+            if (archiveService.isArchived(session.id)) {
+              skippedCount++;
+              continue;
+            }
+            const metadata = options.sessionMetadataService?.getMetadata(
+              session.id,
+            );
+            if (shouldSkipAutoArchiveForStarredSession(session, metadata)) {
+              skippedCount++;
+              continue;
+            }
+            if (
+              supervisor.getProcessForSession(session.id) ||
+              externalTracker?.isExternal(session.id)
+            ) {
+              skippedCount++;
+              continue;
+            }
+
+            try {
+              const sessionFilePath = await findSessionFileForArchive(
+                project,
+                source.reader,
+                source.sessionDir,
+                session.id,
+              );
+              if (!sessionFilePath) {
+                skippedCount++;
+                continue;
+              }
+
+              const record = await archiveService.archiveSession({
+                sessionId: session.id,
+                provider: archiveProvider,
+                project,
+                summary: session,
+                sessionFilePath,
+                reason: "auto",
+              });
+              archivedCount++;
+
+              await options.sessionMetadataService?.setArchived(
+                session.id,
+                true,
+              );
+              options.eventBus?.emit({
+                type: "session-metadata-changed",
+                sessionId: session.id,
+                archived: true,
+                timestamp: new Date().toISOString(),
+              });
+              emitArchiveFileChange(options.eventBus, record, roots, "delete");
+            } catch (error) {
+              if (
+                error instanceof ArchiveError &&
+                error.code === "already_archived"
+              ) {
+                skippedCount++;
+                continue;
+              }
+              failedCount++;
+              getLogger().warn(
+                { err: error, sessionId: session.id },
+                "[SessionArchiveService] Failed to auto-archive session",
+              );
+            }
+          }
+        }
+      }
+
+      if (archivedCount > 0) {
+        scanner.invalidateCache();
+        codexScanner.invalidateCache();
+      }
+      getLogger().info(
+        `[SessionArchiveService] Auto-archive scan finished archived=${archivedCount} skipped=${skippedCount} failed=${failedCount}`,
+      );
+    });
+  }
+
   // Create PushNotifier if push notifications are enabled
   // This sends push notifications when sessions need user input
   if (options.eventBus && options.pushService) {
@@ -571,6 +813,8 @@ export function createApp(options: AppOptions): AppResult {
       serverSettingsService: options.serverSettingsService,
       modelInfoService: options.modelInfoService,
       codexBridgeService: options.codexBridgeService,
+      sessionArchiveService: options.sessionArchiveService,
+      claudeProjectsDir: options.projectsDir ?? CLAUDE_PROJECTS_DIR,
     }),
   );
   app.route(

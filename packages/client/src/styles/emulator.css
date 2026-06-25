@@ -65,11 +65,15 @@
 
 /* Emulator buttons */
 .emulator-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   padding: 6px 14px;
   border: none;
   border-radius: 6px;
   font-size: 0.85em;
   cursor: pointer;
+  text-decoration: none;
   transition: background 0.15s;
 }
 
@@ -252,8 +256,35 @@
   color: var(--app-text-secondary);
 }
 
+.emulator-download-prompt h2 {
+  margin: 0 0 12px;
+  color: var(--app-text-primary);
+  font-size: 1.1rem;
+}
+
 .emulator-download-prompt p {
   margin: 0 0 16px;
+}
+
+.emulator-usage-guide {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 640px;
+  margin: 4px auto 20px;
+  padding-left: 24px;
+  text-align: left;
+}
+
+.emulator-usage-guide li {
+  line-height: 1.45;
+}
+
+.emulator-setup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
 }
 
 .emulator-download-prompt .emulator-error {

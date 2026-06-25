@@ -160,6 +160,50 @@ export interface SearchResponse {
   searchDurationMs: number;
 }
 
+export type ArchiveProvider = "claude" | "codex";
+export type ArchiveReason = "manual" | "auto";
+
+export interface ArchivedFileRecord {
+  kind: "session" | "agent-session" | "agent-meta";
+  originalPath: string;
+  archivePath: string;
+  size: number;
+  mtimeMs: number;
+}
+
+export interface ArchivedSessionRecord {
+  sessionId: string;
+  provider: ArchiveProvider;
+  projectId: string;
+  projectPath: string;
+  title?: string | null;
+  fullTitle?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  messageCount?: number;
+  archivedAt: string;
+  reason: ArchiveReason;
+  files: ArchivedFileRecord[];
+}
+
+export interface ArchiveSessionsResponse {
+  archiveDir: string;
+  sessions: ArchivedSessionRecord[];
+}
+
+export interface ArchiveSessionResponse {
+  session: ArchivedSessionRecord;
+}
+
+export interface SessionMetadataUpdateResponse {
+  updated: boolean;
+  archive?: {
+    physical: boolean;
+    action: "archive" | "restore" | "already_archived";
+    record?: ArchivedSessionRecord;
+  };
+}
+
 export interface SessionOptions {
   mode?: PermissionMode;
   /** Model ID (e.g., "sonnet", "opus", "qwen2.5-coder:0.5b") */
@@ -787,10 +831,21 @@ export const api = {
     sessionId: string,
     updates: { title?: string; archived?: boolean; starred?: boolean },
   ) =>
-    fetchJSON<{ updated: boolean }>(`/sessions/${sessionId}/metadata`, {
-      method: "PUT",
-      body: JSON.stringify(updates),
-    }),
+    fetchJSON<SessionMetadataUpdateResponse>(
+      `/sessions/${sessionId}/metadata`,
+      {
+        method: "PUT",
+        body: JSON.stringify(updates),
+      },
+    ),
+
+  getArchivedSessions: () =>
+    fetchJSON<ArchiveSessionsResponse>("/archive/sessions"),
+
+  getArchivedSession: (sessionId: string) =>
+    fetchJSON<ArchiveSessionResponse>(
+      `/archive/sessions/${encodeURIComponent(sessionId)}`,
+    ),
 
   /**
    * Clone a session, creating a new session with the same conversation history.

@@ -1,5 +1,10 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { UrlProjectId } from "@yep-anywhere/shared";
 import { describe, expect, it, vi } from "vitest";
+import { SessionArchiveService } from "../../src/archive/index.js";
 import {
   type SessionsDeps,
   createSessionsRoutes,
@@ -229,5 +234,113 @@ describe("Sessions metadata route", () => {
         providerName: "codex",
       }),
     );
+  });
+
+  it("physically archives and restores session files through metadata updates", async () => {
+    const testDir = join(tmpdir(), `yep-route-archive-test-${randomUUID()}`);
+    const dataDir = join(testDir, "data");
+    const sessionDir = join(testDir, "claude", "projects", "-tmp-project");
+
+    try {
+      await mkdir(sessionDir, { recursive: true });
+      const project = { ...createProject(), sessionDir, provider: "claude" };
+      const sessionId = "sess-1";
+      const sessionPath = join(sessionDir, `${sessionId}.jsonl`);
+      await writeFile(sessionPath, '{"type":"assistant","message":{}}\n');
+
+      const summary = {
+        ...createSummary(),
+        provider: "claude" as const,
+        title: "Archive target",
+        fullTitle: "Archive target",
+      };
+      const reader = {
+        getSessionSummary: vi.fn(async () => summary),
+        getSessionFilePath: vi.fn(async () => sessionPath),
+      } as unknown as ISessionReader;
+      const archiveService = new SessionArchiveService({ dataDir });
+      await archiveService.initialize();
+      const updateMetadata = vi.fn(async () => undefined);
+      const invalidateCache = vi.fn();
+
+      const routes = createSessionsRoutes({
+        supervisor: {
+          getProcessForSession: vi.fn(() => null),
+        } as unknown as SessionsDeps["supervisor"],
+        scanner: {
+          listProjects: vi.fn(async () => [project]),
+          invalidateCache,
+        } as unknown as SessionsDeps["scanner"],
+        readerFactory: vi.fn(() => reader),
+        sessionMetadataService: {
+          getProvider: vi.fn(() => undefined),
+          updateMetadata,
+        } as unknown as NonNullable<SessionsDeps["sessionMetadataService"]>,
+        sessionArchiveService: archiveService,
+      });
+
+      const archiveResponse = await routes.request(
+        `/sessions/${sessionId}/metadata`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ archived: true }),
+        },
+      );
+
+      expect(archiveResponse.status).toBe(200);
+      const archiveJson = await archiveResponse.json();
+      expect(archiveJson.archive).toMatchObject({
+        physical: true,
+        action: "archive",
+      });
+      await expect(stat(sessionPath)).rejects.toThrow();
+      expect(archiveService.getArchivedSession(sessionId)).toMatchObject({
+        sessionId,
+        provider: "claude",
+        title: "Archive target",
+      });
+      const archiveListResponse = await routes.request("/archive/sessions");
+      expect(archiveListResponse.status).toBe(200);
+      const archiveListJson = await archiveListResponse.json();
+      expect(archiveListJson.sessions).toHaveLength(1);
+
+      const archiveDetailResponse = await routes.request(
+        `/archive/sessions/${sessionId}`,
+      );
+      expect(archiveDetailResponse.status).toBe(200);
+      const archiveDetailJson = await archiveDetailResponse.json();
+      expect(archiveDetailJson.session).toMatchObject({
+        sessionId,
+        title: "Archive target",
+      });
+      expect(updateMetadata).toHaveBeenCalledWith(sessionId, {
+        title: undefined,
+        archived: true,
+        starred: undefined,
+      });
+      expect(invalidateCache).toHaveBeenCalledTimes(1);
+
+      const restoreResponse = await routes.request(
+        `/sessions/${sessionId}/metadata`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ archived: false }),
+        },
+      );
+
+      expect(restoreResponse.status).toBe(200);
+      expect(await readFile(sessionPath, "utf-8")).toContain("assistant");
+      expect(archiveService.getArchivedSession(sessionId)).toBeUndefined();
+      expect(updateMetadata).toHaveBeenLastCalledWith(sessionId, {
+        title: undefined,
+        archived: false,
+        starred: undefined,
+      });
+      expect(invalidateCache).toHaveBeenCalledTimes(2);
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
   });
 });
