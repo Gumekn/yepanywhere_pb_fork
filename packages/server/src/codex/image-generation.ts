@@ -11,7 +11,14 @@ export function isCodexImageGenerationRecord(
   value: unknown,
 ): value is Record<string, unknown> {
   if (!isRecord(value)) return false;
-  return value.type === "image_generation" || value.type === "imageGeneration";
+  return (
+    value.type === "image_generation" ||
+    value.type === "imageGeneration" ||
+    value.type === "image_generation_call" ||
+    value.type === "imageGenerationCall" ||
+    value.type === "image_generation_end" ||
+    value.type === "imageGenerationEnd"
+  );
 }
 
 export function normalizeCodexImageGenerationRecord(

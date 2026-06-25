@@ -272,6 +272,7 @@ function convertCodexEntries(
   const externalToolCalls: PendingExternalCodexToolCall[] = [];
   const responseItemImageGenerationIds =
     collectResponseItemImageGenerationIds(entries);
+  const imageGenerationEndKeys = collectCodexImageGenerationEndKeys(entries);
 
   for (const entry of entries) {
     if (entry.type === "response_item") {
@@ -280,6 +281,7 @@ function convertCodexEntries(
         messageIndex++,
         toolCallContexts,
         externalToolCalls,
+        { skippedImageGenerationCallKeys: imageGenerationEndKeys },
       );
       const convertedMessages = Array.isArray(converted)
         ? converted
@@ -331,7 +333,9 @@ function convertCodexEntries(
               messageIndex,
               responseItemImageGenerationIds,
             )
-          : null;
+          : entry.payload.type === "image_generation_end"
+            ? convertCodexImageGenerationEndEvent(entry, messageIndex)
+            : null;
       // Skip agent_message and agent_reasoning events when response_item exists;
       // those are streaming artifacts that duplicate full response data.
       if (imageGenerationMessages) {
@@ -570,6 +574,49 @@ function collectResponseItemImageGenerationIds(
   return ids;
 }
 
+function collectCodexImageGenerationEndKeys(
+  entries: CodexSessionEntry[],
+): Set<string> {
+  const keys = new Set<string>();
+  for (const entry of entries) {
+    if (
+      entry.type !== "event_msg" ||
+      entry.payload.type !== "image_generation_end"
+    ) {
+      continue;
+    }
+
+    for (const key of collectCodexImageGenerationRecordKeys(
+      entry.payload as Record<string, unknown>,
+    )) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
+function collectCodexImageGenerationRecordKeys(
+  record: Record<string, unknown>,
+): string[] {
+  const image = normalizeCodexImageGenerationRecord(record);
+  const keys: string[] = [];
+  if (image.id) keys.push(`id:${image.id}`);
+  if (image.path) keys.push(`path:${image.path}`);
+  if (image.url) keys.push(`url:${image.url}`);
+  if (image.result) keys.push(`result:${image.result}`);
+  return keys;
+}
+
+function hasMatchingCodexImageGenerationRecordKey(
+  record: Record<string, unknown>,
+  keys?: Set<string>,
+): boolean {
+  if (!keys?.size) return false;
+  return collectCodexImageGenerationRecordKeys(record).some((key) =>
+    keys.has(key),
+  );
+}
+
 function convertCodexItemCompletedImageGeneration(
   entry: CodexEventMsgEntry,
   index: number,
@@ -596,11 +643,27 @@ function convertCodexItemCompletedImageGeneration(
   );
 }
 
+function convertCodexImageGenerationEndEvent(
+  entry: CodexEventMsgEntry,
+  index: number,
+): Message[] | null {
+  if (entry.payload.type !== "image_generation_end") {
+    return null;
+  }
+
+  return convertCodexImageGenerationRecord(
+    entry.payload as Record<string, unknown>,
+    `codex-event-${index}-${entry.timestamp}`,
+    entry.timestamp,
+  );
+}
+
 function convertCodexResponseItem(
   entry: CodexResponseItemEntry,
   index: number,
   toolCallContexts: Map<string, CodexToolCallContext>,
   externalToolCalls: PendingExternalCodexToolCall[],
+  options: { skippedImageGenerationCallKeys?: Set<string> } = {},
 ): Message | Message[] | null {
   const payload = entry.payload;
   const uuid = `codex-${index}-${entry.timestamp}`;
@@ -665,6 +728,16 @@ function convertCodexResponseItem(
 
     case "image_generation":
     case "imageGeneration":
+    case "image_generation_call":
+      if (
+        payload.type === "image_generation_call" &&
+        hasMatchingCodexImageGenerationRecordKey(
+          payload as Record<string, unknown>,
+          options.skippedImageGenerationCallKeys,
+        )
+      ) {
+        return null;
+      }
       return convertCodexImageGenerationPayload(payload, uuid, entry.timestamp);
 
     case "ghost_snapshot":

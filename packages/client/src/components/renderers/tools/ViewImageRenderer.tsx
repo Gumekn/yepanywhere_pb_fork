@@ -23,6 +23,11 @@ interface ImageSessionMetadata {
   projectPath: string | null;
 }
 
+interface ImageDimensions {
+  width: number;
+  height: number;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -51,20 +56,23 @@ function getImageInput(input: unknown, result?: unknown): ViewImageInput {
 }
 
 function getFileName(path: string): string {
-  return path.split("/").pop() ?? path;
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!normalized) return path;
+  return normalized.split("/").pop() || path;
 }
 
-function getUrlName(url: string): string {
+function getUrlFileName(url: string): string | undefined {
   if (url.startsWith("data:")) {
-    return "Generated image";
+    return undefined;
   }
 
   try {
     const parsed = new URL(url);
-    const name = getFileName(parsed.pathname);
-    return name || parsed.hostname || "Generated image";
+    const decodedPath = decodeURIComponent(parsed.pathname);
+    const name = getFileName(decodedPath);
+    return name && name !== "/" ? name : undefined;
   } catch {
-    return "Generated image";
+    return undefined;
   }
 }
 
@@ -92,26 +100,98 @@ function getImageSource(
       return {
         type: "direct",
         url: api.getFileRawUrl(metadata.projectId, projectRelativePath),
-        label: input.title ?? getFileName(input.path),
+        label: getFileName(input.path) || input.title || "Generated image",
       };
     }
 
     return {
       type: "local",
       path: input.path,
-      label: input.title ?? getFileName(input.path),
+      label: getFileName(input.path) || input.title || "Generated image",
     };
   }
 
   if (input.url) {
+    const fileName = getUrlFileName(input.url);
     return {
       type: "direct",
       url: input.url,
-      label: input.title ?? getUrlName(input.url),
+      label: fileName ?? input.title ?? "Generated image",
     };
   }
 
   return null;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function ImageInfo({
+  dimensions,
+  bytes,
+  mimeType,
+}: {
+  dimensions: ImageDimensions | null;
+  bytes?: number | null;
+  mimeType?: string | null;
+}) {
+  const items: string[] = [];
+
+  if (dimensions) {
+    items.push(`Dimensions ${dimensions.width}x${dimensions.height}`);
+  }
+
+  if (bytes != null) {
+    items.push(`Size ${formatBytes(bytes)}`);
+  }
+
+  if (mimeType) {
+    items.push(`Type ${mimeType}`);
+  }
+
+  if (!items.length) return null;
+
+  return <div className="image-info viewimage-info">{items.join(" · ")}</div>;
+}
+
+function ImagePreview({
+  src,
+  alt,
+  bytes,
+  mimeType,
+}: {
+  src: string;
+  alt: string;
+  bytes?: number | null;
+  mimeType?: string | null;
+}) {
+  const [dimensions, setDimensions] = useState<ImageDimensions | null>(null);
+
+  return (
+    <div className="read-image-result">
+      <img
+        className="read-image"
+        src={src}
+        alt={alt}
+        style={{ maxWidth: "100%" }}
+        onLoad={(event) => {
+          const { naturalWidth, naturalHeight } = event.currentTarget;
+          setDimensions(
+            naturalWidth > 0 && naturalHeight > 0
+              ? { width: naturalWidth, height: naturalHeight }
+              : null,
+          );
+        }}
+      />
+      <ImageInfo dimensions={dimensions} bytes={bytes} mimeType={mimeType} />
+    </div>
+  );
 }
 
 /**
@@ -128,19 +208,10 @@ function ViewImageModalContent({
     source.type === "local"
       ? `/api/local-image?path=${encodeURIComponent(source.path)}`
       : null;
-  const { url, loading, error } = useFetchedImage(apiPath);
+  const { url, loading, error, bytes, mimeType } = useFetchedImage(apiPath);
 
   if (source.type === "direct") {
-    return (
-      <div className="read-image-result">
-        <img
-          className="read-image"
-          src={source.url}
-          alt={alt}
-          style={{ maxWidth: "100%" }}
-        />
-      </div>
-    );
+    return <ImagePreview src={source.url} alt={alt} />;
   }
 
   if (loading) {
@@ -153,16 +224,7 @@ function ViewImageModalContent({
     );
   }
 
-  return (
-    <div className="read-image-result">
-      <img
-        className="read-image"
-        src={url}
-        alt={alt}
-        style={{ maxWidth: "100%" }}
-      />
-    </div>
-  );
+  return <ImagePreview src={url} alt={alt} bytes={bytes} mimeType={mimeType} />;
 }
 
 /**

@@ -34,6 +34,15 @@
   line-height: 1.5;
   color: var(--text-primary);
   position: relative;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.text-block {
+  /* Keep the hover copy affordance out of the text hit-test area. Without
+     this reserve, the absolutely positioned button sits over the first line
+     and can make drag-selection snap to the containing paragraph. */
+  padding-right: 36px;
 }
 
 /* Copy button for text blocks */
@@ -55,6 +64,7 @@
   opacity: 0;
   transition: opacity 0.15s, background 0.15s, color 0.15s;
   z-index: 10;
+  pointer-events: none;
   -webkit-touch-callout: none;
   -webkit-user-select: none;
   user-select: none;
@@ -63,6 +73,7 @@
 .text-block:hover .text-block-copy,
 .text-block-copy:focus {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .text-block-copy:hover {
@@ -902,6 +913,11 @@ details[open] .collapsible__icon {
 .image-info {
   color: var(--text-muted);
   font-size: var(--font-size-sm);
+}
+
+.viewimage-info {
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .read-image {

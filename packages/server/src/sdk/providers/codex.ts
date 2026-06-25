@@ -1974,7 +1974,9 @@ export class CodexProvider implements AgentProvider {
         return { id, type: "image_view", path: imagePath };
       }
 
-      case "image_generation": {
+      case "image_generation":
+      case "image_generation_call":
+      case "image_generation_end": {
         const image = normalizeCodexImageGenerationRecord(itemRecord, {
           defaultStatus: "completed",
         });

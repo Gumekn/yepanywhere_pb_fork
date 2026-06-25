@@ -239,9 +239,17 @@ export const CodexImageGenerationCamelPayloadSchema = z
   })
   .passthrough();
 
+export const CodexImageGenerationCallPayloadSchema = z
+  .object({
+    type: z.literal("image_generation_call"),
+    ...CodexImageGenerationPayloadFields,
+  })
+  .passthrough();
+
 export type CodexImageGenerationPayload =
   | z.infer<typeof CodexImageGenerationPayloadSchema>
-  | z.infer<typeof CodexImageGenerationCamelPayloadSchema>;
+  | z.infer<typeof CodexImageGenerationCamelPayloadSchema>
+  | z.infer<typeof CodexImageGenerationCallPayloadSchema>;
 
 /**
  * Ghost commit snapshot for git state tracking.
@@ -273,6 +281,7 @@ export const CodexResponseItemPayloadSchema = z.discriminatedUnion("type", [
   CodexWebSearchCallPayloadSchema,
   CodexImageGenerationPayloadSchema,
   CodexImageGenerationCamelPayloadSchema,
+  CodexImageGenerationCallPayloadSchema,
   CodexGhostSnapshotPayloadSchema,
 ]);
 
@@ -402,6 +411,13 @@ export const CodexItemCompletedEventSchema = z
   })
   .passthrough();
 
+export const CodexImageGenerationEndEventSchema = z
+  .object({
+    type: z.literal("image_generation_end"),
+    ...CodexImageGenerationPayloadFields,
+  })
+  .passthrough();
+
 /**
  * Turn aborted event.
  */
@@ -462,6 +478,7 @@ export const CodexEventMsgPayloadSchema = z.discriminatedUnion("type", [
   CodexTokenCountEventSchema,
   CodexContextCompactedEventSchema,
   CodexItemCompletedEventSchema,
+  CodexImageGenerationEndEventSchema,
   CodexTurnAbortedEventSchema,
   CodexThreadRolledBackEventSchema,
   CodexTaskStartedEventSchema,

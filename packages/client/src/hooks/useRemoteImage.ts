@@ -19,6 +19,10 @@ interface RemoteImageResult {
   loading: boolean;
   /** Error message if loading failed */
   error: string | null;
+  /** Size of fetched image bytes, when loaded through fetch */
+  bytes: number | null;
+  /** MIME type of fetched image bytes, when available */
+  mimeType: string | null;
 }
 
 /**
@@ -31,7 +35,13 @@ interface RemoteImageResult {
  * @returns Object with url, loading state, and error
  */
 export function useRemoteImage(apiPath: string | null): RemoteImageResult {
-  return { url: apiPath, loading: false, error: apiPath ? null : null };
+  return {
+    url: apiPath,
+    loading: false,
+    error: apiPath ? null : null,
+    bytes: null,
+    mimeType: null,
+  };
 }
 
 /**
@@ -44,6 +54,8 @@ export function useFetchedImage(apiPath: string | null): RemoteImageResult {
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [bytes, setBytes] = useState<number | null>(null);
+  const [mimeType, setMimeType] = useState<string | null>(null);
   const blobUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -54,12 +66,16 @@ export function useFetchedImage(apiPath: string | null): RemoteImageResult {
       }
       setBlobUrl(null);
       setError(null);
+      setBytes(null);
+      setMimeType(null);
       return;
     }
 
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setBytes(null);
+    setMimeType(null);
 
     if (blobUrlRef.current) {
       URL.revokeObjectURL(blobUrlRef.current);
@@ -77,12 +93,16 @@ export function useFetchedImage(apiPath: string | null): RemoteImageResult {
         const url = URL.createObjectURL(blob);
         blobUrlRef.current = url;
         setBlobUrl(url);
+        setBytes(blob.size);
+        setMimeType(blob.type || null);
         setLoading(false);
       })
       .catch((err) => {
         if (cancelled) return;
         console.error("[useFetchedImage] Failed to fetch image:", err);
         setError(err instanceof Error ? err.message : "Failed to load image");
+        setBytes(null);
+        setMimeType(null);
         setLoading(false);
       });
 
@@ -96,10 +116,16 @@ export function useFetchedImage(apiPath: string | null): RemoteImageResult {
   }, [apiPath]);
 
   if (!apiPath) {
-    return { url: null, loading: false, error: null };
+    return {
+      url: null,
+      loading: false,
+      error: null,
+      bytes: null,
+      mimeType: null,
+    };
   }
 
-  return { url: blobUrl, loading, error };
+  return { url: blobUrl, loading, error, bytes, mimeType };
 }
 
 /**

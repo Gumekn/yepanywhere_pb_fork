@@ -708,6 +708,60 @@ describe("CodexProvider Event Normalization", () => {
     });
   });
 
+  it("normalizes image_generation_call notifications into completed ViewImage rows", () => {
+    const provider = createTestProvider() as unknown as {
+      convertNotificationToSDKMessages: (
+        notification: { method: string; params?: unknown },
+        sessionId: string,
+        usageByTurnId: Map<string, unknown>,
+      ) => Array<Record<string, unknown>>;
+    };
+
+    const messages = provider.convertNotificationToSDKMessages(
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            id: "img-2",
+            type: "image_generation_call",
+            status: "generating",
+            saved_path:
+              "/Users/test/.codex/generated_images/session-1/ig_456.png",
+            revised_prompt: "A saved generated image",
+            result: "iVBORw0KGgoAAAANSUhEUgAA",
+          },
+        },
+      },
+      "session-1",
+      new Map(),
+    );
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.message).toMatchObject({
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "img-2",
+          name: "ViewImage",
+          input: {
+            path: "/Users/test/.codex/generated_images/session-1/ig_456.png",
+            revised_prompt: "A saved generated image",
+            status: "generating",
+            title: "Generated image",
+          },
+        },
+      ],
+    });
+    expect(messages[1]?.toolUseResult).toMatchObject({
+      type: "image",
+      path: "/Users/test/.codex/generated_images/session-1/ig_456.png",
+      revisedPrompt: "A saved generated image",
+    });
+  });
+
   it("does not emit rate limit errors when hasCredits is false but usage is below 100%", () => {
     const provider = createTestProvider() as unknown as {
       convertNotificationToSDKMessages: (

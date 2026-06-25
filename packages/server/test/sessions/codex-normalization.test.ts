@@ -508,6 +508,94 @@ describe("Codex Normalization", () => {
     });
   });
 
+  it("normalizes Codex image_generation_end events and skips duplicate image_generation_call rows", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "image_generation_end",
+          status: "generating",
+          revised_prompt: "A generated preview",
+          result: "iVBORw0KGgoAAAANSUhEUgAA",
+          saved_path:
+            "/Users/test/.codex/generated_images/session-1/ig_123.png",
+        },
+      },
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:02Z",
+        payload: {
+          type: "image_generation_call",
+          id: "ig_123",
+          status: "generating",
+          revised_prompt: "A generated preview",
+          result: "iVBORw0KGgoAAAANSUhEUgAA",
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const imageItems = renderItems.filter(
+      (item) => item.type === "tool_call" && item.toolName === "ViewImage",
+    );
+
+    expect(imageItems).toHaveLength(1);
+    const imageItem = imageItems[0];
+    expect(imageItem?.type).toBe("tool_call");
+    if (imageItem?.type !== "tool_call") {
+      throw new Error("Expected ViewImage render item");
+    }
+
+    expect(imageItem.toolInput).toMatchObject({
+      path: "/Users/test/.codex/generated_images/session-1/ig_123.png",
+      revised_prompt: "A generated preview",
+      status: "generating",
+      title: "Generated image",
+    });
+    expect(imageItem.toolResult?.content).toBe(
+      "Generated image: /Users/test/.codex/generated_images/session-1/ig_123.png",
+    );
+  });
+
+  it("keeps distinct image_generation_call rows when an end event exists", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "image_generation_end",
+          id: "ig_123",
+          status: "completed",
+          result: "iVBORw0KGgoAAAANSUhEUgAA",
+          saved_path:
+            "/Users/test/.codex/generated_images/session-1/ig_123.png",
+        },
+      },
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:02Z",
+        payload: {
+          type: "image_generation_call",
+          id: "ig_456",
+          status: "completed",
+          result: "iVBORw0KGgoAAAANSUhEUgBB",
+          saved_path:
+            "/Users/test/.codex/generated_images/session-1/ig_456.png",
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const imageItems = renderItems.filter(
+      (item) => item.type === "tool_call" && item.toolName === "ViewImage",
+    );
+
+    expect(imageItems).toHaveLength(2);
+  });
+
   it("projects Codex external agent Read markers into a completed tool row", () => {
     const entries: CodexSessionEntry[] = [
       codexAssistantMessage(

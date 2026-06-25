@@ -2722,6 +2722,7 @@ a.sidebar-nav-item {
   margin-top: var(--space-1);
   /* Allow line-height: 1 so the row hugs the bubble */
   line-height: 1.2;
+  pointer-events: none;
   -webkit-touch-callout: none;
   -webkit-user-select: none;
   user-select: none;
@@ -2733,6 +2734,7 @@ a.sidebar-nav-item {
 .assistant-turn:focus-within .message-actions,
 .message-actions.is-active {
   opacity: 1;
+  pointer-events: auto;
 }
 
 /* Touch devices — :hover never matches reliably; show at half-opacity always
@@ -2740,6 +2742,7 @@ a.sidebar-nav-item {
 @media (hover: none) and (pointer: coarse) {
   .message-actions {
     opacity: 0.55;
+    pointer-events: auto;
   }
 }
 

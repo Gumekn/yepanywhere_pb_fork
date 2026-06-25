@@ -11,7 +11,10 @@ import {
   CODEX_CLEAR_MCP_APP_SERVER_ARGS,
   CODEX_STANDARD_MCP_APP_SERVER_ARGS,
 } from "./codex/mcp-profile.js";
-import { getDefaultCodexSessionsDir } from "./projects/codex-scanner.js";
+import {
+  getDefaultCodexHomeDir,
+  getDefaultCodexSessionsDir,
+} from "./projects/codex-scanner.js";
 
 /**
  * Get the data directory for yep-anywhere state files.
@@ -228,6 +231,10 @@ export function loadConfig(): Config {
           .map((s) => s.trim())
           .filter(Boolean)
       : ["/tmp"];
+  const codexGeneratedImagesDir = path.join(
+    getDefaultCodexHomeDir(),
+    "generated_images",
+  );
 
   return {
     dataDir,
@@ -332,7 +339,11 @@ export function loadConfig(): Config {
     // Always allow yep-managed uploads. ALLOWED_IMAGE_PATHS adds external paths
     // like /tmp; an empty value disables only those extras.
     allowedImagePaths: Array.from(
-      new Set([managedUploadsDir, ...extraAllowedImagePaths]),
+      new Set([
+        managedUploadsDir,
+        codexGeneratedImagesDir,
+        ...extraAllowedImagePaths,
+      ]),
     ),
     // Auth disabled override (for recovery if user forgets password)
     authDisabled: process.env.AUTH_DISABLED === "true",
