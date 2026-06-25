@@ -1215,6 +1215,121 @@ h2 {
   min-width: 0;
 }
 
+.session-inspector-plan-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  margin: 0 var(--space-3) var(--space-3);
+  padding: var(--space-2);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+
+.session-inspector-plan-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.session-inspector-plan-header h3 {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.session-inspector-plan-progress {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.session-inspector-plan-note {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.session-inspector-plan-items {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.session-inspector-plan-item {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.session-inspector-plan-marker {
+  position: relative;
+  box-sizing: border-box;
+  width: 10px;
+  height: 10px;
+  margin-top: 4px;
+  border: 1.5px solid var(--text-dimmed);
+  border-radius: 50%;
+}
+
+.session-inspector-plan-item.in-progress .session-inspector-plan-marker {
+  border-color: color-mix(in srgb, var(--primary-color) 72%, transparent);
+}
+
+.session-inspector-plan-item.in-progress .session-inspector-plan-marker::after {
+  content: "";
+  position: absolute;
+  inset: 2.5px;
+  border-radius: 50%;
+  background: var(--primary-color);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.session-inspector-plan-item.completed .session-inspector-plan-marker {
+  border-color: var(--success-color);
+  background: var(--success-color);
+}
+
+.session-inspector-plan-item.completed .session-inspector-plan-marker::after {
+  content: "✓";
+  position: absolute;
+  inset: -2px 0 0;
+  color: #ffffff;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 10px;
+  text-align: center;
+}
+
+.session-inspector-plan-label {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.session-inspector-plan-item.completed .session-inspector-plan-label {
+  color: var(--text-muted);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
 .session-inspector-status-top {
   display: flex;
   align-items: center;

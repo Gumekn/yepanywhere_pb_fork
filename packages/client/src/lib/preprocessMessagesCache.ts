@@ -5,6 +5,7 @@ import { getMessageId } from "./mergeMessages";
 import {
   type ActiveToolApproval,
   type PreprocessAugments,
+  collapsePlanProgressItems,
   preprocessMessages,
 } from "./preprocessMessages";
 
@@ -68,10 +69,10 @@ function tryPreprocessStreamingTail(
     previous.messages.length === messages.length - 1 &&
     hasSameMessagePrefix(previous.messages, messages, previous.messages.length)
   ) {
-    return [
+    return collapsePlanProgressItems([
       ...previous.renderItems,
       ...preprocessMessages([nextTail], augments),
-    ];
+    ]);
   }
 
   if (
@@ -96,7 +97,10 @@ function tryPreprocessStreamingTail(
       return null;
     }
 
-    return [...prefixItems, ...preprocessMessages([nextTail], augments)];
+    return collapsePlanProgressItems([
+      ...prefixItems,
+      ...preprocessMessages([nextTail], augments),
+    ]);
   }
 
   return null;
@@ -148,6 +152,11 @@ function withoutTailSourceItems(
   for (let index = renderItems.length - 1; index >= 0; index--) {
     const item = renderItems[index];
     if (item && hasSourceMessage(item, messageId)) {
+      if (
+        item.sourceMessages.some((source) => getMessageId(source) !== messageId)
+      ) {
+        return null;
+      }
       firstTailIndex = index;
       foundTailSource = true;
       continue;

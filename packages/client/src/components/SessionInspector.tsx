@@ -7,10 +7,15 @@ import { useI18n } from "../i18n";
 import { formatSmartTime } from "../lib/datetime";
 import {
   type ActiveToolApproval,
+  isPlanProgressItem,
   preprocessMessages,
 } from "../lib/preprocessMessages";
 import type { ContentBlock, Message, SessionStatus } from "../types";
 import type { RenderItem, ToolCallItem } from "../types/renderItems";
+import {
+  type ChecklistItem,
+  normalizeChecklistStatus,
+} from "./renderers/tools/Checklist";
 
 type InspectorPresentation = "sidebar" | "drawer";
 type InspectorTab = "questions" | "files" | "checks" | "git";
@@ -56,6 +61,14 @@ interface CheckItem {
   messageId: string;
   timestamp?: string;
   lastIndex: number;
+}
+
+interface PlanProgress {
+  title: string;
+  completed: number;
+  total: number;
+  items: ChecklistItem[];
+  note?: string;
 }
 
 const TAB_KEYS: InspectorTab[] = ["questions", "files", "checks", "git"];
@@ -114,6 +127,10 @@ export function SessionInspector({
     [renderItems],
   );
   const checks = useMemo(() => buildCheckItems(renderItems), [renderItems]);
+  const planProgress = useMemo(
+    () => buildPlanProgress(renderItems, t),
+    [renderItems, t],
+  );
 
   const handleSelect = (messageId: string) => {
     onSelectMessage(messageId);
@@ -198,6 +215,8 @@ export function SessionInspector({
           </button>
         </div>
       </div>
+
+      {planProgress && <InspectorPlanProgress progress={planProgress} t={t} />}
 
       {presentation === "drawer" && (
         <div className="session-inspector-tabs" role="tablist">
@@ -463,6 +482,151 @@ function InspectorSection({
 
 function EmptyState({ text }: { text: string }) {
   return <div className="session-inspector-empty">{text}</div>;
+}
+
+function InspectorPlanProgress({
+  progress,
+  t,
+}: {
+  progress: PlanProgress;
+  t: TFunction;
+}) {
+  return (
+    <section className="session-inspector-plan-card">
+      <div className="session-inspector-plan-header">
+        <h3>{progress.title}</h3>
+        <span className="session-inspector-plan-progress">
+          {t("sessionInspectorPlanProgress", {
+            completed: progress.completed,
+            total: progress.total,
+          })}
+        </span>
+      </div>
+      {progress.note && (
+        <div className="session-inspector-plan-note">{progress.note}</div>
+      )}
+      <div className="session-inspector-plan-items">
+        {progress.items.map((item, index) => (
+          <div
+            key={`${item.label}-${index}`}
+            className={`session-inspector-plan-item ${getPlanStatusClassName(item.status)}`}
+          >
+            <span
+              className="session-inspector-plan-marker"
+              aria-hidden="true"
+            />
+            <span className="session-inspector-plan-label">{item.label}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function getPlanStatusClassName(status: ChecklistItem["status"]): string {
+  return status === "in_progress" ? "in-progress" : status;
+}
+
+function buildPlanProgress(
+  items: RenderItem[],
+  t: TFunction,
+): PlanProgress | null {
+  const planItems = items.filter(isPlanProgressItem);
+  const latest = planItems[planItems.length - 1];
+  if (!latest) {
+    return null;
+  }
+
+  const extracted = extractPlanProgress(latest);
+  if (!extracted || extracted.items.length === 0) {
+    return null;
+  }
+
+  const completed = extracted.items.filter(
+    (item) => item.status === "completed",
+  ).length;
+
+  return {
+    title: t("sessionInspectorPlan"),
+    completed,
+    total: extracted.items.length,
+    items: extracted.items,
+    note: extracted.note,
+  };
+}
+
+function extractPlanProgress(
+  item: ToolCallItem,
+): { items: ChecklistItem[]; note?: string } | null {
+  const normalizedToolName = item.toolName
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]/g, "");
+
+  if (normalizedToolName === "updateplan") {
+    return extractUpdatePlanProgress(item.toolInput);
+  }
+
+  if (normalizedToolName === "todowrite") {
+    return extractTodoWriteProgress(item);
+  }
+
+  return null;
+}
+
+function extractUpdatePlanProgress(
+  input: unknown,
+): { items: ChecklistItem[]; note?: string } | null {
+  if (!isRecord(input) || !Array.isArray(input.plan)) {
+    return null;
+  }
+
+  const items = input.plan
+    .filter(
+      (entry): entry is Record<string, unknown> =>
+        isRecord(entry) && typeof entry.step === "string" && entry.step !== "",
+    )
+    .map((entry) => ({
+      label: entry.step as string,
+      status: normalizeChecklistStatus(entry.status),
+    }));
+
+  const note =
+    typeof input.explanation === "string" && input.explanation.trim()
+      ? input.explanation.trim()
+      : undefined;
+
+  return { items, note };
+}
+
+function extractTodoWriteProgress(
+  item: ToolCallItem,
+): { items: ChecklistItem[] } | null {
+  const structured = item.toolResult?.structured;
+  const todos =
+    isRecord(structured) && Array.isArray(structured.newTodos)
+      ? structured.newTodos
+      : isRecord(item.toolInput) && Array.isArray(item.toolInput.todos)
+        ? item.toolInput.todos
+        : null;
+
+  if (!todos) {
+    return null;
+  }
+
+  const items = todos
+    .filter(
+      (entry): entry is Record<string, unknown> =>
+        isRecord(entry) &&
+        typeof entry.content === "string" &&
+        entry.content !== "",
+    )
+    .map((entry) => ({
+      label: entry.content as string,
+      status: normalizeChecklistStatus(entry.status),
+    }));
+
+  return { items };
 }
 
 function buildQuestionItems(items: RenderItem[]): QuestionItem[] {

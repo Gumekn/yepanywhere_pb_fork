@@ -2,6 +2,7 @@ import type { MarkdownAugment } from "@yep-anywhere/shared";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type ActiveToolApproval,
+  isPlanProgressItem,
   preprocessMessages,
 } from "../lib/preprocessMessages";
 import type { Message } from "../types";
@@ -181,27 +182,31 @@ export const MessageList = memo(function MessageList({
       }),
     [preprocessedItems, messages, markdownAugments, activeToolApproval],
   );
-  const turnGroups = useMemo(
-    () => groupItemsIntoTurns(renderItems),
+  const visibleRenderItems = useMemo(
+    () => renderItems.filter((item) => !isPlanProgressItem(item)),
     [renderItems],
+  );
+  const turnGroups = useMemo(
+    () => groupItemsIntoTurns(visibleRenderItems),
+    [visibleRenderItems],
   );
   const focusedBranchItemId = useMemo(() => {
     if (!focusBranchId) return null;
     return (
-      renderItems.find((item) => getBranchId(item) === focusBranchId)?.id ??
-      null
+      visibleRenderItems.find((item) => getBranchId(item) === focusBranchId)
+        ?.id ?? null
     );
-  }, [focusBranchId, renderItems]);
+  }, [focusBranchId, visibleRenderItems]);
 
   // Render item that contains the deep-link target message (search results).
   const targetItemId = useMemo(() => {
     if (!targetMessageId) return null;
     return (
-      renderItems.find((item) =>
+      visibleRenderItems.find((item) =>
         item.sourceMessages.some((m) => getMessageId(m) === targetMessageId),
       )?.id ?? null
     );
-  }, [targetMessageId, renderItems]);
+  }, [targetMessageId, visibleRenderItems]);
 
   const toggleThinkingExpanded = useCallback(() => {
     setThinkingExpanded((prev) => !prev);

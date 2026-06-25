@@ -11,6 +11,7 @@ import { AgentContentContext } from "../../../contexts/AgentContentContext";
 import { useSchemaValidationContext } from "../../../contexts/SchemaValidationContext";
 import { useSessionMetadata } from "../../../contexts/SessionMetadataContext";
 import { classifyToolError } from "../../../lib/classifyToolError";
+import { isPlanProgressItem } from "../../../lib/preprocessMessages";
 import {
   type PreprocessMessagesCache,
   preprocessMessagesCached,
@@ -150,7 +151,7 @@ function TaskNestedContent({
       preprocessCacheRef.current,
     );
     preprocessCacheRef.current = result.cache;
-    return result.renderItems;
+    return result.renderItems.filter((item) => !isPlanProgressItem(item));
   }, [messages]);
 
   return (

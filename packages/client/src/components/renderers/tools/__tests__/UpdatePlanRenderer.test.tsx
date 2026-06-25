@@ -36,11 +36,17 @@ describe("UpdatePlanRenderer", () => {
       </div>,
     );
 
-    expect(screen.getByText("1 out of 3 tasks completed")).toBeDefined();
+    expect(screen.getByText("Plan")).toBeDefined();
+    expect(screen.getByText("1/3 complete")).toBeDefined();
     expect(screen.getByText("Resuming from previous checkpoint")).toBeDefined();
-    expect(screen.getByText("1. Investigate renderer mismatch")).toBeDefined();
-    expect(screen.getByText("2. Add compatibility aliases")).toBeDefined();
-    expect(screen.getByText("3. Add regression tests")).toBeDefined();
+    expect(screen.getByText("Investigate renderer mismatch")).toBeDefined();
+    expect(screen.getByText("Add compatibility aliases")).toBeDefined();
+    expect(screen.getByText("Add regression tests")).toBeDefined();
+    expect(
+      screen
+        .getByText("Investigate renderer mismatch")
+        .closest(".task-checklist-item")?.className,
+    ).toContain("completed");
   });
 
   it("renders an inline error message when tool call fails", () => {

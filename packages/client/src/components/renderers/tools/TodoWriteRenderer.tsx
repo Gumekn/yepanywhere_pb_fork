@@ -3,6 +3,12 @@ import type { ZodError } from "zod";
 import { useSchemaValidationContext } from "../../../contexts/SchemaValidationContext";
 import { validateToolResult } from "../../../lib/validateToolResult";
 import { SchemaWarning } from "../../SchemaWarning";
+import {
+  type ChecklistItem,
+  ChecklistPanel,
+  getChecklistSummary,
+  normalizeChecklistStatus,
+} from "./Checklist";
 import type {
   Todo,
   TodoWriteInput,
@@ -10,64 +16,26 @@ import type {
   ToolRenderer,
 } from "./types";
 
-/**
- * Get status icon for a todo item
- */
-function getStatusIcon(status: Todo["status"]): string {
-  switch (status) {
-    case "pending":
-      return "□";
-    case "in_progress":
-      return "❋";
-    case "completed":
-      return "✓";
-    default:
-      return "□";
-  }
-}
-
-/**
- * Single todo item
- */
-function TodoItem({ todo }: { todo: Todo }) {
-  const statusClass = `todo-status-${todo.status}`;
-  const isCompleted = todo.status === "completed";
-
-  return (
-    <div className={`todo-item ${statusClass}`}>
-      <span className="todo-checkbox">{getStatusIcon(todo.status)}</span>
-      <span className={`todo-content ${isCompleted ? "todo-completed" : ""}`}>
-        {todo.content}
-      </span>
-    </div>
-  );
+function todosToChecklistItems(todos: Todo[] | undefined): ChecklistItem[] {
+  return (todos ?? [])
+    .filter((todo) => typeof todo.content === "string" && todo.content)
+    .map((todo) => ({
+      label: todo.content,
+      status: normalizeChecklistStatus(todo.status),
+    }));
 }
 
 /**
  * TodoWrite tool use - shows intended todo changes
  */
 function TodoWriteToolUse({ input }: { input: TodoWriteInput }) {
-  if (!input?.todos || input.todos.length === 0) {
-    return <div className="todo-empty">No todos specified</div>;
+  const items = todosToChecklistItems(input?.todos);
+
+  if (items.length === 0) {
+    return <div className="task-checklist-empty">No todos specified</div>;
   }
 
-  const inProgress = input.todos.filter((t) => t.status === "in_progress");
-  const pending = input.todos.filter((t) => t.status === "pending");
-  const completed = input.todos.filter((t) => t.status === "completed");
-
-  return (
-    <div className="todo-tool-use">
-      <span className="todo-summary">
-        {inProgress.length > 0 && `${inProgress.length} in progress`}
-        {inProgress.length > 0 &&
-          (pending.length > 0 || completed.length > 0) &&
-          ", "}
-        {pending.length > 0 && `${pending.length} pending`}
-        {pending.length > 0 && completed.length > 0 && ", "}
-        {completed.length > 0 && `${completed.length} completed`}
-      </span>
-    </div>
-  );
+  return <ChecklistPanel title="Tasks" items={items} />;
 }
 
 /**
@@ -77,7 +45,7 @@ function TodoWriteToolResult({
   result,
   isError,
 }: {
-  result: TodoWriteResult;
+  result: TodoWriteResult | string | undefined;
   isError: boolean;
 }) {
   const { enabled, reportValidationError, isToolIgnored } =
@@ -87,7 +55,7 @@ function TodoWriteToolResult({
   );
 
   useEffect(() => {
-    if (enabled && result) {
+    if (enabled && result && typeof result === "object") {
       const validation = validateToolResult("TodoWrite", result);
       if (!validation.valid && validation.errors) {
         setValidationErrors(validation.errors);
@@ -103,21 +71,29 @@ function TodoWriteToolResult({
 
   if (isError) {
     const errorResult = result as unknown as { content?: unknown } | undefined;
+    const errorText =
+      typeof result === "string" && result.trim()
+        ? result.trim()
+        : typeof result === "object" && errorResult?.content
+          ? String(errorResult.content)
+          : "Failed to update todos";
     return (
       <div className="todo-error">
         {showValidationWarning && validationErrors && (
           <SchemaWarning toolName="TodoWrite" errors={validationErrors} />
         )}
-        {typeof result === "object" && errorResult?.content
-          ? String(errorResult.content)
-          : "Failed to update todos"}
+        {errorText}
       </div>
     );
   }
 
-  if (!result?.newTodos || result.newTodos.length === 0) {
+  const items = todosToChecklistItems(
+    typeof result === "object" ? result?.newTodos : undefined,
+  );
+
+  if (items.length === 0) {
     return (
-      <div className="todo-empty">
+      <div className="task-checklist-empty">
         {showValidationWarning && validationErrors && (
           <SchemaWarning toolName="TodoWrite" errors={validationErrors} />
         )}
@@ -131,11 +107,7 @@ function TodoWriteToolResult({
       {showValidationWarning && validationErrors && (
         <SchemaWarning toolName="TodoWrite" errors={validationErrors} />
       )}
-      <div className="todo-list">
-        {result.newTodos.map((todo, index) => (
-          <TodoItem key={`${todo.content}-${index}`} todo={todo} />
-        ))}
-      </div>
+      <ChecklistPanel title="Tasks" items={items} />
     </div>
   );
 }
@@ -159,13 +131,26 @@ export const todoWriteRenderer: ToolRenderer<TodoWriteInput, TodoWriteResult> =
     },
 
     getUseSummary(input) {
-      const todos = (input as TodoWriteInput).todos;
-      return todos ? `${todos.length} items` : "Todos";
+      const items = todosToChecklistItems((input as TodoWriteInput).todos);
+      return items.length > 0 ? getChecklistSummary(items) : "Todos";
+    },
+
+    renderInline(input, result, isError, status) {
+      if (status === "pending" || status === "aborted" || !result) {
+        return <TodoWriteToolUse input={input as TodoWriteInput} />;
+      }
+      return (
+        <TodoWriteToolResult
+          result={result as TodoWriteResult | string | undefined}
+          isError={isError}
+        />
+      );
     },
 
     getResultSummary(result, isError) {
       if (isError) return "Error";
       const r = result as TodoWriteResult;
-      return r?.newTodos ? `${r.newTodos.length} items` : "Todos";
+      const items = todosToChecklistItems(r?.newTodos);
+      return items.length > 0 ? getChecklistSummary(items) : "Todos";
     },
   };

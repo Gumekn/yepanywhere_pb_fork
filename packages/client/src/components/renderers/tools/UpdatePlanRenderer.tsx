@@ -1,3 +1,9 @@
+import {
+  type ChecklistItem,
+  ChecklistPanel,
+  getChecklistSummary,
+  normalizeChecklistStatus,
+} from "./Checklist";
 import type {
   ToolRenderer,
   UpdatePlanInput,
@@ -5,57 +11,11 @@ import type {
   UpdatePlanStep,
 } from "./types";
 
-type NormalizedPlanStatus = "pending" | "in_progress" | "completed";
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function normalizePlanStatus(status: unknown): NormalizedPlanStatus {
-  if (typeof status !== "string") {
-    return "pending";
-  }
-
-  const normalized = status.trim().toLowerCase();
-  if (
-    normalized === "completed" ||
-    normalized === "complete" ||
-    normalized === "done"
-  ) {
-    return "completed";
-  }
-  if (
-    normalized === "in_progress" ||
-    normalized === "in-progress" ||
-    normalized === "active" ||
-    normalized === "running"
-  ) {
-    return "in_progress";
-  }
-  return "pending";
-}
-
-function getStatusIcon(status: NormalizedPlanStatus): string {
-  switch (status) {
-    case "completed":
-      return "✓";
-    case "in_progress":
-      return "◌";
-    default:
-      return "○";
-  }
-}
-
-function statusClassName(status: NormalizedPlanStatus): string {
-  return status === "in_progress"
-    ? "todo-status-in-progress"
-    : `todo-status-${status}`;
-}
-
-function extractPlanSteps(input: unknown): Array<{
-  step: string;
-  status: NormalizedPlanStatus;
-}> {
+function extractPlanSteps(input: unknown): ChecklistItem[] {
   if (!isRecord(input) || !Array.isArray(input.plan)) {
     return [];
   }
@@ -66,8 +26,8 @@ function extractPlanSteps(input: unknown): Array<{
         isRecord(item) && typeof item.step === "string",
     )
     .map((item) => ({
-      step: item.step,
-      status: normalizePlanStatus(item.status),
+      label: item.step,
+      status: normalizeChecklistStatus(item.status),
     }));
 }
 
@@ -123,46 +83,29 @@ export const updatePlanRenderer: ToolRenderer<
 
     if (steps.length === 0) {
       if (status === "pending") {
-        return <div className="todo-summary">Updating plan...</div>;
+        return <div className="task-checklist-empty">Updating plan...</div>;
       }
       return (
-        <div className="todo-summary">{resultMessage || "Plan updated"}</div>
+        <div className="task-checklist-empty">
+          {resultMessage || "Plan updated"}
+        </div>
       );
     }
 
-    const completed = steps.filter(
-      (step) => step.status === "completed",
-    ).length;
+    const trailingMessage =
+      status !== "pending" &&
+      resultMessage &&
+      resultMessage.toLowerCase() !== "plan updated"
+        ? resultMessage
+        : undefined;
 
     return (
-      <div className="todo-result">
-        <div className="todo-summary">
-          {completed} out of {steps.length} tasks completed
-        </div>
-        {explanation && <div className="todo-summary">{explanation}</div>}
-        <div className="todo-list">
-          {steps.map((step, index) => (
-            <div
-              key={`${step.step}-${index}`}
-              className={`todo-item ${statusClassName(step.status)}`}
-            >
-              <span className="todo-checkbox">
-                {getStatusIcon(step.status)}
-              </span>
-              <span
-                className={`todo-content ${step.status === "completed" ? "todo-completed" : ""}`}
-              >
-                {index + 1}. {step.step}
-              </span>
-            </div>
-          ))}
-        </div>
-        {status !== "pending" &&
-          resultMessage &&
-          resultMessage.toLowerCase() !== "plan updated" && (
-            <div className="todo-summary">{resultMessage}</div>
-          )}
-      </div>
+      <ChecklistPanel
+        title="Plan"
+        items={steps}
+        note={explanation}
+        trailingMessage={trailingMessage}
+      />
     );
   },
 
@@ -171,10 +114,7 @@ export const updatePlanRenderer: ToolRenderer<
     if (steps.length === 0) {
       return "Update plan";
     }
-    const completed = steps.filter(
-      (step) => step.status === "completed",
-    ).length;
-    return `${completed}/${steps.length} complete`;
+    return getChecklistSummary(steps);
   },
 
   getResultSummary(result, isError) {

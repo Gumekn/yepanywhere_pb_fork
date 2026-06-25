@@ -44,6 +44,184 @@ describe("preprocessMessages", () => {
     });
   });
 
+  it("collapses repeated plan progress snapshots within one user turn", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-user",
+        role: "user",
+        content: "Implement the feature",
+        timestamp: "2024-01-01T00:00:00Z",
+      },
+      {
+        id: "msg-plan-1",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "plan-1",
+            name: "UpdatePlan",
+            input: {
+              plan: [
+                { step: "Inspect code", status: "in_progress" },
+                { step: "Patch renderer", status: "pending" },
+              ],
+            },
+          },
+        ],
+        timestamp: "2024-01-01T00:00:01Z",
+      },
+      {
+        id: "msg-plan-2",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "plan-2",
+            name: "UpdatePlan",
+            input: {
+              plan: [
+                { step: "Inspect code", status: "completed" },
+                { step: "Patch renderer", status: "in_progress" },
+              ],
+            },
+          },
+        ],
+        timestamp: "2024-01-01T00:00:02Z",
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+    const planItems = items.filter(
+      (item) => item.type === "tool_call" && item.toolName === "UpdatePlan",
+    );
+
+    expect(planItems).toHaveLength(1);
+    expect(planItems[0]).toMatchObject({
+      type: "tool_call",
+      id: "plan-1",
+      toolInput: {
+        plan: [
+          { step: "Inspect code", status: "completed" },
+          { step: "Patch renderer", status: "in_progress" },
+        ],
+      },
+    });
+  });
+
+  it("keeps plan progress snapshots separate across user turns", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-user-1",
+        role: "user",
+        content: "First task",
+        timestamp: "2024-01-01T00:00:00Z",
+      },
+      {
+        id: "msg-plan-1",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "plan-1",
+            name: "UpdatePlan",
+            input: { plan: [{ step: "Do first", status: "completed" }] },
+          },
+        ],
+        timestamp: "2024-01-01T00:00:01Z",
+      },
+      {
+        id: "msg-user-2",
+        role: "user",
+        content: "Second task",
+        timestamp: "2024-01-01T00:00:02Z",
+      },
+      {
+        id: "msg-plan-2",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "plan-2",
+            name: "UpdatePlan",
+            input: { plan: [{ step: "Do second", status: "pending" }] },
+          },
+        ],
+        timestamp: "2024-01-01T00:00:03Z",
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+    const planItems = items.filter(
+      (item) => item.type === "tool_call" && item.toolName === "UpdatePlan",
+    );
+
+    expect(planItems).toHaveLength(2);
+  });
+
+  it("collapses repeated TodoWrite snapshots within one user turn", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-user",
+        role: "user",
+        content: "Implement the feature",
+        timestamp: "2024-01-01T00:00:00Z",
+      },
+      {
+        id: "msg-todo-1",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "todo-1",
+            name: "TodoWrite",
+            input: {
+              todos: [
+                { content: "Inspect code", status: "in_progress" },
+                { content: "Patch renderer", status: "pending" },
+              ],
+            },
+          },
+        ],
+        timestamp: "2024-01-01T00:00:01Z",
+      },
+      {
+        id: "msg-todo-2",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "todo-2",
+            name: "TodoWrite",
+            input: {
+              todos: [
+                { content: "Inspect code", status: "completed" },
+                { content: "Patch renderer", status: "in_progress" },
+              ],
+            },
+          },
+        ],
+        timestamp: "2024-01-01T00:00:02Z",
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+    const todoItems = items.filter(
+      (item) => item.type === "tool_call" && item.toolName === "TodoWrite",
+    );
+
+    expect(todoItems).toHaveLength(1);
+    expect(todoItems[0]).toMatchObject({
+      type: "tool_call",
+      id: "todo-1",
+      toolInput: {
+        todos: [
+          { content: "Inspect code", status: "completed" },
+          { content: "Patch renderer", status: "in_progress" },
+        ],
+      },
+    });
+  });
+
   it("preserves Agent tool summaries for rendering completed tasks", () => {
     const messages: Message[] = [
       {

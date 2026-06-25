@@ -1891,66 +1891,140 @@ details[open] .collapsible__icon {
 }
 
 /* ==========================================================================
-   TodoWrite Tool
+   Checklist / Todo / Plan Tools
    ========================================================================== */
 
-.todo-tool-use {
+.task-checklist {
   display: flex;
-  align-items: center;
-  gap: 0.5rem;
+  flex-direction: column;
+  gap: 6px;
+  box-sizing: border-box;
+  width: min(100%, 560px);
+  max-width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-secondary) 90%, transparent);
 }
 
-.todo-summary {
+.task-checklist-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.task-checklist-title {
+  color: var(--text-secondary);
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.task-checklist-progress {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 1px 7px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-tertiary) 72%, transparent);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.task-checklist-note {
+  max-width: 100%;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-base);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.task-checklist-items {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.task-checklist-item {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  min-width: 0;
+  padding: 1px 0;
+}
+
+.task-checklist-marker {
+  position: relative;
+  box-sizing: border-box;
+  width: 12px;
+  height: 12px;
+  margin-top: 3px;
+  border: 1.5px solid var(--text-dimmed);
+  border-radius: 50%;
+}
+
+.task-checklist-item.in-progress .task-checklist-marker {
+  border-color: color-mix(in srgb, var(--primary-color) 72%, transparent);
+}
+
+.task-checklist-item.in-progress .task-checklist-marker::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--primary-color);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.task-checklist-item.completed .task-checklist-marker {
+  border-color: var(--success-color);
+  background: var(--success-color);
+}
+
+.task-checklist-item.completed .task-checklist-marker::after {
+  content: "✓";
+  position: absolute;
+  inset: -1px 0 0;
+  color: #ffffff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 12px;
+  text-align: center;
+}
+
+.task-checklist-label {
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: var(--font-size-lg);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.task-checklist-item.completed .task-checklist-label {
+  color: var(--text-muted);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.task-checklist-empty {
   color: var(--text-muted);
   font-size: var(--font-size-lg);
+  font-style: italic;
 }
 
 .todo-result {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
-}
-
-.todo-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-}
-
-.todo-item {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.5rem;
-  padding: 0.125rem 0;
-}
-
-.todo-checkbox {
-  font-size: 1rem;
-  line-height: 1.4;
-  flex-shrink: 0;
-}
-
-.todo-content {
-  line-height: 1.4;
-  word-break: break-word;
-}
-
-.todo-completed {
-  text-decoration: line-through;
-  color: var(--text-muted);
-}
-
-/* Todo status colors - muted gray tones */
-.todo-status-pending .todo-checkbox {
-  color: var(--text-muted);
-}
-
-.todo-status-in-progress .todo-checkbox {
-  color: var(--text-muted);
-}
-
-.todo-status-completed .todo-checkbox {
-  color: var(--text-muted);
+  gap: 0.4rem;
 }
 
 .todo-error {
@@ -1958,12 +2032,6 @@ details[open] .collapsible__icon {
   padding: 0.5rem;
   background: var(--bg-error, rgba(207, 34, 46, 0.1));
   border-radius: 4px;
-}
-
-.todo-empty {
-  color: var(--text-muted);
-  font-style: italic;
-  font-size: var(--font-size-lg);
 }
 
 /* ==========================================================================

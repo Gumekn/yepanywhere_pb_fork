@@ -72,7 +72,7 @@ export function preprocessMessages(
   }
 
   const enrichedItems = enrichWriteStdinWithCommand(items);
-  return collapseSessionSetupRuns(enrichedItems);
+  return collapsePlanProgressItems(collapseSessionSetupRuns(enrichedItems));
 }
 
 const SESSION_SETUP_PREFIXES = [
@@ -269,6 +269,113 @@ function collapseSessionSetupRuns(items: RenderItem[]): RenderItem[] {
   }
 
   return dedupeUserPromptsSeparatedOnlyBySetup(result);
+}
+
+function isPlanProgressToolName(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase().replace(/[_-]/g, "");
+  return normalized === "updateplan" || normalized === "todowrite";
+}
+
+export function isPlanProgressItem(item: RenderItem): item is ToolCallItem {
+  return item.type === "tool_call" && isPlanProgressToolName(item.toolName);
+}
+
+function uniqueSourceMessages(messages: Message[]): Message[] {
+  const seen = new Set<string>();
+  const unique: Message[] = [];
+
+  for (const message of messages) {
+    const id = getMessageId(message);
+    const key = id || `${message.type ?? "unknown"}-${message.timestamp ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(message);
+  }
+
+  return unique;
+}
+
+function collapsePlanProgressSegment(segment: RenderItem[]): RenderItem[] {
+  let firstPlanIndex: number | null = null;
+  let firstPlanItem: ToolCallItem | null = null;
+  let latestPlanItem: ToolCallItem | null = null;
+  const planSourceMessages: Message[] = [];
+
+  for (let index = 0; index < segment.length; index++) {
+    const item = segment[index];
+    if (!item || !isPlanProgressItem(item)) {
+      continue;
+    }
+
+    firstPlanIndex ??= index;
+    firstPlanItem ??= item;
+    latestPlanItem = item;
+    planSourceMessages.push(...item.sourceMessages);
+  }
+
+  if (
+    firstPlanIndex === null ||
+    !firstPlanItem ||
+    !latestPlanItem ||
+    firstPlanItem === latestPlanItem
+  ) {
+    return segment;
+  }
+
+  const collapsedPlanItem: ToolCallItem = {
+    ...latestPlanItem,
+    id: firstPlanItem.id,
+    sourceMessages: uniqueSourceMessages(planSourceMessages),
+  };
+
+  const collapsedSegment: RenderItem[] = [];
+  for (let index = 0; index < segment.length; index++) {
+    const item = segment[index];
+    if (!item) {
+      continue;
+    }
+    if (!isPlanProgressItem(item)) {
+      collapsedSegment.push(item);
+      continue;
+    }
+    if (index === firstPlanIndex) {
+      collapsedSegment.push(collapsedPlanItem);
+    }
+  }
+
+  return collapsedSegment;
+}
+
+/**
+ * Keep plan progress as a single current card per user turn. Claude's
+ * TodoWrite and Codex's UpdatePlan both emit repeated snapshots as work
+ * advances; rendering every snapshot creates noisy historical cards.
+ */
+export function collapsePlanProgressItems(items: RenderItem[]): RenderItem[] {
+  const collapsed: RenderItem[] = [];
+  let assistantSegment: RenderItem[] = [];
+
+  const flushAssistantSegment = () => {
+    if (assistantSegment.length === 0) {
+      return;
+    }
+    collapsed.push(...collapsePlanProgressSegment(assistantSegment));
+    assistantSegment = [];
+  };
+
+  for (const item of items) {
+    if (item.type === "user_prompt" || item.type === "session_setup") {
+      flushAssistantSegment();
+      collapsed.push(item);
+      continue;
+    }
+    assistantSegment.push(item);
+  }
+
+  flushAssistantSegment();
+  return collapsed;
 }
 
 function processMessage(
