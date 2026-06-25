@@ -7,6 +7,7 @@ import type { CodexSessionEntry, UrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeProjectId } from "../../src/projects/paths.js";
 import { CodexSessionReader } from "../../src/sessions/codex-reader.js";
+import { invalidateCodexSessionManifest } from "../../src/sessions/codex-session-manifest.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -22,6 +23,7 @@ describe("CodexSessionReader - OSS Support", () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    invalidateCodexSessionManifest(testDir);
     await rm(testDir, { recursive: true, force: true });
   });
 
@@ -111,14 +113,9 @@ describe("CodexSessionReader - OSS Support", () => {
     );
   };
 
-  it("coalesces concurrent session file scans", async () => {
+  it("serves concurrent session file listings from the shared manifest", async () => {
     const sessionId = randomUUID();
     await createSessionFile(sessionId, "openai", "gpt-5");
-
-    const internals = reader as unknown as {
-      findJsonlFiles: (dir: string) => Promise<string[]>;
-    };
-    const findSpy = vi.spyOn(internals, "findJsonlFiles");
 
     const [first, second] = await Promise.all([
       reader.listSessionFiles(testDir),
@@ -129,7 +126,46 @@ describe("CodexSessionReader - OSS Support", () => {
     expect(second).toHaveLength(1);
     expect(first[0]?.sessionId).toBe(sessionId);
     expect(second[0]?.sessionId).toBe(sessionId);
-    expect(findSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("filters manifest session files by project path", async () => {
+    const matchingSessionId = randomUUID();
+    const otherSessionId = randomUUID();
+    await createSessionFile(matchingSessionId, "openai", "gpt-5");
+
+    const now = new Date().toISOString();
+    await writeFile(
+      join(testDir, `${otherSessionId}.jsonl`),
+      `${[
+        JSON.stringify({
+          type: "session_meta",
+          timestamp: now,
+          payload: {
+            id: otherSessionId,
+            cwd: "/test/other-project",
+            timestamp: now,
+            model_provider: "openai",
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          timestamp: now,
+          payload: {
+            type: "user_message",
+            message: "Hello world",
+          },
+        }),
+      ].join("\n")}\n`,
+    );
+
+    const filteredReader = new CodexSessionReader({
+      sessionsDir: testDir,
+      projectPath: "/test/project",
+    });
+
+    const sessions = await filteredReader.listSessionFiles(testDir);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.sessionId).toBe(matchingSessionId);
   });
 
   const createRollbackSessionFile = async (sessionId: string) => {

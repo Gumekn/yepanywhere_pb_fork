@@ -15,7 +15,6 @@
  */
 
 import { createHash } from "node:crypto";
-import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -24,7 +23,7 @@ import {
   type UrlProjectId,
 } from "@yep-anywhere/shared";
 import { getLogger } from "../logging/logger.js";
-import type { ISessionReader } from "../sessions/types.js";
+import type { ISessionReader, SessionFileEntry } from "../sessions/types.js";
 import type { Message } from "../supervisor/types.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
 import {
@@ -34,6 +33,11 @@ import {
 } from "./extractSearchableText.js";
 
 const logger = getLogger();
+
+interface SessionFileStat {
+  mtimeMs: number;
+  size: number;
+}
 
 /** Cached searchable content for a single session. */
 export interface CachedSessionContent {
@@ -474,7 +478,7 @@ export class SessionContentIndexService {
     let indexChanged = false;
 
     // Enumerate session files (reader override for Codex/Gemini shared trees).
-    let sessionFiles: { sessionId: string; filePath: string }[];
+    let sessionFiles: SessionFileEntry[];
     try {
       if (reader.listSessionFiles) {
         sessionFiles = await reader.listSessionFiles(sessionDir);
@@ -494,13 +498,19 @@ export class SessionContentIndexService {
 
     const seen = new Set<string>();
     const STAT_BATCH = 100;
-    const allStats: (Stats | null)[] = new Array(sessionFiles.length);
+    const allStats: (SessionFileStat | null)[] = new Array(sessionFiles.length);
     for (let b = 0; b < sessionFiles.length; b += STAT_BATCH) {
       const end = Math.min(b + STAT_BATCH, sessionFiles.length);
       const batch = await Promise.all(
-        sessionFiles
-          .slice(b, end)
-          .map((f) => fs.stat(f.filePath).catch(() => null)),
+        sessionFiles.slice(b, end).map((file) => {
+          if (file.mtime !== undefined && file.size !== undefined) {
+            return Promise.resolve({
+              mtimeMs: file.mtime,
+              size: file.size,
+            });
+          }
+          return fs.stat(file.filePath).catch(() => null);
+        }),
       );
       for (let j = 0; j < batch.length; j++) {
         allStats[b + j] = batch[j] ?? null;

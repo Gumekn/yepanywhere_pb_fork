@@ -11,7 +11,6 @@
  */
 
 import { createHash } from "node:crypto";
-import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -20,7 +19,7 @@ import {
   type UrlProjectId,
 } from "@yep-anywhere/shared";
 import { getLogger } from "../logging/logger.js";
-import type { ISessionReader } from "../sessions/types.js";
+import type { ISessionReader, SessionFileEntry } from "../sessions/types.js";
 import type { SessionSummary } from "../supervisor/types.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
 import type {
@@ -62,6 +61,11 @@ export interface SessionIndexState {
 }
 
 const CURRENT_VERSION = 3;
+
+interface SessionFileStat {
+  mtimeMs: number;
+  size: number;
+}
 
 export interface SessionIndexServiceOptions {
   /** Directory to store index files (defaults to ~/.yep-anywhere/indexes) */
@@ -687,7 +691,7 @@ export class SessionIndexService implements ISessionIndexService {
       // Enumerate session files — delegate to reader if it supports custom
       // enumeration (e.g., Gemini JSON where session ID is inside the file),
       // otherwise use default JSONL filename-based discovery.
-      let sessionFiles: { sessionId: string; filePath: string }[];
+      let sessionFiles: SessionFileEntry[];
       if (reader.listSessionFiles) {
         sessionFiles = await reader.listSessionFiles(sessionDir);
       } else {
@@ -700,8 +704,10 @@ export class SessionIndexService implements ISessionIndexService {
           }));
       }
 
-      const allStats = await this.statSessionFilesForValidation(sessionFiles);
-      statCalls += sessionFiles.length;
+      const validationStats =
+        await this.statSessionFilesForValidation(sessionFiles);
+      const allStats = validationStats.allStats;
+      statCalls += validationStats.statCalls;
 
       const cacheMisses: {
         sessionId: string;
@@ -793,11 +799,12 @@ export class SessionIndexService implements ISessionIndexService {
   }
 
   private async statSessionFilesForValidation(
-    sessionFiles: { sessionId: string; filePath: string }[],
-  ): Promise<(Stats | null)[]> {
-    const allStats: (Stats | null)[] = new Array(sessionFiles.length).fill(
-      null,
-    );
+    sessionFiles: SessionFileEntry[],
+  ): Promise<{ allStats: (SessionFileStat | null)[]; statCalls: number }> {
+    const allStats: (SessionFileStat | null)[] = new Array(
+      sessionFiles.length,
+    ).fill(null);
+    let statCalls = 0;
     let nextIndex = 0;
     const workerCount = Math.min(
       FULL_VALIDATION_STAT_CONCURRENCY,
@@ -813,12 +820,17 @@ export class SessionIndexService implements ISessionIndexService {
 
           const entry = sessionFiles[index];
           if (!entry) continue;
+          if (entry.mtime !== undefined && entry.size !== undefined) {
+            allStats[index] = { mtimeMs: entry.mtime, size: entry.size };
+            continue;
+          }
+          statCalls += 1;
           allStats[index] = await fs.stat(entry.filePath).catch(() => null);
         }
       }),
     );
 
-    return allStats;
+    return { allStats, statCalls };
   }
 
   getDebugStats(): {

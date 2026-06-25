@@ -11,8 +11,7 @@
  * Unlike Claude's DAG structure, Codex sessions are linear.
  */
 
-import { readdir, stat } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { stat } from "node:fs/promises";
 import {
   type CodexEventMsgEntry,
   type CodexFunctionCallOutputPayload,
@@ -37,15 +36,22 @@ import type {
   Session,
   SessionSummary,
 } from "../supervisor/types.js";
-import { readFirstLine, readJsonlLines } from "../utils/jsonl.js";
+import { readJsonlLines } from "../utils/jsonl.js";
 import {
   applyCodexRollbackMarkers,
   buildCodexBranchView,
 } from "./codex-rollback.js";
+import {
+  type CodexSessionManifest,
+  type CodexSessionManifestEntry,
+  getCodexSessionManifest,
+  invalidateCodexSessionManifest,
+} from "./codex-session-manifest.js";
 import type {
   GetSessionOptions,
   ISessionReader,
   LoadedSession,
+  SessionFileEntry,
 } from "./types.js";
 
 export interface CodexSessionReaderOptions {
@@ -61,26 +67,9 @@ export interface CodexSessionReaderOptions {
   projectPath?: string;
 }
 
-interface CodexSessionFile {
-  id: string;
-  filePath: string;
-  cwd: string;
-  timestamp: string;
-  mtime: number;
-  size: number;
-  isSubagent: boolean;
-}
+type CodexSessionFile = CodexSessionManifestEntry;
 
-const CODEX_META_READ_MAX_BYTES = 1024 * 1024;
-const CODEX_SESSION_SCAN_CACHE_TTL_MS = 5000;
-
-interface SharedCodexSessionScan {
-  sessions: CodexSessionFile[];
-  timestamp: number;
-  inFlight?: Promise<CodexSessionFile[]>;
-}
-
-const sharedSessionScanCache = new Map<string, SharedCodexSessionScan>();
+const CODEX_SESSION_FILE_CACHE_TTL_MS = 5000;
 
 /**
  * Codex-specific session reader for Codex CLI JSONL files.
@@ -106,7 +95,7 @@ export class CodexSessionReader implements ISessionReader {
   invalidateCache(): void {
     this.sessionFileCache.clear();
     this.cacheTimestamp = 0;
-    sharedSessionScanCache.delete(this.sessionsDir);
+    invalidateCodexSessionManifest(this.sessionsDir);
   }
 
   async listSessions(projectId: UrlProjectId): Promise<SessionSummary[]> {
@@ -114,14 +103,6 @@ export class CodexSessionReader implements ISessionReader {
     const sessions = await this.scanSessions();
 
     for (const session of sessions) {
-      // Filter by project path if set
-      if (
-        this.projectPath &&
-        canonicalizeProjectPath(session.cwd) !== this.projectPath
-      ) {
-        continue;
-      }
-
       const summary = await this.getSessionSummary(session.id, projectId);
       if (summary) {
         summaries.push(summary);
@@ -314,53 +295,17 @@ export class CodexSessionReader implements ISessionReader {
    * Scan the sessions directory and find all session files.
    */
   private async scanSessions(): Promise<CodexSessionFile[]> {
-    // Check cache
     const now = Date.now();
-    if (now - this.cacheTimestamp < CODEX_SESSION_SCAN_CACHE_TTL_MS) {
+    if (now - this.cacheTimestamp < CODEX_SESSION_FILE_CACHE_TTL_MS) {
       return Array.from(this.sessionFileCache.values());
     }
 
-    const shared = sharedSessionScanCache.get(this.sessionsDir);
-    if (shared && now - shared.timestamp < CODEX_SESSION_SCAN_CACHE_TTL_MS) {
-      this.replaceSessionFileCache(shared.sessions);
-      return shared.sessions.filter((session) => !session.isSubagent);
-    }
-
-    if (shared?.inFlight) {
-      const sessions = await shared.inFlight;
-      this.replaceSessionFileCache(sessions);
-      return sessions.filter((session) => !session.isSubagent);
-    }
-
-    const promise = this.scanSessionsFromDisk();
-    sharedSessionScanCache.set(this.sessionsDir, {
-      sessions: shared?.sessions ?? [],
-      timestamp: shared?.timestamp ?? 0,
-      inFlight: promise,
-    });
-
-    try {
-      const sessions = await promise;
-      sharedSessionScanCache.set(this.sessionsDir, {
-        sessions,
-        timestamp: Date.now(),
-      });
-      this.replaceSessionFileCache(sessions);
-      return sessions.filter((session) => !session.isSubagent);
-    } catch (error) {
-      const latest = sharedSessionScanCache.get(this.sessionsDir);
-      if (latest?.inFlight === promise) {
-        if (latest.sessions.length > 0) {
-          sharedSessionScanCache.set(this.sessionsDir, {
-            sessions: latest.sessions,
-            timestamp: latest.timestamp,
-          });
-        } else {
-          sharedSessionScanCache.delete(this.sessionsDir);
-        }
-      }
-      throw error;
-    }
+    const manifest = await getCodexSessionManifest(this.sessionsDir);
+    const sessions = this.getManifestSessionsForScope(manifest).filter(
+      (session) => !session.isSubagent,
+    );
+    this.replaceSessionFileCache(sessions);
+    return sessions;
   }
 
   private replaceSessionFileCache(sessions: CodexSessionFile[]): void {
@@ -369,21 +314,6 @@ export class CodexSessionReader implements ISessionReader {
       this.sessionFileCache.set(session.id, session);
     }
     this.cacheTimestamp = Date.now();
-  }
-
-  private async scanSessionsFromDisk(): Promise<CodexSessionFile[]> {
-    const sessions: CodexSessionFile[] = [];
-    const files = await this.findJsonlFiles(this.sessionsDir);
-
-    for (const filePath of files) {
-      const session = await this.readSessionMeta(filePath);
-      if (session) {
-        sessions.push(session);
-        this.sessionFileCache.set(session.id, session);
-      }
-    }
-
-    return sessions;
   }
 
   async getSessionFilePath(sessionId: string): Promise<string | null> {
@@ -395,21 +325,15 @@ export class CodexSessionReader implements ISessionReader {
     return `codex::${sessionDir}::${this.projectPath ?? "*"}`;
   }
 
-  async listSessionFiles(
-    _sessionDir: string,
-  ): Promise<{ sessionId: string; filePath: string }[]> {
+  async listSessionFiles(_sessionDir: string): Promise<SessionFileEntry[]> {
     const sessions = await this.scanSessions();
 
-    return sessions
-      .filter((session) =>
-        this.projectPath
-          ? canonicalizeProjectPath(session.cwd) === this.projectPath
-          : true,
-      )
-      .map((session) => ({
-        sessionId: session.id,
-        filePath: session.filePath,
-      }));
+    return sessions.map((session) => ({
+      sessionId: session.id,
+      filePath: session.filePath,
+      mtime: session.mtime,
+      size: session.size,
+    }));
   }
 
   /**
@@ -422,90 +346,28 @@ export class CodexSessionReader implements ISessionReader {
     const cached = this.sessionFileCache.get(sessionId);
     if (cached) return cached;
 
-    // Scan if cache miss
-    await this.scanSessions();
-    return this.sessionFileCache.get(sessionId) ?? null;
-  }
+    const manifest = await getCodexSessionManifest(this.sessionsDir);
+    const session = manifest.byId.get(sessionId);
+    if (!session || session.isSubagent) return null;
 
-  /**
-   * Recursively find all .jsonl files in a directory.
-   */
-  private async findJsonlFiles(dir: string): Promise<string[]> {
-    const files: string[] = [];
-
-    try {
-      const entries = await readdir(dir, { withFileTypes: true });
-
-      for (const entry of entries) {
-        const fullPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          const subFiles = await this.findJsonlFiles(fullPath);
-          files.push(...subFiles);
-        } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-          files.push(fullPath);
-        }
-      }
-    } catch {
-      // Ignore errors (permission denied, etc.)
-    }
-
-    return files;
-  }
-
-  /**
-   * Read session metadata from the first line of a file.
-   */
-  private async readSessionMeta(
-    filePath: string,
-  ): Promise<CodexSessionFile | null> {
-    try {
-      const [stats, firstLine] = await Promise.all([
-        stat(filePath),
-        readFirstLine(filePath, CODEX_META_READ_MAX_BYTES),
-      ]);
-
-      if (!firstLine) return null;
-
-      const entry = parseCodexSessionEntry(firstLine);
-      if (!entry || entry.type !== "session_meta") return null;
-
-      const meta = entry.payload;
-
-      return {
-        id: meta.id,
-        filePath,
-        cwd: meta.cwd,
-        timestamp: meta.timestamp,
-        mtime: stats.mtimeMs,
-        size: stats.size,
-        isSubagent: this.isSubagentSessionMeta(meta),
-      };
-    } catch {
+    if (
+      this.projectPath &&
+      canonicalizeProjectPath(session.cwd) !== this.projectPath
+    ) {
       return null;
     }
+
+    this.sessionFileCache.set(session.id, session);
+    return session;
   }
 
-  private isSubagentSessionMeta(
-    meta: CodexSessionMetaEntry["payload"],
-  ): boolean {
-    if (
-      !("forked_from_id" in meta) ||
-      typeof meta.forked_from_id !== "string"
-    ) {
-      return false;
+  private getManifestSessionsForScope(
+    manifest: CodexSessionManifest,
+  ): CodexSessionFile[] {
+    if (!this.projectPath) {
+      return manifest.sessions;
     }
-
-    const source = meta.source;
-    if (!source || typeof source !== "object") return false;
-
-    const subagentSource = source as {
-      subagent?: { thread_spawn?: { parent_thread_id?: string } };
-    };
-
-    return (
-      typeof subagentSource.subagent?.thread_spawn?.parent_thread_id ===
-      "string"
-    );
+    return manifest.byProjectPath.get(this.projectPath) ?? [];
   }
 
   /**

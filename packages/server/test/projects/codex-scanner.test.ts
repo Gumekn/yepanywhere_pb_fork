@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexSessionScanner } from "../../src/projects/codex-scanner.js";
+import { invalidateCodexSessionManifest } from "../../src/sessions/codex-session-manifest.js";
 
 function makeSessionMeta(
   id: string,
@@ -26,6 +27,9 @@ describe("CodexSessionScanner", () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    for (const dir of tempDirs) {
+      invalidateCodexSessionManifest(dir);
+    }
     await Promise.all(
       tempDirs
         .splice(0)
@@ -216,7 +220,7 @@ describe("CodexSessionScanner", () => {
     expect(sessions[0].id).toBe(id1);
   });
 
-  it("coalesces concurrent full-tree scans", async () => {
+  it("caches the physical-tree manifest until invalidated", async () => {
     const sessionsDir = join(tmpdir(), `codex-scan-${randomUUID()}`);
     tempDirs.push(sessionsDir);
 
@@ -230,20 +234,26 @@ describe("CodexSessionScanner", () => {
     );
 
     const scanner = new CodexSessionScanner({ sessionsDir });
-    const internals = scanner as unknown as {
-      findJsonlFiles: (dir: string) => Promise<string[]>;
-    };
-    const findSpy = vi.spyOn(internals, "findJsonlFiles");
-
-    const [projects, sessions] = await Promise.all([
-      scanner.listProjects(),
-      scanner.getSessionsForProject("/home/user/project-a"),
-    ]);
-
+    const projects = await scanner.listProjects();
     expect(projects).toHaveLength(1);
+
+    const id2 = randomUUID();
+    await writeFile(
+      join(dateDir, `rollout-${id2}.jsonl`),
+      `${makeSessionMeta(id2, "/home/user/project-b")}\n`,
+    );
+
+    const cachedProjects = await scanner.listProjects();
+    expect(cachedProjects).toHaveLength(1);
+
+    scanner.invalidateCache();
+    const refreshedProjects = await scanner.listProjects();
+    const sessions = await scanner.getSessionsForProject(
+      "/home/user/project-a",
+    );
+
+    expect(refreshedProjects).toHaveLength(2);
     expect(sessions).toHaveLength(1);
-    expect(
-      findSpy.mock.calls.filter(([dir]) => dir === sessionsDir),
-    ).toHaveLength(1);
+    expect(sessions[0].id).toBe(id);
   });
 });

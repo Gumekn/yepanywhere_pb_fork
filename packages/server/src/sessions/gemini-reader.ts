@@ -35,6 +35,7 @@ import type {
   GetSessionOptions,
   ISessionReader,
   LoadedSession,
+  SessionFileEntry,
 } from "./types.js";
 
 export interface GeminiSessionReaderOptions {
@@ -259,35 +260,35 @@ export class GeminiSessionReader implements ISessionReader {
 
   /**
    * Enumerate session files in a directory for SessionIndexService.
-   * Reads each file to extract the sessionId (not derivable from filename).
+   * Reuses the reader's scan cache because Gemini IDs are inside JSON content.
    */
-  async listSessionFiles(
-    sessionDir: string,
-  ): Promise<{ sessionId: string; filePath: string }[]> {
-    const results: { sessionId: string; filePath: string }[] = [];
-    try {
-      const entries = await readdir(sessionDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (
-          entry.isFile() &&
-          entry.name.startsWith("session-") &&
-          entry.name.endsWith(".json")
-        ) {
-          const filePath = join(sessionDir, entry.name);
-          try {
-            const content = await readFile(filePath, "utf-8");
-            const session = parseGeminiSessionFile(content);
-            if (session) {
-              results.push({ sessionId: session.sessionId, filePath });
-            }
-          } catch {
-            // Skip unreadable files
-          }
-        }
-      }
-    } catch {
-      // Directory doesn't exist or unreadable
+  async listSessionFiles(_sessionDir: string): Promise<SessionFileEntry[]> {
+    const sessions = await this.scanSessions();
+    const results: SessionFileEntry[] = [];
+
+    let map: Map<string, string> | undefined;
+    if (this.projectPath) {
+      map =
+        this.hashToCwd instanceof Promise
+          ? await this.hashToCwd
+          : this.hashToCwd;
     }
+
+    for (const session of sessions) {
+      if (
+        this.projectPath &&
+        map?.get(session.projectHash) !== this.projectPath
+      ) {
+        continue;
+      }
+      results.push({
+        sessionId: session.id,
+        filePath: session.filePath,
+        mtime: session.mtime,
+        size: session.size,
+      });
+    }
+
     return results;
   }
 

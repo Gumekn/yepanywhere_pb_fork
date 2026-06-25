@@ -684,5 +684,57 @@ describe("SessionIndexService", () => {
       expect(sessions).toHaveLength(sessionCount);
       expect(service.getDebugStats().statCalls).toBe(sessionCount);
     });
+
+    it("reuses reader-provided file stats during full validation", async () => {
+      const statlessSessionDir = join(projectsDir, "statless-sessions");
+      await mkdir(statlessSessionDir, { recursive: true });
+
+      const sessionFiles = [
+        {
+          sessionId: "session-1",
+          filePath: join(statlessSessionDir, "session-1.jsonl"),
+          mtime: 1000,
+          size: 10,
+        },
+        {
+          sessionId: "session-2",
+          filePath: join(statlessSessionDir, "session-2.jsonl"),
+          mtime: 2000,
+          size: 20,
+        },
+      ];
+
+      const statlessReader: ISessionReader = {
+        listSessions: async () => [],
+        listSessionFiles: async () => sessionFiles,
+        getSessionSummary: async (
+          sessionId: string,
+          projectId: string,
+        ): Promise<SessionSummary> => ({
+          id: sessionId,
+          projectId,
+          title: sessionId,
+          fullTitle: sessionId,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          messageCount: 1,
+          ownership: { owner: "none" },
+          provider: "codex",
+        }),
+        getSession: async () => null,
+        getSessionSummaryIfChanged: async () => null,
+        getAgentMappings: async () => [],
+        getAgentSession: async () => null,
+      };
+
+      const sessions = await service.getSessionsWithCache(
+        statlessSessionDir,
+        projectId,
+        statlessReader,
+      );
+
+      expect(sessions).toHaveLength(2);
+      expect(service.getDebugStats().statCalls).toBe(0);
+    });
   });
 });

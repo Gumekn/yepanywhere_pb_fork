@@ -37,6 +37,15 @@ export interface LoadedSession {
   codexBranchState?: CodexBranchState;
 }
 
+export interface SessionFileEntry {
+  sessionId: string;
+  filePath: string;
+  /** Optional file mtime in ms. Readers that already scanned file stats can provide this to avoid duplicate stat calls. */
+  mtime?: number;
+  /** Optional file size in bytes. Readers that already scanned file stats can provide this to avoid duplicate stat calls. */
+  size?: number;
+}
+
 /**
  * Common interface for session readers across providers.
  *
@@ -119,9 +128,7 @@ export interface ISessionReader {
    * When not implemented, the index service falls back to JSONL
    * filename-based enumeration.
    */
-  listSessionFiles?(
-    sessionDir: string,
-  ): Promise<{ sessionId: string; filePath: string }[]>;
+  listSessionFiles?(sessionDir: string): Promise<SessionFileEntry[]>;
 
   /**
    * Return a stable cache/index scope key for this reader.
