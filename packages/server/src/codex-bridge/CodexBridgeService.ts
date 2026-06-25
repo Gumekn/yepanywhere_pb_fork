@@ -29,6 +29,7 @@ interface CodexBridgeServiceOptions {
   upstreamUrl?: string;
   upstreamStartPort?: number;
   lightUpstreamArgs?: string[];
+  clearUpstreamArgs?: string[];
   fullUpstreamArgs?: string[];
   upstreamArgs?: string[];
   codexPath?: string;
@@ -146,6 +147,7 @@ export class CodexBridgeService implements CodexBridgeController {
     this.upstreamUrlOverride = options.upstreamUrl;
     this.upstreamStartPort = options.upstreamStartPort;
     this.upstreamArgsByProfile = {
+      clear: options.clearUpstreamArgs ?? [],
       light: options.lightUpstreamArgs ?? options.upstreamArgs ?? [],
       full: options.fullUpstreamArgs ?? [],
     };
@@ -243,6 +245,7 @@ export class CodexBridgeService implements CodexBridgeController {
       upstreamRunning: this.isAnyManagedUpstreamRunning(),
       upstreamMode: this.upstreamUrlOverride ? "external" : "managed",
       upstreams: {
+        clear: this.getUpstreamStatus("clear"),
         light: this.getUpstreamStatus("light"),
         full: this.getUpstreamStatus("full"),
       },
@@ -1595,6 +1598,7 @@ export class CodexBridgeService implements CodexBridgeController {
 
   private getManagedUpstreamUrl(): string | null {
     return (
+      this.upstreams.get("clear")?.url ??
       this.upstreams.get("light")?.url ??
       this.upstreams.get("full")?.url ??
       null
@@ -1672,8 +1676,17 @@ function parseMcpProfile(
     ?.replace(/^Bearer\s+/i, "")
     .trim()
     .toLowerCase();
-  if (token === "full" || token === "mcp=full" || token === "profile:full") {
-    return "full";
+  if (token) {
+    if (token === "full" || token === "mcp=full" || token === "profile:full") {
+      return "full";
+    }
+    if (
+      token === "clear" ||
+      token === "mcp=clear" ||
+      token === "profile:clear"
+    ) {
+      return "clear";
+    }
   }
 
   const requested = new URL(url ?? "/", "http://127.0.0.1").searchParams
@@ -1681,7 +1694,9 @@ function parseMcpProfile(
     .at(-1)
     ?.trim()
     .toLowerCase();
-  return requested === "full" ? "full" : "light";
+  if (requested === "full") return "full";
+  if (requested === "clear") return "clear";
+  return "light";
 }
 
 function rawDataToString(data: RawData): string {

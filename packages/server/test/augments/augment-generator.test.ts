@@ -256,6 +256,24 @@ describe("AugmentGenerator", () => {
       expect(augment.html).toContain("this");
       expect(augment.html).not.toContain("javascript:");
     });
+
+    it("linkifies bare local image paths", async () => {
+      const block: CompletedBlock = {
+        type: "paragraph",
+        content: "Saved image:\n\n/tmp/kitten.png",
+        startOffset: 0,
+        endOffset: 29,
+      };
+
+      const augment = await generator.processBlock(block, 0);
+
+      expect(augment.html).toContain('class="local-media-link"');
+      expect(augment.html).toContain('data-media-type="image"');
+      expect(augment.html).toContain(
+        'href="/api/local-image?path=%2Ftmp%2Fkitten.png"',
+      );
+      expect(augment.html).toContain("/tmp/kitten.png");
+    });
   });
 
   describe("renderPending", () => {

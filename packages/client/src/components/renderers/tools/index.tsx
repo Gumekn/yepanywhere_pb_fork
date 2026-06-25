@@ -13,6 +13,8 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
   Agent: "Task", // SDK 0.2.76+ renamed Task → Agent
   view_image: "ViewImage",
   imageView: "ViewImage",
+  image_generation: "ViewImage",
+  imageGeneration: "ViewImage",
 };
 
 function canonicalizeToolName(toolName: string): string {

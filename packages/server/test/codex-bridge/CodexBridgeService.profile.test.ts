@@ -24,7 +24,7 @@ describe("CodexBridgeService managed upstream profiles", () => {
     }
   });
 
-  it("routes default connections to light upstream and bearer full to full upstream", async () => {
+  it("routes default connections to light upstream and bearer tokens to profile upstreams", async () => {
     tempDir = await mkdtemp(join(process.cwd(), ".tmp-codex-bridge-profile-"));
     const codexPath = join(tempDir, "fake-codex.mjs");
     const argsLogPath = join(tempDir, "args.jsonl");
@@ -42,6 +42,7 @@ describe("CodexBridgeService managed upstream profiles", () => {
       port: bridgePort,
       upstreamStartPort,
       lightUpstreamArgs: ["--light-profile"],
+      clearUpstreamArgs: ["--clear-profile"],
       fullUpstreamArgs: ["--full-profile"],
       codexPath,
       startupTimeoutMs: 5000,
@@ -54,13 +55,17 @@ describe("CodexBridgeService managed upstream profiles", () => {
       authorization: "Bearer full",
     });
     await waitForArgsLog(argsLogPath, 2);
+    const clearClient = await connect(`ws://127.0.0.1:${bridgePort}`, {
+      authorization: "Bearer clear",
+    });
+    await waitForArgsLog(argsLogPath, 3);
     const fallbackClient = await connect(
       `ws://127.0.0.1:${bridgePort}?mcp=unknown`,
     );
 
     try {
       const args = await readArgsLog(argsLogPath);
-      expect(args).toHaveLength(2);
+      expect(args).toHaveLength(3);
       expect(args[0]).toEqual([
         "app-server",
         "--light-profile",
@@ -73,10 +78,24 @@ describe("CodexBridgeService managed upstream profiles", () => {
         "--listen",
         expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       ]);
+      expect(args[2]).toEqual([
+        "app-server",
+        "--clear-profile",
+        "--listen",
+        expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+      ]);
       expect(args[0]?.at(-1)).not.toBe(args[1]?.at(-1));
+      expect(args[0]?.at(-1)).not.toBe(args[2]?.at(-1));
+      expect(args[1]?.at(-1)).not.toBe(args[2]?.at(-1));
 
       const status = bridge.getStatus();
       expect(status.upstreamMode).toBe("managed");
+      expect(status.upstreams.clear).toMatchObject({
+        profile: "clear",
+        running: true,
+        starting: false,
+        args: ["--clear-profile"],
+      });
       expect(status.upstreams.light).toMatchObject({
         profile: "light",
         running: true,
@@ -90,9 +109,11 @@ describe("CodexBridgeService managed upstream profiles", () => {
         args: ["--full-profile"],
       });
       expect(status.upstreams.light.url).not.toBe(status.upstreams.full.url);
+      expect(status.upstreams.clear.url).not.toBe(status.upstreams.light.url);
     } finally {
       lightClient.close();
       fullClient.close();
+      clearClient.close();
       fallbackClient.close();
     }
   });

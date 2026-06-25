@@ -1,3 +1,4 @@
+import { splitTextWithFilePaths } from "@yep-anywhere/shared";
 import {
   Marked,
   type RendererObject,
@@ -74,6 +75,28 @@ function renderLocalMediaLink(
   return `<a href="${apiUrl}" class="local-media-link" data-media-type="${mediaType}">${escapedLabel}<span class="local-media-type">(${typeLabel})</span></a>`;
 }
 
+function renderTextWithLocalMediaLinks(text: string): string {
+  return splitTextWithFilePaths(text)
+    .map((segment) => {
+      if (segment.type === "text") {
+        return escapeHtml(segment.content);
+      }
+
+      const path = segment.detected.filePath;
+      if (!isLocalFilePath(path)) {
+        return escapeHtml(segment.detected.match);
+      }
+
+      const ext = getExtension(path);
+      if (!MEDIA_EXTENSIONS.has(ext)) {
+        return escapeHtml(segment.detected.match);
+      }
+
+      return renderLocalMediaLink(path, segment.detected.match, ext);
+    })
+    .join("");
+}
+
 const MARKDOWN_SANITIZE_OPTIONS = {
   allowedTags: [
     "a",
@@ -129,6 +152,9 @@ const renderer: RendererObject<string, string> = {
   html({ text }) {
     // Disable raw HTML passthrough from markdown by escaping it.
     return escapeHtml(text);
+  },
+  text({ text }: Tokens.Text | Tokens.Escape) {
+    return renderTextWithLocalMediaLinks(text);
   },
   link(
     this: RendererThis<string, string>,

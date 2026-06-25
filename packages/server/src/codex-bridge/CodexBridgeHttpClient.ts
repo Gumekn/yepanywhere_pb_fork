@@ -77,6 +77,14 @@ export class CodexBridgeHttpClient implements CodexBridgeController {
         upstreamRunning: false,
         upstreamMode: "managed",
         upstreams: {
+          clear: {
+            profile: "clear",
+            url: null,
+            running: false,
+            starting: false,
+            pid: null,
+            args: [],
+          },
           light: {
             profile: "light",
             url: null,

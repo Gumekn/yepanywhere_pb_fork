@@ -10,6 +10,7 @@ export async function runCodexBridgeOnly(): Promise<void> {
     upstreamUrl: config.codexBridgeUpstreamUrl,
     upstreamStartPort: config.codexBridgeUpstreamStartPort,
     lightUpstreamArgs: config.codexBridgeLightUpstreamArgs,
+    clearUpstreamArgs: config.codexBridgeClearUpstreamArgs,
     fullUpstreamArgs: config.codexBridgeFullUpstreamArgs,
   });
 

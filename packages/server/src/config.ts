@@ -7,7 +7,10 @@ import {
   type PermissionMode,
 } from "@yep-anywhere/shared";
 import type { Level as LogLevel } from "pino";
-import { CODEX_STANDARD_MCP_APP_SERVER_ARGS } from "./codex/mcp-profile.js";
+import {
+  CODEX_CLEAR_MCP_APP_SERVER_ARGS,
+  CODEX_STANDARD_MCP_APP_SERVER_ARGS,
+} from "./codex/mcp-profile.js";
 import { getDefaultCodexSessionsDir } from "./projects/codex-scanner.js";
 
 /**
@@ -60,6 +63,8 @@ export interface Config {
   codexBridgeUpstreamStartPort: number;
   /** Extra args passed to the managed light `codex app-server` upstream. */
   codexBridgeLightUpstreamArgs: string[];
+  /** Extra args passed to the managed clear `codex app-server` upstream. */
+  codexBridgeClearUpstreamArgs: string[];
   /** Extra args passed to the managed full `codex app-server` upstream. */
   codexBridgeFullUpstreamArgs: string[];
   /**
@@ -254,6 +259,10 @@ export function loadConfig(): Config {
         legacyCodexBridgeUpstreamArgs,
       DEFAULT_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS,
     ),
+    codexBridgeClearUpstreamArgs: parseCodexBridgeUpstreamArgs(
+      process.env.YEP_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS,
+      DEFAULT_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS,
+    ),
     codexBridgeFullUpstreamArgs: parseCodexBridgeUpstreamArgs(
       process.env.YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS,
       [],
@@ -434,6 +443,10 @@ function parseCodexBridgeMode(
 
 const DEFAULT_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS = [
   ...CODEX_STANDARD_MCP_APP_SERVER_ARGS,
+];
+
+const DEFAULT_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS = [
+  ...CODEX_CLEAR_MCP_APP_SERVER_ARGS,
 ];
 
 function parseCodexBridgeUpstreamArgs(

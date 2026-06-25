@@ -13,6 +13,11 @@ import {
   logCodexCorrelationDebug,
   summarizeCodexNormalizedMessage,
 } from "../../codex/correlationDebugLogger.js";
+import {
+  buildCodexImageGenerationResultText,
+  normalizeCodexImageGenerationRecord,
+  summarizeCodexImageGenerationResult,
+} from "../../codex/image-generation.js";
 import { getCodexMcpAppServerArgs } from "../../codex/mcp-profile.js";
 import {
   type CodexToolCallContext,
@@ -301,7 +306,16 @@ type NormalizedThreadItem =
       items: Array<{ text: string; completed: boolean }>;
     }
   | { id: string; type: "error"; message: string }
-  | { id: string; type: "image_view"; path: string };
+  | { id: string; type: "image_view"; path: string }
+  | {
+      id: string;
+      type: "image_generation";
+      status: string;
+      revised_prompt?: string;
+      result?: string;
+      path?: string;
+      url?: string;
+    };
 
 /**
  * Configuration for Codex provider.
@@ -1960,6 +1974,24 @@ export class CodexProvider implements AgentProvider {
         return { id, type: "image_view", path: imagePath };
       }
 
+      case "image_generation": {
+        const image = normalizeCodexImageGenerationRecord(itemRecord, {
+          defaultStatus: "completed",
+        });
+
+        return {
+          id,
+          type: "image_generation",
+          status: image.status ?? "completed",
+          ...(image.revisedPrompt
+            ? { revised_prompt: image.revisedPrompt }
+            : {}),
+          ...(image.result ? { result: image.result } : {}),
+          ...(image.path ? { path: image.path } : {}),
+          ...(image.url ? { url: image.url } : {}),
+        };
+      }
+
       case "error": {
         const message =
           this.getOptionalString(itemRecord.message) ?? "Codex error";
@@ -2598,6 +2630,98 @@ export class CodexProvider implements AgentProvider {
             callId: item.id,
             phase: "completed",
             sourceEvent,
+          });
+          messages.push(toolResultMessage);
+        }
+
+        return messages;
+      }
+
+      case "image_generation": {
+        const input: Record<string, unknown> = {
+          title: "Generated image",
+          ...(item.path ? { path: item.path } : {}),
+          ...(item.url ? { url: item.url } : {}),
+          ...(item.status ? { status: item.status } : {}),
+          ...(item.revised_prompt
+            ? { revised_prompt: item.revised_prompt }
+            : {}),
+          ...(!item.path && !item.url && item.result
+            ? { result: summarizeCodexImageGenerationResult(item.result) }
+            : {}),
+        };
+
+        const toolUseMessage = withCodexTimestamp(
+          {
+            type: "assistant",
+            session_id: sessionId,
+            uuid,
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: item.id,
+                  name: "ViewImage",
+                  input,
+                },
+              ],
+            },
+            codexToolName: "imageGeneration",
+          } as SDKMessage,
+          observedAt,
+        );
+        logSdkCorrelationDebug(sessionId, toolUseMessage, {
+          eventKind: "image_generation",
+          turnId,
+          itemId: item.id,
+          phase: isComplete ? "completed" : "started",
+          sourceEvent,
+          status: item.status,
+        });
+
+        const messages: SDKMessage[] = [toolUseMessage];
+        if (isComplete && item.status !== "in_progress") {
+          const toolResultMessage = withCodexTimestamp(
+            {
+              type: "user",
+              session_id: sessionId,
+              uuid: `${uuid}-result`,
+              message: {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: item.id,
+                    content: buildCodexImageGenerationResultText({
+                      path: item.path,
+                      url: item.url,
+                      status: item.status,
+                      result: item.result,
+                    }),
+                  },
+                ],
+              },
+              toolUseResult: {
+                type: "image",
+                ...(item.path ? { path: item.path } : {}),
+                ...(item.url ? { url: item.url } : {}),
+                ...(item.status ? { status: item.status } : {}),
+                ...(item.revised_prompt
+                  ? { revisedPrompt: item.revised_prompt }
+                  : {}),
+              },
+            } as SDKMessage,
+            observedAt,
+          );
+          logSdkCorrelationDebug(sessionId, toolResultMessage, {
+            eventKind: "tool_result",
+            turnId,
+            itemId: item.id,
+            callId: item.id,
+            phase: "completed",
+            sourceEvent,
+            status: item.status,
           });
           messages.push(toolResultMessage);
         }

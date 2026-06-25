@@ -60,8 +60,9 @@ describe("loadConfig codex paths", () => {
     ]);
   });
 
-  it("uses light Codex bridge upstream args by default and keeps full profile unrestricted", async () => {
+  it("uses light and clear Codex bridge upstream args by default and keeps full profile unrestricted", async () => {
     vi.stubEnv("YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS", undefined);
+    vi.stubEnv("YEP_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS", undefined);
     vi.stubEnv("YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS", undefined);
     vi.stubEnv("YEP_CODEX_BRIDGE_UPSTREAM_ARGS", undefined);
     vi.stubEnv("CODEX_BRIDGE_UPSTREAM_ARGS", undefined);
@@ -77,11 +78,27 @@ describe("loadConfig codex paths", () => {
       "-c",
       "mcp_servers.chrome-devtools.enabled=false",
     ]);
+    expect(config.codexBridgeClearUpstreamArgs).toEqual([
+      "--disable",
+      "apps",
+      "--disable",
+      "plugins",
+      "-c",
+      "mcp_servers.chrome-devtools.enabled=false",
+      "-c",
+      "mcp_servers.node_repl.enabled=false",
+      "-c",
+      "mcp_servers.feishu-mcp.enabled=false",
+    ]);
     expect(config.codexBridgeFullUpstreamArgs).toEqual([]);
   });
 
   it("parses profile-specific Codex bridge upstream args from env", async () => {
     vi.stubEnv("YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS", "");
+    vi.stubEnv(
+      "YEP_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS",
+      '["--disable","apps","-c","mcp_servers.foo.enabled=false"]',
+    );
     vi.stubEnv(
       "YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS",
       '["--enable","apps","-c","x.y=true"]',
@@ -92,6 +109,12 @@ describe("loadConfig codex paths", () => {
     const config = loadConfig();
 
     expect(config.codexBridgeLightUpstreamArgs).toEqual([]);
+    expect(config.codexBridgeClearUpstreamArgs).toEqual([
+      "--disable",
+      "apps",
+      "-c",
+      "mcp_servers.foo.enabled=false",
+    ]);
     expect(config.codexBridgeFullUpstreamArgs).toEqual([
       "--enable",
       "apps",
@@ -102,6 +125,7 @@ describe("loadConfig codex paths", () => {
 
   it("keeps legacy Codex bridge upstream args as a light-profile override only", async () => {
     vi.stubEnv("YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS", undefined);
+    vi.stubEnv("YEP_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS", undefined);
     vi.stubEnv("YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS", undefined);
     vi.stubEnv("YEP_CODEX_BRIDGE_UPSTREAM_ARGS", "--disable apps");
 
@@ -109,6 +133,18 @@ describe("loadConfig codex paths", () => {
     const config = loadConfig();
 
     expect(config.codexBridgeLightUpstreamArgs).toEqual(["--disable", "apps"]);
+    expect(config.codexBridgeClearUpstreamArgs).toEqual([
+      "--disable",
+      "apps",
+      "--disable",
+      "plugins",
+      "-c",
+      "mcp_servers.chrome-devtools.enabled=false",
+      "-c",
+      "mcp_servers.node_repl.enabled=false",
+      "-c",
+      "mcp_servers.feishu-mcp.enabled=false",
+    ]);
     expect(config.codexBridgeFullUpstreamArgs).toEqual([]);
   });
 });

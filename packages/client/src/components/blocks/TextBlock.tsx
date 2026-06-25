@@ -5,6 +5,7 @@ import { useStreamingMarkdownContext } from "../../contexts/StreamingMarkdownCon
 import { useStreamingMarkdown } from "../../hooks/useStreamingMarkdown";
 import { appPath } from "../../lib/apiPath";
 import { getSelectionAwareCopyText } from "../../lib/clipboard";
+import { splitTextWithFilePaths } from "../../lib/filePathDetection";
 import { FileViewerModal } from "../FilePathLink";
 import {
   LocalMediaModal,
@@ -31,6 +32,65 @@ function getProjectRelativePath(
 
 function isModifiedClick(e: React.MouseEvent): boolean {
   return e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
+}
+
+const IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "tiff",
+  "tif",
+  "svg",
+]);
+
+const VIDEO_EXTENSIONS = new Set(["mp4", "webm", "mov", "avi", "mkv", "ogv"]);
+const MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
+
+function getExtension(path: string): string {
+  return (path.split(".").pop() ?? "").toLowerCase();
+}
+
+function isLocalMediaPath(path: string): boolean {
+  if (!path.startsWith("/") || path.startsWith("//")) return false;
+  return MEDIA_EXTENSIONS.has(getExtension(path));
+}
+
+function localMediaApiPath(path: string): string {
+  return `/api/local-image?path=${encodeURIComponent(path)}`;
+}
+
+function renderPlainTextWithLocalMediaLinks(text: string): React.ReactNode {
+  const segments = splitTextWithFilePaths(text);
+
+  return segments.map((segment) => {
+    if (segment.type === "text") {
+      return segment.content;
+    }
+
+    const path = segment.detected.filePath;
+    if (!isLocalMediaPath(path)) {
+      return segment.detected.match;
+    }
+
+    const ext = getExtension(path);
+    const mediaType = VIDEO_EXTENSIONS.has(ext) ? "video" : "image";
+    const typeLabel = mediaType;
+
+    return (
+      <a
+        key={`${path}-${segment.detected.startIndex}`}
+        href={localMediaApiPath(path)}
+        className="local-media-link"
+        data-media-type={mediaType}
+      >
+        {segment.detected.match}
+        <span className="local-media-type">({typeLabel})</span>
+      </a>
+    );
+  });
 }
 
 export const TextBlock = memo(function TextBlock({
@@ -185,7 +245,7 @@ export const TextBlock = memo(function TextBlock({
           <div dangerouslySetInnerHTML={{ __html: augmentHtml }} />
         ) : (
           // Plain text fallback (no server augment available)
-          <p>{text}</p>
+          <p>{renderPlainTextWithLocalMediaLinks(text)}</p>
         ))}
       {modal && (
         <LocalMediaModal

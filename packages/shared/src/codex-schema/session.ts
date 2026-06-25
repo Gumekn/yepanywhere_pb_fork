@@ -208,6 +208,41 @@ export type CodexWebSearchCallPayload = z.infer<
   typeof CodexWebSearchCallPayloadSchema
 >;
 
+const CodexImageGenerationPayloadFields = {
+  id: z.string().optional(),
+  status: z.string().optional(),
+  revisedPrompt: z.string().nullable().optional(),
+  revised_prompt: z.string().nullable().optional(),
+  result: z.string().optional(),
+  savedPath: z.string().optional(),
+  saved_path: z.string().optional(),
+};
+
+/**
+ * Image generation payload.
+ *
+ * Codex app-server exposes this as a ThreadItem, but some persisted formats can
+ * also carry it as a response_item payload. Accept both naming styles so older
+ * rollout files remain renderable.
+ */
+export const CodexImageGenerationPayloadSchema = z
+  .object({
+    type: z.literal("image_generation"),
+    ...CodexImageGenerationPayloadFields,
+  })
+  .passthrough();
+
+export const CodexImageGenerationCamelPayloadSchema = z
+  .object({
+    type: z.literal("imageGeneration"),
+    ...CodexImageGenerationPayloadFields,
+  })
+  .passthrough();
+
+export type CodexImageGenerationPayload =
+  | z.infer<typeof CodexImageGenerationPayloadSchema>
+  | z.infer<typeof CodexImageGenerationCamelPayloadSchema>;
+
 /**
  * Ghost commit snapshot for git state tracking.
  */
@@ -236,6 +271,8 @@ export const CodexResponseItemPayloadSchema = z.discriminatedUnion("type", [
   CodexCustomToolCallPayloadSchema,
   CodexCustomToolCallOutputPayloadSchema,
   CodexWebSearchCallPayloadSchema,
+  CodexImageGenerationPayloadSchema,
+  CodexImageGenerationCamelPayloadSchema,
   CodexGhostSnapshotPayloadSchema,
 ]);
 

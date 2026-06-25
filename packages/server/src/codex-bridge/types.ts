@@ -7,7 +7,7 @@ import type {
 import type { SessionSummary } from "../supervisor/types.js";
 
 export type JsonRpcId = string | number;
-export type CodexBridgeUpstreamProfile = "light" | "full";
+export type CodexBridgeUpstreamProfile = "clear" | "light" | "full";
 
 export interface JsonRpcError {
   code?: number;

@@ -123,15 +123,17 @@ export const ALL_PERMISSION_MODES: readonly PermissionMode[] = [
 
 /**
  * Codex MCP profile for app-server-backed sessions.
+ * - "clear": Matches `cf -clear` profile (apps/plugins disabled, MCP disabled).
  * - "standard": Matches `cf` light profile (apps/plugins disabled).
  * - "full": Matches `cf -mcp` full profile (load all configured MCP/apps/plugins).
  */
-export type CodexMcpMode = "standard" | "full";
+export type CodexMcpMode = "clear" | "standard" | "full";
 
 /**
  * All Codex MCP modes in canonical order.
  */
 export const ALL_CODEX_MCP_MODES: readonly CodexMcpMode[] = [
+  "clear",
   "standard",
   "full",
 ] as const;

@@ -428,6 +428,86 @@ describe("Codex Normalization", () => {
     });
   });
 
+  it("normalizes persisted Codex imageGeneration into a completed ViewImage row", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "imageGeneration",
+          id: "img-1",
+          status: "completed",
+          revisedPrompt: "A quiet product screenshot",
+          result: "file:///tmp/generated-product.png",
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    expect(normalized.messages).toHaveLength(2);
+
+    const renderItems = preprocessMessages(normalized.messages);
+    const imageItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "ViewImage",
+    );
+
+    expect(imageItem?.type).toBe("tool_call");
+    if (imageItem?.type !== "tool_call") {
+      throw new Error("Expected ViewImage render item");
+    }
+
+    expect(imageItem.status).toBe("complete");
+    expect(imageItem.toolInput).toMatchObject({
+      path: "/tmp/generated-product.png",
+      revised_prompt: "A quiet product screenshot",
+      status: "completed",
+      title: "Generated image",
+    });
+    expect(imageItem.toolResult?.content).toBe(
+      "Generated image: /tmp/generated-product.png",
+    );
+    expect(imageItem.toolResult?.structured).toMatchObject({
+      type: "image",
+      path: "/tmp/generated-product.png",
+    });
+  });
+
+  it("normalizes Codex item_completed imageGeneration events when no response_item exists", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "item_completed",
+          item: {
+            type: "imageGeneration",
+            id: "img-event-1",
+            status: "completed",
+            savedPath: "/tmp/event-generated.png",
+            result: "Image saved",
+          },
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const imageItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "ViewImage",
+    );
+
+    expect(imageItem?.type).toBe("tool_call");
+    if (imageItem?.type !== "tool_call") {
+      throw new Error("Expected ViewImage render item");
+    }
+
+    expect(imageItem.status).toBe("complete");
+    expect(imageItem.id).toBe("img-event-1");
+    expect(imageItem.toolInput).toMatchObject({
+      path: "/tmp/event-generated.png",
+    });
+  });
+
   it("projects Codex external agent Read markers into a completed tool row", () => {
     const entries: CodexSessionEntry[] = [
       codexAssistantMessage(

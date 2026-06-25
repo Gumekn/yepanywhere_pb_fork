@@ -894,6 +894,11 @@ details[open] .collapsible__icon {
   gap: 0.5rem;
 }
 
+.viewimage-error {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
 .image-info {
   color: var(--text-muted);
   font-size: var(--font-size-sm);

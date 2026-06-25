@@ -69,6 +69,7 @@ describe("TextBlock", () => {
   afterEach(() => {
     window.getSelection()?.removeAllRanges();
     cleanup();
+    vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
 
@@ -103,6 +104,32 @@ describe("TextBlock", () => {
       );
     });
     expect(await screen.findByText("corrected transcript")).toBeTruthy();
+  });
+
+  it("linkifies plain local image paths and opens the media modal", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise(() => {
+            // Keep the image request pending so the modal remains in loading state.
+          }),
+      ),
+    );
+
+    renderWithSessionMetadata(
+      <TextBlock text={"Saved image:\n\n/tmp/kitten.png"} />,
+    );
+
+    const link = screen.getByRole("link", { name: /\/tmp\/kitten\.png/i });
+    expect(link.getAttribute("href")).toBe(
+      "/api/local-image?path=%2Ftmp%2Fkitten.png",
+    );
+    expect(link.getAttribute("data-media-type")).toBe("image");
+
+    fireEvent.click(link);
+
+    expect(await screen.findByText("Loading...")).toBeTruthy();
   });
 
   it("copies active text selection instead of the whole block", async () => {

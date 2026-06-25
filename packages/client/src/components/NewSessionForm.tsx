@@ -58,7 +58,7 @@ const MODE_ORDER: PermissionMode[] = [
   "plan",
   "bypassPermissions",
 ];
-const CODEX_MCP_MODE_ORDER: CodexMcpMode[] = ["standard", "full"];
+const CODEX_MCP_MODE_ORDER: CodexMcpMode[] = ["clear", "standard", "full"];
 
 const EFFORT_LABEL_KEYS: Record<
   EffortLevel,
@@ -203,10 +203,12 @@ export function NewSessionForm({
     bypassPermissions: t("modeBypassPermissionsDescription"),
   };
   const codexMcpModeLabels: Record<CodexMcpMode, string> = {
+    clear: t("newSessionCodexMcpClearLabel"),
     standard: t("newSessionCodexMcpStandardLabel"),
     full: t("newSessionCodexMcpFullLabel"),
   };
   const codexMcpModeDescriptions: Record<CodexMcpMode, string> = {
+    clear: t("newSessionCodexMcpClearDescription"),
     standard: t("newSessionCodexMcpStandardDescription"),
     full: t("newSessionCodexMcpFullDescription"),
   };

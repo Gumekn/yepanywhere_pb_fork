@@ -288,6 +288,67 @@ process.stdin.on("data", (chunk) => {
         rmSync(tempDir, { recursive: true, force: true });
       }
     });
+
+    it("uses clear Codex MCP profile with default MCP servers disabled", async () => {
+      const tempDir = mkdtempSync(
+        join(require("node:os").tmpdir(), "codex-app-server-"),
+      );
+      const fakeCodexPath = writeFakeCodexAppServer(tempDir);
+      const capturePath = join(tempDir, "capture.json");
+      const previousCapturePath = process.env.CODEX_FAKE_CAPTURE;
+      let session: Awaited<ReturnType<CodexProvider["startSession"]>> | null =
+        null;
+
+      process.env.CODEX_FAKE_CAPTURE = capturePath;
+
+      try {
+        const provider = new CodexProvider({ codexPath: fakeCodexPath });
+        session = await provider.startSession({
+          cwd: tempDir,
+          initialMessage: { text: "hello" },
+          codexMcpMode: "clear",
+        });
+
+        const first = await session.iterator.next();
+        expect(first.value).toMatchObject({
+          type: "system",
+          subtype: "init",
+          session_id: "thread-new",
+          model: "gpt-5.5",
+        });
+        expect(JSON.parse(readFileSync(capturePath, "utf8"))).toMatchObject({
+          argv: [
+            "app-server",
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            "-c",
+            "mcp_servers.chrome-devtools.enabled=false",
+            "-c",
+            "mcp_servers.node_repl.enabled=false",
+            "-c",
+            "mcp_servers.feishu-mcp.enabled=false",
+            "--listen",
+            "stdio://",
+          ],
+          method: "thread/start",
+          params: {
+            model: null,
+            modelProvider: "openai",
+            cwd: tempDir,
+          },
+        });
+      } finally {
+        session?.abort();
+        if (previousCapturePath === undefined) {
+          process.env.CODEX_FAKE_CAPTURE = undefined;
+        } else {
+          process.env.CODEX_FAKE_CAPTURE = previousCapturePath;
+        }
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
   });
 });
 
@@ -581,6 +642,69 @@ describe("CodexProvider Event Normalization", () => {
     expect(messages[1]?.toolUseResult).toMatchObject({
       mode: "files_with_matches",
       numFiles: 0,
+    });
+  });
+
+  it("normalizes imageGeneration notifications into completed ViewImage rows", () => {
+    const provider = createTestProvider() as unknown as {
+      convertNotificationToSDKMessages: (
+        notification: { method: string; params?: unknown },
+        sessionId: string,
+        usageByTurnId: Map<string, unknown>,
+      ) => Array<Record<string, unknown>>;
+    };
+
+    const messages = provider.convertNotificationToSDKMessages(
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            id: "img-1",
+            type: "imageGeneration",
+            status: "completed",
+            savedPath: "/tmp/generated.png",
+            revisedPrompt: "A quiet product screenshot",
+            result: "Image saved",
+          },
+        },
+      },
+      "session-1",
+      new Map(),
+    );
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.message).toMatchObject({
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "img-1",
+          name: "ViewImage",
+          input: {
+            path: "/tmp/generated.png",
+            revised_prompt: "A quiet product screenshot",
+            status: "completed",
+            title: "Generated image",
+          },
+        },
+      ],
+    });
+    expect(messages[1]?.message).toMatchObject({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "img-1",
+          content: "Generated image: /tmp/generated.png",
+        },
+      ],
+    });
+    expect(messages[1]?.toolUseResult).toMatchObject({
+      type: "image",
+      path: "/tmp/generated.png",
+      revisedPrompt: "A quiet product screenshot",
     });
   });
 

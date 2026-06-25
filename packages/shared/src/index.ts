@@ -243,6 +243,7 @@ export type {
   CodexCustomToolCallPayload,
   CodexCustomToolCallOutputPayload,
   CodexWebSearchCallPayload,
+  CodexImageGenerationPayload,
   CodexGhostSnapshotPayload,
   CodexResponseItemPayload,
   CodexResponseItemEntry,

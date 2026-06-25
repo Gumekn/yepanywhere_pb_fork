@@ -5,6 +5,7 @@ import type {
   CodexCustomToolCallPayload,
   CodexEventMsgEntry,
   CodexFunctionCallPayload,
+  CodexImageGenerationPayload,
   CodexMessagePayload,
   CodexReasoningPayload,
   CodexResponseItemEntry,
@@ -29,6 +30,12 @@ import {
   logCodexCorrelationDebug,
   summarizeCodexNormalizedMessage,
 } from "../codex/correlationDebugLogger.js";
+import {
+  buildCodexImageGenerationResultText,
+  isCodexImageGenerationRecord,
+  normalizeCodexImageGenerationRecord,
+  summarizeCodexImageGenerationResult,
+} from "../codex/image-generation.js";
 import {
   type CodexToolCallContext,
   canonicalizeCodexToolName,
@@ -263,6 +270,8 @@ function convertCodexEntries(
     .filter((timestamp): timestamp is number => timestamp !== null);
   const toolCallContexts = new Map<string, CodexToolCallContext>();
   const externalToolCalls: PendingExternalCodexToolCall[] = [];
+  const responseItemImageGenerationIds =
+    collectResponseItemImageGenerationIds(entries);
 
   for (const entry of entries) {
     if (entry.type === "response_item") {
@@ -315,9 +324,35 @@ function convertCodexEntries(
       const shouldIncludeContextCompacted =
         entry.payload.type === "context_compacted" &&
         !hasNearbyCodexCompactedEntry(compactedTimestamps, entry.timestamp);
+      const imageGenerationMessages =
+        entry.payload.type === "item_completed"
+          ? convertCodexItemCompletedImageGeneration(
+              entry,
+              messageIndex,
+              responseItemImageGenerationIds,
+            )
+          : null;
       // Skip agent_message and agent_reasoning events when response_item exists;
       // those are streaming artifacts that duplicate full response data.
-      if (
+      if (imageGenerationMessages) {
+        messageIndex++;
+        for (const msg of imageGenerationMessages) {
+          if (isCodexCorrelationDebugEnabled()) {
+            logCodexCorrelationDebug({
+              sessionId,
+              channel: "jsonl",
+              authority: "durable",
+              entryType: entry.type,
+              payloadType: entry.payload.type,
+              eventKind: "image_generation",
+              turnId: getCodexEventPayloadTurnId(entry.payload),
+              itemId: getCodexEventPayloadItemId(entry.payload),
+              ...summarizeCodexNormalizedMessage(msg),
+            });
+          }
+          messages.push(msg);
+        }
+      } else if (
         shouldIncludeUserMessage ||
         shouldIncludeTurnAborted ||
         shouldIncludeContextCompacted
@@ -519,6 +554,48 @@ function hasCodexResponseItemUserMessages(
   );
 }
 
+function collectResponseItemImageGenerationIds(
+  entries: CodexSessionEntry[],
+): Set<string> {
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    if (entry.type !== "response_item") continue;
+    const payload = entry.payload;
+    if (!isCodexImageGenerationRecord(payload)) continue;
+    const id = getFirstString((payload as Record<string, unknown>).id);
+    if (id) {
+      ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function convertCodexItemCompletedImageGeneration(
+  entry: CodexEventMsgEntry,
+  index: number,
+  responseItemImageGenerationIds: Set<string>,
+): Message[] | null {
+  if (entry.payload.type !== "item_completed") {
+    return null;
+  }
+
+  const item = entry.payload.item;
+  if (!isRecord(item) || !isCodexImageGenerationRecord(item)) {
+    return null;
+  }
+
+  const itemId = getFirstString(item.id);
+  if (itemId && responseItemImageGenerationIds.has(itemId)) {
+    return null;
+  }
+
+  return convertCodexImageGenerationRecord(
+    item,
+    `codex-event-${index}-${entry.timestamp}`,
+    entry.timestamp,
+  );
+}
+
 function convertCodexResponseItem(
   entry: CodexResponseItemEntry,
   index: number,
@@ -586,12 +663,97 @@ function convertCodexResponseItem(
     case "web_search_call":
       return convertCodexWebSearchCallPayload(payload, uuid, entry.timestamp);
 
+    case "image_generation":
+    case "imageGeneration":
+      return convertCodexImageGenerationPayload(payload, uuid, entry.timestamp);
+
     case "ghost_snapshot":
       return null;
 
     default:
       return null;
   }
+}
+
+function convertCodexImageGenerationPayload(
+  payload: CodexImageGenerationPayload,
+  uuid: string,
+  timestamp: string,
+): Message[] {
+  return convertCodexImageGenerationRecord(
+    payload as Record<string, unknown>,
+    uuid,
+    timestamp,
+  );
+}
+
+function convertCodexImageGenerationRecord(
+  record: Record<string, unknown>,
+  uuid: string,
+  timestamp: string,
+): Message[] {
+  const image = normalizeCodexImageGenerationRecord(record);
+  const callId = image.id ?? `${uuid}-image-generation`;
+
+  const input: Record<string, unknown> = {
+    title: "Generated image",
+    ...(image.path ? { path: image.path } : {}),
+    ...(image.url ? { url: image.url } : {}),
+    ...(image.status ? { status: image.status } : {}),
+    ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),
+    ...(!image.path && !image.url && image.result
+      ? { result: summarizeCodexImageGenerationResult(image.result) }
+      : {}),
+  };
+
+  const toolUseMessage: Message = {
+    uuid,
+    type: "assistant",
+    message: {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: callId,
+          name: "ViewImage",
+          input,
+        },
+      ],
+    },
+    codexToolName: "imageGeneration",
+    timestamp,
+  };
+
+  const toolResult: ContentBlock = {
+    type: "tool_result",
+    tool_use_id: callId,
+    content: buildCodexImageGenerationResultText({
+      path: image.path,
+      url: image.url,
+      status: image.status,
+      result: image.result,
+    }),
+  };
+
+  return [
+    toolUseMessage,
+    {
+      uuid: `${uuid}-result`,
+      type: "user",
+      message: {
+        role: "user",
+        content: [toolResult],
+      },
+      toolUseResult: {
+        type: "image",
+        ...(image.path ? { path: image.path } : {}),
+        ...(image.url ? { url: image.url } : {}),
+        ...(image.status ? { status: image.status } : {}),
+        ...(image.revisedPrompt ? { revisedPrompt: image.revisedPrompt } : {}),
+      },
+      timestamp,
+    },
+  ];
 }
 
 function convertCodexMessagePayload(

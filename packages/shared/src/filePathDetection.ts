@@ -148,6 +148,22 @@ const FILE_EXTENSIONS = new Set([
   "cmake",
   "lock",
   "log",
+  // Media
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "tiff",
+  "tif",
+  "svg",
+  "mp4",
+  "webm",
+  "mov",
+  "avi",
+  "mkv",
+  "ogv",
 ]);
 
 /**
