@@ -951,7 +951,7 @@ function normalizeCodexInputImageBlock(
 
   const imageUrl =
     typeof block.image_url === "string" ? block.image_url.trim() : "";
-  if (imageUrl && !isDataUrl(imageUrl)) {
+  if (imageUrl) {
     normalized.image_url = imageUrl;
   }
 
@@ -973,10 +973,6 @@ function resolveCodexInputImageMimeType(
 
   const dataUrlMime = parseDataUrlMimeType(block.image_url);
   return dataUrlMime || undefined;
-}
-
-function isDataUrl(value: string): boolean {
-  return value.startsWith("data:");
 }
 
 function parseDataUrlMimeType(dataUrl: string): string | null {

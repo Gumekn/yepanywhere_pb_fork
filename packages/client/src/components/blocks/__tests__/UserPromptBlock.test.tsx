@@ -38,7 +38,7 @@ describe("UserPromptBlock", () => {
     const content: ContentBlock[] = [
       {
         type: "text",
-        text: "Please review this screenshot.\n<image>\nThanks.",
+        text: '<image name=[Image #1] path="/Users/test/Desktop/screenshot.png"></image>[Image #1] Please review this screenshot.',
       },
       {
         type: "input_image",
@@ -55,6 +55,9 @@ describe("UserPromptBlock", () => {
     const attachmentButton = screen.getByRole("button", {
       name: /pasted-image-1\.png/i,
     });
+    expect(screen.queryByText(/<image/i)).toBeNull();
+    expect(screen.queryByText(/<\/image>/i)).toBeNull();
+
     fireEvent.click(attachmentButton);
 
     expect(

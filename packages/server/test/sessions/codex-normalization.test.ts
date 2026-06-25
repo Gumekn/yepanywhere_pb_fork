@@ -1280,7 +1280,7 @@ describe("Codex Normalization", () => {
     );
   });
 
-  it("preserves Codex input_image blocks without dumping data URLs into text", () => {
+  it("preserves Codex input_image preview data without dumping it into text", () => {
     const entries: CodexSessionEntry[] = [
       {
         type: "response_item",
@@ -1322,10 +1322,8 @@ describe("Codex Normalization", () => {
     expect(inputImageBlock).toMatchObject({
       type: "input_image",
       mime_type: "image/png",
+      image_url: "data:image/png;base64,AAAA",
     });
-    expect(
-      (inputImageBlock as { image_url?: string } | undefined)?.image_url,
-    ).toBeUndefined();
   });
 
   it("does not add encrypted reasoning placeholder when summary is present", () => {

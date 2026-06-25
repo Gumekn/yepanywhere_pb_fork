@@ -2270,6 +2270,10 @@ a.sidebar-nav-item {
   border-bottom-right-radius: 6px;
 }
 
+.message-user-prompt .text-block {
+  padding-right: 0;
+}
+
 /* On narrower viewports the bubble can take more width so wrapping reads well. */
 @media (max-width: 600px) {
   .message-user-prompt {

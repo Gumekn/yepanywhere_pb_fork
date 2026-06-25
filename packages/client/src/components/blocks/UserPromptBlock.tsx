@@ -116,8 +116,12 @@ function isInputImageBlock(block: ContentBlock): block is InputImageBlock {
 
 function stripCodexImageMarkers(text: string): string {
   return text
+    .replace(/<image\b[^>]*>\s*<\/image>/gi, "\n")
     .split("\n")
-    .filter((line) => line.trim() !== "<image>")
+    .filter((line) => {
+      const trimmed = line.trim();
+      return !/^<image\b[^>]*>$/i.test(trimmed) && trimmed !== "</image>";
+    })
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
