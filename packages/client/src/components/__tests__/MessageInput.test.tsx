@@ -132,6 +132,36 @@ describe("MessageInput command completion", () => {
     expect(textarea.value).toBe("$model ");
   });
 
+  it("keeps the toolbar command button stable while commands are loading", () => {
+    renderMessageInput({
+      commandPrefix: "/",
+      commandLabel: "Slash commands",
+      commands: [],
+      showCommandButton: true,
+    });
+
+    const button = screen.getByRole("button", {
+      name: "Show slash commands",
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+
+    fireEvent.click(button);
+    expect(screen.queryByRole("menu", { name: "Slash commands" })).toBeNull();
+  });
+
+  it("does not show the toolbar command button when provider flags disable it", () => {
+    renderMessageInput({
+      commandPrefix: "/",
+      commandLabel: "Slash commands",
+      commands: [],
+      showCommandButton: false,
+    });
+
+    expect(
+      screen.queryByRole("button", { name: "Show slash commands" }),
+    ).toBeNull();
+  });
+
   it("keeps custom slash commands from handling Codex dollar commands", () => {
     const onCustomCommand = vi.fn(() => true);
     const { textarea } = renderMessageInput({

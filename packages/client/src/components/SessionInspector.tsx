@@ -1,4 +1,4 @@
-import type { MarkdownAugment, ProviderName } from "@yep-anywhere/shared";
+import type { MarkdownAugment } from "@yep-anywhere/shared";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
@@ -11,7 +11,6 @@ import {
 } from "../lib/preprocessMessages";
 import type { ContentBlock, Message, SessionStatus } from "../types";
 import type { RenderItem, ToolCallItem } from "../types/renderItems";
-import { ProviderBadge } from "./ProviderBadge";
 
 type InspectorPresentation = "sidebar" | "drawer";
 type InspectorTab = "questions" | "files" | "checks" | "git";
@@ -29,10 +28,6 @@ interface SessionInspectorProps {
   projectId: string;
   sessionId: string;
   basePath?: string;
-  provider?: ProviderName;
-  model?: string;
-  reasoningEffort?: string;
-  serviceTier?: string;
   status: SessionStatus;
   processState?: string;
   onSelectMessage: (messageId: string) => void;
@@ -88,10 +83,6 @@ export function SessionInspector({
   projectId,
   sessionId,
   basePath = "",
-  provider,
-  model,
-  reasoningEffort,
-  serviceTier,
   status,
   processState,
   onSelectMessage,
@@ -171,19 +162,9 @@ export function SessionInspector({
 
       <div className="session-inspector-status-card">
         <div className="session-inspector-status-top">
-          {provider ? (
-            <ProviderBadge
-              provider={provider}
-              model={model}
-              reasoningEffort={reasoningEffort}
-              serviceTier={serviceTier}
-              isThinking={processState === "in-turn"}
-            />
-          ) : (
-            <span className="session-inspector-muted">
-              {t("sessionInspectorStatus")}
-            </span>
-          )}
+          <span className="session-inspector-muted">
+            {t("sessionInspectorStatus")}
+          </span>
           <span className="session-inspector-pill">
             {getStatusLabel(t, status, processState)}
           </span>

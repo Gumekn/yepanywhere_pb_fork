@@ -19,7 +19,7 @@
   "sidebarTerminal": "Terminal",
   "sidebarSettings": "Ajustes",
   "sidebarSectionStarred": "Destacadas",
-  "sidebarSectionLast24Hours": "Últimas 24 horas",
+  "sidebarSectionLast24Hours": "Sesiones recientes",
   "sidebarSectionOlder": "Anteriores",
   "sidebarLoadingSessions": "Cargando sesiones...",
   "sidebarNoSessions": "Todavía no hay sesiones",

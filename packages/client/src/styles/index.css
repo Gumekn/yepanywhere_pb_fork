@@ -1122,7 +1122,8 @@ h2 {
   background: var(--bg-hover);
 }
 
-.session-inspector-toggle {
+.session-inspector-toggle,
+.session-info-button {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1136,12 +1137,14 @@ h2 {
   transition: color 0.15s, background 0.15s;
 }
 
-.session-inspector-toggle:hover {
+.session-inspector-toggle:hover,
+.session-info-button:hover {
   color: var(--text-primary);
   background: var(--bg-hover);
 }
 
-.session-inspector-toggle:focus-visible {
+.session-inspector-toggle:focus-visible,
+.session-info-button:focus-visible {
   outline: 2px solid var(--focus-border);
   outline-offset: 2px;
 }
@@ -1218,18 +1221,6 @@ h2 {
   justify-content: space-between;
   gap: var(--space-2);
   min-width: 0;
-}
-
-.session-inspector-status-top .provider-badge {
-  min-width: 0;
-  max-width: 190px;
-}
-
-.session-inspector-status-top .provider-badge-label,
-.session-inspector-status-top .provider-badge-model {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .session-inspector-pill {
@@ -2211,15 +2202,6 @@ a.sidebar-nav-item {
     overflow: hidden;
     text-overflow: ellipsis;
     flex: 0 1 auto;
-  }
-
-  .session-header-right .provider-badge-button {
-    max-width: min(34vw, 132px);
-    flex-shrink: 1;
-  }
-
-  .session-header-right .provider-badge {
-    max-width: 100%;
   }
 
   .session-messages {
@@ -3688,10 +3670,13 @@ a.sidebar-nav-item {
   color: var(--text-muted);
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s, color 0.15s;
-  min-width: 28px;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  box-sizing: border-box;
 }
 
-.slash-command-button:hover {
+.slash-command-button:hover:not(:disabled) {
   background: var(--bg-hover);
   border-color: var(--border-input);
 }
@@ -3708,6 +3693,7 @@ a.sidebar-nav-item {
 }
 
 .slash-icon {
+  font-family: var(--font-mono);
   font-weight: 600;
   font-size: var(--font-size-sm);
   line-height: 1;
@@ -7057,28 +7043,6 @@ button.context-usage-indicator--button:focus-visible {
   height: 14px;
   border-radius: 2px;
   flex-shrink: 0;
-}
-
-/* Clickable provider badge button (in session header) */
-.provider-badge-button {
-  display: inline-flex;
-  min-width: 0;
-  padding: 0;
-  margin: 0;
-  background: none;
-  border: none;
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-  transition: opacity 0.15s;
-}
-
-.provider-badge-button:hover {
-  opacity: 0.8;
-}
-
-.provider-badge-button:focus-visible {
-  outline: 2px solid var(--focus-border);
-  outline-offset: 2px;
 }
 
 .provider-badge-dot-inline {

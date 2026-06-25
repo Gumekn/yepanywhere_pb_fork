@@ -127,6 +127,8 @@ interface Props {
   commandPrefix?: CommandPrefix;
   /** Available commands (without prefix) */
   commands?: string[];
+  /** Whether to reserve the command button slot even before commands are ready */
+  showCommandButton?: boolean;
   /** Accessible label for the active command menu */
   commandLabel?: string;
   /** Callback for custom client-side "/" commands (e.g., "model"). Return true if handled. */
@@ -159,6 +161,7 @@ export function MessageInput({
   supportsThinkingToggle = true,
   commandPrefix = "/",
   commands = [],
+  showCommandButton = commands.length > 0,
   commandLabel = "Commands",
   onCustomCommand,
 }: Props) {
@@ -656,6 +659,7 @@ export function MessageInput({
             commandPrefix={commandPrefix}
             commandLabel={commandLabel}
             commands={commands}
+            showCommandButton={showCommandButton}
             onSelectCommand={handleSlashCommand}
             contextUsage={contextUsage}
             projectId={projectId}

@@ -535,12 +535,11 @@ export function NewSessionForm({
       // Pass initial status so SessionPage can connect SSE immediately
       // without waiting for getSession to complete
       // Also pass initial message as optimistic title (session name = first message)
-      // Pass model/provider so ProviderBadge can render immediately
+      // Pass provider so provider-specific controls can render immediately
       navigate(`${basePath}/projects/${projectId}/sessions/${sessionId}`, {
         state: {
           initialStatus: { state: "owned", processId },
           initialTitle: trimmedMessage,
-          initialModel: selectedModel,
           initialProvider: selectedProvider,
         },
       });

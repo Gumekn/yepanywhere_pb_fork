@@ -13,7 +13,6 @@ import { MessageInputToolbar } from "../components/MessageInputToolbar";
 import { MessageList } from "../components/MessageList";
 import { ModelSwitchModal } from "../components/ModelSwitchModal";
 import { ProcessInfoModal } from "../components/ProcessInfoModal";
-import { ProviderBadge } from "../components/ProviderBadge";
 import { QuestionAnswerPanel } from "../components/QuestionAnswerPanel";
 import { RecentSessionsDropdown } from "../components/RecentSessionsDropdown";
 import { SessionInspector } from "../components/SessionInspector";
@@ -140,6 +139,12 @@ function isCodexCommandProvider(
   return provider === "codex" || provider === "codex-oss";
 }
 
+function providerDefaultsToSlashCommands(
+  provider: ProviderName | string | undefined | null,
+): boolean {
+  return provider === "claude" || provider === "claude-ollama";
+}
+
 function isCodexAppServerProvider(
   provider: ProviderName | string | undefined | null,
 ): provider is "codex" {
@@ -204,18 +209,16 @@ function SessionPageContent({
   const selectedBranchId = searchParams.get("branch") || undefined;
   // Get initial status and title from navigation state (passed by NewSessionPage)
   // This allows SSE to connect immediately and show optimistic title without waiting for getSession
-  // Also get model/provider so ProviderBadge can render immediately
+  // Also get provider so provider-specific controls can render immediately
   const navState = location.state as {
     initialStatus?: { owner: "self"; processId: string };
     initialTitle?: string;
-    initialModel?: string;
     initialProvider?: ProviderName;
     /** Message id to scroll to + highlight (set by search deep-links). */
     targetMessageId?: string;
   } | null;
   const initialStatus = navState?.initialStatus;
   const initialTitle = navState?.initialTitle;
-  const initialModel = navState?.initialModel;
   const initialProvider = navState?.initialProvider;
 
   // Get streaming markdown context for server-rendered markdown streaming
@@ -305,11 +308,8 @@ function SessionPageContent({
           ? "connecting"
           : "disconnected";
 
-  // Effective provider/model for immediate display before session data loads
+  // Effective provider for immediate display before session data loads
   const effectiveProvider = session?.provider ?? initialProvider;
-  const effectiveModel = session?.model ?? initialModel;
-  const effectiveReasoningEffort = session?.reasoningEffort;
-  const effectiveServiceTier = session?.serviceTier;
   const approvalAgentName = getApprovalAgentName(effectiveProvider);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
@@ -503,11 +503,15 @@ function SessionPageContent({
   const supportsThinkingToggle =
     currentProviderInfo?.supportsThinkingToggle ?? true;
   const supportsSlashCommands =
-    currentProviderInfo?.supportsSlashCommands ?? false;
+    currentProviderInfo?.supportsSlashCommands ??
+    providerDefaultsToSlashCommands(effectiveProvider);
   const commandPrefix = isCodexCommandProvider(effectiveProvider) ? "$" : "/";
   const commandLabel = isCodexCommandProvider(effectiveProvider)
     ? "Codex commands"
     : "Slash commands";
+  const showCommandButton =
+    status.owner === "self" &&
+    (isCodexCommandProvider(effectiveProvider) || supportsSlashCommands);
   const activeCommands = useMemo(() => {
     if (status.owner !== "self") return [];
     if (isCodexCommandProvider(effectiveProvider)) return CODEX_DOLLAR_COMMANDS;
@@ -1413,6 +1417,24 @@ function SessionPageContent({
     </svg>
   );
 
+  const SessionInfoIcon = () => (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="10" />
+      <line x1="12" y1="16" x2="12" y2="12" />
+      <line x1="12" y1="8" x2="12.01" y2="8" />
+    </svg>
+  );
+
   return (
     <div
       className={
@@ -1575,20 +1597,15 @@ function SessionPageContent({
                   <SessionOutlineIcon />
                 </button>
               )}
-              {!loading && effectiveProvider && (
+              {!loading && session && (
                 <button
                   type="button"
-                  className="provider-badge-button"
+                  className="session-info-button"
                   onClick={() => setShowProcessInfoModal(true)}
                   title={t("sessionViewInfo")}
+                  aria-label={t("sessionViewInfo")}
                 >
-                  <ProviderBadge
-                    provider={effectiveProvider}
-                    model={effectiveModel}
-                    reasoningEffort={effectiveReasoningEffort}
-                    serviceTier={effectiveServiceTier}
-                    isThinking={processState === "in-turn"}
-                  />
+                  <SessionInfoIcon />
                 </button>
               )}
             </div>
@@ -1820,6 +1837,7 @@ function SessionPageContent({
                 commandPrefix={commandPrefix}
                 commandLabel={commandLabel}
                 commands={activeCommands}
+                showCommandButton={showCommandButton}
                 onCustomCommand={handleCustomCommand}
               />
             )}
@@ -1835,10 +1853,6 @@ function SessionPageContent({
           projectId={projectId}
           sessionId={actualSessionId}
           basePath={basePath}
-          provider={effectiveProvider}
-          model={effectiveModel}
-          reasoningEffort={effectiveReasoningEffort}
-          serviceTier={effectiveServiceTier}
           status={status}
           processState={processState}
           onSelectMessage={handleInspectorSelectMessage}
@@ -1854,10 +1868,6 @@ function SessionPageContent({
           projectId={projectId}
           sessionId={actualSessionId}
           basePath={basePath}
-          provider={effectiveProvider}
-          model={effectiveModel}
-          reasoningEffort={effectiveReasoningEffort}
-          serviceTier={effectiveServiceTier}
           status={status}
           processState={processState}
           onSelectMessage={handleInspectorSelectMessage}

@@ -27,6 +27,13 @@ export function SlashCommandButton({
   const [isOpen, setIsOpen] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const hasCommands = commands.length > 0;
+
+  useEffect(() => {
+    if (!hasCommands) {
+      setIsOpen(false);
+    }
+  }, [hasCommands]);
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -70,19 +77,18 @@ export function SlashCommandButton({
     [onSelectCommand, prefix],
   );
 
-  // Don't render if no commands available
-  if (commands.length === 0) {
-    return null;
-  }
-
   return (
     <div className="slash-command-container">
       <button
         ref={buttonRef}
         type="button"
         className={`slash-command-button ${isOpen ? "active" : ""}`}
-        onClick={() => setIsOpen(!isOpen)}
-        disabled={disabled}
+        onClick={() => {
+          if (hasCommands) {
+            setIsOpen(!isOpen);
+          }
+        }}
+        disabled={disabled || !hasCommands}
         title={label}
         aria-label={`Show ${label.toLowerCase()}`}
         aria-expanded={isOpen}

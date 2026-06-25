@@ -36,6 +36,7 @@ export interface MessageInputToolbarProps {
   commandPrefix?: "/" | "$";
   commandLabel?: string;
   commands?: string[];
+  showCommandButton?: boolean;
   onSelectCommand?: (command: string) => void;
 
   // Context usage
@@ -80,6 +81,7 @@ export function MessageInputToolbar({
   commandPrefix = "/",
   commandLabel = "Commands",
   commands = [],
+  showCommandButton = commands.length > 0,
   onSelectCommand,
   contextUsage,
   projectId,
@@ -195,7 +197,7 @@ export function MessageInputToolbar({
             disabled={voiceDisabled}
           />
         )}
-        {onSelectCommand && (
+        {showCommandButton && onSelectCommand && (
           <SlashCommandButton
             commands={commands}
             onSelectCommand={onSelectCommand}
