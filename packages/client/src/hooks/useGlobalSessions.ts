@@ -84,6 +84,8 @@ export interface UseGlobalSessionsOptions {
   includeStats?: boolean;
   /** Skip initial fetch and live refetches while the consuming UI is hidden. */
   enabled?: boolean;
+  /** Subscribe to live session activity and reconnect refreshes. */
+  liveUpdates?: boolean;
 }
 
 /** Default stats when no data loaded */
@@ -107,6 +109,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     excludeSessionKind,
     includeStats = false,
     enabled = true,
+    liveUpdates = true,
   } = options;
   const [sessions, setSessions] = useState<GlobalSessionItem[]>([]);
   const [stats, setStats] = useState<GlobalSessionStats>(DEFAULT_STATS);
@@ -597,19 +600,16 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   );
 
   // Subscribe to SSE events
-  useFileActivity(
-    enabled
-      ? {
-          onSessionStatusChange: handleSessionStatusChange,
-          onSessionCreated: handleSessionCreated,
-          onProcessStateChange: handleProcessStateChange,
-          onSessionMetadataChange: handleSessionMetadataChange,
-          onSessionSeen: handleSessionSeen,
-          onSessionUpdated: handleSessionUpdated,
-          onReconnect: handleReconnect,
-        }
-      : {},
-  );
+  useFileActivity({
+    enabled: enabled && liveUpdates,
+    onSessionStatusChange: handleSessionStatusChange,
+    onSessionCreated: handleSessionCreated,
+    onProcessStateChange: handleProcessStateChange,
+    onSessionMetadataChange: handleSessionMetadataChange,
+    onSessionSeen: handleSessionSeen,
+    onSessionUpdated: handleSessionUpdated,
+    onReconnect: handleReconnect,
+  });
 
   // Initial fetch and refetch when options change
   useEffect(() => {

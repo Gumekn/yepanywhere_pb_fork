@@ -103,7 +103,7 @@ export function GitStatusPage() {
   );
 }
 
-function GitStatusContent({
+export function GitStatusContent({
   status,
   projectId,
   t,

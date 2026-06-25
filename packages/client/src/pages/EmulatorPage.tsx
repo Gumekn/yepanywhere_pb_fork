@@ -19,7 +19,7 @@ const DEVICE_TYPE_ORDER: DeviceInfo["type"][] = [
   "ios-simulator",
 ];
 
-function deviceLabel(device: DeviceInfo): string {
+export function deviceLabel(device: DeviceInfo): string {
   return device.label || device.avd || device.id;
 }
 
@@ -38,7 +38,10 @@ function deviceTypeLabel(type: DeviceInfo["type"]): string {
   }
 }
 
-function hasAction(device: DeviceInfo, action: "stream" | "start" | "stop") {
+export function hasAction(
+  device: DeviceInfo,
+  action: "stream" | "start" | "stop",
+) {
   if (device.actions?.length) {
     return device.actions.includes(action);
   }
@@ -244,7 +247,7 @@ function DeviceBridgeUnavailablePrompt() {
   );
 }
 
-function StreamView({
+export function StreamView({
   device,
   onBack,
 }: { device: DeviceInfo; onBack: () => void }) {

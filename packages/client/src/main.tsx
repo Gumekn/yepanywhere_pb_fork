@@ -4,7 +4,14 @@ import { createRoot } from "react-dom/client";
 // Toggle to disable StrictMode for easier debugging (avoids double renders)
 const STRICT_MODE = false;
 const Wrapper = STRICT_MODE ? StrictMode : Fragment;
-import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import {
+  BrowserRouter,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useParams,
+} from "react-router-dom";
 import { App } from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { initializeFontSize } from "./hooks/useFontSize";
@@ -29,18 +36,8 @@ const ArchivePage = lazy(() =>
     default: module.ArchivePage,
   })),
 );
-const EmulatorPage = lazy(() =>
-  import("./pages/EmulatorPage").then((module) => ({
-    default: module.EmulatorPage,
-  })),
-);
 const FilePage = lazy(() =>
   import("./pages/FilePage").then((module) => ({ default: module.FilePage })),
-);
-const GitStatusPage = lazy(() =>
-  import("./pages/GitStatusPage").then((module) => ({
-    default: module.GitStatusPage,
-  })),
 );
 const GlobalSessionsPage = lazy(() =>
   import("./pages/GlobalSessionsPage").then((module) => ({
@@ -93,6 +90,32 @@ const SettingsLayout = lazy(() =>
   })),
 );
 
+function RedirectWithSearch({ to }: { to: string }) {
+  const location = useLocation();
+  return <Navigate to={{ pathname: to, search: location.search }} replace />;
+}
+
+function LegacyDeviceRedirect() {
+  const location = useLocation();
+  const { deviceId } = useParams<{ deviceId?: string }>();
+  const searchParams = new URLSearchParams(location.search);
+
+  if (deviceId) {
+    searchParams.set("deviceId", deviceId);
+  }
+
+  const search = searchParams.toString();
+  return (
+    <Navigate
+      to={{
+        pathname: "/settings/emulator",
+        search: search ? `?${search}` : "",
+      }}
+      replace
+    />
+  );
+}
+
 // Apply saved preferences before React renders to avoid flash
 initializeTheme();
 initializeFontSize();
@@ -139,9 +162,15 @@ createRoot(rootElement).render(
                   path="/projects/:projectId"
                   element={<Navigate to="/sessions" replace />}
                 />
-                <Route path="/git-status" element={<GitStatusPage />} />
-                <Route path="/devices" element={<EmulatorPage />} />
-                <Route path="/devices/:deviceId" element={<EmulatorPage />} />
+                <Route
+                  path="/git-status"
+                  element={<RedirectWithSearch to="/settings/source-control" />}
+                />
+                <Route path="/devices" element={<LegacyDeviceRedirect />} />
+                <Route
+                  path="/devices/:deviceId"
+                  element={<LegacyDeviceRedirect />}
+                />
                 <Route path="/terminal" element={<TerminalPage />} />
                 <Route
                   path="/terminal/:terminalId"

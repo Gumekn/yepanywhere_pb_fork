@@ -1,5 +1,5 @@
 import { SLASH_COMMAND_SESSION_KIND } from "@yep-anywhere/shared";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { GlobalSessionItem } from "../api/client";
 import { useDrafts } from "../hooks/useDrafts";
@@ -112,23 +112,31 @@ export function Sidebar({
   const shouldLoadSessionLists = isDesktop ? !isCollapsed : isOpen;
 
   // Fetch global sessions for sidebar (non-starred only for recent/older sections)
-  const { sessions: globalSessions, loading: globalLoading } =
-    useGlobalSessions({
-      limit: 50,
-      includeStats: false,
-      excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
-      enabled: shouldLoadSessionLists,
-    });
+  const {
+    sessions: globalSessions,
+    loading: globalLoading,
+    refetch: refetchGlobalSessions,
+  } = useGlobalSessions({
+    limit: 50,
+    includeStats: false,
+    excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
+    enabled: shouldLoadSessionLists,
+    liveUpdates: false,
+  });
 
   // Fetch starred sessions separately to ensure we get ALL starred sessions
-  const { sessions: starredSessions, loading: starredLoading } =
-    useGlobalSessions({
-      starred: true,
-      limit: 100,
-      includeStats: false,
-      excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
-      enabled: shouldLoadSessionLists,
-    });
+  const {
+    sessions: starredSessions,
+    loading: starredLoading,
+    refetch: refetchStarredSessions,
+  } = useGlobalSessions({
+    starred: true,
+    limit: 100,
+    includeStats: false,
+    excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
+    enabled: shouldLoadSessionLists,
+    liveUpdates: false,
+  });
 
   const sessionsLoading = globalLoading || starredLoading;
 
@@ -157,9 +165,26 @@ export function Sidebar({
   const [starredSessionsLimit, setStarredSessionsLimit] = useState(
     RECENT_SESSIONS_INITIAL,
   );
+  const [isRefreshingSessions, setIsRefreshingSessions] = useState(false);
   const [expandedProjectGroups, setExpandedProjectGroups] = useState<
     Set<string>
   >(() => new Set());
+
+  const handleRefreshRecentSessions = useCallback(async () => {
+    if (!shouldLoadSessionLists || isRefreshingSessions) return;
+
+    setIsRefreshingSessions(true);
+    try {
+      await Promise.all([refetchGlobalSessions(), refetchStarredSessions()]);
+    } finally {
+      setIsRefreshingSessions(false);
+    }
+  }, [
+    isRefreshingSessions,
+    refetchGlobalSessions,
+    refetchStarredSessions,
+    shouldLoadSessionLists,
+  ]);
 
   const handleTouchStart = (e: React.TouchEvent) => {
     touchStartX.current = e.touches[0]?.clientX ?? null;
@@ -611,20 +636,6 @@ export function Sidebar({
               basePath={basePath}
             />
             <SidebarNavItem
-              to="/git-status"
-              icon={SidebarIcons.sourceControl}
-              label={t("sidebarSourceControl")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/devices"
-              icon={SidebarIcons.emulator}
-              label={t("sidebarDevices")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
               to="/settings"
               icon={SidebarIcons.settings}
               label={t("sidebarSettings")}
@@ -667,9 +678,37 @@ export function Sidebar({
 
           {recentDaySessions.length > 0 && (
             <div className="sidebar-section">
-              <h3 className="sidebar-section-title">
-                {t("sidebarSectionLast24Hours")}
-              </h3>
+              <div className="sidebar-section-heading">
+                <h3 className="sidebar-section-title">
+                  {t("sidebarSectionLast24Hours")}
+                </h3>
+                <button
+                  type="button"
+                  className="sidebar-section-refresh"
+                  onClick={() => void handleRefreshRecentSessions()}
+                  disabled={isRefreshingSessions || sessionsLoading}
+                  title={t("contextRefreshTooltip")}
+                  aria-label={t("contextRefreshTooltip")}
+                >
+                  <svg
+                    className={isRefreshingSessions ? "spinning" : undefined}
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M21 12a9 9 0 0 1-15.5 6.2" />
+                    <path d="M3 12A9 9 0 0 1 18.5 5.8" />
+                    <path d="M18 2v4h4" />
+                    <path d="M6 22v-4H2" />
+                  </svg>
+                </button>
+              </div>
               {renderProjectGroups(recentProjectGroups)}
               {allRecentProjectGroups.length > recentProjectGroupsLimit && (
                 <button

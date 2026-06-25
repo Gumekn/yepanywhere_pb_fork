@@ -361,7 +361,7 @@ export function SessionInspector({
             action={
               <Link
                 className="session-inspector-section-link"
-                to={`${basePath}/git-status?projectId=${encodeURIComponent(projectId)}`}
+                to={`${basePath}/settings/source-control?projectId=${encodeURIComponent(projectId)}`}
               >
                 {t("gitStatusTitle")}
               </Link>
@@ -391,7 +391,7 @@ export function SessionInspector({
                     <li key={`${file.path}-${file.staged}`}>
                       <Link
                         className="session-inspector-row"
-                        to={`${basePath}/git-status?projectId=${encodeURIComponent(projectId)}`}
+                        to={`${basePath}/settings/source-control?projectId=${encodeURIComponent(projectId)}`}
                         title={file.path}
                       >
                         <span className="session-inspector-git-status">

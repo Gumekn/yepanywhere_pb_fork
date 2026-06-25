@@ -22,6 +22,7 @@ import { ModelSettings } from "./ModelSettings";
 import { NotificationsSettings } from "./NotificationsSettings";
 import { ProvidersSettings } from "./ProvidersSettings";
 import { RemoteExecutorsSettings } from "./RemoteExecutorsSettings";
+import { SourceControlSettings } from "./SourceControlSettings";
 import type { SettingsCategory } from "./types";
 
 // Map category IDs to their components
@@ -36,6 +37,7 @@ const CATEGORY_COMPONENTS: Record<string, React.ComponentType> = {
   "local-access": LocalAccessSettings,
   providers: ProvidersSettings,
   "remote-executors": RemoteExecutorsSettings,
+  "source-control": SourceControlSettings,
   emulator: EmulatorSettings,
   about: AboutSettings,
   development: DevelopmentSettings,

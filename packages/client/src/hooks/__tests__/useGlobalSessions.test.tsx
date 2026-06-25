@@ -263,6 +263,16 @@ describe("useGlobalSessions", () => {
     expect(result.current.stats).toEqual(stats);
   });
 
+  it("can disable live activity updates while keeping the initial fetch", async () => {
+    renderHook(() => useGlobalSessions({ limit: 50, liveUpdates: false }));
+    await flushPromises();
+
+    expect(mockGetGlobalSessions).toHaveBeenCalledTimes(1);
+    expect(mockUseFileActivity).toHaveBeenLastCalledWith(
+      expect.objectContaining({ enabled: false }),
+    );
+  });
+
   it("uses the latest filters when a pending title refetch fires", async () => {
     const project2Session: GlobalSessionItem = {
       ...baseSession,

@@ -1,4 +1,6 @@
-import { useState } from "react";
+import type { DeviceInfo } from "@yep-anywhere/shared";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   EMULATOR_FPS_OPTIONS,
   EMULATOR_WIDTH_OPTIONS,
@@ -8,19 +10,16 @@ import {
 } from "../../hooks/useEmulatorSettings";
 import { useEmulators } from "../../hooks/useEmulators";
 import { useServerSettings } from "../../hooks/useServerSettings";
+import { useVersion } from "../../hooks/useVersion";
 import { useI18n } from "../../i18n";
+import {
+  BridgeRuntimePrompt,
+  StreamView,
+  deviceLabel,
+  hasAction,
+} from "../EmulatorPage";
 
 const QUALITY_OPTIONS: EmulatorQuality[] = ["high", "medium", "low"];
-
-function canStartDevice(type: string, state: string, actions?: string[]) {
-  if (actions?.length) return actions.includes("start");
-  return type === "emulator" && state === "stopped";
-}
-
-function canStopDevice(type: string, state: string, actions?: string[]) {
-  if (actions?.length) return actions.includes("stop");
-  return type === "emulator" && state !== "stopped";
-}
 
 /**
  * Settings section for the device bridge.
@@ -28,8 +27,9 @@ function canStopDevice(type: string, state: string, actions?: string[]) {
  */
 export function EmulatorSettings() {
   const { t } = useI18n();
-  const { emulators, loading, error, startEmulator, stopEmulator, refresh } =
-    useEmulators();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedDeviceId = searchParams.get("deviceId");
+  const shouldAutoConnect = searchParams.has("auto");
   const {
     maxFps,
     setMaxFps,
@@ -46,12 +46,40 @@ export function EmulatorSettings() {
     error: settingsError,
     updateSetting,
   } = useServerSettings();
+  const {
+    version: versionInfo,
+    loading: versionLoading,
+    error: versionError,
+    refetch: refetchVersion,
+  } = useVersion();
   const [hostInput, setHostInput] = useState("");
   const [chromeOsHostError, setChromeOsHostError] = useState<string | null>(
     null,
   );
+  const [activeDevice, setActiveDevice] = useState<DeviceInfo | null>(null);
 
   const chromeOsHosts = settings?.chromeOsHosts ?? [];
+  const capabilities = versionInfo?.capabilities ?? [];
+  const deviceBridgeEnabled = settings?.deviceBridgeEnabled ?? false;
+  const deviceBridgeState = versionInfo?.deviceBridgeState;
+  const bridgeRuntimeMode =
+    deviceBridgeEnabled && deviceBridgeState === "update-available"
+      ? "update"
+      : deviceBridgeEnabled &&
+          (deviceBridgeState === "downloadable" ||
+            (capabilities.includes("deviceBridge-download") &&
+              !capabilities.includes("deviceBridge")))
+        ? "download"
+        : null;
+  const bridgeReady =
+    deviceBridgeEnabled &&
+    !bridgeRuntimeMode &&
+    (deviceBridgeState === "available" ||
+      capabilities.includes("deviceBridge"));
+  const canLoadDevices =
+    !!versionInfo && !versionLoading && !settingsLoading && bridgeReady;
+  const { emulators, loading, error, startEmulator, stopEmulator, refresh } =
+    useEmulators({ enabled: canLoadDevices });
 
   const addHost = async () => {
     const value = hostInput.trim();
@@ -92,7 +120,48 @@ export function EmulatorSettings() {
     }
   };
 
-  const deviceBridgeEnabled = settings?.deviceBridgeEnabled ?? false;
+  useEffect(() => {
+    if (activeDevice || loading || !canLoadDevices) return;
+
+    const requestedDevice = requestedDeviceId
+      ? emulators.find((device) => device.id === requestedDeviceId)
+      : null;
+    const autoDevice = shouldAutoConnect
+      ? emulators.find((device) => hasAction(device, "stream"))
+      : null;
+    const nextDevice = requestedDevice ?? autoDevice;
+
+    if (nextDevice && hasAction(nextDevice, "stream")) {
+      setActiveDevice(nextDevice);
+    }
+  }, [
+    activeDevice,
+    canLoadDevices,
+    emulators,
+    loading,
+    requestedDeviceId,
+    shouldAutoConnect,
+  ]);
+
+  const handleConnect = (device: DeviceInfo) => {
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.set("deviceId", device.id);
+    nextParams.delete("auto");
+    setSearchParams(nextParams, { replace: true });
+    setActiveDevice(device);
+  };
+
+  const handleBackFromStream = () => {
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete("deviceId");
+    nextParams.delete("auto");
+    setSearchParams(nextParams, { replace: true });
+    setActiveDevice(null);
+  };
+
+  if (activeDevice) {
+    return <StreamView device={activeDevice} onBack={handleBackFromStream} />;
+  }
 
   return (
     <section className="settings-section">
@@ -275,50 +344,79 @@ export function EmulatorSettings() {
           <div className="settings-group">
             <h3>{t("emulatorDiscoveredDevicesTitle")}</h3>
 
-            {loading && (
+            {versionLoading && (
+              <p className="settings-muted">{t("emulatorLoadingBridge")}</p>
+            )}
+            {!versionLoading && versionError && (
+              <p className="settings-error">
+                {t("emulatorLoadBridgeStatusFailed")} {versionError.message}
+              </p>
+            )}
+            {!versionLoading &&
+            !versionError &&
+            deviceBridgeState === "unavailable" ? (
+              <p className="settings-error">{t("emulatorBridgeUnavailable")}</p>
+            ) : !versionLoading && !versionError && bridgeRuntimeMode ? (
+              <BridgeRuntimePrompt
+                mode={bridgeRuntimeMode}
+                installedVersion={versionInfo?.deviceBridgeVersion}
+                latestVersion={versionInfo?.latestDeviceBridgeVersion}
+                onDownloaded={refetchVersion}
+              />
+            ) : null}
+
+            {canLoadDevices && loading && (
               <p className="settings-muted">{t("projectsLoading")}</p>
             )}
-            {error && <p className="settings-error">{error}</p>}
+            {canLoadDevices && error && (
+              <p className="settings-error">{error}</p>
+            )}
 
-            {!loading && emulators.length === 0 && (
+            {canLoadDevices && !loading && emulators.length === 0 && (
               <p className="settings-muted">{t("emulatorNoDevicesFound")}</p>
             )}
 
-            {emulators.map((device) => (
-              <div key={device.id} className="settings-item">
-                <div className="settings-item-info">
-                  <span className="settings-item-label">
-                    {device.label || device.avd || device.id}
-                  </span>
-                  <span className="settings-item-description">
-                    {device.type} - {device.id} - {device.state}
-                  </span>
+            {canLoadDevices &&
+              emulators.map((device) => (
+                <div key={device.id} className="settings-item">
+                  <div className="settings-item-info">
+                    <span className="settings-item-label">
+                      {deviceLabel(device)}
+                    </span>
+                    <span className="settings-item-description">
+                      {device.type} - {device.id} - {device.state}
+                    </span>
+                  </div>
+                  <div className="settings-item-actions">
+                    {hasAction(device, "stream") && (
+                      <button
+                        type="button"
+                        className="settings-button"
+                        onClick={() => handleConnect(device)}
+                      >
+                        {t("emulatorConnect")}
+                      </button>
+                    )}
+                    {hasAction(device, "stop") ? (
+                      <button
+                        type="button"
+                        className="settings-button"
+                        onClick={() => stopEmulator(device.id)}
+                      >
+                        {t("emulatorStop")}
+                      </button>
+                    ) : hasAction(device, "start") ? (
+                      <button
+                        type="button"
+                        className="settings-button"
+                        onClick={() => startEmulator(device.id)}
+                      >
+                        {t("emulatorStart")}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
-                <div className="settings-item-action">
-                  {canStopDevice(device.type, device.state, device.actions) ? (
-                    <button
-                      type="button"
-                      className="settings-button"
-                      onClick={() => stopEmulator(device.id)}
-                    >
-                      {t("emulatorStop")}
-                    </button>
-                  ) : canStartDevice(
-                      device.type,
-                      device.state,
-                      device.actions,
-                    ) ? (
-                    <button
-                      type="button"
-                      className="settings-button"
-                      onClick={() => startEmulator(device.id)}
-                    >
-                      {t("emulatorStart")}
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-            ))}
+              ))}
           </div>
         </>
       )}

@@ -26,6 +26,8 @@ export type {
 } from "../lib/activityBus";
 
 interface UseFileActivityOptions {
+  /** Whether to subscribe to activity events and connection polling. */
+  enabled?: boolean;
   /** Maximum number of events to keep in buffer (default: 500) */
   maxEvents?: number;
   /** Whether to connect on mount (default: true) - ignored, bus is always connected */
@@ -56,6 +58,7 @@ const DEFAULT_MAX_EVENTS = 500;
  */
 export function useFileActivity(options: UseFileActivityOptions = {}) {
   const {
+    enabled = true,
     maxEvents = DEFAULT_MAX_EVENTS,
     onFileChange,
     onSessionStatusChange,
@@ -96,6 +99,8 @@ export function useFileActivity(options: UseFileActivityOptions = {}) {
 
   // Subscribe to all events from the bus
   useEffect(() => {
+    if (!enabled) return;
+
     const unsubscribers: (() => void)[] = [];
 
     // File change - buffer events and call callback
@@ -170,10 +175,12 @@ export function useFileActivity(options: UseFileActivityOptions = {}) {
         unsub();
       }
     };
-  }, []);
+  }, [enabled]);
 
   // Sync connected state with bus (for initial render and disconnects)
   useEffect(() => {
+    if (!enabled) return;
+
     const checkConnection = () => {
       setConnected(activityBus.connected);
     };
@@ -181,7 +188,7 @@ export function useFileActivity(options: UseFileActivityOptions = {}) {
     // Check periodically since we don't have a disconnect event
     const interval = setInterval(checkConnection, 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [enabled]);
 
   const clearEvents = useCallback(() => {
     setEvents([]);
