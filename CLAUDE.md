@@ -207,14 +207,15 @@ scripts/release-website.sh 1.5.3
 
 ## 服务端日志
 
-服务端日志写入 `{dataDir}/logs/`（默认：`~/.yep-anywhere/logs/`）：
+服务端应用日志路径会在启动时打印为 `[Config] Log file: ...`，默认位于 `{dataDir}/logs/`（默认：`~/.yep-anywhere/logs/`）：
 
 - `server.log`：主服务端日志（`pnpm dev` 开发模式）
 - `e2e-server.log`：E2E 测试期间的服务端日志
+- `/private/tmp/yep-server.log`：当前本机 `yepanywhere --port 8022` / launchd 方式运行时的 stdout/stderr 实际日志，排查生产本机实例优先看这里
 
-实时查看日志：`tail -f ~/.yep-anywhere/logs/server.log`
+实时查看当前本机实例日志：`tail -f /private/tmp/yep-server.log`
 
-所有 `console.log/error/warn` 输出都会被捕获。文件中的日志是 JSON 格式，但控制台会 pretty-print。
+所有 `console.log/error/warn` 输出都会被捕获。应用日志文件通常是 JSON 格式；stdout/stderr 日志会 pretty-print。
 
 环境变量：
 - `LOG_DIR`：自定义日志目录
