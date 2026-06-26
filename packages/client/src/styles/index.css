@@ -5447,6 +5447,27 @@ a.sidebar-nav-item {
   color: white;
 }
 
+.settings-mobile-node-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.settings-mobile-node-button {
+  min-height: 36px;
+}
+
+.settings-mobile-node-button.active {
+  background: var(--app-yep-green);
+  border-color: var(--app-yep-green);
+  color: white;
+}
+
+.settings-mobile-node-current {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
 /* Ignored tools display */
 .ignored-tools-list {
   display: flex;

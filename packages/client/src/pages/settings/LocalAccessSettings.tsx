@@ -3,7 +3,7 @@ import { api } from "../../api/client";
 import { FilterDropdown } from "../../components/FilterDropdown";
 import { useOptionalAuth } from "../../contexts/AuthContext";
 import {
-  type MobileShellChannel,
+  MOBILE_SHELL_NODES,
   useMobileShellChannel,
 } from "../../hooks/useMobileShellChannel";
 import { useNetworkBinding } from "../../hooks/useNetworkBinding";
@@ -11,41 +11,60 @@ import { useServerInfo } from "../../hooks/useServerInfo";
 import { useServerSettings } from "../../hooks/useServerSettings";
 import { useI18n } from "../../i18n";
 
-const MOBILE_CHANNELS: MobileShellChannel[] = ["tcp", "http"];
-
 function MobileShellChannelSettings() {
   const { t } = useI18n();
-  const { isMobileShell, channel, setChannel } = useMobileShellChannel();
+  const { isMobileShell, channel, nodeOrigin, setChannel, setNode } =
+    useMobileShellChannel();
 
   if (!isMobileShell) return null;
 
   return (
     <div className="settings-group">
-      <div className="settings-item">
-        <div className="settings-item-info">
-          <strong>{t("localAccessMobileChannelTitle")}</strong>
-          <p>{t("localAccessMobileChannelDescription")}</p>
+      <div className="settings-item settings-item-stacked">
+        <div className="settings-item-row">
+          <div className="settings-item-info">
+            <strong>{t("localAccessMobileNodeTitle")}</strong>
+            <p>{t("localAccessMobileNodeDescription")}</p>
+          </div>
         </div>
         <div
-          className="settings-segmented-control"
+          className="settings-mobile-node-options"
           role="group"
-          aria-label={t("localAccessMobileChannelTitle")}
+          aria-label={t("localAccessMobileNodeTitle")}
         >
-          {MOBILE_CHANNELS.map((value) => (
-            <button
-              key={value}
-              type="button"
-              className={`settings-segmented-option ${channel === value ? "active" : ""}`}
-              aria-pressed={channel === value}
-              onClick={() => {
-                if (channel !== value) setChannel(value);
-              }}
-            >
-              {value === "tcp"
-                ? t("localAccessMobileChannelTcp")
-                : t("localAccessMobileChannelHttp")}
-            </button>
-          ))}
+          {MOBILE_SHELL_NODES.map((node) => {
+            const isActive = channel === "tcp" && nodeOrigin === node.origin;
+            return (
+              <button
+                key={node.origin}
+                type="button"
+                className={`settings-button settings-mobile-node-button ${isActive ? "active" : ""}`}
+                aria-pressed={isActive}
+                onClick={() => {
+                  if (!isActive) setNode(node);
+                }}
+              >
+                {node.label}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            className={`settings-button settings-mobile-node-button ${channel === "http" ? "active" : ""}`}
+            aria-pressed={channel === "http"}
+            onClick={() => {
+              if (channel !== "http") setChannel("http");
+            }}
+          >
+            {t("localAccessMobileRelay")}
+          </button>
+        </div>
+        <div className="settings-mobile-node-current">
+          {channel === "http"
+            ? t("localAccessMobileCurrentHttp")
+            : t("localAccessMobileCurrentNode", {
+                node: nodeOrigin?.replace(/^https?:\/\//, "") ?? "TCP",
+              })}
         </div>
       </div>
     </div>

@@ -8,6 +8,7 @@
     />
     <title>Yep Anywhere</title>
     <link rel="dns-prefetch" href="//123.56.106.49" />
+    <link rel="dns-prefetch" href="//43.226.60.75" />
     <link rel="dns-prefetch" href="//air.yueyuan.uk" />
     <link rel="preconnect" href="https://air.yueyuan.uk" crossorigin />
     <script src="./loader.js" defer></script>
@@ -68,7 +69,9 @@
       .shell-loader__content {
         display: grid;
         justify-items: center;
-        gap: 16px;
+        gap: 14px;
+        width: calc(100% - 40px);
+        max-width: 360px;
       }
 
       .shell-loader__mark {
@@ -99,6 +102,105 @@
         color: #5f6b7a;
         font-size: 14px;
         line-height: 20px;
+        text-align: center;
+      }
+
+      .shell-loader__node-form {
+        display: grid;
+        gap: 8px;
+        width: 100%;
+        margin-top: 2px;
+      }
+
+      .shell-loader__node-label {
+        color: #374151;
+        font-size: 12px;
+        font-weight: 650;
+        line-height: 16px;
+      }
+
+      .shell-loader__node-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        width: 100%;
+      }
+
+      .shell-loader__node-input {
+        min-width: 0;
+        height: 40px;
+        box-sizing: border-box;
+        border: 1px solid rgba(95, 107, 122, 0.24);
+        border-radius: 8px;
+        padding: 0 10px;
+        background: rgba(255, 255, 255, 0.76);
+        color: #20242c;
+        font: inherit;
+        font-size: 14px;
+        outline: none;
+      }
+
+      .shell-loader__node-input:focus {
+        border-color: #20242c;
+        box-shadow: 0 0 0 3px rgba(32, 36, 44, 0.12);
+      }
+
+      .shell-loader__node-submit,
+      .shell-loader__channel-button,
+      .shell-loader__history-button {
+        min-height: 36px;
+        border: 1px solid rgba(95, 107, 122, 0.22);
+        border-radius: 8px;
+        padding: 0 12px;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 650;
+        letter-spacing: 0;
+        cursor: pointer;
+      }
+
+      .shell-loader__node-submit {
+        height: 40px;
+        border-color: #20242c;
+        background: #20242c;
+        color: #ffffff;
+      }
+
+      .shell-loader__channel-button,
+      .shell-loader__history-button {
+        background: rgba(255, 255, 255, 0.72);
+        color: #374151;
+      }
+
+      .shell-loader__channel-button.is-active,
+      .shell-loader__history-button.is-active {
+        border-color: #20242c;
+        background: #ffffff;
+        color: #20242c;
+        box-shadow: 0 8px 18px rgba(32, 36, 44, 0.1);
+      }
+
+      .shell-loader__history {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 6px;
+        width: 100%;
+      }
+
+      .shell-loader__history-button {
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .shell-loader__node-error {
+        min-height: 16px;
+        color: #b42318;
+        font-size: 12px;
+        line-height: 16px;
+        text-align: center;
       }
 
       body.is-loaded iframe {
@@ -143,6 +245,46 @@
         .shell-loader__status {
           color: #c9ced6;
         }
+
+        .shell-loader__node-label {
+          color: #e5e7eb;
+        }
+
+        .shell-loader__node-input {
+          border-color: rgba(229, 231, 235, 0.18);
+          background: rgba(255, 255, 255, 0.08);
+          color: #f4f4f5;
+        }
+
+        .shell-loader__node-input:focus {
+          border-color: #faf9f5;
+          box-shadow: 0 0 0 3px rgba(250, 249, 245, 0.12);
+        }
+
+        .shell-loader__node-submit {
+          border-color: #faf9f5;
+          background: #faf9f5;
+          color: #20242c;
+        }
+
+        .shell-loader__channel-button,
+        .shell-loader__history-button {
+          border-color: rgba(229, 231, 235, 0.18);
+          background: rgba(255, 255, 255, 0.08);
+          color: #e5e7eb;
+        }
+
+        .shell-loader__channel-button.is-active,
+        .shell-loader__history-button.is-active {
+          border-color: #faf9f5;
+          background: rgba(250, 249, 245, 0.16);
+          color: #ffffff;
+          box-shadow: none;
+        }
+
+        .shell-loader__node-error {
+          color: #fca5a5;
+        }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -158,13 +300,58 @@
     </style>
   </head>
   <body>
-    <div class="shell-loader" role="status" aria-live="polite">
+    <div class="shell-loader">
       <div class="shell-loader__content">
         <div class="shell-loader__mark" aria-hidden="true">Y</div>
         <div class="shell-loader__spinner" aria-hidden="true"></div>
-        <div class="shell-loader__status" data-loader-status>
+        <div
+          class="shell-loader__status"
+          data-loader-status
+          role="status"
+          aria-live="polite"
+        >
           Loading Yep Anywhere
         </div>
+        <form class="shell-loader__node-form" data-node-form>
+          <label class="shell-loader__node-label" for="shell-node-input">
+            Server node
+          </label>
+          <div class="shell-loader__node-row">
+            <input
+              class="shell-loader__node-input"
+              id="shell-node-input"
+              data-node-input
+              type="text"
+              inputmode="url"
+              autocomplete="off"
+              autocapitalize="none"
+              spellcheck="false"
+              placeholder="123.56.106.49:37160"
+              aria-describedby="shell-node-error"
+            />
+            <button class="shell-loader__node-submit" type="submit">
+              Connect
+            </button>
+          </div>
+          <div
+            class="shell-loader__node-error"
+            id="shell-node-error"
+            data-node-error
+            aria-live="polite"
+          ></div>
+        </form>
+        <div
+          class="shell-loader__history"
+          data-node-history
+          aria-label="Saved nodes"
+        ></div>
+        <button
+          class="shell-loader__channel-button"
+          type="button"
+          data-http-channel
+        >
+          HTTPS relay
+        </button>
       </div>
     </div>
     <iframe

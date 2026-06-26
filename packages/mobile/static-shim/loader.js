@@ -4,16 +4,26 @@
   var GET_CHANNEL_MESSAGE = "yep-anywhere:mobile-shell-get-channel";
   var SET_CHANNEL_MESSAGE = "yep-anywhere:mobile-shell-set-channel";
   var CHANNEL_STORAGE_KEY = "yep-anywhere-mobile-channel";
+  var ACTIVE_NODE_STORAGE_KEY = "yep-anywhere-mobile-active-node";
+  var NODE_HISTORY_STORAGE_KEY = "yep-anywhere-mobile-node-history";
   var DEFAULT_CHANNEL = "tcp";
+  var DEFAULT_TCP_ORIGIN = "http://123.56.106.49:37160";
+  var SEEDED_NODE_HISTORY = [
+    "http://43.226.60.75:46789",
+    DEFAULT_TCP_ORIGIN
+  ];
+  var NODE_HISTORY_LIMIT = 8;
   var FRAME_LOAD_FALLBACK_MS = 6000;
   var SLOW_STATUS_MS = 8000;
   var CHANNELS = {
     tcp: {
+      label: "TCP",
       status: "Connecting via TCP",
-      origin: "http://123.56.106.49:37160"
+      origin: DEFAULT_TCP_ORIGIN
     },
     http: {
-      status: "Connecting via HTTP",
+      label: "HTTPS relay",
+      status: "Connecting via HTTPS relay",
       origin: "https://air.yueyuan.uk"
     }
   };
@@ -21,35 +31,172 @@
   var frameLoadFallbackTimer = null;
   var slowStatusTimer = null;
   var activeChannel = DEFAULT_CHANNEL;
+  var activeTarget = null;
 
   function isValidChannel(channel) {
     return Object.prototype.hasOwnProperty.call(CHANNELS, channel);
   }
 
-  function getStoredChannel() {
+  function readStorage(key) {
     try {
-      var value = window.localStorage.getItem(CHANNEL_STORAGE_KEY);
-      return isValidChannel(value) ? value : null;
+      return window.localStorage.getItem(key);
     } catch (_err) {
       return null;
     }
   }
 
-  function getRequestedChannel() {
+  function writeStorage(key, value) {
     try {
-      var value = new URLSearchParams(window.location.search).get("channel");
-      return isValidChannel(value) ? value : null;
+      window.localStorage.setItem(key, value);
+    } catch (_err) {
+      // Storage can be unavailable in restricted WebView modes.
+    }
+  }
+
+  function getStoredChannel() {
+    var value = readStorage(CHANNEL_STORAGE_KEY);
+    return isValidChannel(value) ? value : null;
+  }
+
+  function getRequestedTarget() {
+    try {
+      var params = new URLSearchParams(window.location.search);
+      var node = params.get("node") || params.get("server");
+      if (node) {
+        return targetFromNodeInput(node);
+      }
+
+      var value = params.get("channel");
+      return isValidChannel(value) ? targetFromChannel(value) : null;
     } catch (_err) {
       return null;
     }
   }
 
   function storeChannel(channel) {
+    writeStorage(CHANNEL_STORAGE_KEY, channel);
+  }
+
+  function normalizeNodeInput(value) {
+    if (typeof value !== "string") return null;
+
+    var trimmed = value.trim().replace(/\s+/g, "");
+    if (!trimmed) return null;
+
+    var candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
+      ? trimmed
+      : "http://" + trimmed;
+
     try {
-      window.localStorage.setItem(CHANNEL_STORAGE_KEY, channel);
+      var url = new URL(candidate);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+      if (!url.hostname || !url.port) return null;
+
+      var origin = url.protocol + "//" + url.host;
+      return {
+        label: origin.replace(/^http:\/\//, ""),
+        origin: origin
+      };
     } catch (_err) {
-      // Storage can be unavailable in restricted WebView modes.
+      return null;
     }
+  }
+
+  function targetFromNodeInput(value) {
+    var node = normalizeNodeInput(value);
+    if (!node) return null;
+
+    return {
+      channel: "tcp",
+      label: node.label,
+      nodeOrigin: node.origin,
+      origin: node.origin,
+      status: "Connecting to " + node.label
+    };
+  }
+
+  function getStoredActiveNode() {
+    var value = readStorage(ACTIVE_NODE_STORAGE_KEY);
+    return value ? normalizeNodeInput(value) : null;
+  }
+
+  function storeActiveNode(origin) {
+    var node = normalizeNodeInput(origin);
+    if (!node) return;
+    writeStorage(ACTIVE_NODE_STORAGE_KEY, node.origin);
+  }
+
+  function dedupeNodes(nodes) {
+    var result = [];
+    var seen = {};
+
+    for (var index = 0; index < nodes.length; index += 1) {
+      var node = normalizeNodeInput(nodes[index]);
+      if (!node || seen[node.origin]) continue;
+      seen[node.origin] = true;
+      result.push(node.origin);
+    }
+
+    return result;
+  }
+
+  function getStoredNodeHistory() {
+    var stored = readStorage(NODE_HISTORY_STORAGE_KEY);
+    var parsed = [];
+
+    if (stored) {
+      try {
+        var value = JSON.parse(stored);
+        if (Array.isArray(value)) parsed = value;
+      } catch (_err) {
+        parsed = [];
+      }
+    }
+
+    return dedupeNodes(parsed.concat(SEEDED_NODE_HISTORY)).slice(
+      0,
+      NODE_HISTORY_LIMIT
+    );
+  }
+
+  function storeNodeHistory(nodes) {
+    writeStorage(
+      NODE_HISTORY_STORAGE_KEY,
+      JSON.stringify(dedupeNodes(nodes).slice(0, NODE_HISTORY_LIMIT))
+    );
+  }
+
+  function addNodeToHistory(origin) {
+    storeNodeHistory([origin].concat(getStoredNodeHistory()));
+  }
+
+  function targetFromChannel(channel) {
+    if (!isValidChannel(channel)) channel = DEFAULT_CHANNEL;
+
+    if (channel === "tcp") {
+      var storedNode = getStoredActiveNode();
+      return (
+        targetFromNodeInput(storedNode ? storedNode.origin : DEFAULT_TCP_ORIGIN)
+      );
+    }
+
+    return {
+      channel: channel,
+      label: CHANNELS[channel].label,
+      origin: CHANNELS[channel].origin,
+      status: CHANNELS[channel].status
+    };
+  }
+
+  function getStoredTarget() {
+    var storedChannel = getStoredChannel();
+    if (storedChannel === "http") return targetFromChannel("http");
+
+    var storedNode = getStoredActiveNode();
+    if (storedNode) return targetFromNodeInput(storedNode.origin);
+    if (storedChannel === "tcp") return targetFromChannel("tcp");
+
+    return null;
   }
 
   function normalizeAppPath(path) {
@@ -59,8 +206,8 @@
     return path.indexOf("/yep") === 0 ? path : "/yep" + path;
   }
 
-  function getFrameUrl(channel, path) {
-    var url = new URL(CHANNELS[channel].origin + normalizeAppPath(path));
+  function getFrameUrl(target, path) {
+    var url = new URL(target.origin + normalizeAppPath(path));
     if (!path && window.location.hash) {
       url.hash = window.location.hash;
     }
@@ -72,16 +219,91 @@
     return data && typeof data.path === "string" ? data.path : null;
   }
 
+  function getNodeFromMessage(data) {
+    if (!data) return null;
+    if (typeof data.node === "string") return data.node;
+    if (typeof data.origin === "string") return data.origin;
+    return null;
+  }
+
+  function getCurrentFramePath() {
+    var frame = document.getElementById("app-frame");
+    if (!frame || !frame.src) return null;
+
+    try {
+      var url = new URL(frame.src);
+      return url.pathname + url.search + url.hash;
+    } catch (_err) {
+      return null;
+    }
+  }
+
   function updateStatus(text) {
     var status = document.querySelector("[data-loader-status]");
     if (status) status.textContent = text;
+  }
+
+  function updateNodeError(text) {
+    var error = document.querySelector("[data-node-error]");
+    if (error) error.textContent = text || "";
+  }
+
+  function renderConnectionControls() {
+    var input = document.querySelector("[data-node-input]");
+    var nodeLabel =
+      activeTarget && activeTarget.nodeOrigin ? activeTarget.label : null;
+
+    if (input && document.activeElement !== input) {
+      input.value =
+        nodeLabel ||
+        (getStoredActiveNode() || normalizeNodeInput(DEFAULT_TCP_ORIGIN))
+          .label;
+    }
+
+    var history = document.querySelector("[data-node-history]");
+    if (history) {
+      history.textContent = "";
+
+      var nodes = getStoredNodeHistory();
+      for (var index = 0; index < nodes.length; index += 1) {
+        var node = normalizeNodeInput(nodes[index]);
+        if (!node) continue;
+
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "shell-loader__history-button";
+        if (activeTarget && activeTarget.nodeOrigin === node.origin) {
+          button.className += " is-active";
+        }
+        button.textContent = node.label;
+        button.setAttribute("data-node-origin", node.origin);
+        button.addEventListener("click", function (event) {
+          var origin = event.currentTarget.getAttribute("data-node-origin");
+          loadNode(origin, { path: getCurrentFramePath() });
+        });
+        history.appendChild(button);
+      }
+    }
+
+    var httpButton = document.querySelector("[data-http-channel]");
+    if (httpButton) {
+      httpButton.className =
+        "shell-loader__channel-button" +
+        (activeChannel === "http" ? " is-active" : "");
+    }
   }
 
   function postChannelStatus() {
     var frame = document.getElementById("app-frame");
     if (!frame || !frame.contentWindow) return;
     frame.contentWindow.postMessage(
-      { type: CHANNEL_STATUS_MESSAGE, channel: activeChannel },
+      {
+        type: CHANNEL_STATUS_MESSAGE,
+        channel: activeChannel,
+        node:
+          activeTarget && activeTarget.nodeOrigin ? activeTarget.label : null,
+        origin: activeTarget ? activeTarget.origin : null
+      },
       "*"
     );
   }
@@ -97,11 +319,13 @@
     }
   }
 
-  function resetLoading(channel) {
+  function resetLoading(target) {
     loaded = false;
     clearTimers();
     if (document.body) document.body.classList.remove("is-loaded");
-    updateStatus(CHANNELS[channel].status);
+    updateStatus(target.status);
+    updateNodeError("");
+    renderConnectionControls();
   }
 
   function markLoaded() {
@@ -115,7 +339,11 @@
     if (slowStatusTimer !== null) window.clearTimeout(slowStatusTimer);
     slowStatusTimer = window.setTimeout(function () {
       if (loaded || !document.body) return;
-      updateStatus("Still connecting");
+      updateStatus(
+        activeTarget
+          ? "Still connecting to " + activeTarget.label
+          : "Still connecting"
+      );
     }, SLOW_STATUS_MS);
   }
 
@@ -127,11 +355,20 @@
     );
   }
 
-  function loadChannel(channel, options) {
-    if (!isValidChannel(channel)) channel = DEFAULT_CHANNEL;
-    activeChannel = channel;
-    if (!options || options.persist !== false) storeChannel(channel);
-    resetLoading(channel);
+  function loadTarget(target, options) {
+    if (!target) target = targetFromChannel(DEFAULT_CHANNEL);
+    activeTarget = target;
+    activeChannel = target.channel;
+
+    if (!options || options.persist !== false) {
+      storeChannel(target.channel);
+      if (target.nodeOrigin) {
+        storeActiveNode(target.nodeOrigin);
+        addNodeToHistory(target.nodeOrigin);
+      }
+    }
+
+    resetLoading(target);
 
     var frame = document.getElementById("app-frame");
     if (!frame) {
@@ -139,9 +376,53 @@
       return;
     }
 
-    frame.onload = markLoadedEventually;
-    frame.src = getFrameUrl(channel, options && options.path);
+    frame.onload = function () {
+      renderConnectionControls();
+      markLoadedEventually();
+    };
+    frame.src = getFrameUrl(target, options && options.path);
     updateSlowStatus();
+    renderConnectionControls();
+  }
+
+  function loadChannel(channel, options) {
+    if (!isValidChannel(channel)) channel = DEFAULT_CHANNEL;
+    loadTarget(targetFromChannel(channel), options);
+  }
+
+  function loadNode(value, options) {
+    var target = targetFromNodeInput(value);
+    if (!target) {
+      updateNodeError("Enter a node as host:port");
+      return;
+    }
+
+    loadTarget(target, options);
+  }
+
+  function bindConnectionControls() {
+    var form = document.querySelector("[data-node-form]");
+    var input = document.querySelector("[data-node-input]");
+    var httpButton = document.querySelector("[data-http-channel]");
+
+    if (form && input) {
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        loadNode(input.value, { path: getCurrentFramePath() });
+      });
+
+      input.addEventListener("input", function () {
+        updateNodeError("");
+      });
+    }
+
+    if (httpButton) {
+      httpButton.addEventListener("click", function () {
+        loadChannel("http", { path: getCurrentFramePath() });
+      });
+    }
+
+    renderConnectionControls();
   }
 
   function bindFrameLoad() {
@@ -163,24 +444,34 @@
         }
 
         if (event.data.type === SET_CHANNEL_MESSAGE) {
-          loadChannel(event.data.channel, {
-            path: getFramePathFromMessage(event.data)
-          });
+          var path = getFramePathFromMessage(event.data);
+          var node = getNodeFromMessage(event.data);
+          if (event.data.channel === "tcp" && node) {
+            loadNode(node, { path: path });
+          } else {
+            loadChannel(event.data.channel, { path: path });
+          }
         }
       });
     } else {
       markLoadedEventually();
     }
-    loadChannel(getRequestedChannel() || getStoredChannel() || DEFAULT_CHANNEL, {
-      persist: false
-    });
+    bindConnectionControls();
+    loadTarget(
+      getRequestedTarget() ||
+        getStoredTarget() ||
+        targetFromChannel(DEFAULT_CHANNEL),
+      { persist: false }
+    );
   }
 
   window.addEventListener("load", markLoadedEventually, { once: true });
   window.addEventListener("hashchange", function () {
     var frame = document.getElementById("app-frame");
     if (!frame) return;
-    frame.src = getFrameUrl(activeChannel);
+    frame.src = getFrameUrl(
+      activeTarget || targetFromChannel(DEFAULT_CHANNEL)
+    );
   });
 
   if (document.readyState === "loading") {
