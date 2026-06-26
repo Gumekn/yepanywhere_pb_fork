@@ -16,7 +16,17 @@ const GET_CHANNEL_MESSAGE = "yep-anywhere:mobile-shell-get-channel";
 const SET_CHANNEL_MESSAGE = "yep-anywhere:mobile-shell-set-channel";
 
 function isMobileShellDocument(): boolean {
-  return document.documentElement.dataset.mobileShell === "true";
+  if (document.documentElement.dataset.mobileShell === "true") {
+    return true;
+  }
+
+  try {
+    return (
+      window.parent !== window && /Android|wv/i.test(window.navigator.userAgent)
+    );
+  } catch {
+    return /Android|wv/i.test(window.navigator.userAgent);
+  }
 }
 
 function isMobileShellChannel(value: unknown): value is MobileShellChannel {

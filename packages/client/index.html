@@ -63,8 +63,33 @@
       // Apply theme before page renders to prevent flash.
       (function() {
         var params = new URLSearchParams(window.location.search);
-        if (params.get('yep-mobile-shell') === '1') {
+        var mobileShellStorageKey = 'yep-anywhere-mobile-shell';
+        var mobileShellParam = params.get('yep-mobile-shell');
+        var isAndroidFrame = false;
+
+        try {
+          isAndroidFrame = window.parent !== window && /Android|wv/i.test(window.navigator.userAgent);
+        } catch (_) {
+          isAndroidFrame = /Android|wv/i.test(window.navigator.userAgent);
+        }
+
+        var isMobileShell = mobileShellParam === '1' || isAndroidFrame;
+
+        if (isMobileShell) {
+          try {
+            sessionStorage.setItem(mobileShellStorageKey, '1');
+          } catch (_) {}
+        } else {
+          try {
+            isMobileShell = sessionStorage.getItem(mobileShellStorageKey) === '1';
+          } catch (_) {}
+        }
+
+        if (isMobileShell) {
           document.documentElement.setAttribute('data-mobile-shell', 'true');
+        }
+
+        if (mobileShellParam !== null) {
           params.delete('yep-mobile-shell');
           var query = params.toString();
           window.history.replaceState(
