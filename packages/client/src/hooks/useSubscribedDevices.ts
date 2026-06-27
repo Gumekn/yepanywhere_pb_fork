@@ -4,8 +4,11 @@ import { api } from "../api/client";
 export interface SubscribedDevice {
   browserProfileId: string;
   createdAt: string;
+  updatedAt?: string;
   deviceName?: string;
   endpointDomain: string;
+  platform?: "android";
+  pushKind?: "web" | "native";
 }
 
 interface SubscribedDevicesState {
@@ -51,11 +54,15 @@ export function useSubscribedDevices() {
   }, [fetchDevices]);
 
   const removeDevice = useCallback(
-    async (browserProfileId: string) => {
+    async (browserProfileId: string, pushKind: "web" | "native" = "web") => {
       setState((s) => ({ ...s, isLoading: true, error: null }));
 
       try {
-        await api.deletePushSubscription(browserProfileId);
+        if (pushKind === "native") {
+          await api.deleteNativePushSubscription(browserProfileId);
+        } else {
+          await api.deletePushSubscription(browserProfileId);
+        }
         // Refresh the list
         await fetchDevices();
       } catch (err) {

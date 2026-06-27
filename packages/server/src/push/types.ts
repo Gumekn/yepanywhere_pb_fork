@@ -50,6 +50,30 @@ export interface SubscriptionState {
   settings?: NotificationSettings;
 }
 
+/** Native mobile push platform. */
+export type NativePushPlatform = "android";
+
+/** Stored native mobile push subscription with metadata. */
+export interface StoredNativePushSubscription {
+  platform: NativePushPlatform;
+  /** FCM registration token for Android. */
+  token: string;
+  /** When this subscription was first created. */
+  createdAt: string;
+  /** When this subscription was last updated. */
+  updatedAt: string;
+  /** Optional friendly name for the device. */
+  deviceName?: string;
+}
+
+/** Native push subscription storage state. */
+export interface NativePushSubscriptionState {
+  /** Schema version for future migrations. */
+  version: number;
+  /** Map of browserProfileId -> native subscription info. */
+  subscriptions: Record<string, StoredNativePushSubscription>;
+}
+
 /** Push notification payload types */
 export type PushPayloadType =
   | "pending-input"
@@ -69,6 +93,8 @@ export interface PendingInputPayload extends BasePushPayload {
   sessionId: string;
   projectId: string;
   projectName: string;
+  /** Optional session display title for native notification surfaces. */
+  sessionTitle?: string;
   inputType: "tool-approval" | "user-question";
   /** Brief summary of what needs approval */
   summary: string;
@@ -82,6 +108,8 @@ export interface SessionHaltedPayload extends BasePushPayload {
   sessionId: string;
   projectId: string;
   projectName: string;
+  /** Optional session display title for native notification surfaces. */
+  sessionTitle?: string;
   reason: "completed" | "error" | "idle";
   /** How long the session was running (ms) */
   duration: number;

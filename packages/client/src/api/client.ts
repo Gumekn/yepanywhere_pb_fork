@@ -59,6 +59,7 @@ export interface InboxItem {
  * Inbox response with sessions categorized into priority tiers.
  */
 export interface InboxResponse {
+  badgeCount: number;
   needsAttention: InboxItem[];
   active: InboxItem[];
   recentActivity: InboxItem[];
@@ -449,6 +450,17 @@ export interface DeploymentJob {
   log?: string;
 }
 
+export type ApkBuildType = "release" | "debug";
+
+export interface DeploymentApkInfo {
+  buildType: ApkBuildType;
+  fileName: string;
+  size: number;
+  mtimeMs: number;
+  builtAt: string;
+  downloadPath: string;
+}
+
 export interface DeploymentStatusResponse {
   available: boolean;
   reason?: string;
@@ -466,6 +478,10 @@ export interface DeploymentStatusResponse {
     devices: AdbDevice[];
     error?: string;
   };
+  apk: {
+    latest: DeploymentApkInfo | null;
+    artifacts: DeploymentApkInfo[];
+  };
   currentJob: DeploymentJob | null;
 }
 
@@ -480,6 +496,72 @@ export interface StartDeploymentRequest {
 export interface GetVersionOptions {
   /** Bypass the server's routine version cache and refresh from the update service. */
   fresh?: boolean;
+}
+
+function parseContentDispositionFilename(value: string | null): string | null {
+  if (!value) return null;
+
+  const encodedMatch = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (encodedMatch?.[1]) {
+    try {
+      return decodeURIComponent(encodedMatch[1]);
+    } catch {
+      return encodedMatch[1];
+    }
+  }
+
+  const quotedMatch = value.match(/filename="([^"]+)"/i);
+  if (quotedMatch?.[1]) return quotedMatch[1];
+
+  const plainMatch = value.match(/filename=([^;]+)/i);
+  return plainMatch?.[1]?.trim() ?? null;
+}
+
+async function fetchBlob(
+  path: string,
+): Promise<{ blob: Blob; fileName: string | null }> {
+  const headers: Record<string, string> = {
+    "X-Yep-Anywhere": "true",
+  };
+  if (desktopAuthToken) {
+    headers["X-Desktop-Token"] = desktopAuthToken;
+  }
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    credentials: "include",
+    cache: "no-store",
+    headers,
+  });
+
+  if (!res.ok) {
+    if (res.status === 401 && !path.startsWith("/auth/")) {
+      console.log("[API] 401 response, signaling login required");
+      authEvents.signalLoginRequired();
+    }
+
+    let errorMessage = `API error: ${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body.error) {
+        errorMessage = body.error;
+      } else if (body.message) {
+        errorMessage = body.message;
+      }
+    } catch {
+      // Response body was not JSON.
+    }
+
+    const error = new Error(errorMessage) as Error & { status: number };
+    error.status = res.status;
+    throw error;
+  }
+
+  return {
+    blob: await res.blob(),
+    fileName: parseContentDispositionFilename(
+      res.headers.get("Content-Disposition"),
+    ),
+  };
 }
 
 export const api = {
@@ -521,6 +603,13 @@ export const api = {
 
   getDeploymentJob: (id: string) =>
     fetchJSON<{ job: DeploymentJob }>(`/deploy/jobs/${id}`),
+
+  downloadDeploymentApk: (buildType?: ApkBuildType) => {
+    const params = new URLSearchParams();
+    if (buildType) params.set("buildType", buildType);
+    const qs = params.toString();
+    return fetchBlob(`/deploy/apk/download${qs ? `?${qs}` : ""}`);
+  },
 
   // Provider API
   getProviders: () => fetchJSON<{ providers: ProviderInfo[] }>("/providers"),
@@ -899,8 +988,11 @@ export const api = {
       subscriptions: Array<{
         browserProfileId: string;
         createdAt: string;
+        updatedAt?: string;
         deviceName?: string;
         endpointDomain: string;
+        platform?: "android";
+        pushKind?: "web" | "native";
       }>;
     }>("/push/subscriptions"),
 
@@ -917,6 +1009,52 @@ export const api = {
   deletePushSubscription: (browserProfileId: string) =>
     fetchJSON<{ success: boolean }>(
       `/push/subscriptions/${encodeURIComponent(browserProfileId)}`,
+      { method: "DELETE" },
+    ),
+
+  getNativePushStatus: () =>
+    fetchJSON<{ configured: boolean }>("/push/native/status"),
+
+  subscribeNativePush: (
+    browserProfileId: string,
+    token: string,
+    deviceName?: string,
+  ) =>
+    fetchJSON<{ success: boolean; browserProfileId: string }>(
+      "/push/native/subscribe",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          browserProfileId,
+          platform: "android",
+          token,
+          deviceName,
+        }),
+      },
+    ),
+
+  unsubscribeNativePush: (browserProfileId: string) =>
+    fetchJSON<{ success: boolean; browserProfileId: string }>(
+      "/push/native/unsubscribe",
+      {
+        method: "POST",
+        body: JSON.stringify({ browserProfileId }),
+      },
+    ),
+
+  testNativePush: (
+    browserProfileId: string,
+    message?: string,
+    urgency?: "normal" | "persistent" | "silent",
+  ) =>
+    fetchJSON<{ success: boolean }>("/push/native/test", {
+      method: "POST",
+      body: JSON.stringify({ browserProfileId, message, urgency }),
+    }),
+
+  deleteNativePushSubscription: (browserProfileId: string) =>
+    fetchJSON<{ success: boolean }>(
+      `/push/native/subscriptions/${encodeURIComponent(browserProfileId)}`,
       { method: "DELETE" },
     ),
 

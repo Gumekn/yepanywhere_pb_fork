@@ -5,7 +5,7 @@ import { useInboxContext } from "../contexts/InboxContext";
 const BADGE_PREFIX_REGEX = /^\(\d+\)\s*/;
 
 /**
- * Hook that monitors the global inbox "needs attention" count and updates
+ * Hook that monitors the global inbox badge count and updates
  * the browser tab title with a badge prefix like "(3) ".
  *
  * This hook works independently of useDocumentTitle - it observes title changes
@@ -14,7 +14,7 @@ const BADGE_PREFIX_REGEX = /^\(\d+\)\s*/;
  * Uses InboxContext for data - no independent fetching.
  */
 export function useNeedsAttentionBadge() {
-  const { totalNeedsAttention: count } = useInboxContext();
+  const { totalBadgeCount: count } = useInboxContext();
 
   // Update document title when count changes
   useEffect(() => {

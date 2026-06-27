@@ -60,6 +60,7 @@ export interface InboxItem {
 }
 
 export interface InboxResponse {
+  badgeCount: number;
   needsAttention: InboxItem[];
   active: InboxItem[];
   recentActivity: InboxItem[];
@@ -336,8 +337,23 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
     unread8h.sort(sortByUpdatedAt);
     unread24h.sort(sortByUpdatedAt);
 
+    const badgeSessionIds = new Set(
+      needsAttention.map((item) => item.sessionId),
+    );
+    const knownVisibleSessionIds = new Set(
+      allSessions.map((item) => item.session.id),
+    );
+    const sessionsNeedingReview =
+      deps.notificationService?.getSessionsNeedingReview() ?? [];
+    for (const sessionId of sessionsNeedingReview) {
+      if (knownVisibleSessionIds.has(sessionId)) {
+        badgeSessionIds.add(sessionId);
+      }
+    }
+
     // Apply limits per tier
     const response: InboxResponse = {
+      badgeCount: badgeSessionIds.size,
       needsAttention: needsAttention.slice(0, MAX_ITEMS_PER_TIER),
       active: active.slice(0, MAX_ITEMS_PER_TIER),
       recentActivity: recentActivity.slice(0, MAX_ITEMS_PER_TIER),

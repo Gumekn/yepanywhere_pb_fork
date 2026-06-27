@@ -18,14 +18,23 @@ export interface LastSeenEntry {
   messageId?: string;
 }
 
+export interface SessionNeedsReviewEntry {
+  /** Why the session should be counted in app badges */
+  reason: "session-halted";
+  /** ISO timestamp of when the review-worthy event happened */
+  timestamp: string;
+}
+
 export interface NotificationState {
   /** Map of sessionId -> last seen info */
   lastSeen: Record<string, LastSeenEntry>;
+  /** Sessions that produced a notification and should stay badged until viewed */
+  needsReview: Record<string, SessionNeedsReviewEntry>;
   /** Schema version for future migrations */
   version: number;
 }
 
-const CURRENT_VERSION = 1;
+const CURRENT_VERSION = 2;
 
 export interface NotificationServiceOptions {
   /** Directory to store notification state (defaults to ~/.yep-anywhere) */
@@ -51,7 +60,11 @@ export class NotificationService {
       );
     this.filePath = path.join(this.dataDir, "notifications.json");
     this.eventBus = options.eventBus;
-    this.state = { lastSeen: {}, version: CURRENT_VERSION };
+    this.state = {
+      lastSeen: {},
+      needsReview: {},
+      version: CURRENT_VERSION,
+    };
   }
 
   /**
@@ -69,11 +82,16 @@ export class NotificationService {
 
       // Validate and migrate if needed
       if (parsed.version === CURRENT_VERSION) {
-        this.state = parsed;
+        this.state = {
+          lastSeen: parsed.lastSeen ?? {},
+          needsReview: parsed.needsReview ?? {},
+          version: CURRENT_VERSION,
+        };
       } else {
         // Future: handle migrations here
         this.state = {
           lastSeen: parsed.lastSeen ?? {},
+          needsReview: parsed.needsReview ?? {},
           version: CURRENT_VERSION,
         };
         await this.save();
@@ -86,7 +104,11 @@ export class NotificationService {
           error,
         );
       }
-      this.state = { lastSeen: {}, version: CURRENT_VERSION };
+      this.state = {
+        lastSeen: {},
+        needsReview: {},
+        version: CURRENT_VERSION,
+      };
     }
   }
 
@@ -111,19 +133,27 @@ export class NotificationService {
     const provided = timestamp ?? now;
     const ts = provided > now ? provided : now;
 
-    // Only update if this is newer than existing entry
+    // Only update if this is newer than existing entry.
     const existing = this.state.lastSeen[sessionId];
-    if (existing && existing.timestamp >= ts) {
+    const shouldUpdateLastSeen = !existing || existing.timestamp < ts;
+    const hadNeedsReview = !!this.state.needsReview[sessionId];
+    if (!shouldUpdateLastSeen && !hadNeedsReview) {
       return;
     }
 
-    this.state.lastSeen[sessionId] = {
-      timestamp: ts,
-      messageId,
-    };
+    if (shouldUpdateLastSeen) {
+      this.state.lastSeen[sessionId] = {
+        timestamp: ts,
+        messageId,
+      };
+    }
+
+    if (hadNeedsReview) {
+      delete this.state.needsReview[sessionId];
+    }
 
     // Emit event for other tabs/clients
-    if (this.eventBus) {
+    if (shouldUpdateLastSeen && this.eventBus) {
       this.eventBus.emit({
         type: "session-seen",
         sessionId,
@@ -133,6 +163,48 @@ export class NotificationService {
     }
 
     await this.save();
+  }
+
+  /**
+   * Mark a session as needing review in app/browser badges.
+   * This is intentionally narrower than hasUnread(): only sessions that have
+   * produced a notification-worthy event are counted here.
+   */
+  async markSessionNeedsReview(
+    sessionId: string,
+    timestamp?: string,
+  ): Promise<void> {
+    const ts = timestamp ?? new Date().toISOString();
+    const existing = this.state.needsReview[sessionId];
+    if (existing && existing.timestamp >= ts) {
+      return;
+    }
+
+    this.state.needsReview[sessionId] = {
+      reason: "session-halted",
+      timestamp: ts,
+    };
+
+    await this.save();
+  }
+
+  /**
+   * Clear the badge-only review state for a session without changing lastSeen.
+   */
+  async clearSessionNeedsReview(sessionId: string): Promise<void> {
+    if (!this.state.needsReview[sessionId]) {
+      return;
+    }
+
+    delete this.state.needsReview[sessionId];
+    await this.save();
+  }
+
+  /**
+   * Get session IDs that should be counted in app/browser badges.
+   */
+  getSessionsNeedingReview(): string[] {
+    return Object.keys(this.state.needsReview);
   }
 
   /**
@@ -168,8 +240,9 @@ export class NotificationService {
    * Useful when a session is deleted.
    */
   async clearSession(sessionId: string): Promise<void> {
-    if (this.state.lastSeen[sessionId]) {
+    if (this.state.lastSeen[sessionId] || this.state.needsReview[sessionId]) {
       delete this.state.lastSeen[sessionId];
+      delete this.state.needsReview[sessionId];
       await this.save();
     }
   }

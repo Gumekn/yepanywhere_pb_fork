@@ -11,6 +11,55 @@ Push notifications require:
 3. **PushManager API** - Not available in all browsers (notably older Safari versions)
 4. **Notification Permission** - User must grant permission when prompted
 
+## Android APK Native Push
+
+The Android APK uses Firebase Cloud Messaging for reliable system
+notifications. Browser Web Push remains available for Chrome/PWA clients.
+
+Required private configuration:
+
+1. Add the Android Firebase config at:
+   `packages/mobile/src-tauri/gen/android/app/google-services.json`
+2. Provide server FCM credentials with one of:
+   - `YEP_FCM_SERVICE_ACCOUNT_FILE=/path/to/firebase-service-account.json`
+   - `YEP_FCM_SERVICE_ACCOUNT_JSON='{"project_id":...}'`
+   - `GOOGLE_APPLICATION_CREDENTIALS=/path/to/firebase-service-account.json`
+
+Both files are ignored by git. Without `google-services.json`, the APK still
+builds but native token registration is unavailable. Without server FCM
+credentials, native devices can be listed locally but test and session push
+delivery fail with a configuration error.
+
+If the server is managed by the macOS LaunchAgent, persist the FCM credential
+there before redeploying:
+
+```bash
+YEP_FCM_SERVICE_ACCOUNT_FILE=/path/to/firebase-service-account.json scripts/install-launchagents.sh --server-only
+```
+
+This reloads only the 8022 server LaunchAgent. Use `--no-start` only when you
+want to write the plist without changing the currently running service; the new
+environment will not be active until the LaunchAgent is loaded again.
+
+`scripts/deploy.sh` checks both native push prerequisites. Missing config is a
+warning by default, or a hard failure with:
+
+```bash
+YEP_REQUIRE_NATIVE_PUSH=true scripts/deploy.sh
+```
+
+### Android 16 compatibility notes
+
+- The APK targets API 36. Android notification permission is still handled with
+  `POST_NOTIFICATIONS` on Android 13+; the app tracks whether the permission was
+  already requested so Settings can distinguish first-run from blocked state.
+- Native FCM sends both `notification` and `data` payloads. Android can show the
+  notification from the system tray while the app is backgrounded, and the data
+  payload still carries `projectId` / `sessionId` for click navigation.
+- Android 16 introduces Local Network Protection as an opt-in preview. The APK
+  declares `NEARBY_WIFI_DEVICES` with `neverForLocation` so future LAN/WebView
+  compatibility work has the required manifest permission in place.
+
 ## Common Issues
 
 ### "Push notifications are not supported in this browser"

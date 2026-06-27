@@ -23,12 +23,13 @@ vi.mock("../../hooks/useFileActivity", () => ({
 }));
 
 function InboxConsumer() {
-  const { error, loading, totalItems } = useInboxContext();
+  const { error, loading, totalBadgeCount, totalItems } = useInboxContext();
   return (
     <div>
       <span data-testid="loading">{String(loading)}</span>
       <span data-testid="error">{error?.message ?? ""}</span>
       <span data-testid="total">{String(totalItems)}</span>
+      <span data-testid="badge">{String(totalBadgeCount)}</span>
     </div>
   );
 }
@@ -40,6 +41,7 @@ function InboxTitleConsumer() {
 
 function emptyInbox(overrides: Partial<InboxResponse> = {}): InboxResponse {
   return {
+    badgeCount: 0,
     needsAttention: [],
     active: [],
     recentActivity: [],
@@ -103,6 +105,25 @@ describe("InboxProvider", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mockGetInbox).not.toHaveBeenCalled();
+  });
+
+  it("uses server-provided badgeCount instead of deriving from unread tiers", async () => {
+    mockGetInbox.mockResolvedValue(
+      emptyInbox({
+        badgeCount: 1,
+        unread24h: [inboxItem, { ...inboxItem, sessionId: "session-2" }],
+      }),
+    );
+
+    render(
+      <InboxProvider>
+        <InboxConsumer />
+      </InboxProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("badge").textContent).toBe("1");
+    });
   });
 
   it("keeps an existing inbox title when a refetch returns Untitled", async () => {

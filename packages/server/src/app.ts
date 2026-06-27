@@ -42,7 +42,11 @@ import {
 } from "./projects/gemini-scanner.js";
 import { CLAUDE_PROJECTS_DIR } from "./projects/paths.js";
 import { ProjectScanner } from "./projects/scanner.js";
-import { PushNotifier, type PushService } from "./push/index.js";
+import {
+  type NativePushService,
+  PushNotifier,
+  type PushService,
+} from "./push/index.js";
 import { createPushRoutes } from "./push/routes.js";
 import type { RecentsService } from "./recents/index.js";
 import { createActivityRoutes } from "./routes/activity.js";
@@ -141,6 +145,8 @@ export interface AppOptions {
   frontendProxy?: FrontendProxy;
   /** PushService for web push notifications */
   pushService?: PushService;
+  /** NativePushService for Android FCM notifications */
+  nativePushService?: NativePushService;
   /** RecentsService for tracking recently visited sessions */
   recentsService?: RecentsService;
   /** Maximum upload file size in bytes. 0 = unlimited */
@@ -645,6 +651,8 @@ export function createApp(options: AppOptions): AppResult {
     new PushNotifier({
       eventBus: options.eventBus,
       pushService: options.pushService,
+      nativePushService: options.nativePushService,
+      notificationService: options.notificationService,
       supervisor,
       connectedBrowsers: options.connectedBrowsers,
     });
@@ -1041,7 +1049,10 @@ export function createApp(options: AppOptions): AppResult {
   if (options.pushService) {
     app.route(
       "/api/push",
-      createPushRoutes({ pushService: options.pushService }),
+      createPushRoutes({
+        pushService: options.pushService,
+        nativePushService: options.nativePushService,
+      }),
     );
   }
 

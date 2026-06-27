@@ -93,6 +93,7 @@ function mergeWithStableOrder(
   currentData: InboxResponse,
 ): InboxResponse {
   const result: InboxResponse = {
+    badgeCount: newData.badgeCount ?? 0,
     needsAttention: [],
     active: [],
     recentActivity: [],
@@ -165,6 +166,7 @@ function createEmptyTierOrder(): TierOrder {
 }
 
 const EMPTY_INBOX: InboxResponse = {
+  badgeCount: 0,
   needsAttention: [],
   active: [],
   recentActivity: [],
@@ -197,6 +199,8 @@ interface InboxContextValue {
   totalNeedsAttention: number;
   /** Count of active sessions */
   totalActive: number;
+  /** Count shown in title/app badges: sessions needing attention or unread review */
+  totalBadgeCount: number;
   /** Total count of all inbox items */
   totalItems: number;
   /** Whether fetching is enabled */
@@ -344,6 +348,7 @@ export function InboxProvider({
   // Computed totals
   const totalNeedsAttention = inbox.needsAttention.length;
   const totalActive = inbox.active.length;
+  const totalBadgeCount = inbox.badgeCount ?? totalNeedsAttention;
   const totalItems =
     inbox.needsAttention.length +
     inbox.active.length +
@@ -366,6 +371,7 @@ export function InboxProvider({
         refetch: fetchInbox,
         totalNeedsAttention,
         totalActive,
+        totalBadgeCount,
         totalItems,
         enabled,
         setEnabled,

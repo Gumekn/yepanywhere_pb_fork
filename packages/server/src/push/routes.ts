@@ -3,11 +3,13 @@
  */
 
 import { Hono } from "hono";
+import type { NativePushService } from "./NativePushService.js";
 import type { PushService } from "./PushService.js";
 import type { NotificationSettings, PushSubscription } from "./types.js";
 
 export interface PushRoutesDeps {
   pushService: PushService;
+  nativePushService?: NativePushService;
 }
 
 interface SubscribeBody {
@@ -26,9 +28,16 @@ interface TestPushBody {
   urgency?: "normal" | "persistent" | "silent";
 }
 
+interface NativeSubscribeBody {
+  browserProfileId: string;
+  platform: "android";
+  token: string;
+  deviceName?: string;
+}
+
 export function createPushRoutes(deps: PushRoutesDeps): Hono {
   const app = new Hono();
-  const { pushService } = deps;
+  const { pushService, nativePushService } = deps;
 
   /**
    * GET /api/push/vapid-public-key
@@ -103,6 +112,7 @@ export function createPushRoutes(deps: PushRoutesDeps): Hono {
    */
   app.get("/subscriptions", (c) => {
     const subscriptions = pushService.getSubscriptions();
+    const nativeSubscriptions = nativePushService?.getSubscriptions() ?? {};
 
     // Return sanitized subscription info (hide sensitive keys)
     const sanitized = Object.entries(subscriptions).map(
@@ -122,13 +132,26 @@ export function createPushRoutes(deps: PushRoutesDeps): Hono {
           createdAt: sub.createdAt,
           deviceName: sub.deviceName,
           endpointDomain,
+          pushKind: "web" as const,
         };
       },
     );
 
+    const nativeSanitized = Object.entries(nativeSubscriptions).map(
+      ([browserProfileId, sub]) => ({
+        browserProfileId,
+        createdAt: sub.createdAt,
+        updatedAt: sub.updatedAt,
+        deviceName: sub.deviceName,
+        endpointDomain: "fcm.googleapis.com",
+        platform: sub.platform,
+        pushKind: "native" as const,
+      }),
+    );
+
     return c.json({
-      count: sanitized.length,
-      subscriptions: sanitized,
+      count: sanitized.length + nativeSanitized.length,
+      subscriptions: [...sanitized, ...nativeSanitized],
     });
   });
 
@@ -173,6 +196,126 @@ export function createPushRoutes(deps: PushRoutesDeps): Hono {
         },
         result.statusCode === 404 || result.statusCode === 410 ? 410 : 500,
       );
+    }
+
+    return c.json({ success: true });
+  });
+
+  /**
+   * GET /api/push/native/status
+   * Returns whether native push is configured server-side.
+   */
+  app.get("/native/status", (c) => {
+    return c.json({
+      configured: nativePushService?.isConfigured() ?? false,
+    });
+  });
+
+  /**
+   * POST /api/push/native/subscribe
+   * Subscribe an Android FCM token for native push notifications.
+   */
+  app.post("/native/subscribe", async (c) => {
+    if (!nativePushService) {
+      return c.json({ error: "Native push service not available" }, 503);
+    }
+
+    const body = await c.req.json<NativeSubscribeBody>();
+
+    if (!body.browserProfileId || typeof body.browserProfileId !== "string") {
+      return c.json({ error: "browserProfileId is required" }, 400);
+    }
+
+    if (body.platform !== "android") {
+      return c.json({ error: "platform must be android" }, 400);
+    }
+
+    if (!body.token || typeof body.token !== "string") {
+      return c.json({ error: "token is required" }, 400);
+    }
+
+    await nativePushService.subscribe(body.browserProfileId, body.token, {
+      deviceName: body.deviceName,
+    });
+
+    return c.json({
+      success: true,
+      browserProfileId: body.browserProfileId,
+    });
+  });
+
+  /**
+   * POST /api/push/native/unsubscribe
+   * Unsubscribe an Android native push profile.
+   */
+  app.post("/native/unsubscribe", async (c) => {
+    if (!nativePushService) {
+      return c.json({ error: "Native push service not available" }, 503);
+    }
+
+    const body = await c.req.json<UnsubscribeBody>();
+
+    if (!body.browserProfileId || typeof body.browserProfileId !== "string") {
+      return c.json({ error: "browserProfileId is required" }, 400);
+    }
+
+    const removed = await nativePushService.unsubscribe(body.browserProfileId);
+
+    return c.json({
+      success: removed,
+      browserProfileId: body.browserProfileId,
+    });
+  });
+
+  /**
+   * POST /api/push/native/test
+   * Send a test notification through native push.
+   */
+  app.post("/native/test", async (c) => {
+    if (!nativePushService) {
+      return c.json({ error: "Native push service not available" }, 503);
+    }
+
+    const body = await c.req.json<TestPushBody>();
+
+    if (!body.browserProfileId) {
+      return c.json({ error: "browserProfileId is required" }, 400);
+    }
+
+    const result = await nativePushService.sendTest(
+      body.browserProfileId,
+      body.message ?? "Test notification from Yep Anywhere",
+      body.urgency,
+    );
+
+    if (!result.success) {
+      return c.json(
+        {
+          success: false,
+          error: result.error,
+          statusCode: result.statusCode,
+        },
+        result.statusCode === 404 || result.statusCode === 410 ? 410 : 500,
+      );
+    }
+
+    return c.json({ success: true });
+  });
+
+  /**
+   * DELETE /api/push/native/subscriptions/:browserProfileId
+   * Remove a specific native push subscription.
+   */
+  app.delete("/native/subscriptions/:browserProfileId", async (c) => {
+    if (!nativePushService) {
+      return c.json({ error: "Native push service not available" }, 503);
+    }
+
+    const browserProfileId = c.req.param("browserProfileId");
+    const removed = await nativePushService.unsubscribe(browserProfileId);
+
+    if (!removed) {
+      return c.json({ error: "Subscription not found" }, 404);
     }
 
     return c.json({ success: true });

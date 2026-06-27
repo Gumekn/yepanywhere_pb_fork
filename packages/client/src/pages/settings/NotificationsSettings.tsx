@@ -1,14 +1,16 @@
 import { BrowserNotificationToggle } from "../../components/BrowserNotificationToggle";
+import { NativePushNotificationToggle } from "../../components/NativePushNotificationToggle";
 import { PushNotificationToggle } from "../../components/PushNotificationToggle";
 import { useBrowserNotifications } from "../../hooks/useBrowserNotifications";
 import { useConnectedDevices } from "../../hooks/useConnectedDevices";
 import { useNotificationSettings } from "../../hooks/useNotificationSettings";
-import { usePushNotifications } from "../../hooks/usePushNotifications";
 import {
   type SubscribedDevice,
   useSubscribedDevices,
 } from "../../hooks/useSubscribedDevices";
 import { useI18n } from "../../i18n";
+import { isMobileShellDocument } from "../../lib/nativePushBridge";
+import { LEGACY_KEYS, getServerScoped } from "../../lib/storageKeys";
 
 /**
  * Unified device that merges subscribed device info with connection status.
@@ -29,6 +31,8 @@ interface UnifiedDevice {
   subscribedAt?: string;
   /** True if this is the current device */
   isCurrentDevice: boolean;
+  /** Web Push or Android native push. */
+  pushKind: "web" | "native";
 }
 
 /**
@@ -38,8 +42,16 @@ interface UnifiedDevice {
 function formatDeviceName(
   deviceName: string | undefined,
   endpointDomain: string | undefined,
+  pushKind: "web" | "native" | undefined,
 ): { displayName: string; browserType: string } {
   const name = deviceName || "Unknown device";
+
+  if (pushKind === "native") {
+    return {
+      displayName: deviceName || "Android APK",
+      browserType: "(Android native)",
+    };
+  }
 
   // Extract push service type from domain
   if (endpointDomain?.includes("google")) {
@@ -103,6 +115,7 @@ function mergeDevices(
     const { displayName, browserType } = formatDeviceName(
       device.deviceName,
       device.endpointDomain,
+      device.pushKind,
     );
     const connection = connectedDevices.get(device.browserProfileId);
 
@@ -115,6 +128,7 @@ function mergeDevices(
       tabCount: connection?.connectionCount ?? 0,
       subscribedAt: device.createdAt,
       isCurrentDevice: device.browserProfileId === currentBrowserProfileId,
+      pushKind: device.pushKind ?? "web",
     });
   }
 
@@ -131,6 +145,7 @@ function mergeDevices(
         isConnected: true,
         tabCount: connection.connectionCount,
         isCurrentDevice: browserProfileId === currentBrowserProfileId,
+        pushKind: "web",
       });
     }
   }
@@ -165,8 +180,13 @@ function mergeDevices(
 
 export function NotificationsSettings() {
   const { t } = useI18n();
-  const { browserProfileId } = usePushNotifications();
   const { isMobile } = useBrowserNotifications();
+  const isMobileShell =
+    typeof document !== "undefined" && isMobileShellDocument();
+  const browserProfileId = getServerScoped(
+    "browserProfileId",
+    LEGACY_KEYS.browserProfileId,
+  );
   const {
     devices: subscribedDevices,
     isLoading: devicesLoading,
@@ -273,16 +293,27 @@ export function NotificationsSettings() {
         </section>
       )}
 
-      {/* Push notifications - service worker based */}
-      <section className="settings-section">
-        <h2>{t("notificationsPushTitle")}</h2>
-        <p className="settings-section-description">
-          {t("notificationsPushDescription")}
-        </p>
-        <div className="settings-group">
-          <PushNotificationToggle />
-        </div>
-      </section>
+      {isMobileShell ? (
+        <section className="settings-section">
+          <h2>{t("nativePushSectionTitle")}</h2>
+          <p className="settings-section-description">
+            {t("nativePushSectionDescription")}
+          </p>
+          <div className="settings-group">
+            <NativePushNotificationToggle />
+          </div>
+        </section>
+      ) : (
+        <section className="settings-section">
+          <h2>{t("notificationsPushTitle")}</h2>
+          <p className="settings-section-description">
+            {t("notificationsPushDescription")}
+          </p>
+          <div className="settings-group">
+            <PushNotificationToggle />
+          </div>
+        </section>
+      )}
 
       {/* Unified devices list */}
       <section className="settings-section">
@@ -345,7 +376,9 @@ export function NotificationsSettings() {
                     <button
                       type="button"
                       className="settings-button settings-button-danger-subtle"
-                      onClick={() => removeDevice(device.browserProfileId)}
+                      onClick={() =>
+                        removeDevice(device.browserProfileId, device.pushKind)
+                      }
                       title={
                         device.isCurrentDevice
                           ? t("notificationsRemoveThisDevice")

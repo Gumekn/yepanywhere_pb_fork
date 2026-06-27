@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  type ApkBuildType,
   type DeploymentActionId,
   type DeploymentJob,
   type DeploymentStatusResponse,
@@ -23,6 +24,29 @@ function getErrorMessage(err: unknown): string {
 
 function isTerminalDeployJob(job: DeploymentJob | null): boolean {
   return job?.status === "succeeded" || job?.status === "failed";
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function saveBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 export function DevelopmentSettings() {
@@ -55,12 +79,11 @@ export function DevelopmentSettings() {
   const [deployError, setDeployError] = useState<string | null>(null);
   const [startingAction, setStartingAction] =
     useState<DeploymentActionId | null>(null);
-  const [apkBuildType, setApkBuildType] = useState<"release" | "debug">(
-    "release",
-  );
+  const [apkBuildType, setApkBuildType] = useState<ApkBuildType>("release");
   const [apkInstall, setApkInstall] = useState(true);
   const [apkDeviceId, setApkDeviceId] = useState("");
   const [skipChecks, setSkipChecks] = useState(false);
+  const [downloadingApk, setDownloadingApk] = useState(false);
 
   const deploymentCapable =
     versionInfo?.capabilities?.includes("deployment") ?? false;
@@ -148,12 +171,26 @@ export function DevelopmentSettings() {
     }
   };
 
+  const handleDownloadApk = async () => {
+    setDownloadingApk(true);
+    setDeployError(null);
+    try {
+      const { blob, fileName } = await api.downloadDeploymentApk();
+      saveBlob(blob, fileName ?? latestApk?.fileName ?? "yep-anywhere.apk");
+    } catch (err) {
+      setDeployError(getErrorMessage(err));
+    } finally {
+      setDownloadingApk(false);
+    }
+  };
+
   const deployRunning = deployJob?.status === "running" || !!startingAction;
   const connectedAdbDevices =
     deployStatus?.adb.devices.filter((device) => device.state === "device") ??
     [];
   const runningBuildId = versionInfo?.build?.buildId?.slice(0, 12);
   const stagedBuildId = deployStatus?.stagedBuild?.buildId?.slice(0, 12);
+  const latestApk = deployStatus?.apk.latest ?? null;
 
   return (
     <section className="settings-section">
@@ -265,6 +302,20 @@ export function DevelopmentSettings() {
               <div className="settings-item-info">
                 <strong>{t("deploymentApkTitle")}</strong>
                 <p>{t("deploymentApkDescription")}</p>
+                {latestApk ? (
+                  <p>
+                    {t("deploymentLatestApk", {
+                      buildType:
+                        latestApk.buildType === "debug"
+                          ? t("deploymentDebug")
+                          : t("deploymentRelease"),
+                      size: formatBytes(latestApk.size),
+                      builtAt: new Date(latestApk.builtAt).toLocaleString(),
+                    })}
+                  </p>
+                ) : (
+                  <p className="settings-hint">{t("deploymentNoApk")}</p>
+                )}
                 {deployStatus?.adb.available === false && (
                   <p className="settings-warning">
                     {t("deploymentAdbUnavailable")}
@@ -279,7 +330,7 @@ export function DevelopmentSettings() {
                   className="settings-select"
                   value={apkBuildType}
                   onChange={(e) =>
-                    setApkBuildType(e.target.value as "release" | "debug")
+                    setApkBuildType(e.target.value as ApkBuildType)
                   }
                   disabled={deployRunning}
                 >
@@ -325,6 +376,16 @@ export function DevelopmentSettings() {
                   : apkInstall
                     ? t("deploymentBuildInstallApk")
                     : t("deploymentBuildApk")}
+              </button>
+              <button
+                type="button"
+                className="settings-button settings-button-secondary"
+                onClick={() => void handleDownloadApk()}
+                disabled={!latestApk || deployRunning || downloadingApk}
+              >
+                {downloadingApk
+                  ? t("deploymentDownloadingApk")
+                  : t("deploymentDownloadApk")}
               </button>
               <button
                 type="button"

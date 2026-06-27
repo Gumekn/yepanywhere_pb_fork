@@ -1,5 +1,6 @@
 import type { UrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { NotificationService } from "../../src/notifications/NotificationService.js";
 import { PushNotifier } from "../../src/push/PushNotifier.js";
 import type { PushService } from "../../src/push/PushService.js";
 import type { Supervisor } from "../../src/supervisor/Supervisor.js";
@@ -13,6 +14,7 @@ import type {
 describe("PushNotifier", () => {
   let mockEventBus: EventBus;
   let mockPushService: PushService;
+  let mockNotificationService: NotificationService;
   let mockSupervisor: Supervisor;
   let eventHandler: ((event: BusEvent) => void) | null = null;
   let unsubscribeCalled = false;
@@ -45,6 +47,11 @@ describe("PushNotifier", () => {
       isNotificationTypeEnabled: vi.fn(() => true),
     } as unknown as PushService;
 
+    mockNotificationService = {
+      markSessionNeedsReview: vi.fn(() => Promise.resolve()),
+      clearSessionNeedsReview: vi.fn(() => Promise.resolve()),
+    } as unknown as NotificationService;
+
     // Mock Supervisor
     mockSupervisor = {
       getProcessForSession: vi.fn(),
@@ -60,6 +67,7 @@ describe("PushNotifier", () => {
       new PushNotifier({
         eventBus: mockEventBus,
         pushService: mockPushService,
+        notificationService: mockNotificationService,
         supervisor: mockSupervisor,
       });
 
@@ -106,6 +114,7 @@ describe("PushNotifier", () => {
       new PushNotifier({
         eventBus: mockEventBus,
         pushService: mockPushService,
+        notificationService: mockNotificationService,
         supervisor: mockSupervisor,
       });
 
@@ -139,6 +148,7 @@ describe("PushNotifier", () => {
       new PushNotifier({
         eventBus: mockEventBus,
         pushService: mockPushService,
+        notificationService: mockNotificationService,
         supervisor: mockSupervisor,
       });
 
@@ -237,6 +247,7 @@ describe("PushNotifier", () => {
       new PushNotifier({
         eventBus: mockEventBus,
         pushService: mockPushService,
+        notificationService: mockNotificationService,
         supervisor: mockSupervisor,
       });
 
@@ -569,6 +580,195 @@ describe("PushNotifier", () => {
       expect(mockPushService.sendToAll).not.toHaveBeenCalled();
 
       consoleSpy.mockRestore();
+    });
+
+    it("should still send session-halted after an unsuccessful pending-input notification", async () => {
+      const waitingProcess = {
+        state: {
+          type: "waiting-input",
+          request: {
+            id: "req-1",
+            sessionId: "session-1",
+            type: "user-question",
+            prompt: "Need confirmation",
+            timestamp: new Date().toISOString(),
+          } as InputRequest,
+        } as ProcessState,
+      };
+      const idleProcess = {
+        state: { type: "idle", since: new Date() } as ProcessState,
+        startedAt: new Date(Date.now() - 10_000),
+        getMessageHistory: vi.fn(() => [
+          {
+            type: "user",
+            message: { content: "Implement native notifications" },
+          },
+        ]),
+      };
+
+      vi.mocked(mockSupervisor.getProcessForSession)
+        .mockReturnValueOnce(
+          waitingProcess as unknown as ReturnType<
+            Supervisor["getProcessForSession"]
+          >,
+        )
+        .mockReturnValue(
+          idleProcess as unknown as ReturnType<
+            Supervisor["getProcessForSession"]
+          >,
+        );
+
+      vi.mocked(mockPushService.sendToAll)
+        .mockResolvedValueOnce([
+          {
+            browserProfileId: "profile-1",
+            success: false,
+            error: "Network error",
+          },
+        ])
+        .mockResolvedValueOnce([
+          { browserProfileId: "profile-1", success: true },
+        ]);
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        supervisor: mockSupervisor,
+      });
+
+      const waitingEvent: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        activity: "waiting-input",
+        timestamp: new Date().toISOString(),
+      };
+      eventHandler?.(waitingEvent);
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+      });
+
+      const idleEvent: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        activity: "idle",
+        timestamp: new Date().toISOString(),
+      };
+      eventHandler?.(idleEvent);
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(2);
+      });
+
+      const payload = vi.mocked(mockPushService.sendToAll).mock.calls[1][0];
+      expect(payload.type).toBe("session-halted");
+      expect(payload.sessionId).toBe("session-1");
+      expect(
+        mockNotificationService.markSessionNeedsReview,
+      ).toHaveBeenCalledWith("session-1", idleEvent.timestamp);
+    });
+
+    it("should send session-halted when a session becomes idle", async () => {
+      const mockProcess = {
+        state: { type: "idle", since: new Date() } as ProcessState,
+        startedAt: new Date(Date.now() - 10_000),
+        getMessageHistory: vi.fn(() => [
+          {
+            type: "user",
+            message: { content: "Implement native notifications" },
+          },
+        ]),
+      };
+
+      vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(
+        mockProcess as unknown as ReturnType<
+          Supervisor["getProcessForSession"]
+        >,
+      );
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        supervisor: mockSupervisor,
+      });
+
+      const idleEvent: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        activity: "idle",
+        timestamp: new Date().toISOString(),
+      };
+
+      eventHandler?.(idleEvent);
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+      });
+
+      const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
+      expect(payload.type).toBe("session-halted");
+      expect(payload.sessionId).toBe("session-1");
+      expect(payload.projectName).toBe("test-project");
+      expect(payload.sessionTitle).toBe("Implement native notifications");
+      expect(payload.reason).toBe("completed");
+      expect(
+        mockNotificationService.markSessionNeedsReview,
+      ).toHaveBeenCalledWith("session-1", idleEvent.timestamp);
+    });
+
+    it("should still mark session-halted badge state without push subscriptions", async () => {
+      vi.mocked(mockPushService.getSubscriptionCount).mockReturnValue(0);
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        supervisor: mockSupervisor,
+      });
+
+      const idleEvent: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        activity: "idle",
+        timestamp: new Date().toISOString(),
+      };
+
+      eventHandler?.(idleEvent);
+
+      await vi.waitFor(() => {
+        expect(
+          mockNotificationService.markSessionNeedsReview,
+        ).toHaveBeenCalledWith("session-1", idleEvent.timestamp);
+      });
+      expect(mockPushService.sendToAll).not.toHaveBeenCalled();
+    });
+
+    it("should send dismiss when a session is marked seen", async () => {
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        supervisor: mockSupervisor,
+      });
+
+      eventHandler?.({
+        type: "session-seen",
+        sessionId: "session-1",
+        timestamp: new Date().toISOString(),
+      });
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+      });
+
+      const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
+      expect(payload.type).toBe("dismiss");
+      expect(payload.sessionId).toBe("session-1");
     });
   });
 

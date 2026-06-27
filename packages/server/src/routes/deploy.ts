@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Hono } from "hono";
+import { stream } from "hono/streaming";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,6 +42,17 @@ export interface AdbDevice {
   state: string;
   model?: string;
   product?: string;
+}
+
+export type ApkBuildType = "release" | "debug";
+
+export interface DeploymentApkInfo {
+  buildType: ApkBuildType;
+  fileName: string;
+  size: number;
+  mtimeMs: number;
+  builtAt: string;
+  downloadPath: string;
 }
 
 export interface DeploymentJob {
@@ -78,6 +90,10 @@ export interface DeploymentStatusResponse {
     available: boolean;
     devices: AdbDevice[];
     error?: string;
+  };
+  apk: {
+    latest: DeploymentApkInfo | null;
+    artifacts: DeploymentApkInfo[];
   };
   currentJob: DeploymentJob | null;
 }
@@ -249,6 +265,125 @@ function buildDeployArgs(input: StartDeploymentRequest): {
 
 function quoteCommandArg(arg: string): string {
   return /[\s"']/u.test(arg) ? JSON.stringify(arg) : arg;
+}
+
+function getApkPath(repoRoot: string, buildType: ApkBuildType): string {
+  return path.join(
+    repoRoot,
+    "packages",
+    "mobile",
+    "src-tauri",
+    "gen",
+    "android",
+    "app",
+    "build",
+    "outputs",
+    "apk",
+    "universal",
+    buildType,
+    `app-universal-${buildType}.apk`,
+  );
+}
+
+async function readApkInfo(
+  repoRoot: string | undefined,
+  buildType: ApkBuildType,
+  buildTimes?: Map<ApkBuildType, string>,
+): Promise<(DeploymentApkInfo & { filePath: string }) | null> {
+  if (!repoRoot) return null;
+  const filePath = getApkPath(repoRoot, buildType);
+
+  try {
+    const stat = await fsp.stat(filePath);
+    if (!stat.isFile()) return null;
+
+    return {
+      buildType,
+      fileName: path.basename(filePath),
+      filePath,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      builtAt: buildTimes?.get(buildType) ?? stat.mtime.toISOString(),
+      downloadPath: `/deploy/apk/download?buildType=${buildType}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function toPublicApkInfo(
+  info: DeploymentApkInfo & { filePath: string },
+): DeploymentApkInfo {
+  const { filePath: _filePath, ...publicInfo } = info;
+  return publicInfo;
+}
+
+async function readApkArtifacts(
+  repoRoot: string | undefined,
+  buildTimes?: Map<ApkBuildType, string>,
+): Promise<Array<DeploymentApkInfo & { filePath: string }>> {
+  const artifacts = await Promise.all([
+    readApkInfo(repoRoot, "release", buildTimes),
+    readApkInfo(repoRoot, "debug", buildTimes),
+  ]);
+  return artifacts
+    .filter(
+      (artifact): artifact is DeploymentApkInfo & { filePath: string } =>
+        !!artifact,
+    )
+    .sort(
+      (a, b) => new Date(b.builtAt).getTime() - new Date(a.builtAt).getTime(),
+    );
+}
+
+async function readLatestApkInfo(
+  repoRoot: string | undefined,
+  buildTimes?: Map<ApkBuildType, string>,
+): Promise<(DeploymentApkInfo & { filePath: string }) | null> {
+  const artifacts = await readApkArtifacts(repoRoot, buildTimes);
+  return artifacts[0] ?? null;
+}
+
+function parseApkBuildType(value: unknown): ApkBuildType | undefined {
+  if (value === "release" || value === "debug") return value;
+  if (value === undefined || value === null || value === "") return undefined;
+  throw new Error("Unsupported APK build type.");
+}
+
+function deploymentJobBuildsApk(job: DeploymentJob): boolean {
+  if (job.status !== "succeeded" || !job.finishedAt) return false;
+  if (job.args.includes("--no-build")) return false;
+  return (
+    job.action === "apk" || job.action === "apk-build" || job.action === "full"
+  );
+}
+
+function getDeploymentJobApkBuildType(job: DeploymentJob): ApkBuildType {
+  return job.args.includes("--debug") ? "debug" : "release";
+}
+
+async function readSuccessfulApkBuildTimes(
+  dataDir: string | undefined,
+): Promise<Map<ApkBuildType, string>> {
+  const records = await listJobRecords(dataDir);
+  const jobs = await Promise.all(
+    records.map((record) => hydrateJob(dataDir, record)),
+  );
+  const buildTimes = new Map<ApkBuildType, string>();
+
+  for (const job of jobs) {
+    if (!deploymentJobBuildsApk(job)) continue;
+    const buildType = getDeploymentJobApkBuildType(job);
+    const finishedAt = job.finishedAt;
+    if (!finishedAt) continue;
+
+    const existing = buildTimes.get(buildType);
+    if (!existing || finishedAt > existing) {
+      buildTimes.set(buildType, finishedAt);
+    }
+  }
+
+  return buildTimes;
 }
 
 function getDeployDir(dataDir?: string): string {
@@ -483,12 +618,19 @@ async function buildStatus(
   options?: DeployRoutesOptions,
 ): Promise<DeploymentStatusResponse> {
   const availability = getDeploymentAvailability(options);
-  const [adb, currentJob, packageVersion, stagedBuild] = await Promise.all([
+  const [adb, packageVersion, stagedBuild] = await Promise.all([
     getAdbStatus(),
-    findCurrentJob(options?.dataDir),
     readPackageVersion(availability.repoRoot),
     readStagedBuildInfo(availability.repoRoot),
   ]);
+  const currentJob = await findCurrentJob(options?.dataDir);
+  const successfulApkBuildTimes = await readSuccessfulApkBuildTimes(
+    options?.dataDir,
+  );
+  const apkArtifacts = await readApkArtifacts(
+    availability.repoRoot,
+    successfulApkBuildTimes,
+  );
 
   return {
     ...availability,
@@ -496,6 +638,10 @@ async function buildStatus(
     stagedBuild,
     actions: DEPLOYMENT_ACTIONS,
     adb,
+    apk: {
+      latest: apkArtifacts[0] ? toPublicApkInfo(apkArtifacts[0]) : null,
+      artifacts: apkArtifacts.map(toPublicApkInfo),
+    },
     currentJob,
   };
 }
@@ -607,6 +753,56 @@ export function createDeployRoutes(options?: DeployRoutesOptions): Hono {
       return c.json({ error: "Deploy job not found" }, 404);
     }
     return c.json({ job: await hydrateJob(options?.dataDir, record) });
+  });
+
+  routes.get("/apk/download", async (c) => {
+    const availability = getDeploymentAvailability(options);
+    if (!availability.available || !availability.repoRoot) {
+      return c.json(
+        { error: availability.reason ?? "Remote deploy is not available." },
+        404,
+      );
+    }
+
+    let artifact: (DeploymentApkInfo & { filePath: string }) | null;
+    try {
+      const buildType = parseApkBuildType(c.req.query("buildType"));
+      const successfulApkBuildTimes = await readSuccessfulApkBuildTimes(
+        options?.dataDir,
+      );
+      artifact = buildType
+        ? await readApkInfo(
+            availability.repoRoot,
+            buildType,
+            successfulApkBuildTimes,
+          )
+        : await readLatestApkInfo(
+            availability.repoRoot,
+            successfulApkBuildTimes,
+          );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return c.json({ error: message }, 400);
+    }
+
+    if (!artifact) {
+      return c.json({ error: "APK artifact not found." }, 404);
+    }
+
+    c.header("Content-Type", "application/vnd.android.package-archive");
+    c.header("Content-Length", artifact.size.toString());
+    c.header(
+      "Content-Disposition",
+      `attachment; filename="${artifact.fileName}"`,
+    );
+    c.header("Cache-Control", "no-store");
+
+    return stream(c, async (s) => {
+      const readable = fs.createReadStream(artifact.filePath);
+      for await (const chunk of readable) {
+        await s.write(chunk);
+      }
+    });
   });
 
   routes.post("/jobs", async (c) => {

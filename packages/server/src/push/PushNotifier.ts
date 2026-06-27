@@ -9,6 +9,7 @@
 
 import { basename } from "node:path";
 import type { UrlProjectId } from "@yep-anywhere/shared";
+import type { NotificationService } from "../notifications/NotificationService.js";
 import { decodeProjectId } from "../projects/paths.js";
 import type { ConnectedBrowsersService } from "../services/ConnectedBrowsersService.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
@@ -17,13 +18,24 @@ import type {
   BusEvent,
   EventBus,
   ProcessStateEvent,
+  ProcessTerminatedEvent,
+  SessionSeenEvent,
 } from "../watcher/EventBus.js";
+import type { NativePushService } from "./NativePushService.js";
 import type { PushService } from "./PushService.js";
-import type { DismissPayload, PendingInputPayload } from "./types.js";
+import type {
+  DismissPayload,
+  PendingInputPayload,
+  SessionHaltedPayload,
+} from "./types.js";
 
 export interface PushNotifierOptions {
   eventBus: EventBus;
   pushService: PushService;
+  /** Optional native mobile push service (Android FCM). */
+  nativePushService?: NativePushService;
+  /** Tracks notification-backed badge state. */
+  notificationService?: NotificationService;
   supervisor: Supervisor;
   /** Optional: skip push for connected browser profiles */
   connectedBrowsers?: ConnectedBrowsersService;
@@ -32,15 +44,24 @@ export interface PushNotifierOptions {
 export class PushNotifier {
   private eventBus: EventBus;
   private pushService: PushService;
+  private nativePushService?: NativePushService;
+  private notificationService?: NotificationService;
   private supervisor: Supervisor;
   private connectedBrowsers?: ConnectedBrowsersService;
   private unsubscribe: (() => void) | null = null;
-  /** Track sessions we've sent notifications for (to know when to send dismiss) */
-  private sessionsWithNotification = new Set<string>();
+  /**
+   * Track sessions with delivered or in-flight notifications.
+   * In-flight entries let rapid waiting-input -> running transitions wait for
+   * delivery before deciding whether a dismiss is needed.
+   */
+  private sessionsWithNotification = new Map<string, true | Promise<boolean>>();
+  private sessionsWithHaltedNotification = new Set<string>();
 
   constructor(options: PushNotifierOptions) {
     this.eventBus = options.eventBus;
     this.pushService = options.pushService;
+    this.nativePushService = options.nativePushService;
+    this.notificationService = options.notificationService;
     this.supervisor = options.supervisor;
     this.connectedBrowsers = options.connectedBrowsers;
 
@@ -48,6 +69,10 @@ export class PushNotifier {
     this.unsubscribe = this.eventBus.subscribe((event: BusEvent) => {
       if (event.type === "process-state-changed") {
         void this.handleProcessStateChange(event);
+      } else if (event.type === "process-terminated") {
+        void this.handleProcessTerminated(event);
+      } else if (event.type === "session-seen") {
+        void this.handleSessionSeen(event);
       }
     });
   }
@@ -62,15 +87,40 @@ export class PushNotifier {
   ): Promise<void> {
     // Send dismiss when leaving waiting-input (if we sent a notification for it)
     if (event.activity !== "waiting-input") {
-      if (this.sessionsWithNotification.has(event.sessionId)) {
-        await this.sendDismiss(event.sessionId);
+      const notificationState = this.sessionsWithNotification.get(
+        event.sessionId,
+      );
+      if (notificationState) {
+        const wasSent =
+          notificationState === true ? true : await notificationState;
+        if (wasSent) {
+          await this.sendDismiss(event.sessionId);
+        }
         this.sessionsWithNotification.delete(event.sessionId);
+      }
+      if (event.activity === "in-turn") {
+        this.sessionsWithHaltedNotification.delete(event.sessionId);
+        try {
+          await this.notificationService?.clearSessionNeedsReview(
+            event.sessionId,
+          );
+        } catch (error) {
+          console.error("[PushNotifier] Failed to clear badge state:", error);
+        }
+      }
+      if (event.activity === "idle") {
+        await this.sendSessionHalted(event, "completed");
       }
       return;
     }
 
+    this.sessionsWithHaltedNotification.delete(event.sessionId);
+
     // Check if there are any subscriptions
-    if (this.pushService.getSubscriptionCount() === 0) {
+    if (
+      this.pushService.getSubscriptionCount() === 0 &&
+      (this.nativePushService?.getSubscriptionCount() ?? 0) === 0
+    ) {
       return;
     }
 
@@ -99,16 +149,34 @@ export class PushNotifier {
       sessionId: event.sessionId,
       projectId: event.projectId,
       projectName,
+      sessionTitle: this.getSessionTitle(process),
       inputType,
       summary,
       requestId: request.id,
       timestamp: event.timestamp,
     };
 
+    // Skip push for browser profiles that are already connected
+    const connectedIds =
+      this.connectedBrowsers?.getConnectedBrowserProfileIds() ?? [];
+    const sendPromise = this.sendPendingInput(payload, connectedIds);
+    this.sessionsWithNotification.set(event.sessionId, sendPromise);
+
+    const sent = await sendPromise;
+    if (sent) {
+      this.sessionsWithNotification.set(event.sessionId, true);
+    } else if (
+      this.sessionsWithNotification.get(event.sessionId) === sendPromise
+    ) {
+      this.sessionsWithNotification.delete(event.sessionId);
+    }
+  }
+
+  private async sendPendingInput(
+    payload: PendingInputPayload,
+    connectedIds: string[],
+  ): Promise<boolean> {
     try {
-      // Skip push for browser profiles that are already connected
-      const connectedIds =
-        this.connectedBrowsers?.getConnectedBrowserProfileIds() ?? [];
       if (connectedIds.length > 0) {
         console.log(
           `[PushNotifier] Skipping push for ${connectedIds.length} connected browser profile(s)`,
@@ -118,16 +186,24 @@ export class PushNotifier {
       const results = await this.pushService.sendToAll(payload, {
         excludeBrowserProfileIds: connectedIds,
       });
-      const successCount = results.filter((r) => r.success).length;
+      const nativeResults =
+        (await this.nativePushService?.sendToAll(payload, {
+          excludeBrowserProfileIds: connectedIds,
+        })) ?? [];
+      const successCount = [...results, ...nativeResults].filter(
+        (r) => r.success,
+      ).length;
+      const totalCount = results.length + nativeResults.length;
       if (successCount > 0) {
         console.log(
-          `[PushNotifier] Sent pending-input notification to ${successCount}/${results.length} devices`,
+          `[PushNotifier] Sent pending-input notification to ${successCount}/${totalCount} devices`,
         );
-        // Track that we sent a notification for this session
-        this.sessionsWithNotification.add(event.sessionId);
+        return true;
       }
+      return false;
     } catch (error) {
       console.error("[PushNotifier] Failed to send push notification:", error);
+      return false;
     }
   }
 
@@ -135,7 +211,10 @@ export class PushNotifier {
    * Send a dismiss notification to close notifications on all devices.
    */
   private async sendDismiss(sessionId: string): Promise<void> {
-    if (this.pushService.getSubscriptionCount() === 0) {
+    if (
+      this.pushService.getSubscriptionCount() === 0 &&
+      (this.nativePushService?.getSubscriptionCount() ?? 0) === 0
+    ) {
       return;
     }
 
@@ -146,10 +225,102 @@ export class PushNotifier {
     };
 
     try {
-      await this.pushService.sendToAll(payload);
+      await Promise.all([
+        this.pushService.sendToAll(payload),
+        this.nativePushService?.sendToAll(payload) ?? Promise.resolve([]),
+      ]);
       console.log(`[PushNotifier] Sent dismiss for session ${sessionId}`);
     } catch (error) {
       console.error("[PushNotifier] Failed to send dismiss:", error);
+    }
+  }
+
+  private async handleProcessTerminated(
+    event: ProcessTerminatedEvent,
+  ): Promise<void> {
+    await this.sendSessionHalted(event, "error");
+  }
+
+  private async handleSessionSeen(event: SessionSeenEvent): Promise<void> {
+    if (!event.timestamp) {
+      return;
+    }
+
+    this.sessionsWithNotification.delete(event.sessionId);
+    this.sessionsWithHaltedNotification.delete(event.sessionId);
+    await this.sendDismiss(event.sessionId);
+  }
+
+  private async sendSessionHalted(
+    event: Pick<
+      ProcessStateEvent | ProcessTerminatedEvent,
+      "sessionId" | "projectId" | "timestamp"
+    >,
+    reason: SessionHaltedPayload["reason"],
+  ): Promise<void> {
+    if (this.sessionsWithHaltedNotification.has(event.sessionId)) {
+      return;
+    }
+    if (!this.pushService.isNotificationTypeEnabled("sessionHalted")) {
+      return;
+    }
+
+    const process = this.supervisor.getProcessForSession(event.sessionId);
+    const projectName = this.getProjectName(event.projectId);
+    const payload: SessionHaltedPayload = {
+      type: "session-halted",
+      sessionId: event.sessionId,
+      projectId: event.projectId,
+      projectName,
+      sessionTitle: process ? this.getSessionTitle(process) : undefined,
+      reason,
+      duration: process?.startedAt
+        ? Date.now() - process.startedAt.getTime()
+        : 0,
+      timestamp: event.timestamp,
+    };
+
+    try {
+      await this.notificationService?.markSessionNeedsReview(
+        event.sessionId,
+        event.timestamp,
+      );
+    } catch (error) {
+      console.error("[PushNotifier] Failed to update badge state:", error);
+    }
+    this.sessionsWithHaltedNotification.add(event.sessionId);
+
+    if (
+      this.pushService.getSubscriptionCount() === 0 &&
+      (this.nativePushService?.getSubscriptionCount() ?? 0) === 0
+    ) {
+      return;
+    }
+
+    try {
+      const connectedIds =
+        this.connectedBrowsers?.getConnectedBrowserProfileIds() ?? [];
+      const results = await this.pushService.sendToAll(payload, {
+        excludeBrowserProfileIds: connectedIds,
+      });
+      const nativeResults =
+        (await this.nativePushService?.sendToAll(payload, {
+          excludeBrowserProfileIds: connectedIds,
+        })) ?? [];
+      const successCount = [...results, ...nativeResults].filter(
+        (r) => r.success,
+      ).length;
+      const totalCount = results.length + nativeResults.length;
+      if (successCount > 0) {
+        console.log(
+          `[PushNotifier] Sent session-halted notification to ${successCount}/${totalCount} devices`,
+        );
+      }
+    } catch (error) {
+      console.error(
+        "[PushNotifier] Failed to send session-halted notification:",
+        error,
+      );
     }
   }
 
@@ -192,6 +363,33 @@ export class PushNotifier {
       return `${prompt.slice(0, 57)}...`;
     }
     return prompt;
+  }
+
+  private getSessionTitle(
+    process: NonNullable<ReturnType<Supervisor["getProcessForSession"]>>,
+  ): string | undefined {
+    const historyReader = (
+      process as {
+        getMessageHistory?: () => Array<{
+          type?: string;
+          message?: { content?: unknown };
+        }>;
+      }
+    ).getMessageHistory;
+    if (typeof historyReader !== "function") return undefined;
+
+    const firstUser = historyReader.call(process).find((message) => {
+      return (
+        message.type === "user" && typeof message.message?.content === "string"
+      );
+    });
+    const content = firstUser?.message?.content;
+    if (typeof content !== "string") return undefined;
+    const normalized = content.replace(/\s+/g, " ").trim();
+    if (!normalized) return undefined;
+    return normalized.length <= 120
+      ? normalized
+      : `${normalized.slice(0, 117)}...`;
   }
 
   /**

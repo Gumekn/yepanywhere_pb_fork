@@ -106,6 +106,7 @@ describe("Inbox Routes", () => {
         (sessionId: string, _updatedAt: string) =>
           unreadMap.get(sessionId) ?? false,
       ),
+      getSessionsNeedingReview: vi.fn(() => []),
     } as unknown as NotificationService;
 
     // Mock session index service
@@ -391,6 +392,104 @@ describe("Inbox Routes", () => {
       expect(result.active[0].sessionId).toBe("sess1");
       expect(result.recentActivity).toHaveLength(0);
       expect(result.unread8h).toHaveLength(0);
+    });
+  });
+
+  describe("badgeCount", () => {
+    it("does not count ordinary historical unread sessions", async () => {
+      const project = createProject("proj1", "myproject", "/sessions/proj1");
+      const session = createSession("sess1", "proj1", hoursAgo(4));
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+      unreadMap.set("sess1", true);
+
+      const result = await makeRequest({
+        scanner: mockScanner,
+        readerFactory: mockReaderFactory,
+        supervisor: mockSupervisor,
+        notificationService: mockNotificationService,
+        sessionIndexService: mockSessionIndexService,
+      });
+
+      expect(result.unread8h.map((item) => item.sessionId)).toEqual(["sess1"]);
+      expect(result.badgeCount).toBe(0);
+    });
+
+    it("counts sessions needing attention", async () => {
+      const project = createProject("proj1", "myproject", "/sessions/proj1");
+      const session = createSession("sess1", "proj1", minutesAgo(5));
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+      processMap.set("sess1", {
+        getPendingInputRequest: () => ({
+          type: "user-question",
+          id: "req1",
+          prompt: "Question?",
+        }),
+        state: { type: "waiting-input" },
+      });
+
+      const result = await makeRequest({
+        scanner: mockScanner,
+        readerFactory: mockReaderFactory,
+        supervisor: mockSupervisor,
+        notificationService: mockNotificationService,
+        sessionIndexService: mockSessionIndexService,
+      });
+
+      expect(result.badgeCount).toBe(1);
+    });
+
+    it("counts notification-backed sessions needing review", async () => {
+      const project = createProject("proj1", "myproject", "/sessions/proj1");
+      const session = createSession("sess1", "proj1", minutesAgo(45));
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+      vi.mocked(
+        mockNotificationService.getSessionsNeedingReview,
+      ).mockReturnValue(["sess1", "missing-session"]);
+
+      const result = await makeRequest({
+        scanner: mockScanner,
+        readerFactory: mockReaderFactory,
+        supervisor: mockSupervisor,
+        notificationService: mockNotificationService,
+        sessionIndexService: mockSessionIndexService,
+      });
+
+      expect(result.badgeCount).toBe(1);
+    });
+
+    it("deduplicates sessions that are both attention and review items", async () => {
+      const project = createProject("proj1", "myproject", "/sessions/proj1");
+      const session = createSession("sess1", "proj1", minutesAgo(5));
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+      processMap.set("sess1", {
+        getPendingInputRequest: () => ({
+          type: "tool-approval",
+          id: "req1",
+          prompt: "Allow?",
+        }),
+        state: { type: "waiting-input" },
+      });
+      vi.mocked(
+        mockNotificationService.getSessionsNeedingReview,
+      ).mockReturnValue(["sess1"]);
+
+      const result = await makeRequest({
+        scanner: mockScanner,
+        readerFactory: mockReaderFactory,
+        supervisor: mockSupervisor,
+        notificationService: mockNotificationService,
+        sessionIndexService: mockSessionIndexService,
+      });
+
+      expect(result.badgeCount).toBe(1);
     });
   });
 

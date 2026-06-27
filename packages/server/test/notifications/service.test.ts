@@ -40,8 +40,9 @@ describe("NotificationService", () => {
         "utf-8",
       );
       const state = JSON.parse(content);
-      expect(state.version).toBe(1);
+      expect(state.version).toBe(2);
       expect(state.lastSeen["session-1"]).toBeDefined();
+      expect(state.needsReview).toEqual({});
     });
 
     it("loads existing state from JSON file", async () => {
@@ -69,6 +70,7 @@ describe("NotificationService", () => {
         timestamp: "2024-01-02T00:00:00Z",
         messageId: "msg-123",
       });
+      expect(service.getSessionsNeedingReview()).toEqual([]);
     });
 
     it("handles corrupted JSON gracefully", async () => {
@@ -82,6 +84,7 @@ describe("NotificationService", () => {
 
       // Should start fresh
       expect(service.getAllLastSeen()).toEqual({});
+      expect(service.getSessionsNeedingReview()).toEqual([]);
     });
   });
 
@@ -146,6 +149,19 @@ describe("NotificationService", () => {
       });
     });
 
+    it("clears needs-review state even when lastSeen is already newer", async () => {
+      await service.initialize();
+
+      await service.markSeen("session-1", "2024-06-15T12:00:00Z");
+      await service.markSessionNeedsReview("session-1", "2024-06-15T12:30:00Z");
+      await service.markSeen("session-1", "2024-06-15T11:00:00Z");
+
+      expect(service.getLastSeen("session-1")).toEqual({
+        timestamp: "2024-06-15T12:00:00Z",
+      });
+      expect(service.getSessionsNeedingReview()).toEqual([]);
+    });
+
     it("updates if new timestamp is newer", async () => {
       await service.initialize();
 
@@ -194,14 +210,73 @@ describe("NotificationService", () => {
     });
   });
 
+  describe("needs-review badge state", () => {
+    it("marks sessions as needing review", async () => {
+      await service.initialize();
+
+      await service.markSessionNeedsReview("session-1", "2024-06-15T12:00:00Z");
+
+      expect(service.getSessionsNeedingReview()).toEqual(["session-1"]);
+    });
+
+    it("persists needs-review sessions", async () => {
+      await service.initialize();
+
+      await service.markSessionNeedsReview("session-1", "2024-06-15T12:00:00Z");
+
+      const newService = new NotificationService({ dataDir: testDir });
+      await newService.initialize();
+
+      expect(newService.getSessionsNeedingReview()).toEqual(["session-1"]);
+    });
+
+    it("does not replace newer needs-review timestamps", async () => {
+      await service.initialize();
+
+      await service.markSessionNeedsReview("session-1", "2024-06-15T12:00:00Z");
+      await service.markSessionNeedsReview("session-1", "2024-06-15T11:00:00Z");
+
+      const persisted = JSON.parse(
+        await fs.readFile(join(testDir, "notifications.json"), "utf-8"),
+      ) as {
+        needsReview: Record<string, { timestamp: string }>;
+      };
+      expect(persisted.needsReview["session-1"]).toEqual({
+        reason: "session-halted",
+        timestamp: "2024-06-15T12:00:00Z",
+      });
+    });
+
+    it("clears needs-review state independently of lastSeen", async () => {
+      await service.initialize();
+
+      await service.markSessionNeedsReview("session-1", "2024-06-15T12:00:00Z");
+      await service.clearSessionNeedsReview("session-1");
+
+      expect(service.getSessionsNeedingReview()).toEqual([]);
+      expect(service.getLastSeen("session-1")).toBeUndefined();
+    });
+
+    it("clears needs-review state when marking seen", async () => {
+      await service.initialize();
+
+      await service.markSessionNeedsReview("session-1", "2024-06-15T12:00:00Z");
+      await service.markSeen("session-1", "2024-06-15T12:01:00Z");
+
+      expect(service.getSessionsNeedingReview()).toEqual([]);
+    });
+  });
+
   describe("clearSession", () => {
     it("removes lastSeen entry for session", async () => {
       await service.initialize();
 
       await service.markSeen("session-1", "2024-06-15T12:00:00Z");
+      await service.markSessionNeedsReview("session-1", "2024-06-15T12:30:00Z");
       await service.clearSession("session-1");
 
       expect(service.getLastSeen("session-1")).toBeUndefined();
+      expect(service.getSessionsNeedingReview()).toEqual([]);
     });
 
     it("persists removal to disk", async () => {

@@ -49,7 +49,11 @@ import { NotificationService } from "./notifications/index.js";
 import { CodexSessionScanner } from "./projects/codex-scanner.js";
 import { GeminiSessionScanner } from "./projects/gemini-scanner.js";
 import { ProjectScanner } from "./projects/scanner.js";
-import { PushService, getOrCreateVapidKeys } from "./push/index.js";
+import {
+  NativePushService,
+  PushService,
+  getOrCreateVapidKeys,
+} from "./push/index.js";
 import { RecentsService } from "./recents/index.js";
 import { createUploadRoutes } from "./routes/upload.js";
 import { createWsRoutes } from "./routes/ws.js";
@@ -406,6 +410,7 @@ const sessionContentIndexService = new SessionContentIndexService({
   eventBus,
 });
 const pushService = new PushService({ dataDir: config.dataDir });
+const nativePushService = new NativePushService({ dataDir: config.dataDir });
 const browserProfileService = new BrowserProfileService({
   dataDir: config.dataDir,
 });
@@ -463,6 +468,7 @@ async function startServer() {
   await sessionContentIndexService.initialize();
   await sessionArchiveService.initialize();
   await pushService.initialize();
+  await nativePushService.initialize();
   await browserProfileService.initialize();
   await recentsService.initialize();
   await authService.initialize();
@@ -503,6 +509,9 @@ async function startServer() {
   const vapidKeys = await getOrCreateVapidKeys();
   pushService.setVapidKeys(vapidKeys);
   console.log("[Push] VAPID keys loaded, push notifications enabled");
+  console.log(
+    `[Push] Native Android push ${nativePushService.isConfigured() ? "enabled" : "disabled (FCM credentials not configured)"}`,
+  );
 
   // Determine if we're in production mode (no Vite dev server)
   const isProduction = process.env.NODE_ENV === "production";
@@ -577,6 +586,7 @@ async function startServer() {
     maxWorkers: config.maxWorkers,
     idlePreemptThresholdMs: config.idlePreemptThresholdMs,
     pushService,
+    nativePushService,
     recentsService,
     authService,
     authDisabled: config.authDisabled,

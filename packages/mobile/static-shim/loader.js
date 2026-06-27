@@ -3,6 +3,9 @@
   var CHANNEL_STATUS_MESSAGE = "yep-anywhere:mobile-shell-channel";
   var GET_CHANNEL_MESSAGE = "yep-anywhere:mobile-shell-get-channel";
   var SET_CHANNEL_MESSAGE = "yep-anywhere:mobile-shell-set-channel";
+  var NATIVE_PUSH_REQUEST_MESSAGE = "yep-anywhere:native-push-request";
+  var NATIVE_PUSH_RESPONSE_MESSAGE = "yep-anywhere:native-push-response";
+  var NATIVE_PUSH_DEBUG_MESSAGE = "yep-anywhere:native-push-debug";
   var CHANNEL_STORAGE_KEY = "yep-anywhere-mobile-channel";
   var ACTIVE_NODE_STORAGE_KEY = "yep-anywhere-mobile-active-node";
   var NODE_HISTORY_STORAGE_KEY = "yep-anywhere-mobile-node-history";
@@ -32,6 +35,29 @@
   var slowStatusTimer = null;
   var activeChannel = DEFAULT_CHANNEL;
   var activeTarget = null;
+  var pendingNativePushFrames = {};
+
+  function logNativePush(message) {
+    try {
+      if (
+        window.YepNativePush &&
+        typeof window.YepNativePush.log === "function"
+      ) {
+        window.YepNativePush.log(message);
+        return;
+      }
+    } catch (_err) {
+      // Keep diagnostics best-effort only.
+    }
+
+    try {
+      if (window.console && typeof window.console.log === "function") {
+        window.console.log("[YepNativePush] " + message);
+      }
+    } catch (_err) {
+      // Ignore console failures in restricted WebView modes.
+    }
+  }
 
   function isValidChannel(channel) {
     return Object.prototype.hasOwnProperty.call(CHANNELS, channel);
@@ -215,8 +241,35 @@
     return url.toString();
   }
 
+  function configureNativeSessionWatcher(target) {
+    if (!target || !target.origin) return;
+    try {
+      if (
+        window.YepNativePush &&
+        typeof window.YepNativePush.configureSessionWatcher === "function"
+      ) {
+        logNativePush("configure session watcher origin=" + target.origin);
+        window.YepNativePush.configureSessionWatcher(target.origin);
+      }
+    } catch (error) {
+      logNativePush(
+        "configure session watcher failed: " +
+          (error && error.message ? error.message : "unknown")
+      );
+    }
+  }
+
   function getFramePathFromMessage(data) {
     return data && typeof data.path === "string" ? data.path : null;
+  }
+
+  function getPendingNativePushPath() {
+    var path =
+      typeof window.__yepPendingNativePushPath === "string"
+        ? window.__yepPendingNativePushPath
+        : null;
+    window.__yepPendingNativePushPath = null;
+    return path;
   }
 
   function getNodeFromMessage(data) {
@@ -359,6 +412,7 @@
     if (!target) target = targetFromChannel(DEFAULT_CHANNEL);
     activeTarget = target;
     activeChannel = target.channel;
+    configureNativeSessionWatcher(target);
 
     if (!options || options.persist !== false) {
       storeChannel(target.channel);
@@ -383,6 +437,153 @@
     frame.src = getFrameUrl(target, options && options.path);
     updateSlowStatus();
     renderConnectionControls();
+  }
+
+  window.__yepOpenNativePushPath = function (path) {
+    if (typeof path !== "string" || path.charAt(0) !== "/") return;
+    loadTarget(activeTarget || getStoredTarget() || targetFromChannel(DEFAULT_CHANNEL), {
+      path: path,
+      persist: false
+    });
+  };
+
+  function postNativePushResponse(targetWindow, id, ok, result, error) {
+    if (!targetWindow || !id) return;
+    logNativePush(
+      "post response id=" +
+        id +
+        " ok=" +
+        (!!ok ? "true" : "false") +
+        " error=" +
+        (error || "null")
+    );
+    targetWindow.postMessage(
+      {
+        type: NATIVE_PUSH_RESPONSE_MESSAGE,
+        id: id,
+        ok: !!ok,
+        result: result || null,
+        error: error || null
+      },
+      "*"
+    );
+  }
+
+  window.__yepNativePushResolve = function (id, responseJson) {
+    var targetWindow = pendingNativePushFrames[id];
+    delete pendingNativePushFrames[id];
+    logNativePush(
+      "resolve from native id=" + id + " hasTarget=" + (!!targetWindow ? "true" : "false")
+    );
+
+    var response;
+    try {
+      response =
+        typeof responseJson === "string"
+          ? JSON.parse(responseJson)
+          : responseJson;
+    } catch (error) {
+      logNativePush("resolve parse failed id=" + id);
+      postNativePushResponse(
+        targetWindow,
+        id,
+        false,
+        null,
+        "Invalid native push response"
+      );
+      return;
+    }
+
+    logNativePush(
+      "resolve parsed id=" +
+        id +
+        " ok=" +
+        (response && response.ok ? "true" : "false") +
+        " error=" +
+        ((response && response.error) || "null")
+    );
+    postNativePushResponse(
+      targetWindow,
+      id,
+      response && response.ok,
+      response && response.result,
+      response && response.error
+    );
+  };
+
+  function handleNativePushRequest(event) {
+    var data = event.data || {};
+    var id = typeof data.id === "string" ? data.id : null;
+    var method = typeof data.method === "string" ? data.method : null;
+    var bridge = window.YepNativePush;
+    logNativePush(
+      "request received id=" +
+        (id || "null") +
+        " method=" +
+        (method || "null") +
+        " hasBridge=" +
+        (!!bridge ? "true" : "false")
+    );
+
+    if (!id || !method || !bridge) {
+      postNativePushResponse(
+        event.source,
+        id,
+        false,
+        null,
+        "Android native push bridge unavailable"
+      );
+      return;
+    }
+
+    var bridgeMethod =
+      method === "status"
+        ? "getStatus"
+        : method === "requestPermission"
+          ? "requestPermission"
+          : method === "getToken"
+            ? "getToken"
+            : null;
+
+    if (!bridgeMethod || typeof bridge[bridgeMethod] !== "function") {
+      logNativePush(
+        "request unsupported id=" +
+          id +
+          " method=" +
+          method +
+          " bridgeMethod=" +
+          (bridgeMethod || "null")
+      );
+      postNativePushResponse(
+        event.source,
+        id,
+        false,
+        null,
+        "Unsupported native push method"
+      );
+      return;
+    }
+
+    pendingNativePushFrames[id] = event.source;
+    try {
+      logNativePush("calling native method id=" + id + " bridgeMethod=" + bridgeMethod);
+      bridge[bridgeMethod](id);
+    } catch (error) {
+      delete pendingNativePushFrames[id];
+      logNativePush(
+        "native call threw id=" +
+          id +
+          " message=" +
+          (error && error.message ? error.message : "unknown")
+      );
+      postNativePushResponse(
+        event.source,
+        id,
+        false,
+        null,
+        error && error.message ? error.message : "Native push bridge failed"
+      );
+    }
   }
 
   function loadChannel(channel, options) {
@@ -432,6 +633,16 @@
         if (event.source !== frame.contentWindow) return;
         if (!event.data) return;
 
+        if (event.data.type === NATIVE_PUSH_REQUEST_MESSAGE) {
+          handleNativePushRequest(event);
+          return;
+        }
+
+        if (event.data.type === NATIVE_PUSH_DEBUG_MESSAGE) {
+          logNativePush("client: " + (event.data.message || ""));
+          return;
+        }
+
         if (event.data.type === APP_READY_MESSAGE) {
           markLoaded();
           postChannelStatus();
@@ -461,7 +672,7 @@
       getRequestedTarget() ||
         getStoredTarget() ||
         targetFromChannel(DEFAULT_CHANNEL),
-      { persist: false }
+      { persist: false, path: getPendingNativePushPath() }
     );
   }
 

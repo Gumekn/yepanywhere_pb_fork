@@ -21,6 +21,8 @@ LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 LOG_DIR="${YEP_LAUNCHD_LOG_DIR:-$HOME/.yep-anywhere/logs}"
 USER_DOMAIN="gui/$(id -u)"
 START_NOW=true
+INSTALL_SERVER=true
+INSTALL_BRIDGE=true
 
 if [[ -t 1 ]]; then
   C_GREEN="\033[32m"; C_YELLOW="\033[33m"; C_RED="\033[31m"; C_DIM="\033[2m"; C_RESET="\033[0m"
@@ -38,7 +40,12 @@ usage() {
   cat <<'EOF'
 
 Usage:
-  scripts/install-launchagents.sh [--no-start]
+  scripts/install-launchagents.sh [--server-only|--bridge-only] [--no-start]
+
+Options:
+  --server-only                Write/reload only the 8022 server LaunchAgent
+  --bridge-only                Write/reload only the 4510 Codex bridge LaunchAgent
+  --no-start                   Write plist file(s) without unloading or starting LaunchAgents
 
 Environment overrides:
   YEP_DEPLOY_PORT              Main server port (default: 8022)
@@ -47,6 +54,10 @@ Environment overrides:
   YEP_LAUNCHD_NODE             Absolute node binary path
   YEP_LAUNCHD_PATH             PATH stored in the LaunchAgent environment
   YEP_LAUNCHD_LOG_DIR          LaunchAgent stdout/stderr log directory
+  YEP_FCM_SERVICE_ACCOUNT_FILE Firebase service account JSON path for Android native push
+  YEP_FCM_SERVICE_ACCOUNT_JSON Raw Firebase service account JSON for Android native push
+  GOOGLE_APPLICATION_CREDENTIALS
+                               Fallback Firebase service account JSON path
 EOF
 }
 
@@ -57,6 +68,16 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-start)
       START_NOW=false
+      shift
+      ;;
+    --server-only)
+      INSTALL_SERVER=true
+      INSTALL_BRIDGE=false
+      shift
+      ;;
+    --bridge-only)
+      INSTALL_SERVER=false
+      INSTALL_BRIDGE=true
       shift
       ;;
     -h|--help)
@@ -70,6 +91,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if ! $INSTALL_SERVER && ! $INSTALL_BRIDGE; then
+  err "Nothing to install: server and bridge are both disabled."
+  exit 2
+fi
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   err "LaunchAgents are only available on macOS."
@@ -90,6 +116,13 @@ fi
 if [[ ! -d "$REPO_ROOT/dist/npm-package/node_modules" ]]; then
   warn "Runtime dependencies are missing from dist/npm-package/node_modules."
   warn "Run scripts/deploy.sh --server-only before relying on the LaunchAgents."
+fi
+
+FCM_SERVICE_ACCOUNT_FILE="${YEP_FCM_SERVICE_ACCOUNT_FILE:-${GOOGLE_APPLICATION_CREDENTIALS:-}}"
+FCM_SERVICE_ACCOUNT_JSON="${YEP_FCM_SERVICE_ACCOUNT_JSON:-}"
+if [[ -n "$FCM_SERVICE_ACCOUNT_FILE" && ! -f "$FCM_SERVICE_ACCOUNT_FILE" ]]; then
+  err "FCM service account file does not exist: $FCM_SERVICE_ACCOUNT_FILE"
+  exit 1
 fi
 
 chmod +x "$CLI_JS" 2>/dev/null || true
@@ -184,15 +217,24 @@ write_bridge_plist() {
 
 write_server_plist() {
   local plist="$LAUNCH_AGENTS_DIR/$SERVER_LABEL.plist"
-  write_header "$plist" "$SERVER_LABEL" "$LOG_DIR/server-launchd.out.log" "$LOG_DIR/server-launchd.err.log"
-  append_env "$plist" \
-    "NODE_ENV" "production" \
-    "PATH" "$LAUNCHD_PATH" \
-    "BASE_PATH" "$SERVER_BASE_PATH" \
-    "YEP_DEPLOY_REPO_ROOT" "$REPO_ROOT" \
-    "YEP_CODEX_BRIDGE_MODE" "external" \
-    "YEP_CODEX_BRIDGE_CONTROL_URL" "$BRIDGE_URL" \
+  local env_args=(
+    "NODE_ENV" "production"
+    "PATH" "$LAUNCHD_PATH"
+    "BASE_PATH" "$SERVER_BASE_PATH"
+    "YEP_DEPLOY_REPO_ROOT" "$REPO_ROOT"
+    "YEP_CODEX_BRIDGE_MODE" "external"
+    "YEP_CODEX_BRIDGE_CONTROL_URL" "$BRIDGE_URL"
     "YEP_CODEX_BRIDGE_PORT" "$BRIDGE_PORT"
+  )
+
+  if [[ -n "$FCM_SERVICE_ACCOUNT_FILE" ]]; then
+    env_args+=("YEP_FCM_SERVICE_ACCOUNT_FILE" "$FCM_SERVICE_ACCOUNT_FILE")
+  elif [[ -n "$FCM_SERVICE_ACCOUNT_JSON" ]]; then
+    env_args+=("YEP_FCM_SERVICE_ACCOUNT_JSON" "$FCM_SERVICE_ACCOUNT_JSON")
+  fi
+
+  write_header "$plist" "$SERVER_LABEL" "$LOG_DIR/server-launchd.out.log" "$LOG_DIR/server-launchd.err.log"
+  append_env "$plist" "${env_args[@]}"
   append_program_arguments "$plist" "$NODE_BIN" "$CLI_JS" "--port" "$SERVER_PORT"
   echo "$plist"
 }
@@ -201,26 +243,48 @@ reload_agent() {
   local label="$1"
   local plist="$2"
 
-  launchctl bootout "$USER_DOMAIN/$label" >/dev/null 2>&1 || true
-  launchctl bootout "$USER_DOMAIN" "$plist" >/dev/null 2>&1 || true
   if ! $START_NOW; then
-    dim "wrote $plist; it will load at next login"
+    dim "wrote $plist; active LaunchAgent was not reloaded"
     return
   fi
+  launchctl bootout "$USER_DOMAIN/$label" >/dev/null 2>&1 || true
+  launchctl bootout "$USER_DOMAIN" "$plist" >/dev/null 2>&1 || true
   launchctl bootstrap "$USER_DOMAIN" "$plist"
   launchctl enable "$USER_DOMAIN/$label"
   launchctl kickstart -k "$USER_DOMAIN/$label"
 }
 
 log "Installing Yep Anywhere LaunchAgents ..."
-BRIDGE_PLIST="$(write_bridge_plist)"
-SERVER_PLIST="$(write_server_plist)"
 
-reload_agent "$BRIDGE_LABEL" "$BRIDGE_PLIST"
-reload_agent "$SERVER_LABEL" "$SERVER_PLIST"
+if $INSTALL_BRIDGE; then
+  BRIDGE_PLIST="$(write_bridge_plist)"
+  reload_agent "$BRIDGE_LABEL" "$BRIDGE_PLIST"
+fi
+
+if $INSTALL_SERVER; then
+  SERVER_PLIST="$(write_server_plist)"
+  reload_agent "$SERVER_LABEL" "$SERVER_PLIST"
+fi
 
 log "Installed LaunchAgents."
-dim "server: $SERVER_LABEL -> http://127.0.0.1:${SERVER_PORT}${SERVER_BASE_PATH}"
-dim "bridge: $BRIDGE_LABEL -> $BRIDGE_URL"
+if $INSTALL_SERVER; then
+  dim "server: $SERVER_LABEL -> http://127.0.0.1:${SERVER_PORT}${SERVER_BASE_PATH}"
+else
+  dim "server: skipped"
+fi
+if $INSTALL_BRIDGE; then
+  dim "bridge: $BRIDGE_LABEL -> $BRIDGE_URL"
+else
+  dim "bridge: skipped"
+fi
 dim "logs:   $LOG_DIR/*-launchd.*.log"
+if $INSTALL_SERVER; then
+  if [[ -n "$FCM_SERVICE_ACCOUNT_FILE" ]]; then
+    dim "native push: server FCM credentials from $FCM_SERVICE_ACCOUNT_FILE"
+  elif [[ -n "$FCM_SERVICE_ACCOUNT_JSON" ]]; then
+    dim "native push: server FCM credentials from YEP_FCM_SERVICE_ACCOUNT_JSON"
+  else
+    warn "native push: no server FCM credentials were stored in the server LaunchAgent."
+  fi
+fi
 dim "KeepAlive is intentionally not set; these agents start at login only."
