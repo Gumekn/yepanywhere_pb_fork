@@ -82,6 +82,7 @@ import { createSettingsRoutes } from "./routes/settings.js";
 import { createSharingRoutes } from "./routes/sharing.js";
 import { ClaudeOllamaProvider } from "./sdk/providers/claude-ollama.js";
 
+import { createLocalFileRoutes } from "./routes/local-file.js";
 import { createLocalImageRoutes } from "./routes/local-image.js";
 import { type UploadDeps, createUploadRoutes } from "./routes/upload.js";
 import { createVersionRoutes } from "./routes/version.js";
@@ -201,6 +202,8 @@ export interface AppOptions {
   voiceInputEnabled?: boolean;
   /** Allowed directory prefixes for serving local images. Default: ["/tmp"] */
   allowedImagePaths?: string[];
+  /** Allowed directory prefixes for serving local markdown/text files. */
+  allowedLocalFilePaths?: string[];
   /** Directory containing Markdown report documents for the Reports page. */
   reportsDir?: string;
   /**
@@ -1044,6 +1047,19 @@ export function createApp(options: AppOptions): AppResult {
       "/api/local-image",
       createLocalImageRoutes({
         allowedPaths: options.allowedImagePaths,
+      }),
+    );
+  }
+
+  // Local markdown/text file serving (opt-in, restricted to allowed paths)
+  if (
+    options.allowedLocalFilePaths &&
+    options.allowedLocalFilePaths.length > 0
+  ) {
+    app.route(
+      "/api/local-file",
+      createLocalFileRoutes({
+        allowedPaths: options.allowedLocalFilePaths,
       }),
     );
   }

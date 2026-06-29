@@ -5,8 +5,16 @@ import { useStreamingMarkdownContext } from "../../contexts/StreamingMarkdownCon
 import { useStreamingMarkdown } from "../../hooks/useStreamingMarkdown";
 import { appPath } from "../../lib/apiPath";
 import { getSelectionAwareCopyText } from "../../lib/clipboard";
-import { splitTextWithFilePaths } from "../../lib/filePathDetection";
+import {
+  parseLineColumn,
+  splitTextWithFilePaths,
+} from "../../lib/filePathDetection";
 import { FileViewerModal } from "../FilePathLink";
+import {
+  LocalFileModal,
+  type LocalFileTarget,
+  extractLocalFileTargetFromUrl,
+} from "../LocalFileModal";
 import {
   LocalMediaModal,
   extractPathFromLocalImageUrl,
@@ -32,6 +40,39 @@ function getProjectRelativePath(
 
 function isModifiedClick(e: React.MouseEvent): boolean {
   return e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
+}
+
+function parseOptionalNumber(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function getLocalFileTarget(anchor: HTMLAnchorElement): LocalFileTarget | null {
+  const datasetPath = anchor.dataset.filePath;
+  if (datasetPath) {
+    return {
+      path: datasetPath,
+      lineNumber: parseOptionalNumber(anchor.dataset.line),
+      columnNumber: parseOptionalNumber(anchor.dataset.column),
+    };
+  }
+
+  const href = anchor.getAttribute("href");
+  if (!href) return null;
+
+  const localFileTarget = extractLocalFileTargetFromUrl(href);
+  if (localFileTarget) return localFileTarget;
+
+  const legacyLocalImagePath = extractPathFromLocalImageUrl(href);
+  if (!legacyLocalImagePath) return null;
+
+  const parsed = parseLineColumn(legacyLocalImagePath);
+  return {
+    path: parsed.path,
+    lineNumber: parsed.line,
+    columnNumber: parsed.column,
+  };
 }
 
 const IMAGE_EXTENSIONS = new Set([
@@ -99,7 +140,13 @@ export const TextBlock = memo(function TextBlock({
   augmentHtml,
 }: Props) {
   const [copied, setCopied] = useState(false);
-  const [fileModal, setFileModal] = useState<{ filePath: string } | null>(null);
+  const [fileModal, setFileModal] = useState<{
+    filePath: string;
+    lineNumber?: number;
+  } | null>(null);
+  const [localFileModal, setLocalFileModal] = useState<LocalFileTarget | null>(
+    null,
+  );
   const blockRef = useRef<HTMLDivElement | null>(null);
   const sessionMetadata = useOptionalSessionMetadata();
 
@@ -167,19 +214,17 @@ export const TextBlock = memo(function TextBlock({
       const href = target.getAttribute("href");
       if (!href) return;
 
-      const absoluteFilePath = extractPathFromLocalImageUrl(href);
-      if (!absoluteFilePath) return;
+      const localFileTarget = getLocalFileTarget(target);
+      if (!localFileTarget) return;
 
       const relativePath = getProjectRelativePath(
-        absoluteFilePath,
+        localFileTarget.path,
         sessionMetadata?.projectPath,
       );
       if (!relativePath || !sessionMetadata?.projectId) {
-        if (href.startsWith("/api/")) {
-          e.preventDefault();
-          e.stopPropagation();
-          window.location.assign(appPath(href));
-        }
+        e.preventDefault();
+        e.stopPropagation();
+        setLocalFileModal(localFileTarget);
         return;
       }
 
@@ -196,7 +241,10 @@ export const TextBlock = memo(function TextBlock({
         return;
       }
 
-      setFileModal({ filePath: relativePath });
+      setFileModal({
+        filePath: relativePath,
+        lineNumber: localFileTarget.lineNumber,
+      });
     },
     [handleLocalMediaClick, sessionMetadata],
   );
@@ -260,10 +308,19 @@ export const TextBlock = memo(function TextBlock({
           <FileViewerModal
             projectId={sessionMetadata.projectId}
             filePath={fileModal.filePath}
+            lineNumber={fileModal.lineNumber}
             onClose={() => setFileModal(null)}
           />,
           document.body,
         )}
+      {localFileModal && (
+        <LocalFileModal
+          path={localFileModal.path}
+          lineNumber={localFileModal.lineNumber}
+          columnNumber={localFileModal.columnNumber}
+          onClose={() => setLocalFileModal(null)}
+        />
+      )}
     </div>
   );
 });

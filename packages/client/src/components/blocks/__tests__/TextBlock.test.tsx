@@ -106,6 +106,52 @@ describe("TextBlock", () => {
     expect(await screen.findByText("corrected transcript")).toBeTruthy();
   });
 
+  it("opens project-external local markdown links in the local file modal", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            metadata: {
+              path: "/Users/yueyuan/.codex/AGENTS.md",
+              size: 27,
+              mimeType: "text/markdown",
+              isText: true,
+            },
+            content: "# Global Agents\n\nUse rg first.",
+            rawUrl:
+              "/api/local-file?path=%2FUsers%2Fyueyuan%2F.codex%2FAGENTS.md",
+            lineNumber: 3,
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      ),
+    );
+
+    renderWithSessionMetadata(
+      <TextBlock
+        text=""
+        augmentHtml={
+          '<p><a href="/api/local-file?path=%2FUsers%2Fyueyuan%2F.codex%2FAGENTS.md&amp;line=3" class="local-file-link" data-file-path="/Users/yueyuan/.codex/AGENTS.md" data-line="3">~/.codex/AGENTS.md</a></p>'
+        }
+      />,
+    );
+
+    fireEvent.click(screen.getByText("~/.codex/AGENTS.md"));
+
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        "/api/local-file?path=%2FUsers%2Fyueyuan%2F.codex%2FAGENTS.md&line=3",
+        { credentials: "include" },
+      );
+    });
+    expect(await screen.findByText("Use rg first.")).toBeTruthy();
+    expect(api.getFile).not.toHaveBeenCalled();
+  });
+
   it("linkifies plain local image paths and opens the media modal", async () => {
     vi.stubGlobal(
       "fetch",

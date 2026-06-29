@@ -66,6 +66,19 @@ describe("loadConfig codex paths", () => {
     ]);
   });
 
+  it("allows Codex home and configured roots for local text files", async () => {
+    vi.stubEnv("CODEX_HOME", "/tmp/codex-home");
+    vi.stubEnv("ALLOWED_LOCAL_FILE_PATHS", "/tmp/reports, /tmp/reports");
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.allowedLocalFilePaths).toEqual([
+      "/tmp/codex-home",
+      "/tmp/reports",
+    ]);
+  });
+
   it("uses light and clear Codex bridge upstream args by default and keeps full profile unrestricted", async () => {
     vi.stubEnv("YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS", undefined);
     vi.stubEnv("YEP_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS", undefined);

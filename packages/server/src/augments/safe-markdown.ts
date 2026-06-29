@@ -1,4 +1,4 @@
-import { splitTextWithFilePaths } from "@yep-anywhere/shared";
+import { parseLineColumn, splitTextWithFilePaths } from "@yep-anywhere/shared";
 import {
   Marked,
   type RendererObject,
@@ -53,10 +53,21 @@ function getFileName(path: string): string {
 }
 
 /**
- * Rewrite a local file path to the local-image API endpoint.
+ * Rewrite a local media path to the local-image API endpoint.
  */
-function localFileApiUrl(path: string): string {
+function localMediaApiUrl(path: string): string {
   return `/api/local-image?path=${encodeURIComponent(path.trim())}`;
+}
+
+function localTextFileApiUrl(
+  path: string,
+  line?: number,
+  column?: number,
+): string {
+  const params = new URLSearchParams({ path: path.trim() });
+  if (line !== undefined) params.set("line", String(line));
+  if (column !== undefined) params.set("column", String(column));
+  return `/api/local-file?${params.toString()}`;
 }
 
 /**
@@ -68,11 +79,36 @@ function renderLocalMediaLink(
   label: string,
   ext: string,
 ): string {
-  const apiUrl = escapeHtml(localFileApiUrl(path));
+  const apiUrl = escapeHtml(localMediaApiUrl(path));
   const escapedLabel = escapeHtml(label || getFileName(path));
   const mediaType = VIDEO_EXTENSIONS.has(ext) ? "video" : "image";
   const typeLabel = VIDEO_EXTENSIONS.has(ext) ? "video" : "image";
   return `<a href="${apiUrl}" class="local-media-link" data-media-type="${mediaType}">${escapedLabel}<span class="local-media-type">(${typeLabel})</span></a>`;
+}
+
+/**
+ * Render a local text file link without routing it through the media endpoint.
+ * The client maps project-local paths to FileViewer and can fetch configured
+ * local text files through /api/local-file.
+ */
+function renderLocalTextFileLink(
+  rawPath: string,
+  renderedText: string,
+  title?: string | null,
+): string {
+  const parsed = parseLineColumn(rawPath.trim());
+  const apiUrl = escapeHtml(
+    localTextFileApiUrl(parsed.path, parsed.line, parsed.column),
+  );
+  const dataAttrs = [
+    `data-file-path="${escapeHtml(parsed.path)}"`,
+    parsed.line !== undefined ? `data-line="${parsed.line}"` : "",
+    parsed.column !== undefined ? `data-column="${parsed.column}"` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+  return `<a href="${apiUrl}" class="local-file-link" ${dataAttrs}${titleAttr}>${renderedText}</a>`;
 }
 
 function renderTextWithLocalMediaLinks(text: string): string {
@@ -129,7 +165,15 @@ const MARKDOWN_SANITIZE_OPTIONS = {
     "ul",
   ],
   allowedAttributes: {
-    a: ["href", "title", "class", "data-media-type"],
+    a: [
+      "href",
+      "title",
+      "class",
+      "data-media-type",
+      "data-file-path",
+      "data-line",
+      "data-column",
+    ],
     code: ["class"],
     img: ["src", "alt", "title"],
     input: ["type", "checked", "disabled"],
@@ -168,10 +212,7 @@ const renderer: RendererObject<string, string> = {
       if (MEDIA_EXTENSIONS.has(ext)) {
         return renderLocalMediaLink(href, renderedText, ext);
       }
-      // Other local file — render as a link to the API
-      const apiUrl = escapeHtml(localFileApiUrl(href));
-      const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
-      return `<a href="${apiUrl}"${titleAttr}>${renderedText}</a>`;
+      return renderLocalTextFileLink(href, renderedText, title);
     }
 
     const safeHref = sanitizeUrl(href);
@@ -270,5 +311,6 @@ export {
   MEDIA_EXTENSIONS,
   VIDEO_EXTENSIONS,
   isLocalFilePath,
-  localFileApiUrl,
+  localMediaApiUrl,
+  localTextFileApiUrl,
 };

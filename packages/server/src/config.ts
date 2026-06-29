@@ -136,6 +136,8 @@ export interface Config {
   voiceInputEnabled: boolean;
   /** Allowed directory prefixes for serving local images (e.g., ["/tmp"]). Empty = disabled. */
   allowedImagePaths: string[];
+  /** Allowed directory prefixes for serving local markdown/text files. Empty = disabled. */
+  allowedLocalFilePaths: string[];
 
   /** Whether cookie-based auth is disabled by env var (--auth-disable or AUTH_DISABLED=true). Used for recovery. */
   authDisabled: boolean;
@@ -235,6 +237,13 @@ export function loadConfig(): Config {
     getDefaultCodexHomeDir(),
     "generated_images",
   );
+  const codexHomeDir = getDefaultCodexHomeDir();
+  const extraAllowedLocalFilePaths =
+    process.env.ALLOWED_LOCAL_FILE_PATHS !== undefined
+      ? process.env.ALLOWED_LOCAL_FILE_PATHS.split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
 
   return {
     dataDir,
@@ -344,6 +353,9 @@ export function loadConfig(): Config {
         codexGeneratedImagesDir,
         ...extraAllowedImagePaths,
       ]),
+    ),
+    allowedLocalFilePaths: Array.from(
+      new Set([codexHomeDir, ...extraAllowedLocalFilePaths]),
     ),
     // Auth disabled override (for recovery if user forgets password)
     authDisabled: process.env.AUTH_DISABLED === "true",

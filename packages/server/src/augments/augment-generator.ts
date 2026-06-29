@@ -6,6 +6,7 @@
  * formatting for pending/incomplete text during streaming.
  */
 
+import { parseLineColumn } from "@yep-anywhere/shared";
 import {
   type BundledLanguage,
   type Highlighter,
@@ -22,7 +23,8 @@ import {
   MEDIA_EXTENSIONS,
   VIDEO_EXTENSIONS,
   isLocalFilePath,
-  localFileApiUrl,
+  localMediaApiUrl,
+  localTextFileApiUrl,
   renderSafeMarkdown,
   sanitizeUrl,
 } from "./safe-markdown.js";
@@ -243,13 +245,24 @@ function renderInlineFormatting(text: string): string {
   result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, href) => {
     if (isLocalFilePath(href)) {
       const ext = (href.split(".").pop() ?? "").toLowerCase();
-      const apiUrl = escapeHtml(localFileApiUrl(href));
       if (MEDIA_EXTENSIONS.has(ext)) {
+        const apiUrl = escapeHtml(localMediaApiUrl(href));
         const mediaType = VIDEO_EXTENSIONS.has(ext) ? "video" : "image";
         const typeLabel = VIDEO_EXTENSIONS.has(ext) ? "video" : "image";
         return `<a href="${apiUrl}" class="local-media-link" data-media-type="${mediaType}">${label}<span class="local-media-type">(${typeLabel})</span></a>`;
       }
-      return `<a href="${apiUrl}">${label}</a>`;
+      const parsed = parseLineColumn(href);
+      const apiUrl = escapeHtml(
+        localTextFileApiUrl(parsed.path, parsed.line, parsed.column),
+      );
+      const dataAttrs = [
+        `data-file-path="${escapeHtml(parsed.path)}"`,
+        parsed.line !== undefined ? `data-line="${parsed.line}"` : "",
+        parsed.column !== undefined ? `data-column="${parsed.column}"` : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return `<a href="${apiUrl}" class="local-file-link" ${dataAttrs}>${label}</a>`;
     }
     const safeHref = sanitizeUrl(href);
     if (!safeHref) {

@@ -274,6 +274,27 @@ describe("AugmentGenerator", () => {
       );
       expect(augment.html).toContain("/tmp/kitten.png");
     });
+
+    it("renders local markdown file links through the local-file endpoint", async () => {
+      const block: CompletedBlock = {
+        type: "paragraph",
+        content: "See [AGENTS.md](/Users/yueyuan/.codex/AGENTS.md:9).",
+        startOffset: 0,
+        endOffset: 57,
+      };
+
+      const augment = await generator.processBlock(block, 0);
+
+      expect(augment.html).toContain('class="local-file-link"');
+      expect(augment.html).toContain(
+        'href="/api/local-file?path=%2FUsers%2Fyueyuan%2F.codex%2FAGENTS.md&amp;line=9"',
+      );
+      expect(augment.html).toContain(
+        'data-file-path="/Users/yueyuan/.codex/AGENTS.md"',
+      );
+      expect(augment.html).toContain('data-line="9"');
+      expect(augment.html).not.toContain("/api/local-image");
+    });
   });
 
   describe("renderPending", () => {
