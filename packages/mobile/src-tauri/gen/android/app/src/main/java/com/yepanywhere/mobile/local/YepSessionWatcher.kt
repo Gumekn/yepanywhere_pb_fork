@@ -134,6 +134,7 @@ class YepSessionWatcher(private val context: Context) {
     }
 
     for (session in visibleActive) {
+      if (notifiedRunning.contains(session.sessionId)) continue
       YepNativeNotifier.showRunning(appContext, session)
     }
 
