@@ -8,6 +8,7 @@ import { resolvePreferredProjectId } from "../hooks/useRecentProject";
 import { useRecentProjects } from "../hooks/useRecentProjects";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
+import { activityBus } from "../lib/activityBus";
 import { formatSmartTime } from "../lib/datetime";
 import { SessionListItem } from "./SessionListItem";
 import {
@@ -170,21 +171,53 @@ export function Sidebar({
     Set<string>
   >(() => new Set());
 
+  const refetchSessionLists = useCallback(async () => {
+    if (!shouldLoadSessionLists) return;
+
+    await Promise.all([refetchGlobalSessions(), refetchStarredSessions()]);
+  }, [refetchGlobalSessions, refetchStarredSessions, shouldLoadSessionLists]);
+
   const handleRefreshRecentSessions = useCallback(async () => {
-    if (!shouldLoadSessionLists || isRefreshingSessions) return;
+    if (isRefreshingSessions) return;
 
     setIsRefreshingSessions(true);
     try {
-      await Promise.all([refetchGlobalSessions(), refetchStarredSessions()]);
+      await refetchSessionLists();
     } finally {
       setIsRefreshingSessions(false);
     }
-  }, [
-    isRefreshingSessions,
-    refetchGlobalSessions,
-    refetchStarredSessions,
-    shouldLoadSessionLists,
-  ]);
+  }, [isRefreshingSessions, refetchSessionLists]);
+
+  useEffect(() => {
+    if (!shouldLoadSessionLists) return;
+
+    const unsubscribeMetadata = activityBus.on(
+      "session-metadata-changed",
+      (event) => {
+        if (
+          event.title === undefined &&
+          event.archived === undefined &&
+          event.starred === undefined
+        ) {
+          return;
+        }
+
+        void refetchSessionLists();
+      },
+    );
+    const unsubscribeReconnect = activityBus.on("reconnect", () => {
+      void refetchSessionLists();
+    });
+    const unsubscribeRefresh = activityBus.on("refresh", () => {
+      void refetchSessionLists();
+    });
+
+    return () => {
+      unsubscribeMetadata();
+      unsubscribeReconnect();
+      unsubscribeRefresh();
+    };
+  }, [refetchSessionLists, shouldLoadSessionLists]);
 
   const handleTouchStart = (e: React.TouchEvent) => {
     touchStartX.current = e.touches[0]?.clientX ?? null;
