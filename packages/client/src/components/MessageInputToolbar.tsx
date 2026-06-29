@@ -2,6 +2,7 @@ import type { UploadedFile } from "@yep-anywhere/shared";
 import { type RefObject, useState } from "react";
 import { useModelSettings } from "../hooks/useModelSettings";
 import { useI18n } from "../i18n";
+import type { AgentCommandConfig } from "../lib/agentCommands";
 import type { ContextUsage, PermissionMode } from "../types";
 import { ContextStatusModal } from "./ContextStatusModal";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
@@ -37,6 +38,7 @@ export interface MessageInputToolbarProps {
   commandLabel?: string;
   commands?: string[];
   showCommandButton?: boolean;
+  commandButtons?: AgentCommandConfig[];
   onSelectCommand?: (command: string) => void;
 
   // Context usage
@@ -82,6 +84,7 @@ export function MessageInputToolbar({
   commandLabel = "Commands",
   commands = [],
   showCommandButton = commands.length > 0,
+  commandButtons,
   onSelectCommand,
   contextUsage,
   projectId,
@@ -98,6 +101,18 @@ export function MessageInputToolbar({
   const { t } = useI18n();
   const { thinkingMode, cycleThinkingMode, thinkingLevel } = useModelSettings();
   const [isContextModalOpen, setIsContextModalOpen] = useState(false);
+  const visibleCommandButtons =
+    commandButtons?.filter((button) => button.showButton) ??
+    (showCommandButton
+      ? [
+          {
+            prefix: commandPrefix,
+            label: commandLabel,
+            showButton: true,
+            commands,
+          },
+        ]
+      : []);
 
   return (
     <div className="message-input-toolbar">
@@ -197,15 +212,17 @@ export function MessageInputToolbar({
             disabled={voiceDisabled}
           />
         )}
-        {showCommandButton && onSelectCommand && (
-          <SlashCommandButton
-            commands={commands}
-            onSelectCommand={onSelectCommand}
-            disabled={voiceDisabled}
-            prefix={commandPrefix}
-            label={commandLabel}
-          />
-        )}
+        {onSelectCommand &&
+          visibleCommandButtons.map((button) => (
+            <SlashCommandButton
+              key={button.prefix}
+              commands={button.commands}
+              onSelectCommand={onSelectCommand}
+              disabled={voiceDisabled}
+              prefix={button.prefix}
+              label={button.label}
+            />
+          ))}
       </div>
       <div className="message-input-actions">
         {/* Pending approval indicator */}

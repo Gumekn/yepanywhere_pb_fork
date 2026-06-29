@@ -39,10 +39,12 @@ import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useRemoteExecutors } from "../hooks/useRemoteExecutors";
 import { useServerSettings } from "../hooks/useServerSettings";
 import { useI18n } from "../i18n";
+import { getStaticAgentCommandConfigs } from "../lib/agentCommands";
 import { hasCoarsePointer } from "../lib/deviceDetection";
 import type { PermissionMode } from "../types";
 import { FilterDropdown, type FilterOption } from "./FilterDropdown";
 import { clearFabPrefill, getFabPrefill } from "./FloatingActionButton";
+import { SlashCommandButton } from "./SlashCommandButton";
 import { VoiceInputButton, type VoiceInputButtonRef } from "./VoiceInputButton";
 
 interface PendingFile {
@@ -223,6 +225,7 @@ export function NewSessionForm({
     selectedProviderInfo?.supportsPermissionMode ?? true;
   const supportsThinkingToggle =
     selectedProviderInfo?.supportsThinkingToggle ?? true;
+  const commandButtons = useMemo(() => getStaticAgentCommandConfigs(), []);
 
   // Initialize provider/model/mode from saved defaults once settings and providers load.
   useEffect(() => {
@@ -658,6 +661,43 @@ export function NewSessionForm({
     setInterimTranscript(transcript);
   }, []);
 
+  const insertIntoMessage = useCallback(
+    (insertText: string) => {
+      const textarea = textareaRef.current;
+      const start = textarea?.selectionStart ?? message.length;
+      const end = textarea?.selectionEnd ?? message.length;
+      const before = message.slice(0, start);
+      const after = message.slice(end);
+      const leading = before.length > 0 && !/\s$/.test(before) ? " " : "";
+      const trailing = after.length > 0 && !/^\s/.test(after) ? " " : " ";
+      const nextMessage = `${before}${leading}${insertText}${trailing}${after}`;
+      const nextCursor =
+        before.length + leading.length + insertText.length + trailing.length;
+
+      setInterimTranscript("");
+      setMessage(nextMessage);
+
+      const restoreFocus = () => {
+        textareaRef.current?.focus();
+        textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
+      };
+
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(restoreFocus);
+      } else {
+        setTimeout(restoreFocus, 0);
+      }
+    },
+    [message, setMessage],
+  );
+
+  const handleSelectCommand = useCallback(
+    (command: string) => {
+      insertIntoMessage(command);
+    },
+    [insertIntoMessage],
+  );
+
   const hasContent = message.trim() || pendingFiles.length > 0;
   const savedDefaults = settings?.newSessionDefaults;
   const codexMcpDefaultsMatch =
@@ -771,6 +811,16 @@ export function NewSessionForm({
             disabled={isStarting}
             className="toolbar-button"
           />
+          {commandButtons.map((button) => (
+            <SlashCommandButton
+              key={button.prefix}
+              commands={button.commands}
+              onSelectCommand={handleSelectCommand}
+              disabled={isStarting}
+              prefix={button.prefix}
+              label={button.label}
+            />
+          ))}
           {supportsThinkingToggle && (
             <button
               type="button"

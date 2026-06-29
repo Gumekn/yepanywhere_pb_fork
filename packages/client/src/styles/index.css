@@ -944,6 +944,18 @@ h2 {
   align-items: center;
 }
 
+.new-session-form-toolbar-left .slash-command-button {
+  width: 36px;
+  height: 36px;
+  border-color: var(--border-input);
+  border-radius: 8px;
+  align-self: center;
+}
+
+.new-session-form-toolbar-left .slash-icon {
+  font-size: var(--font-size-base);
+}
+
 .new-session-effort-control {
   display: flex;
   align-items: center;

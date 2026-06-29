@@ -44,6 +44,10 @@ import {
 } from "../hooks/useSession";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
+import {
+  getAgentCommandConfig,
+  getStaticAgentCommandConfigs,
+} from "../lib/agentCommands";
 import { getMessageId } from "../lib/mergeMessages";
 import { preprocessMessages } from "../lib/preprocessMessages";
 import {
@@ -81,68 +85,6 @@ export function SessionPage() {
 function SessionPageInvalidRoute() {
   const { t } = useI18n();
   return <div className="error">{t("sessionInvalidUrl")}</div>;
-}
-
-const CODEX_DOLLAR_COMMANDS = [
-  "permissions",
-  "ide",
-  "keymap",
-  "vim",
-  "sandbox-add-read-dir",
-  "agent",
-  "apps",
-  "plugins",
-  "hooks",
-  "clear",
-  "archive",
-  "delete",
-  "compact",
-  "copy",
-  "diff",
-  "exit",
-  "experimental",
-  "approve",
-  "memories",
-  "skills",
-  "import",
-  "feedback",
-  "init",
-  "logout",
-  "mcp",
-  "mention",
-  "model",
-  "fast",
-  "plan",
-  "goal",
-  "personality",
-  "ps",
-  "stop",
-  "fork",
-  "side",
-  "btw",
-  "raw",
-  "resume",
-  "new",
-  "quit",
-  "review",
-  "status",
-  "usage",
-  "debug-config",
-  "statusline",
-  "title",
-  "theme",
-];
-
-function isCodexCommandProvider(
-  provider: ProviderName | string | undefined | null,
-): provider is "codex" | "codex-oss" {
-  return provider === "codex" || provider === "codex-oss";
-}
-
-function providerDefaultsToSlashCommands(
-  provider: ProviderName | string | undefined | null,
-): boolean {
-  return provider === "claude" || provider === "claude-ollama";
 }
 
 function isCodexAppServerProvider(
@@ -502,27 +444,25 @@ function SessionPageContent({
     currentProviderInfo?.supportsPermissionMode ?? true;
   const supportsThinkingToggle =
     currentProviderInfo?.supportsThinkingToggle ?? true;
-  const supportsSlashCommands =
-    currentProviderInfo?.supportsSlashCommands ??
-    providerDefaultsToSlashCommands(effectiveProvider);
-  const commandPrefix = isCodexCommandProvider(effectiveProvider) ? "$" : "/";
-  const commandLabel = isCodexCommandProvider(effectiveProvider)
-    ? "Codex commands"
-    : "Slash commands";
-  const showCommandButton =
-    status.owner === "self" &&
-    (isCodexCommandProvider(effectiveProvider) || supportsSlashCommands);
+  const supportsSlashCommands = currentProviderInfo?.supportsSlashCommands;
+  const commandConfig = useMemo(() => {
+    return getAgentCommandConfig(
+      effectiveProvider,
+      supportsSlashCommands,
+      allSlashCommands,
+    );
+  }, [allSlashCommands, effectiveProvider, supportsSlashCommands]);
+  const showCommandButton = status.owner === "self" && commandConfig.showButton;
   const activeCommands = useMemo(() => {
     if (status.owner !== "self") return [];
-    if (isCodexCommandProvider(effectiveProvider)) return CODEX_DOLLAR_COMMANDS;
-    if (supportsSlashCommands) return allSlashCommands;
-    return [];
-  }, [
-    allSlashCommands,
-    effectiveProvider,
-    status.owner,
-    supportsSlashCommands,
-  ]);
+    return commandConfig.commands;
+  }, [commandConfig.commands, status.owner]);
+  const commandPrefix = commandConfig.prefix;
+  const commandLabel = commandConfig.label;
+  const commandButtons = useMemo(() => {
+    if (status.owner !== "self") return [];
+    return getStaticAgentCommandConfigs(allSlashCommands);
+  }, [allSlashCommands, status.owner]);
 
   // Inline title editing state
   const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -1838,6 +1778,7 @@ function SessionPageContent({
                 commandLabel={commandLabel}
                 commands={activeCommands}
                 showCommandButton={showCommandButton}
+                commandButtons={commandButtons}
                 onCustomCommand={handleCustomCommand}
               />
             )}

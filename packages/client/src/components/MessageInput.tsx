@@ -14,6 +14,7 @@ import {
   useDraftPersistence,
 } from "../hooks/useDraftPersistence";
 import { useI18n } from "../i18n";
+import type { AgentCommandConfig } from "../lib/agentCommands";
 import { hasCoarsePointer } from "../lib/deviceDetection";
 import type { ContextUsage, PermissionMode } from "../types";
 import { MessageInputToolbar } from "./MessageInputToolbar";
@@ -131,6 +132,8 @@ interface Props {
   showCommandButton?: boolean;
   /** Accessible label for the active command menu */
   commandLabel?: string;
+  /** Static command buttons to show in the toolbar. */
+  commandButtons?: AgentCommandConfig[];
   /** Callback for custom client-side "/" commands (e.g., "model"). Return true if handled. */
   onCustomCommand?: (command: string) => boolean;
 }
@@ -163,6 +166,7 @@ export function MessageInput({
   commands = [],
   showCommandButton = commands.length > 0,
   commandLabel = "Commands",
+  commandButtons,
   onCustomCommand,
 }: Props) {
   const { t } = useI18n();
@@ -660,6 +664,7 @@ export function MessageInput({
             commandLabel={commandLabel}
             commands={commands}
             showCommandButton={showCommandButton}
+            commandButtons={commandButtons}
             onSelectCommand={handleSlashCommand}
             contextUsage={contextUsage}
             projectId={projectId}

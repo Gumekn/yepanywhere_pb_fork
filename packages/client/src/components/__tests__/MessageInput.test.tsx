@@ -132,6 +132,40 @@ describe("MessageInput command completion", () => {
     expect(textarea.value).toBe("$model ");
   });
 
+  it("renders static dollar and slash command toolbar buttons", () => {
+    const { textarea } = renderMessageInput({
+      commandPrefix: "$",
+      commandLabel: "Codex commands",
+      commands: ["model"],
+      commandButtons: [
+        {
+          prefix: "$",
+          label: "Codex commands",
+          showButton: true,
+          commands: ["model"],
+        },
+        {
+          prefix: "/",
+          label: "Slash commands",
+          showButton: true,
+          commands: ["help"],
+        },
+      ],
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show slash commands" }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("menu", { name: "Slash commands" })).getByRole(
+        "menuitem",
+        { name: "/help" },
+      ),
+    );
+
+    expect(textarea.value).toBe("/help ");
+  });
+
   it("keeps the toolbar command button stable while commands are loading", () => {
     renderMessageInput({
       commandPrefix: "/",

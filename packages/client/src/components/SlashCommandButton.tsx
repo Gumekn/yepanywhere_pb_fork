@@ -5,6 +5,8 @@ interface SlashCommandButtonProps {
   commands: string[];
   /** Callback when a command is selected */
   onSelectCommand: (command: string) => void;
+  /** Optional fallback when only the prefix is available to insert. */
+  onInsertPrefix?: () => void;
   /** Whether the button should be disabled */
   disabled?: boolean;
   /** Prefix to display and insert before commands */
@@ -20,6 +22,7 @@ interface SlashCommandButtonProps {
 export function SlashCommandButton({
   commands,
   onSelectCommand,
+  onInsertPrefix,
   disabled,
   prefix = "/",
   label = "Commands",
@@ -28,6 +31,7 @@ export function SlashCommandButton({
   const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const hasCommands = commands.length > 0;
+  const canActivate = hasCommands || !!onInsertPrefix;
 
   useEffect(() => {
     if (!hasCommands) {
@@ -86,13 +90,19 @@ export function SlashCommandButton({
         onClick={() => {
           if (hasCommands) {
             setIsOpen(!isOpen);
+          } else {
+            onInsertPrefix?.();
           }
         }}
-        disabled={disabled || !hasCommands}
+        disabled={disabled || !canActivate}
         title={label}
-        aria-label={`Show ${label.toLowerCase()}`}
-        aria-expanded={isOpen}
-        aria-haspopup="menu"
+        aria-label={
+          hasCommands || !onInsertPrefix
+            ? `Show ${label.toLowerCase()}`
+            : `Insert ${label.toLowerCase()} prefix`
+        }
+        aria-expanded={hasCommands ? isOpen : undefined}
+        aria-haspopup={hasCommands ? "menu" : undefined}
       >
         <span className="slash-icon">{prefix}</span>
       </button>
