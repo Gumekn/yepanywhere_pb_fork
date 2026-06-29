@@ -1793,6 +1793,10 @@ function SessionPageContent({
           activeToolApproval={activeToolApproval}
           projectId={projectId}
           sessionId={actualSessionId}
+          provider={session?.provider}
+          model={session?.model}
+          reasoningEffort={session?.reasoningEffort}
+          serviceTier={session?.serviceTier}
           basePath={basePath}
           status={status}
           processState={processState}
@@ -1808,6 +1812,10 @@ function SessionPageContent({
           activeToolApproval={activeToolApproval}
           projectId={projectId}
           sessionId={actualSessionId}
+          provider={session?.provider}
+          model={session?.model}
+          reasoningEffort={session?.reasoningEffort}
+          serviceTier={session?.serviceTier}
           basePath={basePath}
           status={status}
           processState={processState}

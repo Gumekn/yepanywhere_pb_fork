@@ -10,8 +10,14 @@ import {
   isPlanProgressItem,
   preprocessMessages,
 } from "../lib/preprocessMessages";
-import type { ContentBlock, Message, SessionStatus } from "../types";
+import type {
+  ContentBlock,
+  Message,
+  ProviderName,
+  SessionStatus,
+} from "../types";
 import type { RenderItem, ToolCallItem } from "../types/renderItems";
+import { ProviderBadge } from "./ProviderBadge";
 import {
   type ChecklistItem,
   normalizeChecklistStatus,
@@ -32,6 +38,10 @@ interface SessionInspectorProps {
   activeToolApproval?: ActiveToolApproval;
   projectId: string;
   sessionId: string;
+  provider?: ProviderName;
+  model?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
   basePath?: string;
   status: SessionStatus;
   processState?: string;
@@ -95,6 +105,10 @@ export function SessionInspector({
   activeToolApproval,
   projectId,
   sessionId,
+  provider,
+  model,
+  reasoningEffort,
+  serviceTier,
   basePath = "",
   status,
   processState,
@@ -186,6 +200,16 @@ export function SessionInspector({
             {getStatusLabel(t, status, processState)}
           </span>
         </div>
+        {provider && (
+          <div className="session-inspector-provider-row">
+            <ProviderBadge
+              provider={provider}
+              model={model}
+              reasoningEffort={reasoningEffort}
+              serviceTier={serviceTier}
+            />
+          </div>
+        )}
         <div className="session-inspector-session-id">
           <span className="session-inspector-session-id-label">
             {t("sessionInspectorSessionId")}
