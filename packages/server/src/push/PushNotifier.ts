@@ -8,7 +8,10 @@
  */
 
 import { basename } from "node:path";
-import type { UrlProjectId } from "@yep-anywhere/shared";
+import {
+  type UrlProjectId,
+  getSessionDisplayTitle,
+} from "@yep-anywhere/shared";
 import type { NotificationService } from "../notifications/NotificationService.js";
 import { decodeProjectId } from "../projects/paths.js";
 import type { ConnectedBrowsersService } from "../services/ConnectedBrowsersService.js";
@@ -56,6 +59,7 @@ export class PushNotifier {
    */
   private sessionsWithNotification = new Map<string, true | Promise<boolean>>();
   private sessionsWithHaltedNotification = new Set<string>();
+  private sessionTitleBySessionId = new Map<string, string>();
 
   constructor(options: PushNotifierOptions) {
     this.eventBus = options.eventBus;
@@ -73,6 +77,16 @@ export class PushNotifier {
         void this.handleProcessTerminated(event);
       } else if (event.type === "session-seen") {
         void this.handleSessionSeen(event);
+      } else if (event.type === "session-created") {
+        this.cacheSessionTitle(
+          event.session.id,
+          getSessionDisplayTitle({
+            customTitle: event.session.customTitle,
+            title: event.session.title,
+          }),
+        );
+      } else if (event.type === "session-updated") {
+        this.cacheSessionTitle(event.sessionId, event.title);
       }
     });
   }
@@ -85,6 +99,9 @@ export class PushNotifier {
   private async handleProcessStateChange(
     event: ProcessStateEvent,
   ): Promise<void> {
+    const process = this.supervisor.getProcessForSession(event.sessionId);
+    this.cacheProcessSessionTitle(event.sessionId, process);
+
     // Send dismiss when leaving waiting-input (if we sent a notification for it)
     if (event.activity !== "waiting-input") {
       const notificationState = this.sessionsWithNotification.get(
@@ -125,7 +142,6 @@ export class PushNotifier {
     }
 
     // Get the process to access the InputRequest details
-    const process = this.supervisor.getProcessForSession(event.sessionId);
     if (!process || process.state.type !== "waiting-input") {
       return;
     }
@@ -248,6 +264,7 @@ export class PushNotifier {
 
     this.sessionsWithNotification.delete(event.sessionId);
     this.sessionsWithHaltedNotification.delete(event.sessionId);
+    this.sessionTitleBySessionId.delete(event.sessionId);
     await this.sendDismiss(event.sessionId);
   }
 
@@ -266,13 +283,17 @@ export class PushNotifier {
     }
 
     const process = this.supervisor.getProcessForSession(event.sessionId);
+    this.cacheProcessSessionTitle(event.sessionId, process);
+    const sessionTitle =
+      (process ? this.getSessionTitle(process) : undefined) ??
+      this.sessionTitleBySessionId.get(event.sessionId);
     const projectName = this.getProjectName(event.projectId);
     const payload: SessionHaltedPayload = {
       type: "session-halted",
       sessionId: event.sessionId,
       projectId: event.projectId,
       projectName,
-      sessionTitle: process ? this.getSessionTitle(process) : undefined,
+      sessionTitle,
       reason,
       duration: process?.startedAt
         ? Date.now() - process.startedAt.getTime()
@@ -322,6 +343,28 @@ export class PushNotifier {
         error,
       );
     }
+  }
+
+  private cacheProcessSessionTitle(
+    sessionId: string,
+    process:
+      | NonNullable<ReturnType<Supervisor["getProcessForSession"]>>
+      | undefined,
+  ): void {
+    if (!process) return;
+    this.cacheSessionTitle(sessionId, this.getSessionTitle(process));
+  }
+
+  private cacheSessionTitle(
+    sessionId: string,
+    title: string | null | undefined,
+  ): void {
+    const normalized = title?.replace(/\s+/g, " ").trim();
+    if (!normalized) return;
+    this.sessionTitleBySessionId.set(
+      sessionId,
+      normalized.length <= 120 ? normalized : `${normalized.slice(0, 117)}...`,
+    );
   }
 
   /**

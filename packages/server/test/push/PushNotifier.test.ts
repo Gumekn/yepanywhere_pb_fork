@@ -721,6 +721,101 @@ describe("PushNotifier", () => {
       ).toHaveBeenCalledWith("session-1", idleEvent.timestamp);
     });
 
+    it("should use the cached process session title after the process is gone", async () => {
+      const runningProcess = {
+        state: { type: "in-turn" } as ProcessState,
+        startedAt: new Date(Date.now() - 10_000),
+        getMessageHistory: vi.fn(() => [
+          {
+            type: "user",
+            message: { content: "Cached process title" },
+          },
+        ]),
+      };
+
+      vi.mocked(mockSupervisor.getProcessForSession)
+        .mockReturnValueOnce(
+          runningProcess as unknown as ReturnType<
+            Supervisor["getProcessForSession"]
+          >,
+        )
+        .mockReturnValue(undefined);
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        supervisor: mockSupervisor,
+      });
+
+      const runningEvent: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        activity: "in-turn",
+        timestamp: new Date().toISOString(),
+      };
+      eventHandler?.(runningEvent);
+
+      await vi.waitFor(() => {
+        expect(mockSupervisor.getProcessForSession).toHaveBeenCalledTimes(1);
+      });
+
+      const idleEvent: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        activity: "idle",
+        timestamp: new Date().toISOString(),
+      };
+      eventHandler?.(idleEvent);
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+      });
+
+      const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
+      expect(payload.type).toBe("session-halted");
+      expect(payload.sessionTitle).toBe("Cached process title");
+    });
+
+    it("should use session-updated titles for halted sessions without a supervisor process", async () => {
+      vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(undefined);
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        supervisor: mockSupervisor,
+      });
+
+      eventHandler?.({
+        type: "session-updated",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        title: "Existing bridge session",
+        updatedAt: new Date().toISOString(),
+        timestamp: new Date().toISOString(),
+      });
+
+      const idleEvent: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        activity: "idle",
+        timestamp: new Date().toISOString(),
+      };
+      eventHandler?.(idleEvent);
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+      });
+
+      const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
+      expect(payload.type).toBe("session-halted");
+      expect(payload.sessionTitle).toBe("Existing bridge session");
+    });
+
     it("should still mark session-halted badge state without push subscriptions", async () => {
       vi.mocked(mockPushService.getSubscriptionCount).mockReturnValue(0);
 
