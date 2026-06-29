@@ -290,14 +290,20 @@ export interface FileContentResponse {
   renderedMarkdownHtml?: string;
 }
 
+export type ReportDocumentKind = "markdown" | "text" | "transcript";
+
 /**
- * Markdown report document surfaced by the Reports page.
+ * Report document surfaced by the Reports page.
  */
 export interface ReportDocument {
   /** Path relative to the configured reports directory */
   path: string;
+  /** Absolute local filesystem path */
+  absolutePath: string;
   /** Display title, usually the first H1/H2 in the document */
   title: string;
+  /** Report source type */
+  kind: ReportDocumentKind;
   /** File size in bytes */
   size: number;
   /** Last modified timestamp */
@@ -308,9 +314,9 @@ export interface ReportDocument {
  * Response from the report document listing API.
  */
 export interface ReportsListResponse {
-  /** Configured root directory for report markdown files */
+  /** Configured root directory for report files */
   rootPath: string;
-  /** Markdown documents found under the root directory */
+  /** Documents found under the root directory */
   documents: ReportDocument[];
 }
 
@@ -323,6 +329,13 @@ export interface ReportDocumentResponse {
   content: string;
   /** Server-rendered safe HTML */
   renderedHtml: string;
+}
+
+/**
+ * Response from uploading a report document.
+ */
+export interface ReportUploadResponse {
+  document: ReportDocument;
 }
 
 /**

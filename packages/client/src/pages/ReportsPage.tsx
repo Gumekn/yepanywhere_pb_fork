@@ -2,10 +2,18 @@ import type {
   ReportDocument,
   ReportDocumentResponse,
 } from "@yep-anywhere/shared";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ChangeEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
+import { useToastContext } from "../contexts/ToastContext";
 import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
@@ -81,12 +89,13 @@ function countMarkdownLines(markdown: string): number {
   return markdown.split(/\r?\n/).length;
 }
 
-function getPathLabel(path: string): string {
-  return path.split("/").pop() || path;
+function getDisplayPath(document: ReportDocument): string {
+  return document.absolutePath || document.path;
 }
 
 export function ReportsPage() {
   const { t, locale } = useI18n();
+  const { showToast } = useToastContext();
   const { openSidebar, isWideScreen, toggleSidebar, isSidebarCollapsed } =
     useNavigationLayout();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -101,8 +110,10 @@ export function ReportsPage() {
     useState<ReportDocumentResponse | null>(null);
   const [loadingDocument, setLoadingDocument] = useState(false);
   const [documentError, setDocumentError] = useState<string | null>(null);
+  const [uploadingReport, setUploadingReport] = useState(false);
   const [activeHeadingId, setActiveHeadingId] = useState<string | null>(null);
   const articleRef = useRef<HTMLElement | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
   useHideSplashOnReady(!loadingList || listError !== null);
 
@@ -229,6 +240,62 @@ export function ReportsPage() {
     [setSearchParams],
   );
 
+  const handleUploadFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0 || uploadingReport) return;
+
+      setUploadingReport(true);
+      let uploadedCount = 0;
+      let lastUploadedPath = "";
+
+      try {
+        for (const file of files) {
+          try {
+            const res = await api.uploadReport(file);
+            uploadedCount += 1;
+            lastUploadedPath = res.document.path;
+            setDocuments((prev) => [
+              res.document,
+              ...prev.filter((doc) => doc.path !== res.document.path),
+            ]);
+          } catch (err) {
+            const message =
+              err instanceof Error ? err.message : t("reportsUploadFailed");
+            showToast(
+              t("reportsUploadFileFailed", {
+                file: file.name,
+                message,
+              }),
+              "error",
+            );
+          }
+        }
+
+        if (uploadedCount > 0) {
+          showToast(
+            t("reportsUploadSucceeded", { count: uploadedCount }),
+            "success",
+          );
+          if (lastUploadedPath) {
+            setSearchParams({ path: lastUploadedPath });
+          }
+        }
+      } finally {
+        setUploadingReport(false);
+      }
+    },
+    [setSearchParams, showToast, t, uploadingReport],
+  );
+
+  const handleUploadInputChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? []);
+      event.target.value = "";
+      void handleUploadFiles(files);
+    },
+    [handleUploadFiles],
+  );
+
   const scrollToHeading = useCallback((heading: HeadingItem) => {
     const article = articleRef.current;
     if (!article) return;
@@ -248,6 +315,34 @@ export function ReportsPage() {
     setActiveHeadingId(heading.id);
   }, []);
 
+  const renderUploadButton = (showLabel = false) => (
+    <button
+      type="button"
+      className={`reports-upload-button ${showLabel ? "with-label" : ""}`}
+      onClick={() => uploadInputRef.current?.click()}
+      disabled={uploadingReport}
+      title={t("reportsUpload")}
+      aria-label={t("reportsUpload")}
+    >
+      <svg
+        width="15"
+        height="15"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M12 3v12" />
+        <path d="m7 8 5-5 5 5" />
+        <path d="M5 21h14" />
+      </svg>
+      {showLabel && <span>{t("reportsUpload")}</span>}
+    </button>
+  );
+
   const renderDocumentList = () => (
     <aside
       className="reports-document-panel"
@@ -258,6 +353,7 @@ export function ReportsPage() {
           <h2>{t("reportsDocuments")}</h2>
           {rootPath && <p title={rootPath}>{rootPath}</p>}
         </div>
+        {renderUploadButton()}
       </div>
       <input
         className="reports-filter-input"
@@ -288,6 +384,9 @@ export function ReportsPage() {
             onClick={() => handleSelectDocument(doc.path)}
           >
             <span className="reports-document-title">{doc.title}</span>
+            <span className="reports-document-path" title={getDisplayPath(doc)}>
+              {doc.path}
+            </span>
             <span className="reports-document-meta">
               {formatSmartTime(doc.modifiedAt, locale)} ·{" "}
               {formatBytes(doc.size)}
@@ -364,6 +463,14 @@ export function ReportsPage() {
         />
 
         <main className="page-scroll-container reports-scroll-container">
+          <input
+            ref={uploadInputRef}
+            type="file"
+            multiple
+            accept=".md,.markdown,.txt,text/markdown,text/plain"
+            className="reports-upload-input"
+            onChange={handleUploadInputChange}
+          />
           <div className="reports-content-inner">
             {isWideScreen && renderDocumentList()}
 
@@ -373,27 +480,33 @@ export function ReportsPage() {
                   <label htmlFor="reports-document-select">
                     {t("reportsSelectDocument")}
                   </label>
-                  <select
-                    id="reports-document-select"
-                    value={selectedPath}
-                    onChange={(event) =>
-                      handleSelectDocument(event.target.value)
-                    }
-                  >
-                    {documents.map((doc) => (
-                      <option key={doc.path} value={doc.path}>
-                        {doc.title}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="reports-mobile-selector-row">
+                    <select
+                      id="reports-document-select"
+                      value={selectedPath}
+                      onChange={(event) =>
+                        handleSelectDocument(event.target.value)
+                      }
+                    >
+                      {documents.map((doc) => (
+                        <option key={doc.path} value={doc.path}>
+                          {doc.title}
+                        </option>
+                      ))}
+                    </select>
+                    {renderUploadButton()}
+                  </div>
                 </div>
               )}
 
               {selectedDocument && (
                 <header className="reports-reader-header">
                   <div>
-                    <p className="reports-reader-eyebrow">
-                      {getPathLabel(selectedDocument.path)}
+                    <p
+                      className="reports-reader-eyebrow"
+                      title={getDisplayPath(selectedDocument)}
+                    >
+                      {getDisplayPath(selectedDocument)}
                     </p>
                     <h1>{selectedDocument.title}</h1>
                     <p>{metaText}</p>
@@ -418,6 +531,9 @@ export function ReportsPage() {
                   <h1>{t("reportsEmptyTitle")}</h1>
                   <p>{t("reportsEmptyDescription")}</p>
                   {rootPath && <code>{rootPath}</code>}
+                  <div className="reports-empty-actions">
+                    {renderUploadButton(true)}
+                  </div>
                 </div>
               )}
 

@@ -14,6 +14,7 @@ import type {
   ProviderInfo,
   ProviderName,
   ReportDocumentResponse,
+  ReportUploadResponse,
   ReportsListResponse,
   SessionKind,
   SlashCommand,
@@ -565,6 +566,50 @@ async function fetchBlob(
   };
 }
 
+async function uploadReportFile(file: File): Promise<ReportUploadResponse> {
+  const headers: Record<string, string> = {
+    "X-Yep-Anywhere": "true",
+  };
+  if (desktopAuthToken) {
+    headers["X-Desktop-Token"] = desktopAuthToken;
+  }
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const res = await fetch(`${API_BASE}/reports/upload`, {
+    method: "POST",
+    credentials: "include",
+    headers,
+    body: formData,
+  });
+
+  if (!res.ok) {
+    if (res.status === 401) {
+      console.log("[API] 401 response, signaling login required");
+      authEvents.signalLoginRequired();
+    }
+
+    let errorMessage = `API error: ${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body.error) {
+        errorMessage = body.error;
+      } else if (body.message) {
+        errorMessage = body.message;
+      }
+    } catch {
+      // Response body was not JSON.
+    }
+
+    const error = new Error(errorMessage) as Error & { status: number };
+    error.status = res.status;
+    throw error;
+  }
+
+  return res.json();
+}
+
 export const api = {
   // Version API
   getVersion: (options?: GetVersionOptions) =>
@@ -1113,6 +1158,8 @@ export const api = {
       `/reports/document?${params.toString()}`,
     );
   },
+
+  uploadReport: uploadReportFile,
 
   /**
    * Expand diff context to show full file.

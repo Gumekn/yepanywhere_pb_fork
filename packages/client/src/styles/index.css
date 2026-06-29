@@ -5948,6 +5948,17 @@ a.sidebar-nav-item {
   gap: var(--space-3);
 }
 
+.reports-document-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.reports-document-panel-header > div {
+  min-width: 0;
+}
+
 .reports-document-panel-header h2,
 .reports-toc-panel h2 {
   margin: 0;
@@ -5960,9 +5971,46 @@ a.sidebar-nav-item {
   margin: 4px 0 0;
   color: var(--text-dimmed);
   font-size: var(--font-size-xs);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.reports-upload-input {
+  display: none;
+}
+
+.reports-upload-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: var(--bg-code);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.reports-upload-button:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.reports-upload-button:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.reports-upload-button.with-label {
+  width: auto;
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
 }
 
 .reports-filter-input,
@@ -6021,6 +6069,13 @@ a.sidebar-nav-item {
   overflow-wrap: anywhere;
 }
 
+.reports-document-path {
+  color: var(--text-dimmed);
+  font-size: var(--font-size-xs);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .reports-document-meta {
   color: var(--text-muted);
   font-size: var(--font-size-xs);
@@ -6067,6 +6122,16 @@ a.sidebar-nav-item {
   flex-direction: column;
   gap: var(--space-2);
   margin-bottom: var(--space-4);
+}
+
+.reports-mobile-selector-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.reports-mobile-selector-row select {
+  flex: 1 1 auto;
 }
 
 .reports-mobile-selector label {
@@ -6176,6 +6241,10 @@ a.sidebar-nav-item {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   overflow-wrap: anywhere;
+}
+
+.reports-empty-actions {
+  margin-top: var(--space-3);
 }
 
 .reports-markdown {
@@ -6347,7 +6416,7 @@ a.sidebar-nav-item {
 @media (min-width: 1024px) {
   .reports-content-inner {
     grid-template-columns:
-      minmax(220px, 260px) minmax(0, 900px)
+      minmax(260px, 340px) minmax(0, 900px)
       minmax(190px, 240px);
     align-items: start;
   }

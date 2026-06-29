@@ -607,6 +607,7 @@ async function startServer() {
     modelInfoService,
     enabledProviders: config.enabledProviders,
     voiceInputEnabled: config.voiceInputEnabled,
+    maxUploadSizeBytes: config.maxUploadSizeBytes,
     allowedImagePaths: config.allowedImagePaths,
     basePath: config.basePath,
   });

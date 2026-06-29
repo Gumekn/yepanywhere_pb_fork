@@ -947,10 +947,13 @@ export function createApp(options: AppOptions): AppResult {
     );
   }
 
-  // Reports routes (read-only Markdown documents)
+  // Reports routes (report document listing, reading, and uploads)
   app.route(
     "/api/reports",
-    createReportsRoutes({ reportsDir: options.reportsDir }),
+    createReportsRoutes({
+      reportsDir: options.reportsDir,
+      maxUploadSizeBytes: options.maxUploadSizeBytes,
+    }),
   );
 
   // Provider routes (multi-provider detection)
