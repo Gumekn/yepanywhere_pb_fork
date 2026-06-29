@@ -5,6 +5,7 @@ import type {
   UploadStartMessage,
   UploadedFile,
 } from "@yep-anywhere/shared";
+import { API_BASE } from "../lib/apiPath";
 
 /** Default chunk size (64KB) - matches server progress interval */
 const DEFAULT_CHUNK_SIZE = 64 * 1024;
@@ -241,15 +242,20 @@ export function buildUploadUrl(
   sessionId: string,
   baseUrl?: string,
 ): string {
+  const pathFor = (apiBase: string) =>
+    `${apiBase}/projects/${projectId}/sessions/${sessionId}/upload/ws`;
+
   if (baseUrl) {
     const url = new URL(baseUrl);
     const protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${url.host}/api/projects/${projectId}/sessions/${sessionId}/upload/ws`;
+    const basePath = url.pathname.replace(/\/$/, "");
+    const apiBase = basePath.endsWith("/api") ? basePath : `${basePath}/api`;
+    return `${protocol}//${url.host}${pathFor(apiBase)}`;
   }
 
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const host = window.location.host;
-  return `${protocol}//${host}/api/projects/${projectId}/sessions/${sessionId}/upload/ws`;
+  return `${protocol}//${host}${pathFor(API_BASE)}`;
 }
 
 /**

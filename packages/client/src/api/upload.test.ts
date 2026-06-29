@@ -357,6 +357,28 @@ describe("buildUploadUrl", () => {
     );
   });
 
+  it("preserves reverse-proxy base path when provided", () => {
+    const url = buildUploadUrl(
+      "proj-123",
+      "sess-456",
+      "https://example.com/yep",
+    );
+    expect(url).toBe(
+      "wss://example.com/yep/api/projects/proj-123/sessions/sess-456/upload/ws",
+    );
+  });
+
+  it("does not duplicate api path when base URL already includes it", () => {
+    const url = buildUploadUrl(
+      "proj-123",
+      "sess-456",
+      "https://example.com/yep/api",
+    );
+    expect(url).toBe(
+      "wss://example.com/yep/api/projects/proj-123/sessions/sess-456/upload/ws",
+    );
+  });
+
   it("handles URL-encoded project IDs", () => {
     const url = buildUploadUrl(
       "L2hvbWUvdXNlci9wcm9qZWN0",
