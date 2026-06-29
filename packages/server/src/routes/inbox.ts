@@ -61,6 +61,7 @@ export interface InboxItem {
 
 export interface InboxResponse {
   badgeCount: number;
+  badgeSessionIds: string[];
   needsAttention: InboxItem[];
   active: InboxItem[];
   recentActivity: InboxItem[];
@@ -354,6 +355,7 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
     // Apply limits per tier
     const response: InboxResponse = {
       badgeCount: badgeSessionIds.size,
+      badgeSessionIds: Array.from(badgeSessionIds),
       needsAttention: needsAttention.slice(0, MAX_ITEMS_PER_TIER),
       active: active.slice(0, MAX_ITEMS_PER_TIER),
       recentActivity: recentActivity.slice(0, MAX_ITEMS_PER_TIER),

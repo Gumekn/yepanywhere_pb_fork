@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { type InboxItem, useInboxContext } from "../contexts/InboxContext";
 import { useDrafts } from "../hooks/useDrafts";
 import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
@@ -18,6 +18,12 @@ interface TierConfig {
   colorClass: string;
   getBadge?: (item: InboxItem) => { label: string; className: string } | null;
 }
+
+type InboxItemBadge = {
+  label: string;
+  className: string;
+  title?: string;
+};
 
 const TIER_CONFIGS: TierConfig[] = [
   {
@@ -72,6 +78,10 @@ interface InboxSectionProps {
   basePath?: string;
   /** Set of session IDs that have unsent drafts */
   drafts: Set<string>;
+  /** Session IDs that are included in the browser title badge count */
+  badgeSessionIds: Set<string>;
+  /** Current browser title badge count */
+  totalBadgeCount: number;
 }
 
 function InboxSection({
@@ -80,6 +90,8 @@ function InboxSection({
   hideProjectName,
   basePath = "",
   drafts,
+  badgeSessionIds,
+  totalBadgeCount,
 }: InboxSectionProps) {
   const { t } = useI18n();
   const isEmpty = items.length === 0;
@@ -98,6 +110,23 @@ function InboxSection({
         <ul className="sessions-list">
           {items.map((item) => {
             const badge = config.getBadge?.(item);
+            const customBadges: InboxItemBadge[] = [];
+            if (badgeSessionIds.has(item.sessionId)) {
+              customBadges.push({
+                label: t("inboxBadgeTitleCount", {
+                  count: totalBadgeCount,
+                }),
+                className: "inbox-badge-title-count",
+                title: t("inboxBadgeTitleTooltip"),
+              });
+            }
+            if (badge) {
+              customBadges.push({
+                ...badge,
+                label: t(badge.label as never),
+              });
+            }
+
             return (
               <SessionListItem
                 key={item.sessionId}
@@ -114,9 +143,7 @@ function InboxSection({
                 showTimestamp
                 showContextUsage={false}
                 showStatusBadge={false}
-                customBadge={
-                  badge ? { ...badge, label: t(badge.label as never) } : null
-                }
+                customBadges={customBadges}
                 basePath={basePath}
                 hasDraft={drafts.has(item.sessionId)}
               />
@@ -169,6 +196,8 @@ export function InboxContent({
     loading,
     error,
     refresh,
+    totalBadgeCount,
+    badgeSessionIds,
   } = useInboxContext();
 
   // Dismiss cold-start splash once inbox finishes initial load.
@@ -180,6 +209,10 @@ export function InboxContent({
   const recentActivity = filterByProject(allRecentActivity, projectId);
   const unread8h = filterByProject(allUnread8h, projectId);
   const unread24h = filterByProject(allUnread24h, projectId);
+  const badgeSessionIdSet = useMemo(
+    () => new Set(badgeSessionIds),
+    [badgeSessionIds],
+  );
 
   const totalItems =
     needsAttention.length +
@@ -187,6 +220,28 @@ export function InboxContent({
     recentActivity.length +
     unread8h.length +
     unread24h.length;
+  const visibleBadgeCount = useMemo(() => {
+    const visibleBadgeSessionIds = new Set<string>();
+    for (const item of [
+      ...needsAttention,
+      ...active,
+      ...recentActivity,
+      ...unread8h,
+      ...unread24h,
+    ]) {
+      if (badgeSessionIdSet.has(item.sessionId)) {
+        visibleBadgeSessionIds.add(item.sessionId);
+      }
+    }
+    return visibleBadgeSessionIds.size;
+  }, [
+    needsAttention,
+    active,
+    recentActivity,
+    unread8h,
+    unread24h,
+    badgeSessionIdSet,
+  ]);
 
   const [refreshing, setRefreshing] = useState(false);
 
@@ -265,6 +320,24 @@ export function InboxContent({
           </button>
         </div>
 
+        {totalBadgeCount > 0 && (
+          <div className="inbox-title-badge-summary">
+            <span className="inbox-title-badge-summary__count">
+              ({totalBadgeCount})
+            </span>
+            <span>
+              {projectId
+                ? t("inboxTitleBadgeSummaryFiltered", {
+                    count: totalBadgeCount,
+                    visible: visibleBadgeCount,
+                  })
+                : t("inboxTitleBadgeSummary", {
+                    count: totalBadgeCount,
+                  })}
+            </span>
+          </div>
+        )}
+
         {loading && <SessionListSkeleton count={5} />}
 
         {error && (
@@ -306,6 +379,8 @@ export function InboxContent({
                 hideProjectName={!!projectId}
                 basePath={basePath}
                 drafts={drafts}
+                badgeSessionIds={badgeSessionIdSet}
+                totalBadgeCount={totalBadgeCount}
               />
             ))}
           </div>

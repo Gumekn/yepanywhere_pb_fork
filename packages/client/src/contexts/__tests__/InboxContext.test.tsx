@@ -40,14 +40,26 @@ function InboxTitleConsumer() {
 }
 
 function emptyInbox(overrides: Partial<InboxResponse> = {}): InboxResponse {
-  return {
+  const response = {
     badgeCount: 0,
+    badgeSessionIds: [],
     needsAttention: [],
     active: [],
     recentActivity: [],
     unread8h: [],
     unread24h: [],
     ...overrides,
+  };
+
+  return {
+    ...response,
+    badgeCount: response.badgeCount ?? 0,
+    badgeSessionIds: response.badgeSessionIds ?? [],
+    needsAttention: response.needsAttention ?? [],
+    active: response.active ?? [],
+    recentActivity: response.recentActivity ?? [],
+    unread8h: response.unread8h ?? [],
+    unread24h: response.unread24h ?? [],
   };
 }
 

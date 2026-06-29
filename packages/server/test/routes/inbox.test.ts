@@ -414,6 +414,7 @@ describe("Inbox Routes", () => {
 
       expect(result.unread8h.map((item) => item.sessionId)).toEqual(["sess1"]);
       expect(result.badgeCount).toBe(0);
+      expect(result.badgeSessionIds).toEqual([]);
     });
 
     it("counts sessions needing attention", async () => {
@@ -440,6 +441,7 @@ describe("Inbox Routes", () => {
       });
 
       expect(result.badgeCount).toBe(1);
+      expect(result.badgeSessionIds).toEqual(["sess1"]);
     });
 
     it("counts notification-backed sessions needing review", async () => {
@@ -461,6 +463,7 @@ describe("Inbox Routes", () => {
       });
 
       expect(result.badgeCount).toBe(1);
+      expect(result.badgeSessionIds).toEqual(["sess1"]);
     });
 
     it("deduplicates sessions that are both attention and review items", async () => {
@@ -490,6 +493,7 @@ describe("Inbox Routes", () => {
       });
 
       expect(result.badgeCount).toBe(1);
+      expect(result.badgeSessionIds).toEqual(["sess1"]);
     });
   });
 

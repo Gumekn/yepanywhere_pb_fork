@@ -42,8 +42,9 @@ interface SessionListItemProps {
   showContextUsage?: boolean;
   showStatusBadge?: boolean;
 
-  // Custom badge (for Inbox)
-  customBadge?: { label: string; className: string } | null;
+  // Custom badges (for Inbox)
+  customBadge?: { label: string; className: string; title?: string } | null;
+  customBadges?: Array<{ label: string; className: string; title?: string }>;
 
   // Actions (menu hidden when all undefined)
   isStarred?: boolean;
@@ -120,6 +121,7 @@ export function SessionListItem({
   showStatusBadge = true,
   // Custom badge
   customBadge,
+  customBadges,
   // Actions
   isStarred: isStarredProp,
   isArchived: isArchivedProp,
@@ -188,6 +190,8 @@ export function SessionListItem({
     undefined,
   );
   const hasUnread = localHasUnread ?? hasUnreadProp;
+  const renderedCustomBadges =
+    customBadges ?? (customBadge ? [customBadge] : []);
 
   // Handlers for menu actions
   const handleToggleStar = async () => {
@@ -440,11 +444,15 @@ export function SessionListItem({
                 {showContextUsage && (
                   <ContextUsageIndicator usage={contextUsage} size={14} />
                 )}
-                {customBadge && (
-                  <span className={`inbox-item-badge ${customBadge.className}`}>
-                    {customBadge.label}
+                {renderedCustomBadges.map((badge) => (
+                  <span
+                    key={`${badge.className}:${badge.label}`}
+                    className={`inbox-item-badge ${badge.className}`}
+                    title={badge.title}
+                  >
+                    {badge.label}
                   </span>
-                )}
+                ))}
                 {showStatusBadge && status && (
                   <SessionStatusBadge
                     status={status}

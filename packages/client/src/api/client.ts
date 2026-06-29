@@ -60,6 +60,7 @@ export interface InboxItem {
  */
 export interface InboxResponse {
   badgeCount: number;
+  badgeSessionIds: string[];
   needsAttention: InboxItem[];
   active: InboxItem[];
   recentActivity: InboxItem[];

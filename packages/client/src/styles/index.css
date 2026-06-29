@@ -8297,6 +8297,26 @@ button.context-usage-indicator--button:focus-visible {
   animation: spin 1s linear infinite;
 }
 
+.inbox-title-badge-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  line-height: 1.4;
+}
+
+.inbox-title-badge-summary__count {
+  color: var(--warning-color);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
 @keyframes spin {
   from {
     transform: rotate(0deg);
@@ -8420,6 +8440,11 @@ button.context-usage-indicator--button:focus-visible {
 .inbox-badge-question {
   background: rgba(77, 170, 252, 0.15);
   color: var(--attention-color);
+}
+
+.inbox-badge-title-count {
+  background: rgba(225, 192, 141, 0.16);
+  color: var(--warning-color);
 }
 
 /* Mobile adjustments */
