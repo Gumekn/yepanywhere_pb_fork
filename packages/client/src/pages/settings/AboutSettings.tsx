@@ -155,6 +155,11 @@ export function AboutSettings() {
     !!stagedBuildVersion &&
     stagedBuildVersion !== versionInfo.current;
   const checkingUpdates = versionLoading || deploymentLoading;
+  const usesLocalDeployment =
+    deploymentCapable || deploymentStatus?.available === true;
+  const hasRegistryUpdate =
+    !!versionInfo?.updateAvailable && !!versionInfo.latest;
+  const showRegistryUpdate = hasRegistryUpdate && !usesLocalDeployment;
 
   return (
     <section className="settings-section">
@@ -194,14 +199,14 @@ export function AboutSettings() {
               {versionInfo ? (
                 <>
                   v{versionInfo.current}
-                  {versionInfo.updateAvailable && versionInfo.latest ? (
+                  {showRegistryUpdate ? (
                     <span className="settings-update-available">
                       {" "}
                       {t("aboutVersionAvailable", {
-                        version: versionInfo.latest,
+                        version: versionInfo.latest ?? "",
                       })}
                     </span>
-                  ) : versionInfo.latest ? (
+                  ) : !hasRegistryUpdate && versionInfo.latest ? (
                     <span className="settings-up-to-date">
                       {" "}
                       {t("aboutUpToDate")}
@@ -222,7 +227,7 @@ export function AboutSettings() {
             {versionError && (
               <p className="settings-warning">{t("aboutUnableRefresh")}</p>
             )}
-            {versionInfo?.updateAvailable && (
+            {showRegistryUpdate && (
               <p className="settings-update-hint">{t("aboutUpdateHint")}</p>
             )}
             {deploymentStatus?.available && (
