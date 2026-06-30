@@ -4,6 +4,8 @@ import { FilterDropdown } from "../../components/FilterDropdown";
 import { useOptionalAuth } from "../../contexts/AuthContext";
 import {
   MOBILE_SHELL_NODES,
+  formatMobileShellNodeLabel,
+  formatMobileShellNodeOrigin,
   useMobileShellChannel,
 } from "../../hooks/useMobileShellChannel";
 import { useNetworkBinding } from "../../hooks/useNetworkBinding";
@@ -44,7 +46,7 @@ function MobileShellChannelSettings() {
                   if (!isActive) setNode(node);
                 }}
               >
-                {node.label}
+                {formatMobileShellNodeLabel(node)}
               </button>
             );
           })}
@@ -63,7 +65,7 @@ function MobileShellChannelSettings() {
           {channel === "http"
             ? t("localAccessMobileCurrentHttp")
             : t("localAccessMobileCurrentNode", {
-                node: nodeOrigin?.replace(/^https?:\/\//, "") ?? "TCP",
+                node: formatMobileShellNodeOrigin(nodeOrigin),
               })}
         </div>
       </div>

@@ -2,14 +2,36 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 export type MobileShellChannel = "tcp" | "http";
 export type MobileShellNode = {
+  alias: string;
   label: string;
   origin: string;
 };
 
 export const MOBILE_SHELL_NODES: MobileShellNode[] = [
-  { label: "43.226.60.75:46789", origin: "http://43.226.60.75:46789" },
-  { label: "123.56.106.49:37160", origin: "http://123.56.106.49:37160" },
+  {
+    alias: "air",
+    label: "43.226.60.75:46789",
+    origin: "http://43.226.60.75:46789",
+  },
+  {
+    alias: "mini",
+    label: "43.226.60.75:61874",
+    origin: "http://43.226.60.75:61874",
+  },
 ];
+
+export function formatMobileShellNodeLabel(
+  node: Pick<MobileShellNode, "alias" | "label">,
+): string {
+  return `${node.label} (${node.alias})`;
+}
+
+export function formatMobileShellNodeOrigin(origin: string | null): string {
+  if (!origin) return "TCP";
+  const knownNode = MOBILE_SHELL_NODES.find((node) => node.origin === origin);
+  if (knownNode) return formatMobileShellNodeLabel(knownNode);
+  return origin.replace(/^https?:\/\//, "");
+}
 
 const CHANNEL_STATUS_MESSAGE = "yep-anywhere:mobile-shell-channel";
 const GET_CHANNEL_MESSAGE = "yep-anywhere:mobile-shell-get-channel";

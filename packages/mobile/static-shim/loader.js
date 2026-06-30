@@ -10,10 +10,25 @@
   var ACTIVE_NODE_STORAGE_KEY = "yep-anywhere-mobile-active-node";
   var NODE_HISTORY_STORAGE_KEY = "yep-anywhere-mobile-node-history";
   var DEFAULT_CHANNEL = "tcp";
-  var DEFAULT_TCP_ORIGIN = "http://123.56.106.49:37160";
+  var TCP_NODES = [
+    {
+      alias: "air",
+      label: "43.226.60.75:46789",
+      origin: "http://43.226.60.75:46789"
+    },
+    {
+      alias: "mini",
+      label: "43.226.60.75:61874",
+      origin: "http://43.226.60.75:61874"
+    }
+  ];
+  var DEFAULT_TCP_ORIGIN = TCP_NODES[0].origin;
   var SEEDED_NODE_HISTORY = [
-    "http://43.226.60.75:46789",
-    DEFAULT_TCP_ORIGIN
+    DEFAULT_TCP_ORIGIN,
+    TCP_NODES[1].origin
+  ];
+  var DEPRECATED_DEFAULT_TCP_ORIGINS = [
+    "http://123.56.106.49:37160"
   ];
   var NODE_HISTORY_LIMIT = 8;
   var FRAME_LOAD_FALLBACK_MS = 6000;
@@ -128,22 +143,47 @@
     }
   }
 
+  function isDeprecatedDefaultNode(origin) {
+    for (var index = 0; index < DEPRECATED_DEFAULT_TCP_ORIGINS.length; index += 1) {
+      if (DEPRECATED_DEFAULT_TCP_ORIGINS[index] === origin) return true;
+    }
+    return false;
+  }
+
+  function getKnownTcpNode(origin) {
+    for (var index = 0; index < TCP_NODES.length; index += 1) {
+      if (TCP_NODES[index].origin === origin) return TCP_NODES[index];
+    }
+    return null;
+  }
+
+  function getNodeDisplayLabel(node) {
+    var knownNode = getKnownTcpNode(node.origin);
+    var label = knownNode ? knownNode.label : node.label;
+    return knownNode && knownNode.alias
+      ? label + " (" + knownNode.alias + ")"
+      : label;
+  }
+
   function targetFromNodeInput(value) {
     var node = normalizeNodeInput(value);
     if (!node) return null;
 
+    var displayLabel = getNodeDisplayLabel(node);
     return {
       channel: "tcp",
+      displayLabel: displayLabel,
       label: node.label,
       nodeOrigin: node.origin,
       origin: node.origin,
-      status: "Connecting to " + node.label
+      status: "Connecting to " + displayLabel
     };
   }
 
   function getStoredActiveNode() {
     var value = readStorage(ACTIVE_NODE_STORAGE_KEY);
-    return value ? normalizeNodeInput(value) : null;
+    var node = value ? normalizeNodeInput(value) : null;
+    return node && !isDeprecatedDefaultNode(node.origin) ? node : null;
   }
 
   function storeActiveNode(origin) {
@@ -158,6 +198,7 @@
 
     for (var index = 0; index < nodes.length; index += 1) {
       var node = normalizeNodeInput(nodes[index]);
+      if (node && isDeprecatedDefaultNode(node.origin)) continue;
       if (!node || seen[node.origin]) continue;
       seen[node.origin] = true;
       result.push(node.origin);
@@ -328,7 +369,7 @@
         if (activeTarget && activeTarget.nodeOrigin === node.origin) {
           button.className += " is-active";
         }
-        button.textContent = node.label;
+        button.textContent = getNodeDisplayLabel(node);
         button.setAttribute("data-node-origin", node.origin);
         button.addEventListener("click", function (event) {
           var origin = event.currentTarget.getAttribute("data-node-origin");
@@ -354,7 +395,9 @@
         type: CHANNEL_STATUS_MESSAGE,
         channel: activeChannel,
         node:
-          activeTarget && activeTarget.nodeOrigin ? activeTarget.label : null,
+          activeTarget && activeTarget.nodeOrigin
+            ? activeTarget.displayLabel || activeTarget.label
+            : null,
         origin: activeTarget ? activeTarget.origin : null
       },
       "*"
@@ -394,7 +437,7 @@
       if (loaded || !document.body) return;
       updateStatus(
         activeTarget
-          ? "Still connecting to " + activeTarget.label
+          ? "Still connecting to " + (activeTarget.displayLabel || activeTarget.label)
           : "Still connecting"
       );
     }, SLOW_STATUS_MS);
