@@ -103,6 +103,11 @@
   margin-bottom: 0;
 }
 
+.text-block-plain {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Streaming cursor animation - uses ::after on last child to stay inline */
 .text-block.streaming > :last-child::after {
   content: "";

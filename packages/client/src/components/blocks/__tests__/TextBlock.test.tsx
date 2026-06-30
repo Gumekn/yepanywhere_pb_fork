@@ -178,6 +178,16 @@ describe("TextBlock", () => {
     expect(await screen.findByText("Loading...")).toBeTruthy();
   });
 
+  it("marks plain fallback text as pre-wrapped so Codex markdown newlines stay visible", () => {
+    const text = "First paragraph\n\n- item 1\n- item 2\n\nSecond paragraph";
+
+    const { container } = renderWithSessionMetadata(<TextBlock text={text} />);
+
+    const paragraph = container.querySelector(".text-block-plain");
+
+    expect(paragraph?.textContent).toBe(text);
+  });
+
   it("copies active text selection instead of the whole block", async () => {
     renderWithSessionMetadata(<TextBlock text="alpha beta gamma" />);
 

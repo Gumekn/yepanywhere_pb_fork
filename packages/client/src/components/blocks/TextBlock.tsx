@@ -293,7 +293,9 @@ export const TextBlock = memo(function TextBlock({
           <div dangerouslySetInnerHTML={{ __html: augmentHtml }} />
         ) : (
           // Plain text fallback (no server augment available)
-          <p>{renderPlainTextWithLocalMediaLinks(text)}</p>
+          <p className="text-block-plain">
+            {renderPlainTextWithLocalMediaLinks(text)}
+          </p>
         ))}
       {modal && (
         <LocalMediaModal
