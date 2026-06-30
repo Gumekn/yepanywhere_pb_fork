@@ -486,6 +486,11 @@ export interface InputRequest {
   toolName?: string;
   toolInput?: unknown;
   timestamp: string;
+  /**
+   * Where the request came from. Persisted requests are reconstructed from a
+   * provider JSONL owned by another process, so they are display-only.
+   */
+  source?: "process" | "codex-bridge" | "persisted";
 }
 
 // =============================================================================

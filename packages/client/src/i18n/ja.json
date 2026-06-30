@@ -309,6 +309,7 @@
   "questionPanelCancel": "キャンセル",
   "questionPanelSubmit": "送信",
   "questionPanelNext": "次へ",
+  "questionPanelExternalReadonly": "この質問は外部の Claude CLI ターミナルで待機中です。続行するにはそちらで回答してください。",
   "processInfoTitle": "セッション情報",
   "processInfoError": "プロセス情報の取得に失敗しました",
   "processInfoThinkingDisabled": "無効",

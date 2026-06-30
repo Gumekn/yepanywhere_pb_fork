@@ -192,6 +192,71 @@ describe("Sessions API", () => {
     });
   });
 
+  describe("GET /api/projects/:projectId/sessions/:sessionId", () => {
+    it("returns pendingInputRequest for a persisted Claude AskUserQuestion", async () => {
+      await writeFile(
+        join(sessionDir, "sess-question.jsonl"),
+        [
+          JSON.stringify({
+            type: "user",
+            uuid: "user-1",
+            parentUuid: null,
+            message: { role: "user", content: "Find the old flow" },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            uuid: "assistant-1",
+            parentUuid: "user-1",
+            timestamp: "2026-06-30T01:02:03.000Z",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "text", text: "Which flow did you mean?" },
+                {
+                  type: "tool_use",
+                  id: "toolu-question",
+                  name: "AskUserQuestion",
+                  input: {
+                    questions: [
+                      {
+                        question: "Which flow did you mean?",
+                        header: "Flow",
+                        multiSelect: false,
+                        options: [
+                          { label: "JumpServer", description: "Use devssh" },
+                          { label: "MCP", description: "Use transfer tools" },
+                        ],
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          }),
+        ].join("\n"),
+      );
+      const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
+
+      const res = await app.request(
+        `/api/projects/${projectId}/sessions/sess-question`,
+      );
+
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.pendingInputRequest).toMatchObject({
+        id: "toolu-question",
+        sessionId: "sess-question",
+        type: "question",
+        prompt: "Which flow did you mean?",
+        toolName: "AskUserQuestion",
+        source: "persisted",
+      });
+      expect(
+        json.pendingInputRequest.toolInput.questions[0].options,
+      ).toHaveLength(2);
+    });
+  });
+
   describe("POST /api/projects/:projectId/sessions/:sessionId/resume", () => {
     it("returns 400 if message is missing", async () => {
       const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });

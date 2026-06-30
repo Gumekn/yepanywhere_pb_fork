@@ -329,6 +329,7 @@
   "questionPanelCancel": "Cancel",
   "questionPanelSubmit": "Submit",
   "questionPanelNext": "Next",
+  "questionPanelExternalReadonly": "This question is waiting in the external Claude CLI terminal. Answer it there to continue.",
   "processInfoTitle": "Session Info",
   "processInfoError": "Failed to fetch process info",
   "processInfoThinkingDisabled": "Disabled",

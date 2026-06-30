@@ -561,10 +561,22 @@ export function useSessionMessages(
           ? { ...prev, ...data.session, messages: prev.messages }
           : data.session,
       );
+      onLoadComplete?.({
+        session: data.session,
+        status: data.ownership,
+        pendingInputRequest: data.pendingInputRequest,
+        slashCommands: data.slashCommands,
+      });
     } catch {
       // Silent fail for incremental updates
     }
-  }, [projectId, sessionId, branchId, updatePersistedTimestampWatermark]);
+  }, [
+    projectId,
+    sessionId,
+    branchId,
+    updatePersistedTimestampWatermark,
+    onLoadComplete,
+  ]);
 
   const refreshSessionMessages = useCallback(
     async (options?: { branchId?: string | null }) => {
@@ -581,12 +593,19 @@ export function useSessionMessages(
           ),
           branchId: resolvedBranchId,
         });
-        return applySessionSnapshot(data);
+        const refreshedSession = applySessionSnapshot(data);
+        onLoadComplete?.({
+          session: data.session,
+          status: data.ownership,
+          pendingInputRequest: data.pendingInputRequest,
+          slashCommands: data.slashCommands,
+        });
+        return refreshedSession;
       } catch {
         return null;
       }
     },
-    [projectId, sessionId, branchId, applySessionSnapshot],
+    [projectId, sessionId, branchId, applySessionSnapshot, onLoadComplete],
   );
 
   // Load older messages (previous chunk before the current truncation point)

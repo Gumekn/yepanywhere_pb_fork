@@ -51,6 +51,7 @@ import {
   sliceAtCompactBoundaries,
 } from "../sessions/pagination.js";
 import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.js";
+import { getPersistedAskUserQuestionInputRequest } from "../sessions/persisted-pending-input.js";
 import { findSessionSummaryAcrossProviders } from "../sessions/provider-resolution.js";
 import type { ISessionReader } from "../sessions/types.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
@@ -692,7 +693,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     const lastSeenAt = lastSeenEntry?.timestamp;
 
     // Get pending input request from active process
-    const pendingInputRequest =
+    const activePendingInputRequest =
       process?.state.type === "waiting-input"
         ? process.state.request
         : ((await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
@@ -768,7 +769,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         hasUnread,
       },
       ownership,
-      pendingInputRequest,
+      pendingInputRequest: activePendingInputRequest,
       slashCommands,
     });
   });
@@ -1087,7 +1088,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Get pending input request from active process (for tool approval prompts)
     // This ensures clients get pending requests immediately without waiting for SSE
-    const pendingInputRequest =
+    const activePendingInputRequest =
       process?.state.type === "waiting-input"
         ? process.state.request
         : ((await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
@@ -1160,7 +1161,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           },
           messages: processMessages,
           ownership,
-          pendingInputRequest,
+          pendingInputRequest: activePendingInputRequest,
           slashCommands,
         });
       }
@@ -1185,7 +1186,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           },
           messages: [],
           ownership,
-          pendingInputRequest,
+          pendingInputRequest: activePendingInputRequest,
           slashCommands,
         });
       }
@@ -1228,6 +1229,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Keep persisted rendering in lockstep with stream augmentation behavior.
     await augmentPersistedSessionMessages(session.messages);
+
+    const persistedPendingInputRequest =
+      activePendingInputRequest === null &&
+      (session.provider === "claude" || session.provider === "claude-ollama")
+        ? getPersistedAskUserQuestionInputRequest(session.messages, sessionId)
+        : null;
+    const pendingInputRequest =
+      activePendingInputRequest ?? persistedPendingInputRequest;
 
     // Override context usage with SDK-reported context window from live process
     // The reader uses hardcoded defaults; the process captures the real value at runtime

@@ -329,6 +329,7 @@
   "questionPanelCancel": "取消",
   "questionPanelSubmit": "提交",
   "questionPanelNext": "下一步",
+  "questionPanelExternalReadonly": "这个问题正在外部 Claude CLI 终端里等待，请回到原终端作答后继续。",
   "processInfoTitle": "会话信息",
   "processInfoError": "获取进程信息失败",
   "processInfoThinkingDisabled": "关闭",

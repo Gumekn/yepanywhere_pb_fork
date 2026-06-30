@@ -1124,6 +1124,7 @@ function SessionPageContent({
 
   // Check if pending request is an AskUserQuestion
   const isAskUserQuestion = pendingInputRequest?.toolName === "AskUserQuestion";
+  const isPersistedInputRequest = pendingInputRequest?.source === "persisted";
 
   // If process is actively in-turn or waiting for input, don't mark tools as orphaned.
   // "orphanedToolUseIds" from server just means "no result yet" - but if the process is
@@ -1665,6 +1666,7 @@ function SessionPageContent({
                   sessionId={actualSessionId}
                   onSubmit={handleQuestionSubmit}
                   onDeny={handleDeny}
+                  readOnly={isPersistedInputRequest}
                 />
               )}
 

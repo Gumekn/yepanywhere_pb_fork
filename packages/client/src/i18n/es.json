@@ -309,6 +309,7 @@
   "questionPanelCancel": "Cancelar",
   "questionPanelSubmit": "Enviar",
   "questionPanelNext": "Siguiente",
+  "questionPanelExternalReadonly": "Esta pregunta está esperando en el terminal externo de Claude CLI. Respóndela allí para continuar.",
   "processInfoTitle": "Información de la sesión",
   "processInfoError": "No se pudo obtener la información del proceso",
   "processInfoThinkingDisabled": "Desactivado",

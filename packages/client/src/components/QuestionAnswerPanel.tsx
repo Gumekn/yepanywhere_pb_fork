@@ -9,6 +9,8 @@ interface Props {
   sessionId: string;
   onSubmit: (answers: Record<string, string>) => Promise<void>;
   onDeny: () => Promise<void>;
+  readOnly?: boolean;
+  readOnlyNotice?: string;
 }
 
 /**
@@ -20,6 +22,8 @@ export function QuestionAnswerPanel({
   sessionId,
   onSubmit,
   onDeny,
+  readOnly = false,
+  readOnlyNotice,
 }: Props) {
   const { t } = useI18n();
   const input = request.toolInput as AskUserQuestionInput;
@@ -68,13 +72,14 @@ export function QuestionAnswerPanel({
 
   const handleSelectOption = useCallback(
     (optionLabel: string) => {
+      if (readOnly) return;
       if (!currentQuestion) return;
       setAnswers((prev) => ({
         ...prev,
         [currentQuestion.question]: optionLabel,
       }));
     },
-    [currentQuestion],
+    [currentQuestion, readOnly],
   );
 
   const handleOtherTextChange = useCallback(
@@ -92,7 +97,7 @@ export function QuestionAnswerPanel({
   }, [isLastQuestion]);
 
   const handleSubmit = useCallback(async () => {
-    if (!allAnswered || submitting) return;
+    if (readOnly || !allAnswered || submitting) return;
 
     // Build final answers, replacing __other__ with actual text
     const finalAnswers: Record<string, string> = {};
@@ -121,21 +126,24 @@ export function QuestionAnswerPanel({
     otherTexts,
     onSubmit,
     clearOtherTexts,
+    readOnly,
   ]);
 
   const handleDeny = useCallback(async () => {
+    if (readOnly) return;
     setSubmitting(true);
     try {
       await onDeny();
     } finally {
       setSubmitting(false);
     }
-  }, [onDeny]);
+  }, [onDeny, readOnly]);
 
   // Keyboard handling
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (submitting) return;
+      if (readOnly) return;
 
       // Escape to deny
       if (e.key === "Escape") {
@@ -187,6 +195,7 @@ export function QuestionAnswerPanel({
     handleDeny,
     handleSubmit,
     advanceToNext,
+    readOnly,
   ]);
 
   if (!questions.length) {
@@ -264,6 +273,7 @@ export function QuestionAnswerPanel({
                       type="button"
                       className={`question-option-btn ${isSelected ? "selected" : ""}`}
                       onClick={() => handleSelectOption(option.label)}
+                      disabled={readOnly}
                     >
                       <span className="question-option-radio">
                         {currentQuestion.multiSelect
@@ -289,20 +299,22 @@ export function QuestionAnswerPanel({
                 })}
 
                 {/* Other option */}
-                <button
-                  type="button"
-                  className={`question-option-btn other ${isOtherSelected ? "selected" : ""}`}
-                  onClick={() => handleSelectOption("__other__")}
-                >
-                  <span className="question-option-radio">
-                    {isOtherSelected ? "●" : "○"}
-                  </span>
-                  <div className="question-option-text">
-                    <span className="question-option-label">
-                      {t("questionPanelOther")}
+                {!readOnly && (
+                  <button
+                    type="button"
+                    className={`question-option-btn other ${isOtherSelected ? "selected" : ""}`}
+                    onClick={() => handleSelectOption("__other__")}
+                  >
+                    <span className="question-option-radio">
+                      {isOtherSelected ? "●" : "○"}
                     </span>
-                  </div>
-                </button>
+                    <div className="question-option-text">
+                      <span className="question-option-label">
+                        {t("questionPanelOther")}
+                      </span>
+                    </div>
+                  </button>
+                )}
 
                 {/* Other text input */}
                 {isOtherSelected && (
@@ -321,39 +333,45 @@ export function QuestionAnswerPanel({
           )}
 
           {/* Actions */}
-          <div className="question-actions">
-            <button
-              type="button"
-              className="question-btn deny"
-              onClick={handleDeny}
-              disabled={submitting}
-            >
-              {t("questionPanelCancel")}
-              <kbd>esc</kbd>
-            </button>
+          {readOnly ? (
+            <div className="question-panel-readonly">
+              {readOnlyNotice ?? t("questionPanelExternalReadonly")}
+            </div>
+          ) : (
+            <div className="question-actions">
+              <button
+                type="button"
+                className="question-btn deny"
+                onClick={handleDeny}
+                disabled={submitting}
+              >
+                {t("questionPanelCancel")}
+                <kbd>esc</kbd>
+              </button>
 
-            {isLastQuestion ? (
-              <button
-                type="button"
-                className="question-btn submit"
-                onClick={handleSubmit}
-                disabled={!allAnswered || submitting}
-              >
-                {t("questionPanelSubmit")}
-                <kbd>↵</kbd>
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="question-btn next"
-                onClick={advanceToNext}
-                disabled={!currentAnswer || submitting}
-              >
-                {t("questionPanelNext")}
-                <kbd>↵</kbd>
-              </button>
-            )}
-          </div>
+              {isLastQuestion ? (
+                <button
+                  type="button"
+                  className="question-btn submit"
+                  onClick={handleSubmit}
+                  disabled={!allAnswered || submitting}
+                >
+                  {t("questionPanelSubmit")}
+                  <kbd>↵</kbd>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="question-btn next"
+                  onClick={advanceToNext}
+                  disabled={!currentAnswer || submitting}
+                >
+                  {t("questionPanelNext")}
+                  <kbd>↵</kbd>
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
