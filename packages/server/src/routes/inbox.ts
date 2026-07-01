@@ -341,16 +341,6 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
     const badgeSessionIds = new Set(
       needsAttention.map((item) => item.sessionId),
     );
-    const knownVisibleSessionIds = new Set(
-      allSessions.map((item) => item.session.id),
-    );
-    const sessionsNeedingReview =
-      deps.notificationService?.getSessionsNeedingReview() ?? [];
-    for (const sessionId of sessionsNeedingReview) {
-      if (knownVisibleSessionIds.has(sessionId)) {
-        badgeSessionIds.add(sessionId);
-      }
-    }
 
     // Apply limits per tier
     const response: InboxResponse = {

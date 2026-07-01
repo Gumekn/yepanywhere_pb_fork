@@ -444,7 +444,7 @@ describe("Inbox Routes", () => {
       expect(result.badgeSessionIds).toEqual(["sess1"]);
     });
 
-    it("counts notification-backed sessions needing review", async () => {
+    it("does not count notification-backed sessions needing review", async () => {
       const project = createProject("proj1", "myproject", "/sessions/proj1");
       const session = createSession("sess1", "proj1", minutesAgo(45));
 
@@ -462,11 +462,14 @@ describe("Inbox Routes", () => {
         sessionIndexService: mockSessionIndexService,
       });
 
-      expect(result.badgeCount).toBe(1);
-      expect(result.badgeSessionIds).toEqual(["sess1"]);
+      expect(result.recentActivity.map((item) => item.sessionId)).toEqual([
+        "sess1",
+      ]);
+      expect(result.badgeCount).toBe(0);
+      expect(result.badgeSessionIds).toEqual([]);
     });
 
-    it("deduplicates sessions that are both attention and review items", async () => {
+    it("counts sessions needing attention even if they also need review", async () => {
       const project = createProject("proj1", "myproject", "/sessions/proj1");
       const session = createSession("sess1", "proj1", minutesAgo(5));
 
