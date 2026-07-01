@@ -166,4 +166,36 @@ describe("loadConfig codex paths", () => {
     ]);
     expect(config.codexBridgeFullUpstreamArgs).toEqual([]);
   });
+
+  it("uses safe Claude bridge defaults", async () => {
+    vi.stubEnv("PORT", undefined);
+    vi.stubEnv("YEP_CLAUDE_BRIDGE_HOST", undefined);
+    vi.stubEnv("YEP_CLAUDE_BRIDGE_PORT", undefined);
+    vi.stubEnv("YEP_CLAUDE_BRIDGE_CONTROL_URL", undefined);
+    vi.stubEnv("YEP_SERVER_URL", undefined);
+    vi.stubEnv("YEP_ANYWHERE_SERVER_URL", undefined);
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.claudeBridgeHost).toBe("127.0.0.1");
+    expect(config.claudeBridgePort).toBe(4520);
+    expect(config.claudeBridgeControlUrl).toBe("http://127.0.0.1:4520");
+    expect(config.claudeBridgeServerUrl).toBe("http://127.0.0.1:3400");
+  });
+
+  it("parses Claude bridge env overrides", async () => {
+    vi.stubEnv("YEP_CLAUDE_BRIDGE_HOST", "localhost");
+    vi.stubEnv("YEP_CLAUDE_BRIDGE_PORT", "4620");
+    vi.stubEnv("YEP_CLAUDE_BRIDGE_CONTROL_URL", "http://localhost:4621");
+    vi.stubEnv("YEP_SERVER_URL", "http://127.0.0.1:8022/yep");
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.claudeBridgeHost).toBe("localhost");
+    expect(config.claudeBridgePort).toBe(4620);
+    expect(config.claudeBridgeControlUrl).toBe("http://localhost:4621");
+    expect(config.claudeBridgeServerUrl).toBe("http://127.0.0.1:8022/yep");
+  });
 });

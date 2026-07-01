@@ -70,6 +70,14 @@ export interface Config {
   codexBridgeClearUpstreamArgs: string[];
   /** Extra args passed to the managed full `codex app-server` upstream. */
   codexBridgeFullUpstreamArgs: string[];
+  /** Host/interface for the Claude terminal bridge. Defaults to localhost for safety. */
+  claudeBridgeHost: string;
+  /** Port for the Claude terminal bridge HTTP listener. */
+  claudeBridgePort: number;
+  /** HTTP control URL for the Claude terminal bridge sidecar. */
+  claudeBridgeControlUrl: string;
+  /** Yep server URL that the Claude bridge sidecar forwards requests to. */
+  claudeBridgeServerUrl: string;
   /**
    * Periodic full-tree rescan interval for codex session watcher (ms).
    * Helps recover from missed fs.watch events on macOS. 0 disables it.
@@ -190,6 +198,10 @@ export function loadConfig(): Config {
     process.env.YEP_CODEX_BRIDGE_PORT ?? process.env.CODEX_BRIDGE_PORT,
     4510,
   );
+  const claudeBridgePort = parseIntOrDefault(
+    process.env.YEP_CLAUDE_BRIDGE_PORT ?? process.env.CLAUDE_BRIDGE_PORT,
+    4520,
+  );
   const codexBridgeMode = parseCodexBridgeMode(
     process.env.YEP_CODEX_BRIDGE_MODE ??
       process.env.CODEX_BRIDGE_MODE ??
@@ -283,6 +295,19 @@ export function loadConfig(): Config {
       process.env.YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS,
       [],
     ),
+    claudeBridgeHost:
+      process.env.YEP_CLAUDE_BRIDGE_HOST ??
+      process.env.CLAUDE_BRIDGE_HOST ??
+      "127.0.0.1",
+    claudeBridgePort,
+    claudeBridgeControlUrl:
+      process.env.YEP_CLAUDE_BRIDGE_CONTROL_URL ??
+      process.env.CLAUDE_BRIDGE_CONTROL_URL ??
+      `http://127.0.0.1:${claudeBridgePort}`,
+    claudeBridgeServerUrl:
+      process.env.YEP_SERVER_URL ??
+      process.env.YEP_ANYWHERE_SERVER_URL ??
+      `http://127.0.0.1:${parseIntOrDefault(process.env.PORT, 3400)}`,
     codexWatchPeriodicRescanMs,
     sessionIndexFullValidationMs,
     sessionIndexWriteLockTimeoutMs,
@@ -374,7 +399,10 @@ export function loadConfig(): Config {
     cliHostOverride: process.env.CLI_HOST_OVERRIDE === "true",
     openBrowser: process.env.OPEN_BROWSER === "true",
     httpsSelfSigned: process.env.HTTPS_SELF_SIGNED === "true",
-    desktopAuthToken: process.env.DESKTOP_AUTH_TOKEN || undefined,
+    desktopAuthToken:
+      process.env.YEP_DESKTOP_AUTH_TOKEN ??
+      process.env.DESKTOP_AUTH_TOKEN ??
+      undefined,
     // Optional reverse-proxy prefix; Caddy in air.yueyuan.uk/yep/* mounts us
     // here. Stripped of any trailing slash so callers can confidently template
     // `${basePath}/api/...`. Empty string keeps the legacy "no prefix" mode.

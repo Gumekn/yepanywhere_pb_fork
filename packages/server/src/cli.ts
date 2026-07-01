@@ -76,6 +76,7 @@ yepanywhere - A mobile-first supervisor for Claude Code agents
 
 USAGE:
   yepanywhere [OPTIONS]
+  yepanywhere claude [OPTIONS] [prompt]
 
 OPTIONS:
   --help, -h            Show this help message
@@ -89,6 +90,8 @@ OPTIONS:
   --auth-disable        Disable authentication (bypass auth even if enabled in settings)
                         Emergency recovery mode; re-enable auth after fixing config
   --codex-bridge-only   Start only the Codex CLI bridge sidecar
+  --claude-bridge-only  Start only the Claude terminal bridge sidecar
+  claude                Start or attach to a Yep-managed Claude session
 
 SETUP OPTIONS (for headless installation):
   --setup-auth <password>
@@ -141,6 +144,12 @@ EXAMPLES:
   # Emergency auth bypass (temporary)
   yepanywhere --auth-disable
 
+  # Start a Yep-managed Claude session from the terminal
+  yepanywhere claude "fix the failing tests"
+
+  # Start only the local Claude terminal bridge sidecar
+  yepanywhere --claude-bridge-only
+
 DOCUMENTATION:
   For full documentation, see: https://github.com/kzahel/yepanywhere
 
@@ -171,119 +180,139 @@ function showVersion(): void {
 
 // Parse command line arguments
 const args = process.argv.slice(2);
+const invokedAs = path.basename(process.argv[1] ?? "");
+const claudeWrapperInvocation =
+  invokedAs === "yc" || invokedAs === "yep-claude" || args[0] === "claude";
 
-if (args.includes("--help") || args.includes("-h")) {
-  showHelp();
-  process.exit(0);
-}
-
-if (args.includes("--version") || args.includes("-v")) {
-  showVersion();
-  process.exit(0);
-}
-
-// Parse --port option
-const portIndex = args.indexOf("--port");
-if (portIndex !== -1) {
-  const portValue = args[portIndex + 1];
-  if (!portValue || portValue.startsWith("-")) {
-    console.error("Error: --port requires a value (e.g., --port 8000)");
-    process.exit(1);
+if (claudeWrapperInvocation) {
+  checkNodeVersion();
+  if (args[0] === "claude") {
+    args.shift();
   }
-  const portNum = Number.parseInt(portValue, 10);
-  if (Number.isNaN(portNum) || portNum < 1 || portNum > 65535) {
-    console.error("Error: --port must be a valid port number (1-65535)");
-    process.exit(1);
-  }
-  process.env.PORT = portValue;
-  // Mark that port was explicitly set via CLI (prevents runtime changes)
-  process.env.CLI_PORT_OVERRIDE = "true";
-  // Remove --port and its value from args
-  args.splice(portIndex, 2);
-}
-
-// Parse --host option
-const hostIndex = args.indexOf("--host");
-if (hostIndex !== -1) {
-  const hostValue = args[hostIndex + 1];
-  if (!hostValue || hostValue.startsWith("-")) {
-    console.error("Error: --host requires a value (e.g., --host 0.0.0.0)");
-    process.exit(1);
-  }
-  process.env.HOST = hostValue;
-  // Mark that host was explicitly set via CLI (prevents runtime changes)
-  process.env.CLI_HOST_OVERRIDE = "true";
-  // Remove --host and its value from args
-  args.splice(hostIndex, 2);
-}
-
-// Parse --open flag
-const openIndex = args.indexOf("--open");
-if (openIndex !== -1) {
-  process.env.OPEN_BROWSER = "true";
-  args.splice(openIndex, 1);
-}
-
-// Parse --https-self-signed flag
-const httpsSelfSignedIndex = args.indexOf("--https-self-signed");
-if (httpsSelfSignedIndex !== -1) {
-  process.env.HTTPS_SELF_SIGNED = "true";
-  args.splice(httpsSelfSignedIndex, 1);
-}
-
-// Parse --auth-disable flag
-const authDisableIndex = args.indexOf("--auth-disable");
-if (authDisableIndex !== -1) {
-  process.env.AUTH_DISABLED = "true";
-  args.splice(authDisableIndex, 1);
-}
-
-// Parse --codex-bridge-only flag
-const codexBridgeOnlyIndex = args.indexOf("--codex-bridge-only");
-const codexBridgeOnly = codexBridgeOnlyIndex !== -1;
-if (codexBridgeOnlyIndex !== -1) {
-  args.splice(codexBridgeOnlyIndex, 1);
-}
-
-// Parse --setup-auth flag
-const setupAuthIndex = args.indexOf("--setup-auth");
-let setupAuthPassword: string | undefined;
-if (setupAuthIndex !== -1) {
-  const passwordValue = args[setupAuthIndex + 1];
-  if (!passwordValue || passwordValue.startsWith("-")) {
-    console.error("Error: --setup-auth requires a password value");
-    process.exit(1);
-  }
-  setupAuthPassword = passwordValue;
-  args.splice(setupAuthIndex, 2);
-}
-
-// If there are unknown arguments, show error and help
-if (args.length > 0) {
-  console.error(`Error: Unknown arguments: ${args.join(" ")}`);
-  console.error("");
-  console.error("Run 'yepanywhere --help' for usage information.");
-  process.exit(1);
-}
-
-// Run prerequisite checks
-checkNodeVersion();
-
-// Set NODE_ENV to production if not already set (CLI users expect production mode)
-if (!process.env.NODE_ENV) {
-  process.env.NODE_ENV = "production";
-}
-
-// Handle setup commands (exit after completion)
-if (setupAuthPassword) {
-  runSetup(setupAuthPassword);
-} else if (codexBridgeOnly) {
-  runCodexBridgeOnly();
+  runClaudeWrapper(args);
 } else {
-  // Only check for Claude CLI when starting the server (not for setup commands)
-  checkClaudeCli();
-  // Normal server startup
-  runServer();
+  if (args.includes("--help") || args.includes("-h")) {
+    showHelp();
+    process.exit(0);
+  }
+
+  if (args.includes("--version") || args.includes("-v")) {
+    showVersion();
+    process.exit(0);
+  }
+
+  // Parse --port option
+  const portIndex = args.indexOf("--port");
+  if (portIndex !== -1) {
+    const portValue = args[portIndex + 1];
+    if (!portValue || portValue.startsWith("-")) {
+      console.error("Error: --port requires a value (e.g., --port 8000)");
+      process.exit(1);
+    }
+    const portNum = Number.parseInt(portValue, 10);
+    if (Number.isNaN(portNum) || portNum < 1 || portNum > 65535) {
+      console.error("Error: --port must be a valid port number (1-65535)");
+      process.exit(1);
+    }
+    process.env.PORT = portValue;
+    // Mark that port was explicitly set via CLI (prevents runtime changes)
+    process.env.CLI_PORT_OVERRIDE = "true";
+    // Remove --port and its value from args
+    args.splice(portIndex, 2);
+  }
+
+  // Parse --host option
+  const hostIndex = args.indexOf("--host");
+  if (hostIndex !== -1) {
+    const hostValue = args[hostIndex + 1];
+    if (!hostValue || hostValue.startsWith("-")) {
+      console.error("Error: --host requires a value (e.g., --host 0.0.0.0)");
+      process.exit(1);
+    }
+    process.env.HOST = hostValue;
+    // Mark that host was explicitly set via CLI (prevents runtime changes)
+    process.env.CLI_HOST_OVERRIDE = "true";
+    // Remove --host and its value from args
+    args.splice(hostIndex, 2);
+  }
+
+  // Parse --open flag
+  const openIndex = args.indexOf("--open");
+  if (openIndex !== -1) {
+    process.env.OPEN_BROWSER = "true";
+    args.splice(openIndex, 1);
+  }
+
+  // Parse --https-self-signed flag
+  const httpsSelfSignedIndex = args.indexOf("--https-self-signed");
+  if (httpsSelfSignedIndex !== -1) {
+    process.env.HTTPS_SELF_SIGNED = "true";
+    args.splice(httpsSelfSignedIndex, 1);
+  }
+
+  // Parse --auth-disable flag
+  const authDisableIndex = args.indexOf("--auth-disable");
+  if (authDisableIndex !== -1) {
+    process.env.AUTH_DISABLED = "true";
+    args.splice(authDisableIndex, 1);
+  }
+
+  // Parse --codex-bridge-only flag
+  const codexBridgeOnlyIndex = args.indexOf("--codex-bridge-only");
+  const codexBridgeOnly = codexBridgeOnlyIndex !== -1;
+  if (codexBridgeOnlyIndex !== -1) {
+    args.splice(codexBridgeOnlyIndex, 1);
+  }
+
+  // Parse --claude-bridge-only flag
+  const claudeBridgeOnlyIndex = args.indexOf("--claude-bridge-only");
+  const claudeBridgeOnly = claudeBridgeOnlyIndex !== -1;
+  if (claudeBridgeOnlyIndex !== -1) {
+    args.splice(claudeBridgeOnlyIndex, 1);
+  }
+
+  // Parse --setup-auth flag
+  const setupAuthIndex = args.indexOf("--setup-auth");
+  let setupAuthPassword: string | undefined;
+  if (setupAuthIndex !== -1) {
+    const passwordValue = args[setupAuthIndex + 1];
+    if (!passwordValue || passwordValue.startsWith("-")) {
+      console.error("Error: --setup-auth requires a password value");
+      process.exit(1);
+    }
+    setupAuthPassword = passwordValue;
+    args.splice(setupAuthIndex, 2);
+  }
+
+  // If there are unknown arguments, show error and help
+  if (args.length > 0) {
+    console.error(`Error: Unknown arguments: ${args.join(" ")}`);
+    console.error("");
+    console.error("Run 'yepanywhere --help' for usage information.");
+    process.exit(1);
+  }
+
+  // Run prerequisite checks
+  checkNodeVersion();
+
+  // Set NODE_ENV to production if not already set (CLI users expect production mode)
+  if (!process.env.NODE_ENV) {
+    process.env.NODE_ENV = "production";
+  }
+
+  // Handle setup commands (exit after completion)
+  if (setupAuthPassword) {
+    runSetup(setupAuthPassword);
+  } else if (codexBridgeOnly) {
+    runCodexBridgeOnly();
+  } else if (claudeBridgeOnly) {
+    runClaudeBridgeOnly();
+  } else {
+    // Only check for Claude CLI when starting the server (not for setup commands)
+    checkClaudeCli();
+    // Normal server startup
+    runServer();
+  }
 }
 
 async function runSetup(authPassword: string | undefined): Promise<never> {
@@ -319,6 +348,28 @@ function runCodexBridgeOnly(): void {
     .then(({ runCodexBridgeOnly }) => runCodexBridgeOnly())
     .catch((error) => {
       console.error("Failed to start Codex bridge:", error);
+      process.exit(1);
+    });
+}
+
+function runClaudeBridgeOnly(): void {
+  import("./claude-bridge/standalone.js")
+    .then(({ runClaudeBridgeOnly }) => runClaudeBridgeOnly())
+    .catch((error) => {
+      console.error("Failed to start Claude bridge:", error);
+      process.exit(1);
+    });
+}
+
+function runClaudeWrapper(wrapperArgs: string[]): void {
+  import("./claude-wrapper.js")
+    .then(({ runClaudeWrapper }) => runClaudeWrapper(wrapperArgs))
+    .catch((error) => {
+      console.error(
+        `Failed to start Claude wrapper: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
       process.exit(1);
     });
 }

@@ -11,10 +11,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SERVER_LABEL="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
 BRIDGE_LABEL="${YEP_LAUNCHD_BRIDGE_LABEL:-com.yueyuan.yepanywhere.codex-bridge}"
+CLAUDE_BRIDGE_LABEL="${YEP_LAUNCHD_CLAUDE_BRIDGE_LABEL:-com.yueyuan.yepanywhere.claude-bridge}"
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
 SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
 BRIDGE_PORT="${YEP_CODEX_BRIDGE_PORT:-${CODEX_BRIDGE_PORT:-4510}}"
 BRIDGE_URL="${YEP_CODEX_BRIDGE_CONTROL_URL:-${CODEX_BRIDGE_CONTROL_URL:-http://127.0.0.1:${BRIDGE_PORT}}}"
+CLAUDE_BRIDGE_PORT="${YEP_CLAUDE_BRIDGE_PORT:-${CLAUDE_BRIDGE_PORT:-4520}}"
+CLAUDE_BRIDGE_URL="${YEP_CLAUDE_BRIDGE_CONTROL_URL:-${CLAUDE_BRIDGE_CONTROL_URL:-http://127.0.0.1:${CLAUDE_BRIDGE_PORT}}}"
+SERVER_URL="http://127.0.0.1:${SERVER_PORT}${SERVER_BASE_PATH}"
 NODE_BIN="${YEP_LAUNCHD_NODE:-$(command -v node 2>/dev/null || true)}"
 CLI_JS="$REPO_ROOT/dist/npm-package/dist/cli.js"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -22,7 +26,8 @@ LOG_DIR="${YEP_LAUNCHD_LOG_DIR:-$HOME/.yep-anywhere/logs}"
 USER_DOMAIN="gui/$(id -u)"
 START_NOW=true
 INSTALL_SERVER=true
-INSTALL_BRIDGE=true
+INSTALL_CODEX_BRIDGE=true
+INSTALL_CLAUDE_BRIDGE=true
 
 if [[ -t 1 ]]; then
   C_GREEN="\033[32m"; C_YELLOW="\033[33m"; C_RED="\033[31m"; C_DIM="\033[2m"; C_RESET="\033[0m"
@@ -40,17 +45,21 @@ usage() {
   cat <<'EOF'
 
 Usage:
-  scripts/install-launchagents.sh [--server-only|--bridge-only] [--no-start]
+  scripts/install-launchagents.sh [--server-only|--bridge-only|--claude-bridge-only] [--no-start]
 
 Options:
   --server-only                Write/reload only the 8022 server LaunchAgent
-  --bridge-only                Write/reload only the 4510 Codex bridge LaunchAgent
+  --bridge-only, --codex-bridge-only
+                               Write/reload only the 4510 Codex bridge LaunchAgent
+  --claude-bridge-only         Write/reload only the 4520 Claude bridge LaunchAgent
+  --bridges-only               Write/reload both bridge LaunchAgents
   --no-start                   Write plist file(s) without unloading or starting LaunchAgents
 
 Environment overrides:
   YEP_DEPLOY_PORT              Main server port (default: 8022)
   YEP_DEPLOY_BASE_PATH         Main server base path (default: /yep)
   YEP_CODEX_BRIDGE_PORT        Codex bridge port (default: 4510)
+  YEP_CLAUDE_BRIDGE_PORT       Claude bridge port (default: 4520)
   YEP_LAUNCHD_NODE             Absolute node binary path
   YEP_LAUNCHD_PATH             PATH stored in the LaunchAgent environment
   YEP_LAUNCHD_LOG_DIR          LaunchAgent stdout/stderr log directory
@@ -72,12 +81,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --server-only)
       INSTALL_SERVER=true
-      INSTALL_BRIDGE=false
+      INSTALL_CODEX_BRIDGE=false
+      INSTALL_CLAUDE_BRIDGE=false
       shift
       ;;
-    --bridge-only)
+    --bridge-only|--codex-bridge-only)
       INSTALL_SERVER=false
-      INSTALL_BRIDGE=true
+      INSTALL_CODEX_BRIDGE=true
+      INSTALL_CLAUDE_BRIDGE=false
+      shift
+      ;;
+    --claude-bridge-only)
+      INSTALL_SERVER=false
+      INSTALL_CODEX_BRIDGE=false
+      INSTALL_CLAUDE_BRIDGE=true
+      shift
+      ;;
+    --bridges-only)
+      INSTALL_SERVER=false
+      INSTALL_CODEX_BRIDGE=true
+      INSTALL_CLAUDE_BRIDGE=true
       shift
       ;;
     -h|--help)
@@ -92,8 +115,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! $INSTALL_SERVER && ! $INSTALL_BRIDGE; then
-  err "Nothing to install: server and bridge are both disabled."
+if ! $INSTALL_SERVER && ! $INSTALL_CODEX_BRIDGE && ! $INSTALL_CLAUDE_BRIDGE; then
+  err "Nothing to install: server and bridges are all disabled."
   exit 2
 fi
 
@@ -215,6 +238,19 @@ write_bridge_plist() {
   echo "$plist"
 }
 
+write_claude_bridge_plist() {
+  local plist="$LAUNCH_AGENTS_DIR/$CLAUDE_BRIDGE_LABEL.plist"
+  write_header "$plist" "$CLAUDE_BRIDGE_LABEL" "$LOG_DIR/claude-bridge-launchd.out.log" "$LOG_DIR/claude-bridge-launchd.err.log"
+  append_env "$plist" \
+    "NODE_ENV" "production" \
+    "PATH" "$LAUNCHD_PATH" \
+    "YEP_DEPLOY_REPO_ROOT" "$REPO_ROOT" \
+    "YEP_CLAUDE_BRIDGE_PORT" "$CLAUDE_BRIDGE_PORT" \
+    "YEP_SERVER_URL" "$SERVER_URL"
+  append_program_arguments "$plist" "$NODE_BIN" "$CLI_JS" "--claude-bridge-only"
+  echo "$plist"
+}
+
 write_server_plist() {
   local plist="$LAUNCH_AGENTS_DIR/$SERVER_LABEL.plist"
   local env_args=(
@@ -225,6 +261,8 @@ write_server_plist() {
     "YEP_CODEX_BRIDGE_MODE" "external"
     "YEP_CODEX_BRIDGE_CONTROL_URL" "$BRIDGE_URL"
     "YEP_CODEX_BRIDGE_PORT" "$BRIDGE_PORT"
+    "YEP_CLAUDE_BRIDGE_CONTROL_URL" "$CLAUDE_BRIDGE_URL"
+    "YEP_CLAUDE_BRIDGE_PORT" "$CLAUDE_BRIDGE_PORT"
   )
 
   if [[ -n "$FCM_SERVICE_ACCOUNT_FILE" ]]; then
@@ -256,9 +294,14 @@ reload_agent() {
 
 log "Installing Yep Anywhere LaunchAgents ..."
 
-if $INSTALL_BRIDGE; then
+if $INSTALL_CODEX_BRIDGE; then
   BRIDGE_PLIST="$(write_bridge_plist)"
   reload_agent "$BRIDGE_LABEL" "$BRIDGE_PLIST"
+fi
+
+if $INSTALL_CLAUDE_BRIDGE; then
+  CLAUDE_BRIDGE_PLIST="$(write_claude_bridge_plist)"
+  reload_agent "$CLAUDE_BRIDGE_LABEL" "$CLAUDE_BRIDGE_PLIST"
 fi
 
 if $INSTALL_SERVER; then
@@ -272,10 +315,16 @@ if $INSTALL_SERVER; then
 else
   dim "server: skipped"
 fi
-if $INSTALL_BRIDGE; then
-  dim "bridge: $BRIDGE_LABEL -> $BRIDGE_URL"
+if $INSTALL_CODEX_BRIDGE; then
+  dim "codex bridge:  $BRIDGE_LABEL -> $BRIDGE_URL"
 else
-  dim "bridge: skipped"
+  dim "codex bridge:  skipped"
+fi
+if $INSTALL_CLAUDE_BRIDGE; then
+  dim "claude bridge: $CLAUDE_BRIDGE_LABEL -> $CLAUDE_BRIDGE_URL"
+  dim "claude bridge server: $SERVER_URL"
+else
+  dim "claude bridge: skipped"
 fi
 dim "logs:   $LOG_DIR/*-launchd.*.log"
 if $INSTALL_SERVER; then

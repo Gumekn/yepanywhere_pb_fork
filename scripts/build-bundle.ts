@@ -338,6 +338,7 @@ step("Generate package.json for npm", () => {
     type: "module",
     bin: {
       yepanywhere: "./dist/cli.js",
+      yc: "./dist/cli.js",
     },
     scripts: {
       postinstall:
