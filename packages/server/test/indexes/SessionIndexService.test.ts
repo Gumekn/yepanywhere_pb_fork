@@ -97,6 +97,71 @@ describe("SessionIndexService", () => {
       expect(sessions2).toHaveLength(1);
       expect(sessions2[0]?.id).toBe("session-1");
     });
+
+    it("caches user questions extracted from raw session files", async () => {
+      const lines = [
+        {
+          type: "user",
+          message: { content: "# AGENTS.md instructions\nignore setup" },
+          uuid: "setup",
+          parentUuid: null,
+          timestamp: "2026-01-01T00:00:00.000Z",
+        },
+        {
+          type: "user",
+          message: { content: "What is 2+2?" },
+          uuid: "question-1",
+          parentUuid: "setup",
+          timestamp: "2026-01-01T00:00:01.000Z",
+        },
+        {
+          type: "assistant",
+          message: { content: "4" },
+          uuid: "answer-1",
+          parentUuid: "question-1",
+          timestamp: "2026-01-01T00:00:02.000Z",
+        },
+        {
+          type: "user",
+          message: { content: "And what about 3+3?" },
+          uuid: "question-2",
+          parentUuid: "answer-1",
+          timestamp: "2026-01-01T00:00:03.000Z",
+        },
+        {
+          type: "user",
+          message: {
+            content: [{ type: "tool_result", tool_use_id: "tool-1" }],
+          },
+          uuid: "tool-result",
+          parentUuid: "question-2",
+          timestamp: "2026-01-01T00:00:04.000Z",
+        },
+      ];
+      await writeFile(
+        join(sessionDir, "session-questions.jsonl"),
+        `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+      );
+
+      const sessions = await service.getSessionsWithCache(
+        sessionDir,
+        projectId,
+        reader,
+      );
+
+      expect(sessions[0]?.userQuestions).toEqual([
+        {
+          id: "question-1",
+          text: "What is 2+2?",
+          timestamp: "2026-01-01T00:00:01.000Z",
+        },
+        {
+          id: "question-2",
+          text: "And what about 3+3?",
+          timestamp: "2026-01-01T00:00:03.000Z",
+        },
+      ]);
+    });
   });
 
   describe("cache miss", () => {

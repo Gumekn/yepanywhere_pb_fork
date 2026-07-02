@@ -6,6 +6,7 @@ import {
   type OpenCodeSessionEntry,
   type OpenCodeStoredPart,
   SESSION_TITLE_MAX_LENGTH,
+  type SessionQuestion,
   type UrlProjectId,
   getModelContextWindow,
 } from "@yep-anywhere/shared";
@@ -19,6 +20,7 @@ import type {
   ISessionReader,
   LoadedSession,
 } from "./types.js";
+import { createSessionQuestion } from "./user-questions.js";
 
 /** Default OpenCode storage directory */
 export const OPENCODE_STORAGE_DIR = join(
@@ -209,6 +211,7 @@ export class OpenCodeSessionReader implements ISessionReader {
       const messageDir = join(this.storageDir, "message", sessionId);
       let messageCount = 0;
       let firstUserMessageText: string | null = null;
+      const userQuestions: SessionQuestion[] = [];
       let model: string | undefined;
 
       try {
@@ -232,15 +235,25 @@ export class OpenCodeSessionReader implements ISessionReader {
             }
 
             // Get first user message text
-            if (!firstUserMessageText && msg.role === "user") {
+            if (msg.role === "user") {
               const text = await this.getMessageText(msg.id);
               if (text) {
-                firstUserMessageText = text;
+                firstUserMessageText ??= text;
+                const question = createSessionQuestion(
+                  {
+                    id: msg.id,
+                    text,
+                    timestamp: msg.time?.created
+                      ? new Date(msg.time.created).toISOString()
+                      : undefined,
+                  },
+                  `opencode-user-${userQuestions.length}`,
+                );
+                if (question) {
+                  userQuestions.push(question);
+                }
               }
             }
-
-            // Stop if we have both
-            if (model && firstUserMessageText) break;
           } catch {
             // Skip unreadable messages
           }
@@ -272,6 +285,7 @@ export class OpenCodeSessionReader implements ISessionReader {
           ? new Date(session.time.updated).toISOString()
           : stats.mtime.toISOString(),
         messageCount,
+        userQuestions,
         ownership: { owner: "none" }, // Will be updated by Supervisor
         contextUsage,
         provider: "opencode",

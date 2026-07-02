@@ -48,6 +48,8 @@ import { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import { normalizeSession } from "../sessions/normalization.js";
 import {
   type PaginationInfo,
+  sliceAfterMessage,
+  sliceAroundMessage,
   sliceAtCompactBoundaries,
 } from "../sessions/pagination.js";
 import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.js";
@@ -747,6 +749,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         createdAt: sessionSummary?.createdAt ?? new Date().toISOString(),
         updatedAt: sessionSummary?.updatedAt ?? new Date().toISOString(),
         messageCount: sessionSummary?.messageCount ?? 0,
+        userQuestions: sessionSummary?.userQuestions,
         provider:
           sessionSummary?.provider ??
           metadataProvider ??
@@ -956,6 +959,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   //   ?afterMessageId=<id> - incremental forward-fetch (append new messages)
   //   ?tailCompactions=<n> - return only last N compact boundaries worth of messages
   //   ?beforeMessageId=<id> - cursor for loading older chunks (used with tailCompactions)
+  //   ?aroundMessageId=<id> - return a bounded window centered on a target message
+  //   ?afterWindowMessageId=<id> - return the next bounded window after a cursor
   //   ?branchId=<id> - derived branch id to render
   routes.get("/projects/:projectId/sessions/:sessionId", async (c) => {
     const projectId = c.req.param("projectId");
@@ -963,6 +968,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     const afterMessageId = c.req.query("afterMessageId");
     const tailCompactionsParam = c.req.query("tailCompactions");
     const beforeMessageId = c.req.query("beforeMessageId");
+    const aroundMessageId = c.req.query("aroundMessageId");
+    const afterWindowMessageId = c.req.query("afterWindowMessageId");
     const branchId = c.req.query("branchId");
     const maxMessagesParam = c.req.query("maxMessages");
     const tailCompactions =
@@ -1008,10 +1015,15 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Always try to read from disk first (even for owned sessions)
     const reader = deps.readerFactory(project);
+    const usesWindowPagination =
+      !afterMessageId && Boolean(aroundMessageId || afterWindowMessageId);
+    const readerAfterMessageId = usesWindowPagination
+      ? undefined
+      : afterMessageId;
     let loadedSession = await reader.getSession(
       sessionId,
       project.id,
-      afterMessageId,
+      readerAfterMessageId,
       {
         // Only include orphaned tool info if:
         // 1. We previously owned this session (not external)
@@ -1041,7 +1053,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         loadedSession = await codexReader.getSession(
           sessionId,
           project.id,
-          afterMessageId,
+          readerAfterMessageId,
           { includeOrphans: wasEverOwned && !process, branchId },
         );
       }
@@ -1067,7 +1079,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         loadedSession = await geminiReader.getSession(
           sessionId,
           project.id,
-          afterMessageId,
+          readerAfterMessageId,
           { includeOrphans: wasEverOwned && !process, branchId },
         );
       }
@@ -1210,7 +1222,27 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     // tailCompactions slices to last N compact boundaries; skip when afterMessageId is
     // present since that's a different use case (incremental forward-fetch)
     let paginationInfo: PaginationInfo | undefined;
-    if (
+    const boundedMaxMessages =
+      maxMessages !== undefined && !Number.isNaN(maxMessages) && maxMessages > 0
+        ? maxMessages
+        : undefined;
+    if (aroundMessageId && !afterMessageId) {
+      const sliced = sliceAroundMessage(
+        session.messages,
+        aroundMessageId,
+        boundedMaxMessages ?? 100,
+      );
+      session = { ...session, messages: sliced.messages };
+      paginationInfo = sliced.pagination;
+    } else if (afterWindowMessageId && !afterMessageId) {
+      const sliced = sliceAfterMessage(
+        session.messages,
+        afterWindowMessageId,
+        boundedMaxMessages ?? 100,
+      );
+      session = { ...session, messages: sliced.messages };
+      paginationInfo = sliced.pagination;
+    } else if (
       tailCompactions !== undefined &&
       !Number.isNaN(tailCompactions) &&
       tailCompactions > 0 &&
@@ -1220,11 +1252,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         session.messages,
         tailCompactions,
         beforeMessageId,
-        maxMessages !== undefined &&
-          !Number.isNaN(maxMessages) &&
-          maxMessages > 0
-          ? maxMessages
-          : undefined,
+        boundedMaxMessages,
       );
       session = { ...session, messages: sliced.messages };
       paginationInfo = sliced.pagination;

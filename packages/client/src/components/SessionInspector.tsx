@@ -1,4 +1,4 @@
-import type { MarkdownAugment } from "@yep-anywhere/shared";
+import type { MarkdownAugment, SessionQuestion } from "@yep-anywhere/shared";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
@@ -35,6 +35,7 @@ interface SessionInspectorProps {
   isOpen?: boolean;
   onClose?: () => void;
   messages: Message[];
+  userQuestions?: SessionQuestion[];
   markdownAugments?: Record<string, MarkdownAugment>;
   activeToolApproval?: ActiveToolApproval;
   projectId: string;
@@ -107,6 +108,7 @@ export function SessionInspector({
   isOpen = true,
   onClose,
   messages,
+  userQuestions,
   markdownAugments,
   activeToolApproval,
   projectId,
@@ -139,9 +141,13 @@ export function SessionInspector({
     [activeToolApproval, markdownAugments, messages],
   );
 
-  const questions = useMemo(
+  const messageQuestions = useMemo(
     () => buildQuestionItems(renderItems),
     [renderItems],
+  );
+  const questions = useMemo(
+    () => mergeQuestionItems(userQuestions, messageQuestions),
+    [messageQuestions, userQuestions],
   );
   const fileActivities = useMemo(
     () => buildFileActivities(renderItems),
@@ -302,7 +308,7 @@ export function SessionInspector({
           >
             {questions.length > 0 ? (
               <ol className="session-inspector-list">
-                {questions.slice(-12).map((question, index) => (
+                {questions.map((question, index) => (
                   <li key={question.id}>
                     <button
                       type="button"
@@ -311,10 +317,7 @@ export function SessionInspector({
                       title={question.text}
                     >
                       <span className="session-inspector-index">
-                        {questions.length -
-                          questions.slice(-12).length +
-                          index +
-                          1}
+                        {index + 1}
                       </span>
                       <span className="session-inspector-row-main">
                         <span className="session-inspector-row-title">
@@ -698,6 +701,43 @@ function buildQuestionItems(items: RenderItem[]): QuestionItem[] {
       text: compactText(contentToText(item.content), 140) || "Untitled",
       timestamp: item.sourceMessages[0]?.timestamp,
     }));
+}
+
+function mergeQuestionItems(
+  serverQuestions: SessionQuestion[] | undefined,
+  messageQuestions: QuestionItem[],
+): QuestionItem[] {
+  const merged: QuestionItem[] = [];
+  const seenIds = new Set<string>();
+  const seenSemanticKeys = new Set<string>();
+
+  const append = (question: QuestionItem) => {
+    const text = compactText(question.text, 140) || "Untitled";
+    const id = question.id || `${question.timestamp ?? ""}:${text}`;
+    const semanticKey = `${question.timestamp ?? ""}\n${text}`;
+
+    if (seenIds.has(id) || seenSemanticKeys.has(semanticKey)) {
+      return;
+    }
+
+    seenIds.add(id);
+    seenSemanticKeys.add(semanticKey);
+    merged.push({
+      id,
+      text,
+      timestamp: question.timestamp,
+    });
+  };
+
+  for (const question of serverQuestions ?? []) {
+    append(question);
+  }
+
+  for (const question of messageQuestions) {
+    append(question);
+  }
+
+  return merged;
 }
 
 function buildCodexChannelSummaries(

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   type PaginationInfo,
+  sliceAfterMessage,
+  sliceAroundMessage,
   sliceAtCompactBoundaries,
 } from "../../src/sessions/pagination.js";
 import type { Message } from "../../src/supervisor/types.js";
@@ -376,5 +378,91 @@ describe("sliceAtCompactBoundaries", () => {
       expect(result.pagination.truncatedBeforeMessageId).toBe("t100");
       expect(result.pagination.totalCompactions).toBe(1);
     });
+  });
+});
+
+describe("sliceAroundMessage", () => {
+  it("returns a bounded window centered on the target message", () => {
+    const messages = Array.from({ length: 10 }, (_, i) =>
+      msg(i % 2 === 0 ? "user" : "assistant", `m${i}`),
+    );
+
+    const result = sliceAroundMessage(messages, "m5", 5);
+
+    expect(result.messages.map((message) => message.uuid)).toEqual([
+      "m3",
+      "m4",
+      "m5",
+      "m6",
+      "m7",
+    ]);
+    expect(result.pagination).toMatchObject({
+      hasOlderMessages: true,
+      hasNewerMessages: true,
+      totalMessageCount: 10,
+      returnedMessageCount: 5,
+      truncatedBeforeMessageId: "m3",
+      truncatedAfterMessageId: "m7",
+      targetMessageId: "m5",
+      targetMessageFound: true,
+    } satisfies Partial<PaginationInfo>);
+  });
+
+  it("shifts the window near the start while keeping the target", () => {
+    const messages = Array.from({ length: 10 }, (_, i) =>
+      msg(i % 2 === 0 ? "user" : "assistant", `m${i}`),
+    );
+
+    const result = sliceAroundMessage(messages, "m1", 5);
+
+    expect(result.messages.map((message) => message.uuid)).toEqual([
+      "m0",
+      "m1",
+      "m2",
+      "m3",
+      "m4",
+    ]);
+    expect(result.pagination.hasOlderMessages).toBe(false);
+    expect(result.pagination.hasNewerMessages).toBe(true);
+    expect(result.pagination.truncatedAfterMessageId).toBe("m4");
+  });
+
+  it("returns target-not-found metadata without falling back to another slice", () => {
+    const messages = [msg("user", "u1"), msg("assistant", "a1")];
+
+    const result = sliceAroundMessage(messages, "missing", 5);
+
+    expect(result.messages).toEqual([]);
+    expect(result.pagination).toMatchObject({
+      hasOlderMessages: false,
+      hasNewerMessages: false,
+      totalMessageCount: 2,
+      returnedMessageCount: 0,
+      targetMessageId: "missing",
+      targetMessageFound: false,
+    } satisfies Partial<PaginationInfo>);
+  });
+});
+
+describe("sliceAfterMessage", () => {
+  it("returns the next bounded window after a cursor", () => {
+    const messages = Array.from({ length: 10 }, (_, i) =>
+      msg(i % 2 === 0 ? "user" : "assistant", `m${i}`),
+    );
+
+    const result = sliceAfterMessage(messages, "m4", 3);
+
+    expect(result.messages.map((message) => message.uuid)).toEqual([
+      "m5",
+      "m6",
+      "m7",
+    ]);
+    expect(result.pagination).toMatchObject({
+      hasOlderMessages: true,
+      hasNewerMessages: true,
+      truncatedBeforeMessageId: "m5",
+      truncatedAfterMessageId: "m7",
+      returnedMessageCount: 3,
+    } satisfies Partial<PaginationInfo>);
   });
 });

@@ -37,6 +37,7 @@ export interface CachedSessionSummary {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  userQuestions?: SessionSummary["userQuestions"];
   contextUsage?: { inputTokens: number; percentage: number };
   /** File size in bytes at time of indexing */
   indexedBytes: number;
@@ -55,12 +56,12 @@ export interface CachedSessionSummary {
 }
 
 export interface SessionIndexState {
-  version: 3;
+  version: 4;
   projectId: string;
   sessions: Record<string, CachedSessionSummary>;
 }
 
-const CURRENT_VERSION = 3;
+const CURRENT_VERSION = 4;
 
 interface SessionFileStat {
   mtimeMs: number;
@@ -469,6 +470,7 @@ export class SessionIndexService implements ISessionIndexService {
         createdAt: cached.createdAt,
         updatedAt: cached.updatedAt,
         messageCount: cached.messageCount,
+        userQuestions: cached.userQuestions,
         ownership: { owner: "none" },
         contextUsage: cached.contextUsage,
         provider: cached.provider ?? DEFAULT_PROVIDER,
@@ -497,6 +499,7 @@ export class SessionIndexService implements ISessionIndexService {
       createdAt: summary.createdAt,
       updatedAt: summary.updatedAt,
       messageCount: summary.messageCount,
+      userQuestions: summary.userQuestions,
       contextUsage: summary.contextUsage,
       indexedBytes: size,
       fileMtime: mtime,
@@ -742,6 +745,7 @@ export class SessionIndexService implements ISessionIndexService {
             createdAt: cached.createdAt,
             updatedAt: cached.updatedAt,
             messageCount: cached.messageCount,
+            userQuestions: cached.userQuestions,
             ownership: { owner: "none" },
             contextUsage: cached.contextUsage,
             provider: cached.provider ?? DEFAULT_PROVIDER,

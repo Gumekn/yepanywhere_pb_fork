@@ -12,14 +12,22 @@ import type { Message } from "../supervisor/types.js";
 export interface PaginationInfo {
   /** Whether there are older messages not included in this response */
   hasOlderMessages: boolean;
+  /** Whether there are newer messages not included in this response */
+  hasNewerMessages?: boolean;
   /** Total message count in the full session */
   totalMessageCount: number;
   /** Number of messages returned in this response */
   returnedMessageCount: number;
   /** UUID of the first returned message (pass as beforeMessageId to load previous chunk) */
   truncatedBeforeMessageId?: string;
+  /** UUID of the last returned message (pass as afterWindowMessageId to load next chunk) */
+  truncatedAfterMessageId?: string;
   /** Total number of compact_boundary entries in the session */
   totalCompactions: number;
+  /** Target message requested by an anchored window request */
+  targetMessageId?: string;
+  /** Whether the target message was found in the normalized session */
+  targetMessageFound?: boolean;
 }
 
 /** Result of slicing messages at compact boundaries */
@@ -121,6 +129,71 @@ export function sliceAtCompactBoundaries(
 }
 
 /**
+ * Return a bounded window centered around a target message. This is used for
+ * deterministic deep-links into long sessions, where the frontend should not
+ * have to page backward repeatedly until the target happens to appear.
+ */
+export function sliceAroundMessage(
+  messages: Message[],
+  targetMessageId: string,
+  maxMessages: number,
+): SliceResult {
+  const totalMessageCount = messages.length;
+  const targetIndex = messages.findIndex(
+    (message) => getMessageId(message) === targetMessageId,
+  );
+
+  if (targetIndex === -1) {
+    return {
+      messages: [],
+      pagination: {
+        hasOlderMessages: false,
+        hasNewerMessages: false,
+        totalMessageCount,
+        returnedMessageCount: 0,
+        totalCompactions: countCompactBoundaries(messages),
+        targetMessageId,
+        targetMessageFound: false,
+      },
+    };
+  }
+
+  return sliceWindow(messages, targetIndex, maxMessages, {
+    targetMessageId,
+    targetMessageFound: true,
+  });
+}
+
+/**
+ * Return the next bounded window after a cursor. This complements
+ * sliceAroundMessage when a user jumps into the middle of a session and then
+ * wants to continue toward newer messages.
+ */
+export function sliceAfterMessage(
+  messages: Message[],
+  afterMessageId: string,
+  maxMessages: number,
+): SliceResult {
+  const cursorIndex = messages.findIndex(
+    (message) => getMessageId(message) === afterMessageId,
+  );
+  if (cursorIndex === -1 || cursorIndex >= messages.length - 1) {
+    return {
+      messages: [],
+      pagination: {
+        hasOlderMessages: cursorIndex > 0,
+        hasNewerMessages: false,
+        totalMessageCount: messages.length,
+        returnedMessageCount: 0,
+        totalCompactions: countCompactBoundaries(messages),
+      },
+    };
+  }
+
+  return sliceRange(messages, cursorIndex + 1, cursorIndex + 1 + maxMessages);
+}
+
+/**
  * Apply a hard message-count cap to an already-sliced result. Keeps only the
  * last `maxMessages` entries so a long, never-compacted session doesn't ship
  * (and re-render) thousands of messages on first load. The dropped prefix stays
@@ -146,4 +219,67 @@ function capByCount(result: SliceResult, maxMessages?: number): SliceResult {
         : result.pagination.truncatedBeforeMessageId,
     },
   };
+}
+
+function sliceWindow(
+  messages: Message[],
+  targetIndex: number,
+  maxMessages: number,
+  extraPagination: Partial<PaginationInfo> = {},
+): SliceResult {
+  const safeMaxMessages = Math.max(1, maxMessages);
+  const beforeCount = Math.floor((safeMaxMessages - 1) / 2);
+  const afterCount = safeMaxMessages - beforeCount - 1;
+
+  let startIndex = Math.max(0, targetIndex - beforeCount);
+  let endIndex = Math.min(messages.length, targetIndex + afterCount + 1);
+
+  if (endIndex - startIndex < safeMaxMessages && startIndex > 0) {
+    startIndex = Math.max(0, endIndex - safeMaxMessages);
+  }
+  if (endIndex - startIndex < safeMaxMessages && endIndex < messages.length) {
+    endIndex = Math.min(messages.length, startIndex + safeMaxMessages);
+  }
+
+  return sliceRange(messages, startIndex, endIndex, extraPagination);
+}
+
+function sliceRange(
+  messages: Message[],
+  rawStartIndex: number,
+  rawEndIndex: number,
+  extraPagination: Partial<PaginationInfo> = {},
+): SliceResult {
+  const startIndex = Math.max(0, Math.min(messages.length, rawStartIndex));
+  const endIndex = Math.max(startIndex, Math.min(messages.length, rawEndIndex));
+  const sliced = messages.slice(startIndex, endIndex);
+  const firstMessage = sliced[0];
+  const lastMessage = sliced[sliced.length - 1];
+  const firstId = firstMessage ? getMessageId(firstMessage) : undefined;
+  const lastId = lastMessage ? getMessageId(lastMessage) : undefined;
+
+  return {
+    messages: sliced,
+    pagination: {
+      hasOlderMessages: startIndex > 0,
+      ...(endIndex < messages.length ? { hasNewerMessages: true } : {}),
+      totalMessageCount: messages.length,
+      returnedMessageCount: sliced.length,
+      ...(startIndex > 0 && firstId
+        ? { truncatedBeforeMessageId: firstId }
+        : {}),
+      ...(endIndex < messages.length && lastId
+        ? { truncatedAfterMessageId: lastId }
+        : {}),
+      totalCompactions: countCompactBoundaries(messages),
+      ...extraPagination,
+    },
+  };
+}
+
+function countCompactBoundaries(messages: Message[]): number {
+  return messages.reduce(
+    (count, message) => count + (isCompactBoundary(message) ? 1 : 0),
+    0,
+  );
 }

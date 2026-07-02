@@ -149,6 +149,7 @@ export type {
   PendingInputType,
   AgentActivity,
   ContextUsage,
+  SessionQuestion,
   SessionOwnership,
   SessionSandboxPolicy,
   SessionBranchOption,

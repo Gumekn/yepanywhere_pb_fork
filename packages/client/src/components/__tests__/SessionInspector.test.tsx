@@ -1,4 +1,5 @@
 import { cleanup, render, screen } from "@testing-library/react";
+import type { SessionQuestion } from "@yep-anywhere/shared";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "../../i18n";
@@ -14,7 +15,11 @@ vi.mock("../../hooks/useGitStatus", () => ({
   }),
 }));
 
-function renderInspector(provider: ProviderName, messages: Message[]) {
+function renderInspector(
+  provider: ProviderName,
+  messages: Message[],
+  userQuestions?: SessionQuestion[],
+) {
   window.localStorage.setItem(UI_KEYS.locale, "en");
   return render(
     <MemoryRouter>
@@ -22,6 +27,7 @@ function renderInspector(provider: ProviderName, messages: Message[]) {
         <SessionInspector
           presentation="sidebar"
           messages={messages}
+          userQuestions={userQuestions}
           projectId="project-1"
           sessionId="session-1"
           provider={provider}
@@ -94,5 +100,36 @@ describe("SessionInspector", () => {
 
     expect(screen.queryByLabelText("Channels")).toBeNull();
     expect(screen.queryByText("Commentary")).toBeNull();
+  });
+
+  it("shows backend user questions when the current message window is empty", () => {
+    renderInspector(
+      "claude",
+      [],
+      [
+        {
+          id: "question-1",
+          text: "Earlier prompt from the raw session file",
+          timestamp: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+    );
+
+    expect(
+      screen.getByText("Earlier prompt from the raw session file"),
+    ).not.toBeNull();
+  });
+
+  it("shows all backend user questions instead of only the latest ones", () => {
+    const userQuestions = Array.from({ length: 13 }, (_, index) => ({
+      id: `question-${index + 1}`,
+      text: `Backend prompt ${index + 1}`,
+      timestamp: `2026-01-01T00:${String(index).padStart(2, "0")}:00.000Z`,
+    }));
+
+    renderInspector("claude", [], userQuestions);
+
+    expect(screen.getByText("Backend prompt 1")).not.toBeNull();
+    expect(screen.getByText("Backend prompt 13")).not.toBeNull();
   });
 });

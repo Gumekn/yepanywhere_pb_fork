@@ -9,6 +9,7 @@ import type {
   PermissionRules,
   ProviderName,
   SessionBranchState,
+  SessionQuestion,
   ThinkingConfig,
   UrlProjectId,
 } from "@yep-anywhere/shared";
@@ -76,6 +77,7 @@ export interface SessionSummary {
   createdAt: string; // ISO timestamp
   updatedAt: string;
   messageCount: number;
+  userQuestions?: SessionQuestion[];
   ownership: SessionOwnership;
   // Notification fields (added by enrichSessionsWithNotifications)
   /** Type of pending input if session needs user action */

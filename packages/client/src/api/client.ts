@@ -17,6 +17,7 @@ import type {
   ReportUploadResponse,
   ReportsListResponse,
   SessionKind,
+  SessionQuestion,
   SlashCommand,
   ThinkingOption,
   UploadedFile,
@@ -36,10 +37,14 @@ import type {
 /** Pagination metadata for compact-boundary-based session loading */
 export interface PaginationInfo {
   hasOlderMessages: boolean;
+  hasNewerMessages?: boolean;
   totalMessageCount: number;
   returnedMessageCount: number;
   truncatedBeforeMessageId?: string;
+  truncatedAfterMessageId?: string;
   totalCompactions: number;
+  targetMessageId?: string;
+  targetMessageFound?: boolean;
 }
 
 /**
@@ -78,6 +83,7 @@ export interface GlobalSessionItem {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  userQuestions?: SessionQuestion[];
   provider: ProviderName;
   projectId: string;
   projectName: string;
@@ -694,6 +700,8 @@ export const api = {
     options?: {
       tailCompactions?: number;
       beforeMessageId?: string;
+      aroundMessageId?: string;
+      afterWindowMessageId?: string;
       branchId?: string;
       maxMessages?: number;
     },
@@ -704,6 +712,10 @@ export const api = {
       params.set("tailCompactions", String(options.tailCompactions));
     if (options?.beforeMessageId)
       params.set("beforeMessageId", options.beforeMessageId);
+    if (options?.aroundMessageId)
+      params.set("aroundMessageId", options.aroundMessageId);
+    if (options?.afterWindowMessageId)
+      params.set("afterWindowMessageId", options.afterWindowMessageId);
     if (options?.branchId) params.set("branchId", options.branchId);
     if (options?.maxMessages !== undefined)
       params.set("maxMessages", String(options.maxMessages));

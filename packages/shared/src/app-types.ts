@@ -194,6 +194,20 @@ export interface ContextUsage {
   cacheCreationTokens?: number;
 }
 
+/**
+ * A user-authored prompt/question extracted from the authoritative provider
+ * session file. Used by session outline UIs so historical prompts survive
+ * message-window pagination and page refreshes.
+ */
+export interface SessionQuestion {
+  /** Message id used for deep-linking to the prompt when it is loaded. */
+  id: string;
+  /** Compact display text for the prompt. */
+  text: string;
+  /** Provider timestamp for the user message, when available. */
+  timestamp?: string;
+}
+
 // =============================================================================
 // Model Context Window Mapping
 // =============================================================================
@@ -416,6 +430,7 @@ export interface AppSessionSummary {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  userQuestions?: SessionQuestion[];
   ownership: SessionOwnership;
   // Provider field - which AI provider is running this session
   provider: ProviderName;

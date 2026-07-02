@@ -18,6 +18,7 @@ import {
   type GeminiSessionMessage,
   type GeminiUserMessage,
   SESSION_TITLE_MAX_LENGTH,
+  type SessionQuestion,
   type UnifiedSession,
   type UrlProjectId,
   getGeminiUserMessageText,
@@ -37,6 +38,7 @@ import type {
   LoadedSession,
   SessionFileEntry,
 } from "./types.js";
+import { createSessionQuestion } from "./user-questions.js";
 
 export interface GeminiSessionReaderOptions {
   /**
@@ -138,6 +140,7 @@ export class GeminiSessionReader implements ISessionReader {
 
       const stats = await stat(sessionCache.filePath);
       const { title, fullTitle } = this.extractTitle(session.messages);
+      const userQuestions = this.extractUserQuestions(session.messages);
       const messageCount = session.messages.length;
       const model = this.extractModel(session.messages);
       const contextUsage = this.extractContextUsage(session.messages, model);
@@ -153,6 +156,7 @@ export class GeminiSessionReader implements ISessionReader {
         createdAt: session.startTime,
         updatedAt: session.lastUpdated ?? stats.mtime.toISOString(),
         messageCount,
+        userQuestions,
         ownership: { owner: "none" },
         contextUsage,
         provider: "gemini",
@@ -451,6 +455,32 @@ export class GeminiSessionReader implements ISessionReader {
     }
 
     return { title: null, fullTitle: null };
+  }
+
+  private extractUserQuestions(
+    messages: GeminiSessionMessage[],
+  ): SessionQuestion[] {
+    const questions: SessionQuestion[] = [];
+
+    for (let index = 0; index < messages.length; index++) {
+      const msg = messages[index];
+      if (!msg || msg.type !== "user") continue;
+
+      const userMsg = msg as GeminiUserMessage;
+      const question = createSessionQuestion(
+        {
+          id: userMsg.id,
+          text: getGeminiUserMessageText(userMsg.content),
+          timestamp: userMsg.timestamp,
+        },
+        `gemini-user-${index}`,
+      );
+      if (question) {
+        questions.push(question);
+      }
+    }
+
+    return questions;
   }
 
   /**

@@ -89,10 +89,20 @@ interface Props {
   activeToolApproval?: ActiveToolApproval;
   /** Whether there are older messages not yet loaded */
   hasOlderMessages?: boolean;
+  /** Whether there are newer messages not yet loaded */
+  hasNewerMessages?: boolean;
   /** Whether older messages are currently being loaded */
   loadingOlder?: boolean;
+  /** Whether newer messages are currently being loaded */
+  loadingNewer?: boolean;
+  /** Whether a target-message window is currently being loaded */
+  loadingTargetMessage?: boolean;
   /** Callback to load the next chunk of older messages */
   onLoadOlderMessages?: () => void;
+  /** Callback to load the next chunk of newer messages */
+  onLoadNewerMessages?: () => void;
+  /** Callback to load a bounded window around a target message */
+  onLoadTargetMessage?: (messageId: string) => Promise<boolean> | boolean;
   /** Edit/rewind a past user prompt (forks the session from that point) */
   onEditUserPrompt?: (args: {
     text: string;
@@ -125,8 +135,13 @@ export const MessageList = memo(function MessageList({
   markdownAugments,
   activeToolApproval,
   hasOlderMessages = false,
+  hasNewerMessages = false,
   loadingOlder = false,
+  loadingNewer = false,
+  loadingTargetMessage = false,
   onLoadOlderMessages,
+  onLoadNewerMessages,
+  onLoadTargetMessage,
   onEditUserPrompt,
   onSelectBranch,
   focusBranchId,
@@ -137,6 +152,7 @@ export const MessageList = memo(function MessageList({
   const containerRef = useRef<HTMLDivElement>(null);
   const focusedBranchRef = useRef<HTMLDivElement | null>(null);
   const targetMessageRef = useRef<HTMLDivElement | null>(null);
+  const requestedTargetMessageRef = useRef<string | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const isInitialLoadRef = useRef(true);
   const isProgrammaticScrollRef = useRef(false);
@@ -238,6 +254,10 @@ export const MessageList = memo(function MessageList({
       });
     });
   }, [onLoadOlderMessages]);
+
+  const handleLoadNewer = useCallback(() => {
+    onLoadNewerMessages?.();
+  }, [onLoadNewerMessages]);
 
   // Mirror the auto-load state into a ref so handleScroll (which only binds
   // once for the lifetime of the listener) can read the latest values without
@@ -383,22 +403,21 @@ export const MessageList = memo(function MessageList({
   }, [focusBranchId, focusedBranchItemId, onBranchFocused]);
 
   // Scroll to + highlight a deep-linked target message (e.g. search result).
-  // If the target isn't in the loaded window yet, auto-load older chunks a few
-  // times until it appears, then scroll. Gives up quietly if never found.
-  const targetLoadAttemptsRef = useRef(0);
+  // If it is not in the current window, ask the server for a bounded window
+  // centered on that exact message. This avoids blind repeated pagination.
   useEffect(() => {
     if (!targetMessageId) {
-      targetLoadAttemptsRef.current = 0;
+      requestedTargetMessageRef.current = null;
       return;
     }
 
     // Found in the current window — scroll and highlight it.
     if (targetItemId) {
+      requestedTargetMessageRef.current = null;
       const target = targetMessageRef.current;
       const container = containerRef.current?.parentElement;
       if (!target || !container) return;
 
-      targetLoadAttemptsRef.current = 0;
       let cancelled = false;
       const raf = requestAnimationFrame(() => {
         if (cancelled) return;
@@ -428,20 +447,33 @@ export const MessageList = memo(function MessageList({
       };
     }
 
-    // Not loaded yet — pull in older messages and try again (bounded).
     if (
-      hasOlderMessages &&
-      onLoadOlderMessages &&
-      targetLoadAttemptsRef.current < 6
+      onLoadTargetMessage &&
+      !loadingTargetMessage &&
+      requestedTargetMessageRef.current !== targetMessageId
     ) {
-      targetLoadAttemptsRef.current += 1;
-      onLoadOlderMessages();
+      requestedTargetMessageRef.current = targetMessageId;
+      let cancelled = false;
+
+      void Promise.resolve(onLoadTargetMessage(targetMessageId)).then(
+        (found) => {
+          if (cancelled) return;
+          if (!found && requestedTargetMessageRef.current === targetMessageId) {
+            requestedTargetMessageRef.current = null;
+            onTargetFocused?.();
+          }
+        },
+      );
+
+      return () => {
+        cancelled = true;
+      };
     }
   }, [
     targetMessageId,
     targetItemId,
-    hasOlderMessages,
-    onLoadOlderMessages,
+    loadingTargetMessage,
+    onLoadTargetMessage,
     onTargetFocused,
   ]);
 
@@ -544,6 +576,24 @@ export const MessageList = memo(function MessageList({
           </div>
         );
       })}
+      {hasNewerMessages && (
+        <div className="load-older-messages">
+          <button
+            type="button"
+            className="load-older-button"
+            onClick={handleLoadNewer}
+            disabled={loadingNewer}
+          >
+            {loadingNewer ? (
+              <>
+                <span className="spinning">&#x21BB;</span> Loading...
+              </>
+            ) : (
+              "Load newer messages"
+            )}
+          </button>
+        </div>
+      )}
       {/* Pending messages - shown as "Uploading..." or "Sending..." until server confirms */}
       {pendingMessages.map((pending) => (
         <div key={pending.tempId} className="pending-message">

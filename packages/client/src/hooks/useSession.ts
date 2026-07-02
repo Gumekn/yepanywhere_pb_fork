@@ -251,7 +251,11 @@ export function useSession(
     fetchSessionMetadata,
     pagination,
     loadingOlder,
+    loadingNewer,
+    loadingTargetMessage,
     loadOlderMessages,
+    loadNewerMessages,
+    loadTargetMessageWindow,
   } = useSessionMessages({
     projectId,
     sessionId,
@@ -1171,7 +1175,11 @@ export function useSession(
     mcpServers, // Available MCP servers from init message
     pagination, // Compact-boundary pagination metadata
     loadingOlder, // Whether older messages are being loaded
+    loadingNewer, // Whether newer messages are being loaded
+    loadingTargetMessage, // Whether a target message window is being loaded
     loadOlderMessages, // Load next chunk of older messages
+    loadNewerMessages, // Load next chunk of newer messages
+    loadTargetMessageWindow, // Load a bounded window around a target message
     reconnectStream, // Force session stream reconnection (e.g., after process restart)
     truncateMessagesBefore, // Rewind/edit: drop a uuid and everything after it
     refreshSessionMessages, // Reload authoritative JSONL/session snapshot

@@ -101,8 +101,16 @@ export interface UseSessionMessagesResult {
   pagination: PaginationInfo | undefined;
   /** Whether older messages are being loaded */
   loadingOlder: boolean;
+  /** Whether newer messages are being loaded */
+  loadingNewer: boolean;
+  /** Whether a target message window is being loaded */
+  loadingTargetMessage: boolean;
   /** Load the next chunk of older messages */
   loadOlderMessages: () => Promise<void>;
+  /** Load the next chunk of newer messages */
+  loadNewerMessages: () => Promise<void>;
+  /** Replace the visible window with one centered on a target message */
+  loadTargetMessageWindow: (messageId: string) => Promise<boolean>;
 }
 
 function isCodexProvider(provider?: string): boolean {
@@ -116,6 +124,36 @@ function isCodexProvider(provider?: string): boolean {
  * messages load on demand via the top-of-list infinite scroll.
  */
 const INITIAL_MESSAGE_LIMIT = 100;
+
+function mergeOlderPagination(
+  current: PaginationInfo | undefined,
+  incoming: PaginationInfo | undefined,
+): PaginationInfo | undefined {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  return {
+    ...incoming,
+    hasNewerMessages: current.hasNewerMessages,
+    truncatedAfterMessageId: current.truncatedAfterMessageId,
+    returnedMessageCount:
+      current.returnedMessageCount + incoming.returnedMessageCount,
+  };
+}
+
+function mergeNewerPagination(
+  current: PaginationInfo | undefined,
+  incoming: PaginationInfo | undefined,
+): PaginationInfo | undefined {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  return {
+    ...incoming,
+    hasOlderMessages: current.hasOlderMessages,
+    truncatedBeforeMessageId: current.truncatedBeforeMessageId,
+    returnedMessageCount:
+      current.returnedMessageCount + incoming.returnedMessageCount,
+  };
+}
 
 function getMessageRole(message: Message): string {
   const nestedRole = (message.message as { role?: unknown } | undefined)?.role;
@@ -207,6 +245,8 @@ export function useSessionMessages(
   const [session, setSession] = useState<Session | null>(null);
   const [pagination, setPagination] = useState<PaginationInfo | undefined>();
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [loadingNewer, setLoadingNewer] = useState(false);
+  const [loadingTargetMessage, setLoadingTargetMessage] = useState(false);
 
   // Buffering: queue stream messages until initial load completes
   const streamBufferRef = useRef<
@@ -535,6 +575,10 @@ export function useSessionMessages(
 
   // Fetch new messages incrementally (for file change events)
   const fetchNewMessages = useCallback(async () => {
+    if (pagination?.hasNewerMessages) {
+      return;
+    }
+
     try {
       const data = await api.getSession(
         projectId,
@@ -574,6 +618,7 @@ export function useSessionMessages(
     projectId,
     sessionId,
     branchId,
+    pagination?.hasNewerMessages,
     updatePersistedTimestampWatermark,
     onLoadComplete,
   ]);
@@ -632,7 +677,9 @@ export function useSessionMessages(
           ? reconcileCodexLinearMessages(combined)
           : combined;
       });
-      setPagination(data.pagination);
+      setPagination((current) =>
+        mergeOlderPagination(current, data.pagination),
+      );
     } catch {
       // Silent fail for loading older messages
     } finally {
@@ -645,6 +692,78 @@ export function useSessionMessages(
     pagination,
     updatePersistedTimestampWatermark,
   ]);
+
+  const loadNewerMessages = useCallback(async () => {
+    if (!pagination?.hasNewerMessages || !pagination.truncatedAfterMessageId) {
+      return;
+    }
+    setLoadingNewer(true);
+    try {
+      const data = await api.getSession(projectId, sessionId, undefined, {
+        maxMessages: INITIAL_MESSAGE_LIMIT,
+        afterWindowMessageId: pagination.truncatedAfterMessageId,
+        branchId,
+      });
+      setMessages((prev) => {
+        const taggedNewer = data.messages.map((m) => ({
+          ...m,
+          _source: "jsonl" as const,
+        }));
+        updatePersistedTimestampWatermark(taggedNewer);
+        const combined = [...prev, ...taggedNewer];
+        return isCodexProvider(data.session.provider)
+          ? reconcileCodexLinearMessages(combined)
+          : combined;
+      });
+      setPagination((current) =>
+        mergeNewerPagination(current, data.pagination),
+      );
+    } catch {
+      // Silent fail for loading newer messages
+    } finally {
+      setLoadingNewer(false);
+    }
+  }, [
+    projectId,
+    sessionId,
+    branchId,
+    pagination,
+    updatePersistedTimestampWatermark,
+  ]);
+
+  const loadTargetMessageWindow = useCallback(
+    async (messageId: string): Promise<boolean> => {
+      if (!messageId) return false;
+      setLoadingTargetMessage(true);
+      try {
+        const data = await api.getSession(projectId, sessionId, undefined, {
+          aroundMessageId: messageId,
+          maxMessages: INITIAL_MESSAGE_LIMIT,
+          branchId,
+        });
+        const targetFound =
+          data.pagination?.targetMessageFound !== false &&
+          data.messages.some((message) => getMessageId(message) === messageId);
+        if (!targetFound) {
+          return false;
+        }
+
+        const loadedSession = applySessionSnapshot(data);
+        onLoadComplete?.({
+          session: data.session,
+          status: data.ownership,
+          pendingInputRequest: data.pendingInputRequest,
+          slashCommands: data.slashCommands,
+        });
+        return Boolean(loadedSession);
+      } catch {
+        return false;
+      } finally {
+        setLoadingTargetMessage(false);
+      }
+    },
+    [projectId, sessionId, branchId, applySessionSnapshot, onLoadComplete],
+  );
 
   // Fetch session metadata only
   const fetchSessionMetadata = useCallback(async () => {
@@ -698,6 +817,10 @@ export function useSessionMessages(
     fetchSessionMetadata,
     pagination,
     loadingOlder,
+    loadingNewer,
+    loadingTargetMessage,
     loadOlderMessages,
+    loadNewerMessages,
+    loadTargetMessageWindow,
   };
 }

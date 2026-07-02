@@ -5,6 +5,7 @@ import {
   type ContextCumulativeUsage,
   type ProviderName,
   SESSION_TITLE_MAX_LENGTH,
+  type SessionQuestion,
   type UrlProjectId,
   escalateContextWindow,
   getModelContextWindow,
@@ -23,6 +24,10 @@ import type {
   ISessionReader,
   LoadedSession,
 } from "./types.js";
+import {
+  createSessionQuestion,
+  extractQuestionTextFromContent,
+} from "./user-questions.js";
 
 // Re-export interface types
 export type { GetSessionOptions, ISessionReader } from "./types.js";
@@ -283,6 +288,8 @@ export class ClaudeSessionReader implements ISessionReader {
       const firstUserMessage = this.findFirstUserMessage(messages);
       const fullTitle = firstUserMessage || null;
       const model = this.extractModel(conversationMessages);
+      const activeBranchMessages = activeBranch.map((node) => node.raw);
+      const userQuestions = this.extractUserQuestions(activeBranchMessages);
 
       // claude-ollama sessions use the same JSONL format but have non-Claude
       // model IDs (e.g. "qwen3-coder-128k:latest" vs "claude-opus-4-5-20251101")
@@ -290,17 +297,14 @@ export class ClaudeSessionReader implements ISessionReader {
         model && !model.startsWith("claude-") ? "claude-ollama" : "claude";
 
       const contextUsage = this.extractContextUsage(
-        activeBranch.map((node) => node.raw),
+        activeBranchMessages,
         model,
         provider,
       );
-      const runtimeConfig = this.extractRuntimeConfig(
-        activeBranch.map((node) => node.raw),
-      );
+      const runtimeConfig = this.extractRuntimeConfig(activeBranchMessages);
 
-      const cumulativeUsage = this.extractCumulativeTokenUsage(
-        activeBranch.map((node) => node.raw),
-      );
+      const cumulativeUsage =
+        this.extractCumulativeTokenUsage(activeBranchMessages);
 
       return {
         id: sessionId,
@@ -310,6 +314,7 @@ export class ClaudeSessionReader implements ISessionReader {
         createdAt: stats.birthtime.toISOString(),
         updatedAt: stats.mtime.toISOString(),
         messageCount: conversationMessages.length,
+        userQuestions,
         ownership: { owner: "none" }, // Will be updated by Supervisor
         contextUsage,
         cumulativeUsage,
@@ -623,6 +628,42 @@ export class ClaudeSessionReader implements ISessionReader {
       }
     }
     return null;
+  }
+
+  private extractUserQuestions(
+    messages: ClaudeSessionEntry[],
+  ): SessionQuestion[] {
+    const questions: SessionQuestion[] = [];
+
+    for (let index = 0; index < messages.length; index++) {
+      const msg = messages[index];
+      if (!msg || msg.type !== "user") continue;
+
+      const content = msg.message.content;
+      if (!content) continue;
+      const questionText =
+        typeof content === "string"
+          ? extractQuestionTextFromContent(content)
+          : extractQuestionTextFromContent(
+              content.filter((block) => typeof block !== "string") as Array<{
+                type?: unknown;
+                text?: unknown;
+              }>,
+            );
+      const question = createSessionQuestion(
+        {
+          id: msg.uuid,
+          text: questionText,
+          timestamp: msg.timestamp,
+        },
+        `claude-user-${index}`,
+      );
+      if (question) {
+        questions.push(question);
+      }
+    }
+
+    return questions;
   }
 
   /**

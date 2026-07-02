@@ -9,6 +9,7 @@ import {
   type ContextUsage,
   type ProviderName,
   type SessionKind,
+  type SessionQuestion,
   isSessionKind,
   sessionMatchesKind,
 } from "@yep-anywhere/shared";
@@ -70,6 +71,7 @@ export interface GlobalSessionItem {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  userQuestions?: SessionQuestion[];
   provider: ProviderName;
   // Project context
   projectId: string;
@@ -621,6 +623,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
             createdAt: session.createdAt,
             updatedAt: session.updatedAt,
             messageCount: session.messageCount,
+            userQuestions: session.userQuestions,
             provider: session.provider,
             projectId: session.projectId,
             projectName: project.name,
@@ -713,6 +716,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
           messageCount: session.messageCount,
+          userQuestions: session.userQuestions,
           provider: session.provider,
           projectId: session.projectId,
           projectName: item.projectName,

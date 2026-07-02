@@ -214,7 +214,11 @@ function SessionPageContent({
     mcpServers,
     pagination,
     loadingOlder,
+    loadingNewer,
+    loadingTargetMessage,
     loadOlderMessages,
+    loadNewerMessages,
+    loadTargetMessageWindow,
     reconnectStream,
     truncateMessagesBefore,
     refreshSessionMessages,
@@ -1631,8 +1635,13 @@ function SessionPageContent({
                   markdownAugments={markdownAugments}
                   activeToolApproval={activeToolApproval}
                   hasOlderMessages={pagination?.hasOlderMessages}
+                  hasNewerMessages={pagination?.hasNewerMessages}
                   loadingOlder={loadingOlder}
+                  loadingNewer={loadingNewer}
+                  loadingTargetMessage={loadingTargetMessage}
                   onLoadOlderMessages={loadOlderMessages}
+                  onLoadNewerMessages={loadNewerMessages}
+                  onLoadTargetMessage={loadTargetMessageWindow}
                   onEditUserPrompt={
                     !isViewingHistoricalBranch &&
                     (session?.provider === "claude" ||
@@ -1791,6 +1800,7 @@ function SessionPageContent({
         <SessionInspector
           presentation="sidebar"
           messages={messages}
+          userQuestions={session?.userQuestions}
           markdownAugments={markdownAugments}
           activeToolApproval={activeToolApproval}
           projectId={projectId}
@@ -1810,6 +1820,7 @@ function SessionPageContent({
           isOpen={isInspectorOpen}
           onClose={() => setInspectorOpen(false)}
           messages={messages}
+          userQuestions={session?.userQuestions}
           markdownAugments={markdownAugments}
           activeToolApproval={activeToolApproval}
           projectId={projectId}

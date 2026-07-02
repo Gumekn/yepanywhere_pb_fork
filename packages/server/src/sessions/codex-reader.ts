@@ -23,6 +23,7 @@ import {
   type CodexSessionMetaEntry,
   type CodexTurnContextEntry,
   SESSION_TITLE_MAX_LENGTH,
+  type SessionQuestion,
   type UnifiedSession,
   type UrlProjectId,
   getModelContextWindow,
@@ -53,6 +54,7 @@ import type {
   LoadedSession,
   SessionFileEntry,
 } from "./types.js";
+import { createSessionQuestion } from "./user-questions.js";
 
 export interface CodexSessionReaderOptions {
   /**
@@ -70,6 +72,27 @@ export interface CodexSessionReaderOptions {
 type CodexSessionFile = CodexSessionManifestEntry;
 
 const CODEX_SESSION_FILE_CACHE_TTL_MS = 5000;
+const CODEX_COMPACTION_EVENT_DEDUPE_WINDOW_MS = 5_000;
+
+function timestampToMs(timestamp: string | undefined): number | null {
+  if (!timestamp) return null;
+  const ms = Date.parse(timestamp);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function hasNearbyCodexCompactedEntry(
+  compactedTimestamps: number[],
+  timestamp: string | undefined,
+): boolean {
+  const eventTimestamp = timestampToMs(timestamp);
+  if (eventTimestamp === null) return false;
+
+  return compactedTimestamps.some(
+    (compactedTimestamp) =>
+      Math.abs(compactedTimestamp - eventTimestamp) <=
+      CODEX_COMPACTION_EVENT_DEDUPE_WINDOW_MS,
+  );
+}
 
 /**
  * Codex-specific session reader for Codex CLI JSONL files.
@@ -148,6 +171,7 @@ export class CodexSessionReader implements ISessionReader {
 
       const stats = await stat(sessionFile.filePath);
       const { title, fullTitle } = this.extractTitle(visibleEntries);
+      const userQuestions = this.extractUserQuestions(visibleEntries);
       const messageCount = this.countMessages(visibleEntries);
       const model = this.extractModel(visibleEntries);
       const provider = this.determineProvider(metaEntry, model);
@@ -170,6 +194,7 @@ export class CodexSessionReader implements ISessionReader {
         createdAt: metaEntry.payload.timestamp,
         updatedAt: stats.mtime.toISOString(),
         messageCount,
+        userQuestions,
         ownership: { owner: "none" },
         contextUsage,
         provider,
@@ -423,6 +448,99 @@ export class CodexSessionReader implements ISessionReader {
     }
 
     return { title: null, fullTitle: null };
+  }
+
+  private extractUserQuestions(
+    entries: CodexSessionEntry[],
+  ): SessionQuestion[] {
+    const questions: SessionQuestion[] = [];
+    const hasResponseItemUser = this.hasResponseItemUserMessages(entries);
+    const compactedTimestamps = entries
+      .filter((entry) => entry.type === "compacted")
+      .map((entry) => timestampToMs(entry.timestamp))
+      .filter((timestamp): timestamp is number => timestamp !== null);
+    let messageIndex = 0;
+
+    for (const entry of entries) {
+      if (entry.type === "response_item") {
+        const currentIndex = messageIndex;
+        messageIndex += 1;
+
+        const payload = entry.payload;
+        if (payload.type === "message" && payload.role === "user") {
+          const question = createSessionQuestion(
+            {
+              id: `codex-${currentIndex}-${entry.timestamp}`,
+              text: this.extractCodexUserMessageText(payload.content),
+              timestamp: entry.timestamp,
+            },
+            `codex-user-${currentIndex}`,
+          );
+          if (question) {
+            questions.push(question);
+          }
+        }
+        continue;
+      }
+
+      if (entry.type === "compacted") {
+        messageIndex += 1;
+        continue;
+      }
+
+      if (entry.type !== "event_msg") {
+        continue;
+      }
+
+      if (entry.payload.type === "user_message" && !hasResponseItemUser) {
+        const question = createSessionQuestion(
+          {
+            id: `codex-event-${messageIndex}-${entry.timestamp}`,
+            text: [
+              entry.payload.message,
+              ...(entry.payload.images?.length ? ["[image]"] : []),
+            ].join("\n"),
+            timestamp: entry.timestamp,
+          },
+          `codex-event-user-${messageIndex}`,
+        );
+        messageIndex += 1;
+        if (question) {
+          questions.push(question);
+        }
+        continue;
+      }
+
+      if (entry.payload.type === "turn_aborted") {
+        messageIndex += 1;
+      }
+
+      if (
+        entry.payload.type === "context_compacted" &&
+        !hasNearbyCodexCompactedEntry(compactedTimestamps, entry.timestamp)
+      ) {
+        messageIndex += 1;
+      }
+    }
+
+    return questions;
+  }
+
+  private extractCodexUserMessageText(
+    content: CodexMessagePayload["content"],
+  ): string {
+    return content
+      .map((block) => {
+        if (block.type === "input_text") {
+          return block.text;
+        }
+        if (block.type === "input_image") {
+          return "[image]";
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
   }
 
   private isSystemPromptUserMessage(text: string): boolean {
