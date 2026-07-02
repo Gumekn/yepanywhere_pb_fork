@@ -206,6 +206,7 @@ export const RenderItemComponent = memo(function RenderItemComponent({
           <UserPromptBlock
             content={item.content}
             timestamp={src?.timestamp}
+            contextBefore={src?.contextBefore}
             branch={src?.branch}
             codexBranch={src?.codexBranch}
             onSelectBranch={onSelectBranch}

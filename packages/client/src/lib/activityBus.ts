@@ -68,6 +68,8 @@ export interface ProcessStateEvent {
 export interface SessionMetadataChangedEvent {
   type: "session-metadata-changed";
   sessionId: string;
+  /** Base64url-encoded project path when known. Enables single-session refreshes. */
+  projectId?: UrlProjectId;
   title?: string;
   aiTitle?: string;
   archived?: boolean;

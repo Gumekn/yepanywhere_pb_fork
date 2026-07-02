@@ -8,6 +8,7 @@ import type {
 } from "../../api/client";
 import type {
   SessionCreatedEvent,
+  SessionMetadataChangedEvent,
   SessionUpdatedEvent,
 } from "../useFileActivity";
 import { useGlobalSessions } from "../useGlobalSessions";
@@ -15,10 +16,12 @@ import { useGlobalSessions } from "../useGlobalSessions";
 const {
   mockGetGlobalSessionStats,
   mockGetGlobalSessions,
+  mockGetSessionMetadata,
   mockUseFileActivity,
 } = vi.hoisted(() => ({
   mockGetGlobalSessionStats: vi.fn(),
   mockGetGlobalSessions: vi.fn(),
+  mockGetSessionMetadata: vi.fn(),
   mockUseFileActivity: vi.fn(),
 }));
 
@@ -26,6 +29,7 @@ vi.mock("../../api/client", () => ({
   api: {
     getGlobalSessionStats: mockGetGlobalSessionStats,
     getGlobalSessions: mockGetGlobalSessions,
+    getSessionMetadata: mockGetSessionMetadata,
   },
 }));
 
@@ -85,6 +89,7 @@ async function flushPromises() {
 describe("useGlobalSessions", () => {
   let activityHandlers: {
     onSessionCreated?: (event: SessionCreatedEvent) => void;
+    onSessionMetadataChange?: (event: SessionMetadataChangedEvent) => void;
     onSessionUpdated?: (event: SessionUpdatedEvent) => void;
     onReconnect?: () => void;
   };
@@ -93,6 +98,7 @@ describe("useGlobalSessions", () => {
     vi.useFakeTimers();
     mockGetGlobalSessions.mockReset();
     mockGetGlobalSessionStats.mockReset();
+    mockGetSessionMetadata.mockReset();
     mockUseFileActivity.mockReset();
     activityHandlers = {};
     mockUseFileActivity.mockImplementation((handlers) => {
@@ -198,6 +204,48 @@ describe("useGlobalSessions", () => {
     expect(result.current.sessions[0]?.messageCount).toBe(4);
   });
 
+  it("refreshes only the changed session when aiTitle metadata changes", async () => {
+    const existingSession = {
+      ...baseSession,
+      title: "Verbose first user message",
+      messageCount: 2,
+    };
+    const refreshedSession = {
+      ...existingSession,
+      aiTitle: "Concise AI Title",
+      updatedAt: "2026-06-22T08:00:02.000Z",
+    };
+    mockGetGlobalSessions.mockResolvedValue(response([existingSession]));
+    mockGetSessionMetadata.mockResolvedValue({
+      session: refreshedSession,
+      ownership: existingSession.ownership,
+    });
+
+    const { result } = renderHook(() => useGlobalSessions({ limit: 50 }));
+    await flushPromises();
+
+    act(() => {
+      activityHandlers.onSessionMetadataChange?.({
+        type: "session-metadata-changed",
+        sessionId: baseSession.id,
+        projectId,
+        aiTitle: "Concise AI Title",
+        timestamp: "2026-06-22T08:00:02.000Z",
+      });
+    });
+    await flushPromises();
+
+    expect(mockGetSessionMetadata).toHaveBeenCalledWith(
+      projectId,
+      baseSession.id,
+    );
+    expect(mockGetGlobalSessions).toHaveBeenCalledTimes(1);
+    expect(result.current.sessions[0]?.aiTitle).toBe("Concise AI Title");
+    expect(result.current.sessions[0]?.updatedAt).toBe(
+      "2026-06-22T08:00:02.000Z",
+    );
+  });
+
   it("keeps an existing title when a refetch returns a transient null title", async () => {
     const resolvedSession = {
       ...baseSession,
@@ -270,6 +318,79 @@ describe("useGlobalSessions", () => {
     expect(mockGetGlobalSessions).toHaveBeenCalledTimes(1);
     expect(mockUseFileActivity).toHaveBeenLastCalledWith(
       expect.objectContaining({ enabled: false }),
+    );
+  });
+
+  it("can subscribe only to metadata live updates for single-session title changes", async () => {
+    const existingSession = {
+      ...baseSession,
+      title: "Verbose first user message",
+      messageCount: 2,
+    };
+    const refreshedSession = {
+      ...existingSession,
+      aiTitle: "Concise AI Title",
+      updatedAt: "2026-06-22T08:00:02.000Z",
+    };
+    mockGetGlobalSessions.mockResolvedValue(response([existingSession]));
+    mockGetSessionMetadata.mockResolvedValue({
+      session: refreshedSession,
+      ownership: existingSession.ownership,
+    });
+
+    const { result } = renderHook(() =>
+      useGlobalSessions({
+        limit: 50,
+        liveUpdates: false,
+        metadataLiveUpdates: true,
+      }),
+    );
+    await flushPromises();
+
+    expect(mockUseFileActivity).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        enabled: true,
+        onSessionCreated: undefined,
+        onSessionUpdated: undefined,
+        onSessionMetadataChange: expect.any(Function),
+      }),
+    );
+
+    act(() => {
+      activityHandlers.onSessionUpdated?.({
+        type: "session-updated",
+        sessionId: baseSession.id,
+        projectId,
+        title: "Should not apply",
+        messageCount: 3,
+        updatedAt: "2026-06-22T08:00:01.000Z",
+        timestamp: "2026-06-22T08:00:01.000Z",
+      });
+    });
+
+    expect(result.current.sessions[0]?.title).toBe(
+      "Verbose first user message",
+    );
+
+    act(() => {
+      activityHandlers.onSessionMetadataChange?.({
+        type: "session-metadata-changed",
+        sessionId: baseSession.id,
+        projectId,
+        aiTitle: "Concise AI Title",
+        timestamp: "2026-06-22T08:00:02.000Z",
+      });
+    });
+    await flushPromises();
+
+    expect(mockGetSessionMetadata).toHaveBeenCalledWith(
+      projectId,
+      baseSession.id,
+    );
+    expect(mockGetGlobalSessions).toHaveBeenCalledTimes(1);
+    expect(result.current.sessions[0]?.aiTitle).toBe("Concise AI Title");
+    expect(result.current.sessions[0]?.updatedAt).toBe(
+      "2026-06-22T08:00:02.000Z",
     );
   });
 

@@ -821,6 +821,9 @@ export function GlobalSessionsPage() {
                         reasoningEffort={session.reasoningEffort}
                         serviceTier={session.serviceTier}
                         executor={session.executor}
+                        createdBy={session.createdBy}
+                        originator={session.originator}
+                        sessionSource={session.source}
                         isStarred={session.isStarred}
                         isArchived={session.isArchived}
                         mode="card"

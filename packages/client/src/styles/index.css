@@ -3077,6 +3077,10 @@ a.sidebar-nav-item {
   font-variant-numeric: tabular-nums;
 }
 
+.message-actions-context {
+  font-variant-numeric: tabular-nums;
+}
+
 .message-actions-copy {
   display: inline-flex;
   align-items: center;
@@ -10109,6 +10113,30 @@ button.context-usage-indicator--button:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-creation-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 30%, transparent);
+}
+
+.session-creation-dot--yep {
+  color: var(--info-color, #3b82f6);
+  background: currentColor;
+}
+
+.session-creation-dot--terminal {
+  color: var(--warning-color);
+  background: currentColor;
+}
+
+.session-creation-dot--unknown {
+  color: var(--text-dimmed);
+  background: currentColor;
+  opacity: 0.55;
 }
 
 /* Rename input */

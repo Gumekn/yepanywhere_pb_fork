@@ -67,4 +67,24 @@ describe("MessageActions", () => {
       expect(writeText).toHaveBeenCalledWith("beta");
     });
   });
+
+  it("renders compact context usage when provided", () => {
+    const { container } = renderWithI18n(
+      <MessageActions
+        timestamp="2026-01-01T12:34:00.000Z"
+        contextBefore={{
+          inputTokens: 10_000,
+          percentage: 4,
+          contextWindow: 258_000,
+        }}
+      />,
+    );
+
+    const context = container.querySelector(".message-actions-context");
+    const time = container.querySelector(".message-actions-time");
+
+    expect(context?.textContent).toBe("10.0K");
+    expect(context?.getAttribute("title")).toBe("10,000 context tokens");
+    expect(time).not.toBeNull();
+  });
 });

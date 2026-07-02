@@ -8,6 +8,7 @@
 import {
   type ContextUsage,
   type ProviderName,
+  type SessionCreatedBy,
   type SessionKind,
   type SessionQuestion,
   isSessionKind,
@@ -87,6 +88,12 @@ export interface GlobalSessionItem {
   isStarred?: boolean;
   /** SSH host alias for remote execution (undefined = local) */
   executor?: string;
+  /** Explicit creation owner recorded by Yep metadata. */
+  createdBy?: SessionCreatedBy;
+  /** Launcher identifier from session metadata (e.g. "Codex Desktop", "yep-anywhere") */
+  originator?: string;
+  /** Session source from provider metadata (e.g. "appServer", "exec") */
+  source?: string;
   /** Latest context-window snapshot from the session summary. Included so
    *  the All Sessions page can render the token count immediately on first
    *  paint, without waiting for a session-updated SSE event. */
@@ -505,6 +512,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         const customTitle = metadata?.customTitle ?? session.customTitle;
         const aiTitle = metadata?.aiTitle ?? session.aiTitle;
         const executor = metadata?.executor;
+        const createdBy = metadata?.createdBy ?? session.createdBy;
 
         // Get unread status
         const hasUnread = deps.notificationService
@@ -636,6 +644,9 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
             isArchived,
             isStarred,
             executor,
+            createdBy,
+            originator: session.originator,
+            source: session.source,
             contextUsage: session.contextUsage,
             model: session.model,
             reasoningEffort: session.reasoningEffort,
@@ -657,6 +668,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       const customTitle = metadata?.customTitle ?? session.customTitle;
       const aiTitle = metadata?.aiTitle ?? session.aiTitle;
       const executor = metadata?.executor;
+      const createdBy = metadata?.createdBy ?? session.createdBy;
 
       const hasUnread = deps.notificationService
         ? deps.notificationService.hasUnread(session.id, session.updatedAt)
@@ -729,6 +741,9 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           isArchived,
           isStarred,
           executor,
+          createdBy,
+          originator: session.originator,
+          source: session.source,
           contextUsage: session.contextUsage,
           model: session.model,
           reasoningEffort: session.reasoningEffort,

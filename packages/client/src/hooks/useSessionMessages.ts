@@ -6,6 +6,10 @@ import {
   reconcileCodexLinearMessages,
 } from "../lib/codexLinearMessages";
 import {
+  applyContextUsageToLatestUserPrompt,
+  extractCodexTurnContextUsage,
+} from "../lib/codexMessageContext";
+import {
   getMessageId,
   mergeJSONLMessages,
   mergeStreamMessage,
@@ -247,6 +251,7 @@ export function useSessionMessages(
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [loadingNewer, setLoadingNewer] = useState(false);
   const [loadingTargetMessage, setLoadingTargetMessage] = useState(false);
+  const sessionRef = useRef<Session | null>(null);
 
   // Buffering: queue stream messages until initial load completes
   const streamBufferRef = useRef<
@@ -270,6 +275,10 @@ export function useSessionMessages(
   // Branch changes reuse the page shell and should keep showing the
   // previous message list until the selected branch content arrives.
   const loadedSessionKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
 
   const updatePersistedTimestampWatermark = useCallback(
     (persistedMessages: Message[]) => {
@@ -300,6 +309,26 @@ export function useSessionMessages(
   const processStreamMessage = useCallback(
     (incoming: Message, fromBufferedReplay = false) => {
       const provider = providerRef.current;
+      const turnContextUsage = extractCodexTurnContextUsage(
+        incoming,
+        sessionRef.current,
+        provider,
+      );
+      if (turnContextUsage) {
+        setMessages((prev) =>
+          applyContextUsageToLatestUserPrompt(prev, turnContextUsage),
+        );
+        setSession((prev) =>
+          prev
+            ? {
+                ...prev,
+                contextUsage: turnContextUsage,
+              }
+            : prev,
+        );
+        return;
+      }
+
       const isReplay = incoming.isReplay === true;
       const shouldApplyReplayDedupe =
         (fromBufferedReplay || isReplay) && isCodexProvider(provider);
@@ -378,6 +407,7 @@ export function useSessionMessages(
       messages: Message[];
       pagination?: PaginationInfo;
     }) => {
+      sessionRef.current = data.session;
       setSession(data.session);
       setPagination(data.pagination);
       providerRef.current = data.session.provider;

@@ -136,6 +136,8 @@ export interface WorkerActivityEvent {
 export interface SessionMetadataChangedEvent {
   type: "session-metadata-changed";
   sessionId: string;
+  /** Base64url-encoded project path when known. Enables single-session refreshes. */
+  projectId?: UrlProjectId;
   /** Updated title (if changed) */
   title?: string;
   /** Updated AI-generated title (if changed) */

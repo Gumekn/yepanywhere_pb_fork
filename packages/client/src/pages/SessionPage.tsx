@@ -547,8 +547,10 @@ function SessionPageContent({
   // Model switch modal state
   const [showModelSwitchModal, setShowModelSwitchModal] = useState(false);
 
-  // Track user engagement to mark session as "seen"
-  // Only enabled when not in external session (we own or it's idle)
+  // Track user engagement to mark session as "seen".
+  // Opening a session counts as reading the current content even when an
+  // external terminal owns the process; future external writes can make it
+  // unread again via updatedAt.
   //
   // We use two timestamps:
   // - activityAt: max(file mtime, SSE activity) - triggers the mark-seen action
@@ -574,7 +576,7 @@ function SessionPageContent({
     updatedAt: sessionUpdatedAt,
     lastSeenAt: session?.lastSeenAt,
     hasUnread: session?.hasUnread,
-    enabled: status.owner !== "external",
+    enabled: Boolean(session),
   });
 
   const handleSend = async (text: string) => {

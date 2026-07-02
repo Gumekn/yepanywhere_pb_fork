@@ -675,6 +675,7 @@ export function createApp(options: AppOptions): AppResult {
               options.eventBus?.emit({
                 type: "session-metadata-changed",
                 sessionId: session.id,
+                projectId: session.projectId,
                 archived: true,
                 timestamp: new Date().toISOString(),
               });

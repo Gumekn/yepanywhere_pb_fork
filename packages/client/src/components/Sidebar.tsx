@@ -123,6 +123,7 @@ export function Sidebar({
     excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
     enabled: shouldLoadSessionLists,
     liveUpdates: false,
+    metadataLiveUpdates: true,
   });
 
   // Fetch starred sessions separately to ensure we get ALL starred sessions
@@ -137,6 +138,7 @@ export function Sidebar({
     excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
     enabled: shouldLoadSessionLists,
     liveUpdates: false,
+    metadataLiveUpdates: true,
   });
 
   const sessionsLoading = globalLoading || starredLoading;
@@ -194,16 +196,9 @@ export function Sidebar({
     const unsubscribeMetadata = activityBus.on(
       "session-metadata-changed",
       (event) => {
-        if (
-          event.title === undefined &&
-          event.aiTitle === undefined &&
-          event.archived === undefined &&
-          event.starred === undefined
-        ) {
-          return;
+        if (event.archived !== undefined || event.starred !== undefined) {
+          void refetchSessionLists();
         }
-
-        void refetchSessionLists();
       },
     );
     const unsubscribeReconnect = activityBus.on("reconnect", () => {
@@ -424,6 +419,9 @@ export function Sidebar({
       model={session.model}
       reasoningEffort={session.reasoningEffort}
       serviceTier={session.serviceTier}
+      createdBy={session.createdBy}
+      originator={session.originator}
+      sessionSource={session.source}
       status={session.ownership}
       pendingInputType={session.pendingInputType}
       hasUnread={session.hasUnread}

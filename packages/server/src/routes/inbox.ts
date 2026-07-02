@@ -9,7 +9,10 @@
  * 5. unread24h - Sessions with hasUnread and updatedAt within 24 hours (not in tiers 1-4)
  */
 
-import { getSessionDisplayTitle } from "@yep-anywhere/shared";
+import {
+  type SessionCreatedBy,
+  getSessionDisplayTitle,
+} from "@yep-anywhere/shared";
 import { Hono } from "hono";
 import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
@@ -58,6 +61,9 @@ export interface InboxItem {
   pendingInputType?: PendingInputType;
   activity?: AgentActivity;
   hasUnread?: boolean;
+  createdBy?: SessionCreatedBy;
+  originator?: string;
+  source?: string;
 }
 
 export interface InboxResponse {
@@ -135,6 +141,9 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       hasUnread?: boolean;
       customTitle?: string;
       aiTitle?: string;
+      createdBy?: SessionCreatedBy;
+      originator?: string;
+      source?: string;
     }> = [];
 
     const logger = getLogger();
@@ -235,6 +244,9 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
           hasUnread,
           customTitle: metadata?.customTitle ?? session.customTitle,
           aiTitle: metadata?.aiTitle ?? session.aiTitle,
+          createdBy: metadata?.createdBy ?? session.createdBy,
+          originator: session.originator,
+          source: session.source,
         });
       }
     }
@@ -272,6 +284,9 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
         hasUnread,
         customTitle: metadata?.customTitle ?? item.session.customTitle,
         aiTitle: metadata?.aiTitle ?? item.session.aiTitle,
+        createdBy: metadata?.createdBy ?? item.session.createdBy,
+        originator: item.session.originator,
+        source: item.session.source,
       });
     }
 
@@ -299,6 +314,9 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       pendingInputType: item.pendingInputType,
       activity: item.activity,
       hasUnread: item.hasUnread,
+      createdBy: item.createdBy,
+      originator: item.originator,
+      source: item.source,
     });
 
     // Tier 1: needsAttention - sessions with pending input

@@ -54,6 +54,7 @@ import type {
   LoadedSession,
   SessionFileEntry,
 } from "./types.js";
+import { isSyntheticUserPromptText } from "./user-prompt-classification.js";
 import { createSessionQuestion } from "./user-questions.js";
 
 export interface CodexSessionReaderOptions {
@@ -413,10 +414,7 @@ export class CodexSessionReader implements ISessionReader {
         entry.payload.type === "user_message"
       ) {
         const fullTitle = entry.payload.message.trim();
-        if (
-          skipLeadingSystemPrompts &&
-          this.isSystemPromptUserMessage(fullTitle)
-        ) {
+        if (skipLeadingSystemPrompts && isSyntheticUserPromptText(fullTitle)) {
           continue;
         }
         const title =
@@ -435,7 +433,7 @@ export class CodexSessionReader implements ISessionReader {
             .trim();
           if (
             text &&
-            !(skipLeadingSystemPrompts && this.isSystemPromptUserMessage(text))
+            !(skipLeadingSystemPrompts && isSyntheticUserPromptText(text))
           ) {
             const title =
               text.length <= SESSION_TITLE_MAX_LENGTH
@@ -541,14 +539,6 @@ export class CodexSessionReader implements ISessionReader {
       })
       .filter(Boolean)
       .join("\n");
-  }
-
-  private isSystemPromptUserMessage(text: string): boolean {
-    const trimmed = text.trimStart();
-    return (
-      trimmed.startsWith("# AGENTS.md instructions") ||
-      trimmed.startsWith("<environment_context>")
-    );
   }
 
   /**

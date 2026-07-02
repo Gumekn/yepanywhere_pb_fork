@@ -211,6 +211,7 @@ interface TokenUsageSnapshot {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  modelContextWindow?: number | null;
 }
 
 interface CodexTurnRuntimeState {
@@ -1461,6 +1462,7 @@ export class CodexProvider implements AgentProvider {
         inputTokens: notification.tokenUsage.last.inputTokens,
         outputTokens: notification.tokenUsage.last.outputTokens,
         cachedInputTokens: notification.tokenUsage.last.cachedInputTokens,
+        modelContextWindow: notification.tokenUsage.modelContextWindow,
       },
     };
   }
@@ -1758,6 +1760,7 @@ export class CodexProvider implements AgentProvider {
                 input_tokens: usage.inputTokens,
                 output_tokens: usage.outputTokens,
                 cached_input_tokens: usage.cachedInputTokens,
+                model_context_window: usage.modelContextWindow,
               }
             : undefined,
         } as SDKMessage);

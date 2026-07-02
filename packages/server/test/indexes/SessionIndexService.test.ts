@@ -653,6 +653,62 @@ describe("SessionIndexService", () => {
       expect(sessions[0]?.title).toBe("Persistent session");
     });
 
+    it("persists provider creation metadata to disk and reloads", async () => {
+      const metadataSessionDir = join(projectsDir, "metadata-session");
+      await mkdir(metadataSessionDir, { recursive: true });
+      const filePath = join(metadataSessionDir, "session-1.jsonl");
+      await writeFile(filePath, "{}\n");
+
+      const metadataReader: ISessionReader = {
+        listSessions: async () => [],
+        listSessionFiles: async () => [{ sessionId: "session-1", filePath }],
+        getSessionSummary: async (
+          sessionId: string,
+          projectId: string,
+        ): Promise<SessionSummary> => {
+          const stats = await stat(filePath);
+          return {
+            id: sessionId,
+            projectId,
+            title: "Persistent metadata",
+            fullTitle: "Persistent metadata",
+            createdAt: new Date(stats.mtimeMs).toISOString(),
+            updatedAt: new Date(stats.mtimeMs).toISOString(),
+            messageCount: 1,
+            ownership: { owner: "none" },
+            provider: "codex",
+            originator: "Codex Desktop",
+            source: "appServer",
+            createdBy: "yep",
+          };
+        },
+        getSession: async () => null,
+        getSessionSummaryIfChanged: async () => null,
+        getAgentMappings: async () => [],
+        getAgentSession: async () => null,
+      };
+
+      await service.getSessionsWithCache(
+        metadataSessionDir,
+        projectId,
+        metadataReader,
+      );
+
+      const newService = new SessionIndexService({ dataDir, projectsDir });
+      await newService.initialize();
+      const sessions = await newService.getSessionsWithCache(
+        metadataSessionDir,
+        projectId,
+        metadataReader,
+      );
+
+      expect(sessions[0]).toMatchObject({
+        originator: "Codex Desktop",
+        source: "appServer",
+        createdBy: "yep",
+      });
+    });
+
     it("writes compact JSON index files", async () => {
       await createSession("session-1", "Compact session");
 

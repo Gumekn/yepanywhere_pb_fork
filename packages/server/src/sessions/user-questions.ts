@@ -4,13 +4,12 @@ import {
   stripBridgeMetadata,
   stripIdeMetadata,
 } from "@yep-anywhere/shared";
+import {
+  isSessionSetupText,
+  isSyntheticUserPromptText,
+} from "./user-prompt-classification.js";
 
 export const SESSION_QUESTION_MAX_LENGTH = 140;
-
-const SESSION_SETUP_PREFIXES = [
-  "# AGENTS.md instructions",
-  "<environment_context>",
-];
 
 export function compactQuestionText(
   text: string,
@@ -24,8 +23,7 @@ export function compactQuestionText(
 }
 
 export function isSessionSetupQuestionText(text: string): boolean {
-  const trimmed = text.trimStart();
-  return SESSION_SETUP_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+  return isSessionSetupText(text);
 }
 
 export function createSessionQuestion(
@@ -37,7 +35,7 @@ export function createSessionQuestion(
   fallbackId: string,
 ): SessionQuestion | null {
   if (!params.text.trim()) return null;
-  if (isSessionSetupQuestionText(params.text)) return null;
+  if (isSyntheticUserPromptText(params.text)) return null;
 
   const compact = compactQuestionText(params.text);
   if (!compact) return null;

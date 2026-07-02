@@ -4,10 +4,12 @@ import { api } from "../api/client";
 import type { AgentActivity } from "../hooks/useFileActivity";
 import { useI18n } from "../i18n";
 import { formatSmartTime } from "../lib/datetime";
+import { formatTokenCount } from "../lib/tokens";
 import type {
   ContextUsage,
   PendingInputType,
   ProviderName,
+  SessionCreatedBy,
   SessionStatus,
 } from "../types";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
@@ -34,6 +36,12 @@ interface SessionListItemProps {
   provider?: ProviderName;
   /** SSH host for remote execution (undefined = local) */
   executor?: string;
+  /** Explicit creation owner recorded by Yep metadata. */
+  createdBy?: SessionCreatedBy;
+  /** Launcher identifier from provider metadata. */
+  originator?: string;
+  /** Provider session source (e.g. "appServer", "exec", "codex-bridge"). */
+  sessionSource?: string;
 
   // Feature toggles
   mode: "card" | "compact";
@@ -84,6 +92,57 @@ interface SessionListItemProps {
   showSizeMeta?: boolean;
 }
 
+type SessionCreationIndicatorKind = "yep" | "terminal" | "unknown";
+
+function normalizeCreationValue(value: string | undefined): string {
+  return value?.trim().toLowerCase() ?? "";
+}
+
+function getSessionCreationIndicator({
+  createdBy,
+  originator,
+  sessionSource,
+  status,
+}: {
+  createdBy?: SessionCreatedBy;
+  originator?: string;
+  sessionSource?: string;
+  status?: SessionStatus;
+}): {
+  kind: SessionCreationIndicatorKind;
+  title: string;
+} {
+  if (createdBy === "yep") {
+    return { kind: "yep", title: "Created in Yep frontend" };
+  }
+
+  if (createdBy === "external") {
+    return { kind: "terminal", title: "Created from terminal or external UI" };
+  }
+
+  const normalizedSource = normalizeCreationValue(sessionSource);
+  const normalizedOriginator = normalizeCreationValue(originator);
+
+  if (
+    normalizedSource === "appserver" ||
+    normalizedOriginator === "yep-anywhere"
+  ) {
+    return { kind: "yep", title: "Created in Yep frontend" };
+  }
+
+  if (
+    ["cli", "exec", "vscode", "codex-bridge"].includes(normalizedSource) ||
+    normalizedOriginator.includes("codex_exec") ||
+    normalizedOriginator.includes("bridge") ||
+    normalizedOriginator.includes("terminal") ||
+    status?.owner === "external"
+  ) {
+    return { kind: "terminal", title: "Created from terminal or external UI" };
+  }
+
+  return { kind: "unknown", title: "Creation source unknown" };
+}
+
 /**
  * Shared session list item component used by Sidebar (compact), SessionsPage (card),
  * RecentsPage, and InboxContent.
@@ -113,6 +172,9 @@ export function SessionListItem({
   status,
   provider,
   executor,
+  createdBy,
+  originator,
+  sessionSource,
   // Feature toggles
   mode,
   showProjectName = false,
@@ -192,6 +254,19 @@ export function SessionListItem({
   const hasUnread = localHasUnread ?? hasUnreadProp;
   const renderedCustomBadges =
     customBadges ?? (customBadge ? [customBadge] : []);
+  const creationIndicator = getSessionCreationIndicator({
+    createdBy,
+    originator,
+    sessionSource,
+    status,
+  });
+  const creationIndicatorEl = (
+    <span
+      className={`session-creation-dot session-creation-dot--${creationIndicator.kind}`}
+      title={creationIndicator.title}
+      aria-label={creationIndicator.title}
+    />
+  );
 
   // Handlers for menu actions
   const handleToggleStar = async () => {
@@ -410,6 +485,7 @@ export function SessionListItem({
                     isThinking={activity === "in-turn"}
                   />
                 )}
+                {creationIndicatorEl}
                 {showTimestamp && updatedAt && (
                   <span
                     className="session-list-item__time"
@@ -499,6 +575,7 @@ export function SessionListItem({
                       className="session-list-item__provider"
                     />
                   )}
+                  {creationIndicatorEl}
                   {hasDraft && (
                     <span className="session-draft-badge">Draft</span>
                   )}
@@ -541,13 +618,4 @@ export function SessionListItem({
       )}
     </li>
   );
-}
-
-/** Compact human-readable token count: 1234 → "1.2K", 12345 → "12.3K",
- *  1234567 → "1.2M". Mirrors the format used in the context-usage modal
- *  so the same number looks the same everywhere. */
-function formatTokenCount(tokens: number): string {
-  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
-  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
-  return tokens.toString();
 }

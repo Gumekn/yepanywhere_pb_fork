@@ -91,6 +91,8 @@ export interface UseGlobalSessionsOptions {
   enabled?: boolean;
   /** Subscribe to live session activity and reconnect refreshes. */
   liveUpdates?: boolean;
+  /** Subscribe to session metadata changes for single-session updates. */
+  metadataLiveUpdates?: boolean;
 }
 
 /** Default stats when no data loaded */
@@ -115,6 +117,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     includeStats = false,
     enabled = true,
     liveUpdates = true,
+    metadataLiveUpdates = liveUpdates,
   } = options;
   const [sessions, setSessions] = useState<GlobalSessionItem[]>([]);
   const [stats, setStats] = useState<GlobalSessionStats>(DEFAULT_STATS);
@@ -300,6 +303,77 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     }
   }, []);
 
+  const refreshSessionMetadata = useCallback(
+    async (sessionId: string, refreshProjectId: string) => {
+      if (!enabled) return;
+
+      try {
+        const data = await api.getSessionMetadata(refreshProjectId, sessionId);
+
+        if (hasResolvedTitle(data.session)) {
+          clearPendingTitleRefetch(sessionId);
+        }
+
+        setSessions((prev) => {
+          let didUpdate = false;
+
+          const updated = prev.map((existing) => {
+            if (existing.id !== sessionId) return existing;
+            didUpdate = true;
+
+            const project = projectsRef.current.find(
+              (p) => p.id === data.session.projectId,
+            );
+            const refreshed: GlobalSessionItem = {
+              id: data.session.id,
+              title: data.session.title,
+              createdAt: data.session.createdAt,
+              updatedAt: data.session.updatedAt,
+              messageCount: data.session.messageCount,
+              userQuestions: data.session.userQuestions,
+              provider: data.session.provider,
+              projectId: data.session.projectId,
+              projectName:
+                existing.projectName ?? project?.name ?? data.session.projectId,
+              ownership: data.ownership,
+              pendingInputType:
+                data.session.pendingInputType ?? existing.pendingInputType,
+              activity: data.session.activity ?? existing.activity,
+              hasUnread: data.session.hasUnread ?? existing.hasUnread,
+              customTitle: data.session.customTitle,
+              aiTitle: data.session.aiTitle,
+              isArchived: data.session.isArchived ?? false,
+              isStarred: data.session.isStarred ?? false,
+              executor: data.session.executor ?? existing.executor,
+              createdBy: data.session.createdBy ?? existing.createdBy,
+              originator: data.session.originator ?? existing.originator,
+              source: data.session.source ?? existing.source,
+              contextUsage: data.session.contextUsage ?? existing.contextUsage,
+              model: data.session.model ?? existing.model,
+              reasoningEffort:
+                data.session.reasoningEffort ?? existing.reasoningEffort,
+              serviceTier: data.session.serviceTier ?? existing.serviceTier,
+            };
+
+            return mergeFetchedSession(existing, refreshed);
+          });
+
+          if (!didUpdate) return prev;
+
+          return updated.filter((session) =>
+            matchesSessionKindFilters(session, {
+              sessionKind,
+              excludeSessionKind,
+            }),
+          );
+        });
+      } catch {
+        void latestFetchRef.current?.();
+      }
+    },
+    [clearPendingTitleRefetch, enabled, excludeSessionKind, sessionKind],
+  );
+
   // Load more sessions (pagination)
   const loadMore = useCallback(async () => {
     if (!enabled || !hasMore || sessions.length === 0) return;
@@ -467,6 +541,9 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           aiTitle: event.session.aiTitle,
           isArchived: event.session.isArchived,
           isStarred: event.session.isStarred,
+          createdBy: event.session.createdBy,
+          originator: event.session.originator,
+          source: event.session.source,
           contextUsage: event.session.contextUsage,
           model: event.session.model,
           reasoningEffort: event.session.reasoningEffort,
@@ -496,6 +573,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       if (event.title?.trim() || event.aiTitle?.trim()) {
         clearPendingTitleRefetch(event.sessionId);
       }
+
+      const existingSession = sessionsRef.current.find(
+        (session) => session.id === event.sessionId,
+      );
+      const refreshProjectId = event.projectId ?? existingSession?.projectId;
 
       setSessions((prev) => {
         const updated = prev.map((session) => {
@@ -527,7 +609,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         return filtered;
       });
 
-      if (sessionKind || excludeSessionKind) {
+      if (searchQuery) {
+        debouncedRefetch();
+      } else if (existingSession && refreshProjectId) {
+        void refreshSessionMetadata(event.sessionId, refreshProjectId);
+      } else if (sessionKind || excludeSessionKind) {
         debouncedRefetch();
       }
     },
@@ -535,9 +621,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       starred,
       sessionKind,
       excludeSessionKind,
+      searchQuery,
       enabled,
       debouncedRefetch,
       clearPendingTitleRefetch,
+      refreshSessionMetadata,
     ],
   );
 
@@ -549,7 +637,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
 
         return {
           ...session,
-          hasUnread: false,
+          hasUnread: event.timestamp === "",
         };
       }),
     );
@@ -621,14 +709,16 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
 
   // Subscribe to SSE events
   useFileActivity({
-    enabled: enabled && liveUpdates,
-    onSessionStatusChange: handleSessionStatusChange,
-    onSessionCreated: handleSessionCreated,
-    onProcessStateChange: handleProcessStateChange,
-    onSessionMetadataChange: handleSessionMetadataChange,
-    onSessionSeen: handleSessionSeen,
-    onSessionUpdated: handleSessionUpdated,
-    onReconnect: handleReconnect,
+    enabled: enabled && (liveUpdates || metadataLiveUpdates),
+    onSessionStatusChange: liveUpdates ? handleSessionStatusChange : undefined,
+    onSessionCreated: liveUpdates ? handleSessionCreated : undefined,
+    onProcessStateChange: liveUpdates ? handleProcessStateChange : undefined,
+    onSessionMetadataChange: metadataLiveUpdates
+      ? handleSessionMetadataChange
+      : undefined,
+    onSessionSeen: liveUpdates ? handleSessionSeen : undefined,
+    onSessionUpdated: liveUpdates ? handleSessionUpdated : undefined,
+    onReconnect: liveUpdates ? handleReconnect : undefined,
   });
 
   // Initial fetch and refetch when options change

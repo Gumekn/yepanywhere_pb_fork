@@ -210,7 +210,7 @@ describe("loadConfig codex paths", () => {
     expect(config.sessionTitleGeneration.subModule).toBe(
       "claude-code-internal",
     );
-    expect(config.sessionTitleGeneration.model).toBe("deepseek-v4-flash");
+    expect(config.sessionTitleGeneration.model).toBe("deepseek-v4-pro");
   });
 
   it("allows session title submodule override", async () => {

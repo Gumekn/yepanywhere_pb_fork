@@ -53,15 +53,21 @@ export interface CachedSessionSummary {
   reasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g. "fast") */
   serviceTier?: string;
+  /** Launcher identifier from provider metadata (e.g. "Codex Desktop") */
+  originator?: string;
+  /** Session source from provider metadata (e.g. "appServer", "exec") */
+  source?: string;
+  /** Explicit creation owner recorded in summary metadata when available. */
+  createdBy?: SessionSummary["createdBy"];
 }
 
 export interface SessionIndexState {
-  version: 4;
+  version: 5;
   projectId: string;
   sessions: Record<string, CachedSessionSummary>;
 }
 
-const CURRENT_VERSION = 4;
+const CURRENT_VERSION = 5;
 
 interface SessionFileStat {
   mtimeMs: number;
@@ -477,6 +483,9 @@ export class SessionIndexService implements ISessionIndexService {
         model: cached.model,
         reasoningEffort: cached.reasoningEffort,
         serviceTier: cached.serviceTier,
+        originator: cached.originator,
+        source: cached.source,
+        createdBy: cached.createdBy,
       });
     }
 
@@ -507,6 +516,9 @@ export class SessionIndexService implements ISessionIndexService {
       model: summary.model,
       reasoningEffort: summary.reasoningEffort,
       serviceTier: summary.serviceTier,
+      originator: summary.originator,
+      source: summary.source,
+      createdBy: summary.createdBy,
     };
   }
 
@@ -752,6 +764,9 @@ export class SessionIndexService implements ISessionIndexService {
             model: cached.model,
             reasoningEffort: cached.reasoningEffort,
             serviceTier: cached.serviceTier,
+            originator: cached.originator,
+            source: cached.source,
+            createdBy: cached.createdBy,
           });
         } else {
           cacheMisses.push({ sessionId, mtime, size });

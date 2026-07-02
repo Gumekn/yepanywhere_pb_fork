@@ -98,9 +98,180 @@ describe("SessionTitleService", () => {
       expect.objectContaining({
         type: "session-metadata-changed",
         sessionId: "session-1",
+        projectId: "project-1",
         aiTitle: "重构重复逻辑",
       }),
     );
+  });
+
+  it("uses DeepSeek v4 Pro by default", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"重构重复逻辑"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () => createSession(),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body.model).toBe("deepseek-v4-pro");
+  });
+
+  it("requires Chinese titles for Chinese user messages", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"重构分析提示词"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          messages: [
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content: "优化 benchmark 结果分析提示词",
+              },
+            },
+            {
+              type: "assistant",
+              message: {
+                role: "assistant",
+                content: "已改成失败模式优先的分析流程。",
+              },
+            },
+          ],
+        }),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body.messages[1].content).toContain(
+      "Required title language:\nChinese",
+    );
+    expect(metadataService.getMetadata("session-1")?.aiTitle).toBe(
+      "重构分析提示词",
+    );
+  });
+
+  it("does not save English titles for Chinese user messages", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content:
+                  '{"title":"Refactor benchmark analysis without hardcoded limits"}',
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          messages: [
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content: "优化 benchmark 结果分析提示词",
+              },
+            },
+            {
+              type: "assistant",
+              message: {
+                role: "assistant",
+                content: "已改成失败模式优先的分析流程。",
+              },
+            },
+          ],
+        }),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(metadataService.getMetadata("session-1")).toBeUndefined();
+  });
+
+  it("does not hard truncate model-generated titles", async () => {
+    const title =
+      "Refactor benchmark analysis prompt to remove hardcoded limits and preserve adaptive failure pattern sampling";
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ title }),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          messages: [
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content:
+                  "Refactor the benchmark analysis prompt to remove hardcoded limits",
+              },
+            },
+            {
+              type: "assistant",
+              message: {
+                role: "assistant",
+                content: "Updated the prompt and related request payload.",
+              },
+            },
+          ],
+        }),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    expect(metadataService.getMetadata("session-1")?.aiTitle).toBe(title);
   });
 
   it("sends a configured submodule header", async () => {
@@ -174,6 +345,136 @@ describe("SessionTitleService", () => {
     const prompt = body.messages[1].content as string;
     expect(prompt).toContain("Actual first user prompt");
     expect(prompt).not.toContain("Stale full summary title");
+  });
+
+  it("skips Codex setup user messages when generating a title", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"前端标记来源"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          provider: "codex",
+          title: "现在的标记有些问题",
+          fullTitle: "现在的标记有些问题",
+          messages: [
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content: [
+                  {
+                    type: "input_text",
+                    text: "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>setup</INSTRUCTIONS>",
+                  },
+                  {
+                    type: "input_text",
+                    text: "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>",
+                  },
+                ],
+              },
+            },
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content: "<skill>\n<name>git-commit-push</name>\n</skill>",
+              },
+            },
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content:
+                  "现在的标记有些问题，是不是我通过 yep 前端创建的前面就没有绿点",
+              },
+            },
+            {
+              type: "assistant",
+              codexMessagePhase: "final_answer",
+              message: {
+                role: "assistant",
+                content: "已区分终端创建和 yep 前端创建的会话标记。",
+              },
+            },
+          ],
+        }),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const prompt = body.messages[1].content as string;
+    expect(prompt).toContain("现在的标记有些问题");
+    expect(prompt).not.toContain("# AGENTS.md instructions");
+    expect(prompt).not.toContain("<environment_context>");
+    expect(prompt).not.toContain("<skill>");
+  });
+
+  it("skips Codex turn_aborted pseudo user messages when generating a title", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"继续处理用户请求"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          provider: "codex",
+          title: "<turn_aborted>\nThe user interrupted.\n</turn_aborted>",
+          fullTitle: "<turn_aborted>\nThe user interrupted.\n</turn_aborted>",
+          messages: [
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content:
+                  "<turn_aborted>\nThe user interrupted.\n</turn_aborted>",
+              },
+            },
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content: "继续处理用户请求",
+              },
+            },
+            {
+              type: "assistant",
+              codexMessagePhase: "final_answer",
+              message: {
+                role: "assistant",
+                content: "继续完成了用户请求。",
+              },
+            },
+          ],
+        }),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const prompt = body.messages[1].content as string;
+    expect(prompt).toContain("继续处理用户请求");
+    expect(prompt).not.toContain("<turn_aborted>");
   });
 
   it("waits for Codex final answer instead of titling from commentary", async () => {
@@ -262,6 +563,257 @@ describe("SessionTitleService", () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(metadataService.getMetadata("session-1")).toBeUndefined();
+  });
+
+  it("generates only after an owned session becomes idle", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"回答完成后标题"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          messages: [
+            {
+              type: "user",
+              message: { role: "user", content: "等最终回答完成后再取标题" },
+            },
+            {
+              type: "assistant",
+              codexMessagePhase: "final_answer",
+              message: {
+                role: "assistant",
+                content: "最终回答已经完成。",
+              },
+            },
+          ],
+        }),
+    });
+
+    try {
+      service.start();
+      eventBus.emit({
+        type: "session-created",
+        session: createSession({
+          messageCount: 2,
+          ownership: {
+            owner: "self",
+            processId: "process-1",
+          },
+        }),
+        timestamp: "2026-01-01T00:00:00Z",
+      });
+      eventBus.emit({
+        type: "session-updated",
+        sessionId: "session-1",
+        projectId: "project-1" as UrlProjectId,
+        messageCount: 2,
+        timestamp: "2026-01-01T00:00:01Z",
+      });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      eventBus.emit({
+        type: "session-status-changed",
+        sessionId: "session-1",
+        projectId: "project-1" as UrlProjectId,
+        ownership: { owner: "none" },
+        timestamp: "2026-01-01T00:00:01.500Z",
+      });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      eventBus.emit({
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: "project-1" as UrlProjectId,
+        activity: "idle",
+        timestamp: "2026-01-01T00:00:02Z",
+      });
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(metadataService.getMetadata("session-1")?.aiTitle).toBe(
+        "回答完成后标题",
+      );
+    } finally {
+      service.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("generates for completed unowned sessions discovered from disk", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"历史完成会话"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () => createSession(),
+    });
+
+    try {
+      service.start();
+      eventBus.emit({
+        type: "session-created",
+        session: createSession({
+          messageCount: 2,
+          ownership: { owner: "none" },
+        }),
+        timestamp: "2026-01-01T00:00:00Z",
+      });
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(metadataService.getMetadata("session-1")?.aiTitle).toBe(
+        "历史完成会话",
+      );
+    } finally {
+      service.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("generates for unowned sessions after the parser discovers messages", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"解析后标题"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () => createSession(),
+    });
+
+    try {
+      service.start();
+      eventBus.emit({
+        type: "session-created",
+        session: createSession({
+          title: null,
+          fullTitle: null,
+          messageCount: 0,
+          ownership: { owner: "none" },
+        }),
+        timestamp: "2026-01-01T00:00:00Z",
+      });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      eventBus.emit({
+        type: "session-updated",
+        sessionId: "session-1",
+        projectId: "project-1" as UrlProjectId,
+        title: "等解析完成后再生成标题",
+        messageCount: 2,
+        timestamp: "2026-01-01T00:00:01Z",
+      });
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(metadataService.getMetadata("session-1")?.aiTitle).toBe(
+        "解析后标题",
+      );
+    } finally {
+      service.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("generates for terminal-created Codex sessions on external updates", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"终端会话标题"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          provider: "codex",
+          messages: [
+            {
+              type: "user",
+              message: { role: "user", content: "从终端启动 Codex CLI" },
+            },
+            {
+              type: "assistant",
+              codexMessagePhase: "final_answer",
+              message: {
+                role: "assistant",
+                content: "终端 Codex 会话已经完成回答。",
+              },
+            },
+          ],
+        }),
+    });
+
+    try {
+      service.start();
+      eventBus.emit({
+        type: "session-created",
+        session: createSession({
+          provider: "codex",
+          title: null,
+          fullTitle: null,
+          messageCount: 0,
+          ownership: { owner: "external" },
+        }),
+        timestamp: "2026-01-01T00:00:00Z",
+      });
+      eventBus.emit({
+        type: "session-updated",
+        sessionId: "session-1",
+        projectId: "project-1" as UrlProjectId,
+        title: "从终端启动 Codex CLI",
+        messageCount: 2,
+        timestamp: "2026-01-01T00:00:01Z",
+      });
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(metadataService.getMetadata("session-1")?.aiTitle).toBe(
+        "终端会话标题",
+      );
+    } finally {
+      service.stop();
+      vi.useRealTimers();
+    }
   });
 
   it("does not overwrite a custom title", async () => {

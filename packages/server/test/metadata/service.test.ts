@@ -230,6 +230,27 @@ describe("SessionMetadataService", () => {
     });
   });
 
+  describe("setCreatedBy", () => {
+    it("persists creation source to disk", async () => {
+      await service.initialize();
+      await service.setCreatedBy("session-1", "yep");
+
+      const newService = new SessionMetadataService({ dataDir: testDir });
+      await newService.initialize();
+
+      expect(newService.getMetadata("session-1")?.createdBy).toBe("yep");
+    });
+
+    it("clears creation source when undefined", async () => {
+      await service.initialize();
+      await service.setCreatedBy("session-1", "yep");
+
+      await service.setCreatedBy("session-1", undefined);
+
+      expect(service.getMetadata("session-1")).toBeUndefined();
+    });
+  });
+
   describe("setStarred", () => {
     it("sets starred status for a session", async () => {
       await service.initialize();

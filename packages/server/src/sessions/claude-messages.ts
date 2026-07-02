@@ -12,6 +12,7 @@ import {
   findSiblingToolBranches,
   findSiblingToolResults,
 } from "./dag.js";
+import { isSyntheticUserPromptText } from "./user-prompt-classification.js";
 
 export interface VisibleClaudeEntriesResult {
   entries: ClaudeSessionEntry[];
@@ -28,23 +29,15 @@ interface NormalizeClaudeEntriesOptions {
   sessionId?: string;
 }
 
-const SESSION_SETUP_PREFIXES = [
-  "# AGENTS.md instructions",
-  "<environment_context>",
-];
-
-function isSessionSetupText(text: string): boolean {
-  const trimmed = text.trimStart();
-  return SESSION_SETUP_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
-}
-
 function getClaudeUserPromptText(raw: ClaudeSessionEntry): string | null {
   if (raw.type !== "user") return null;
 
   const content = raw.message?.content;
   if (typeof content === "string") {
     const trimmed = content.trim();
-    return trimmed.length > 0 && !isSessionSetupText(content) ? content : null;
+    return trimmed.length > 0 && !isSyntheticUserPromptText(content)
+      ? content
+      : null;
   }
 
   if (!Array.isArray(content)) return null;
@@ -71,7 +64,7 @@ function getClaudeUserPromptText(raw: ClaudeSessionEntry): string | null {
     .join("\n");
 
   const trimmed = text.trim();
-  return trimmed.length > 0 && !isSessionSetupText(text) ? text : null;
+  return trimmed.length > 0 && !isSyntheticUserPromptText(text) ? text : null;
 }
 
 function branchTitle(prompt: string): string {

@@ -5,6 +5,7 @@ import type {
   AppMessage,
   CodexBranchOption,
   CodexBranchState,
+  ContextUsage,
   SessionBranchOption,
   SessionBranchState,
 } from "@yep-anywhere/shared";
@@ -42,6 +43,7 @@ export type {
   PendingInputType,
   AgentActivity,
   ContextUsage,
+  SessionCreatedBy,
   SessionBranchOption,
   SessionBranchState,
   CodexBranchOption,
@@ -149,6 +151,8 @@ export interface Message {
     siblingCount: number;
     alternatives: CodexBranchOption[];
   };
+  /** Context-window usage snapshot for the request associated with this message. */
+  contextBefore?: ContextUsage;
   /** Codex app-server assistant message phase, when provided by Codex CLI. */
   codexMessagePhase?: "commentary" | "final_answer";
   /** Allow any additional fields from SDK/server */

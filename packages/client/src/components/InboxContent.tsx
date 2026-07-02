@@ -138,6 +138,9 @@ function InboxSection({
                 hasUnread={item.hasUnread}
                 activity={config.key === "active" ? "in-turn" : item.activity}
                 pendingInputType={item.pendingInputType}
+                createdBy={item.createdBy}
+                originator={item.originator}
+                sessionSource={item.source}
                 mode="card"
                 showProjectName={!hideProjectName}
                 showTimestamp

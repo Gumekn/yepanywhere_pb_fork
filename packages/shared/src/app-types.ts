@@ -111,6 +111,12 @@ export interface AppMessageExtensions {
   codexBranch?: SessionBranchMetadata;
 
   /**
+   * Context-window usage snapshot for the model request associated with this
+   * message. Codex uses this on user prompts to show the turn's input context.
+   */
+  contextBefore?: ContextUsage;
+
+  /**
    * Codex app-server phase for assistant text, when available.
    * Values map to Codex protocol MessagePhase: "commentary" or "final_answer".
    */
@@ -166,6 +172,8 @@ export type AppConversationMessage =
 // =============================================================================
 // Session Types
 // =============================================================================
+
+export type SessionCreatedBy = "yep" | "external";
 
 /** Type of pending input request for notification badges */
 export type PendingInputType = "tool-approval" | "user-question";
@@ -455,6 +463,8 @@ export interface AppSessionSummary {
   executor?: string;
   /** Launcher identifier from session metadata (e.g. "Codex Desktop", "yep-anywhere") */
   originator?: string;
+  /** Explicit creation owner recorded by Yep metadata. */
+  createdBy?: SessionCreatedBy;
   /** CLI version from session metadata (e.g. "0.101.0") */
   cliVersion?: string;
   /** Session source from session metadata (e.g. "vscode", "exec") */

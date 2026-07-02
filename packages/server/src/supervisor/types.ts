@@ -9,6 +9,7 @@ import type {
   PermissionRules,
   ProviderName,
   SessionBranchState,
+  SessionCreatedBy,
   SessionQuestion,
   ThinkingConfig,
   UrlProjectId,
@@ -112,6 +113,8 @@ export interface SessionSummary {
   serviceTier?: string;
   /** Launcher identifier from session metadata (e.g. "Codex Desktop", "yep-anywhere") */
   originator?: string;
+  /** Explicit creation owner recorded by Yep metadata. */
+  createdBy?: SessionCreatedBy;
   /** CLI version from session metadata (e.g. "0.101.0") */
   cliVersion?: string;
   /** Session source from session metadata (e.g. "vscode", "exec") */
@@ -179,6 +182,8 @@ export interface Message {
   toolUseResult?: unknown;
   // Computed fields (added by SessionReader)
   orphanedToolUseIds?: string[];
+  // Context-window usage snapshot for the request associated with this message
+  contextBefore?: ContextUsage;
   // Allow any additional fields from JSONL
   [key: string]: unknown;
 }

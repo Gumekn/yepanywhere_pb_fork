@@ -7,7 +7,11 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { CodexMcpMode, ProviderName } from "@yep-anywhere/shared";
+import type {
+  CodexMcpMode,
+  ProviderName,
+  SessionCreatedBy,
+} from "@yep-anywhere/shared";
 
 export interface SessionMetadata {
   /** Custom title that overrides auto-generated title */
@@ -26,6 +30,8 @@ export interface SessionMetadata {
   executor?: string;
   /** Codex MCP profile for app-server sessions. */
   codexMcpMode?: CodexMcpMode;
+  /** Whether Yep created this session, or it was discovered from an external client. */
+  createdBy?: SessionCreatedBy;
 }
 
 export interface SessionMetadataState {
@@ -236,6 +242,20 @@ export class SessionMetadataService {
   }
 
   /**
+   * Set the creation source for a session.
+   */
+  async setCreatedBy(
+    sessionId: string,
+    createdBy: SessionCreatedBy | undefined,
+  ): Promise<void> {
+    this.updateSessionMetadata(sessionId, (metadata) => ({
+      ...metadata,
+      createdBy: createdBy || undefined,
+    }));
+    await this.save();
+  }
+
+  /**
    * Update metadata for a session (title, archived, starred).
    */
   async updateMetadata(
@@ -286,6 +306,7 @@ export class SessionMetadataService {
     if (updated.provider) cleaned.provider = updated.provider;
     if (updated.executor) cleaned.executor = updated.executor;
     if (updated.codexMcpMode) cleaned.codexMcpMode = updated.codexMcpMode;
+    if (updated.createdBy) cleaned.createdBy = updated.createdBy;
 
     if (Object.keys(cleaned).length === 0) {
       // Remove the entry entirely if empty

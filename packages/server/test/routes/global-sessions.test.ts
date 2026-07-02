@@ -1,4 +1,4 @@
-import type { UrlProjectId } from "@yep-anywhere/shared";
+import type { SessionCreatedBy, UrlProjectId } from "@yep-anywhere/shared";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexBridgeController } from "../../src/codex-bridge/types.js";
 import type { SessionIndexService } from "../../src/indexes/index.js";
@@ -89,6 +89,7 @@ describe("Global Sessions Routes", () => {
       aiTitle?: string;
       isArchived?: boolean;
       isStarred?: boolean;
+      createdBy?: SessionCreatedBy;
     }
   >;
   let externalSessions: Set<string>;
@@ -216,6 +217,28 @@ describe("Global Sessions Routes", () => {
       expect(result.sessions[0].projectName).toBe("project-one");
       expect(result.sessions[1].id).toBe("sess2");
       expect(result.sessions[1].projectName).toBe("project-two");
+    });
+
+    it("passes creation source metadata through to global session items", async () => {
+      const project = createProject("proj1", "project-one", "/sessions/proj1");
+      const session = createSession("sess1", "proj1", minutesAgo(5), {
+        provider: "codex",
+        originator: "Codex Desktop",
+        source: "appServer",
+      });
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+      metadataMap.set("sess1", { createdBy: "yep" });
+
+      const result = await makeRequest();
+
+      expect(result.sessions[0]).toMatchObject({
+        id: "sess1",
+        createdBy: "yep",
+        originator: "Codex Desktop",
+        source: "appServer",
+      });
     });
 
     it("stops scanning older projects once the requested page is full", async () => {

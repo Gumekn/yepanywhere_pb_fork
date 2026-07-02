@@ -287,7 +287,7 @@ export function loadConfig(): Config {
     enabled: sessionTitleGenerationRequested && Boolean(sessionTitleApiKey),
     apiBase: sessionTitleApiBase,
     apiKey: sessionTitleApiKey,
-    model: process.env.SESSION_TITLE_MODEL ?? "deepseek-v4-flash",
+    model: process.env.SESSION_TITLE_MODEL ?? "deepseek-v4-pro",
     subModule:
       process.env.SESSION_TITLE_SUB_MODULE ??
       process.env.LLM_SUB_MODULE ??

@@ -12,6 +12,7 @@ import type {
   CodexResponseItemEntry,
   CodexSessionEntry,
   CodexWebSearchCallPayload,
+  ContextUsage,
   GeminiAssistantMessage,
   GeminiSessionMessage,
   GeminiUserMessage,
@@ -24,6 +25,7 @@ import type {
 import {
   getGeminiUserMessageText,
   getMessageContent,
+  getModelContextWindow,
   isConversationEntry,
 } from "@yep-anywhere/shared";
 import {
@@ -52,6 +54,7 @@ import {
   isCodexTurnAbortedNoticeText,
 } from "./codex-turn-aborted.js";
 import type { LoadedSession } from "./types.js";
+import { isUserPromptMessage } from "./user-prompt-message.js";
 
 interface CodexToolUseConversion {
   callId: string;
@@ -143,6 +146,10 @@ export function normalizeSession(loaded: LoadedSession): Session {
           applyCodexRollbackMarkers(data.session.entries),
           summary.id,
           branchState,
+          {
+            model: summary.model,
+            provider: data.provider,
+          },
         ),
       };
     }
@@ -257,13 +264,91 @@ function hasNearbyCodexCompactedEntry(
   );
 }
 
+interface CodexContextSnapshotOptions {
+  model?: string;
+  provider: "codex" | "codex-oss";
+}
+
+function isCodexTokenCountImmediatelyAfterCompaction(
+  entries: CodexSessionEntry[],
+  tokenCountIndex: number,
+): boolean {
+  for (let i = tokenCountIndex - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!entry) continue;
+    if (entry.type === "compacted") return true;
+    if (
+      entry.type === "event_msg" &&
+      entry.payload.type === "context_compacted"
+    ) {
+      return true;
+    }
+    if (entry.type === "event_msg" && entry.payload.type === "token_count") {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+function extractCodexTokenCountContextUsage(
+  entries: CodexSessionEntry[],
+  tokenCountIndex: number,
+  options: CodexContextSnapshotOptions,
+): ContextUsage | undefined {
+  const entry = entries[tokenCountIndex];
+  if (
+    !entry ||
+    entry.type !== "event_msg" ||
+    entry.payload.type !== "token_count"
+  ) {
+    return undefined;
+  }
+
+  const info = entry.payload.info;
+  const usage = info?.last_token_usage ?? info?.total_token_usage;
+  if (!usage) return undefined;
+
+  let inputTokens = usage.input_tokens;
+  if (
+    inputTokens === 0 &&
+    usage.total_tokens > 0 &&
+    isCodexTokenCountImmediatelyAfterCompaction(entries, tokenCountIndex)
+  ) {
+    inputTokens = usage.total_tokens;
+  }
+  if (inputTokens <= 0) return undefined;
+
+  const contextWindow =
+    info?.model_context_window && info.model_context_window > 0
+      ? info.model_context_window
+      : getModelContextWindow(options.model, options.provider);
+
+  const result: ContextUsage = {
+    inputTokens,
+    percentage: Math.min(100, Math.round((inputTokens / contextWindow) * 100)),
+    contextWindow,
+  };
+
+  if (usage.output_tokens > 0) {
+    result.outputTokens = usage.output_tokens;
+  }
+  if ((usage.cached_input_tokens ?? 0) > 0) {
+    result.cacheReadTokens = usage.cached_input_tokens;
+  }
+
+  return result;
+}
+
 function convertCodexEntries(
   entries: CodexSessionEntry[],
   sessionId: string,
   branchState?: SessionBranchState,
+  contextOptions: CodexContextSnapshotOptions = { provider: "codex" },
 ): Message[] {
   const messages: Message[] = [];
   let messageIndex = 0;
+  let pendingContextMessage: Message | null = null;
   const hasResponseItemUser = hasCodexResponseItemUserMessages(entries);
   const compactedTimestamps = entries
     .filter((entry) => entry.type === "compacted")
@@ -275,7 +360,10 @@ function convertCodexEntries(
     collectResponseItemImageGenerationIds(entries);
   const imageGenerationEndKeys = collectCodexImageGenerationEndKeys(entries);
 
-  for (const entry of entries) {
+  for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+    const entry = entries[entryIndex];
+    if (!entry) continue;
+
     if (entry.type === "response_item") {
       const converted = convertCodexResponseItem(
         entry,
@@ -304,8 +392,12 @@ function convertCodexEntries(
           });
         }
         messages.push(msg);
+        if (isUserPromptMessage(msg)) {
+          pendingContextMessage = msg;
+        }
       }
     } else if (entry.type === "compacted") {
+      pendingContextMessage = null;
       const msg = convertCodexCompactedEntry(entry, messageIndex++);
       if (msg) {
         if (isCodexCorrelationDebugEnabled()) {
@@ -321,12 +413,28 @@ function convertCodexEntries(
         messages.push(msg);
       }
     } else if (entry.type === "event_msg") {
+      if (entry.payload.type === "token_count") {
+        const contextUsage = extractCodexTokenCountContextUsage(
+          entries,
+          entryIndex,
+          contextOptions,
+        );
+        if (contextUsage && pendingContextMessage) {
+          pendingContextMessage.contextBefore = contextUsage;
+          pendingContextMessage = null;
+        }
+        continue;
+      }
+
       const shouldIncludeUserMessage =
         entry.payload.type === "user_message" && !hasResponseItemUser;
       const shouldIncludeTurnAborted = entry.payload.type === "turn_aborted";
       const shouldIncludeContextCompacted =
         entry.payload.type === "context_compacted" &&
         !hasNearbyCodexCompactedEntry(compactedTimestamps, entry.timestamp);
+      if (entry.payload.type === "context_compacted") {
+        pendingContextMessage = null;
+      }
       const imageGenerationMessages =
         entry.payload.type === "item_completed"
           ? convertCodexItemCompletedImageGeneration(
@@ -378,6 +486,9 @@ function convertCodexEntries(
             });
           }
           messages.push(msg);
+          if (isUserPromptMessage(msg)) {
+            pendingContextMessage = msg;
+          }
         }
       }
     }

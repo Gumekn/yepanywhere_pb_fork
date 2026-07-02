@@ -16,6 +16,7 @@ import type {
   ReportDocumentResponse,
   ReportUploadResponse,
   ReportsListResponse,
+  SessionCreatedBy,
   SessionKind,
   SessionQuestion,
   SlashCommand,
@@ -59,6 +60,9 @@ export interface InboxItem {
   pendingInputType?: PendingInputType;
   activity?: AgentActivity;
   hasUnread?: boolean;
+  createdBy?: SessionCreatedBy;
+  originator?: string;
+  source?: string;
 }
 
 /**
@@ -97,6 +101,12 @@ export interface GlobalSessionItem {
   isStarred?: boolean;
   /** SSH host alias for remote execution (undefined = local) */
   executor?: string;
+  /** Explicit creation owner recorded by Yep metadata. */
+  createdBy?: SessionCreatedBy;
+  /** Launcher identifier from session metadata (e.g. "Codex Desktop", "yep-anywhere") */
+  originator?: string;
+  /** Session source from provider metadata (e.g. "appServer", "exec") */
+  source?: string;
   /** Cached context window usage if the server has it. */
   contextUsage?: ContextUsage;
   /** Model name from the session summary (e.g. "opus", "gpt-5.5"). */

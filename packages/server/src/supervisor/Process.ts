@@ -1635,6 +1635,21 @@ export class Process {
           this.emit({ type: "message", message });
         }
 
+        if (message.type === "system" && message.subtype === "turn_complete") {
+          const usage = message.usage as
+            | { model_context_window?: unknown }
+            | undefined;
+          if (
+            typeof usage?.model_context_window === "number" &&
+            usage.model_context_window > 0
+          ) {
+            this._contextWindow = Math.max(
+              this._contextWindow ?? 0,
+              usage.model_context_window,
+            );
+          }
+        }
+
         // Handle special message types
         if (message.type === "system" && message.subtype === "input_request") {
           // Legacy mock SDK behavior - handle input_request message

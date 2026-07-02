@@ -9,6 +9,7 @@ import {
 import type {
   CodexBranchOption,
   ContentBlock,
+  ContextUsage,
   SessionBranchOption,
 } from "../../types";
 import { MessageActions } from "../MessageActions";
@@ -21,6 +22,8 @@ interface Props {
   content: string | ContentBlock[];
   /** ISO timestamp from the source JSONL entry, used for hover-revealed time. */
   timestamp?: string;
+  /** Context-window usage snapshot associated with this prompt. */
+  contextBefore?: ContextUsage;
   /** Provider-agnostic branch metadata for editable conversation history. */
   branch?: {
     sessionId: string;
@@ -483,6 +486,7 @@ function CollapsibleText({ text }: { text: string }) {
 export const UserPromptBlock = memo(function UserPromptBlock({
   content,
   timestamp,
+  contextBefore,
   branch,
   codexBranch,
   onSelectBranch,
@@ -513,6 +517,7 @@ export const UserPromptBlock = memo(function UserPromptBlock({
       <div className="user-prompt-container">
         <MessageActions
           timestamp={timestamp}
+          contextBefore={contextBefore}
           copyText={copyText}
           onEdit={onEdit && text ? () => onEdit(text) : undefined}
         />
@@ -572,6 +577,7 @@ export const UserPromptBlock = memo(function UserPromptBlock({
     <div className="user-prompt-container">
       <MessageActions
         timestamp={timestamp}
+        contextBefore={contextBefore}
         copyText={copyText}
         onEdit={onEdit && text ? () => onEdit(text) : undefined}
       />

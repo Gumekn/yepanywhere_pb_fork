@@ -73,7 +73,7 @@ Environment overrides:
   LLM_API_BASE                 Fallback API base for AI session titles
   SESSION_TITLE_SUB_MODULE     X-Sub-Module header for AI session titles
   LLM_SUB_MODULE               Fallback X-Sub-Module header for AI session titles
-  SESSION_TITLE_MODEL          Model for AI session titles (default: deepseek-v4-flash)
+  SESSION_TITLE_MODEL          Model for AI session titles (default: deepseek-v4-pro)
   SESSION_TITLE_GENERATION     Set false to disable AI session titles
   SESSION_TITLE_TIMEOUT_MS     Request timeout for AI session title generation
 EOF

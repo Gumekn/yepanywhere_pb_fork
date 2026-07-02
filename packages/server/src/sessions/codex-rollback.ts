@@ -4,6 +4,10 @@ import type {
   CodexSessionEntry,
 } from "@yep-anywhere/shared";
 import { isCodexTurnAbortedNoticeText } from "./codex-turn-aborted.js";
+import {
+  isSessionSetupText,
+  isSyntheticUserPromptText,
+} from "./user-prompt-classification.js";
 
 interface CodexBranchNode {
   id: string;
@@ -22,11 +26,6 @@ export interface CodexBranchView {
   entries: CodexSessionEntry[];
   branchState: CodexBranchState;
 }
-
-const SESSION_SETUP_PREFIXES = [
-  "# AGENTS.md instructions",
-  "<environment_context>",
-];
 
 function hasResponseItemUserMessages(entries: CodexSessionEntry[]): boolean {
   return entries.some(
@@ -93,11 +92,6 @@ function getUserTurnText(
   return hasResponseItemUser
     ? getResponseMessageText(entry)
     : getEventUserMessageText(entry);
-}
-
-function isSessionSetupText(text: string): boolean {
-  const trimmed = text.trimStart();
-  return SESSION_SETUP_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
 }
 
 function getRollbackNumTurns(entry: CodexSessionEntry): number | null {
@@ -271,6 +265,9 @@ export function buildCodexBranchView(
         } else {
           prefixEntries.push(entry);
         }
+        continue;
+      }
+      if (isSyntheticUserPromptText(userText)) {
         continue;
       }
 

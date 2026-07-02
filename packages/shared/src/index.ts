@@ -150,6 +150,7 @@ export type {
   AgentActivity,
   ContextUsage,
   SessionQuestion,
+  SessionCreatedBy,
   SessionOwnership,
   SessionSandboxPolicy,
   SessionBranchOption,

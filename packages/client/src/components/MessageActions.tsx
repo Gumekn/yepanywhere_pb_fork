@@ -1,10 +1,14 @@
+import type { ContextUsage } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { getSelectionAwareCopyText } from "../lib/clipboard";
+import { formatTokenCount } from "../lib/tokens";
 
 interface MessageActionsProps {
   /** ISO timestamp string from the source message; shown on hover. */
   timestamp?: string;
+  /** Context-window usage snapshot associated with this message. */
+  contextBefore?: ContextUsage;
   /** Plain-text payload to copy. When omitted, the copy button is hidden. */
   copyText?: string;
   /**
@@ -25,6 +29,7 @@ interface MessageActionsProps {
  */
 export function MessageActions({
   timestamp,
+  contextBefore,
   copyText,
   onEdit,
 }: MessageActionsProps) {
@@ -69,7 +74,16 @@ export function MessageActions({
     }
   }, [copyText]);
 
-  if (!timestamp && !copyText && !onEdit) return null;
+  const contextTokenLabel =
+    contextBefore && contextBefore.inputTokens > 0
+      ? formatTokenCount(contextBefore.inputTokens)
+      : null;
+  const contextTokenTitle =
+    contextBefore && contextBefore.inputTokens > 0
+      ? `${contextBefore.inputTokens.toLocaleString()} context tokens`
+      : undefined;
+
+  if (!timestamp && !contextTokenLabel && !copyText && !onEdit) return null;
 
   return (
     <span
@@ -86,6 +100,11 @@ export function MessageActions({
         >
           {formatShortTime(timestamp)}
         </time>
+      )}
+      {contextTokenLabel && (
+        <span className="message-actions-context" title={contextTokenTitle}>
+          {contextTokenLabel}
+        </span>
       )}
       {onEdit && (
         <button

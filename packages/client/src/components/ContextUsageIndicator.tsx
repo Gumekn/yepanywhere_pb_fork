@@ -1,4 +1,5 @@
 import { useI18n } from "../i18n";
+import { formatTokenCount as formatTokens } from "../lib/tokens";
 import type { ContextUsage } from "../types";
 
 interface ContextUsageIndicatorProps {
@@ -132,17 +133,4 @@ function ContextUsageWrapper({
       {children}
     </span>
   );
-}
-
-/**
- * Format token count for display (e.g., 34500 -> "34.5K")
- */
-function formatTokens(tokens: number): string {
-  if (tokens >= 1_000_000) {
-    return `${(tokens / 1_000_000).toFixed(1)}M`;
-  }
-  if (tokens >= 1_000) {
-    return `${(tokens / 1_000).toFixed(1)}K`;
-  }
-  return tokens.toString();
 }

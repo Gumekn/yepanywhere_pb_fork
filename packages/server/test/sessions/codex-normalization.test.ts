@@ -103,6 +103,41 @@ function codexAssistantMessage(
   };
 }
 
+function codexTokenCount(
+  inputTokens: number,
+  second: number,
+  options: {
+    outputTokens?: number;
+    cachedInputTokens?: number;
+    totalTokens?: number;
+    modelContextWindow?: number;
+  } = {},
+): CodexSessionEntry {
+  const outputTokens = options.outputTokens ?? 100;
+  const cachedInputTokens = options.cachedInputTokens ?? 0;
+  const totalTokens = options.totalTokens ?? inputTokens + outputTokens;
+  const usage = {
+    input_tokens: inputTokens,
+    cached_input_tokens: cachedInputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokens,
+  };
+
+  return {
+    type: "event_msg",
+    timestamp: `2024-01-01T00:00:${String(second).padStart(2, "0")}Z`,
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: usage,
+        last_token_usage: usage,
+        model_context_window: options.modelContextWindow ?? 258_000,
+      },
+      rate_limits: null,
+    },
+  };
+}
+
 function codexRollbackMarker(
   numTurns: number,
   second: number,
@@ -201,6 +236,109 @@ describe("Codex Normalization", () => {
       type: "text",
       text: "How are you?",
     });
+  });
+
+  it("annotates codex user messages with turn context usage snapshots", () => {
+    const entries: CodexSessionEntry[] = [
+      codexUserMessage("Beijing weather", 1),
+      codexAssistantMessage("Beijing is sunny", 2),
+      codexTokenCount(10_000, 3),
+      codexUserMessage("Wuhan weather", 4),
+      codexAssistantMessage("Wuhan is cloudy", 5),
+      codexTokenCount(20_100, 6),
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    const users = result.messages.filter((message) => message.type === "user");
+
+    expect(users).toHaveLength(2);
+    expect(users[0]?.contextBefore).toMatchObject({
+      inputTokens: 10_000,
+      percentage: 4,
+      contextWindow: 258_000,
+    });
+    expect(users[1]?.contextBefore).toMatchObject({
+      inputTokens: 20_100,
+      percentage: 8,
+      contextWindow: 258_000,
+    });
+  });
+
+  it("keeps Codex turn context usage on the prompt instead of tool results", () => {
+    const entries: CodexSessionEntry[] = [
+      codexUserMessage("Use pwd", 1),
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:02Z",
+        payload: {
+          type: "function_call",
+          name: "shell_command",
+          call_id: "call-1",
+          arguments: '{"command":"pwd"}',
+        },
+      },
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:03Z",
+        payload: {
+          type: "function_call_output",
+          call_id: "call-1",
+          output: "/tmp/project",
+        },
+      },
+      codexAssistantMessage("Done", 4),
+      codexTokenCount(12_345, 5),
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    const prompt = result.messages.find(
+      (message) => firstMessageText(message) === "Use pwd",
+    );
+    const toolResult = result.messages.find((message) => {
+      const content = message.message?.content;
+      return (
+        Array.isArray(content) &&
+        content.some(
+          (block) =>
+            block &&
+            typeof block === "object" &&
+            (block as { type?: unknown }).type === "tool_result",
+        )
+      );
+    });
+
+    expect(prompt?.contextBefore?.inputTokens).toBe(12_345);
+    expect(toolResult?.contextBefore).toBeUndefined();
+  });
+
+  it("does not let post-compaction token counts overwrite the previous user snapshot", () => {
+    const entries: CodexSessionEntry[] = [
+      codexUserMessage("pre-compact prompt", 1),
+      codexAssistantMessage("pre-compact answer", 2),
+      codexTokenCount(227_243, 3),
+      {
+        type: "compacted",
+        timestamp: "2024-01-01T00:00:04Z",
+        payload: {
+          message: "Context compacted",
+          replacement_history: [],
+        },
+      },
+      codexTokenCount(0, 5, {
+        outputTokens: 0,
+        totalTokens: 7_945,
+      }),
+      codexUserMessage("post-compact prompt", 6),
+      codexAssistantMessage("post-compact answer", 7),
+      codexTokenCount(9_500, 8),
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    const users = result.messages.filter((message) => message.type === "user");
+
+    expect(users).toHaveLength(2);
+    expect(users[0]?.contextBefore?.inputTokens).toBe(227_243);
+    expect(users[1]?.contextBefore?.inputTokens).toBe(9_500);
   });
 
   it("preserves Codex assistant message phase metadata", () => {
@@ -316,14 +454,15 @@ describe("Codex Normalization", () => {
     ).toEqual(["q2", "q2-1"]);
   });
 
-  it("does not expose turn_aborted pseudo user messages as prompts or branches", () => {
+  it("does not expose synthetic user messages as prompts or branches", () => {
     const entries: CodexSessionEntry[] = [
       codexUserMessage("q1", 1),
       codexAssistantMessage("a1", 2),
-      codexTurnAbortedPseudoUser(3),
-      codexTurnAbortedEvent(4),
-      codexUserMessage("q2", 5),
-      codexAssistantMessage("a2", 6),
+      codexUserMessage("<skill>\n<name>git-commit-push</name>\n</skill>", 3),
+      codexTurnAbortedPseudoUser(4),
+      codexTurnAbortedEvent(5),
+      codexUserMessage("q2", 6),
+      codexAssistantMessage("a2", 7),
     ];
 
     const branchView = buildCodexBranchView(entries, "test-session");
@@ -345,6 +484,7 @@ describe("Codex Normalization", () => {
     );
 
     expect(JSON.stringify(result.messages)).not.toContain("<turn_aborted>");
+    expect(JSON.stringify(result.messages)).not.toContain("<skill>");
     expect(visibleText).toEqual([
       "q1",
       "a1",

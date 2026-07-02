@@ -56,6 +56,7 @@ import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.
 import { getPersistedAskUserQuestionInputRequest } from "../sessions/persisted-pending-input.js";
 import { findSessionSummaryAcrossProviders } from "../sessions/provider-resolution.js";
 import type { ISessionReader } from "../sessions/types.js";
+import { isUserPromptMessage } from "../sessions/user-prompt-message.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
 import type { Process } from "../supervisor/Process.js";
 import type {
@@ -246,8 +247,13 @@ interface InputResponseBody {
  * Convert SDK messages to client Message format.
  * Used for mock SDK sessions where messages aren't persisted to disk.
  */
-function sdkMessagesToClientMessages(sdkMessages: SDKMessage[]): Message[] {
+function sdkMessagesToClientMessages(
+  sdkMessages: SDKMessage[],
+  options: { model?: string; provider?: ProviderName } = {},
+): Message[] {
   const messages: Message[] = [];
+  let pendingUserMessage: Message | null = null;
+
   for (const msg of sdkMessages) {
     // Only include user and assistant messages with content
     if (
@@ -283,9 +289,72 @@ function sdkMessagesToClientMessages(sdkMessages: SDKMessage[]): Message[] {
             ? msg.timestamp
             : new Date().toISOString(),
       });
+
+      const latest = messages[messages.length - 1];
+      if (latest && isUserPromptMessage(latest)) {
+        pendingUserMessage = latest;
+      }
+      continue;
+    }
+
+    const contextUsage = extractCodexTurnCompleteContextUsage(msg, options);
+    if (contextUsage && pendingUserMessage) {
+      pendingUserMessage.contextBefore = contextUsage;
+      pendingUserMessage = null;
     }
   }
   return messages;
+}
+
+function extractCodexTurnCompleteContextUsage(
+  msg: SDKMessage,
+  options: { model?: string; provider?: ProviderName },
+): ContextUsage | undefined {
+  if (
+    (options.provider !== "codex" && options.provider !== "codex-oss") ||
+    msg.type !== "system" ||
+    msg.subtype !== "turn_complete"
+  ) {
+    return undefined;
+  }
+
+  const usage = msg.usage as
+    | {
+        input_tokens?: unknown;
+        output_tokens?: unknown;
+        cached_input_tokens?: unknown;
+        model_context_window?: unknown;
+      }
+    | undefined;
+  if (typeof usage?.input_tokens !== "number" || usage.input_tokens <= 0) {
+    return undefined;
+  }
+
+  const contextWindow =
+    typeof usage.model_context_window === "number" &&
+    usage.model_context_window > 0
+      ? usage.model_context_window
+      : getModelContextWindow(options.model, options.provider);
+  const result: ContextUsage = {
+    inputTokens: usage.input_tokens,
+    percentage: Math.min(
+      100,
+      Math.round((usage.input_tokens / contextWindow) * 100),
+    ),
+    contextWindow,
+  };
+
+  if (typeof usage.output_tokens === "number" && usage.output_tokens > 0) {
+    result.outputTokens = usage.output_tokens;
+  }
+  if (
+    typeof usage.cached_input_tokens === "number" &&
+    usage.cached_input_tokens > 0
+  ) {
+    result.cacheReadTokens = usage.cached_input_tokens;
+  }
+
+  return result;
 }
 
 /**
@@ -552,6 +621,22 @@ function emitArchiveFileEvents(
   }
 }
 
+async function markSessionCreatedByYep(
+  deps: SessionsDeps,
+  sessionId: string,
+  projectId: string,
+): Promise<void> {
+  if (!deps.sessionMetadataService) return;
+
+  await deps.sessionMetadataService.setCreatedBy(sessionId, "yep");
+  deps.eventBus?.emit({
+    type: "session-metadata-changed",
+    sessionId,
+    projectId: projectId as UrlProjectId,
+    timestamp: new Date().toISOString(),
+  });
+}
+
 export function createSessionsRoutes(deps: SessionsDeps): Hono {
   const routes = new Hono();
   const getCodexReader = (projectPath: string): CodexSessionReader | null =>
@@ -760,6 +845,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           sessionSummary?.reasoningEffort ?? process?.resolvedReasoningEffort,
         serviceTier: sessionSummary?.serviceTier ?? process?.serviceTier,
         originator: sessionSummary?.originator,
+        createdBy: metadata?.createdBy ?? sessionSummary?.createdBy,
         cliVersion: sessionSummary?.cliVersion,
         source: sessionSummary?.source,
         approvalPolicy: sessionSummary?.approvalPolicy,
@@ -1120,7 +1206,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         // Get raw messages from process memory
         const sdkMessages = process.getMessageHistory();
         // Convert to client format
-        const processMessages = sdkMessagesToClientMessages(sdkMessages);
+        const processMessages = sdkMessagesToClientMessages(sdkMessages, {
+          model: process.resolvedModel,
+          provider: process.provider,
+        });
         // Extract context usage from raw SDK messages (has usage field)
         // Use process.contextWindow (captured from result messages) as primary source
         const mis = deps.modelInfoService;
@@ -1165,6 +1254,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             aiTitle: metadata?.aiTitle,
             isArchived: metadata?.isArchived,
             isStarred: metadata?.isStarred,
+            createdBy: metadata?.createdBy,
             lastSeenAt: lastSeenEntry?.timestamp,
             hasUnread,
             provider: process.provider,
@@ -1196,6 +1286,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             aiTitle: metadata?.aiTitle ?? bridgedSession.session.aiTitle,
             isArchived: metadata?.isArchived,
             isStarred: metadata?.isStarred,
+            createdBy: metadata?.createdBy ?? bridgedSession.session.createdBy,
             lastSeenAt: lastSeenEntry?.timestamp,
             hasUnread,
           },
@@ -1296,6 +1387,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         aiTitle: metadata?.aiTitle ?? session.aiTitle,
         isArchived: metadata?.isArchived,
         isStarred: metadata?.isStarred,
+        createdBy: metadata?.createdBy ?? session.createdBy,
         // Model comes from the session reader (extracted from JSONL)
         model: session.model,
         lastSeenAt,
@@ -1448,6 +1540,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         );
       }
     }
+    await markSessionCreatedByYep(deps, result.sessionId, project.id);
 
     return c.json({
       sessionId: result.sessionId,
@@ -1552,6 +1645,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         );
       }
     }
+    await markSessionCreatedByYep(deps, result.sessionId, project.id);
 
     return c.json({
       sessionId: result.sessionId,

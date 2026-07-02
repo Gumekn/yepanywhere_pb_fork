@@ -1434,6 +1434,7 @@ export class CodexBridgeService implements CodexBridgeController {
       reasoningEffort: session.reasoningEffort,
       serviceTier: session.serviceTier,
       originator: "Yep Codex Bridge",
+      createdBy: "external",
       source: "codex-bridge",
     };
   }
