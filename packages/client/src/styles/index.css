@@ -3773,6 +3773,231 @@ a.sidebar-nav-item {
   }
 }
 
+/* ==========================================================================
+   Remote terminal
+   ========================================================================== */
+
+.terminal-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: #0b0b0b;
+}
+
+.terminal-status-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+  min-height: 33px;
+  padding: var(--space-1) var(--space-3);
+  color: #aaa;
+  border-bottom: 1px solid var(--border-color, #2a2a2a);
+  background: #111;
+  font-size: var(--font-size-sm);
+  line-height: 1.3;
+  overflow: hidden;
+}
+
+.terminal-status-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.terminal-status-subtitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.7;
+}
+
+.terminal-status-error {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #ff8a80;
+}
+
+.terminal-status-spacer {
+  flex: 1 1 auto;
+  min-width: var(--space-2);
+}
+
+.terminal-status-action {
+  flex: 0 0 auto;
+  padding: var(--space-1) 10px;
+  color: #eee;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.terminal-status-action:hover {
+  border-color: #666;
+  background: #333;
+}
+
+.terminal-surface {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  padding: 6px;
+  background: #0b0b0b;
+  overflow: hidden;
+  touch-action: pan-x pan-y;
+}
+
+.terminal-surface .xterm {
+  height: 100%;
+}
+
+.terminal-mobile-controls {
+  display: none;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+  background: #151515;
+  border-top: 1px solid #2a2a2a;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.terminal-key-row {
+  display: grid;
+  grid-auto-columns: minmax(52px, 1fr);
+  grid-auto-flow: column;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.terminal-key-row::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-modifier-row {
+  grid-template-columns: minmax(58px, 76px) minmax(58px, 76px) minmax(0, 1fr);
+  grid-auto-flow: initial;
+  align-items: center;
+}
+
+.terminal-key {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  height: 38px;
+  padding: 0 10px;
+  color: #e7e7e7;
+  background: #242424;
+  border: 1px solid #3a3a3a;
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.terminal-key:hover {
+  border-color: #5a5a5a;
+  background: #2c2c2c;
+}
+
+.terminal-key:active,
+.terminal-key-armed,
+.terminal-key-locked {
+  color: #fff;
+  border-color: var(--primary-color);
+  background: color-mix(in srgb, var(--primary-color) 28%, #202020 72%);
+}
+
+.terminal-key-modifier::after {
+  position: absolute;
+  right: 5px;
+  bottom: 4px;
+  color: #dbeafe;
+  font-family: var(--font-sans);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.terminal-key-modifier[data-mode="armed"]::after {
+  content: "1";
+}
+
+.terminal-key-modifier[data-mode="locked"]::after {
+  content: "L";
+}
+
+.terminal-key-wide {
+  min-width: 74px;
+}
+
+.terminal-modifier-hint {
+  min-width: 0;
+  overflow: hidden;
+  color: #8a8a8a;
+  font-size: 11px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 760px), (pointer: coarse) {
+  .terminal-mobile-controls {
+    display: flex;
+  }
+
+  .terminal-status-bar {
+    min-height: 30px;
+    padding: var(--space-1) var(--space-2);
+  }
+
+  .terminal-surface {
+    padding: 4px;
+  }
+}
+
+@media (max-width: 420px) {
+  .terminal-mobile-controls {
+    gap: 5px;
+    padding: 6px;
+    padding-bottom: max(6px, env(safe-area-inset-bottom, 0px));
+  }
+
+  .terminal-key-row {
+    grid-auto-columns: minmax(48px, 1fr);
+    gap: 5px;
+  }
+
+  .terminal-key {
+    height: 36px;
+    padding: 0 8px;
+    font-size: 11px;
+  }
+
+  .terminal-modifier-row {
+    grid-template-columns: 56px 56px minmax(0, 1fr);
+  }
+}
+
 /* Attach button */
 .attach-button {
   display: flex;
