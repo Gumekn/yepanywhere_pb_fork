@@ -242,27 +242,6 @@ describe("WebSocket Transport E2E", () => {
       }
     });
 
-    it("should handle GET request for version endpoint", async () => {
-      const ws = await connectWebSocket();
-
-      try {
-        const request: WireRequest = {
-          type: "request",
-          id: randomUUID(),
-          method: "GET",
-          path: "/api/version",
-        };
-
-        const response = await sendRequest(ws, request);
-
-        expect(response.status).toBe(200);
-        expect(response.body).toHaveProperty("current");
-        expect(response.body).toHaveProperty("resumeProtocolVersion", 2);
-      } finally {
-        ws.close();
-      }
-    });
-
     it("should handle GET request for projects endpoint", async () => {
       const ws = await connectWebSocket();
 
@@ -320,7 +299,7 @@ describe("WebSocket Transport E2E", () => {
           type: "request",
           id: randomUUID(),
           method: "GET",
-          path: "/api/version",
+          path: "/api/projects",
         };
 
         // Send both requests concurrently
@@ -333,6 +312,7 @@ describe("WebSocket Transport E2E", () => {
         expect(response1.id).toBe(request1.id);
         expect(response2.status).toBe(200);
         expect(response2.id).toBe(request2.id);
+        expect(response2.body).toHaveProperty("projects");
       } finally {
         ws.close();
       }
@@ -1110,7 +1090,7 @@ describe("WebSocket Transport E2E", () => {
           type: "request",
           id: randomUUID(),
           method: "GET",
-          path: "/api/version",
+          path: "/api/projects",
         };
         const binaryResponse = await sendBinaryRequest(ws, binaryRequest);
         expect(binaryResponse.status).toBe(200);
