@@ -132,12 +132,14 @@ export interface WorkerActivityEvent {
   timestamp: string;
 }
 
-/** Event emitted when session metadata changes (title, archived, starred) */
+/** Event emitted when session metadata changes (title, AI title, archived, starred) */
 export interface SessionMetadataChangedEvent {
   type: "session-metadata-changed";
   sessionId: string;
   /** Updated title (if changed) */
   title?: string;
+  /** Updated AI-generated title (if changed) */
+  aiTitle?: string;
   /** Updated archived status (if changed) */
   archived?: boolean;
   /** Updated starred status (if changed) */

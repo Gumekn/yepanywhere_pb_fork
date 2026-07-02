@@ -69,6 +69,7 @@ export interface SessionMetadataChangedEvent {
   type: "session-metadata-changed";
   sessionId: string;
   title?: string;
+  aiTitle?: string;
   archived?: boolean;
   starred?: boolean;
   timestamp: string;

@@ -21,13 +21,17 @@ const PENDING_TITLE_REFETCH_DELAYS_MS = [1500, 4000, 8000] as const;
 
 function hasResolvedTitle(session: {
   customTitle?: string | null;
+  aiTitle?: string | null;
   title?: string | null;
 }): boolean {
-  return Boolean((session.customTitle ?? session.title)?.trim());
+  return Boolean(
+    (session.customTitle ?? session.aiTitle ?? session.title)?.trim(),
+  );
 }
 
 function needsPendingTitleRefetch(session: {
   customTitle?: string | null;
+  aiTitle?: string | null;
   title?: string | null;
   messageCount?: number;
 }): boolean {
@@ -67,6 +71,7 @@ function mergeFetchedSession(
       ...incoming,
       title: existing.title,
       customTitle: existing.customTitle ?? incoming.customTitle,
+      aiTitle: existing.aiTitle ?? incoming.aiTitle,
     };
   }
 
@@ -459,6 +464,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           activity: event.session.activity,
           hasUnread: event.session.hasUnread,
           customTitle: event.session.customTitle,
+          aiTitle: event.session.aiTitle,
           isArchived: event.session.isArchived,
           isStarred: event.session.isStarred,
           contextUsage: event.session.contextUsage,
@@ -487,13 +493,20 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     (event: SessionMetadataChangedEvent) => {
       if (!enabled) return;
 
+      if (event.title?.trim() || event.aiTitle?.trim()) {
+        clearPendingTitleRefetch(event.sessionId);
+      }
+
       setSessions((prev) => {
         const updated = prev.map((session) => {
           if (session.id !== event.sessionId) return session;
+          const nextCustomTitle = event.title?.trim() ? event.title : undefined;
+          const nextAiTitle = event.aiTitle?.trim() ? event.aiTitle : undefined;
 
           return {
             ...session,
-            ...(event.title !== undefined && { customTitle: event.title }),
+            ...(event.title !== undefined && { customTitle: nextCustomTitle }),
+            ...(event.aiTitle !== undefined && { aiTitle: nextAiTitle }),
             ...(event.archived !== undefined && { isArchived: event.archived }),
             ...(event.starred !== undefined && { isStarred: event.starred }),
           };
@@ -518,7 +531,14 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         debouncedRefetch();
       }
     },
-    [starred, sessionKind, excludeSessionKind, enabled, debouncedRefetch],
+    [
+      starred,
+      sessionKind,
+      excludeSessionKind,
+      enabled,
+      debouncedRefetch,
+      clearPendingTitleRefetch,
+    ],
   );
 
   // Handle session seen events

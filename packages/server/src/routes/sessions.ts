@@ -763,6 +763,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         sandboxPolicy: sessionSummary?.sandboxPolicy,
         contextUsage: sessionSummary?.contextUsage,
         customTitle: metadata?.customTitle,
+        aiTitle: metadata?.aiTitle ?? sessionSummary?.aiTitle,
         isArchived: metadata?.isArchived,
         isStarred: metadata?.isStarred,
         lastSeenAt,
@@ -1149,6 +1150,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             ownership,
             messages: processMessages,
             customTitle: metadata?.customTitle,
+            aiTitle: metadata?.aiTitle,
             isArchived: metadata?.isArchived,
             isStarred: metadata?.isStarred,
             lastSeenAt: lastSeenEntry?.timestamp,
@@ -1179,6 +1181,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             ...bridgedSession.session,
             messages: [],
             customTitle: metadata?.customTitle,
+            aiTitle: metadata?.aiTitle ?? bridgedSession.session.aiTitle,
             isArchived: metadata?.isArchived,
             isStarred: metadata?.isStarred,
             lastSeenAt: lastSeenEntry?.timestamp,
@@ -1262,6 +1265,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         ownership,
         contextUsage,
         customTitle: metadata?.customTitle,
+        aiTitle: metadata?.aiTitle ?? session.aiTitle,
         isArchived: metadata?.isArchived,
         isStarred: metadata?.isStarred,
         // Model comes from the session reader (extracted from JSONL)
@@ -2407,7 +2411,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         const originalMetadata =
           deps.sessionMetadataService.getMetadata(sessionId);
         const originalTitle =
-          originalMetadata?.customTitle ?? originalSession?.title;
+          originalMetadata?.customTitle ??
+          originalMetadata?.aiTitle ??
+          originalSession?.aiTitle ??
+          originalSession?.title;
         if (originalTitle) {
           cloneTitle = `${originalTitle} [cloned]`;
         }

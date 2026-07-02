@@ -60,6 +60,7 @@ export class Session extends SessionView {
       summary.hasUnread ?? false,
       summary.contextUsage,
       summary.provider,
+      summary.aiTitle,
     );
     this.deps = deps;
   }
@@ -92,6 +93,7 @@ export class Session extends SessionView {
     const enrichedSummary: AppSessionSummary = {
       ...summary,
       customTitle: metadata?.customTitle,
+      aiTitle: metadata?.aiTitle,
       isArchived: metadata?.isArchived,
       isStarred: metadata?.isStarred,
       executor: metadata?.executor,
@@ -161,6 +163,7 @@ export class Session extends SessionView {
       title: this.autoTitle,
       fullTitle: this.fullTitle,
       customTitle: this.customTitle,
+      aiTitle: this.aiTitle,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
       messageCount: this.messageCount,

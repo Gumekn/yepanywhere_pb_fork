@@ -202,11 +202,12 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
         ? deps.notificationService.hasUnread(session.id, session.updatedAt)
         : undefined;
 
-      // Get session metadata (custom title, archived, starred)
+      // Get session metadata (custom title, AI title, archived, starred)
       const metadata = deps.sessionMetadataService?.getMetadata(session.id);
-      const customTitle = metadata?.customTitle;
-      const isArchived = metadata?.isArchived;
-      const isStarred = metadata?.isStarred;
+      const customTitle = metadata?.customTitle ?? session.customTitle;
+      const aiTitle = metadata?.aiTitle ?? session.aiTitle;
+      const isArchived = metadata?.isArchived ?? session.isArchived;
+      const isStarred = metadata?.isStarred ?? session.isStarred;
 
       return {
         ...session,
@@ -216,6 +217,7 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
         lastSeenAt,
         hasUnread,
         customTitle,
+        aiTitle,
         isArchived,
         isStarred,
       };

@@ -55,6 +55,7 @@ export interface SearchResultSession {
   provider: string;
   title: string;
   customTitle?: string;
+  aiTitle?: string;
   updatedAt: string;
   matchCount: number;
   matches: SearchMatch[];
@@ -188,14 +189,20 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
         result.sessionId,
       );
       const customTitle = metadata?.customTitle;
+      const aiTitle = metadata?.aiTitle;
       totalMatches += result.matchCount;
       items.push({
         sessionId: result.sessionId,
         projectId: project.id,
         projectName: project.name,
         provider: result.provider,
-        title: getSessionDisplayTitle({ customTitle, title: result.title }),
+        title: getSessionDisplayTitle({
+          customTitle,
+          aiTitle,
+          title: result.title,
+        }),
         customTitle,
+        aiTitle,
         updatedAt: result.updatedAt,
         matchCount: result.matchCount,
         matches: result.matches,
@@ -205,7 +212,8 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
     // Rank: title matches first, then more matches, then most recent.
     const titleHit = (item: SearchResultSession): boolean =>
       (item.title?.toLowerCase().includes(queryLower) ?? false) ||
-      (item.customTitle?.toLowerCase().includes(queryLower) ?? false);
+      (item.customTitle?.toLowerCase().includes(queryLower) ?? false) ||
+      (item.aiTitle?.toLowerCase().includes(queryLower) ?? false);
 
     items.sort((a, b) => {
       const at = titleHit(a) ? 1 : 0;

@@ -37,3 +37,8 @@ export {
 } from "./SharingService.js";
 
 export { ModelInfoService } from "./ModelInfoService.js";
+
+export {
+  SessionTitleService,
+  type SessionTitleServiceOptions,
+} from "./SessionTitleService.js";

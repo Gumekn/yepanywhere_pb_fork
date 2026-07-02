@@ -80,6 +80,7 @@ export interface GlobalSessionItem {
   activity?: AgentActivity;
   hasUnread?: boolean;
   customTitle?: string;
+  aiTitle?: string;
   isArchived?: boolean;
   isStarred?: boolean;
   /** SSH host alias for remote execution (undefined = local) */
@@ -500,6 +501,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         const isArchived = metadata?.isArchived ?? session.isArchived ?? false;
         const isStarred = metadata?.isStarred ?? session.isStarred ?? false;
         const customTitle = metadata?.customTitle ?? session.customTitle;
+        const aiTitle = metadata?.aiTitle ?? session.aiTitle;
         const executor = metadata?.executor;
 
         // Get unread status
@@ -545,11 +547,17 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           const customTitleMatch = customTitle
             ?.toLowerCase()
             .includes(searchQuery);
+          const aiTitleMatch = aiTitle?.toLowerCase().includes(searchQuery);
           const projectNameMatch = project.name
             .toLowerCase()
             .includes(searchQuery);
 
-          if (!titleMatch && !customTitleMatch && !projectNameMatch) {
+          if (
+            !titleMatch &&
+            !customTitleMatch &&
+            !aiTitleMatch &&
+            !projectNameMatch
+          ) {
             continue;
           }
         }
@@ -621,6 +629,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
             activity,
             hasUnread,
             customTitle,
+            aiTitle,
             isArchived,
             isStarred,
             executor,
@@ -643,6 +652,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       const isArchived = metadata?.isArchived ?? session.isArchived ?? false;
       const isStarred = metadata?.isStarred ?? session.isStarred ?? false;
       const customTitle = metadata?.customTitle ?? session.customTitle;
+      const aiTitle = metadata?.aiTitle ?? session.aiTitle;
       const executor = metadata?.executor;
 
       const hasUnread = deps.notificationService
@@ -679,10 +689,12 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       if (searchQuery) {
         const title = session.title ?? "";
         const custom = customTitle ?? "";
+        const ai = aiTitle ?? "";
         const projectName = item.projectName;
         if (
           !title.toLowerCase().includes(searchQuery) &&
           !custom.toLowerCase().includes(searchQuery) &&
+          !ai.toLowerCase().includes(searchQuery) &&
           !projectName.toLowerCase().includes(searchQuery)
         ) {
           continue;
@@ -709,6 +721,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           activity: item.activity,
           hasUnread,
           customTitle,
+          aiTitle,
           isArchived,
           isStarred,
           executor,

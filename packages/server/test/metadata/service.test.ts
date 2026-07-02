@@ -186,6 +186,50 @@ describe("SessionMetadataService", () => {
     });
   });
 
+  describe("setAiTitle", () => {
+    it("sets AI title for a session", async () => {
+      await service.initialize();
+
+      await service.setAiTitle("session-1", "Short Title");
+
+      expect(service.getMetadata("session-1")).toEqual({
+        aiTitle: "Short Title",
+      });
+    });
+
+    it("trims whitespace from AI title", async () => {
+      await service.initialize();
+
+      await service.setAiTitle("session-1", "  Short Title  ");
+
+      expect(service.getMetadata("session-1")?.aiTitle).toBe("Short Title");
+    });
+
+    it("preserves custom title when updating AI title", async () => {
+      await service.initialize();
+      await service.setTitle("session-1", "Manual Title");
+
+      await service.setAiTitle("session-1", "AI Title");
+
+      expect(service.getMetadata("session-1")).toEqual({
+        customTitle: "Manual Title",
+        aiTitle: "AI Title",
+      });
+    });
+
+    it("persists AI title to disk", async () => {
+      await service.initialize();
+      await service.setAiTitle("session-1", "Persistent AI Title");
+
+      const newService = new SessionMetadataService({ dataDir: testDir });
+      await newService.initialize();
+
+      expect(newService.getMetadata("session-1")?.aiTitle).toBe(
+        "Persistent AI Title",
+      );
+    });
+  });
+
   describe("setStarred", () => {
     it("sets starred status for a session", async () => {
       await service.initialize();

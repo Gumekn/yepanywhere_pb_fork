@@ -2,7 +2,7 @@
  * SessionView provides a unified interface for session display in the UI.
  *
  * This class encapsulates all the data needed to render session UI components:
- * - Title handling (auto, custom, display priority)
+ * - Title handling (auto, AI-generated, custom, display priority)
  * - Metadata (starred, archived)
  * - Notification state (unread, pending input)
  * - Process state (running, idle, waiting)
@@ -62,6 +62,8 @@ export class SessionView {
     readonly contextUsage: ContextUsage | undefined,
     /** AI provider for this session */
     readonly provider: ProviderName,
+    /** AI-generated title (overrides autoTitle, but not customTitle) */
+    readonly aiTitle: string | undefined = undefined,
   ) {}
 
   // ===========================================================================
@@ -70,10 +72,10 @@ export class SessionView {
 
   /**
    * Get the title to display in the UI.
-   * Priority: customTitle > autoTitle > "Untitled"
+   * Priority: customTitle > aiTitle > autoTitle > "Untitled"
    */
   get displayTitle(): string {
-    return this.customTitle ?? this.autoTitle ?? "Untitled";
+    return this.customTitle ?? this.aiTitle ?? this.autoTitle ?? "Untitled";
   }
 
   /**
@@ -81,6 +83,13 @@ export class SessionView {
    */
   get hasCustomTitle(): boolean {
     return !!this.customTitle;
+  }
+
+  /**
+   * Check if the session has an AI-generated title.
+   */
+  get hasAiTitle(): boolean {
+    return !!this.aiTitle;
   }
 
   /**
@@ -171,6 +180,7 @@ export class SessionView {
       summary.hasUnread ?? false,
       summary.contextUsage,
       summary.provider,
+      summary.aiTitle,
     );
   }
 
@@ -184,6 +194,7 @@ export class SessionView {
     title?: string | null;
     fullTitle?: string | null;
     customTitle?: string;
+    aiTitle?: string;
     createdAt?: string;
     updatedAt?: string;
     messageCount?: number;
@@ -216,6 +227,7 @@ export class SessionView {
       data.hasUnread ?? false,
       data.contextUsage,
       data.provider ?? DEFAULT_PROVIDER,
+      data.aiTitle,
     );
   }
 }
@@ -225,11 +237,14 @@ export class SessionView {
  * Useful when you don't need a full SessionView instance.
  *
  * @param session - Object with optional title fields
- * @returns The display title (customTitle > title > "Untitled")
+ * @returns The display title (customTitle > aiTitle > title > "Untitled")
  */
 export function getSessionDisplayTitle(
-  session: { customTitle?: string; title?: string | null } | null | undefined,
+  session:
+    | { customTitle?: string; aiTitle?: string; title?: string | null }
+    | null
+    | undefined,
 ): string {
   if (!session) return "Untitled";
-  return session.customTitle ?? session.title ?? "Untitled";
+  return session.customTitle ?? session.aiTitle ?? session.title ?? "Untitled";
 }

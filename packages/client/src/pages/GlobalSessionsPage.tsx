@@ -45,7 +45,7 @@ const PROVIDER_COLORS: Record<ProviderName, string> = {
 };
 
 const getSessionListTitle = (session: GlobalSessionItem): string | null =>
-  session.customTitle ?? session.title ?? null;
+  session.customTitle ?? session.aiTitle ?? session.title ?? null;
 
 /**
  * Global sessions page showing all sessions across all projects.

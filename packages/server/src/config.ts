@@ -50,6 +50,8 @@ export interface Config {
   geminiSessionsDir: string;
   /** Codex sessions directory (~/.codex/sessions) */
   codexSessionsDir: string;
+  /** AI title generation for completed first-turn sessions. */
+  sessionTitleGeneration: SessionTitleGenerationConfig;
   /** Whether to run the local Codex CLI bridge for `codex --remote ws://...`. */
   codexBridgeEnabled: boolean;
   /** How the Codex CLI bridge is hosted. */
@@ -171,6 +173,19 @@ export interface Config {
   basePath: string;
 }
 
+export interface SessionTitleGenerationConfig {
+  /** Enabled only when an API key is available unless explicitly disabled. */
+  enabled: boolean;
+  /** OpenAI-compatible API base URL. May include or omit /v1. */
+  apiBase: string;
+  /** API key for the OpenAI-compatible endpoint. */
+  apiKey?: string;
+  /** Model used to produce compact session titles. */
+  model: string;
+  /** Request timeout in milliseconds. */
+  requestTimeoutMs: number;
+}
+
 /**
  * Load configuration from environment variables with defaults.
  */
@@ -256,6 +271,25 @@ export function loadConfig(): Config {
           .map((s) => s.trim())
           .filter(Boolean)
       : [];
+  const sessionTitleApiKey =
+    process.env.SESSION_TITLE_LLM_API_KEY ?? process.env.LLM_API_KEY;
+  const sessionTitleGenerationRequested = parseBooleanOrDefault(
+    process.env.SESSION_TITLE_GENERATION,
+    Boolean(sessionTitleApiKey),
+  );
+  const sessionTitleGeneration: SessionTitleGenerationConfig = {
+    enabled: sessionTitleGenerationRequested && Boolean(sessionTitleApiKey),
+    apiBase:
+      process.env.SESSION_TITLE_LLM_API_BASE ??
+      process.env.LLM_API_BASE ??
+      "https://api.ohmyrouter.com",
+    apiKey: sessionTitleApiKey,
+    model: process.env.SESSION_TITLE_MODEL ?? "deepseek-v4-pro",
+    requestTimeoutMs: Math.max(
+      1000,
+      parseIntOrDefault(process.env.SESSION_TITLE_TIMEOUT_MS, 20000),
+    ),
+  };
 
   return {
     dataDir,
@@ -263,6 +297,7 @@ export function loadConfig(): Config {
     claudeSessionsDir,
     geminiSessionsDir,
     codexSessionsDir,
+    sessionTitleGeneration,
     codexBridgeEnabled: codexBridgeMode !== "disabled",
     codexBridgeMode,
     codexBridgeHost:

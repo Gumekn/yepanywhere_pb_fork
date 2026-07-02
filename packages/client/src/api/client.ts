@@ -86,6 +86,7 @@ export interface GlobalSessionItem {
   activity?: AgentActivity;
   hasUnread?: boolean;
   customTitle?: string;
+  aiTitle?: string;
   isArchived?: boolean;
   isStarred?: boolean;
   /** SSH host alias for remote execution (undefined = local) */
@@ -150,6 +151,7 @@ export interface SearchResultSession {
   provider: ProviderName;
   title: string;
   customTitle?: string;
+  aiTitle?: string;
   updatedAt: string;
   matchCount: number;
   matches: SearchMatch[];

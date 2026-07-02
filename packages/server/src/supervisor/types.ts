@@ -87,6 +87,8 @@ export interface SessionSummary {
   // Metadata fields (added from SessionMetadataService)
   /** Custom title that overrides auto-generated title */
   customTitle?: string;
+  /** AI-generated title that overrides auto title but not custom title */
+  aiTitle?: string;
   /** Whether the session is archived (hidden from default list) */
   isArchived?: boolean;
   /** Whether the session is starred/favorited */

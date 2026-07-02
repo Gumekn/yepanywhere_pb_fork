@@ -44,7 +44,7 @@ function formatRelativeTime(timestamp: string): string {
 
 /** Get display title */
 function getDisplayTitle(session: GlobalSessionItem): string {
-  return session.customTitle || session.title || "Untitled";
+  return session.customTitle || session.aiTitle || session.title || "Untitled";
 }
 
 /** Compact status indicator */

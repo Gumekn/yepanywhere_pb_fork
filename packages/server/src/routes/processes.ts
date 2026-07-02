@@ -67,9 +67,10 @@ async function enrichProcessInfo(
       process.sessionId,
     );
 
-    // Use getSessionDisplayTitle to compute final title (customTitle > title > "Untitled")
+    // Use getSessionDisplayTitle to compute final title (customTitle > aiTitle > title > "Untitled")
     const displayTitle = getSessionDisplayTitle({
       customTitle: metadata?.customTitle,
+      aiTitle: metadata?.aiTitle ?? summary?.aiTitle,
       title,
     });
 

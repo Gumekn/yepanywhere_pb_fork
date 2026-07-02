@@ -12,6 +12,7 @@ import {
 import type { AuthService } from "./auth/AuthService.js";
 import { createAuthRoutes } from "./auth/routes.js";
 import type { CodexBridgeController } from "./codex-bridge/types.js";
+import type { SessionTitleGenerationConfig } from "./config.js";
 import type { DeviceBridgeService } from "./device/DeviceBridgeService.js";
 import type { FrontendProxy } from "./frontend/index.js";
 import type {
@@ -96,9 +97,11 @@ import type { ConnectedBrowsersService } from "./services/ConnectedBrowsersServi
 import type { ModelInfoService } from "./services/ModelInfoService.js";
 import type { NetworkBindingService } from "./services/NetworkBindingService.js";
 import type { ServerSettingsService } from "./services/ServerSettingsService.js";
+import { SessionTitleService } from "./services/SessionTitleService.js";
 import type { SharingService } from "./services/SharingService.js";
 import { CodexSessionReader } from "./sessions/codex-reader.js";
 import { GeminiSessionReader } from "./sessions/gemini-reader.js";
+import { normalizeSession } from "./sessions/normalization.js";
 import { OpenCodeSessionReader } from "./sessions/opencode-reader.js";
 import {
   findSessionSummaryAcrossProviders,
@@ -196,6 +199,8 @@ export interface AppOptions {
   deviceBridgeService?: DeviceBridgeService;
   /** Codex bridge for externally launched `codex --remote` TUI sessions. */
   codexBridgeService?: CodexBridgeController;
+  /** AI title generation settings. */
+  sessionTitleGeneration?: SessionTitleGenerationConfig;
   /** If non-empty, only these provider names are exposed via the API. */
   enabledProviders?: string[];
   /** Whether voice input is enabled. Default: true */
@@ -497,6 +502,59 @@ export function createApp(options: AppOptions): AppResult {
         getSessionSummary,
       })
     : undefined;
+
+  if (
+    options.eventBus &&
+    options.sessionMetadataService &&
+    options.sessionTitleGeneration?.enabled
+  ) {
+    const sessionTitleService = new SessionTitleService({
+      eventBus: options.eventBus,
+      metadataService: options.sessionMetadataService,
+      ...options.sessionTitleGeneration,
+      loadSession: async (sessionId, projectId) => {
+        const project = await scanner.getProject(projectId);
+        if (!project) return null;
+        const resolved = await findSessionSummaryAcrossProviders(
+          project,
+          sessionId,
+          project.id,
+          {
+            readerFactory,
+            codexSessionsDir: CODEX_SESSIONS_DIR,
+            codexReaderFactory,
+            geminiSessionsDir: GEMINI_TMP_DIR,
+            geminiReaderFactory,
+            geminiHashToCwd: geminiScanner.getHashToCwd(),
+          },
+          options.sessionMetadataService?.getProvider(sessionId),
+        );
+        const loaded = await resolved?.source.reader.getSession(
+          sessionId,
+          project.id,
+          undefined,
+          { includeOrphans: false },
+        );
+        if (!loaded) return null;
+
+        const session = normalizeSession(loaded);
+        const metadata = options.sessionMetadataService?.getMetadata(sessionId);
+        return {
+          ...session,
+          customTitle: metadata?.customTitle ?? session.customTitle,
+          aiTitle: metadata?.aiTitle ?? session.aiTitle,
+        };
+      },
+    });
+    sessionTitleService.start();
+    getLogger().info(
+      {
+        model: options.sessionTitleGeneration.model,
+        apiBase: options.sessionTitleGeneration.apiBase,
+      },
+      "[SessionTitleService] Enabled",
+    );
+  }
 
   if (options.sessionArchiveService) {
     const archiveService = options.sessionArchiveService;
@@ -861,6 +919,7 @@ export function createApp(options: AppOptions): AppResult {
         }
       },
       sessionIndexService: options.sessionIndexService,
+      sessionMetadataService: options.sessionMetadataService,
     }),
   );
 

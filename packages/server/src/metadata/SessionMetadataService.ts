@@ -12,6 +12,8 @@ import type { CodexMcpMode, ProviderName } from "@yep-anywhere/shared";
 export interface SessionMetadata {
   /** Custom title that overrides auto-generated title */
   customTitle?: string;
+  /** AI-generated title that overrides auto-generated title, but not customTitle */
+  aiTitle?: string;
   /** Whether the session is archived (hidden from default list) */
   isArchived?: boolean;
   /** Whether the session is starred/favorited */
@@ -121,6 +123,22 @@ export class SessionMetadataService {
     this.updateSessionMetadata(sessionId, (metadata) => ({
       ...metadata,
       customTitle: trimmedTitle || undefined,
+    }));
+    await this.save();
+  }
+
+  /**
+   * Set the AI-generated title for a session.
+   * Pass undefined or empty string to clear the AI title.
+   */
+  async setAiTitle(
+    sessionId: string,
+    title: string | undefined,
+  ): Promise<void> {
+    const trimmedTitle = title?.trim();
+    this.updateSessionMetadata(sessionId, (metadata) => ({
+      ...metadata,
+      aiTitle: trimmedTitle || undefined,
     }));
     await this.save();
   }
@@ -261,6 +279,7 @@ export class SessionMetadataService {
     // Remove undefined values and check if entry should be deleted
     const cleaned: SessionMetadata = {};
     if (updated.customTitle) cleaned.customTitle = updated.customTitle;
+    if (updated.aiTitle) cleaned.aiTitle = updated.aiTitle;
     if (updated.isArchived) cleaned.isArchived = updated.isArchived;
     if (updated.isStarred) cleaned.isStarred = updated.isStarred;
     if (updated.model) cleaned.model = updated.model;

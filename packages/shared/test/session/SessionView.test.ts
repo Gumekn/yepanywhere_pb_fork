@@ -19,6 +19,7 @@ function createView(
     autoTitle: string | null;
     fullTitle: string | null;
     customTitle: string | undefined;
+    aiTitle: string | undefined;
     createdAt: string;
     updatedAt: string;
     messageCount: number;
@@ -52,6 +53,7 @@ function createView(
     overrides.hasUnread ?? false,
     overrides.contextUsage,
     "claude",
+    overrides.aiTitle,
   );
 }
 
@@ -101,6 +103,14 @@ describe("SessionView", () => {
       expect(view.displayTitle).toBe("Auto title");
     });
 
+    it("returns aiTitle when no customTitle", () => {
+      const view = createView({
+        autoTitle: "Auto title",
+        aiTitle: "AI title",
+      });
+      expect(view.displayTitle).toBe("AI title");
+    });
+
     it("returns 'Untitled' when no titles", () => {
       const view = createView({ autoTitle: null, fullTitle: null });
       expect(view.displayTitle).toBe("Untitled");
@@ -112,6 +122,27 @@ describe("SessionView", () => {
         customTitle: "Custom",
       });
       expect(view.displayTitle).toBe("Custom");
+    });
+
+    it("prefers customTitle over aiTitle", () => {
+      const view = createView({
+        autoTitle: "Auto",
+        aiTitle: "AI",
+        customTitle: "Custom",
+      });
+      expect(view.displayTitle).toBe("Custom");
+    });
+  });
+
+  describe("hasAiTitle", () => {
+    it("returns true when aiTitle is set", () => {
+      const view = createView({ aiTitle: "AI" });
+      expect(view.hasAiTitle).toBe(true);
+    });
+
+    it("returns false when aiTitle is undefined", () => {
+      const view = createView();
+      expect(view.hasAiTitle).toBe(false);
     });
   });
 
@@ -256,6 +287,7 @@ describe("SessionView", () => {
         title: "Auto title",
         fullTitle: "Full auto title",
         customTitle: "Custom name",
+        aiTitle: "AI name",
         createdAt: "2024-01-01T00:00:00Z",
         updatedAt: "2024-01-02T00:00:00Z",
         messageCount: 10,
@@ -277,6 +309,7 @@ describe("SessionView", () => {
       expect(view.autoTitle).toBe("Auto title");
       expect(view.fullTitle).toBe("Full auto title");
       expect(view.customTitle).toBe("Custom name");
+      expect(view.aiTitle).toBe("AI name");
       expect(view.displayTitle).toBe("Custom name");
       expect(view.isArchived).toBe(true);
       expect(view.isStarred).toBe(true);
@@ -317,12 +350,14 @@ describe("SessionView", () => {
       const view = SessionView.fromPartial({
         id: "session-123",
         title: "Auto",
+        aiTitle: "AI",
         customTitle: "Custom",
         isStarred: true,
       });
 
       expect(view.id).toBe("session-123");
       expect(view.autoTitle).toBe("Auto");
+      expect(view.aiTitle).toBe("AI");
       expect(view.customTitle).toBe("Custom");
       expect(view.displayTitle).toBe("Custom");
       expect(view.isStarred).toBe(true);
@@ -354,6 +389,20 @@ describe("getSessionDisplayTitle", () => {
 
   it("returns title when no customTitle", () => {
     expect(getSessionDisplayTitle({ title: "Auto" })).toBe("Auto");
+  });
+
+  it("returns aiTitle when no customTitle", () => {
+    expect(getSessionDisplayTitle({ aiTitle: "AI", title: "Auto" })).toBe("AI");
+  });
+
+  it("prefers customTitle over aiTitle", () => {
+    expect(
+      getSessionDisplayTitle({
+        customTitle: "Custom",
+        aiTitle: "AI",
+        title: "Auto",
+      }),
+    ).toBe("Custom");
   });
 
   it("returns 'Untitled' when no titles", () => {

@@ -82,11 +82,14 @@ export class PushNotifier {
           event.session.id,
           getSessionDisplayTitle({
             customTitle: event.session.customTitle,
+            aiTitle: event.session.aiTitle,
             title: event.session.title,
           }),
         );
       } else if (event.type === "session-updated") {
         this.cacheSessionTitle(event.sessionId, event.title);
+      } else if (event.type === "session-metadata-changed") {
+        this.cacheSessionTitle(event.sessionId, event.title ?? event.aiTitle);
       }
     });
   }

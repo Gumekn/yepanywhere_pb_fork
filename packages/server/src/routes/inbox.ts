@@ -133,6 +133,7 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       activity?: AgentActivity;
       hasUnread?: boolean;
       customTitle?: string;
+      aiTitle?: string;
     }> = [];
 
     const logger = getLogger();
@@ -217,6 +218,7 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
           activity,
           hasUnread,
           customTitle: metadata?.customTitle ?? session.customTitle,
+          aiTitle: metadata?.aiTitle ?? session.aiTitle,
         });
       }
     }
@@ -249,6 +251,7 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
         activity: item.activity,
         hasUnread,
         customTitle: metadata?.customTitle ?? item.session.customTitle,
+        aiTitle: metadata?.aiTitle ?? item.session.aiTitle,
       });
     }
 
@@ -269,6 +272,7 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       projectName: item.projectName,
       sessionTitle: getSessionDisplayTitle({
         customTitle: item.customTitle,
+        aiTitle: item.aiTitle,
         title: item.session.title,
       }),
       updatedAt: item.session.updatedAt,

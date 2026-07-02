@@ -604,6 +604,7 @@ async function startServer() {
     sharingService,
     deviceBridgeService,
     codexBridgeService,
+    sessionTitleGeneration: config.sessionTitleGeneration,
     modelInfoService,
     enabledProviders: config.enabledProviders,
     voiceInputEnabled: config.voiceInputEnabled,

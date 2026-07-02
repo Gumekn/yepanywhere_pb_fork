@@ -84,7 +84,12 @@ describe("Global Sessions Routes", () => {
   let unreadMap: Map<string, boolean>;
   let metadataMap: Map<
     string,
-    { customTitle?: string; isArchived?: boolean; isStarred?: boolean }
+    {
+      customTitle?: string;
+      aiTitle?: string;
+      isArchived?: boolean;
+      isStarred?: boolean;
+    }
   >;
   let externalSessions: Set<string>;
 
@@ -936,7 +941,7 @@ describe("Global Sessions Routes", () => {
       expect(result.sessions[0].hasUnread).toBe(true);
     });
 
-    it("enriches with metadata (customTitle, isArchived, isStarred)", async () => {
+    it("enriches with metadata (customTitle, aiTitle, isArchived, isStarred)", async () => {
       const project = createProject("proj1", "project", "/sessions/proj1");
       const session = createSession("sess1", "proj1", minutesAgo(5));
 
@@ -944,12 +949,14 @@ describe("Global Sessions Routes", () => {
       sessionsByDir.set("/sessions/proj1", [session]);
       metadataMap.set("sess1", {
         customTitle: "My Custom Title",
+        aiTitle: "AI Title",
         isStarred: true,
       });
 
       const result = await makeRequest();
 
       expect(result.sessions[0].customTitle).toBe("My Custom Title");
+      expect(result.sessions[0].aiTitle).toBe("AI Title");
       expect(result.sessions[0].isStarred).toBe(true);
     });
   });

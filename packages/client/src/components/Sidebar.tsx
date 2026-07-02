@@ -25,7 +25,7 @@ const RECENT_SESSIONS_INITIAL = 12; // Initial number of recent sessions to show
 const RECENT_SESSIONS_INCREMENT = 10; // How many more to show on each expand
 
 const getSessionListTitle = (session: GlobalSessionItem): string | null =>
-  session.customTitle ?? session.title ?? null;
+  session.customTitle ?? session.aiTitle ?? session.title ?? null;
 
 const sortSessionsByUpdatedAtDesc = (
   sessions: GlobalSessionItem[],
@@ -196,6 +196,7 @@ export function Sidebar({
       (event) => {
         if (
           event.title === undefined &&
+          event.aiTitle === undefined &&
           event.archived === undefined &&
           event.starred === undefined
         ) {

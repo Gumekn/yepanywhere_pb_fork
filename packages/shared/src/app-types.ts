@@ -426,6 +426,7 @@ export interface AppSessionSummary {
   hasUnread?: boolean;
   // Metadata fields
   customTitle?: string;
+  aiTitle?: string;
   isArchived?: boolean;
   isStarred?: boolean;
   contextUsage?: ContextUsage;
