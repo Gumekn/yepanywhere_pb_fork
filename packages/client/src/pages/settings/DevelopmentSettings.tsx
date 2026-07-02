@@ -4,6 +4,7 @@ import {
   type ApkBuildType,
   type DeploymentActionId,
   type DeploymentJob,
+  type DeploymentRestartTargets,
   type DeploymentStatusResponse,
   api,
 } from "../../api/client";
@@ -17,6 +18,11 @@ import { useVersion } from "../../hooks/useVersion";
 import { useI18n } from "../../i18n";
 
 const LAST_DEPLOY_JOB_KEY = "yepanywhere:lastDeployJobId";
+const DEFAULT_RESTART_TARGETS: Required<DeploymentRestartTargets> = {
+  server: true,
+  codexBridge: false,
+  claudeBridge: false,
+};
 
 function getErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -83,6 +89,7 @@ export function DevelopmentSettings() {
   const [apkInstall, setApkInstall] = useState(true);
   const [apkDeviceId, setApkDeviceId] = useState("");
   const [skipChecks, setSkipChecks] = useState(false);
+  const [restartTargets, setRestartTargets] = useState(DEFAULT_RESTART_TARGETS);
   const [downloadingApk, setDownloadingApk] = useState(false);
 
   const deploymentCapable =
@@ -150,7 +157,10 @@ export function DevelopmentSettings() {
     return () => window.clearInterval(interval);
   }, [deployJob?.status, refreshDeployment]);
 
-  const handleStartDeployment = async (action: DeploymentActionId) => {
+  const handleStartDeployment = async (
+    action: DeploymentActionId,
+    options?: { restartTargets?: DeploymentRestartTargets },
+  ) => {
     setStartingAction(action);
     setDeployError(null);
     try {
@@ -160,6 +170,7 @@ export function DevelopmentSettings() {
         install: apkInstall,
         deviceId: apkDeviceId || undefined,
         skipChecks,
+        restartTargets: options?.restartTargets,
       });
       setDeployJob(job);
       localStorage.setItem(LAST_DEPLOY_JOB_KEY, job.id);
@@ -191,6 +202,17 @@ export function DevelopmentSettings() {
   const runningBuildId = versionInfo?.build?.buildId?.slice(0, 12);
   const stagedBuildId = deployStatus?.stagedBuild?.buildId?.slice(0, 12);
   const latestApk = deployStatus?.apk.latest ?? null;
+  const hasSelectedRestartTarget =
+    restartTargets.server ||
+    restartTargets.codexBridge ||
+    restartTargets.claudeBridge;
+
+  const setRestartTarget = (
+    target: keyof Required<DeploymentRestartTargets>,
+    checked: boolean,
+  ) => {
+    setRestartTargets((current) => ({ ...current, [target]: checked }));
+  };
 
   return (
     <section className="settings-section">
@@ -262,39 +284,89 @@ export function DevelopmentSettings() {
             </div>
           </div>
 
-          <div className="settings-item">
-            <div className="settings-item-info">
-              <strong>{t("deploymentServerTitle")}</strong>
-              <p>{t("deploymentServerDescription")}</p>
+          <div className="settings-item settings-item-stacked">
+            <div className="settings-item-row">
+              <div className="settings-item-info">
+                <strong>{t("deploymentServerTitle")}</strong>
+                <p>{t("deploymentServerDescription")}</p>
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={skipChecks}
+                    onChange={(e) => setSkipChecks(e.target.checked)}
+                  />
+                  <span>{t("deploymentSkipChecks")}</span>
+                </label>
+              </div>
+              <div className="settings-item-actions">
+                <button
+                  type="button"
+                  className="settings-button"
+                  onClick={() => void handleStartDeployment("server")}
+                  disabled={!deployStatus?.available || deployRunning}
+                >
+                  {startingAction === "server"
+                    ? t("deploymentStarting")
+                    : t("deploymentRedeployServer")}
+                </button>
+              </div>
+            </div>
+            <div className="deployment-controls deployment-restart-targets">
               <label className="settings-checkbox-row">
                 <input
                   type="checkbox"
-                  checked={skipChecks}
-                  onChange={(e) => setSkipChecks(e.target.checked)}
+                  checked={restartTargets.server}
+                  onChange={(e) => setRestartTarget("server", e.target.checked)}
+                  disabled={deployRunning}
                 />
-                <span>{t("deploymentSkipChecks")}</span>
+                <span>{t("deploymentRestartTargetServer")}</span>
               </label>
-            </div>
-            <div className="settings-item-actions">
-              <button
-                type="button"
-                className="settings-button"
-                onClick={() => void handleStartDeployment("server")}
-                disabled={!deployStatus?.available || deployRunning}
-              >
-                {startingAction === "server"
-                  ? t("deploymentStarting")
-                  : t("deploymentRedeployServer")}
-              </button>
+              <label className="settings-checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={restartTargets.codexBridge}
+                  onChange={(e) =>
+                    setRestartTarget("codexBridge", e.target.checked)
+                  }
+                  disabled={deployRunning}
+                />
+                <span>{t("deploymentRestartTargetCodexBridge")}</span>
+              </label>
+              <label className="settings-checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={restartTargets.claudeBridge}
+                  onChange={(e) =>
+                    setRestartTarget("claudeBridge", e.target.checked)
+                  }
+                  disabled={deployRunning}
+                />
+                <span>{t("deploymentRestartTargetClaudeBridge")}</span>
+              </label>
               <button
                 type="button"
                 className="settings-button settings-button-secondary"
-                onClick={() => void handleStartDeployment("server-restart")}
-                disabled={!deployStatus?.available || deployRunning}
+                onClick={() =>
+                  void handleStartDeployment("services-restart", {
+                    restartTargets,
+                  })
+                }
+                disabled={
+                  !deployStatus?.available ||
+                  deployRunning ||
+                  !hasSelectedRestartTarget
+                }
               >
-                {t("deploymentRestartBundle")}
+                {startingAction === "services-restart"
+                  ? t("deploymentStarting")
+                  : t("deploymentRestartSelected")}
               </button>
             </div>
+            {!hasSelectedRestartTarget && (
+              <p className="settings-warning">
+                {t("deploymentRestartSelectTarget")}
+              </p>
+            )}
           </div>
 
           <div className="settings-item settings-item-stacked">

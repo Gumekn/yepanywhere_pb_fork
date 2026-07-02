@@ -416,6 +416,7 @@ export type DeploymentActionId =
   | "full"
   | "server"
   | "server-restart"
+  | "services-restart"
   | "server-build"
   | "apk"
   | "apk-build"
@@ -430,6 +431,7 @@ export interface DeploymentAction {
   supportsBuildType: boolean;
   supportsInstall: boolean;
   supportsSkipChecks: boolean;
+  supportsRestartTargets?: boolean;
 }
 
 export interface AdbDevice {
@@ -495,6 +497,13 @@ export interface StartDeploymentRequest {
   install?: boolean;
   deviceId?: string;
   skipChecks?: boolean;
+  restartTargets?: DeploymentRestartTargets;
+}
+
+export interface DeploymentRestartTargets {
+  server?: boolean;
+  codexBridge?: boolean;
+  claudeBridge?: boolean;
 }
 
 export interface GetVersionOptions {

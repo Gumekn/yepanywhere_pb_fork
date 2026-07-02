@@ -21,6 +21,7 @@ export type DeploymentActionId =
   | "full"
   | "server"
   | "server-restart"
+  | "services-restart"
   | "server-build"
   | "apk"
   | "apk-build"
@@ -35,6 +36,7 @@ export interface DeploymentAction {
   supportsBuildType: boolean;
   supportsInstall: boolean;
   supportsSkipChecks: boolean;
+  supportsRestartTargets?: boolean;
 }
 
 export interface AdbDevice {
@@ -104,6 +106,13 @@ export interface StartDeploymentRequest {
   install?: boolean;
   deviceId?: string;
   skipChecks?: boolean;
+  restartTargets?: DeploymentRestartTargets;
+}
+
+export interface DeploymentRestartTargets {
+  server?: boolean;
+  codexBridge?: boolean;
+  claudeBridge?: boolean;
 }
 
 export interface DeployRoutesOptions {
@@ -119,6 +128,7 @@ const DEPLOYMENT_ACTIONS: DeploymentAction[] = [
     supportsBuildType: false,
     supportsInstall: false,
     supportsSkipChecks: true,
+    supportsRestartTargets: true,
   },
   {
     id: "server-restart",
@@ -127,6 +137,16 @@ const DEPLOYMENT_ACTIONS: DeploymentAction[] = [
     supportsBuildType: false,
     supportsInstall: false,
     supportsSkipChecks: false,
+    supportsRestartTargets: true,
+  },
+  {
+    id: "services-restart",
+    args: [],
+    requiresDevice: false,
+    supportsBuildType: false,
+    supportsInstall: false,
+    supportsSkipChecks: false,
+    supportsRestartTargets: true,
   },
   {
     id: "server-build",
@@ -167,6 +187,7 @@ const DEPLOYMENT_ACTIONS: DeploymentAction[] = [
     supportsBuildType: true,
     supportsInstall: true,
     supportsSkipChecks: true,
+    supportsRestartTargets: true,
   },
 ];
 
@@ -235,11 +256,90 @@ function getAction(actionId: unknown): DeploymentAction {
   return action;
 }
 
-function buildDeployArgs(input: StartDeploymentRequest): {
+function parseRestartTargets(value: unknown): DeploymentRestartTargets {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("restartTargets must be an object.");
+  }
+
+  const input = value as Record<string, unknown>;
+  const targets: DeploymentRestartTargets = {};
+  if ("server" in input) targets.server = input.server === true;
+  if ("codexBridge" in input) {
+    targets.codexBridge = input.codexBridge === true;
+  }
+  if ("claudeBridge" in input) {
+    targets.claudeBridge = input.claudeBridge === true;
+  }
+  return targets;
+}
+
+function hasRestartTargets(targets: DeploymentRestartTargets): boolean {
+  return (
+    targets.server === true ||
+    targets.codexBridge === true ||
+    targets.claudeBridge === true
+  );
+}
+
+function buildServicesRestartArgs(targets: DeploymentRestartTargets): string[] {
+  if (!hasRestartTargets(targets)) {
+    throw new Error("Select at least one service to restart.");
+  }
+
+  const args = ["--restart-only"];
+  if (targets.server) {
+    args.push("--server-only");
+  } else {
+    args.push("--no-server", "--no-apk");
+  }
+  if (targets.codexBridge) {
+    args.push("--restart-codex-bridge");
+  }
+  if (targets.claudeBridge) {
+    args.push("--restart-claude-bridge");
+  }
+  return args;
+}
+
+function appendOptionalRestartTargetArgs(
+  action: DeploymentAction,
+  args: string[],
+  targets: DeploymentRestartTargets,
+): void {
+  if (!hasRestartTargets(targets)) return;
+  if (!action.supportsRestartTargets) {
+    throw new Error(
+      "Restart target options are not supported for this action.",
+    );
+  }
+
+  if (targets.server === false) {
+    throw new Error(
+      "Use the services-restart action to restart sidecars without the web/API server.",
+    );
+  }
+  if (targets.codexBridge) {
+    args.push("--restart-codex-bridge");
+  }
+  if (targets.claudeBridge) {
+    args.push("--restart-claude-bridge");
+  }
+}
+
+export function buildDeployArgs(input: StartDeploymentRequest): {
   action: DeploymentAction;
   args: string[];
 } {
   const action = getAction(input.action);
+  const restartTargets = parseRestartTargets(input.restartTargets);
+  if (action.id === "services-restart") {
+    return {
+      action,
+      args: buildServicesRestartArgs(restartTargets),
+    };
+  }
+
   const args = [...action.args];
   const buildType = input.buildType === "debug" ? "debug" : "release";
   const deviceId = validateDeviceId(input.deviceId);
@@ -259,6 +359,8 @@ function buildDeployArgs(input: StartDeploymentRequest): {
   if (deviceId) {
     args.push("--device", deviceId);
   }
+
+  appendOptionalRestartTargetArgs(action, args, restartTargets);
 
   return { action, args };
 }

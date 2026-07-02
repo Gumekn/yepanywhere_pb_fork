@@ -5339,6 +5339,14 @@ a.sidebar-nav-item {
   font-size: var(--font-size-sm);
 }
 
+.deployment-restart-targets {
+  align-items: center;
+}
+
+.deployment-restart-targets .settings-checkbox-row {
+  margin-top: 0;
+}
+
 .deployment-log {
   width: 100%;
   max-height: 260px;

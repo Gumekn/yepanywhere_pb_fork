@@ -89,7 +89,7 @@ export function AboutSettings() {
     setDeploymentError(null);
     try {
       if (deploymentCapable) {
-        const { job } = await api.startDeployment({ action: "server" });
+        const { job } = await api.startDeployment({ action: "server-restart" });
         setRestartJobId(job.id);
         setDeploymentStatus((current) =>
           current ? { ...current, currentJob: job } : current,
