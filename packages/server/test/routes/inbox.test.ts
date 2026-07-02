@@ -1,5 +1,6 @@
 import type { UrlProjectId } from "@yep-anywhere/shared";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { CodexBridgeController } from "../../src/codex-bridge/types.js";
 import type { SessionIndexService } from "../../src/indexes/index.js";
 import type { NotificationService } from "../../src/notifications/index.js";
 import type { CodexSessionScanner } from "../../src/projects/codex-scanner.js";
@@ -224,6 +225,44 @@ describe("Inbox Routes", () => {
       expect(result.active).toHaveLength(1);
       expect(result.active[0].sessionId).toBe("sess1");
       expect(result.active[0].activity).toBe("in-turn");
+    });
+
+    it("does not treat inactive codex bridge session views as active", async () => {
+      const project = createProject("proj1", "myproject", "/sessions/proj1");
+      const session = createSession("bridge-sess", "proj1", hoursAgo(2), {
+        provider: "codex",
+      });
+      const codexBridgeService = {
+        listSessionViews: vi.fn(async () => [
+          {
+            session: {
+              ...session,
+              ownership: { owner: "external" },
+            },
+            projectName: project.name,
+            activity: "in-turn" as const,
+          },
+        ]),
+        isSessionActive: vi.fn(async () => false),
+      } as unknown as CodexBridgeController;
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+
+      const result = await makeRequest({
+        scanner: mockScanner,
+        readerFactory: mockReaderFactory,
+        supervisor: mockSupervisor,
+        notificationService: mockNotificationService,
+        sessionIndexService: mockSessionIndexService,
+        codexBridgeService,
+      });
+
+      expect(result.active).toHaveLength(0);
+      expect(result.needsAttention).toHaveLength(0);
+      expect(codexBridgeService.isSessionActive).toHaveBeenCalledWith(
+        "bridge-sess",
+      );
     });
 
     it("categorizes session updated in last hour into recentActivity", async () => {

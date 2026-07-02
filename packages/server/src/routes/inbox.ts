@@ -11,6 +11,7 @@
 
 import { getSessionDisplayTitle } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
 import type { SessionIndexService } from "../indexes/index.js";
 import { getLogger } from "../logging/logger.js";
@@ -146,6 +147,18 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
     const bridgedSessionById = new Map(
       bridgeSessionViews.map((item) => [item.session.id, item]),
     );
+    const activeBridgeSessionIds = new Set<string>();
+    await Promise.all(
+      bridgeSessionViews.map(async (item) => {
+        if (!isLiveBridgeSessionView(item)) return;
+        const isActive =
+          (await deps.codexBridgeService?.isSessionActive(item.session.id)) ??
+          false;
+        if (isActive) {
+          activeBridgeSessionIds.add(item.session.id);
+        }
+      }),
+    );
 
     // Fetch sessions from all projects in parallel
     const projectSessionResults = await Promise.all(
@@ -201,7 +214,10 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
           }
         } else {
           const bridgedSession = bridgedSessionById.get(session.id) ?? null;
-          if (bridgedSession) {
+          if (
+            bridgedSession &&
+            activeBridgeSessionIds.has(bridgedSession.session.id)
+          ) {
             pendingInputType = bridgedSession.pendingInputType;
             activity = bridgedSession.activity;
           }
@@ -247,8 +263,12 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       allSessions.push({
         session: item.session,
         projectName: item.projectName,
-        pendingInputType: item.pendingInputType,
-        activity: item.activity,
+        pendingInputType: activeBridgeSessionIds.has(item.session.id)
+          ? item.pendingInputType
+          : undefined,
+        activity: activeBridgeSessionIds.has(item.session.id)
+          ? item.activity
+          : undefined,
         hasUnread,
         customTitle: metadata?.customTitle ?? item.session.customTitle,
         aiTitle: metadata?.aiTitle ?? item.session.aiTitle,

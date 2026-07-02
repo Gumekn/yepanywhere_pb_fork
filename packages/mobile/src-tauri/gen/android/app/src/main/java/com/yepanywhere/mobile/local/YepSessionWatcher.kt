@@ -138,6 +138,8 @@ class YepSessionWatcher(private val context: Context) {
       YepNativeNotifier.showRunning(appContext, session)
     }
 
+    YepNativeNotifier.cancelStaleRunning(appContext, visibleActiveIds)
+
     cancelMissing(notifiedNeedsAttention, visibleNeedsAttentionIds) { sessionId ->
       YepNativeNotifier.cancelSession(appContext, sessionId)
     }

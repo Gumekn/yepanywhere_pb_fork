@@ -22,6 +22,7 @@ object YepNativeNotifier {
   private const val TAG = "YepNativePush"
   private const val NOTIFICATION_ID = 1001
   private const val RUNNING_NOTIFICATION_ID = 1002
+  private const val RUNNING_TAG_PREFIX = "session-running-"
 
   data class SessionNotification(
     val sessionId: String,
@@ -101,7 +102,7 @@ object YepNativeNotifier {
   fun showRunning(context: Context, session: SessionNotification) {
     showNotification(
       context = context,
-      tag = "session-running-${session.sessionId}",
+      tag = "$RUNNING_TAG_PREFIX${session.sessionId}",
       notificationId = RUNNING_NOTIFICATION_ID,
       channelId = RUNNING_CHANNEL_ID,
       title = displaySessionTitle(session),
@@ -190,7 +191,25 @@ object YepNativeNotifier {
   fun cancelRunning(context: Context, sessionId: String?) {
     if (sessionId.isNullOrBlank()) return
     NotificationManagerCompat.from(context)
-      .cancel("session-running-$sessionId", RUNNING_NOTIFICATION_ID)
+      .cancel("$RUNNING_TAG_PREFIX$sessionId", RUNNING_NOTIFICATION_ID)
+  }
+
+  fun cancelStaleRunning(context: Context, visibleRunningSessionIds: Set<String>) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+
+    val manager = context.getSystemService(NotificationManager::class.java) ?: return
+    for (notification in manager.activeNotifications) {
+      if (notification.id != RUNNING_NOTIFICATION_ID) continue
+
+      val tag = notification.tag ?: continue
+      if (!tag.startsWith(RUNNING_TAG_PREFIX)) continue
+
+      val sessionId = tag.removePrefix(RUNNING_TAG_PREFIX)
+      if (visibleRunningSessionIds.contains(sessionId)) continue
+
+      NotificationManagerCompat.from(context).cancel(tag, RUNNING_NOTIFICATION_ID)
+      Log.i(TAG, "cancelStaleRunning: sessionId=$sessionId")
+    }
   }
 
   @SuppressLint("MissingPermission")
