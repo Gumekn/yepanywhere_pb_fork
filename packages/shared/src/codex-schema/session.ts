@@ -79,12 +79,20 @@ export const CodexInputImageContentSchema = z
   })
   .passthrough();
 
+export const CodexMessagePhaseSchema = z
+  .enum(["commentary", "final_answer"])
+  .nullable()
+  .optional();
+
+export type CodexMessagePhase = z.infer<typeof CodexMessagePhaseSchema>;
+
 /**
  * User or assistant message payload.
  */
 export const CodexMessagePayloadSchema = z.object({
   type: z.literal("message"),
   role: z.enum(["user", "assistant", "developer"]),
+  phase: CodexMessagePhaseSchema,
   content: z.array(
     z.union([
       CodexInputTextContentSchema,

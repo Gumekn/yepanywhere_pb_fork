@@ -227,6 +227,8 @@ interface ThreadRollbackResponse {
   thread: ThreadResumeResponse["thread"];
 }
 
+type CodexMessagePhase = "commentary" | "final_answer";
+
 async function terminateChildProcess(
   child: ChildProcess | null | undefined,
   graceMs = APP_SERVER_SHUTDOWN_GRACE_MS,
@@ -274,7 +276,12 @@ interface NormalizedFileChange {
 
 type NormalizedThreadItem =
   | { id: string; type: "reasoning"; text: string }
-  | { id: string; type: "agent_message"; text: string }
+  | {
+      id: string;
+      type: "agent_message";
+      text: string;
+      phase?: CodexMessagePhase;
+    }
   | {
       id: string;
       type: "command_execution";
@@ -1842,7 +1849,14 @@ export class CodexProvider implements AgentProvider {
       case "agent_message":
       case "plan": {
         const text = this.getOptionalString(itemRecord.text) ?? "";
-        return { id, type: "agent_message", text };
+        return {
+          id,
+          type: "agent_message",
+          text,
+          ...(normalizedType === "agent_message"
+            ? { phase: this.getCodexMessagePhase(itemRecord.phase) }
+            : {}),
+        };
       }
 
       case "command_execution": {
@@ -2220,6 +2234,7 @@ export class CodexProvider implements AgentProvider {
             type: "assistant",
             session_id: sessionId,
             uuid,
+            ...(item.phase ? { codexMessagePhase: item.phase } : {}),
             message: {
               role: "assistant",
               content: item.text,
@@ -2231,7 +2246,7 @@ export class CodexProvider implements AgentProvider {
           eventKind: "agent_message",
           turnId,
           itemId: item.id,
-          phase: isComplete ? "completed" : "started",
+          phase: item.phase ?? (isComplete ? "completed" : "started"),
           sourceEvent,
         });
         return [message];
@@ -2804,6 +2819,12 @@ export class CodexProvider implements AgentProvider {
 
   private getOptionalString(value: unknown): string | null {
     return typeof value === "string" ? value : null;
+  }
+
+  private getCodexMessagePhase(value: unknown): CodexMessagePhase | undefined {
+    return value === "commentary" || value === "final_answer"
+      ? value
+      : undefined;
   }
 
   private getOptionalNumber(value: unknown): number | null {

@@ -7,6 +7,7 @@ import type {
   CodexFunctionCallPayload,
   CodexImageGenerationPayload,
   CodexMessagePayload,
+  CodexMessagePhase,
   CodexReasoningPayload,
   CodexResponseItemEntry,
   CodexSessionEntry,
@@ -835,6 +836,11 @@ function convertCodexMessagePayload(
   timestamp: string,
   externalToolCalls: PendingExternalCodexToolCall[],
 ): Message | null {
+  const codexMessagePhase =
+    payload.role === "assistant"
+      ? normalizeCodexMessagePhase(payload.phase)
+      : undefined;
+
   if (payload.role === "assistant") {
     const externalToolMessage = convertExternalAgentToolMarkerPayload(
       payload,
@@ -879,6 +885,7 @@ function convertCodexMessagePayload(
     return {
       uuid,
       type: payload.role,
+      ...(codexMessagePhase ? { codexMessagePhase } : {}),
       message: {
         role: payload.role,
         content: [],
@@ -890,12 +897,19 @@ function convertCodexMessagePayload(
   return {
     uuid,
     type: payload.role,
+    ...(codexMessagePhase ? { codexMessagePhase } : {}),
     message: {
       role: payload.role,
       content,
     },
     timestamp,
   };
+}
+
+function normalizeCodexMessagePhase(
+  phase: CodexMessagePhase,
+): "commentary" | "final_answer" | undefined {
+  return phase === "commentary" || phase === "final_answer" ? phase : undefined;
 }
 
 function convertCodexReasoningPayload(

@@ -248,6 +248,7 @@ export type {
   // Session file entry types
   CodexSessionMetaPayload,
   CodexSessionMetaEntry,
+  CodexMessagePhase,
   CodexMessagePayload,
   CodexReasoningPayload,
   CodexFunctionCallPayload,

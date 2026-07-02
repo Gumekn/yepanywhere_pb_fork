@@ -149,6 +149,8 @@ export interface Message {
     siblingCount: number;
     alternatives: CodexBranchOption[];
   };
+  /** Codex app-server assistant message phase, when provided by Codex CLI. */
+  codexMessagePhase?: "commentary" | "final_answer";
   /** Allow any additional fields from SDK/server */
   [key: string]: unknown;
 }

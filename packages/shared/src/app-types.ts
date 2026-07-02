@@ -111,6 +111,12 @@ export interface AppMessageExtensions {
   codexBranch?: SessionBranchMetadata;
 
   /**
+   * Codex app-server phase for assistant text, when available.
+   * Values map to Codex protocol MessagePhase: "commentary" or "final_answer".
+   */
+  codexMessagePhase?: "commentary" | "final_answer";
+
+  /**
    * Allow any additional fields from JSONL.
    * This makes the type compatible with pass-through of unknown fields.
    */

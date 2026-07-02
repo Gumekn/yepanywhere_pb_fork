@@ -17,6 +17,7 @@ export type {
 export type {
   CodexSessionMetaPayload,
   CodexSessionMetaEntry,
+  CodexMessagePhase,
   CodexMessagePayload,
   CodexReasoningPayload,
   CodexFunctionCallPayload,

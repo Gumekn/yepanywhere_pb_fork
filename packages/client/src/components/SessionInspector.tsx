@@ -27,6 +27,7 @@ type InspectorPresentation = "sidebar" | "drawer";
 type InspectorTab = "questions" | "files" | "checks" | "git";
 type FileActivityKind = "modified" | "read" | "searched" | "other";
 type CheckStatus = "passed" | "failed" | "running" | "pending";
+type CodexMessagePhase = "commentary" | "final_answer";
 type TFunction = ReturnType<typeof useI18n>["t"];
 
 interface SessionInspectorProps {
@@ -81,7 +82,12 @@ interface PlanProgress {
   note?: string;
 }
 
-const TAB_KEYS: InspectorTab[] = ["questions", "files", "checks", "git"];
+interface CodexChannelSummary {
+  phase: CodexMessagePhase;
+  count: number;
+}
+
+const BASE_TAB_KEYS: InspectorTab[] = ["questions", "files", "checks", "git"];
 
 const MUTATING_FILE_TOOLS = new Set([
   "Edit",
@@ -122,6 +128,7 @@ export function SessionInspector({
     loading: gitLoading,
     error: gitError,
   } = useGitStatus(projectId);
+  const isCodexProvider = provider === "codex" || provider === "codex-oss";
 
   const renderItems = useMemo(
     () =>
@@ -144,6 +151,10 @@ export function SessionInspector({
   const planProgress = useMemo(
     () => buildPlanProgress(renderItems, t),
     [renderItems, t],
+  );
+  const codexChannelSummaries = useMemo(
+    () => (isCodexProvider ? buildCodexChannelSummaries(messages) : []),
+    [isCodexProvider, messages],
   );
 
   const handleSelect = (messageId: string) => {
@@ -210,6 +221,30 @@ export function SessionInspector({
             />
           </div>
         )}
+        {codexChannelSummaries.length > 0 && (
+          <div
+            className="session-inspector-channel-summary"
+            aria-label={t("sessionInspectorChannels")}
+          >
+            {codexChannelSummaries.map((item) => (
+              <span
+                key={item.phase}
+                className="session-inspector-channel-summary-item"
+              >
+                <span
+                  className={`session-inspector-channel-dot phase-${item.phase}`}
+                  aria-hidden="true"
+                />
+                <span>{getCodexChannelLabel(t, item.phase)}</span>
+                <span className="session-inspector-row-meta">
+                  {t("sessionInspectorChannelMessageCount", {
+                    count: item.count,
+                  })}
+                </span>
+              </span>
+            ))}
+          </div>
+        )}
         <div className="session-inspector-session-id">
           <span className="session-inspector-session-id-label">
             {t("sessionInspectorSessionId")}
@@ -244,7 +279,7 @@ export function SessionInspector({
 
       {presentation === "drawer" && (
         <div className="session-inspector-tabs" role="tablist">
-          {TAB_KEYS.map((tab) => (
+          {BASE_TAB_KEYS.map((tab) => (
             <button
               key={tab}
               type="button"
@@ -665,6 +700,46 @@ function buildQuestionItems(items: RenderItem[]): QuestionItem[] {
     }));
 }
 
+function buildCodexChannelSummaries(
+  messages: Message[],
+): CodexChannelSummary[] {
+  const summaries = new Map<CodexMessagePhase, CodexChannelSummary>();
+
+  for (const message of messages) {
+    const phase = getCodexMessagePhase(message.codexMessagePhase);
+    if (!phase || message.type !== "assistant") {
+      continue;
+    }
+
+    const content =
+      (message.message as { content?: string | ContentBlock[] } | undefined)
+        ?.content ?? message.content;
+    if (content === undefined) {
+      continue;
+    }
+
+    const text = contentToText(content).replace(/\s+/g, " ").trim();
+    if (!text) {
+      continue;
+    }
+
+    const current = summaries.get(phase);
+    summaries.set(phase, {
+      phase,
+      count: (current?.count ?? 0) + 1,
+    });
+  }
+
+  return (["commentary", "final_answer"] as const).flatMap((phase) => {
+    const summary = summaries.get(phase);
+    return summary ? [summary] : [];
+  });
+}
+
+function getCodexMessagePhase(value: unknown): CodexMessagePhase | null {
+  return value === "commentary" || value === "final_answer" ? value : null;
+}
+
 function buildFileActivities(items: RenderItem[]): FileActivity[] {
   const grouped = new Map<string, FileActivity>();
 
@@ -860,6 +935,15 @@ function getTabLabel(t: TFunction, tab: InspectorTab): string {
       return t("sessionInspectorChecks");
     case "git":
       return t("sessionInspectorGit");
+  }
+}
+
+function getCodexChannelLabel(t: TFunction, phase: CodexMessagePhase): string {
+  switch (phase) {
+    case "commentary":
+      return t("sessionInspectorCommentary");
+    case "final_answer":
+      return t("sessionInspectorFinalAnswer");
   }
 }
 

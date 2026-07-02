@@ -89,6 +89,7 @@ function codexTurnAbortedEvent(second: number): CodexSessionEntry {
 function codexAssistantMessage(
   text: string,
   second: number,
+  phase?: "commentary" | "final_answer",
 ): CodexSessionEntry {
   return {
     type: "response_item",
@@ -96,6 +97,7 @@ function codexAssistantMessage(
     payload: {
       type: "message",
       role: "assistant",
+      ...(phase ? { phase } : {}),
       content: [{ type: "output_text", text }],
     },
   };
@@ -198,6 +200,25 @@ describe("Codex Normalization", () => {
     expect(Array.isArray(content1) ? content1[0] : content1).toEqual({
       type: "text",
       text: "How are you?",
+    });
+  });
+
+  it("preserves Codex assistant message phase metadata", () => {
+    const entries: CodexSessionEntry[] = [
+      codexUserMessage("Do the thing", 1),
+      codexAssistantMessage("I am checking the repo.", 2, "commentary"),
+      codexAssistantMessage("Done.", 3, "final_answer"),
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+
+    expect(result.messages[1]).toMatchObject({
+      type: "assistant",
+      codexMessagePhase: "commentary",
+    });
+    expect(result.messages[2]).toMatchObject({
+      type: "assistant",
+      codexMessagePhase: "final_answer",
     });
   });
 
