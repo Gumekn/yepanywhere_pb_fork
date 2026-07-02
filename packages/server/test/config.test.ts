@@ -198,4 +198,29 @@ describe("loadConfig codex paths", () => {
     expect(config.claudeBridgeControlUrl).toBe("http://localhost:4621");
     expect(config.claudeBridgeServerUrl).toBe("http://127.0.0.1:8022/yep");
   });
+
+  it("defaults session title submodule for ohmyrouter", async () => {
+    vi.stubEnv("SESSION_TITLE_LLM_API_KEY", "test-key");
+    vi.stubEnv("SESSION_TITLE_LLM_API_BASE", "https://api.ohmyrouter.com");
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.sessionTitleGeneration.enabled).toBe(true);
+    expect(config.sessionTitleGeneration.subModule).toBe(
+      "claude-code-internal",
+    );
+    expect(config.sessionTitleGeneration.model).toBe("deepseek-v4-flash");
+  });
+
+  it("allows session title submodule override", async () => {
+    vi.stubEnv("SESSION_TITLE_LLM_API_KEY", "test-key");
+    vi.stubEnv("SESSION_TITLE_LLM_API_BASE", "https://api.example.com");
+    vi.stubEnv("SESSION_TITLE_SUB_MODULE", "custom-submodule");
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.sessionTitleGeneration.subModule).toBe("custom-submodule");
+  });
 });

@@ -85,6 +85,12 @@ describe("SessionTitleService", () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
       "https://api.example.com/v1/chat/completions",
     );
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).not.toHaveProperty(
+      "X-Sub-Module",
+    );
+    expect(
+      JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)).max_tokens,
+    ).toBe(100000);
     expect(metadataService.getMetadata("session-1")?.aiTitle).toBe(
       "重构重复逻辑",
     );
@@ -95,6 +101,167 @@ describe("SessionTitleService", () => {
         aiTitle: "重构重复逻辑",
       }),
     );
+  });
+
+  it("sends a configured submodule header", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"重构重复逻辑"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      subModule: "claude-code-internal",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () => createSession(),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toHaveProperty(
+      "X-Sub-Module",
+      "claude-code-internal",
+    );
+  });
+
+  it("uses the first real user message instead of the summary title", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"真实用户问题标题"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          title: "Stale summary title",
+          fullTitle: "Stale full summary title",
+          messages: [
+            {
+              type: "user",
+              message: {
+                role: "user",
+                content: "Actual first user prompt",
+              },
+            },
+            {
+              type: "assistant",
+              message: {
+                role: "assistant",
+                content: "Actual assistant response",
+              },
+            },
+          ],
+        }),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const prompt = body.messages[1].content as string;
+    expect(prompt).toContain("Actual first user prompt");
+    expect(prompt).not.toContain("Stale full summary title");
+  });
+
+  it("waits for Codex final answer instead of titling from commentary", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"title":"最终回答标题"}' } }],
+        }),
+        { status: 200 },
+      );
+    });
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          provider: "codex",
+          messages: [
+            {
+              type: "user",
+              message: { role: "user", content: "Move questions to backend" },
+            },
+            {
+              type: "assistant",
+              codexMessagePhase: "commentary",
+              message: {
+                role: "assistant",
+                content: "I will inspect the code first.",
+              },
+            },
+            {
+              type: "assistant",
+              codexMessagePhase: "final_answer",
+              message: {
+                role: "assistant",
+                content:
+                  "Implemented backend-owned session questions and updated the inspector.",
+              },
+            },
+          ],
+        }),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const prompt = body.messages[1].content as string;
+    expect(prompt).toContain(
+      "Implemented backend-owned session questions and updated the inspector.",
+    );
+    expect(prompt).not.toContain("I will inspect the code first.");
+  });
+
+  it("does not generate a Codex title before the final answer is present", async () => {
+    const fetchMock = vi.fn();
+    const service = new SessionTitleService({
+      eventBus,
+      metadataService,
+      apiKey: "test-key",
+      minRetryIntervalMs: 0,
+      fetchImpl: fetchMock,
+      loadSession: async () =>
+        createSession({
+          provider: "codex",
+          messages: [
+            {
+              type: "user",
+              message: { role: "user", content: "Move questions to backend" },
+            },
+            {
+              type: "assistant",
+              codexMessagePhase: "commentary",
+              message: {
+                role: "assistant",
+                content: "I will inspect the code first.",
+              },
+            },
+          ],
+        }),
+    });
+
+    await service.generateForSession("session-1", "project-1" as UrlProjectId);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(metadataService.getMetadata("session-1")).toBeUndefined();
   });
 
   it("does not overwrite a custom title", async () => {

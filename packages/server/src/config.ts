@@ -182,6 +182,8 @@ export interface SessionTitleGenerationConfig {
   apiKey?: string;
   /** Model used to produce compact session titles. */
   model: string;
+  /** Optional gateway submodule header for internal OpenAI-compatible routers. */
+  subModule?: string;
   /** Request timeout in milliseconds. */
   requestTimeoutMs: number;
 }
@@ -273,21 +275,26 @@ export function loadConfig(): Config {
       : [];
   const sessionTitleApiKey =
     process.env.SESSION_TITLE_LLM_API_KEY ?? process.env.LLM_API_KEY;
+  const sessionTitleApiBase =
+    process.env.SESSION_TITLE_LLM_API_BASE ??
+    process.env.LLM_API_BASE ??
+    "https://api.ohmyrouter.com";
   const sessionTitleGenerationRequested = parseBooleanOrDefault(
     process.env.SESSION_TITLE_GENERATION,
     Boolean(sessionTitleApiKey),
   );
   const sessionTitleGeneration: SessionTitleGenerationConfig = {
     enabled: sessionTitleGenerationRequested && Boolean(sessionTitleApiKey),
-    apiBase:
-      process.env.SESSION_TITLE_LLM_API_BASE ??
-      process.env.LLM_API_BASE ??
-      "https://api.ohmyrouter.com",
+    apiBase: sessionTitleApiBase,
     apiKey: sessionTitleApiKey,
-    model: process.env.SESSION_TITLE_MODEL ?? "deepseek-v4-pro",
+    model: process.env.SESSION_TITLE_MODEL ?? "deepseek-v4-flash",
+    subModule:
+      process.env.SESSION_TITLE_SUB_MODULE ??
+      process.env.LLM_SUB_MODULE ??
+      getDefaultSessionTitleSubModule(sessionTitleApiBase),
     requestTimeoutMs: Math.max(
       1000,
-      parseIntOrDefault(process.env.SESSION_TITLE_TIMEOUT_MS, 20000),
+      parseIntOrDefault(process.env.SESSION_TITLE_TIMEOUT_MS, 120000),
     ),
   };
 
@@ -443,6 +450,18 @@ export function loadConfig(): Config {
     // `${basePath}/api/...`. Empty string keeps the legacy "no prefix" mode.
     basePath: normalizeBasePath(process.env.BASE_PATH),
   };
+}
+
+function getDefaultSessionTitleSubModule(apiBase: string): string | undefined {
+  try {
+    const hostname = new URL(apiBase).hostname;
+    if (hostname === "api.ohmyrouter.com") {
+      return "claude-code-internal";
+    }
+  } catch {
+    // Invalid API bases are handled by fetch at request time.
+  }
+  return undefined;
 }
 
 function normalizeBasePath(raw: string | undefined): string {

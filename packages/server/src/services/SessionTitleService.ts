@@ -4,14 +4,14 @@ import type { SessionMetadataService } from "../metadata/SessionMetadataService.
 import type { Message, Session } from "../supervisor/types.js";
 import type { BusEvent, EventBus } from "../watcher/EventBus.js";
 
-const DEFAULT_MODEL = "deepseek-v4-pro";
+const DEFAULT_MODEL = "deepseek-v4-flash";
 const DEFAULT_API_BASE = "https://api.ohmyrouter.com";
-const DEFAULT_REQUEST_TIMEOUT_MS = 20000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_SCHEDULE_DELAY_MS = 1500;
 const DEFAULT_MIN_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_MESSAGE_COUNT_FOR_TITLE = 2;
 const MAX_CONTEXT_CHARS = 2400;
-const MAX_TITLE_CHARS = 36;
+const MAX_TITLE_CHARS = 30;
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -26,6 +26,7 @@ export interface SessionTitleServiceOptions {
   apiBase?: string;
   apiKey?: string;
   model?: string;
+  subModule?: string;
   requestTimeoutMs?: number;
   scheduleDelayMs?: number;
   minRetryIntervalMs?: number;
@@ -40,6 +41,7 @@ export class SessionTitleService {
   private readonly apiBase: string;
   private readonly apiKey: string | undefined;
   private readonly model: string;
+  private readonly subModule: string | undefined;
   private readonly requestTimeoutMs: number;
   private readonly scheduleDelayMs: number;
   private readonly minRetryIntervalMs: number;
@@ -56,6 +58,7 @@ export class SessionTitleService {
     this.apiBase = options.apiBase ?? DEFAULT_API_BASE;
     this.apiKey = options.apiKey;
     this.model = options.model ?? DEFAULT_MODEL;
+    this.subModule = options.subModule?.trim() || undefined;
     this.requestTimeoutMs =
       options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.scheduleDelayMs = options.scheduleDelayMs ?? DEFAULT_SCHEDULE_DELAY_MS;
@@ -118,7 +121,7 @@ export class SessionTitleService {
       }
 
       const firstUserMessage =
-        session.fullTitle ?? session.title ?? extractFirstUserText(session);
+        extractFirstUserText(session) ?? session.fullTitle ?? session.title;
       const firstAssistantMessage = extractFirstAssistantText(session);
       if (!firstUserMessage?.trim() || !firstAssistantMessage?.trim()) return;
 
@@ -191,22 +194,26 @@ export class SessionTitleService {
   }): Promise<string | null> {
     if (!this.apiKey) return null;
 
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${this.apiKey}`,
+    };
+    if (this.subModule) {
+      headers["X-Sub-Module"] = this.subModule;
+    }
+
     const response = await this.fetchImpl(getChatCompletionsUrl(this.apiBase), {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-        "X-Sub-Module": "yepanywhere-session-title",
-      },
+      headers,
       body: JSON.stringify({
         model: this.model,
         temperature: 0.2,
-        max_tokens: 80,
+        max_tokens: 100000,
         messages: [
           {
             role: "system",
             content:
-              'You generate concise chat session titles. Output only JSON: {"title":"..."}. The title should be 4-12 Chinese characters/words or at most 8 English words. No quotes outside JSON, no punctuation, no explanation.',
+              'You generate precise chat session titles. Output only JSON: {"title":"..."}. For Chinese, prefer 15-30 characters; for English, prefer 6-12 words. Preserve key technical terms. No quotes outside JSON, no punctuation, no explanation.',
           },
           {
             role: "user",
@@ -299,10 +306,18 @@ function extractFirstAssistantText(session: Session): string | null {
       continue;
     }
     if (!seenUser || role !== "assistant") continue;
+    if (isAssistantProgressMessage(message)) continue;
     const text = extractMessageText(message);
     if (text) return text;
   }
   return null;
+}
+
+function isAssistantProgressMessage(message: Message): boolean {
+  return (
+    (message as { codexMessagePhase?: unknown }).codexMessagePhase ===
+    "commentary"
+  );
 }
 
 function getMessageRole(message: Message): string | undefined {

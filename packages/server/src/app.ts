@@ -551,6 +551,7 @@ export function createApp(options: AppOptions): AppResult {
       {
         model: options.sessionTitleGeneration.model,
         apiBase: options.sessionTitleGeneration.apiBase,
+        subModule: options.sessionTitleGeneration.subModule,
       },
       "[SessionTitleService] Enabled",
     );

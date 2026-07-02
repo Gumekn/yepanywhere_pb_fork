@@ -67,6 +67,15 @@ Environment overrides:
   YEP_FCM_SERVICE_ACCOUNT_JSON Raw Firebase service account JSON for Android native push
   GOOGLE_APPLICATION_CREDENTIALS
                                Fallback Firebase service account JSON path
+  SESSION_TITLE_LLM_API_KEY    OpenAI-compatible API key for AI session titles
+  LLM_API_KEY                  Fallback API key for AI session titles
+  SESSION_TITLE_LLM_API_BASE   OpenAI-compatible API base for AI session titles
+  LLM_API_BASE                 Fallback API base for AI session titles
+  SESSION_TITLE_SUB_MODULE     X-Sub-Module header for AI session titles
+  LLM_SUB_MODULE               Fallback X-Sub-Module header for AI session titles
+  SESSION_TITLE_MODEL          Model for AI session titles (default: deepseek-v4-flash)
+  SESSION_TITLE_GENERATION     Set false to disable AI session titles
+  SESSION_TITLE_TIMEOUT_MS     Request timeout for AI session title generation
 EOF
 }
 
@@ -147,6 +156,9 @@ if [[ -n "$FCM_SERVICE_ACCOUNT_FILE" && ! -f "$FCM_SERVICE_ACCOUNT_FILE" ]]; the
   err "FCM service account file does not exist: $FCM_SERVICE_ACCOUNT_FILE"
   exit 1
 fi
+SESSION_TITLE_API_KEY="${SESSION_TITLE_LLM_API_KEY:-${LLM_API_KEY:-}}"
+SESSION_TITLE_API_BASE="${SESSION_TITLE_LLM_API_BASE:-${LLM_API_BASE:-}}"
+SESSION_TITLE_SUB_MODULE_VALUE="${SESSION_TITLE_SUB_MODULE:-${LLM_SUB_MODULE:-}}"
 
 chmod +x "$CLI_JS" 2>/dev/null || true
 mkdir -p "$LAUNCH_AGENTS_DIR" "$LOG_DIR"
@@ -271,6 +283,25 @@ write_server_plist() {
     env_args+=("YEP_FCM_SERVICE_ACCOUNT_JSON" "$FCM_SERVICE_ACCOUNT_JSON")
   fi
 
+  if [[ -n "$SESSION_TITLE_API_KEY" ]]; then
+    env_args+=("SESSION_TITLE_LLM_API_KEY" "$SESSION_TITLE_API_KEY")
+  fi
+  if [[ -n "$SESSION_TITLE_API_BASE" ]]; then
+    env_args+=("SESSION_TITLE_LLM_API_BASE" "$SESSION_TITLE_API_BASE")
+  fi
+  if [[ -n "$SESSION_TITLE_SUB_MODULE_VALUE" ]]; then
+    env_args+=("SESSION_TITLE_SUB_MODULE" "$SESSION_TITLE_SUB_MODULE_VALUE")
+  fi
+  if [[ -n "${SESSION_TITLE_MODEL:-}" ]]; then
+    env_args+=("SESSION_TITLE_MODEL" "$SESSION_TITLE_MODEL")
+  fi
+  if [[ -n "${SESSION_TITLE_GENERATION+x}" ]]; then
+    env_args+=("SESSION_TITLE_GENERATION" "$SESSION_TITLE_GENERATION")
+  fi
+  if [[ -n "${SESSION_TITLE_TIMEOUT_MS:-}" ]]; then
+    env_args+=("SESSION_TITLE_TIMEOUT_MS" "$SESSION_TITLE_TIMEOUT_MS")
+  fi
+
   write_header "$plist" "$SERVER_LABEL" "$LOG_DIR/server-launchd.out.log" "$LOG_DIR/server-launchd.err.log"
   append_env "$plist" "${env_args[@]}"
   append_program_arguments "$plist" "$NODE_BIN" "$CLI_JS" "--port" "$SERVER_PORT"
@@ -334,6 +365,19 @@ if $INSTALL_SERVER; then
     dim "native push: server FCM credentials from YEP_FCM_SERVICE_ACCOUNT_JSON"
   else
     warn "native push: no server FCM credentials were stored in the server LaunchAgent."
+  fi
+  if [[ -n "$SESSION_TITLE_API_KEY" ]]; then
+    dim "session titles: LLM API key stored as SESSION_TITLE_LLM_API_KEY"
+    if [[ -n "${SESSION_TITLE_MODEL:-}" ]]; then
+      dim "session titles: model $SESSION_TITLE_MODEL"
+    fi
+    if [[ -n "$SESSION_TITLE_SUB_MODULE_VALUE" ]]; then
+      dim "session titles: submodule $SESSION_TITLE_SUB_MODULE_VALUE"
+    fi
+  elif [[ -n "${SESSION_TITLE_GENERATION+x}" ]]; then
+    dim "session titles: SESSION_TITLE_GENERATION=$SESSION_TITLE_GENERATION"
+  else
+    warn "session titles: no LLM API key was stored in the server LaunchAgent."
   fi
 fi
 dim "KeepAlive is intentionally not set; these agents start at login only."

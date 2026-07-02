@@ -159,6 +159,21 @@ Native push deploy config:
   YEP_SYNC_NATIVE_PUSH_LAUNCHAGENT=false
                                     Disable automatic server LaunchAgent FCM env sync
   YEP_REQUIRE_NATIVE_PUSH=true     Fail deploy when native push prerequisites are missing
+
+AI session title deploy config:
+  SESSION_TITLE_LLM_API_KEY        OpenAI-compatible API key for title generation
+  LLM_API_KEY                      Fallback API key for title generation
+  SESSION_TITLE_LLM_API_BASE       OpenAI-compatible API base for title generation
+  LLM_API_BASE                     Fallback API base for title generation
+  SESSION_TITLE_SUB_MODULE         X-Sub-Module header for title generation
+  LLM_SUB_MODULE                   Fallback X-Sub-Module header for title generation
+  SESSION_TITLE_MODEL              Title model (default: deepseek-v4-flash)
+  SESSION_TITLE_GENERATION=false   Disable title generation
+  SESSION_TITLE_TIMEOUT_MS         Title request timeout in milliseconds
+  YEP_SYNC_SESSION_TITLE_LAUNCHAGENT=false
+                                    Disable automatic server LaunchAgent title env sync
+  YEP_REQUIRE_SESSION_TITLE_GENERATION=true
+                                    Fail deploy when title generation is not configured
 EOF
 }
 
@@ -180,7 +195,10 @@ ANDROID_GOOGLE_SERVICES_TARGET="${YEP_ANDROID_GOOGLE_SERVICES_TARGET:-$REPO_ROOT
 ANDROID_GOOGLE_SERVICES_SOURCE="${YEP_ANDROID_GOOGLE_SERVICES_JSON:-$REPO_ROOT/google-services.json}"
 REQUIRE_NATIVE_PUSH="${YEP_REQUIRE_NATIVE_PUSH:-false}"
 SYNC_NATIVE_PUSH_LAUNCHAGENT="${YEP_SYNC_NATIVE_PUSH_LAUNCHAGENT:-true}"
+REQUIRE_SESSION_TITLE_GENERATION="${YEP_REQUIRE_SESSION_TITLE_GENERATION:-false}"
+SYNC_SESSION_TITLE_LAUNCHAGENT="${YEP_SYNC_SESSION_TITLE_LAUNCHAGENT:-true}"
 NEED_SERVER_LAUNCHAGENT_SYNC=false
+SERVER_LAUNCHAGENT_SYNC_REASONS=()
 
 is_truthy() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -189,8 +207,26 @@ is_truthy() {
   esac
 }
 
+is_falsey() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no|n|off) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 shell_quote() {
   printf '%q' "$1"
+}
+
+mark_server_launchagent_sync_needed() {
+  local reason="$1"
+  local existing
+
+  NEED_SERVER_LAUNCHAGENT_SYNC=true
+  for existing in "${SERVER_LAUNCHAGENT_SYNC_REASONS[@]-}"; do
+    [[ "$existing" == "$reason" ]] && return
+  done
+  SERVER_LAUNCHAGENT_SYNC_REASONS+=("$reason")
 }
 
 server_args_contain() {
@@ -411,7 +447,7 @@ check_native_push_preflight() {
       if $launchd_has_current_fcm; then
         dim "native push server config: LaunchAgent $server_label has FCM credentials"
       elif $shell_has_fcm && server_deploy_restarts && is_truthy "$SYNC_NATIVE_PUSH_LAUNCHAGENT"; then
-        NEED_SERVER_LAUNCHAGENT_SYNC=true
+        mark_server_launchagent_sync_needed "native push"
         if $launchd_has_fcm; then
           dim "native push server config: LaunchAgent $server_label will be refreshed before server restart"
         else
@@ -452,6 +488,99 @@ check_native_push_preflight() {
   fi
 }
 
+check_session_title_preflight() {
+  $DO_SERVER || return 0
+
+  local title_api_key="${SESSION_TITLE_LLM_API_KEY:-${LLM_API_KEY:-}}"
+  local shell_has_title_key=false
+  local shell_requests_title_disable=false
+  local missing=0
+
+  if [[ -n "$title_api_key" ]]; then
+    shell_has_title_key=true
+  fi
+  if [[ -n "${SESSION_TITLE_GENERATION+x}" ]] && is_falsey "$SESSION_TITLE_GENERATION"; then
+    shell_requests_title_disable=true
+  fi
+
+  local server_label="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
+  local launchd_loaded=false
+  local launchd_has_title_config=false
+  local launchd_has_title_key=false
+
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1; then
+    local user_domain="gui/$(id -u)"
+    local launchd_state
+    launchd_state="$(launchctl print "$user_domain/$server_label" 2>/dev/null || true)"
+    if [[ -n "$launchd_state" ]]; then
+      launchd_loaded=true
+      case "$launchd_state" in
+        *SESSION_TITLE_LLM_API_KEY*|*LLM_API_KEY*)
+          launchd_has_title_key=true
+          launchd_has_title_config=true
+          ;;
+      esac
+      case "$launchd_state" in
+        *SESSION_TITLE_GENERATION*|*SESSION_TITLE_LLM_API_BASE*|*LLM_API_BASE*|*SESSION_TITLE_SUB_MODULE*|*LLM_SUB_MODULE*|*SESSION_TITLE_MODEL*|*SESSION_TITLE_TIMEOUT_MS*)
+          launchd_has_title_config=true
+          ;;
+      esac
+    fi
+  fi
+
+  if $launchd_loaded; then
+    if { $shell_has_title_key || $shell_requests_title_disable; } &&
+      server_deploy_restarts &&
+      is_truthy "$SYNC_SESSION_TITLE_LAUNCHAGENT"; then
+      mark_server_launchagent_sync_needed "session titles"
+      if $launchd_has_title_config; then
+        dim "session title config: LaunchAgent $server_label will be refreshed before server restart"
+      else
+        dim "session title config: LaunchAgent $server_label will be updated before server restart"
+      fi
+    elif $launchd_has_title_key; then
+      dim "session title config: LaunchAgent $server_label has an LLM API key"
+    elif $shell_requests_title_disable; then
+      dim "session title config: disabled by SESSION_TITLE_GENERATION=$SESSION_TITLE_GENERATION"
+      if server_deploy_restarts && ! is_truthy "$SYNC_SESSION_TITLE_LAUNCHAGENT"; then
+        dim "YEP_SYNC_SESSION_TITLE_LAUNCHAGENT is disabled; LaunchAgent env was not updated"
+      fi
+    else
+      warn "session title config is missing from loaded LaunchAgent $server_label."
+      warn "Redeploy uses the LaunchAgent environment, so current shell LLM variables will not affect the restarted server unless they are synced."
+      missing=1
+      if $shell_has_title_key; then
+        if ! server_deploy_restarts; then
+          dim "server deploy is build-only, so LaunchAgent env was not auto-synced"
+        elif ! is_truthy "$SYNC_SESSION_TITLE_LAUNCHAGENT"; then
+          dim "YEP_SYNC_SESSION_TITLE_LAUNCHAGENT is disabled"
+        else
+          dim "persist it with: SESSION_TITLE_LLM_API_KEY=<redacted> scripts/install-launchagents.sh --server-only"
+        fi
+      else
+        dim "set SESSION_TITLE_LLM_API_KEY or LLM_API_KEY in .env.deploy.local or the deploying shell"
+      fi
+    fi
+  elif $shell_has_title_key; then
+    dim "session title config: LLM API key supplied in current environment"
+  elif $shell_requests_title_disable; then
+    dim "session title config: disabled by SESSION_TITLE_GENERATION=$SESSION_TITLE_GENERATION"
+  else
+    warn "session title generation is not configured in the current environment."
+    warn "AI-generated aiTitle values will remain disabled until an LLM API key is available to the server."
+    missing=1
+    dim "set SESSION_TITLE_LLM_API_KEY or LLM_API_KEY in .env.deploy.local or the deploying shell"
+  fi
+
+  if [[ "$missing" -ne 0 ]]; then
+    dim "set YEP_REQUIRE_SESSION_TITLE_GENERATION=true to make deploy fail fast when title generation is missing"
+    if is_truthy "$REQUIRE_SESSION_TITLE_GENERATION"; then
+      err "Session title generation is missing and YEP_REQUIRE_SESSION_TITLE_GENERATION=true."
+      exit 1
+    fi
+  fi
+}
+
 ensure_server_bundle_for_launchagent_sync() {
   local cli_js="$REPO_ROOT/dist/npm-package/dist/cli.js"
 
@@ -473,7 +602,10 @@ sync_server_launchagent_env_if_needed() {
   fi
   ensure_server_bundle_for_launchagent_sync
 
-  log "Syncing native push env into the 8022 server LaunchAgent ..."
+  log "Syncing env into the 8022 server LaunchAgent ..."
+  if [[ ${#SERVER_LAUNCHAGENT_SYNC_REASONS[@]} -gt 0 ]]; then
+    dim "reasons: ${SERVER_LAUNCHAGENT_SYNC_REASONS[*]}"
+  fi
   dim "4510 Codex bridge and 4520 Claude bridge are not touched"
   scripts/install-launchagents.sh --server-only
 }
@@ -602,10 +734,17 @@ fi
 if [[ -n "$DISCOVERED_FCM_SERVICE_ACCOUNT_FILE" ]]; then
   dim "server FCM:        auto-detected $DISCOVERED_FCM_SERVICE_ACCOUNT_FILE"
 fi
+if [[ -n "${SESSION_TITLE_LLM_API_KEY:-${LLM_API_KEY:-}}" ]]; then
+  dim "session titles:    LLM API key available in deploy env"
+elif [[ -n "${SESSION_TITLE_GENERATION+x}" ]] && is_falsey "$SESSION_TITLE_GENERATION"; then
+  dim "session titles:    disabled by deploy env"
+fi
 
 log "Checking native push deploy prerequisites ..."
 sync_android_google_services
 check_native_push_preflight
+log "Checking session title deploy prerequisites ..."
+check_session_title_preflight
 
 if $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE || $DO_CLAUDE_BRIDGE; }; then
   log "Running preflight checks ..."
