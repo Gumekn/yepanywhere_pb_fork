@@ -11,6 +11,8 @@
     "launchd:install": "scripts/install-launchagents.sh",
     "launchd:uninstall": "scripts/uninstall-launchagents.sh",
     "dev": "node scripts/dev.js",
+    "dev:8022": "node scripts/dev-8022.js",
+    "dev:8022:replace": "node scripts/dev-8022.js --replace",
     "staging": "node scripts/staging.js",
     "dev:auto": "pnpm --filter server dev & pnpm --filter client dev",
     "dev-tailscale": "tailscale serve --bg 3400 && pnpm dev",

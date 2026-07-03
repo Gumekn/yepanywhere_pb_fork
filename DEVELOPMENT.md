@@ -29,6 +29,32 @@ pnpm test       # 运行单元测试
 pnpm test:e2e   # 运行 E2E 测试
 ```
 
+## 8022 热重载
+
+本机 `8022` 可以用开发热重载模式原地接管，同时保留 `4510`
+Codex bridge sidecar，不会断开已有 `codex --remote ws://127.0.0.1:4510`
+会话：
+
+```bash
+pnpm dev:8022:replace
+```
+
+这个命令会：
+
+- 使用 `PORT=8022`、`BASE_PATH=/yep`、`VITE_PORT=8024`
+- 强制 `YEP_CODEX_BRIDGE_MODE=external`，指向 `http://127.0.0.1:4510`
+- 启用前端 Vite HMR 和后端 `tsx watch`
+- 只停止当前 `8022` web/API listener；如果发现 `4510` 被 `8022`
+  进程内嵌持有，会拒绝启动
+- 如果当前 Yep 主进程有 active managed work，会拒绝替换；确实要中断它们时再加
+  `--allow-yep-session-interrupt`
+
+只做检查、不启动或停止任何进程：
+
+```bash
+pnpm dev:8022 -- --check
+```
+
 ## 端口配置
 
 端口都从同一个 `PORT` 变量推导出来，默认值是 `3400`：
