@@ -43,7 +43,9 @@ export function reloadNotify(options: ReloadNotifyOptions = {}): Plugin {
 
       // Notify the backend about the file change
       const apiPort = process.env.VITE_API_PORT || "3400";
-      const url = `http://localhost:${apiPort}${endpoint}`;
+      const basePath = normalizeBasePath(process.env.BASE_PATH);
+      const endpointPath = `${basePath}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
+      const url = `http://localhost:${apiPort}${endpointPath}`;
 
       fetch(url, {
         method: "POST",
@@ -64,4 +66,11 @@ export function reloadNotify(options: ReloadNotifyOptions = {}): Plugin {
       return [];
     },
   };
+}
+
+function normalizeBasePath(value: string | undefined): string {
+  const raw = value?.trim();
+  if (!raw || raw === "/") return "";
+  const withLeadingSlash = raw.startsWith("/") ? raw : `/${raw}`;
+  return withLeadingSlash.replace(/\/+$/, "");
 }

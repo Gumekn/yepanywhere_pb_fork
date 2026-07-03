@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { API_BASE } from "../lib/apiPath";
 
 /**
  * For browser fetches under a reverse-proxy prefix (Caddy mounts the
@@ -6,10 +7,12 @@ import { useEffect, useRef, useState } from "react";
  * the document host root and miss the mounted server. Templating with
  * BASE_URL here lets every existing caller keep passing "/api/foo".
  */
-const BASE = (import.meta.env.BASE_URL ?? "/").replace(/\/$/, "");
 function directApiUrl(path: string): string {
-  if (!BASE) return path;
-  return path.startsWith(BASE) ? path : `${BASE}${path}`;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(path)) return path;
+  if (path.startsWith(API_BASE)) return path;
+
+  const endpoint = path.startsWith("/api") ? path.slice(4) : path;
+  return `${API_BASE}${endpoint.startsWith("/") ? "" : "/"}${endpoint}`;
 }
 
 interface RemoteImageResult {
@@ -28,17 +31,18 @@ interface RemoteImageResult {
 /**
  * Hook for loading images by API path.
  *
- * Returns the API path directly for use as an image src. Retained for
- * call-site compatibility; returns the API path directly.
+ * Returns a browser-loadable URL for use as an image src. Retained for
+ * call-site compatibility; it does not fetch the image bytes.
  *
  * @param apiPath - The API path for the image (e.g., "/api/projects/.../upload/image.png")
  * @returns Object with url, loading state, and error
  */
 export function useRemoteImage(apiPath: string | null): RemoteImageResult {
+  const url = apiPath ? directApiUrl(apiPath) : null;
   return {
-    url: apiPath,
+    url,
     loading: false,
-    error: apiPath ? null : null,
+    error: null,
     bytes: null,
     mimeType: null,
   };
@@ -129,14 +133,13 @@ export function useFetchedImage(apiPath: string | null): RemoteImageResult {
 }
 
 /**
- * Resolve an image API path. Retained for call-site compatibility;
- * returns the path as-is.
+ * Resolve an image API path. Retained for call-site compatibility.
  *
  * @param apiPath - The API path for the image
- * @returns The API path
+ * @returns A browser-loadable URL for the API path
  */
 export async function preloadRemoteImage(
   apiPath: string,
 ): Promise<string | null> {
-  return apiPath;
+  return directApiUrl(apiPath);
 }

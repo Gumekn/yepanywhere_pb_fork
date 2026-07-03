@@ -123,6 +123,10 @@ const basePort = process.env.PORT
 const vitePort = process.env.VITE_PORT
   ? Number.parseInt(process.env.VITE_PORT, 10)
   : basePort + 2;
+const maintenancePort =
+  process.env.MAINTENANCE_PORT !== undefined
+    ? Number.parseInt(process.env.MAINTENANCE_PORT, 10)
+    : basePort + 1;
 const protocol = process.env.HTTPS_SELF_SIGNED === "true" ? "https" : "http";
 const configuredHost = process.env.HOST?.trim();
 const displayHost =
@@ -133,7 +137,7 @@ const displayHost =
 console.log("Starting dev server...");
 console.log(`  Access at: ${protocol}://${displayHost}:${basePort}`);
 console.log(
-  `  Ports: server=${basePort}, maintenance=${basePort + 1}, vite=${vitePort}`,
+  `  Ports: server=${basePort}, maintenance=${maintenancePort}, vite=${vitePort}`,
 );
 console.log(
   `  Note: Vite output on :${vitePort} is internal HMR only; browse ${protocol}://${displayHost}:${basePort}`,
@@ -151,6 +155,8 @@ const env = {
   NO_FRONTEND_RELOAD: noFrontendReload ? "true" : "",
   // Pass vite port to both server and client for consistency
   VITE_PORT: String(vitePort),
+  VITE_API_PORT: String(basePort),
+  MAINTENANCE_PORT: String(maintenancePort),
 };
 
 // Track child processes for cleanup
