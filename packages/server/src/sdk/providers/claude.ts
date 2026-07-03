@@ -29,6 +29,10 @@ import {
 } from "../remote-spawn.js";
 import { getProjectDirFromCwd, syncSessionFile } from "../session-sync.js";
 import type { ContentBlock, SDKMessage } from "../types.js";
+import {
+  fetchClaudeModelCatalog,
+  getConfiguredClaudeModels,
+} from "./claude-settings.js";
 import { filterEnvForChildProcess } from "./env-filter.js";
 import type {
   AgentProvider,
@@ -196,29 +200,64 @@ export class ClaudeProvider implements AgentProvider {
   async getAvailableModels(): Promise<ModelInfo[]> {
     // Return cached models if available
     if (cachedModels) {
-      return cachedModels;
+      return mergeClaudeModels([
+        ...(await getConfiguredClaudeModels()),
+        ...cachedModels,
+      ]);
     }
+
+    const configuredModels = await getConfiguredClaudeModels();
+    const catalogPromise = fetchClaudeModelCatalog();
 
     // Check if user is authenticated before trying to probe
     const authStatus = await this.getAuthStatus();
     if (!authStatus.authenticated) {
-      return CLAUDE_MODELS_FALLBACK;
+      return mergeClaudeModels([
+        ...configuredModels,
+        ...(await catalogPromise),
+      ]);
     }
 
     // If probe is already in progress, wait for it
     if (probePromise) {
-      return probePromise;
+      try {
+        const [probedModels, catalogModels] = await Promise.all([
+          probePromise,
+          catalogPromise,
+        ]);
+        return mergeClaudeModels([
+          ...configuredModels,
+          ...probedModels,
+          ...catalogModels,
+        ]);
+      } catch (error) {
+        console.warn("[Claude] Failed to probe models, using fallback:", error);
+        return mergeClaudeModels([
+          ...configuredModels,
+          ...(await catalogPromise),
+        ]);
+      }
     }
 
     // Start a new probe
     probePromise = this.probeModels();
     try {
-      const models = await probePromise;
-      cachedModels = mergeClaudeModels(models);
+      const [models, catalogModels] = await Promise.all([
+        probePromise,
+        catalogPromise,
+      ]);
+      cachedModels = mergeClaudeModels([
+        ...configuredModels,
+        ...models,
+        ...catalogModels,
+      ]);
       return cachedModels;
     } catch (error) {
       console.warn("[Claude] Failed to probe models, using fallback:", error);
-      return CLAUDE_MODELS_FALLBACK;
+      return mergeClaudeModels([
+        ...configuredModels,
+        ...(await catalogPromise),
+      ]);
     } finally {
       probePromise = null;
     }

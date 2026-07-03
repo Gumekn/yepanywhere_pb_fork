@@ -1,12 +1,44 @@
 import type { ProviderInfo, ProviderName } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import { getClaudeCodeSettings } from "../sdk/providers/claude-settings.js";
 import { getAllProviders } from "../sdk/providers/index.js";
+import type { AgentProvider } from "../sdk/providers/types.js";
 import type { ModelInfoService } from "../services/ModelInfoService.js";
 
 interface ProviderRouteDeps {
   modelInfoService?: ModelInfoService;
   /** If non-empty, only these provider names are exposed. */
   enabledProviders?: string[];
+}
+
+async function buildProviderInfo(
+  provider: AgentProvider,
+  modelInfoService?: ModelInfoService,
+): Promise<ProviderInfo> {
+  const [authStatus, models] = await Promise.all([
+    provider.getAuthStatus(),
+    provider.getAvailableModels(),
+  ]);
+  modelInfoService?.ingestModels(provider.name as ProviderName, models);
+
+  const claudeSettings =
+    provider.name === "claude" ? await getClaudeCodeSettings() : null;
+
+  return {
+    name: provider.name,
+    displayName: provider.displayName,
+    installed: authStatus.installed,
+    authenticated: authStatus.authenticated,
+    enabled: authStatus.enabled,
+    expiresAt: authStatus.expiresAt?.toISOString(),
+    user: authStatus.user,
+    models,
+    currentModel: claudeSettings?.model,
+    currentEffortLevel: claudeSettings?.effortLevel,
+    supportsPermissionMode: provider.supportsPermissionMode,
+    supportsThinkingToggle: provider.supportsThinkingToggle,
+    supportsSlashCommands: provider.supportsSlashCommands,
+  };
 }
 
 /**
@@ -27,27 +59,9 @@ export function createProvidersRoutes(deps: ProviderRouteDeps = {}): Hono {
     const providerInfos: ProviderInfo[] = [];
 
     for (const provider of providers) {
-      const [authStatus, models] = await Promise.all([
-        provider.getAuthStatus(),
-        provider.getAvailableModels(),
-      ]);
-      deps.modelInfoService?.ingestModels(
-        provider.name as ProviderName,
-        models,
+      providerInfos.push(
+        await buildProviderInfo(provider, deps.modelInfoService),
       );
-      providerInfos.push({
-        name: provider.name,
-        displayName: provider.displayName,
-        installed: authStatus.installed,
-        authenticated: authStatus.authenticated,
-        enabled: authStatus.enabled,
-        expiresAt: authStatus.expiresAt?.toISOString(),
-        user: authStatus.user,
-        models,
-        supportsPermissionMode: provider.supportsPermissionMode,
-        supportsThinkingToggle: provider.supportsThinkingToggle,
-        supportsSlashCommands: provider.supportsSlashCommands,
-      });
     }
 
     return c.json({ providers: providerInfos });
@@ -63,24 +77,10 @@ export function createProvidersRoutes(deps: ProviderRouteDeps = {}): Hono {
       return c.json({ error: "Provider not found" }, 404);
     }
 
-    const [authStatus, models] = await Promise.all([
-      provider.getAuthStatus(),
-      provider.getAvailableModels(),
-    ]);
-    deps.modelInfoService?.ingestModels(provider.name as ProviderName, models);
-    const providerInfo: ProviderInfo = {
-      name: provider.name,
-      displayName: provider.displayName,
-      installed: authStatus.installed,
-      authenticated: authStatus.authenticated,
-      enabled: authStatus.enabled,
-      expiresAt: authStatus.expiresAt?.toISOString(),
-      user: authStatus.user,
-      models,
-      supportsPermissionMode: provider.supportsPermissionMode,
-      supportsThinkingToggle: provider.supportsThinkingToggle,
-      supportsSlashCommands: provider.supportsSlashCommands,
-    };
+    const providerInfo = await buildProviderInfo(
+      provider,
+      deps.modelInfoService,
+    );
 
     return c.json({ provider: providerInfo });
   });

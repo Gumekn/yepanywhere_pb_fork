@@ -84,6 +84,38 @@ function getThinkingOption(
   return `on:${effort}`;
 }
 
+type ThinkingPreset = "off" | "auto" | `on:${EffortLevel}`;
+
+const THINKING_PRESET_ORDER: readonly ThinkingPreset[] = [
+  "off",
+  "auto",
+  "on:low",
+  "on:medium",
+  "on:high",
+  "on:max",
+];
+
+function isEffortLevel(value: string): value is EffortLevel {
+  return EFFORT_LEVEL_OPTIONS.some((option) => option.value === value);
+}
+
+function getThinkingPreset(
+  mode: ThinkingMode,
+  effort: EffortLevel,
+): ThinkingPreset {
+  if (mode === "on") return `on:${effort}`;
+  return mode;
+}
+
+function normalizeThinkingOption(
+  option: ThinkingOption | undefined,
+): ThinkingPreset | null {
+  if (!option) return null;
+  if (option === "off" || option === "auto") return option;
+  const effort = option.startsWith("on:") ? option.slice(3) : option;
+  return isEffortLevel(effort) ? `on:${effort}` : null;
+}
+
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -214,6 +246,61 @@ export function NewSessionForm({
     standard: t("newSessionCodexMcpStandardDescription"),
     full: t("newSessionCodexMcpFullDescription"),
   };
+  const getEffortLabel = useCallback(
+    (effort: EffortLevel): string => {
+      if (
+        (selectedProvider === "codex" || selectedProvider === "codex-oss") &&
+        effort === "max"
+      ) {
+        return "xhigh";
+      }
+      return t(EFFORT_LABEL_KEYS[effort]);
+    },
+    [selectedProvider, t],
+  );
+  const selectedThinkingPreset = getThinkingPreset(thinkingMode, thinkingLevel);
+  const thinkingOptions = useMemo((): FilterOption<ThinkingPreset>[] => {
+    return THINKING_PRESET_ORDER.map((preset) => {
+      if (preset === "off") {
+        return {
+          value: preset,
+          label: t("newSessionThinkingOff"),
+        };
+      }
+      if (preset === "auto") {
+        return {
+          value: preset,
+          label: t("newSessionThinkingAuto"),
+        };
+      }
+      const effort = preset.slice(3) as EffortLevel;
+      return {
+        value: preset,
+        label: t("newSessionThinkingOn", {
+          level: getEffortLabel(effort),
+        }),
+      };
+    });
+  }, [getEffortLabel, t]);
+  const applyThinkingPreset = useCallback(
+    (preset: ThinkingPreset) => {
+      if (preset === "off" || preset === "auto") {
+        setThinkingMode(preset);
+        return;
+      }
+      const effort = preset.slice(3);
+      if (!isEffortLevel(effort)) return;
+      setEffortLevel(effort);
+      setThinkingMode("on");
+    },
+    [setEffortLevel, setThinkingMode],
+  );
+  const handleThinkingSelect = useCallback(
+    (selected: ThinkingPreset[]) => {
+      applyThinkingPreset(selected[0] ?? "off");
+    },
+    [applyThinkingPreset],
+  );
 
   // Get models and capabilities for the currently selected provider
   const selectedProviderInfo = providers.find(
@@ -258,14 +345,27 @@ export function NewSessionForm({
 
     setSelectedProvider(initialProvider.name);
     setSelectedModel(
-      getPreferredModelId(initialProvider.models ?? [], savedDefaults?.model),
+      getPreferredModelId(
+        initialProvider.models ?? [],
+        savedDefaults?.model ?? initialProvider.currentModel,
+      ),
     );
     setSelectedCodexMcpMode(savedDefaults?.codexMcpMode ?? "standard");
     setMode(savedDefaults?.permissionMode ?? DEFAULT_PERMISSION_MODE);
+    const savedThinkingPreset = normalizeThinkingOption(
+      savedDefaults?.thinking,
+    );
+    if (savedThinkingPreset) {
+      applyThinkingPreset(savedThinkingPreset);
+    } else if (initialProvider.currentEffortLevel) {
+      setEffortLevel(initialProvider.currentEffortLevel);
+    }
   }, [
+    applyThinkingPreset,
     availableProviders,
     providers,
     providersLoading,
+    setEffortLevel,
     settings,
     settingsLoading,
   ]);
@@ -275,9 +375,14 @@ export function NewSessionForm({
     setSelectedProvider(providerName);
     const provider = providers.find((p) => p.name === providerName);
     if (provider?.models && provider.models.length > 0) {
-      setSelectedModel(getPreferredModelId(provider.models));
+      setSelectedModel(
+        getPreferredModelId(provider.models, provider.currentModel),
+      );
     } else {
       setSelectedModel(null);
+    }
+    if (provider?.currentEffortLevel) {
+      setEffortLevel(provider.currentEffortLevel);
     }
   };
 
@@ -380,19 +485,6 @@ export function NewSessionForm({
     setSelectedCodexMcpMode(selectedMode);
   };
 
-  const getEffortLabel = useCallback(
-    (effort: EffortLevel): string => {
-      if (
-        (selectedProvider === "codex" || selectedProvider === "codex-oss") &&
-        effort === "max"
-      ) {
-        return "xhigh";
-      }
-      return t(EFFORT_LABEL_KEYS[effort]);
-    },
-    [selectedProvider, t],
-  );
-
   const handleSelectEffort = useCallback(
     (effort: EffortLevel) => {
       setEffortLevel(effort);
@@ -407,6 +499,9 @@ export function NewSessionForm({
       await updateServerSetting("newSessionDefaults", {
         provider: selectedProvider ?? undefined,
         model: selectedModel ?? undefined,
+        thinking: supportsThinkingToggle
+          ? getThinkingOption(thinkingMode, thinkingLevel)
+          : undefined,
         permissionMode: mode,
         codexMcpMode:
           selectedProvider === "codex" ? selectedCodexMcpMode : undefined,
@@ -427,7 +522,10 @@ export function NewSessionForm({
     selectedModel,
     selectedProvider,
     showToast,
+    supportsThinkingToggle,
     t,
+    thinkingLevel,
+    thinkingMode,
     updateServerSetting,
   ]);
 
@@ -704,11 +802,16 @@ export function NewSessionForm({
     selectedProvider === "codex"
       ? (savedDefaults?.codexMcpMode ?? "standard") === selectedCodexMcpMode
       : true;
+  const thinkingDefaultsMatch = supportsThinkingToggle
+    ? (savedDefaults?.thinking ?? undefined) ===
+      getThinkingOption(thinkingMode, thinkingLevel)
+    : true;
   const defaultsMatchCurrent =
     (savedDefaults?.provider ?? undefined) ===
       (selectedProvider ?? undefined) &&
     (savedDefaults?.model ?? undefined) === (selectedModel ?? undefined) &&
     (savedDefaults?.permissionMode ?? DEFAULT_PERMISSION_MODE) === mode &&
+    thinkingDefaultsMatch &&
     codexMcpDefaultsMatch;
 
   // Split providers into available vs unavailable so the unavailable ones can
@@ -821,7 +924,7 @@ export function NewSessionForm({
               label={button.label}
             />
           ))}
-          {supportsThinkingToggle && (
+          {supportsThinkingToggle && compact && (
             <button
               type="button"
               className={`toolbar-button thinking-toggle-button ${thinkingMode !== "off" ? `active ${thinkingMode}` : ""}`}
@@ -893,7 +996,7 @@ export function NewSessionForm({
           )}
         </button>
       </div>
-      {supportsThinkingToggle && (
+      {supportsThinkingToggle && compact && (
         <div className="new-session-effort-control">
           <span className="new-session-effort-label">
             {t("newSessionEffortTitle")}
@@ -1023,20 +1126,41 @@ export function NewSessionForm({
         </div>
       )}
 
-      {/* Model Selection */}
-      {selectedProvider && modelOptions.length > 0 && (
-        <div className="new-session-model-section">
-          <h3>{t("newSessionModelTitle")}</h3>
-          <FilterDropdown
-            label={t("newSessionModelTitle")}
-            options={modelOptions}
-            selected={selectedModel ? [selectedModel] : []}
-            onChange={handleModelSelect}
-            multiSelect={false}
-            placeholder={t("newSessionModelPlaceholder")}
-          />
-        </div>
-      )}
+      {/* Model / Thinking Selection */}
+      {selectedProvider &&
+        (modelOptions.length > 0 || supportsThinkingToggle) && (
+          <div className="new-session-model-section">
+            <div className="new-session-model-controls">
+              {modelOptions.length > 0 && (
+                <div className="new-session-config-field">
+                  <h3>{t("newSessionModelTitle")}</h3>
+                  <FilterDropdown
+                    label={t("newSessionModelTitle")}
+                    options={modelOptions}
+                    selected={selectedModel ? [selectedModel] : []}
+                    onChange={handleModelSelect}
+                    multiSelect={false}
+                    placeholder={t("newSessionModelPlaceholder")}
+                  />
+                </div>
+              )}
+              {supportsThinkingToggle && (
+                <div className="new-session-config-field">
+                  <h3>{t("newSessionThinkingControlTitle")}</h3>
+                  <FilterDropdown
+                    label={t("newSessionThinkingControlTitle")}
+                    options={thinkingOptions}
+                    selected={[selectedThinkingPreset]}
+                    onChange={handleThinkingSelect}
+                    multiSelect={false}
+                    placeholder={t("newSessionThinkingControlTitle")}
+                    align="right"
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
       {/* Codex MCP Profile - matches cf / cf -mcp launch modes */}
       {selectedProvider === "codex" && (

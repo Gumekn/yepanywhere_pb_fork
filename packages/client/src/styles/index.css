@@ -7779,6 +7779,10 @@ button.context-usage-indicator--button:focus-visible {
     align-items: stretch;
   }
 
+  .new-session-model-controls {
+    grid-template-columns: 1fr;
+  }
+
   .new-session-effort-control {
     align-items: stretch;
     flex-direction: column;
@@ -7817,6 +7821,31 @@ button.context-usage-indicator--button:focus-visible {
 /* Model Selection Section */
 .new-session-model-section {
   margin-bottom: 1.5rem;
+}
+
+.new-session-model-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(180px, 0.85fr);
+  gap: var(--space-3);
+  align-items: end;
+}
+
+.new-session-config-field {
+  min-width: 0;
+}
+
+.new-session-config-field .filter-dropdown-container,
+.new-session-config-field .filter-dropdown-button {
+  width: 100%;
+}
+
+.new-session-config-field .filter-dropdown-button {
+  justify-content: space-between;
+  min-height: 40px;
+}
+
+.new-session-config-field .filter-dropdown-dropdown {
+  min-width: min(420px, 80vw);
 }
 
 .new-session-model-section h3 {
@@ -10299,6 +10328,17 @@ button.context-usage-indicator--button:focus-visible {
   color: var(--text-muted);
   cursor: pointer;
   transition: border-color 0.15s ease, background 0.15s ease;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.filter-dropdown-button-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
 }
 
 .filter-dropdown-button:hover {

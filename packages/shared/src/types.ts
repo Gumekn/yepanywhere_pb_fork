@@ -83,6 +83,10 @@ export interface ProviderInfo {
   user?: { email?: string; name?: string };
   /** Available models for this provider */
   models?: ModelInfo[];
+  /** Provider's current CLI/default model, when discoverable */
+  currentModel?: string;
+  /** Provider's current CLI/default effort level, when discoverable */
+  currentEffortLevel?: EffortLevel;
   /** Whether this provider supports permission modes (default: true for backward compat) */
   supportsPermissionMode?: boolean;
   /** Whether this provider supports extended thinking toggle (default: true for backward compat) */
@@ -144,6 +148,7 @@ export const ALL_CODEX_MCP_MODES: readonly CodexMcpMode[] = [
 export interface NewSessionDefaults {
   provider?: ProviderName;
   model?: string;
+  thinking?: ThinkingOption;
   permissionMode?: PermissionMode;
   codexMcpMode?: CodexMcpMode;
 }

@@ -7,11 +7,14 @@ import {
   ALL_PERMISSION_MODES,
   ALL_PROVIDERS,
   type CodexMcpMode,
+  type EffortLevel,
   type NewSessionDefaults,
   type PermissionMode,
   type ProviderName,
+  type ThinkingOption,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import { updateClaudeCodeSettings } from "../sdk/providers/claude-settings.js";
 import { testSSHConnection } from "../sdk/remote-spawn.js";
 import type {
   ServerSettings,
@@ -21,6 +24,8 @@ import {
   isValidSshHostAlias,
   normalizeSshHostAlias,
 } from "../utils/sshHostAlias.js";
+
+const EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "max"];
 
 export interface SettingsRoutesDeps {
   serverSettingsService: ServerSettingsService;
@@ -53,6 +58,29 @@ function parseHostAliasList(rawHosts: unknown[]): {
   }
 
   return { hosts };
+}
+
+function isEffortLevel(value: string): value is EffortLevel {
+  return EFFORT_LEVELS.includes(value as EffortLevel);
+}
+
+function isThinkingOption(value: unknown): value is ThinkingOption {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value === "off" || value === "auto") return true;
+  if (isEffortLevel(value)) return true;
+  if (!value.startsWith("on:")) return false;
+  return isEffortLevel(value.slice(3));
+}
+
+function getEffortFromThinkingOption(
+  option: ThinkingOption | undefined,
+): EffortLevel | undefined {
+  if (!option || option === "off" || option === "auto") return undefined;
+  if (option.startsWith("on:")) {
+    const effort = option.slice(3);
+    return isEffortLevel(effort) ? effort : undefined;
+  }
+  return isEffortLevel(option) ? option : undefined;
 }
 
 /**
@@ -96,6 +124,20 @@ function parseNewSessionDefaults(
     }
     if (typeof input.model === "string" && input.model.length > 0) {
       parsed.model = input.model;
+    }
+  }
+
+  if ("thinking" in input) {
+    if (
+      input.thinking !== undefined &&
+      input.thinking !== null &&
+      input.thinking !== "" &&
+      !isThinkingOption(input.thinking)
+    ) {
+      return null;
+    }
+    if (isThinkingOption(input.thinking)) {
+      parsed.thinking = input.thinking;
     }
   }
 
@@ -258,6 +300,34 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
       const parsedDefaults = parseNewSessionDefaults(body.newSessionDefaults);
       if (parsedDefaults === null) {
         return c.json({ error: "Invalid newSessionDefaults setting" }, 400);
+      }
+      if (parsedDefaults?.provider === "claude") {
+        try {
+          const claudeSettingsPatch: Parameters<
+            typeof updateClaudeCodeSettings
+          >[0] = {};
+          if (parsedDefaults.model !== undefined) {
+            claudeSettingsPatch.model = parsedDefaults.model;
+          }
+          const effortLevel = getEffortFromThinkingOption(
+            parsedDefaults.thinking,
+          );
+          if (effortLevel !== undefined) {
+            claudeSettingsPatch.effortLevel = effortLevel;
+          }
+          if (Object.keys(claudeSettingsPatch).length > 0) {
+            await updateClaudeCodeSettings(claudeSettingsPatch);
+          }
+        } catch (error) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Unknown Claude Code settings error";
+          return c.json(
+            { error: `Failed to update Claude Code settings: ${message}` },
+            500,
+          );
+        }
       }
       updates.newSessionDefaults = parsedDefaults;
     }
