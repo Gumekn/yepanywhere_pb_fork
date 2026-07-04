@@ -60,6 +60,7 @@ RESTART_CODEX_BRIDGE=false
 RESTART_CLAUDE_BRIDGE=false
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
 SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
+SERVER_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
 if [[ "$SERVER_BASE_PATH" == "/" ]]; then
   SERVER_BASE_PATH=""
 else
@@ -433,6 +434,7 @@ if $DO_RESTART; then
   elif $USE_CODEX_BRIDGE_SIDECAR; then
     dim "LaunchAgent ${SERVER_LAUNCHD_LABEL} is not loaded; falling back to nohup (logs: /tmp/yep-server.log)"
     BASE_PATH="${SERVER_BASE_PATH:-/}" \
+      ALLOWED_IMAGE_PATHS="$SERVER_ALLOWED_IMAGE_PATHS" \
       YEP_CODEX_BRIDGE_MODE=external \
       YEP_CODEX_BRIDGE_CONTROL_URL="$CODEX_BRIDGE_HTTP_URL" \
       YEP_CODEX_BRIDGE_PORT="$CODEX_BRIDGE_PORT" \
@@ -441,7 +443,9 @@ if $DO_RESTART; then
       nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
   else
     dim "LaunchAgent ${SERVER_LAUNCHD_LABEL} is not loaded; falling back to nohup (logs: /tmp/yep-server.log)"
-    BASE_PATH="${SERVER_BASE_PATH:-/}" nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
+    BASE_PATH="${SERVER_BASE_PATH:-/}" \
+      ALLOWED_IMAGE_PATHS="$SERVER_ALLOWED_IMAGE_PATHS" \
+      nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
   fi
 
   # Health-check loop. Tries up to 15s; the server usually answers within 2s

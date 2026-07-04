@@ -152,6 +152,8 @@ APK options passed through:
 
 Native push deploy config:
   YEP_DEPLOY_ENV_FILE              Env file to load (default: .env.deploy.local)
+  ALLOWED_IMAGE_PATHS              Extra local media paths for /api/local-image
+                                   (default: /tmp,$HOME/Downloads)
   YEP_ANDROID_GOOGLE_SERVICES_JSON Source path copied to Android app google-services.json
   YEP_FCM_SERVICE_ACCOUNT_FILE     Firebase service account JSON path for server FCM
   YEP_FCM_SERVICE_ACCOUNT_JSON     Raw Firebase service account JSON for server FCM
@@ -197,6 +199,7 @@ REQUIRE_NATIVE_PUSH="${YEP_REQUIRE_NATIVE_PUSH:-false}"
 SYNC_NATIVE_PUSH_LAUNCHAGENT="${YEP_SYNC_NATIVE_PUSH_LAUNCHAGENT:-true}"
 REQUIRE_SESSION_TITLE_GENERATION="${YEP_REQUIRE_SESSION_TITLE_GENERATION:-false}"
 SYNC_SESSION_TITLE_LAUNCHAGENT="${YEP_SYNC_SESSION_TITLE_LAUNCHAGENT:-true}"
+SERVER_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
 NEED_SERVER_LAUNCHAGENT_SYNC=false
 SERVER_LAUNCHAGENT_SYNC_REASONS=()
 
@@ -581,6 +584,53 @@ check_session_title_preflight() {
   fi
 }
 
+check_local_media_preflight() {
+  $DO_SERVER || return 0
+
+  local server_label="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
+  local expected="$SERVER_ALLOWED_IMAGE_PATHS"
+  local launchd_state=""
+  local plist="$HOME/Library/LaunchAgents/$server_label.plist"
+  local plist_content=""
+
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1; then
+    local user_domain="gui/$(id -u)"
+    launchd_state="$(launchctl print "$user_domain/$server_label" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$launchd_state" ]]; then
+    if [[ "$launchd_state" == *"ALLOWED_IMAGE_PATHS"* && "$launchd_state" == *"$expected"* ]]; then
+      dim "local media config: LaunchAgent $server_label allows $expected"
+      return 0
+    fi
+
+    if server_deploy_restarts; then
+      mark_server_launchagent_sync_needed "local media paths"
+      dim "local media config: LaunchAgent $server_label will be updated with ALLOWED_IMAGE_PATHS=$expected"
+    else
+      warn "local media config in loaded LaunchAgent $server_label does not include ALLOWED_IMAGE_PATHS=$expected."
+      dim "server deploy is build-only, so LaunchAgent env was not auto-synced"
+    fi
+    return 0
+  fi
+
+  if [[ -f "$plist" ]]; then
+    plist_content="$(cat "$plist")"
+    if [[ "$plist_content" == *"<key>ALLOWED_IMAGE_PATHS</key>"* && "$plist_content" == *"$expected"* ]]; then
+      dim "local media config: LaunchAgent plist allows $expected"
+      return 0
+    fi
+
+    if server_deploy_restarts; then
+      mark_server_launchagent_sync_needed "local media paths"
+      dim "local media config: LaunchAgent plist will be updated with ALLOWED_IMAGE_PATHS=$expected"
+    else
+      warn "local media config in $plist does not include ALLOWED_IMAGE_PATHS=$expected."
+      dim "server deploy is build-only, so LaunchAgent env was not auto-synced"
+    fi
+  fi
+}
+
 ensure_server_bundle_for_launchagent_sync() {
   local cli_js="$REPO_ROOT/dist/npm-package/dist/cli.js"
 
@@ -745,6 +795,8 @@ sync_android_google_services
 check_native_push_preflight
 log "Checking session title deploy prerequisites ..."
 check_session_title_preflight
+log "Checking local media deploy prerequisites ..."
+check_local_media_preflight
 
 if $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE || $DO_CLAUDE_BRIDGE; }; then
   log "Running preflight checks ..."
