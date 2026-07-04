@@ -149,9 +149,11 @@ export function FileViewerModal({
       onMouseDown={(e) => e.stopPropagation()}
     >
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: click only stops propagation, keyboard handled globally */}
-      <dialog
+      <div
         className="modal file-viewer-modal"
-        open
+        role="dialog"
+        aria-modal="true"
+        aria-label={filePath}
         onClick={(e) => e.stopPropagation()}
       >
         <FileViewer
@@ -160,7 +162,7 @@ export function FileViewerModal({
           lineNumber={lineNumber}
           onClose={onClose}
         />
-      </dialog>
+      </div>
     </div>
   );
 }

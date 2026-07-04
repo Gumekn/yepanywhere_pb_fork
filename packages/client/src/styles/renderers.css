@@ -1291,9 +1291,15 @@ details[open] .collapsible__icon {
 }
 
 .modal {
+  position: relative;
+  box-sizing: border-box;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
   background: var(--bg-surface);
   border: 1px solid var(--border-color);
   border-radius: 4px;
+  color: var(--text-primary);
   width: 90vw;
   max-width: 1200px;
   max-height: 85vh;
@@ -1380,6 +1386,7 @@ details[open] .collapsible__icon {
 
 .modal-content {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 0.5rem;
 }
@@ -3026,6 +3033,8 @@ details[open] .collapsible__icon {
   display: flex;
   flex-direction: column;
   height: 100%;
+  min-height: 0;
+  overflow: hidden;
   background: var(--bg-surface);
 }
 
@@ -3100,8 +3109,11 @@ details[open] .collapsible__icon {
 }
 
 .file-viewer-body {
-  flex: 1;
-  overflow: auto;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
   padding: 0;
 }
 
@@ -3152,11 +3164,13 @@ details[open] .collapsible__icon {
 
 /* Code display with syntax highlighting */
 .file-viewer-code {
+  flex: 1 1 auto;
+  min-height: 0;
   font-family: "SF Mono", Monaco, "Cascadia Code", "Consolas", monospace;
   font-size: var(--font-size-base);
   line-height: 1.5;
   background: var(--bg-code);
-  overflow-x: auto;
+  overflow: auto;
 }
 
 /* Syntax highlighter overrides */
@@ -3308,10 +3322,11 @@ pre.code-highlighter-plain code {
 /* Image display */
 .file-viewer-image {
   display: flex;
+  flex: 1 1 auto;
   align-items: center;
   justify-content: center;
+  min-height: 0;
   padding: 1rem;
-  min-height: 200px;
 }
 
 .file-viewer-image img {
@@ -3324,9 +3339,11 @@ pre.code-highlighter-plain code {
 /* Binary file display */
 .file-viewer-binary {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  min-height: 0;
   gap: 1rem;
   padding: 2rem;
   text-align: center;
@@ -3437,6 +3454,18 @@ pre.code-highlighter-plain code {
   height: 100%;
 }
 
+.file-viewer-modal {
+  height: min(85vh, calc(100vh - 2rem));
+  overflow: hidden;
+}
+
+@media (max-width: 600px) {
+  .file-viewer-modal {
+    height: auto;
+    max-height: none;
+  }
+}
+
 /* ==========================================================================
    File Page (Standalone)
    ========================================================================== */
@@ -3523,6 +3552,7 @@ pre.code-highlighter-plain code {
 /* Markdown preview toggle */
 .markdown-view-toggle {
   display: flex;
+  flex-shrink: 0;
   gap: 0;
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border-subtle);
@@ -3560,6 +3590,8 @@ pre.code-highlighter-plain code {
 
 /* Markdown preview container */
 .markdown-preview {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
 }
 
