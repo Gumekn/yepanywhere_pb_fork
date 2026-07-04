@@ -44,16 +44,17 @@ export function createServerAdminRoutes(deps: ServerAdminDeps): Hono {
       return response;
     }
 
-    // Respond before exiting
+    // Respond before restarting.
+    // Send SIGTERM to self so the registered gracefulShutdown handler aborts
+    // active sessions and cleans up before the process supervisor (scripts/dev.js,
+    // systemd, pm2, launchd) restarts the process.
     const response = c.json({
       ok: true,
       message: "Server restarting...",
     });
 
-    // Schedule exit after response is sent.
-    // Process supervisor (scripts/dev.js, systemd, pm2) will restart the process.
     setTimeout(() => {
-      process.exit(0);
+      process.kill(process.pid, "SIGTERM");
     }, 100);
 
     return response;

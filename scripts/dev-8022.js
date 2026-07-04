@@ -28,7 +28,7 @@ Options:
   --replace                    Stop the current 8022 web/API process first
   --allow-yep-session-interrupt
                                Allow replacing 8022 when Yep-managed sessions are active
-  --no-backend-watch           Disable backend tsx watch reloads
+  --no-backend-watch           Disable supervised backend reloads
   --no-frontend-reload         Disable frontend HMR and show reload banners
   --check                      Run preflight checks without starting or stopping anything
   -h, --help                   Show this help message
@@ -199,9 +199,51 @@ async function stopServerPids(port, pids) {
   );
 }
 
+/**
+ * Ask the running server to shut down gracefully via its maintenance endpoint
+ * (POST /reload). This routes through gracefulShutdown, which aborts active
+ * sessions cleanly and lets the CLI flush jsonl before the process exits —
+ * preserving session history so the user can resume after the restart.
+ *
+ * Falls back to stopServerPids (direct SIGTERM) if the maintenance endpoint is
+ * unreachable or doesn't release the port in time.
+ */
+async function stopServerGracefully(maintenancePort, port, pids) {
+  if (maintenancePort === 0) {
+    await stopServerPids(port, pids);
+    return;
+  }
+
+  const url = `http://127.0.0.1:${maintenancePort}/reload`;
+  console.log(`Asking server to shut down gracefully via ${url}`);
+  try {
+    await fetch(url, { method: "POST" });
+  } catch (error) {
+    console.warn(
+      `Graceful reload via maintenance endpoint failed (${
+        error instanceof Error ? error.message : String(error)
+      }); falling back to SIGTERM`,
+    );
+    await stopServerPids(port, pids);
+    return;
+  }
+
+  // gracefulShutdown aborts sessions (5s timeout each) before exiting; give it
+  // a generous window, then fall back to SIGTERM if the port is still held.
+  if (await waitForPortRelease(port, 15000)) {
+    return;
+  }
+
+  console.warn(
+    `Port ${port} not released after graceful reload; falling back to SIGTERM`,
+  );
+  await stopServerPids(port, pids);
+}
+
 function startDevServer(env, options) {
   const devArgs = [join(rootDir, "scripts/dev.js")];
   if (options.backendWatch) devArgs.push("--watch");
+  else devArgs.push("--no-watch");
   if (options.noFrontendReload) devArgs.push("--no-frontend-reload");
 
   const child = spawn(process.execPath, devArgs, {
@@ -301,7 +343,7 @@ async function main() {
       );
     }
 
-    await stopServerPids(port, serverPids);
+    await stopServerGracefully(maintenancePort, port, serverPids);
 
     const bridgePidsAfter = getListenPids(bridgePort);
     if (bridgePids.length > 0 && !setsOverlap(bridgePids, bridgePidsAfter)) {

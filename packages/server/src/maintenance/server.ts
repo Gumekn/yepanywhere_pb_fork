@@ -404,16 +404,18 @@ async function handleSetProxyDebug(
 
 /** POST /reload */
 function handleReload(res: http.ServerResponse): void {
-  console.log("[Maintenance] Reload requested, exiting...");
+  console.log("[Maintenance] Reload requested, restarting gracefully...");
 
   sendJson(res, 200, {
     message: "Server restarting...",
     timestamp: new Date().toISOString(),
   });
 
-  // Exit after response is sent
+  // Send SIGTERM to self so the main process's gracefulShutdown handler aborts
+  // active sessions and cleans up before the supervisor restarts the process.
+  // (maintenance server runs in the same process as the main server.)
   setTimeout(() => {
-    process.exit(0);
+    process.kill(process.pid, "SIGTERM");
   }, 100);
 }
 

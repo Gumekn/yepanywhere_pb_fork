@@ -4,8 +4,8 @@
  * Dev server wrapper script with configurable reload behavior.
  *
  * Usage:
- *   pnpm dev                      # Default: no Enter-to-restart
- *   pnpm dev --watch              # Enable backend auto-reload on file changes
+ *   pnpm dev                      # Default: supervised backend reload + frontend HMR
+ *   pnpm dev --no-watch           # Backend manual reload (banner), no auto-restart
  *   pnpm dev --no-frontend-reload # Frontend watches but doesn't HMR
  *
  * Environment:
@@ -15,13 +15,20 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  watch,
+} from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { exitIfUnsafeHome } from "./safe-home.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, "..");
+const serverDir = join(rootDir, "packages", "server");
 const isWindows = process.platform === "win32";
 const pnpmBin = isWindows ? "pnpm.cmd" : "pnpm";
 // Node 24+ on Windows requires shell:true to spawn .cmd files (CVE-2024-27980).
@@ -104,16 +111,22 @@ if (args.includes("--help") || args.includes("-h")) {
   console.log(`Usage: pnpm dev [options]
 
 Options:
-  --watch              Enable backend auto-reload (tsx watch mode)
+  --no-watch          Disable backend auto-reload (manual restart mode)
   --no-frontend-reload Frontend watches but doesn't HMR
-  -h, --help           Show this help message
+  -h, --help          Show this help message
+
+By default, supervised backend auto-reload and frontend HMR are both enabled.
+Use --no-watch to switch the backend to manual restart mode (shows a reload
+banner on file changes instead of auto-restarting).
 `);
   process.exit(0);
 }
 
-// Backend auto-reload is OFF by default (no Enter-to-restart behavior)
-// Use --watch to enable tsx watch mode
-const backendWatch = args.includes("--watch");
+// Backend auto-reload is ON by default (dev.js supervises the backend process).
+// Use --no-watch to disable it and fall back to the manual reload banner.
+// (--watch is accepted as a no-op for backwards compatibility with callers
+// like dev-8022.js that used to opt in explicitly.)
+const backendWatch = !args.includes("--no-watch");
 const noFrontendReload = args.includes("--no-frontend-reload");
 
 // Port configuration: PORT + 0 = server, PORT + 1 = maintenance, PORT + 2 = vite
@@ -142,7 +155,7 @@ console.log(
 console.log(
   `  Note: Vite output on :${vitePort} is internal HMR only; browse ${protocol}://${displayHost}:${basePort}`,
 );
-if (backendWatch) console.log("  Backend auto-reload: ENABLED (--watch)");
+if (backendWatch) console.log("  Backend auto-reload: ENABLED");
 if (noFrontendReload) console.log("  Frontend HMR: DISABLED");
 if (!backendWatch && !noFrontendReload)
   console.log("  Frontend HMR: ENABLED, Backend: manual restart only");
@@ -150,7 +163,7 @@ if (!backendWatch && !noFrontendReload)
 // Build environment for child processes
 const env = {
   ...process.env,
-  // When not using --watch, enable manual reload mode (shows banner on file changes)
+  // When backend watch is disabled, enable manual reload mode (shows banner on file changes)
   NO_BACKEND_RELOAD: backendWatch ? "" : "true",
   NO_FRONTEND_RELOAD: noFrontendReload ? "true" : "",
   // Pass vite port to both server and client for consistency
@@ -161,8 +174,17 @@ const env = {
 
 // Track child processes for cleanup
 const children = [];
+const backendSourceWatchers = [];
+const pendingBackendFiles = new Set();
+let serverProcess = null;
+let backendRestartTimer = null;
+let restartRequested = false;
+let restartReason = "";
+let isCleaningUp = false;
 
 function cleanup() {
+  isCleaningUp = true;
+  stopBackendSourceWatchers();
   for (const child of children) {
     if (child && !child.killed) {
       child.kill("SIGTERM");
@@ -184,27 +206,35 @@ process.on("SIGTERM", () => {
  * Spawn a server process
  */
 function startServer() {
-  // Use dev:watch for auto-reload, dev for no-reload (default)
-  const serverScript = backendWatch ? "dev:watch" : "dev";
+  const server = spawn(
+    process.execPath,
+    ["--import", "tsx", "--conditions", "source", "src/index.ts"],
+    {
+      cwd: serverDir,
+      env,
+      stdio: "inherit",
+    },
+  );
 
-  const server = spawn(pnpmBin, ["--filter", "server", serverScript], {
-    cwd: rootDir,
-    env,
-    stdio: "inherit",
-    ...shellOption,
-  });
-
+  serverProcess = server;
   children.push(server);
 
   server.on("exit", (code, signal) => {
+    if (serverProcess === server) serverProcess = null;
+
     // Remove from children list
     const idx = children.indexOf(server);
     if (idx !== -1) children.splice(idx, 1);
 
-    // If server exited cleanly (code 0) and we're in manual reload mode,
-    // it was a reload request - restart it
-    if (!backendWatch && code === 0 && signal === null) {
-      console.log("\nRestarting server...");
+    if (isCleaningUp) return;
+
+    // Restart after a clean self-shutdown (/server/restart or /reload), or
+    // after the wrapper requested a source-change restart.
+    if (restartRequested || (code === 0 && signal === null)) {
+      const reason = restartReason ? ` (${restartReason})` : "";
+      restartRequested = false;
+      restartReason = "";
+      console.log(`\nRestarting server${reason}...`);
       startServer();
     } else if (code !== null && code !== 0) {
       console.error(`Server exited with code ${code}`);
@@ -212,6 +242,133 @@ function startServer() {
   });
 
   return server;
+}
+
+function isBackendSourceFile(filename) {
+  return (
+    (filename.endsWith(".ts") || filename.endsWith(".tsx")) &&
+    !filename.includes("node_modules") &&
+    !filename.includes("dist")
+  );
+}
+
+function summarizeFiles(files) {
+  const shown = files.slice(0, 3).join(", ");
+  return files.length > 3 ? `${shown}, +${files.length - 3} more` : shown;
+}
+
+function requestServerRestart(reason) {
+  if (isCleaningUp) return;
+
+  restartRequested = true;
+  restartReason = reason;
+
+  if (!serverProcess || serverProcess.exitCode !== null) {
+    restartRequested = false;
+    restartReason = "";
+    console.log(`\nStarting server (${reason})...`);
+    startServer();
+    return;
+  }
+
+  if (!serverProcess.killed) {
+    serverProcess.kill("SIGTERM");
+  }
+}
+
+function scheduleBackendRestart() {
+  if (backendRestartTimer) clearTimeout(backendRestartTimer);
+
+  backendRestartTimer = setTimeout(() => {
+    const files = Array.from(pendingBackendFiles);
+    pendingBackendFiles.clear();
+    backendRestartTimer = null;
+
+    if (files.length > 0) {
+      console.log(`[BackendWatch] Source changed: ${summarizeFiles(files)}`);
+    }
+    requestServerRestart("source change");
+  }, 300);
+}
+
+function createWatchHandler(watchDir) {
+  return (_eventType, filename) => {
+    if (!filename) return;
+
+    const file = filename.toString();
+    if (!isBackendSourceFile(file)) return;
+
+    pendingBackendFiles.add(relative(rootDir, join(watchDir, file)));
+    scheduleBackendRestart();
+  };
+}
+
+function watchTree(root, handler) {
+  const watchers = [];
+
+  const visit = (dir) => {
+    watchers.push(watch(dir, handler));
+
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === "node_modules" || entry.name === "dist") continue;
+      visit(join(dir, entry.name));
+    }
+  };
+
+  visit(root);
+  return watchers;
+}
+
+function startWatchingBackendDir(watchDir) {
+  const handler = createWatchHandler(watchDir);
+
+  try {
+    return [watch(watchDir, { recursive: true }, handler)];
+  } catch (error) {
+    console.warn(
+      `[BackendWatch] Recursive watch unavailable for ${relative(
+        rootDir,
+        watchDir,
+      )}; watching existing subdirectories instead.`,
+    );
+    return watchTree(watchDir, handler);
+  }
+}
+
+function startBackendSourceWatchers() {
+  if (!backendWatch || backendSourceWatchers.length > 0) return;
+
+  const watchDirs = [
+    join(rootDir, "packages", "server", "src"),
+    join(rootDir, "packages", "shared", "src"),
+  ];
+
+  for (const watchDir of watchDirs) {
+    if (!existsSync(watchDir) || !statSync(watchDir).isDirectory()) continue;
+
+    const watchers = startWatchingBackendDir(watchDir);
+    for (const watcher of watchers) {
+      watcher.on("error", (error) => {
+        console.error("[BackendWatch] Error:", error);
+      });
+      backendSourceWatchers.push(watcher);
+    }
+
+    console.log(`[BackendWatch] Watching ${relative(rootDir, watchDir)}`);
+  }
+}
+
+function stopBackendSourceWatchers() {
+  if (backendRestartTimer) {
+    clearTimeout(backendRestartTimer);
+    backendRestartTimer = null;
+  }
+  pendingBackendFiles.clear();
+
+  while (backendSourceWatchers.length > 0) {
+    backendSourceWatchers.pop()?.close();
+  }
 }
 
 /**
@@ -249,4 +406,5 @@ function startClient() {
 
 // Start both processes
 startServer();
+startBackendSourceWatchers();
 startClient();
