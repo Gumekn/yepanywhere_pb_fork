@@ -124,11 +124,10 @@ export class NotificationService {
     messageId?: string,
   ): Promise<void> {
     // Use the later of provided timestamp and current server time.
-    // The client sends the file's updatedAt (mtime), but late writes
-    // (e.g., tool results flushed after a process stops) can bump mtime
-    // past that value. Using max(provided, now) ensures that any writes
-    // landing between process stop and user viewing don't flip the
-    // session back to unread.
+    // The client sends the session summary's updatedAt (latest visible
+    // activity). Using max(provided, now) ensures that late non-visible writes
+    // landing between process stop and user viewing don't flip the session back
+    // to unread.
     const now = new Date().toISOString();
     const provided = timestamp ?? now;
     const ts = provided > now ? provided : now;

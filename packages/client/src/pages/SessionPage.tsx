@@ -572,11 +572,11 @@ function SessionPageContent({
   // unread again via updatedAt.
   //
   // We use two timestamps:
-  // - activityAt: max(file mtime, SSE activity) - triggers the mark-seen action
-  // - updatedAt: file mtime only - the timestamp we record
+  // - activityAt: max(session summary update, SSE activity) - triggers the mark-seen action
+  // - updatedAt: latest visible session activity - the timestamp we record
   //
   // This separation prevents a race condition where SSE timestamps (client clock)
-  // could be ahead of file mtime (server disk write time), causing sessions to
+  // could be ahead of the persisted session summary time, causing sessions to
   // never become unread again after viewing.
   const sessionUpdatedAt = session?.updatedAt ?? null;
   const activityAt = useMemo(() => {

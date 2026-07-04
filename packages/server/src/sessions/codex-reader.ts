@@ -95,6 +95,26 @@ function hasNearbyCodexCompactedEntry(
   );
 }
 
+function latestVisibleEntryTimestamp(
+  entries: CodexSessionEntry[],
+): string | null {
+  let latestMs = Number.NEGATIVE_INFINITY;
+  let latestTimestamp: string | null = null;
+
+  for (const entry of entries) {
+    if (entry.type !== "response_item" && entry.type !== "event_msg") {
+      continue;
+    }
+
+    const ms = timestampToMs(entry.timestamp);
+    if (ms === null || ms <= latestMs) continue;
+    latestMs = ms;
+    latestTimestamp = new Date(ms).toISOString();
+  }
+
+  return latestTimestamp;
+}
+
 /**
  * Codex-specific session reader for Codex CLI JSONL files.
  *
@@ -193,7 +213,9 @@ export class CodexSessionReader implements ISessionReader {
         title,
         fullTitle,
         createdAt: metaEntry.payload.timestamp,
-        updatedAt: stats.mtime.toISOString(),
+        updatedAt:
+          latestVisibleEntryTimestamp(visibleEntries) ??
+          stats.mtime.toISOString(),
         messageCount,
         userQuestions,
         ownership: { owner: "none" },

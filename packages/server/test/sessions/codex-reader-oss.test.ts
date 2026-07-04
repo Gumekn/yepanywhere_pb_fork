@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -270,6 +270,50 @@ describe("CodexSessionReader - OSS Support", () => {
       "test-project" as UrlProjectId,
     );
     expect(summary?.provider).toBe("codex");
+  });
+
+  it("uses the latest visible entry timestamp for updatedAt", async () => {
+    const sessionId = "touched-codex-session";
+    const messageTime = new Date("2026-01-01T00:00:00.000Z");
+    const metadataTime = new Date("2025-12-31T23:59:00.000Z");
+    const nonVisibleTime = new Date("2026-01-01T00:05:00.000Z");
+    const touchedTime = new Date("2026-01-01T00:10:00.000Z");
+    const filePath = join(testDir, `${sessionId}.jsonl`);
+    const lines = [
+      JSON.stringify({
+        type: "session_meta",
+        timestamp: metadataTime.toISOString(),
+        payload: {
+          id: sessionId,
+          cwd: "/test/project",
+          timestamp: metadataTime.toISOString(),
+          model_provider: "openai",
+        },
+      }),
+      JSON.stringify({
+        type: "turn_context",
+        timestamp: nonVisibleTime.toISOString(),
+        payload: { model: "gpt-5" },
+      }),
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: messageTime.toISOString(),
+        payload: {
+          type: "user_message",
+          message: "Already read",
+        },
+      }),
+    ];
+
+    await writeFile(filePath, `${lines.join("\n")}\n`);
+    await utimes(filePath, touchedTime, touchedTime);
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+
+    expect(summary?.updatedAt).toBe(messageTime.toISOString());
   });
 
   it("extracts runtime config from the latest turn context", async () => {

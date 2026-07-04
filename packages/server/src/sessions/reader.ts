@@ -90,6 +90,24 @@ type UsageFields = {
   cache_creation_input_tokens?: number;
 };
 
+function latestEntryTimestamp(entries: ClaudeSessionEntry[]): string | null {
+  let latestMs = Number.NEGATIVE_INFINITY;
+  let latestTimestamp: string | null = null;
+
+  for (const entry of entries) {
+    if (!("timestamp" in entry) || typeof entry.timestamp !== "string") {
+      continue;
+    }
+
+    const ms = Date.parse(entry.timestamp);
+    if (!Number.isFinite(ms) || ms <= latestMs) continue;
+    latestMs = ms;
+    latestTimestamp = new Date(ms).toISOString();
+  }
+
+  return latestTimestamp;
+}
+
 /**
  * Get the total input tokens from a usage object.
  * Total = fresh input + cached reads + cache creation.
@@ -323,7 +341,9 @@ export class ClaudeSessionReader implements ISessionReader {
         title: this.extractTitle(firstUserMessage),
         fullTitle,
         createdAt: stats.birthtime.toISOString(),
-        updatedAt: stats.mtime.toISOString(),
+        updatedAt:
+          latestEntryTimestamp(conversationMessages) ??
+          stats.mtime.toISOString(),
         messageCount: conversationMessages.length,
         userQuestions,
         ownership: { owner: "none" }, // Will be updated by Supervisor

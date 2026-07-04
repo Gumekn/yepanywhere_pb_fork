@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { toUrlProjectId } from "@yep-anywhere/shared";
@@ -128,6 +128,26 @@ describe("Session", () => {
       expect(session?.updatedAt).toBeDefined();
       expect(session?.messageCount).toBe(1);
       expect(session?.ownership).toEqual({ owner: "none" });
+    });
+
+    it("uses the latest conversation timestamp for updatedAt", async () => {
+      const sessionId = "session-touched";
+      const messageTime = new Date("2026-01-01T00:00:00.000Z");
+      const touchedTime = new Date("2026-01-01T00:10:00.000Z");
+      const filePath = join(sessionDir, `${sessionId}.jsonl`);
+      const jsonl = JSON.stringify({
+        type: "user",
+        message: { content: "Already read", role: "user" },
+        uuid: `msg-${sessionId}-1`,
+        timestamp: messageTime.toISOString(),
+      });
+
+      await writeFile(filePath, `${jsonl}\n`);
+      await utimes(filePath, touchedTime, touchedTime);
+
+      const summary = await reader.getSessionSummary(sessionId, projectId);
+
+      expect(summary?.updatedAt).toBe(messageTime.toISOString());
     });
   });
 

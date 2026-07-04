@@ -18,11 +18,11 @@ import { api } from "../api/client";
  *
  * We use two different timestamps:
  * - activityAt: Triggers the mark-seen action (includes SSE streaming activity)
- * - updatedAt: The timestamp we send to mark-seen (file mtime)
+ * - updatedAt: The timestamp we send to mark-seen (latest visible session activity)
  *
  * The server takes max(provided timestamp, server now) when recording lastSeen,
- * so late file writes (e.g., tool results flushed after a process stops) that
- * bump mtime won't cause false unread notifications.
+ * so late non-visible file writes that bump mtime won't cause false unread
+ * notifications.
  */
 
 interface UseEngagementTrackingOptions {
@@ -35,9 +35,9 @@ interface UseEngagementTrackingOptions {
    */
   activityAt: string | null;
   /**
-   * ISO timestamp to record when marking seen (file mtime).
-   * This is what hasUnread() compares against, so it must match the file's
-   * actual updatedAt to avoid race conditions.
+   * ISO timestamp to record when marking seen.
+   * This is what hasUnread() compares against, so it must match the session
+   * summary's updatedAt to avoid race conditions.
    */
   updatedAt: string | null;
   /** ISO timestamp of when user last viewed this session */
@@ -73,7 +73,7 @@ export function useEngagementTracking(options: UseEngagementTrackingOptions) {
     return activityAt > lastSeenAt || hasUnread;
   }, [activityAt, lastSeenAt, hasUnread]);
 
-  // Mark session as seen at updatedAt (file mtime), triggered by activityAt.
+  // Mark session as seen at updatedAt, triggered by activityAt.
   // No debounce: "page visible" is the only gate, so we mark immediately.
   const markSeen = useCallback(async () => {
     if (!enabled || !mountedRef.current) return;
