@@ -12,8 +12,10 @@ const MAX_LINES_COLLAPSED = 20;
  */
 function StatusIndicator({ status }: { status: string }) {
   const statusConfig = {
+    success: { icon: "✓", className: "status-completed" },
     running: { icon: "⟳", className: "status-running" },
     completed: { icon: "✓", className: "status-completed" },
+    not_ready: { icon: "⟳", className: "status-running" },
     failed: { icon: "✗", className: "status-failed" },
     timeout: { icon: "⏱", className: "status-timeout" },
   };
@@ -28,6 +30,84 @@ function StatusIndicator({ status }: { status: string }) {
       {config.icon} {status}
     </span>
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function nullableNumberField(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function extractXmlTag(text: string, tag: string): string | undefined {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text);
+  return match?.[1]?.trim();
+}
+
+function parseTaskOutputXml(text: string): TaskOutputResult | undefined {
+  const output = extractXmlTag(text, "output");
+  const retrievalStatus = extractXmlTag(text, "retrieval_status");
+  const status = extractXmlTag(text, "status");
+
+  if (!output && !retrievalStatus && !status) {
+    return undefined;
+  }
+
+  return {
+    retrieval_status: retrievalStatus ?? "completed",
+    task: {
+      task_id: extractXmlTag(text, "task_id") ?? "",
+      task_type: extractXmlTag(text, "task_type") ?? "agent",
+      status: status ?? "completed",
+      description: extractXmlTag(text, "description") ?? "",
+      output: output ?? "",
+      exitCode: null,
+    },
+  } as TaskOutputResult;
+}
+
+function normalizeTaskOutputResult(
+  result: TaskOutputResult | string | { content?: unknown } | undefined,
+): TaskOutputResult | undefined {
+  if (!result) return undefined;
+
+  if (typeof result === "string") {
+    return parseTaskOutputXml(result);
+  }
+
+  if (!isRecord(result)) {
+    return undefined;
+  }
+
+  if ("task" in result && isRecord(result.task)) {
+    const resultRecord = result as Record<string, unknown>;
+    const task = result.task;
+    return {
+      retrieval_status:
+        stringField(resultRecord.retrieval_status) ??
+        (stringField(task.status) === "completed" ? "completed" : "running"),
+      task: {
+        task_id: stringField(task.task_id) ?? "",
+        task_type: stringField(task.task_type) ?? "agent",
+        status: stringField(task.status) ?? "completed",
+        description: stringField(task.description) ?? "",
+        output: stringField(task.output) ?? "",
+        exitCode: nullableNumberField(task.exitCode),
+        _renderedOutputHtml: stringField(task._renderedOutputHtml),
+      },
+    } as TaskOutputResult;
+  }
+
+  if (typeof result.content === "string") {
+    return parseTaskOutputXml(result.content);
+  }
+
+  return undefined;
 }
 
 /**
@@ -81,6 +161,7 @@ function TaskOutputToolResult({
 
   const showValidationWarning =
     enabled && validationErrors && !isToolIgnored("TaskOutput");
+  const normalized = normalizeTaskOutputResult(result);
 
   if (isError) {
     const errorResult = result as unknown as { content?: unknown } | undefined;
@@ -96,11 +177,11 @@ function TaskOutputToolResult({
     );
   }
 
-  if (!result) {
+  if (!normalized) {
     return <div className="taskoutput-empty">No output</div>;
   }
 
-  const task = result.task;
+  const task = normalized.task;
   const outputLines = task?.output?.split("\n") || [];
   const needsCollapse = outputLines.length > MAX_LINES_COLLAPSED;
   const displayLines =
@@ -111,7 +192,7 @@ function TaskOutputToolResult({
   return (
     <div className="taskoutput-result">
       <div className="taskoutput-header">
-        <StatusIndicator status={result.retrieval_status} />
+        <StatusIndicator status={normalized.retrieval_status} />
         {task?.task_type && (
           <span className="badge badge-info">{task.task_type}</span>
         )}
@@ -126,7 +207,7 @@ function TaskOutputToolResult({
         <div className="taskoutput-task">
           <div className="taskoutput-task-status">
             <StatusIndicator status={task.status} />
-            {task.exitCode !== null && (
+            {typeof task.exitCode === "number" && (
               <span
                 className={`badge ${task.exitCode === 0 ? "badge-success" : "badge-error"}`}
               >
@@ -134,7 +215,13 @@ function TaskOutputToolResult({
               </span>
             )}
           </div>
-          {task.output && (
+          {task._renderedOutputHtml ? (
+            <div
+              className="taskoutput-markdown markdown-rendered"
+              // biome-ignore lint/security/noDangerouslySetInnerHtml: server-rendered sanitized markdown HTML
+              dangerouslySetInnerHTML={{ __html: task._renderedOutputHtml }}
+            />
+          ) : task.output ? (
             <>
               <pre className="taskoutput-content code-block">
                 <code>{displayLines.join("\n")}</code>
@@ -151,7 +238,7 @@ function TaskOutputToolResult({
                 </button>
               )}
             </>
-          )}
+          ) : null}
         </div>
       )}
     </div>
@@ -169,6 +256,19 @@ export const taskOutputRenderer: ToolRenderer<
   },
 
   renderToolResult(result, isError, _context) {
+    return (
+      <TaskOutputToolResult
+        result={result as TaskOutputResult}
+        isError={isError}
+      />
+    );
+  },
+
+  renderInline(input, result, isError, status) {
+    if (status === "pending" || status === "aborted") {
+      return <TaskOutputToolUse input={input as TaskOutputInput} />;
+    }
+
     return (
       <TaskOutputToolResult
         result={result as TaskOutputResult}

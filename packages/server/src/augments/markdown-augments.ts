@@ -72,6 +72,60 @@ export async function renderMarkdownToHtml(markdown: string): Promise<string> {
   return cachedRenderMarkdownToHtml(markdown);
 }
 
+export function extractTaskNotificationResult(content: unknown): string | null {
+  const text = getTaskNotificationText(content);
+  if (!text) {
+    return null;
+  }
+
+  const result = extractXmlTag(text, "result");
+  return result ? decodeXmlEntities(result) : null;
+}
+
+function getTaskNotificationText(content: unknown): string | null {
+  if (typeof content === "string") {
+    return content.trimStart().startsWith("<task-notification>")
+      ? content
+      : null;
+  }
+
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  const text = content
+    .map((block) => {
+      if (
+        block &&
+        typeof block === "object" &&
+        "type" in block &&
+        block.type === "text" &&
+        "text" in block &&
+        typeof block.text === "string"
+      ) {
+        return block.text;
+      }
+      return "";
+    })
+    .join("\n");
+
+  return text.trimStart().startsWith("<task-notification>") ? text : null;
+}
+
+function extractXmlTag(text: string, tag: string): string | undefined {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text);
+  return match?.[1]?.trim();
+}
+
+function decodeXmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 /** ~8M chars (≈16MB UTF-16) of distinct markdown inputs retained. */
 const CACHE_MAX_CHARS = 8_000_000;
 
@@ -122,6 +176,26 @@ export async function augmentTextBlocks(
 ): Promise<void> {
   // Process all messages in parallel
   const messagePromises = messages.map(async (msg) => {
+    const taskNotificationResult = extractTaskNotificationResult(
+      msg.message?.content ?? msg.content,
+    );
+    if (taskNotificationResult) {
+      try {
+        const html = await renderMarkdownToHtml(taskNotificationResult);
+        (
+          msg as { _taskNotificationResultHtml?: string }
+        )._taskNotificationResultHtml = html;
+        if (msg.message && typeof msg.message === "object") {
+          (
+            msg.message as { _taskNotificationResultHtml?: string }
+          )._taskNotificationResultHtml = html;
+        }
+      } catch (err) {
+        // Ignore errors during augmentation
+      }
+      return;
+    }
+
     // Only process assistant messages
     if (msg.type !== "assistant") return;
 

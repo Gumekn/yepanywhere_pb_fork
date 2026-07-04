@@ -302,14 +302,20 @@ export interface TaskOutputInput {
 }
 
 export interface TaskOutputResult {
-  retrieval_status: "completed" | "timeout" | "running";
+  retrieval_status:
+    | "completed"
+    | "success"
+    | "not_ready"
+    | "timeout"
+    | "running";
   task: {
     task_id: string;
-    task_type: "local_bash" | "agent";
+    task_type: "local_bash" | "local_agent" | "agent";
     status: "running" | "completed" | "failed";
     description: string;
     output: string;
     exitCode: number | null;
+    _renderedOutputHtml?: string;
   };
 }
 

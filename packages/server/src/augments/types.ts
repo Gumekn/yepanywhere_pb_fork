@@ -34,6 +34,20 @@ export interface ReadResultWithAugment {
   _renderedMarkdownHtml?: string;
 }
 
+/** TaskOutput tool_result structured data with rendered agent output. */
+export interface TaskOutputResultWithAugment {
+  retrieval_status?: string;
+  task?: {
+    task_id?: string;
+    task_type?: string;
+    status?: string;
+    description?: string;
+    output?: string;
+    exitCode?: number | null;
+    _renderedOutputHtml?: string;
+  };
+}
+
 /** Edit tool_use input with embedded augment data */
 export interface EditInputWithAugment extends EditInput {
   _structuredPatch?: Array<{

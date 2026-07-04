@@ -26,7 +26,10 @@ import {
   extractRawPatchFromEditInput,
   parseRawEditPatch,
 } from "./edit-raw-patch.js";
-import { renderMarkdownToHtml } from "./markdown-augments.js";
+import {
+  extractTaskNotificationResult,
+  renderMarkdownToHtml,
+} from "./markdown-augments.js";
 import {
   extractIdFromAssistant,
   extractMessageIdFromStart,
@@ -46,6 +49,7 @@ import type {
   ExitPlanModeInput,
   ExitPlanModeResult,
   ReadResultWithAugment,
+  TaskOutputResultWithAugment,
   WriteInputWithAugment,
 } from "./types.js";
 import { computeWriteAugment } from "./write-augments.js";
@@ -336,6 +340,26 @@ export async function createStreamAugmenter(
     // Check for user message with tool_result and structured tool result payload.
     // Support both snake_case and camelCase keys across provider stream formats.
     if (message.type === "user") {
+      const taskNotificationResult = extractTaskNotificationResult(
+        getMessageContent(message),
+      );
+      if (taskNotificationResult) {
+        try {
+          const html = await renderMarkdownToHtml(taskNotificationResult);
+          (
+            message as { _taskNotificationResultHtml?: string }
+          )._taskNotificationResultHtml = html;
+          const nestedMessage = message.message;
+          if (nestedMessage && typeof nestedMessage === "object") {
+            (
+              nestedMessage as { _taskNotificationResultHtml?: string }
+            )._taskNotificationResultHtml = html;
+          }
+        } catch (err) {
+          handleError(err, "Failed to render task notification result HTML");
+        }
+      }
+
       const toolUseResult = (message.tool_use_result ??
         message.toolUseResult) as ExitPlanModeResult | undefined;
       if (toolUseResult?.plan && !toolUseResult._renderedHtml) {
@@ -373,6 +397,22 @@ export async function createStreamAugmenter(
           }
         } catch (err) {
           handleError(err, "Failed to compute read augment");
+        }
+      }
+
+      const taskOutputResult = (message.tool_use_result ??
+        message.toolUseResult) as TaskOutputResultWithAugment | undefined;
+      if (
+        taskOutputResult?.task?.output &&
+        !taskOutputResult.task._renderedOutputHtml &&
+        (taskOutputResult.task.task_type === "agent" ||
+          taskOutputResult.task.task_type === "local_agent")
+      ) {
+        try {
+          taskOutputResult.task._renderedOutputHtml =
+            await renderMarkdownToHtml(taskOutputResult.task.output);
+        } catch (err) {
+          handleError(err, "Failed to render TaskOutput output HTML");
         }
       }
     }

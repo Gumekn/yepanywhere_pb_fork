@@ -53,6 +53,7 @@ export type {
   ExitPlanModeResult,
   ReadResultWithAugment,
   SDKMessageLike,
+  TaskOutputResultWithAugment,
   WriteInputWithAugment,
 } from "./types.js";
 

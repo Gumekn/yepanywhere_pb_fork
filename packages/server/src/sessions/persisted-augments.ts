@@ -7,6 +7,7 @@ import {
   type ExitPlanModeInput,
   type ExitPlanModeResult,
   type ReadResultWithAugment,
+  type TaskOutputResultWithAugment,
   type WriteInputWithAugment,
   computeEditAugment,
   computeReadAugment,
@@ -260,6 +261,28 @@ export async function augmentExitPlanModeAndReadResults(
                   readResult._renderedMarkdownHtml =
                     augment.renderedMarkdownHtml;
                 }
+              }
+            })
+            .catch(() => {
+              // Augments are best-effort.
+            }),
+        );
+      }
+
+      const taskOutputResult = (toolUseResult ?? toolUseResultSnake) as
+        | TaskOutputResultWithAugment
+        | undefined;
+      if (
+        taskOutputResult?.task?.output &&
+        !taskOutputResult.task._renderedOutputHtml &&
+        (taskOutputResult.task.task_type === "agent" ||
+          taskOutputResult.task.task_type === "local_agent")
+      ) {
+        promises.push(
+          renderMarkdownToHtml(taskOutputResult.task.output)
+            .then((html) => {
+              if (taskOutputResult.task) {
+                taskOutputResult.task._renderedOutputHtml = html;
               }
             })
             .catch(() => {

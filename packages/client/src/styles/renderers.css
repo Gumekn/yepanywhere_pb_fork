@@ -2888,6 +2888,18 @@ details[open] .collapsible__icon {
   margin: 0;
 }
 
+.taskoutput-markdown {
+  color: var(--text-primary);
+}
+
+.taskoutput-markdown > :first-child {
+  margin-top: 0;
+}
+
+.taskoutput-markdown > :last-child {
+  margin-bottom: 0;
+}
+
 .taskoutput-error {
   color: var(--error-color);
   padding: 0.5rem;

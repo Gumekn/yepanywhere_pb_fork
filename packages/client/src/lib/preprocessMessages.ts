@@ -12,6 +12,20 @@ import { getMessageId } from "./mergeMessages";
 
 const CODEX_TURN_ABORTED_DISPLAY_TEXT = "Conversation stopped by user";
 
+interface TaskNotification {
+  taskId: string;
+  toolUseId: string;
+  outputFile?: string;
+  status: string;
+  summary?: string;
+  result?: string;
+  usage?: {
+    subagentTokens?: number;
+    toolUses?: number;
+    durationMs?: number;
+  };
+}
+
 /**
  * When true, indicates the session has an active tool approval request.
  * All orphaned tools will be treated as pending (not interrupted).
@@ -388,6 +402,18 @@ function processMessage(
 ): void {
   const msgId = getMessageId(msg);
 
+  const taskNotification = parseTaskNotificationMessage(msg);
+  if (taskNotification) {
+    attachTaskNotificationResult(
+      taskNotification,
+      msg,
+      items,
+      toolCallIndices,
+      pendingToolCalls,
+    );
+    return;
+  }
+
   // Handle provider/runtime error entries as visible system messages.
   if (msg.type === "error") {
     const errorText =
@@ -596,6 +622,197 @@ function processMessage(
       }
     }
   }
+}
+
+function parseTaskNotificationMessage(msg: Message): TaskNotification | null {
+  const content = msg.message?.content ?? msg.content;
+  const text = getTaskNotificationText(content);
+  if (!text) {
+    return null;
+  }
+
+  const taskId = extractXmlTag(text, "task-id");
+  const toolUseId = extractXmlTag(text, "tool-use-id");
+  if (!taskId || !toolUseId) {
+    return null;
+  }
+
+  return {
+    taskId,
+    toolUseId,
+    outputFile: extractXmlTag(text, "output-file"),
+    status: extractXmlTag(text, "status") ?? "completed",
+    summary: decodeXmlEntities(extractXmlTag(text, "summary") ?? ""),
+    result: decodeXmlEntities(extractXmlTag(text, "result") ?? ""),
+    usage: parseTaskNotificationUsage(extractXmlTag(text, "usage")),
+  };
+}
+
+function getTaskNotificationText(
+  content: string | ContentBlock[] | undefined,
+): string | null {
+  if (typeof content === "string") {
+    const trimmed = content.trimStart();
+    return trimmed.startsWith("<task-notification>") ? content : null;
+  }
+
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  const text = content
+    .filter(
+      (block): block is ContentBlock & { type: "text"; text: string } =>
+        block.type === "text" && typeof block.text === "string",
+    )
+    .map((block) => block.text)
+    .join("\n");
+  return text.trimStart().startsWith("<task-notification>") ? text : null;
+}
+
+function extractXmlTag(text: string, tag: string): string | undefined {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text);
+  return match?.[1]?.trim();
+}
+
+function decodeXmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function parseTaskNotificationUsage(
+  usage: string | undefined,
+): TaskNotification["usage"] {
+  if (!usage) {
+    return undefined;
+  }
+
+  const subagentTokens = parseIntegerXmlField(usage, "subagent_tokens");
+  const toolUses = parseIntegerXmlField(usage, "tool_uses");
+  const durationMs = parseIntegerXmlField(usage, "duration_ms");
+
+  if (
+    subagentTokens === undefined &&
+    toolUses === undefined &&
+    durationMs === undefined
+  ) {
+    return undefined;
+  }
+
+  return { subagentTokens, toolUses, durationMs };
+}
+
+function parseIntegerXmlField(
+  text: string,
+  fieldName: string,
+): number | undefined {
+  const match =
+    new RegExp(`${fieldName}:\\s*(\\d+)`).exec(text) ??
+    new RegExp(`<${fieldName}>(\\d+)</${fieldName}>`).exec(text);
+  if (!match?.[1]) {
+    return undefined;
+  }
+  return Number.parseInt(match[1], 10);
+}
+
+function getTaskNotificationRenderedHtml(msg: Message): string | undefined {
+  const messageRecord = msg as Record<string, unknown>;
+  if (typeof messageRecord._taskNotificationResultHtml === "string") {
+    return messageRecord._taskNotificationResultHtml;
+  }
+
+  const nestedMessage = msg.message as Record<string, unknown> | undefined;
+  return typeof nestedMessage?._taskNotificationResultHtml === "string"
+    ? nestedMessage._taskNotificationResultHtml
+    : undefined;
+}
+
+function taskNotificationStatusToTaskStatus(
+  status: string,
+): "completed" | "failed" | "timeout" {
+  if (status === "completed") {
+    return "completed";
+  }
+  if (status === "timeout") {
+    return "timeout";
+  }
+  return "failed";
+}
+
+function attachTaskNotificationResult(
+  notification: TaskNotification,
+  resultMessage: Message,
+  items: RenderItem[],
+  toolCallIndices: Map<string, number>,
+  pendingToolCalls: Map<string, number>,
+): void {
+  const index = toolCallIndices.get(notification.toolUseId);
+  if (index === undefined) {
+    return;
+  }
+
+  const item = items[index];
+  if (!item || item.type !== "tool_call") {
+    return;
+  }
+
+  const existingStructured = isRecord(item.toolResult?.structured)
+    ? item.toolResult.structured
+    : {};
+  const isError = notification.status !== "completed";
+  const notificationHtml = getTaskNotificationRenderedHtml(resultMessage);
+  const contentBlocks: ContentBlock[] = notification.result
+    ? [
+        {
+          type: "text",
+          text: notification.result,
+          ...(notificationHtml ? { _renderedHtml: notificationHtml } : {}),
+        } as ContentBlock,
+      ]
+    : [];
+
+  const structured = {
+    ...existingStructured,
+    agentId:
+      typeof existingStructured.agentId === "string"
+        ? existingStructured.agentId
+        : notification.taskId,
+    status: taskNotificationStatusToTaskStatus(notification.status),
+    content: contentBlocks,
+    totalTokens:
+      notification.usage?.subagentTokens ??
+      (typeof existingStructured.totalTokens === "number"
+        ? existingStructured.totalTokens
+        : undefined),
+    totalToolUseCount:
+      notification.usage?.toolUses ??
+      (typeof existingStructured.totalToolUseCount === "number"
+        ? existingStructured.totalToolUseCount
+        : undefined),
+    totalDurationMs:
+      notification.usage?.durationMs ??
+      (typeof existingStructured.totalDurationMs === "number"
+        ? existingStructured.totalDurationMs
+        : undefined),
+    outputFile: notification.outputFile,
+    summary: notification.summary,
+  };
+
+  items[index] = {
+    ...item,
+    toolResult: {
+      content: notification.result ?? notification.summary ?? "",
+      isError,
+      structured,
+    },
+    status: isError ? "error" : "complete",
+    sourceMessages: appendSourceMessage(item, resultMessage).sourceMessages,
+  };
+  pendingToolCalls.delete(notification.toolUseId);
 }
 
 function appendSourceMessage(

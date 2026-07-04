@@ -291,6 +291,96 @@ describe("preprocessMessages", () => {
     });
   });
 
+  it("routes task notifications back into the matching Agent tool call", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-1",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "Agent",
+            input: {
+              description: "查找 session 未读状态定义",
+              prompt: "Find unread session logic",
+              subagent_type: "Explore",
+            },
+          },
+        ],
+        timestamp: "2024-01-01T00:00:00Z",
+      },
+      {
+        id: "msg-2",
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool-1",
+            content: [
+              {
+                type: "text",
+                text: "Async agent launched successfully.\nagentId: agent-123\noutput_file: /tmp/agent-123.output",
+              },
+            ],
+          },
+        ],
+        toolUseResult: {
+          isAsync: true,
+          status: "async_launched",
+          agentId: "agent-123",
+          outputFile: "/tmp/agent-123.output",
+        },
+        timestamp: "2024-01-01T00:00:01Z",
+      },
+      {
+        id: "msg-3",
+        role: "user",
+        type: "user",
+        content: `<task-notification>
+<task-id>agent-123</task-id>
+<tool-use-id>tool-1</tool-use-id>
+<output-file>/tmp/agent-123.output</output-file>
+<status>completed</status>
+<summary>Agent "查找 session 未读状态定义" finished</summary>
+<result># Report
+
+Details with a &gt; comparison.</result>
+<usage><subagent_tokens>173541</subagent_tokens><tool_uses>44</tool_uses><duration_ms>640939</duration_ms></usage>
+</task-notification>`,
+        _taskNotificationResultHtml: "<h1>Report</h1><p>Details</p>",
+        timestamp: "2024-01-01T00:00:02Z",
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      id: "tool-1",
+      toolName: "Agent",
+      status: "complete",
+      toolResult: {
+        isError: false,
+        structured: {
+          agentId: "agent-123",
+          status: "completed",
+          totalTokens: 173541,
+          totalToolUseCount: 44,
+          totalDurationMs: 640939,
+          content: [
+            {
+              type: "text",
+              text: "# Report\n\nDetails with a > comparison.",
+              _renderedHtml: "<h1>Report</h1><p>Details</p>",
+            },
+          ],
+        },
+      },
+    });
+  });
+
   it("marks tool_use as pending when result not yet received", () => {
     const messages: Message[] = [
       {
