@@ -908,6 +908,7 @@
   "fileViewerLoadFailed": "Failed to load file",
   "fileViewerLoading": "Loading {name}...",
   "fileViewerNotFound": "File not found",
+  "fileViewerAttemptedPath": "Tried to open",
   "fileViewerSource": "Source",
   "fileViewerPreview": "Preview",
   "fileViewerHighlightTruncated": "File truncated for highlighting (showing first 2000 lines)",

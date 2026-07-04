@@ -353,12 +353,22 @@ export function createFilesRoutes(deps: FilesDeps): Hono {
     try {
       stats = await stat(filePath);
     } catch {
-      return c.json({ error: "File not found" }, 404);
+      return c.json(
+        { error: "File not found", path: relativePath, absolutePath: filePath },
+        404,
+      );
     }
 
     // Must be a file, not a directory
     if (!stats.isFile()) {
-      return c.json({ error: "Path is not a file" }, 400);
+      return c.json(
+        {
+          error: "Path is not a file",
+          path: relativePath,
+          absolutePath: filePath,
+        },
+        400,
+      );
     }
 
     const mimeType = getMimeType(filePath);
@@ -366,6 +376,7 @@ export function createFilesRoutes(deps: FilesDeps): Hono {
 
     const metadata: FileMetadata = {
       path: relativePath,
+      absolutePath: filePath,
       size: stats.size,
       mimeType,
       isText,
@@ -455,12 +466,22 @@ export function createFilesRoutes(deps: FilesDeps): Hono {
     try {
       stats = await stat(filePath);
     } catch {
-      return c.json({ error: "File not found" }, 404);
+      return c.json(
+        { error: "File not found", path: relativePath, absolutePath: filePath },
+        404,
+      );
     }
 
     // Must be a file, not a directory
     if (!stats.isFile()) {
-      return c.json({ error: "Path is not a file" }, 400);
+      return c.json(
+        {
+          error: "Path is not a file",
+          path: relativePath,
+          absolutePath: filePath,
+        },
+        400,
+      );
     }
 
     // Read file content

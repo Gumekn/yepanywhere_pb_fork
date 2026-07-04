@@ -267,6 +267,8 @@ export type SessionOwnership =
 export interface FileMetadata {
   /** File path relative to project root */
   path: string;
+  /** Absolute local filesystem path */
+  absolutePath?: string;
   /** File size in bytes */
   size: number;
   /** MIME type (e.g., "text/typescript", "image/png") */

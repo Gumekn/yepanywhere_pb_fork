@@ -3118,6 +3118,38 @@ details[open] .collapsible__icon {
   color: var(--error-color);
 }
 
+.file-viewer-error-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  max-width: min(720px, 100%);
+  text-align: center;
+}
+
+.file-viewer-error-path {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-width: 100%;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.file-viewer-error-path code,
+.local-file-error code {
+  display: block;
+  max-width: 100%;
+  padding: 0.375rem 0.5rem;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-code);
+  color: var(--text-primary);
+  font-family: "SF Mono", Monaco, "Cascadia Code", "Consolas", monospace;
+  text-align: left;
+}
+
 /* Code display with syntax highlighting */
 .file-viewer-code {
   font-family: "SF Mono", Monaco, "Cascadia Code", "Consolas", monospace;

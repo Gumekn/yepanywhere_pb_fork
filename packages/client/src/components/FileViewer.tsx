@@ -1,6 +1,6 @@
 import type { FileContentResponse } from "@yep-anywhere/shared";
 import { memo, useCallback, useEffect, useState } from "react";
-import { api } from "../api/client";
+import { type ApiError, api } from "../api/client";
 import { useI18n } from "../i18n";
 import { appPath } from "../lib/apiPath";
 
@@ -88,6 +88,17 @@ function getFileName(filePath: string): string {
   return filePath.split("/").pop() || filePath;
 }
 
+function getErrorFilePath(err: unknown, fallbackPath: string): string | null {
+  const apiError = err as Partial<ApiError> | null;
+  if (typeof apiError?.absolutePath === "string") {
+    return apiError.absolutePath;
+  }
+  if (typeof apiError?.path === "string" && apiError.path.startsWith("/")) {
+    return apiError.path;
+  }
+  return fallbackPath.startsWith("/") ? fallbackPath : null;
+}
+
 /**
  * FileViewer component - displays file content with appropriate formatting.
  */
@@ -103,6 +114,7 @@ export const FileViewer = memo(function FileViewer({
   const [fileData, setFileData] = useState<FileContentResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorFilePath, setErrorFilePath] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
@@ -113,6 +125,7 @@ export const FileViewer = memo(function FileViewer({
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setErrorFilePath(null);
 
     // Request highlighting for code files
     api
@@ -126,6 +139,7 @@ export const FileViewer = memo(function FileViewer({
       .catch((err) => {
         if (!cancelled) {
           setError(err.message || t("fileViewerLoadFailed" as never));
+          setErrorFilePath(getErrorFilePath(err, filePath));
           setLoading(false);
         }
       });
@@ -202,13 +216,22 @@ export const FileViewer = memo(function FileViewer({
     return (
       <div className="file-viewer">
         <div className="file-viewer-error">
-          {error || t("fileViewerNotFound" as never)}
+          <div className="file-viewer-error-content">
+            <div>{error || t("fileViewerNotFound" as never)}</div>
+            {errorFilePath && (
+              <div className="file-viewer-error-path">
+                <span>{t("fileViewerAttemptedPath" as never)}</span>
+                <code>{errorFilePath}</code>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );
   }
 
   const { metadata, content, rawUrl } = fileData;
+  const displayPath = metadata.absolutePath ?? filePath;
   const isImage = isImageFile(metadata.mimeType);
 
   // Render content based on file type
@@ -373,8 +396,8 @@ export const FileViewer = memo(function FileViewer({
   const header = (
     <div className="file-viewer-header">
       <div className="file-viewer-info">
-        <span className="file-viewer-path" title={filePath}>
-          {filePath}
+        <span className="file-viewer-path" title={displayPath}>
+          {displayPath}
         </span>
         <span className="file-viewer-meta">
           {formatFileSize(metadata.size)}

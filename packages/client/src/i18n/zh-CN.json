@@ -908,6 +908,7 @@
   "fileViewerLoadFailed": "加载文件失败",
   "fileViewerLoading": "正在加载 {name}...",
   "fileViewerNotFound": "未找到文件",
+  "fileViewerAttemptedPath": "尝试打开",
   "fileViewerSource": "源码",
   "fileViewerPreview": "预览",
   "fileViewerHighlightTruncated": "高亮内容已截断（仅显示前 2000 行）",

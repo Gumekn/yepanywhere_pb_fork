@@ -73,6 +73,7 @@ describe("Files API", () => {
       expect(res.status).toBe(200);
       const json = (await res.json()) as FileContentResponse;
       expect(json.metadata.path).toBe("README.md");
+      expect(json.metadata.absolutePath).toBe(join(projectPath, "README.md"));
       expect(json.metadata.mimeType).toBe("text/markdown");
       expect(json.metadata.isText).toBe(true);
       expect(json.metadata.size).toBeGreaterThan(0);
@@ -94,6 +95,9 @@ describe("Files API", () => {
       expect(res.status).toBe(200);
       const json = (await res.json()) as FileContentResponse;
       expect(json.metadata.path).toBe("src/index.ts");
+      expect(json.metadata.absolutePath).toBe(
+        join(projectPath, "src", "index.ts"),
+      );
       expect(json.metadata.mimeType).toBe("text/typescript");
       expect(json.metadata.isText).toBe(true);
       expect(json.content).toBe('console.log("Hello, world!");');
@@ -173,8 +177,14 @@ describe("Files API", () => {
       );
 
       expect(res.status).toBe(404);
-      const json = (await res.json()) as { error: string };
+      const json = (await res.json()) as {
+        error: string;
+        path?: string;
+        absolutePath?: string;
+      };
       expect(json.error).toBe("File not found");
+      expect(json.path).toBe("nonexistent.txt");
+      expect(json.absolutePath).toBe(join(projectPath, "nonexistent.txt"));
     });
 
     it("returns 400 for path traversal attempt with ..", async () => {
@@ -347,8 +357,14 @@ describe("Files API", () => {
       );
 
       expect(res.status).toBe(404);
-      const json = (await res.json()) as { error: string };
+      const json = (await res.json()) as {
+        error: string;
+        path?: string;
+        absolutePath?: string;
+      };
       expect(json.error).toBe("File not found");
+      expect(json.path).toBe("nonexistent.txt");
+      expect(json.absolutePath).toBe(join(projectPath, "nonexistent.txt"));
     });
   });
 

@@ -236,6 +236,8 @@ export interface SessionMetadataUpdateResponse {
 export interface ApiError extends Error {
   status: number;
   code?: string;
+  absolutePath?: string;
+  path?: string;
   details?: unknown;
   runtime?: SessionRuntime;
   setupRequired?: boolean;
@@ -334,6 +336,8 @@ export async function fetchJSON<T>(
           error?: unknown;
           message?: unknown;
           code?: unknown;
+          absolutePath?: unknown;
+          path?: unknown;
           details?: unknown;
           runtime?: unknown;
         }
@@ -354,6 +358,10 @@ export async function fetchJSON<T>(
     const error = new Error(errorMessage) as ApiError;
     error.status = res.status;
     if (typeof errorBody?.code === "string") error.code = errorBody.code;
+    if (typeof errorBody?.absolutePath === "string") {
+      error.absolutePath = errorBody.absolutePath;
+    }
+    if (typeof errorBody?.path === "string") error.path = errorBody.path;
     if (errorBody?.details !== undefined) error.details = errorBody.details;
     if (errorBody?.runtime !== undefined) {
       error.runtime = errorBody.runtime as SessionRuntime;

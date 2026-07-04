@@ -137,7 +137,12 @@ export function LocalFileModal({
     <Modal title={title} onClose={onClose}>
       <div className="local-file-modal-content">
         {loading && <div className="local-file-loading">Loading...</div>}
-        {error && <div className="local-file-error">{error}</div>}
+        {error && (
+          <div className="local-file-error">
+            <div>{error}</div>
+            <code>{path}</code>
+          </div>
+        )}
         {data && (
           <>
             <div className="local-file-meta" title={path}>
