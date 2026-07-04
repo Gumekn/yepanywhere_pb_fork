@@ -17,6 +17,7 @@ import {
   SidebarNavSection,
 } from "./SidebarNavItem";
 import { Skeleton } from "./Skeleton";
+import { ThinkingIndicator } from "./ThinkingIndicator";
 import { YepAnywhereLogo } from "./YepAnywhereLogo";
 
 const SWIPE_THRESHOLD = 50; // Minimum distance to trigger close
@@ -40,6 +41,12 @@ interface SessionProjectGroup {
   projectName: string;
   sessions: GlobalSessionItem[];
   latestUpdatedAt: string;
+  runningCount: number;
+  unreadCount: number;
+}
+
+function isRunningSession(session: GlobalSessionItem): boolean {
+  return session.activity === "in-turn";
 }
 
 function groupSessionsByProject(
@@ -54,6 +61,14 @@ function groupSessionsByProject(
 
     if (group) {
       group.sessions.push(session);
+      if (isRunningSession(session)) group.runningCount += 1;
+      if (session.hasUnread) group.unreadCount += 1;
+      if (
+        new Date(session.updatedAt).getTime() >
+        new Date(group.latestUpdatedAt).getTime()
+      ) {
+        group.latestUpdatedAt = session.updatedAt;
+      }
       continue;
     }
 
@@ -63,6 +78,8 @@ function groupSessionsByProject(
       projectName: session.projectName || session.projectId,
       sessions: [session],
       latestUpdatedAt: session.updatedAt,
+      runningCount: isRunningSession(session) ? 1 : 0,
+      unreadCount: session.hasUnread ? 1 : 0,
     });
   }
 
@@ -122,7 +139,7 @@ export function Sidebar({
     includeStats: false,
     excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
     enabled: shouldLoadSessionLists,
-    liveUpdates: false,
+    liveUpdates: true,
     metadataLiveUpdates: true,
   });
 
@@ -137,7 +154,7 @@ export function Sidebar({
     includeStats: false,
     excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
     enabled: shouldLoadSessionLists,
-    liveUpdates: false,
+    liveUpdates: true,
     metadataLiveUpdates: true,
   });
 
@@ -448,6 +465,8 @@ export function Sidebar({
         const isCurrentGroup = group.sessions.some(
           (session) => session.id === currentSessionId,
         );
+        const runningLabel = t("agentsRunning");
+        const unreadLabel = t("globalSessionsStatusUnread");
 
         return (
           <div
@@ -469,8 +488,33 @@ export function Sidebar({
                   ›
                 </span>
                 <span className="sidebar-project-main">
-                  <span className="sidebar-project-name">
-                    {group.projectName}
+                  <span className="sidebar-project-title">
+                    <span className="sidebar-project-name">
+                      {group.projectName}
+                    </span>
+                    {group.runningCount > 0 && (
+                      <span
+                        className="sidebar-project-status sidebar-project-status--running"
+                        title={`${group.runningCount} ${runningLabel}`}
+                        aria-label={`${group.runningCount} ${runningLabel}`}
+                      >
+                        <ThinkingIndicator />
+                        <span>{group.runningCount}</span>
+                      </span>
+                    )}
+                    {group.unreadCount > 0 && (
+                      <span
+                        className="sidebar-project-status sidebar-project-status--unread"
+                        title={`${group.unreadCount} ${unreadLabel}`}
+                        aria-label={`${group.unreadCount} ${unreadLabel}`}
+                      >
+                        <span
+                          className="sidebar-project-unread-dot"
+                          aria-hidden="true"
+                        />
+                        <span>{group.unreadCount}</span>
+                      </span>
+                    )}
                   </span>
                   <span className="sidebar-project-meta">
                     {t("projectSelectorSessionsCount", {

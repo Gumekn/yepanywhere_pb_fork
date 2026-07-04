@@ -2110,12 +2110,56 @@ a.sidebar-nav-item {
   gap: 1px;
 }
 
+.sidebar-project-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
 .sidebar-project-name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: var(--font-size-sm);
   font-weight: 500;
+}
+
+.sidebar-project-status {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.2rem;
+  min-width: 1.35rem;
+  height: 1.1rem;
+  padding: 0 0.3rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.sidebar-project-status .thinking-indicator-dot,
+.sidebar-project-unread-dot {
+  width: 6px;
+  height: 6px;
+}
+
+.sidebar-project-status--running {
+  background: color-mix(in srgb, var(--thinking-color) 14%, transparent);
+  color: var(--thinking-color);
+}
+
+.sidebar-project-status--unread {
+  background: var(--status-badge-input-bg);
+  color: var(--status-badge-input-text);
+}
+
+.sidebar-project-unread-dot {
+  display: inline-block;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .sidebar-project-meta {
