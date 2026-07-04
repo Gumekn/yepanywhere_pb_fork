@@ -1,0 +1,134 @@
+import type {
+  AgentActivity,
+  SessionArchiveBlockCode,
+  SessionRuntime,
+} from "@yep-anywhere/shared";
+import type { PermissionMode } from "../sdk/types.js";
+import type { Process } from "../supervisor/Process.js";
+import type { SessionOwnership } from "../supervisor/types.js";
+
+export function getProcessActivity(process: Process): AgentActivity {
+  switch (process.state.type) {
+    case "in-turn":
+    case "idle":
+    case "waiting-input":
+    case "hold":
+    case "terminated":
+      return process.state.type;
+  }
+}
+
+export function isBusyActivity(activity: AgentActivity | undefined): boolean {
+  return (
+    activity === "in-turn" ||
+    activity === "waiting-input" ||
+    activity === "hold"
+  );
+}
+
+function buildSelfOwnership(process: Process): SessionOwnership {
+  return {
+    owner: "self",
+    processId: process.id,
+    permissionMode: process.permissionMode as PermissionMode,
+    modeVersion: process.modeVersion,
+  };
+}
+
+function getArchiveBlock(
+  ownership: SessionOwnership,
+  activity: AgentActivity | undefined,
+): {
+  archiveBlockCode?: SessionArchiveBlockCode;
+  archiveBlockReason?: string;
+} {
+  if (activity === "waiting-input") {
+    return {
+      archiveBlockCode: "waiting_input",
+      archiveBlockReason:
+        "This session is waiting for input. Respond or stop it before archiving.",
+    };
+  }
+
+  if (activity === "hold") {
+    return {
+      archiveBlockCode: "agent_on_hold",
+      archiveBlockReason:
+        "This session is on hold. Resume or stop it before archiving.",
+    };
+  }
+
+  if (activity === "in-turn") {
+    return {
+      archiveBlockCode: "agent_in_turn",
+      archiveBlockReason:
+        "This session is currently running. Wait for it to finish or stop it before archiving.",
+    };
+  }
+
+  if (ownership.owner === "external") {
+    return {
+      archiveBlockCode: "external_active",
+      archiveBlockReason:
+        "This session is controlled by an active external process. Wait for it to finish before archiving.",
+    };
+  }
+
+  return {};
+}
+
+export interface DeriveSessionRuntimeOptions {
+  process?: Process | null;
+  externalActive?: boolean;
+  externalActivity?: AgentActivity;
+  fallbackOwnership?: SessionOwnership;
+}
+
+export function deriveSessionRuntime({
+  process,
+  externalActive = false,
+  externalActivity,
+  fallbackOwnership,
+}: DeriveSessionRuntimeOptions): SessionRuntime {
+  const ownership = process
+    ? buildSelfOwnership(process)
+    : externalActive
+      ? ({ owner: "external" } as const)
+      : (fallbackOwnership ?? { owner: "none" as const });
+
+  const activity = process
+    ? getProcessActivity(process)
+    : externalActive
+      ? externalActivity
+      : undefined;
+
+  const isBusy =
+    isBusyActivity(activity) ||
+    (ownership.owner === "external" && externalActive);
+  const hasResidentWorker = Boolean(process && activity === "idle");
+  const block = isBusy ? getArchiveBlock(ownership, activity) : {};
+
+  return {
+    ownership,
+    activity,
+    isBusy,
+    hasResidentWorker,
+    canArchive: !isBusy,
+    ...block,
+  };
+}
+
+export function pendingInputTypeFromProcess(
+  process: Process | undefined | null,
+): "tool-approval" | "user-question" | undefined {
+  const getPendingInputRequest = (
+    process as
+      | { getPendingInputRequest?: () => { type: string } | null }
+      | undefined
+      | null
+  )?.getPendingInputRequest;
+  if (!getPendingInputRequest) return undefined;
+  const request = getPendingInputRequest.call(process);
+  if (!request) return undefined;
+  return request.type === "tool-approval" ? "tool-approval" : "user-question";
+}

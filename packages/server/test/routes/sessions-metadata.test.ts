@@ -127,6 +127,17 @@ describe("Sessions metadata route", () => {
 
     const json = await response.json();
     expect(json.session.provider).toBe("codex");
+    expect(json.runtime).toMatchObject({
+      ownership: { owner: "self", processId: "proc-1" },
+      activity: "idle",
+      hasResidentWorker: true,
+      canArchive: true,
+    });
+    expect(json.session.runtime).toMatchObject({
+      activity: "idle",
+      hasResidentWorker: true,
+      canArchive: true,
+    });
   });
 
   it("prefers persisted provider over conflicting client resume provider", async () => {
@@ -343,4 +354,149 @@ describe("Sessions metadata route", () => {
       await rm(testDir, { recursive: true, force: true });
     }
   });
+
+  it("archives an idle owned session after releasing the resident worker", async () => {
+    const testDir = join(tmpdir(), `yep-route-idle-archive-${randomUUID()}`);
+    const dataDir = join(testDir, "data");
+    const sessionDir = join(testDir, "claude", "projects", "-tmp-project");
+
+    try {
+      await mkdir(sessionDir, { recursive: true });
+      const project = { ...createProject(), sessionDir, provider: "claude" };
+      const sessionId = "idle-owned-session";
+      const sessionPath = join(sessionDir, `${sessionId}.jsonl`);
+      await writeFile(sessionPath, '{"type":"assistant","message":{}}\n');
+
+      const summary = {
+        ...createSummary(),
+        id: sessionId,
+        provider: "claude" as const,
+        title: "Idle archive target",
+        fullTitle: "Idle archive target",
+      };
+      const reader = {
+        getSessionSummary: vi.fn(async () => summary),
+        getSessionFilePath: vi.fn(async () => sessionPath),
+      } as unknown as ISessionReader;
+      const archiveService = new SessionArchiveService({ dataDir });
+      await archiveService.initialize();
+      let residentProcess:
+        | {
+            id: string;
+            permissionMode: string;
+            modeVersion: number;
+            state: { type: "idle"; since: Date };
+          }
+        | undefined = {
+        id: "proc-idle",
+        permissionMode: "default",
+        modeVersion: 0,
+        state: { type: "idle", since: new Date("2026-03-10T09:47:00.000Z") },
+      };
+      const abortProcess = vi.fn(async () => {
+        residentProcess = undefined;
+        return true;
+      });
+
+      const routes = createSessionsRoutes({
+        supervisor: {
+          getProcessForSession: vi.fn(() => residentProcess),
+          abortProcess,
+        } as unknown as SessionsDeps["supervisor"],
+        scanner: {
+          listProjects: vi.fn(async () => [project]),
+          invalidateCache: vi.fn(),
+        } as unknown as SessionsDeps["scanner"],
+        readerFactory: vi.fn(() => reader),
+        sessionMetadataService: {
+          getProvider: vi.fn(() => undefined),
+          updateMetadata: vi.fn(async () => undefined),
+        } as unknown as NonNullable<SessionsDeps["sessionMetadataService"]>,
+        sessionArchiveService: archiveService,
+      });
+
+      const response = await routes.request(`/sessions/${sessionId}/metadata`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived: true }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(abortProcess).toHaveBeenCalledWith("proc-idle");
+      expect(residentProcess).toBeUndefined();
+      await expect(stat(sessionPath)).rejects.toThrow();
+      expect(archiveService.getArchivedSession(sessionId)).toMatchObject({
+        sessionId,
+        provider: "claude",
+      });
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["in-turn", "agent_in_turn"],
+    ["waiting-input", "waiting_input"],
+  ] as const)(
+    "rejects archiving a %s owned session with a structured reason",
+    async (stateType, expectedCode) => {
+      const updateMetadata = vi.fn(async () => undefined);
+      const abortProcess = vi.fn(async () => true);
+      const processState =
+        stateType === "waiting-input"
+          ? {
+              type: "waiting-input" as const,
+              request: {
+                id: "req-1",
+                sessionId: "sess-1",
+                type: "tool-approval" as const,
+                prompt: "Approve?",
+                timestamp: "2026-03-10T09:47:00.000Z",
+              },
+            }
+          : { type: "in-turn" as const };
+
+      const routes = createSessionsRoutes({
+        supervisor: {
+          getProcessForSession: vi.fn(() => ({
+            id: "proc-busy",
+            permissionMode: "default",
+            modeVersion: 0,
+            state: processState,
+          })),
+          abortProcess,
+        } as unknown as SessionsDeps["supervisor"],
+        scanner: {
+          listProjects: vi.fn(async () => []),
+        } as unknown as SessionsDeps["scanner"],
+        readerFactory: vi.fn(),
+        sessionMetadataService: {
+          updateMetadata,
+        } as unknown as NonNullable<SessionsDeps["sessionMetadataService"]>,
+        sessionArchiveService: {
+          getSession: vi.fn(),
+        } as unknown as SessionsDeps["sessionArchiveService"],
+      });
+
+      const response = await routes.request("/sessions/sess-1/metadata", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived: true }),
+      });
+
+      expect(response.status).toBe(409);
+      const json = await response.json();
+      expect(json).toMatchObject({
+        code: expectedCode,
+        runtime: {
+          canArchive: false,
+          isBusy: true,
+          activity: stateType,
+        },
+      });
+      expect(json.error).toEqual(expect.any(String));
+      expect(abortProcess).not.toHaveBeenCalled();
+      expect(updateMetadata).not.toHaveBeenCalled();
+    },
+  );
 });

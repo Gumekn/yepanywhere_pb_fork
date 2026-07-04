@@ -59,6 +59,12 @@ export interface CachedSessionSummary {
   source?: string;
   /** Explicit creation owner recorded in summary metadata when available. */
   createdBy?: SessionSummary["createdBy"];
+  /**
+   * True when the active branch ends on an unanswered user message or a
+   * mid-stream assistant message — the last turn was interrupted (e.g. by a
+   * server restart) and the session can be resumed.
+   */
+  interrupted?: boolean;
 }
 
 export interface SessionIndexState {
@@ -486,6 +492,7 @@ export class SessionIndexService implements ISessionIndexService {
         originator: cached.originator,
         source: cached.source,
         createdBy: cached.createdBy,
+        interrupted: cached.interrupted,
       });
     }
 
@@ -519,6 +526,7 @@ export class SessionIndexService implements ISessionIndexService {
       originator: summary.originator,
       source: summary.source,
       createdBy: summary.createdBy,
+      interrupted: summary.interrupted,
     };
   }
 

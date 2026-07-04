@@ -19,6 +19,7 @@ import type {
   SessionCreatedBy,
   SessionKind,
   SessionQuestion,
+  SessionRuntime,
   SlashCommand,
   ThinkingOption,
   UploadedFile,
@@ -59,6 +60,7 @@ export interface InboxItem {
   updatedAt: string;
   pendingInputType?: PendingInputType;
   activity?: AgentActivity;
+  runtime?: SessionRuntime;
   hasUnread?: boolean;
   createdBy?: SessionCreatedBy;
   originator?: string;
@@ -94,6 +96,7 @@ export interface GlobalSessionItem {
   ownership: SessionStatus;
   pendingInputType?: PendingInputType;
   activity?: AgentActivity;
+  runtime?: SessionRuntime;
   hasUnread?: boolean;
   customTitle?: string;
   aiTitle?: string;
@@ -115,6 +118,11 @@ export interface GlobalSessionItem {
   reasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g. "fast"). */
   serviceTier?: string;
+  /**
+   * True when the session's last turn was interrupted (e.g. by a server
+   * restart) and it can be resumed. Only set for owner==="none" sessions.
+   */
+  interrupted?: boolean;
 }
 
 /** Stats about all sessions (computed during full scan on server) */
@@ -225,6 +233,14 @@ export interface SessionMetadataUpdateResponse {
   };
 }
 
+export interface ApiError extends Error {
+  status: number;
+  code?: string;
+  details?: unknown;
+  runtime?: SessionRuntime;
+  setupRequired?: boolean;
+}
+
 export interface SessionOptions {
   mode?: PermissionMode;
   /** Model ID (e.g., "sonnet", "opus", "qwen2.5-coder:0.5b") */
@@ -313,12 +329,21 @@ export async function fetchJSON<T>(
 
     // Try to parse error message from response body
     let errorMessage = `API error: ${res.status} ${res.statusText}`;
+    let errorBody:
+      | {
+          error?: unknown;
+          message?: unknown;
+          code?: unknown;
+          details?: unknown;
+          runtime?: unknown;
+        }
+      | undefined;
     try {
-      const body = await res.json();
-      if (body.error) {
-        errorMessage = body.error;
-      } else if (body.message) {
-        errorMessage = body.message;
+      errorBody = await res.json();
+      if (typeof errorBody?.error === "string") {
+        errorMessage = errorBody.error;
+      } else if (typeof errorBody?.message === "string") {
+        errorMessage = errorBody.message;
       }
     } catch {
       // Response body wasn't JSON, use default message
@@ -326,11 +351,13 @@ export async function fetchJSON<T>(
 
     // Include setup required info in error for auth handling
     const setupRequired = res.headers.get("X-Setup-Required") === "true";
-    const error = new Error(errorMessage) as Error & {
-      status: number;
-      setupRequired?: boolean;
-    };
+    const error = new Error(errorMessage) as ApiError;
     error.status = res.status;
+    if (typeof errorBody?.code === "string") error.code = errorBody.code;
+    if (errorBody?.details !== undefined) error.details = errorBody.details;
+    if (errorBody?.runtime !== undefined) {
+      error.runtime = errorBody.runtime as SessionRuntime;
+    }
     if (setupRequired) error.setupRequired = true;
     throw error;
   }
@@ -734,6 +761,7 @@ export const api = {
       session: Session;
       messages: Message[];
       ownership: SessionStatus;
+      runtime?: SessionRuntime;
       pendingInputRequest?: InputRequest | null;
       slashCommands?: SlashCommand[] | null;
       pagination?: PaginationInfo;
@@ -748,6 +776,7 @@ export const api = {
     fetchJSON<{
       session: Session;
       ownership: SessionStatus;
+      runtime?: SessionRuntime;
       pendingInputRequest?: InputRequest | null;
       slashCommands?: SlashCommand[] | null;
     }>(`/projects/${projectId}/sessions/${sessionId}/metadata`),

@@ -41,6 +41,8 @@ function getStateLabel(state: string, t: (key: never) => string): string {
       return t("agentsRunning" as never);
     case "waiting-input":
       return t("agentsNeedsInput" as never);
+    case "hold":
+      return "Hold";
     case "idle":
       return t("agentsIdle" as never);
     case "terminated":
@@ -58,6 +60,8 @@ function getStateBadgeClass(state: string): string {
     case "running":
       return "agent-state-running";
     case "waiting-input":
+      return "agent-state-input";
+    case "hold":
       return "agent-state-input";
     case "idle":
       return "agent-state-idle";
@@ -197,9 +201,12 @@ export function AgentsPage() {
 
   const { openSidebar, isWideScreen } = useNavigationLayout();
 
-  // Split processes into active (in-turn/waiting-input) and idle
+  // Split processes into active/busy and idle
   const activeProcesses = processes.filter(
-    (p) => p.state === "in-turn" || p.state === "waiting-input",
+    (p) =>
+      p.state === "in-turn" ||
+      p.state === "waiting-input" ||
+      p.state === "hold",
   );
   const idleProcesses = processes.filter((p) => p.state === "idle");
 

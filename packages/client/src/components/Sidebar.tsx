@@ -423,8 +423,10 @@ export function Sidebar({
       originator={session.originator}
       sessionSource={session.source}
       status={session.ownership}
+      runtime={session.runtime}
       pendingInputType={session.pendingInputType}
       hasUnread={session.hasUnread}
+      interrupted={session.interrupted}
       isStarred={session.isStarred}
       isArchived={session.isArchived}
       mode="compact"

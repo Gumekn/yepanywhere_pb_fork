@@ -78,6 +78,73 @@ function mergeFetchedSession(
   return incoming;
 }
 
+function isBusyActivity(activity: GlobalSessionItem["activity"]): boolean {
+  return (
+    activity === "in-turn" ||
+    activity === "waiting-input" ||
+    activity === "hold"
+  );
+}
+
+function getArchiveBlockForActivity(
+  ownership: GlobalSessionItem["ownership"],
+  activity: GlobalSessionItem["activity"],
+): Partial<
+  Pick<
+    NonNullable<GlobalSessionItem["runtime"]>,
+    "archiveBlockCode" | "archiveBlockReason"
+  >
+> {
+  if (activity === "waiting-input") {
+    return {
+      archiveBlockCode: "waiting_input",
+      archiveBlockReason:
+        "This session is waiting for input. Respond or stop it before archiving.",
+    };
+  }
+  if (activity === "hold") {
+    return {
+      archiveBlockCode: "agent_on_hold",
+      archiveBlockReason:
+        "This session is on hold. Resume or stop it before archiving.",
+    };
+  }
+  if (activity === "in-turn") {
+    return {
+      archiveBlockCode: "agent_in_turn",
+      archiveBlockReason:
+        "This session is currently running. Wait for it to finish or stop it before archiving.",
+    };
+  }
+  if (ownership.owner === "external") {
+    return {
+      archiveBlockCode: "external_active",
+      archiveBlockReason:
+        "This session is controlled by an active external process. Wait for it to finish before archiving.",
+    };
+  }
+  return {};
+}
+
+function updateRuntimeSnapshot(
+  session: GlobalSessionItem,
+  ownership: GlobalSessionItem["ownership"],
+  activity: GlobalSessionItem["activity"],
+): GlobalSessionItem["runtime"] {
+  const isBusy = isBusyActivity(activity) || ownership.owner === "external";
+  const block = isBusy ? getArchiveBlockForActivity(ownership, activity) : {};
+  return {
+    ...session.runtime,
+    ownership,
+    activity,
+    isBusy,
+    hasResidentWorker: ownership.owner === "self" && activity === "idle",
+    canArchive: !isBusy,
+    archiveBlockCode: block.archiveBlockCode,
+    archiveBlockReason: block.archiveBlockReason,
+  };
+}
+
 export interface UseGlobalSessionsOptions {
   projectId?: string | null;
   searchQuery?: string;
@@ -336,9 +403,19 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
               projectName:
                 existing.projectName ?? project?.name ?? data.session.projectId,
               ownership: data.ownership,
+              runtime: data.runtime ?? data.session.runtime ?? existing.runtime,
               pendingInputType:
-                data.session.pendingInputType ?? existing.pendingInputType,
-              activity: data.session.activity ?? existing.activity,
+                data.session.pendingInputType ??
+                (data.ownership.owner === "none"
+                  ? undefined
+                  : existing.pendingInputType),
+              activity:
+                data.session.runtime?.activity ??
+                data.runtime?.activity ??
+                data.session.activity ??
+                (data.ownership.owner === "none"
+                  ? undefined
+                  : existing.activity),
               hasUnread: data.session.hasUnread ?? existing.hasUnread,
               customTitle: data.session.customTitle,
               aiTitle: data.session.aiTitle,
@@ -436,49 +513,45 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   // Handle session ownership changes
   const handleSessionStatusChange = useCallback((event: SessionStatusEvent) => {
     setSessions((prev) =>
-      prev.map((session) =>
-        session.id === event.sessionId
-          ? { ...session, ownership: event.ownership }
-          : session,
-      ),
+      prev.map((session) => {
+        if (session.id !== event.sessionId) return session;
+        const activity =
+          event.ownership.owner === "none" ? undefined : session.activity;
+        return {
+          ...session,
+          ownership: event.ownership,
+          pendingInputType:
+            event.ownership.owner === "none"
+              ? undefined
+              : session.pendingInputType,
+          activity,
+          runtime: updateRuntimeSnapshot(session, event.ownership, activity),
+        };
+      }),
     );
-
-    // Clear activity when session goes to none ownership
-    if (event.ownership.owner === "none") {
-      setSessions((prev) =>
-        prev.map((session) =>
-          session.id === event.sessionId
-            ? {
-                ...session,
-                pendingInputType: undefined,
-                activity: undefined,
-              }
-            : session,
-        ),
-      );
-    }
   }, []);
 
   // Handle process state changes
   const handleProcessStateChange = useCallback((event: ProcessStateEvent) => {
     setSessions((prev) =>
-      prev.map((session) =>
-        session.id === event.sessionId
-          ? { ...session, activity: event.activity }
-          : session,
-      ),
+      prev.map((session) => {
+        if (session.id !== event.sessionId) return session;
+        const pendingInputType =
+          event.activity === "waiting-input"
+            ? (event.pendingInputType ?? session.pendingInputType)
+            : undefined;
+        return {
+          ...session,
+          activity: event.activity,
+          pendingInputType,
+          runtime: updateRuntimeSnapshot(
+            session,
+            session.ownership,
+            event.activity,
+          ),
+        };
+      }),
     );
-
-    // When state changes to "in-turn", clear pendingInputType
-    if (event.activity === "in-turn") {
-      setSessions((prev) =>
-        prev.map((session) =>
-          session.id === event.sessionId
-            ? { ...session, pendingInputType: undefined }
-            : session,
-        ),
-      );
-    }
   }, []);
 
   // Handle new session created
@@ -536,6 +609,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           ownership: event.session.ownership,
           pendingInputType: event.session.pendingInputType,
           activity: event.session.activity,
+          runtime: event.session.runtime,
           hasUnread: event.session.hasUnread,
           customTitle: event.session.customTitle,
           aiTitle: event.session.aiTitle,
@@ -716,7 +790,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     onSessionMetadataChange: metadataLiveUpdates
       ? handleSessionMetadataChange
       : undefined,
-    onSessionSeen: liveUpdates ? handleSessionSeen : undefined,
+    // Seen/unread is a metadata-level change (like title/starred), not a
+    // high-frequency process activity. Bind it to metadataLiveUpdates so the
+    // sidebar (liveUpdates=false, metadataLiveUpdates=true) still clears the
+    // unread dot via a single-item update instead of waiting for a full refetch.
+    onSessionSeen: metadataLiveUpdates ? handleSessionSeen : undefined,
     onSessionUpdated: liveUpdates ? handleSessionUpdated : undefined,
     onReconnect: liveUpdates ? handleReconnect : undefined,
   });

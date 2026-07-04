@@ -4,28 +4,26 @@ import { api } from "../api/client";
 /**
  * Tracks user engagement with a session to determine when to mark it as "seen".
  *
- * We don't want to mark a session as seen just because the page is open:
- * - User might have left their laptop open
- * - Auto-scrolling content doesn't mean user is reading
+ * Definition of "seen": if the session page is visible, the user has seen it.
+ * - Navigating into the session = seen (the page is visible at that moment)
+ * - New content arriving while the page is visible = seen
+ * - Page in the background = not seen (new content stays unread until the user
+ *   returns)
  *
- * We mark as seen when:
- * 1. Tab is focused (document.hasFocus())
- * 2. User has interacted recently (within last 30 seconds)
- * 3. Session has new content (activityAt > lastSeenAt)
+ * This intentionally avoids heuristics like "tab focused + recent interaction".
+ * Such checks sound careful but in practice cause sessions to stay unread after
+ * a quick glance (debounce timers dropped on unmount, mobile scroll not
+ * counting as interaction, etc.). For a mobile-first monitor, "I opened it"
+ * is the right semantic.
  *
- * Important: We use two different timestamps:
+ * We use two different timestamps:
  * - activityAt: Triggers the mark-seen action (includes SSE streaming activity)
  * - updatedAt: The timestamp we send to mark-seen (file mtime)
  *
  * The server takes max(provided timestamp, server now) when recording lastSeen,
  * so late file writes (e.g., tool results flushed after a process stops) that
  * bump mtime won't cause false unread notifications.
- *
- * Debounces API calls to avoid excessive writes.
  */
-
-const INTERACTION_TIMEOUT_MS = 30_000; // 30 seconds
-const DEBOUNCE_MS = 2_000; // 2 seconds
 
 interface UseEngagementTrackingOptions {
   /** Session ID to track */
@@ -60,16 +58,9 @@ export function useEngagementTracking(options: UseEngagementTrackingOptions) {
     enabled = true,
   } = options;
 
-  // Track last user interaction time
-  const lastInteractionRef = useRef<number>(Date.now());
-  // Track if we've already marked this content as seen (by activityAt)
-  const markedSeenRef = useRef<string | null>(null);
-  // Debounce timer
-  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Track if component is mounted
   const mountedRef = useRef(true);
-  // Track if this is the first time activityAt became available (initial navigation)
-  const isInitialLoadRef = useRef(true);
+  // Track the activityAt we've already marked as seen (avoids duplicate calls)
+  const markedSeenRef = useRef<string | null>(null);
 
   // Check if there's content that needs to be marked as seen.
   // This includes:
@@ -82,165 +73,72 @@ export function useEngagementTracking(options: UseEngagementTrackingOptions) {
     return activityAt > lastSeenAt || hasUnread;
   }, [activityAt, lastSeenAt, hasUnread]);
 
-  // Check if user is actively engaged
-  const isEngaged = useCallback(() => {
-    const isFocused = document.hasFocus();
-    const hasRecentInteraction =
-      Date.now() - lastInteractionRef.current < INTERACTION_TIMEOUT_MS;
-    return isFocused && hasRecentInteraction;
-  }, []);
-
-  // Mark session as seen (debounced)
-  // Records updatedAt (file mtime), but triggers based on activityAt
-  const markSeen = useCallback(() => {
+  // Mark session as seen at updatedAt (file mtime), triggered by activityAt.
+  // No debounce: "page visible" is the only gate, so we mark immediately.
+  const markSeen = useCallback(async () => {
     if (!enabled || !mountedRef.current) return;
     if (!activityAt || !updatedAt) return;
-
-    // Don't re-mark if we've already marked this activity
     if (markedSeenRef.current === activityAt) return;
-
-    // Check engagement NOW, before the debounce.
-    // If user is engaged when we decide to mark seen, follow through.
-    // The debounce is just to avoid API spam, not to re-validate engagement.
-    if (!isEngaged()) return;
     if (!hasNewContent()) return;
 
-    // Clear any pending debounce
-    if (debounceTimerRef.current) {
-      clearTimeout(debounceTimerRef.current);
-    }
-
-    // Debounce the API call
-    debounceTimerRef.current = setTimeout(async () => {
-      if (!mountedRef.current) return;
-      // Re-check hasNewContent in case it changed during debounce,
-      // but don't re-check engagement (we already validated it)
-
-      try {
-        // Record the file's updatedAt, not activityAt
-        // This ensures hasUnread() comparisons work correctly
-        await api.markSessionSeen(sessionId, updatedAt);
+    try {
+      await api.markSessionSeen(sessionId, updatedAt);
+      if (mountedRef.current) {
         markedSeenRef.current = activityAt;
-      } catch (error) {
-        console.warn(
-          "[useEngagementTracking] Failed to mark session as seen:",
-          error,
-        );
       }
-    }, DEBOUNCE_MS);
-  }, [enabled, sessionId, activityAt, updatedAt, isEngaged, hasNewContent]);
+    } catch (error) {
+      console.warn(
+        "[useEngagementTracking] Failed to mark session as seen:",
+        error,
+      );
+    }
+  }, [enabled, activityAt, updatedAt, hasNewContent, sessionId]);
 
-  // Track user interactions
+  // Mark as seen when new content arrives while the page is visible.
+  // Covers the initial navigation too: activityAt first becomes available with
+  // the page visible, so this fires immediately on entry.
   useEffect(() => {
     if (!enabled) return;
-
-    const handleInteraction = () => {
-      lastInteractionRef.current = Date.now();
-
-      // If engaged and there's new content, schedule mark-seen
-      if (hasNewContent() && isEngaged()) {
-        markSeen();
-      }
-    };
-
-    // Track various interaction types
-    const events = ["mousemove", "keydown", "scroll", "click", "touchstart"];
-    for (const event of events) {
-      window.addEventListener(event, handleInteraction, { passive: true });
+    if (document.visibilityState !== "visible") return;
+    if (hasNewContent()) {
+      markSeen();
     }
+  }, [enabled, hasNewContent, markSeen]);
 
-    return () => {
-      for (const event of events) {
-        window.removeEventListener(event, handleInteraction);
-      }
-    };
-  }, [enabled, hasNewContent, isEngaged, markSeen]);
-
-  // Track focus changes
+  // Mark as seen when the page becomes visible (e.g., switching back to the tab
+  // or returning from background). Catches content that arrived while hidden.
   useEffect(() => {
     if (!enabled) return;
 
     const handleVisibilityChange = () => {
-      if (
-        document.visibilityState === "visible" &&
-        hasNewContent() &&
-        isEngaged()
-      ) {
-        markSeen();
-      }
-    };
-
-    const handleFocus = () => {
-      // Record interaction when focusing
-      lastInteractionRef.current = Date.now();
-      if (hasNewContent() && isEngaged()) {
+      if (document.visibilityState === "visible" && hasNewContent()) {
         markSeen();
       }
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("focus", handleFocus);
-
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("focus", handleFocus);
     };
-  }, [enabled, hasNewContent, isEngaged, markSeen]);
-
-  // Handle initial navigation: when activityAt first becomes available,
-  // mark as seen if there's new content. No engagement check needed -
-  // the user navigating to this session IS engagement.
-  // After initial load, we rely on interaction/focus handlers.
-  useEffect(() => {
-    if (!enabled) return;
-    if (!activityAt || !updatedAt) return;
-    if (!isInitialLoadRef.current) return;
-
-    // Mark that we've handled initial load
-    isInitialLoadRef.current = false;
-
-    // If there's new content, mark it as seen after a brief debounce
-    if (hasNewContent()) {
-      // Clear any pending debounce
-      if (debounceTimerRef.current) {
-        clearTimeout(debounceTimerRef.current);
-      }
-
-      debounceTimerRef.current = setTimeout(async () => {
-        if (!mountedRef.current) return;
-        if (markedSeenRef.current === activityAt) return;
-
-        try {
-          await api.markSessionSeen(sessionId, updatedAt);
-          markedSeenRef.current = activityAt;
-        } catch (error) {
-          console.warn(
-            "[useEngagementTracking] Failed to mark session as seen:",
-            error,
-          );
-        }
-      }, DEBOUNCE_MS);
-    }
-  }, [enabled, sessionId, activityAt, updatedAt, hasNewContent]);
+  }, [enabled, hasNewContent, markSeen]);
 
   // Cleanup
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      if (debounceTimerRef.current) {
-        clearTimeout(debounceTimerRef.current);
-      }
     };
   }, []);
 
-  // Force mark as seen (for explicit user action, bypasses engagement check)
+  // Force mark as seen (for explicit user action, bypasses visibility check)
   const forceMarkSeen = useCallback(async () => {
     if (!enabled || !updatedAt) return;
 
     try {
       await api.markSessionSeen(sessionId, updatedAt);
-      markedSeenRef.current = activityAt;
+      if (mountedRef.current) {
+        markedSeenRef.current = activityAt;
+      }
     } catch (error) {
       console.warn(
         "[useEngagementTracking] Failed to force mark session as seen:",
@@ -250,9 +148,7 @@ export function useEngagementTracking(options: UseEngagementTrackingOptions) {
   }, [enabled, sessionId, activityAt, updatedAt]);
 
   return {
-    /** Manually mark the session as seen (bypasses engagement check) */
+    /** Manually mark the session as seen (bypasses visibility check) */
     forceMarkSeen,
-    /** Check if user is currently engaged */
-    isEngaged,
   };
 }

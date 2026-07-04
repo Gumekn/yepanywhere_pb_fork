@@ -186,6 +186,22 @@ export type AgentActivity =
   | "hold"
   | "terminated";
 
+export type SessionArchiveBlockCode =
+  | "agent_in_turn"
+  | "waiting_input"
+  | "agent_on_hold"
+  | "external_active";
+
+export interface SessionRuntime {
+  ownership: SessionOwnership;
+  activity?: AgentActivity;
+  isBusy: boolean;
+  hasResidentWorker: boolean;
+  canArchive: boolean;
+  archiveBlockCode?: SessionArchiveBlockCode;
+  archiveBlockReason?: string;
+}
+
 /** Context usage information extracted from the last assistant message */
 export interface ContextUsage {
   /** Input tokens used for context-window meter (provider-specific semantics) */
@@ -451,6 +467,7 @@ export interface AppSessionSummary {
   // Notification fields
   pendingInputType?: PendingInputType;
   activity?: AgentActivity;
+  runtime?: SessionRuntime;
   lastSeenAt?: string;
   hasUnread?: boolean;
   // Metadata fields
@@ -477,6 +494,13 @@ export interface AppSessionSummary {
   branchState?: SessionBranchState;
   /** Codex-only branch state derived from thread_rolled_back markers. */
   codexBranchState?: CodexBranchState;
+  /**
+   * True when the active branch has messages but no trailing `result` message,
+   * indicating the last turn was interrupted (e.g. by a server restart) and the
+   * session can be resumed. Only meaningful when ownership is "none" and the
+   * session is not externally active.
+   */
+  interrupted?: boolean;
 }
 
 /**

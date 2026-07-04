@@ -55,6 +55,10 @@ import {
 import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.js";
 import { getPersistedAskUserQuestionInputRequest } from "../sessions/persisted-pending-input.js";
 import { findSessionSummaryAcrossProviders } from "../sessions/provider-resolution.js";
+import {
+  deriveSessionRuntime,
+  pendingInputTypeFromProcess,
+} from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
 import { isUserPromptMessage } from "../sessions/user-prompt-message.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
@@ -759,18 +763,12 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       (deps.externalTracker?.isExternal(sessionId) ?? false) ||
       (isBridgeSessionLive && isBridgeSessionActive);
 
-    // Determine the session ownership
-    const ownership = process
-      ? {
-          owner: "self" as const,
-          processId: process.id,
-          permissionMode: process.permissionMode,
-          modeVersion: process.modeVersion,
-          state: process.state.type,
-        }
-      : isExternal
-        ? { owner: "external" as const }
-        : { owner: "none" as const };
+    const runtime = deriveSessionRuntime({
+      process,
+      externalActive: isExternal,
+      externalActivity: bridgedSession?.activity,
+    });
+    const ownership = runtime.ownership;
 
     // Get session metadata (custom title, archived, starred)
     const metadata = deps.sessionMetadataService?.getMetadata(sessionId);
@@ -785,6 +783,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         ? process.state.request
         : ((await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
           null);
+    const pendingInputType =
+      pendingInputTypeFromProcess(process) ??
+      bridgedSession?.pendingInputType ??
+      (activePendingInputRequest
+        ? activePendingInputRequest.type === "tool-approval"
+          ? "tool-approval"
+          : "user-question"
+        : undefined);
 
     // Get available slash commands from active process
     const slashCommands = process?.supportsDynamicCommands
@@ -835,6 +841,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         updatedAt: sessionSummary?.updatedAt ?? new Date().toISOString(),
         messageCount: sessionSummary?.messageCount ?? 0,
         userQuestions: sessionSummary?.userQuestions,
+        ownership,
         provider:
           sessionSummary?.provider ??
           metadataProvider ??
@@ -855,10 +862,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         aiTitle: metadata?.aiTitle ?? sessionSummary?.aiTitle,
         isArchived: metadata?.isArchived,
         isStarred: metadata?.isStarred,
+        pendingInputType,
+        activity: runtime.activity,
+        runtime,
         lastSeenAt,
         hasUnread,
       },
       ownership,
+      runtime,
       pendingInputRequest: activePendingInputRequest,
       slashCommands,
     });
@@ -926,6 +937,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             if (modelForCache && usage.rawMaxTokens > 0) {
               deps.modelInfoService?.recordContextWindow(
                 modelForCache,
+                usage.rawMaxTokens,
+                process.provider,
+              );
+            }
+            if (usage.rawMaxTokens > 0) {
+              deps.modelInfoService?.recordSessionContextWindow(
+                sessionId,
                 usage.rawMaxTokens,
                 process.provider,
               );
@@ -998,10 +1016,15 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       const cachedWindow = deps.modelInfoService?.getCachedContextWindow(
         model,
         providerName,
+        sessionId,
       );
       const baseContextWindow =
         cachedWindow ??
-        deps.modelInfoService?.getContextWindow(model, providerName) ??
+        deps.modelInfoService?.getContextWindow(
+          model,
+          providerName,
+          sessionId,
+        ) ??
         getModelContextWindow(model, providerName);
 
       // Re-derive percentage with the (possibly cached) contextWindow so the
@@ -1173,17 +1196,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     let session = loadedSession ? normalizeSession(loadedSession) : null;
 
-    // Determine the session ownership
-    const ownership = process
-      ? {
-          owner: "self" as const,
-          processId: process.id,
-          permissionMode: process.permissionMode,
-          modeVersion: process.modeVersion,
-        }
-      : isExternal
-        ? { owner: "external" as const }
-        : (session?.ownership ?? { owner: "none" as const });
+    const runtime = deriveSessionRuntime({
+      process,
+      externalActive: isExternal,
+      externalActivity: bridgedSession?.activity,
+      fallbackOwnership: session?.ownership,
+    });
+    const ownership = runtime.ownership;
 
     // Get pending input request from active process (for tool approval prompts)
     // This ensures clients get pending requests immediately without waiting for SSE
@@ -1192,6 +1211,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         ? process.state.request
         : ((await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
           null);
+    const livePendingInputType =
+      pendingInputTypeFromProcess(process) ??
+      bridgedSession?.pendingInputType ??
+      (activePendingInputRequest
+        ? activePendingInputRequest.type === "tool-approval"
+          ? "tool-approval"
+          : "user-question"
+        : undefined);
 
     // Get available slash commands from active process (for "/" button in toolbar)
     // The init message that normally carries these gets discarded from the SSE buffer
@@ -1221,13 +1248,20 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           sdkContextWindow
             ? () => sdkContextWindow
             : mis
-              ? (m, p) => mis.getContextWindow(m, p)
+              ? (m, p) => mis.getContextWindow(m, p, sessionId)
               : undefined,
         );
         // Cache SDK-reported context window for future JSONL reads
         if (mis && sdkContextWindow && process.resolvedModel) {
           mis.recordContextWindow(
             process.resolvedModel,
+            sdkContextWindow,
+            process.provider,
+          );
+        }
+        if (mis && sdkContextWindow) {
+          mis.recordSessionContextWindow(
+            sessionId,
             sdkContextWindow,
             process.provider,
           );
@@ -1249,6 +1283,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             updatedAt: newSessionUpdatedAt,
             messageCount: processMessages.length,
             ownership,
+            pendingInputType: livePendingInputType,
+            activity: runtime.activity,
+            runtime,
             messages: processMessages,
             customTitle: metadata?.customTitle,
             aiTitle: metadata?.aiTitle,
@@ -1265,6 +1302,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           },
           messages: processMessages,
           ownership,
+          runtime,
           pendingInputRequest: activePendingInputRequest,
           slashCommands,
         });
@@ -1287,11 +1325,16 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             isArchived: metadata?.isArchived,
             isStarred: metadata?.isStarred,
             createdBy: metadata?.createdBy ?? bridgedSession.session.createdBy,
+            ownership,
+            pendingInputType: livePendingInputType,
+            activity: runtime.activity,
+            runtime,
             lastSeenAt: lastSeenEntry?.timestamp,
             hasUnread,
           },
           messages: [],
           ownership,
+          runtime,
           pendingInputRequest: activePendingInputRequest,
           slashCommands,
         });
@@ -1359,6 +1402,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         : null;
     const pendingInputRequest =
       activePendingInputRequest ?? persistedPendingInputRequest;
+    const pendingInputType = pendingInputRequest
+      ? pendingInputRequest.type === "tool-approval"
+        ? "tool-approval"
+        : "user-question"
+      : livePendingInputType;
 
     // Override context usage with SDK-reported context window from live process
     // The reader uses hardcoded defaults; the process captures the real value at runtime
@@ -1376,12 +1424,20 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         cw,
         process.provider,
       );
+      deps.modelInfoService?.recordSessionContextWindow(
+        sessionId,
+        cw,
+        process.provider,
+      );
     }
 
     return c.json({
       session: {
         ...session,
         ownership,
+        pendingInputType,
+        activity: runtime.activity,
+        runtime,
         contextUsage,
         customTitle: metadata?.customTitle,
         aiTitle: metadata?.aiTitle ?? session.aiTitle,
@@ -1395,6 +1451,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       },
       messages: session.messages,
       ownership,
+      runtime,
       pendingInputRequest,
       slashCommands,
       ...(paginationInfo && { pagination: paginationInfo }),
@@ -2353,17 +2410,36 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     if (body.archived === true && deps.sessionArchiveService) {
       const activeProcess = deps.supervisor.getProcessForSession(sessionId);
-      if (activeProcess) {
+      const bridgeView =
+        (await deps.codexBridgeService?.getSessionView(sessionId)) ?? null;
+      const isBridgeSessionActive = bridgeView
+        ? ((await deps.codexBridgeService?.isSessionActive(sessionId)) ?? false)
+        : false;
+      const isBridgeSessionLive =
+        bridgeView !== null && isLiveBridgeSessionView(bridgeView);
+      const runtime = deriveSessionRuntime({
+        process: activeProcess,
+        externalActive:
+          (deps.externalTracker?.isExternal(sessionId) ?? false) ||
+          (isBridgeSessionLive && isBridgeSessionActive),
+        externalActivity: bridgeView?.activity,
+      });
+
+      if (!runtime.canArchive) {
         return c.json(
-          { error: "Active sessions must be stopped before archiving" },
+          {
+            error:
+              runtime.archiveBlockReason ??
+              "This session cannot be archived right now.",
+            code: runtime.archiveBlockCode,
+            runtime,
+          },
           409,
         );
       }
-      if (deps.externalTracker?.isExternal(sessionId)) {
-        return c.json(
-          { error: "External sessions must be idle before archiving" },
-          409,
-        );
+
+      if (activeProcess) {
+        await deps.supervisor.abortProcess(activeProcess.id);
       }
 
       const target = await resolveArchiveTarget(deps, sessionId);

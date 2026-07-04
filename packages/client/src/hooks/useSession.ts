@@ -1,4 +1,5 @@
 import {
+  type AgentActivity,
   DEFAULT_PERMISSION_MODE,
   type MarkdownAugment,
   type ProviderName,
@@ -36,6 +37,23 @@ import {
 } from "./useStreamingContent";
 
 export type ProcessState = "idle" | "in-turn" | "waiting-input" | "hold";
+
+function processStateFromActivity(
+  activity: AgentActivity | undefined,
+): ProcessState | undefined {
+  if (
+    activity === "idle" ||
+    activity === "in-turn" ||
+    activity === "waiting-input" ||
+    activity === "hold"
+  ) {
+    return activity;
+  }
+  if (activity === "terminated") {
+    return "idle";
+  }
+  return undefined;
+}
 
 // Re-export types from useSessionMessages
 export type { AgentContent, AgentContentMap } from "./useSessionMessages";
@@ -215,6 +233,14 @@ export function useSession(
           ? (result.pendingInputRequest as InputRequest)
           : null,
       );
+      const loadedProcessState = processStateFromActivity(
+        result.session.runtime?.activity ?? result.session.activity,
+      );
+      if (loadedProcessState) {
+        setProcessState(loadedProcessState);
+      } else if (result.status.owner === "none") {
+        setProcessState("idle");
+      }
       // Set slash commands from API response so the "/" button appears reliably
       // (the SSE init message that normally carries these is discarded after ~30s)
       if (result.slashCommands?.length) {
@@ -552,13 +578,9 @@ export function useSession(
       if (event.sessionId !== sessionId) return;
 
       // Update process state from activity bus
-      if (
-        event.activity === "idle" ||
-        event.activity === "in-turn" ||
-        event.activity === "waiting-input" ||
-        event.activity === "hold"
-      ) {
-        setProcessState(event.activity);
+      const nextProcessState = processStateFromActivity(event.activity);
+      if (nextProcessState) {
+        setProcessState(nextProcessState);
       }
 
       // Always refresh the current request on waiting-input. Codex can emit
@@ -591,7 +613,12 @@ export function useSession(
       const data = await api.getSessionMetadata(projectId, sessionId);
       setStatus(data.ownership);
       setPendingInputRequest(data.pendingInputRequest ?? null);
-      if (data.ownership.owner === "none") {
+      const nextProcessState = processStateFromActivity(
+        data.session.runtime?.activity ?? data.session.activity,
+      );
+      if (nextProcessState) {
+        setProcessState(nextProcessState);
+      } else if (data.ownership.owner === "none") {
         setProcessState("idle");
       }
     } catch {
@@ -1086,6 +1113,11 @@ export function useSession(
       if (data.ownership.owner !== "self") {
         setStatus({ owner: "none" });
         setProcessState("idle");
+      } else {
+        const nextProcessState = processStateFromActivity(
+          data.session.runtime?.activity ?? data.session.activity,
+        );
+        if (nextProcessState) setProcessState(nextProcessState);
       }
     } catch {
       // If session fetch fails, assume process is dead
@@ -1113,7 +1145,12 @@ export function useSession(
         .then((data) => {
           setStatus(data.ownership);
           setPendingInputRequest(data.pendingInputRequest ?? null);
-          if (data.ownership.owner === "none") {
+          const nextProcessState = processStateFromActivity(
+            data.session.runtime?.activity ?? data.session.activity,
+          );
+          if (nextProcessState) {
+            setProcessState(nextProcessState);
+          } else if (data.ownership.owner === "none") {
             setProcessState("idle");
           }
         })

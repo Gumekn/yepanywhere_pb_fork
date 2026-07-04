@@ -52,6 +52,7 @@ export interface ClaudeSessionReaderOptions {
   getContextWindow?: (
     model: string | undefined,
     provider?: ProviderName,
+    sessionId?: string,
   ) => number;
 }
 
@@ -174,6 +175,7 @@ export class ClaudeSessionReader implements ISessionReader {
   private resolveContextWindow: (
     model: string | undefined,
     provider?: ProviderName,
+    sessionId?: string,
   ) => number;
 
   constructor(options: ClaudeSessionReaderOptions) {
@@ -300,11 +302,20 @@ export class ClaudeSessionReader implements ISessionReader {
         activeBranchMessages,
         model,
         provider,
+        sessionId,
       );
       const runtimeConfig = this.extractRuntimeConfig(activeBranchMessages);
 
       const cumulativeUsage =
         this.extractCumulativeTokenUsage(activeBranchMessages);
+
+      // A session is "interrupted" when its last turn was cut short (e.g. by a
+      // server restart) and the session can be resumed. The reliable signal is
+      // the active branch ending on a user message (the user sent a prompt but
+      // never got an assistant reply), or on an assistant message with no
+      // stop_reason (streaming was severed mid-turn). A trailing assistant
+      // message with end_turn/tool_use is a completed turn, not interrupted.
+      const interrupted = this.isBranchInterrupted(conversationMessages);
 
       return {
         id: sessionId,
@@ -321,6 +332,7 @@ export class ClaudeSessionReader implements ISessionReader {
         provider,
         model,
         serviceTier: runtimeConfig.serviceTier,
+        interrupted,
       };
     } catch {
       return null;
@@ -580,6 +592,33 @@ export class ClaudeSessionReader implements ISessionReader {
   }
 
   /**
+   * Determine whether a session's active branch looks interrupted (resumable
+   * after a server restart). True when the branch ends on a user message with
+   * no assistant reply, or on an assistant message whose turn never reached a
+   * stop_reason (streaming severed mid-turn). A trailing assistant message
+   * with end_turn/tool_use/etc. is a completed turn.
+   */
+  private isBranchInterrupted(messages: ClaudeSessionEntry[]): boolean {
+    if (messages.length === 0) return false;
+    const last = messages[messages.length - 1];
+    if (!last) return false;
+
+    // Last message is a user prompt that never got a reply.
+    if (last.type === "user") return true;
+
+    if (last.type === "assistant") {
+      const stopReason = (last as { message?: { stop_reason?: string } })
+        .message?.stop_reason;
+      // No stop_reason = assistant was mid-stream when severed.
+      // end_turn / tool_use / tool_use etc. mean the turn completed (or paused
+      // normally for tool use), so it's not an interruption.
+      return !stopReason;
+    }
+
+    return false;
+  }
+
+  /**
    * Read agent metadata from meta.json file (SDK 0.2.76+).
    * Returns agentType if available, e.g. "Explore", "Plan".
    */
@@ -682,8 +721,13 @@ export class ClaudeSessionReader implements ISessionReader {
     messages: ClaudeSessionEntry[],
     model: string | undefined,
     provider?: ProviderName,
+    sessionId?: string,
   ): ContextUsage | undefined {
-    const contextWindowSize = this.resolveContextWindow(model, provider);
+    const contextWindowSize = this.resolveContextWindow(
+      model,
+      provider,
+      sessionId,
+    );
 
     // Compute token overhead from compaction metadata.
     // After compaction, the API reports fewer input_tokens because old messages are

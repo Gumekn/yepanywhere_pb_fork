@@ -30,6 +30,8 @@ interface StoredState {
   version: number;
   /** Map of "provider:model" → contextWindow tokens */
   contextWindows: Record<string, number>;
+  /** Map of "provider:sessionId" → contextWindow tokens observed at runtime */
+  sessionContextWindows?: Record<string, number>;
 }
 
 export interface ModelInfoServiceOptions {
@@ -40,6 +42,8 @@ export interface ModelInfoServiceOptions {
 export class ModelInfoService {
   /** (provider:modelId) → contextWindow */
   private contextWindows = new Map<string, number>();
+  /** (provider:sessionId) → contextWindow */
+  private sessionContextWindows = new Map<string, number>();
   private dataDir?: string;
   private filePath?: string;
   private initialized = false;
@@ -78,6 +82,13 @@ export class ModelInfoService {
             this.contextWindows.set(key, value);
           }
         }
+        for (const [key, value] of Object.entries(
+          parsed.sessionContextWindows ?? {},
+        )) {
+          if (typeof value === "number" && value > 0) {
+            this.sessionContextWindows.set(key, value);
+          }
+        }
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -93,7 +104,16 @@ export class ModelInfoService {
    * Get context window for a model (sync).
    * Checks cache first, falls back to shared heuristic.
    */
-  getContextWindow(model: string | undefined, provider?: ProviderName): number {
+  getContextWindow(
+    model: string | undefined,
+    provider?: ProviderName,
+    sessionId?: string,
+  ): number {
+    const sessionWindow = this.getCachedSessionContextWindow(
+      sessionId,
+      provider,
+    );
+    if (sessionWindow !== undefined) return sessionWindow;
     if (model && provider) {
       const cached = this.contextWindows.get(`${provider}:${model}`);
       if (cached !== undefined) return cached;
@@ -109,9 +129,27 @@ export class ModelInfoService {
   getCachedContextWindow(
     model: string | undefined,
     provider?: ProviderName,
+    sessionId?: string,
   ): number | undefined {
+    const sessionWindow = this.getCachedSessionContextWindow(
+      sessionId,
+      provider,
+    );
+    if (sessionWindow !== undefined) return sessionWindow;
     if (!model || !provider) return undefined;
     return this.contextWindows.get(`${provider}:${model}`);
+  }
+
+  getCachedSessionContextWindow(
+    sessionId: string | undefined,
+    provider?: ProviderName,
+  ): number | undefined {
+    if (!sessionId) return undefined;
+    if (provider) {
+      const scoped = this.sessionContextWindows.get(`${provider}:${sessionId}`);
+      if (scoped !== undefined) return scoped;
+    }
+    return this.sessionContextWindows.get(sessionId);
   }
 
   /**
@@ -140,7 +178,11 @@ export class ModelInfoService {
     for (const m of models) {
       if (m.contextWindow) {
         const key = `${providerName}:${m.id}`;
-        if (this.contextWindows.get(key) !== m.contextWindow) {
+        const existing = this.contextWindows.get(key);
+        // Provider model lists often contain heuristic context windows. Do not
+        // let a later model-list refresh downgrade a larger runtime-observed
+        // window such as a Claude [1m] session.
+        if (existing === undefined || m.contextWindow > existing) {
           this.contextWindows.set(key, m.contextWindow);
           changed = true;
         }
@@ -162,6 +204,18 @@ export class ModelInfoService {
     const key = provider ? `${provider}:${model}` : model;
     if (this.contextWindows.get(key) === contextWindow) return;
     this.contextWindows.set(key, contextWindow);
+    this.schedulePersist();
+  }
+
+  recordSessionContextWindow(
+    sessionId: string,
+    contextWindow: number,
+    provider?: ProviderName,
+  ): void {
+    if (!sessionId || contextWindow <= 0) return;
+    const key = provider ? `${provider}:${sessionId}` : sessionId;
+    if (this.sessionContextWindows.get(key) === contextWindow) return;
+    this.sessionContextWindows.set(key, contextWindow);
     this.schedulePersist();
   }
 
@@ -202,6 +256,9 @@ export class ModelInfoService {
     const state: StoredState = {
       version: CURRENT_VERSION,
       contextWindows: Object.fromEntries(this.contextWindows.entries()),
+      sessionContextWindows: Object.fromEntries(
+        this.sessionContextWindows.entries(),
+      ),
     };
     const content = JSON.stringify(state, null, 2);
     await fs.writeFile(this.filePath, content, "utf-8");

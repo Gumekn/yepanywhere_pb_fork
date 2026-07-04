@@ -14,6 +14,8 @@ export interface SessionMenuProps {
   provider?: string;
   /** Process ID if session has an active process (enables terminate option) */
   processId?: string;
+  canArchive?: boolean;
+  archiveBlockReason?: string;
   onToggleStar: () => void | Promise<void>;
   onToggleArchive: () => void | Promise<void>;
   onToggleRead?: () => void | Promise<void>;
@@ -42,6 +44,8 @@ export function SessionMenu({
   hasUnread,
   provider,
   processId,
+  canArchive,
+  archiveBlockReason,
   onToggleStar,
   onToggleArchive,
   onToggleRead,
@@ -292,7 +296,14 @@ export function SessionMenu({
           {isSharing ? t("sessionMenuSharing") : t("sessionMenuShare")}
         </button>
       )}
-      <button type="button" onClick={() => handleAction(onToggleArchive)}>
+      <button
+        type="button"
+        onClick={() => handleAction(onToggleArchive)}
+        disabled={!isArchived && canArchive === false}
+        title={
+          !isArchived && canArchive === false ? archiveBlockReason : undefined
+        }
+      >
         <svg
           width="14"
           height="14"

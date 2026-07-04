@@ -1364,7 +1364,9 @@ export class Supervisor {
         if (
           event.state.type === "in-turn" ||
           event.state.type === "waiting-input" ||
-          event.state.type === "idle"
+          event.state.type === "idle" ||
+          event.state.type === "hold" ||
+          event.state.type === "terminated"
         ) {
           // Convert InputRequest.type to PendingInputType when waiting for input
           // "tool-approval" stays as-is, "question" or "choice" becomes "user-question"
@@ -1645,7 +1647,10 @@ export class Supervisor {
     if (!this.eventBus) return;
 
     const hasActiveWork = Array.from(this.processes.values()).some(
-      (p) => p.state.type === "in-turn" || p.state.type === "waiting-input",
+      (p) =>
+        p.state.type === "in-turn" ||
+        p.state.type === "waiting-input" ||
+        p.state.type === "hold",
     );
 
     const event: WorkerActivityEvent = {

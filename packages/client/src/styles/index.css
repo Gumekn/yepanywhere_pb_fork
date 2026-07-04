@@ -4483,6 +4483,12 @@ a.sidebar-nav-item {
   animation: pulse-blue 2s ease-in-out infinite;
 }
 
+/* "Continue" badge - session was interrupted (e.g. by a server restart) */
+.status-badge.notification-continue {
+  background: var(--status-badge-running-bg);
+  color: var(--status-badge-running-text);
+}
+
 @keyframes pulse-blue {
   0%,
   100% {
@@ -10135,6 +10141,11 @@ button.context-usage-indicator--button:focus-visible {
   color: var(--status-badge-input-text);
 }
 
+.session-badge-continue {
+  background: var(--status-badge-running-bg);
+  color: var(--status-badge-running-text);
+}
+
 .session-badge-executor {
   background: var(--bg-hover);
   color: var(--text-muted);
@@ -10144,27 +10155,34 @@ button.context-usage-indicator--button:focus-visible {
   white-space: nowrap;
 }
 
-.session-creation-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+.session-creation-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 16px;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0;
   flex-shrink: 0;
-  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 30%, transparent);
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  opacity: 0.9;
 }
 
-.session-creation-dot--yep {
+.session-creation-badge--yep {
   color: var(--info-color, #3b82f6);
-  background: currentColor;
 }
 
-.session-creation-dot--terminal {
+.session-creation-badge--terminal {
   color: var(--warning-color);
-  background: currentColor;
 }
 
-.session-creation-dot--unknown {
+.session-creation-badge--unknown {
   color: var(--text-dimmed);
-  background: currentColor;
   opacity: 0.55;
 }
 

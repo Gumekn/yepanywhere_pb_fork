@@ -43,6 +43,15 @@ describe("SessionStatusBadge", () => {
     expect(container.querySelector(".status-indicator")).toBeNull();
   });
 
+  it("does not show an external badge from ownership alone", () => {
+    const { container } = render(
+      <SessionStatusBadge status={{ owner: "external" }} />,
+    );
+
+    expect(container.querySelector(".status-badge")).toBeNull();
+    expect(container.querySelector(".status-indicator")).toBeNull();
+  });
+
   it("shows nothing when unowned", () => {
     const { container } = render(
       <SessionStatusBadge status={{ owner: "none" }} />,

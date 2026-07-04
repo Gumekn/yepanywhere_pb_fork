@@ -419,7 +419,8 @@ export function createApp(options: AppOptions): AppResult {
               sessionDir: project.sessionDir,
               additionalDirs: project.mergedSessionDirs,
               getContextWindow: mis
-                ? (model, provider) => mis.getContextWindow(model, provider)
+                ? (model, provider, sessionId) =>
+                    mis.getContextWindow(model, provider, sessionId)
                 : undefined,
             }),
         );

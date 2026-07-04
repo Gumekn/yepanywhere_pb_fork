@@ -814,9 +814,11 @@ export function GlobalSessionsPage() {
                         updatedAt={session.updatedAt}
                         hasUnread={session.hasUnread}
                         activity={session.activity}
+                        runtime={session.runtime}
                         pendingInputType={session.pendingInputType}
                         status={session.ownership}
                         provider={session.provider}
+                        interrupted={session.interrupted}
                         model={session.model}
                         reasoningEffort={session.reasoningEffort}
                         serviceTier={session.serviceTier}

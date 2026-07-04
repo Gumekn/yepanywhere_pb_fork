@@ -11,6 +11,7 @@ import {
   type SessionCreatedBy,
   type SessionKind,
   type SessionQuestion,
+  type SessionRuntime,
   isSessionKind,
   sessionMatchesKind,
 } from "@yep-anywhere/shared";
@@ -26,6 +27,10 @@ import type { ProjectScanner } from "../projects/scanner.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import { listSessionsAcrossProviders } from "../sessions/provider-resolution.js";
+import {
+  deriveSessionRuntime,
+  pendingInputTypeFromProcess,
+} from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
@@ -81,6 +86,7 @@ export interface GlobalSessionItem {
   ownership: SessionOwnership;
   pendingInputType?: PendingInputType;
   activity?: AgentActivity;
+  runtime?: SessionRuntime;
   hasUnread?: boolean;
   customTitle?: string;
   aiTitle?: string;
@@ -104,6 +110,13 @@ export interface GlobalSessionItem {
   reasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g. "fast") */
   serviceTier?: string;
+  /**
+   * True when the active branch has messages but no trailing `result` and no
+   * live process owns the session — the last turn was interrupted (e.g. by a
+   * server restart) and the session can be resumed. Only set when
+   * ownership.owner === "none" and the session is not externally active.
+   */
+  interrupted?: boolean;
 }
 
 /** Stats about all sessions (computed during full scan) */
@@ -592,36 +605,17 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           (deps.externalTracker?.isExternal(session.id) ?? false) ||
           (isBridgeSessionLive && isBridgeSessionActive);
 
-        const ownership: SessionOwnership = process
-          ? {
-              owner: "self",
-              processId: process.id,
-              permissionMode: process.permissionMode,
-              modeVersion: process.modeVersion,
-            }
-          : isExternal
-            ? { owner: "external" }
-            : (session.ownership ?? { owner: "none" });
-
-        // Get agent activity
-        let pendingInputType: PendingInputType | undefined;
-        let activity: AgentActivity | undefined;
-        if (process) {
-          const pendingRequest = process.getPendingInputRequest();
-          if (pendingRequest) {
-            pendingInputType =
-              pendingRequest.type === "tool-approval"
-                ? "tool-approval"
-                : "user-question";
-          }
-          const state = process.state.type;
-          if (state === "in-turn" || state === "waiting-input") {
-            activity = state;
-          }
-        } else if (bridgedSession) {
-          pendingInputType = bridgedSession.pendingInputType;
-          activity = bridgedSession.activity;
-        }
+        const runtime = deriveSessionRuntime({
+          process,
+          externalActive: isExternal,
+          externalActivity: bridgedSession?.activity,
+          fallbackOwnership: session.ownership,
+        });
+        const ownership: SessionOwnership = runtime.ownership;
+        const pendingInputType =
+          pendingInputTypeFromProcess(process) ??
+          bridgedSession?.pendingInputType;
+        const activity = runtime.activity;
 
         addTopSession(
           topSessions,
@@ -638,6 +632,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
             ownership,
             pendingInputType,
             activity,
+            runtime,
             hasUnread,
             customTitle,
             aiTitle,
@@ -651,6 +646,8 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
             model: session.model,
             reasoningEffort: session.reasoningEffort,
             serviceTier: session.serviceTier,
+            interrupted:
+              ownership.owner === "none" ? session.interrupted : undefined,
           },
           maxCandidates,
         );
@@ -720,6 +717,12 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         continue;
       }
 
+      const runtime = deriveSessionRuntime({
+        externalActive: isLiveBridgeSessionView(item),
+        externalActivity: item.activity,
+        fallbackOwnership: session.ownership,
+      });
+
       addTopSession(
         topSessions,
         {
@@ -732,9 +735,10 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           provider: session.provider,
           projectId: session.projectId,
           projectName: item.projectName,
-          ownership: session.ownership,
+          ownership: runtime.ownership,
           pendingInputType: item.pendingInputType,
-          activity: item.activity,
+          activity: runtime.activity,
+          runtime,
           hasUnread,
           customTitle,
           aiTitle,
@@ -748,6 +752,10 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           model: session.model,
           reasoningEffort: session.reasoningEffort,
           serviceTier: session.serviceTier,
+          interrupted:
+            runtime.ownership.owner === "none"
+              ? session.interrupted
+              : undefined,
         },
         maxCandidates,
       );

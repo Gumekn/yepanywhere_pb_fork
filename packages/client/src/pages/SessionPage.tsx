@@ -110,6 +110,25 @@ function getApprovalAgentName(
   }
 }
 
+function getArchiveBlockReasonForState(
+  owner: "self" | "external" | "none",
+  processState: string,
+): string {
+  if (processState === "waiting-input") {
+    return "This session is waiting for input. Respond or stop it before archiving.";
+  }
+  if (processState === "hold") {
+    return "This session is on hold. Resume or stop it before archiving.";
+  }
+  if (processState === "in-turn") {
+    return "This session is currently running. Wait for it to finish or stop it before archiving.";
+  }
+  if (owner === "external") {
+    return "This session is controlled by an active external process. Wait for it to finish before archiving.";
+  }
+  return "This session cannot be archived right now.";
+}
+
 function calculateCodexRollbackNumTurns(
   messages: Message[],
   editedUuid: string,
@@ -1179,6 +1198,18 @@ function SessionPageContent({
     t("sessionUntitled");
   const isArchived = localIsArchived ?? session?.isArchived ?? false;
   const isStarred = localIsStarred ?? session?.isStarred ?? false;
+  const isRuntimeBusy =
+    processState === "in-turn" ||
+    processState === "waiting-input" ||
+    processState === "hold" ||
+    session?.runtime?.isBusy === true;
+  const canArchive =
+    isArchived ||
+    (session?.runtime?.canArchive ??
+      !(isRuntimeBusy || status.owner === "external"));
+  const archiveBlockReason =
+    session?.runtime?.archiveBlockReason ??
+    getArchiveBlockReasonForState(status.owner, processState);
 
   // Update browser tab title
   useDocumentTitle(project?.name, displayTitle);
@@ -1243,6 +1274,10 @@ function SessionPageContent({
 
   const handleToggleArchive = async () => {
     const newArchived = !isArchived;
+    if (newArchived && !canArchive) {
+      showToast(archiveBlockReason, "error");
+      return;
+    }
     try {
       await api.updateSessionMetadata(sessionId, { archived: newArchived });
       setLocalIsArchived(newArchived);
@@ -1252,7 +1287,10 @@ function SessionPageContent({
       );
     } catch (err) {
       console.error("Failed to update archive status:", err);
-      showToast(t("sessionArchiveFailed"), "error");
+      showToast(
+        err instanceof Error ? err.message : t("sessionArchiveFailed"),
+        "error",
+      );
     }
   };
 
@@ -1514,6 +1552,8 @@ function SessionPageContent({
                     processId={
                       status.owner === "self" ? status.processId : undefined
                     }
+                    canArchive={canArchive}
+                    archiveBlockReason={archiveBlockReason}
                     onToggleStar={handleToggleStar}
                     onToggleArchive={handleToggleArchive}
                     onToggleRead={handleToggleRead}

@@ -148,6 +148,8 @@ export type {
   // Session types
   PendingInputType,
   AgentActivity,
+  SessionArchiveBlockCode,
+  SessionRuntime,
   ContextUsage,
   SessionQuestion,
   SessionCreatedBy,

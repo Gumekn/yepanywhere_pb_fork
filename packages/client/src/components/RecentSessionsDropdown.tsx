@@ -57,14 +57,13 @@ function StatusIndicator({ session }: { session: GlobalSessionItem }) {
   }
 
   // Needs input
-  if (session.pendingInputType) {
+  if (session.pendingInputType || activity === "waiting-input") {
     const label = session.pendingInputType === "tool-approval" ? "Appr" : "Q";
     return <span className="recent-sessions-badge needs-input">{label}</span>;
   }
 
-  // External session
-  if (session.ownership.owner === "external") {
-    return <span className="recent-sessions-badge external">Ext</span>;
+  if (activity === "hold") {
+    return <span className="recent-sessions-badge external">Hold</span>;
   }
 
   return null;

@@ -11,6 +11,7 @@ import type {
   SessionBranchState,
   SessionCreatedBy,
   SessionQuestion,
+  SessionRuntime,
   ThinkingConfig,
   UrlProjectId,
 } from "@yep-anywhere/shared";
@@ -83,6 +84,8 @@ export interface SessionSummary {
   // Notification fields (added by enrichSessionsWithNotifications)
   /** Type of pending input if session needs user action */
   pendingInputType?: PendingInputType;
+  activity?: AgentActivity;
+  runtime?: SessionRuntime;
   /** When the session was last viewed (if tracked) */
   lastSeenAt?: string;
   /** Whether session has new content since last viewed */
@@ -127,6 +130,13 @@ export interface SessionSummary {
   branchState?: SessionBranchState;
   /** Codex-only branch state derived from thread_rolled_back markers. */
   codexBranchState?: CodexBranchState;
+  /**
+   * True when the active branch has messages but no trailing `result` message,
+   * indicating the last turn was interrupted (e.g. by a server restart) and the
+   * session can be resumed. Only meaningful when ownership is "none" and the
+   * session is not externally active.
+   */
+  interrupted?: boolean;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
+import { useToastContext } from "../contexts/ToastContext";
 import type { AgentActivity } from "../hooks/useFileActivity";
 import { useI18n } from "../i18n";
 import { formatSmartTime } from "../lib/datetime";
@@ -10,6 +11,7 @@ import type {
   PendingInputType,
   ProviderName,
   SessionCreatedBy,
+  SessionRuntime,
   SessionStatus,
 } from "../types";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
@@ -30,10 +32,16 @@ interface SessionListItemProps {
   updatedAt?: string;
   hasUnread?: boolean;
   activity?: AgentActivity;
+  runtime?: SessionRuntime;
   pendingInputType?: PendingInputType;
   contextUsage?: ContextUsage;
   status?: SessionStatus;
   provider?: ProviderName;
+  /**
+   * True when the session's last turn was interrupted (e.g. by a server
+   * restart) and it can be resumed. Only set for owner==="none" sessions.
+   */
+  interrupted?: boolean;
   /** SSH host for remote execution (undefined = local) */
   executor?: string;
   /** Explicit creation owner recorded by Yep metadata. */
@@ -110,14 +118,19 @@ function getSessionCreationIndicator({
   status?: SessionStatus;
 }): {
   kind: SessionCreationIndicatorKind;
+  label: string;
   title: string;
 } {
   if (createdBy === "yep") {
-    return { kind: "yep", title: "Created in Yep frontend" };
+    return { kind: "yep", label: "Yep", title: "创建来源：Yep 前端" };
   }
 
   if (createdBy === "external") {
-    return { kind: "terminal", title: "Created from terminal or external UI" };
+    return {
+      kind: "terminal",
+      label: "终端",
+      title: "创建来源：终端或外部 UI",
+    };
   }
 
   const normalizedSource = normalizeCreationValue(sessionSource);
@@ -127,7 +140,7 @@ function getSessionCreationIndicator({
     normalizedSource === "appserver" ||
     normalizedOriginator === "yep-anywhere"
   ) {
-    return { kind: "yep", title: "Created in Yep frontend" };
+    return { kind: "yep", label: "Yep", title: "创建来源：Yep 前端" };
   }
 
   if (
@@ -137,10 +150,14 @@ function getSessionCreationIndicator({
     normalizedOriginator.includes("terminal") ||
     status?.owner === "external"
   ) {
-    return { kind: "terminal", title: "Created from terminal or external UI" };
+    return {
+      kind: "terminal",
+      label: "终端",
+      title: "创建来源：终端或外部 UI",
+    };
   }
 
-  return { kind: "unknown", title: "Creation source unknown" };
+  return { kind: "unknown", label: "未知", title: "创建来源：未知" };
 }
 
 /**
@@ -167,10 +184,12 @@ export function SessionListItem({
   updatedAt,
   hasUnread: hasUnreadProp,
   activity,
+  runtime,
   pendingInputType,
   contextUsage,
   status,
   provider,
+  interrupted,
   executor,
   createdBy,
   originator,
@@ -209,6 +228,7 @@ export function SessionListItem({
   showSizeMeta = false,
 }: SessionListItemProps) {
   const { t, locale } = useI18n();
+  const { showToast } = useToastContext();
   const navigate = useNavigate();
 
   // Local state for optimistic updates (only used when action handlers are provided)
@@ -228,6 +248,9 @@ export function SessionListItem({
   // Computed values with optimistic fallback
   const isStarred = localIsStarred ?? isStarredProp;
   const isArchived = localIsArchived ?? isArchivedProp;
+  const canArchive = isArchived || runtime?.canArchive !== false;
+  const archiveBlockReason =
+    runtime?.archiveBlockReason ?? "This session cannot be archived right now.";
   // Detect brand new sessions that haven't received a title yet
   // Use messageCount === 0, or if messageCount is unknown but session is actively running
   const isNewSession =
@@ -262,10 +285,12 @@ export function SessionListItem({
   });
   const creationIndicatorEl = (
     <span
-      className={`session-creation-dot session-creation-dot--${creationIndicator.kind}`}
+      className={`session-creation-badge session-creation-badge--${creationIndicator.kind}`}
       title={creationIndicator.title}
       aria-label={creationIndicator.title}
-    />
+    >
+      {creationIndicator.label}
+    </span>
   );
 
   // Handlers for menu actions
@@ -283,12 +308,20 @@ export function SessionListItem({
 
   const handleToggleArchive = async () => {
     const newArchived = !isArchived;
+    if (newArchived && !canArchive) {
+      showToast(archiveBlockReason, "error");
+      return;
+    }
     setLocalIsArchived(newArchived);
     try {
       await api.updateSessionMetadata(sessionId, { archived: newArchived });
       onToggleArchive?.();
     } catch (err) {
       console.error("Failed to update archive status:", err);
+      showToast(
+        err instanceof Error ? err.message : t("sessionArchiveFailed" as never),
+        "error",
+      );
       setLocalIsArchived(undefined); // Revert on error
     }
   };
@@ -369,13 +402,8 @@ export function SessionListItem({
 
   // Activity indicator for compact mode
   const getCompactActivityIndicator = () => {
-    // External sessions always show external badge
-    if (status?.owner === "external") {
-      return <span className="session-badge session-badge-external">Ext</span>;
-    }
-
     // Priority 1: Needs input
-    if (pendingInputType) {
+    if (pendingInputType || activity === "waiting-input") {
       const label = pendingInputType === "tool-approval" ? "Appr" : "Q";
       return (
         <span className="session-badge session-badge-needs-input">{label}</span>
@@ -385,6 +413,22 @@ export function SessionListItem({
     // Priority 2: In-turn (thinking)
     if (activity === "in-turn") {
       return <ThinkingIndicator />;
+    }
+
+    if (activity === "hold") {
+      return <span className="session-badge session-badge-external">Hold</span>;
+    }
+
+    // Priority 3: Interrupted (e.g. by a server restart) - prompt to continue
+    if (interrupted) {
+      return (
+        <span
+          className="session-badge session-badge-continue"
+          title="Session was interrupted — send a message to continue"
+        >
+          Cont
+        </span>
+      );
     }
 
     return null;
@@ -535,6 +579,7 @@ export function SessionListItem({
                     pendingInputType={pendingInputType}
                     hasUnread={hasUnread}
                     activity={activity}
+                    interrupted={interrupted}
                   />
                 )}
               </span>
@@ -599,6 +644,8 @@ export function SessionListItem({
           isArchived={isArchived ?? false}
           hasUnread={hasUnread ?? false}
           provider={provider}
+          canArchive={canArchive}
+          archiveBlockReason={archiveBlockReason}
           onToggleStar={handleToggleStar}
           onToggleArchive={handleToggleArchive}
           onToggleRead={handleToggleRead}

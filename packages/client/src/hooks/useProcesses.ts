@@ -83,7 +83,10 @@ export function useProcesses() {
 
   // Count of active processes (in-turn or waiting-input)
   const activeCount = processes.filter(
-    (p) => p.state === "in-turn" || p.state === "waiting-input",
+    (p) =>
+      p.state === "in-turn" ||
+      p.state === "waiting-input" ||
+      p.state === "hold",
   ).length;
 
   return {

@@ -49,6 +49,7 @@ export type {
   CodexBranchOption,
   CodexBranchState,
   SessionOwnership,
+  SessionRuntime,
   AppSessionSummary,
   AppSession,
   AgentStatus,
