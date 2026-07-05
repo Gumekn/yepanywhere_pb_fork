@@ -125,7 +125,12 @@ export function LocalAccessSettings() {
     } else {
       setAllowAllHostsToggle(false);
       // 将逗号分隔的字符串转换为数组
-      const hosts = ah ? ah.split(",").map(h => h.trim()).filter(Boolean) : [];
+      const hosts = ah
+        ? ah
+            .split(",")
+            .map((h) => h.trim())
+            .filter(Boolean)
+        : [];
       setCustomHosts(hosts);
     }
     setFormInitialized(true);
@@ -159,10 +164,7 @@ export function LocalAccessSettings() {
     const authChanged = newRequirePassword !== auth.authEnabled;
     const passwordEntered = newPassword.length > 0;
     const localhostOpenChanged = newLocalhostOpen !== auth.localhostOpen;
-    const newValue = getAllowedHostsValue(
-      newAllowAllHosts,
-      newCustomHosts,
-    );
+    const newValue = getAllowedHostsValue(newAllowAllHosts, newCustomHosts);
     const oldValue = serverSettings.allowedHosts;
     const allowedHostsChanged = (newValue ?? "") !== (oldValue ?? "");
     return (
@@ -477,7 +479,10 @@ export function LocalAccessSettings() {
                         value: "0.0.0.0",
                         label: t("localAccessInterfaceAll"),
                       },
-                      { value: "custom", label: t("localAccessInterfaceCustom") },
+                      {
+                        value: "custom",
+                        label: t("localAccessInterfaceCustom"),
+                      },
                     ]}
                     selected={selectedInterface ? [selectedInterface] : []}
                     onChange={(values) => {
@@ -642,7 +647,9 @@ export function LocalAccessSettings() {
                     </div>
                   )}
                   {!auth.authEnabled && (
-                    <p className="form-hint">{t("localAccessPasswordResetHint")}</p>
+                    <p className="form-hint">
+                      {t("localAccessPasswordResetHint")}
+                    </p>
                   )}
                 </div>
               )}

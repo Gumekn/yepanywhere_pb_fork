@@ -1,6 +1,5 @@
 # Yep Anywhere
 
-跨项目上下文（本项目与其他 Kyle 项目的关系）见 `~/code/dotfiles/projects/README.md`。
 
 这是一个面向移动端优先的 Claude Code agent 监督器。它类似 VS Code 的 Claude 扩展，但专为手机和多会话工作流设计。
 
@@ -18,6 +17,8 @@
 
 ## 端口配置
 
+### 开发模式（pnpm dev）
+
 所有端口都从单个 `PORT` 环境变量派生（默认：3400）：
 
 | 端口 | 用途 |
@@ -34,6 +35,17 @@ PORT=4000 pnpm dev  # 使用 4000、4001、4002
 单独覆盖（很少需要）：
 - `MAINTENANCE_PORT`：覆盖维护端口（设为 0 可禁用）
 - `VITE_PORT`：覆盖 Vite dev 端口
+
+### 生产模式（LaunchAgent）
+
+生产部署默认使用端口 8022（通过 `YEP_DEPLOY_PORT` 环境变量控制）：
+
+```bash
+# 修改生产端口
+YEP_DEPLOY_PORT=3400 scripts/install-launchagents.sh
+```
+
+**说明**：开发模式（3400）和生产模式（8022）使用不同的默认端口是设计行为，避免两者同时运行时冲突。
 
 ## 数据目录与 Profile
 
@@ -209,11 +221,26 @@ scripts/release-website.sh 1.5.3
 
 服务端应用日志路径会在启动时打印为 `[Config] Log file: ...`，默认位于 `{dataDir}/logs/`（默认：`~/.yep-anywhere/logs/`）：
 
-- `server.log`：主服务端日志（`pnpm dev` 开发模式）
+- `server.log`：开发模式日志（`pnpm dev`）
 - `e2e-server.log`：E2E 测试期间的服务端日志
-- `/private/tmp/yep-server.log`：当前本机 `yepanywhere --port 8022` / launchd 方式运行时的 stdout/stderr 实际日志，排查生产本机实例优先看这里
+- `server-launchd.out.log`：LaunchAgent 标准输出日志
+- `server-launchd.err.log`：LaunchAgent 错误输出日志
 
-实时查看当前本机实例日志：`tail -f /private/tmp/yep-server.log`
+**开发模式日志**：
+```bash
+tail -f ~/.yep-anywhere/logs/server.log
+```
+
+**生产模式日志**（LaunchAgent）：
+```bash
+tail -f ~/.yep-anywhere/logs/server-launchd.out.log
+tail -f ~/.yep-anywhere/logs/server-launchd.err.log
+```
+
+**后台运行日志**（使用 yep.sh 脚本时）：
+```bash
+tail -f /private/tmp/yep-server.log
+```
 
 所有 `console.log/error/warn` 输出都会被捕获。应用日志文件通常是 JSON 格式；stdout/stderr 日志会 pretty-print。
 
@@ -221,16 +248,12 @@ scripts/release-website.sh 1.5.3
 - `LOG_DIR`：自定义日志目录
 - `LOG_FILE`：自定义日志文件名（默认：server.log）
 
-## 本地部署记忆
+## 本地部署
 
-`~/.zshrc` 中历史 shell alias 如下：
+**本地别名配置**：每个用户的环境可能不同，具体别名配置请参考 `docs/project/local-setup-pbzhang.md`（或创建自己的本地配置文档）。
 
-```bash
-alias yep-deploy='/Users/yueyuan/Desktop/work/before_work/yepanywhere/scripts/redeploy-server.sh && /Users/yueyuan/Desktop/work/before_work/yepanywhere/scripts/rebuild-apk.sh'
-alias yep-server='/Users/yueyuan/Desktop/work/before_work/yepanywhere/scripts/redeploy-server.sh'
-```
+使用统一的部署脚本：
 
-新的工作优先使用统一项目入口：
 
 ```bash
 scripts/deploy.sh                 # 服务端 rebuild/restart/verify，然后构建/安装 APK
@@ -239,7 +262,7 @@ scripts/deploy.sh --apk-only      # 仅 APK
 pnpm deploy -- --server-only      # 通过 package.json 使用同一入口
 ```
 
-`scripts/redeploy-server.sh` 现在会在重启后执行强部署验证。它会比较运行中服务端的 `/api/version` `build.buildId`、已服务的前端 `/build-info.json`，以及 `dist/npm-package/build-info.json`。如果验证失败，说明响应 8022 的进程或静态前端 bundle 不是刚构建的代码。调试应用行为前，先检查 `/tmp/yep-server.log` 和 `~/.yep-anywhere/logs/server.log`。
+`scripts/redeploy-server.sh` 现在会在重启后执行强部署验证。它会比较运行中服务端的 `/api/version` `build.buildId`、已服务的前端 `/build-info.json`，以及 `dist/npm-package/build-info.json`。如果验证失败，说明响应端口的进程或静态前端 bundle 不是刚构建的代码。调试应用行为前，先检查服务端日志（开发模式：`~/.yep-anywhere/logs/server.log`，生产模式：`~/.yep-anywhere/logs/server-launchd.*.log`）。
 
 处理 Codex 编辑消息/session branch 问题时，先检查服务端日志中的：
 

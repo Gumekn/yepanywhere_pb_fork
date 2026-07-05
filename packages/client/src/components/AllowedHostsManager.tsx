@@ -35,11 +35,16 @@ export function AllowedHostsManager({
     if (trimmed.includes(" ")) return false;
 
     // 简单的域名/IP格式检查
-    const domainPattern = /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+    const domainPattern =
+      /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
     const ipv4Pattern = /^(\d{1,3}\.){3}\d{1,3}$/;
     const ipv6Pattern = /^[0-9a-fA-F:]+$/;
 
-    return domainPattern.test(trimmed) || ipv4Pattern.test(trimmed) || ipv6Pattern.test(trimmed);
+    return (
+      domainPattern.test(trimmed) ||
+      ipv4Pattern.test(trimmed) ||
+      ipv6Pattern.test(trimmed)
+    );
   };
 
   const handleAddHost = () => {
@@ -61,7 +66,7 @@ export function AllowedHostsManager({
   };
 
   const handleRemoveHost = (hostname: string) => {
-    onChange(customHosts.filter(h => h !== hostname));
+    onChange(customHosts.filter((h) => h !== hostname));
   };
 
   const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -121,6 +126,8 @@ export function AllowedHostsManager({
                     stroke="currentColor"
                     strokeWidth="2"
                     strokeLinecap="round"
+                    role="img"
+                    aria-label={t("allowedHostsRemove", { hostname })}
                   >
                     <path d="M4 4L12 12M12 4L4 12" />
                   </svg>
@@ -129,9 +136,7 @@ export function AllowedHostsManager({
             ))}
           </div>
         ) : (
-          <div className="allowed-hosts-empty">
-            {t("allowedHostsEmpty")}
-          </div>
+          <div className="allowed-hosts-empty">{t("allowedHostsEmpty")}</div>
         )}
       </div>
 
@@ -159,12 +164,8 @@ export function AllowedHostsManager({
             {t("allowedHostsAdd")}
           </button>
         </div>
-        {inputError && (
-          <div className="allowed-hosts-error">{inputError}</div>
-        )}
-        <div className="allowed-hosts-hint">
-          {t("allowedHostsAddHint")}
-        </div>
+        {inputError && <div className="allowed-hosts-error">{inputError}</div>}
+        <div className="allowed-hosts-hint">{t("allowedHostsAddHint")}</div>
       </div>
     </div>
   );
