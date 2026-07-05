@@ -972,5 +972,19 @@
   "sessionInspectorPending": "Pending",
   "sessionInspectorExternal": "External",
   "sessionInspectorSelf": "Owned",
-  "sessionInspectorIdle": "Idle"
+  "sessionInspectorIdle": "Idle",
+  "allowedHostsBuiltinTitle": "Built-in Rules (Always Allowed)",
+  "allowedHostsBuiltinPrivateIps": "Private IPs (192.168.x.x, 10.x.x.x, 172.16-31.x.x)",
+  "allowedHostsCustomTitle": "Custom Hostnames",
+  "allowedHostsEmpty": "No custom hostnames yet",
+  "allowedHostsAdd": "Add",
+  "allowedHostsAddPlaceholder": "e.g., example.com",
+  "allowedHostsAddHint": "Supports hostnames, IP addresses, and wildcards (e.g., *.example.com)",
+  "allowedHostsRemove": "Remove {hostname}",
+  "allowedHostsInvalidFormat": "Invalid hostname format",
+  "allowedHostsAlreadyExists": "This hostname already exists",
+  "localAccessModeCustom": "Custom Hostname Whitelist",
+  "localAccessModeCustomDescription": "Only allow specified hostnames (recommended)",
+  "localAccessModeAllowAll": "Allow All Hostnames",
+  "localAccessModeAllowAllDescription": "Accept requests from any hostname (unsafe, for testing only)"
 }

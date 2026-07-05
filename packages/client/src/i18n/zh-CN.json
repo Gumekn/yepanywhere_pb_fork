@@ -972,5 +972,19 @@
   "sessionInspectorPending": "等待中",
   "sessionInspectorExternal": "外部",
   "sessionInspectorSelf": "本会话",
-  "sessionInspectorIdle": "空闲"
+  "sessionInspectorIdle": "空闲",
+  "allowedHostsBuiltinTitle": "内置规则（始终允许）",
+  "allowedHostsBuiltinPrivateIps": "私有 IP (192.168.x.x, 10.x.x.x, 172.16-31.x.x)",
+  "allowedHostsCustomTitle": "自定义域名",
+  "allowedHostsEmpty": "暂无自定义域名",
+  "allowedHostsAdd": "添加",
+  "allowedHostsAddPlaceholder": "例如：example.com",
+  "allowedHostsAddHint": "支持域名、IP 地址和通配符（如 *.example.com）",
+  "allowedHostsRemove": "删除 {hostname}",
+  "allowedHostsInvalidFormat": "域名格式无效",
+  "allowedHostsAlreadyExists": "该域名已存在",
+  "localAccessModeCustom": "自定义域名白名单",
+  "localAccessModeCustomDescription": "只允许指定的域名访问（推荐）",
+  "localAccessModeAllowAll": "允许所有域名",
+  "localAccessModeAllowAllDescription": "接受来自任意域名的请求（不安全，仅用于测试）"
 }

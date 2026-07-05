@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api } from "../../api/client";
+import { AllowedHostsManager } from "../../components/AllowedHostsManager";
 import { FilterDropdown } from "../../components/FilterDropdown";
 import { useOptionalAuth } from "../../contexts/AuthContext";
 import {
@@ -101,7 +102,7 @@ export function LocalAccessSettings() {
 
   // Allowed hosts form state
   const [allowAllHostsToggle, setAllowAllHostsToggle] = useState(false);
-  const [allowedHostsText, setAllowedHostsText] = useState("");
+  const [customHosts, setCustomHosts] = useState<string[]>([]);
 
   // Form state
   const [formError, setFormError] = useState<string | null>(null);
@@ -120,10 +121,12 @@ export function LocalAccessSettings() {
     const ah = serverSettings.allowedHosts;
     if (ah === "*") {
       setAllowAllHostsToggle(true);
-      setAllowedHostsText("");
+      setCustomHosts([]);
     } else {
       setAllowAllHostsToggle(false);
-      setAllowedHostsText(ah ?? "");
+      // 将逗号分隔的字符串转换为数组
+      const hosts = ah ? ah.split(",").map(h => h.trim()).filter(Boolean) : [];
+      setCustomHosts(hosts);
     }
     setFormInitialized(true);
   }
@@ -131,11 +134,11 @@ export function LocalAccessSettings() {
   // Compute the effective allowedHosts value for comparison/saving
   const getAllowedHostsValue = (
     toggle: boolean,
-    text: string,
+    hosts: string[],
   ): string | undefined => {
     if (toggle) return "*";
-    const trimmed = text.trim();
-    return trimmed || undefined;
+    const hostsString = hosts.join(",");
+    return hostsString || undefined;
   };
 
   // Track changes - includes auth and allowed hosts changes
@@ -146,7 +149,7 @@ export function LocalAccessSettings() {
     newRequirePassword: boolean,
     newPassword: string,
     newAllowAllHosts: boolean,
-    newAllowedHostsText: string,
+    newCustomHosts: string[],
     newLocalhostOpen: boolean,
   ) => {
     if (!binding || !auth || !serverSettings) return false;
@@ -158,7 +161,7 @@ export function LocalAccessSettings() {
     const localhostOpenChanged = newLocalhostOpen !== auth.localhostOpen;
     const newValue = getAllowedHostsValue(
       newAllowAllHosts,
-      newAllowedHostsText,
+      newCustomHosts,
     );
     const oldValue = serverSettings.allowedHosts;
     const allowedHostsChanged = (newValue ?? "") !== (oldValue ?? "");
@@ -181,7 +184,7 @@ export function LocalAccessSettings() {
     requirePw?: boolean;
     password?: string;
     allowAll?: boolean;
-    hostsText?: string;
+    customHosts?: string[];
     localhostOpen?: boolean;
   }) => {
     setHasChanges(
@@ -192,7 +195,7 @@ export function LocalAccessSettings() {
         overrides.requirePw ?? requirePassword,
         overrides.password ?? authPassword,
         overrides.allowAll ?? allowAllHostsToggle,
-        overrides.hostsText ?? allowedHostsText,
+        overrides.customHosts ?? customHosts,
         overrides.localhostOpen ?? localhostOpenToggle,
       ),
     );
@@ -263,7 +266,7 @@ export function LocalAccessSettings() {
       // Apply allowed hosts changes
       const newAllowedHosts = getAllowedHostsValue(
         allowAllHostsToggle,
-        allowedHostsText,
+        customHosts,
       );
       await api.updateServerSettings({
         allowedHosts: newAllowedHosts ?? "",
@@ -423,201 +426,227 @@ export function LocalAccessSettings() {
             )}
           </div>
 
-          <div className="settings-item">
-            <div className="settings-item-info">
-              <strong>{t("localAccessNetworkTitle")}</strong>
-              <p>{t("localAccessNetworkDescription")}</p>
-            </div>
-            {binding?.network.overriddenByCli ? (
-              <span className="settings-value-readonly">
-                {binding.network.host}:{binding.network.port}{" "}
-                <span className="settings-hint">
-                  {t("localAccessSetViaHost")}
+          {/* Network binding - consolidated into one card */}
+          <div className="settings-item settings-item-stacked">
+            <div className="settings-item-row">
+              <div className="settings-item-info">
+                <strong>{t("localAccessNetworkTitle")}</strong>
+                <p>{t("localAccessNetworkDescription")}</p>
+              </div>
+              {binding?.network.overriddenByCli ? (
+                <span className="settings-value-readonly">
+                  {binding.network.host}:{binding.network.port}{" "}
+                  <span className="settings-hint">
+                    {t("localAccessSetViaHost")}
+                  </span>
                 </span>
-              </span>
-            ) : (
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={networkEnabled}
-                  onChange={(e) => {
-                    setNetworkEnabled(e.target.checked);
-                    updateHasChanges({ networkEnabled: e.target.checked });
-                  }}
-                />
-                <span className="toggle-slider" />
-              </label>
-            )}
-          </div>
-
-          {networkEnabled && !binding?.network.overriddenByCli && binding && (
-            <div className="settings-item">
-              <div className="settings-item-info">
-                <strong>{t("localAccessInterfaceTitle")}</strong>
-                <p>{t("localAccessInterfaceDescription")}</p>
-              </div>
-              <FilterDropdown
-                label={t("localAccessInterfaceTitle")}
-                placeholder={t("localAccessInterfacePlaceholder")}
-                multiSelect={false}
-                align="right"
-                options={[
-                  ...binding.interfaces.map((iface) => ({
-                    value: iface.address,
-                    label: iface.displayName,
-                  })),
-                  {
-                    value: "0.0.0.0",
-                    label: t("localAccessInterfaceAll"),
-                  },
-                  { value: "custom", label: t("localAccessInterfaceCustom") },
-                ]}
-                selected={selectedInterface ? [selectedInterface] : []}
-                onChange={(values) => {
-                  const newInterface = values[0] ?? "";
-                  setSelectedInterface(newInterface);
-                  updateHasChanges({ iface: newInterface });
-                }}
-              />
+              ) : (
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={networkEnabled}
+                    onChange={(e) => {
+                      setNetworkEnabled(e.target.checked);
+                      updateHasChanges({ networkEnabled: e.target.checked });
+                    }}
+                  />
+                  <span className="toggle-slider" />
+                </label>
+              )}
             </div>
-          )}
 
-          {networkEnabled &&
-            !binding?.network.overriddenByCli &&
-            selectedInterface === "custom" && (
-              <div className="settings-item">
-                <div className="settings-item-info">
-                  <strong>{t("localAccessCustomIpTitle")}</strong>
-                  <p>{t("localAccessCustomIpDescription")}</p>
-                </div>
-                <input
-                  type="text"
-                  className="settings-input"
-                  placeholder="192.168.1.100"
-                  value={customIp}
-                  onChange={(e) => setCustomIp(e.target.value)}
-                />
-              </div>
-            )}
-
-          {/* Allowed Hosts — applies even on localhost (reverse proxy may use different hostname) */}
-          <div className="settings-item">
-            <div className="settings-item-info">
-              <strong>{t("localAccessAllowAllHostsTitle")}</strong>
-              <p>{t("localAccessAllowAllHostsDescription")}</p>
-            </div>
-            <label className="toggle-switch">
-              <input
-                type="checkbox"
-                checked={allowAllHostsToggle}
-                onChange={(e) => {
-                  setAllowAllHostsToggle(e.target.checked);
-                  updateHasChanges({ allowAll: e.target.checked });
-                }}
-              />
-              <span className="toggle-slider" />
-            </label>
-          </div>
-          {!allowAllHostsToggle && (
-            <div className="settings-item">
-              <div className="settings-item-info">
-                <strong>{t("localAccessAllowedHostsTitle")}</strong>
-                <p>{t("localAccessAllowedHostsDescription")}</p>
-              </div>
-              <input
-                type="text"
-                className="settings-input"
-                placeholder={t("localAccessAllowedHostsPlaceholder")}
-                value={allowedHostsText}
-                onChange={(e) => {
-                  setAllowedHostsText(e.target.value);
-                  updateHasChanges({ hostsText: e.target.value });
-                }}
-              />
-            </div>
-          )}
-          <p className="form-hint">{t("localAccessAllowedHostsHint")}</p>
-
-          {/* Require Password toggle */}
-          {!auth.authDisabledByEnv && (
-            <div className="settings-item">
-              <div className="settings-item-info">
-                <strong>{t("localAccessRequirePasswordTitle")}</strong>
-                <p>{t("localAccessRequirePasswordDescription")}</p>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={requirePassword}
-                  onChange={(e) => {
-                    setRequirePassword(e.target.checked);
-                    updateHasChanges({ requirePw: e.target.checked });
-                  }}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-          )}
-
-          {/* Password fields - shown when auth is on */}
-          {showPasswordFields && (
-            <>
-              {/* Hidden username field to prevent Chrome from using port as username */}
-              <input
-                type="text"
-                name="username"
-                autoComplete="username"
-                style={{
-                  position: "absolute",
-                  visibility: "hidden",
-                  pointerEvents: "none",
-                }}
-                tabIndex={-1}
-              />
-              <div className="settings-item">
-                <div className="settings-item-info">
-                  <strong>{t("localAccessPasswordTitle")}</strong>
-                  <p>
-                    {auth.authEnabled
-                      ? t("localAccessPasswordKeepCurrent")
-                      : t("localAccessPasswordMinLength")}
-                  </p>
-                </div>
-                <input
-                  type="password"
-                  className="settings-input"
-                  value={authPassword}
-                  onChange={(e) => {
-                    setAuthPassword(e.target.value);
-                    updateHasChanges({ password: e.target.value });
-                  }}
-                  autoComplete="new-password"
-                  placeholder={
-                    auth.authEnabled
-                      ? t("localAccessPasswordNewPlaceholder")
-                      : t("localAccessPasswordPlaceholder")
-                  }
-                />
-              </div>
-              {authPassword.length > 0 && (
+            {/* Network interface selector - shown when network is enabled */}
+            {networkEnabled && !binding?.network.overriddenByCli && binding && (
+              <div className="settings-nested-content">
                 <div className="settings-item">
                   <div className="settings-item-info">
-                    <strong>{t("localAccessConfirmPasswordTitle")}</strong>
+                    <strong>{t("localAccessInterfaceTitle")}</strong>
+                    <p>{t("localAccessInterfaceDescription")}</p>
                   </div>
-                  <input
-                    type="password"
-                    className="settings-input"
-                    value={authPasswordConfirm}
-                    onChange={(e) => setAuthPasswordConfirm(e.target.value)}
-                    autoComplete="new-password"
-                    placeholder={t("localAccessConfirmPasswordPlaceholder")}
+                  <FilterDropdown
+                    label={t("localAccessInterfaceTitle")}
+                    placeholder={t("localAccessInterfacePlaceholder")}
+                    multiSelect={false}
+                    align="right"
+                    options={[
+                      ...binding.interfaces.map((iface) => ({
+                        value: iface.address,
+                        label: iface.displayName,
+                      })),
+                      {
+                        value: "0.0.0.0",
+                        label: t("localAccessInterfaceAll"),
+                      },
+                      { value: "custom", label: t("localAccessInterfaceCustom") },
+                    ]}
+                    selected={selectedInterface ? [selectedInterface] : []}
+                    onChange={(values) => {
+                      const newInterface = values[0] ?? "";
+                      setSelectedInterface(newInterface);
+                      updateHasChanges({ iface: newInterface });
+                    }}
                   />
                 </div>
+
+                {/* Custom IP input - shown when custom interface is selected */}
+                {selectedInterface === "custom" && (
+                  <div className="settings-item">
+                    <div className="settings-item-info">
+                      <strong>{t("localAccessCustomIpTitle")}</strong>
+                      <p>{t("localAccessCustomIpDescription")}</p>
+                    </div>
+                    <input
+                      type="text"
+                      className="settings-input"
+                      placeholder="192.168.1.100"
+                      value={customIp}
+                      onChange={(e) => setCustomIp(e.target.value)}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Allowed Hosts — consolidated into one card with radio selection */}
+          <div className="settings-item settings-item-stacked">
+            <div className="settings-item-info">
+              <strong>{t("localAccessAllowedHostsTitle")}</strong>
+              <p>{t("localAccessAllowedHostsDescription")}</p>
+            </div>
+
+            {/* Host access mode selector */}
+            <div className="settings-radio-group">
+              <label className="settings-radio-option">
+                <input
+                  type="radio"
+                  name="hostAccessMode"
+                  checked={!allowAllHostsToggle}
+                  onChange={() => {
+                    setAllowAllHostsToggle(false);
+                    updateHasChanges({ allowAll: false });
+                  }}
+                />
+                <div className="settings-radio-label">
+                  <strong>{t("localAccessModeCustom")}</strong>
+                  <span>{t("localAccessModeCustomDescription")}</span>
+                </div>
+              </label>
+
+              <label className="settings-radio-option">
+                <input
+                  type="radio"
+                  name="hostAccessMode"
+                  checked={allowAllHostsToggle}
+                  onChange={() => {
+                    setAllowAllHostsToggle(true);
+                    updateHasChanges({ allowAll: true });
+                  }}
+                />
+                <div className="settings-radio-label">
+                  <strong>{t("localAccessModeAllowAll")}</strong>
+                  <span>{t("localAccessModeAllowAllDescription")}</span>
+                </div>
+              </label>
+            </div>
+
+            {/* Custom hosts manager - shown when custom mode is selected */}
+            {!allowAllHostsToggle && (
+              <div className="settings-nested-content">
+                <AllowedHostsManager
+                  customHosts={customHosts}
+                  onChange={(newHosts) => {
+                    setCustomHosts(newHosts);
+                    updateHasChanges({ customHosts: newHosts });
+                  }}
+                  disabled={isApplying || applying}
+                />
+              </div>
+            )}
+          </div>
+
+          {/* Authentication - consolidated into one card */}
+          {!auth.authDisabledByEnv && (
+            <div className="settings-item settings-item-stacked">
+              <div className="settings-item-row">
+                <div className="settings-item-info">
+                  <strong>{t("localAccessRequirePasswordTitle")}</strong>
+                  <p>{t("localAccessRequirePasswordDescription")}</p>
+                </div>
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={requirePassword}
+                    onChange={(e) => {
+                      setRequirePassword(e.target.checked);
+                      updateHasChanges({ requirePw: e.target.checked });
+                    }}
+                  />
+                  <span className="toggle-slider" />
+                </label>
+              </div>
+
+              {/* Password fields - shown when auth is on */}
+              {showPasswordFields && (
+                <div className="settings-nested-content">
+                  {/* Hidden username field to prevent Chrome from using port as username */}
+                  <input
+                    type="text"
+                    name="username"
+                    autoComplete="username"
+                    style={{
+                      position: "absolute",
+                      visibility: "hidden",
+                      pointerEvents: "none",
+                    }}
+                    tabIndex={-1}
+                  />
+                  <div className="settings-item">
+                    <div className="settings-item-info">
+                      <strong>{t("localAccessPasswordTitle")}</strong>
+                      <p>
+                        {auth.authEnabled
+                          ? t("localAccessPasswordKeepCurrent")
+                          : t("localAccessPasswordMinLength")}
+                      </p>
+                    </div>
+                    <input
+                      type="password"
+                      className="settings-input"
+                      value={authPassword}
+                      onChange={(e) => {
+                        setAuthPassword(e.target.value);
+                        updateHasChanges({ password: e.target.value });
+                      }}
+                      autoComplete="new-password"
+                      placeholder={
+                        auth.authEnabled
+                          ? t("localAccessPasswordNewPlaceholder")
+                          : t("localAccessPasswordPlaceholder")
+                      }
+                    />
+                  </div>
+                  {authPassword.length > 0 && (
+                    <div className="settings-item">
+                      <div className="settings-item-info">
+                        <strong>{t("localAccessConfirmPasswordTitle")}</strong>
+                      </div>
+                      <input
+                        type="password"
+                        className="settings-input"
+                        value={authPasswordConfirm}
+                        onChange={(e) => setAuthPasswordConfirm(e.target.value)}
+                        autoComplete="new-password"
+                        placeholder={t("localAccessConfirmPasswordPlaceholder")}
+                      />
+                    </div>
+                  )}
+                  {!auth.authEnabled && (
+                    <p className="form-hint">{t("localAccessPasswordResetHint")}</p>
+                  )}
+                </div>
               )}
-              {!auth.authEnabled && (
-                <p className="form-hint">{t("localAccessPasswordResetHint")}</p>
-              )}
-            </>
+            </div>
           )}
 
           {/* Allow Localhost Access - shown in desktop mode when password auth is off */}

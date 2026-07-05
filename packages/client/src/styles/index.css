@@ -11771,3 +11771,277 @@ button.context-usage-indicator--button:focus-visible {
   animation: message-target-flash 2.4s ease-out;
   border-radius: var(--radius-md);
 }
+
+/* ==================== Allowed Hosts Manager ==================== */
+
+.allowed-hosts-manager {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-3);
+  background: var(--bg-surface);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+}
+
+.allowed-hosts-section-title {
+  font-weight: 600;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  margin-bottom: var(--space-2);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* 内置规则区域 */
+.allowed-hosts-builtin {
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.allowed-hosts-builtin-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.allowed-hosts-builtin-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  background: var(--bg-code);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.allowed-hosts-icon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--success-color);
+  font-weight: 600;
+}
+
+/* 自定义域名列表区域 */
+.allowed-hosts-custom {
+  /* 无额外样式 */
+}
+
+.allowed-hosts-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.allowed-hosts-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-code);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.allowed-hosts-item:hover {
+  border-color: var(--text-dimmed);
+  background: var(--bg-hover);
+}
+
+.allowed-hosts-item-text {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.allowed-hosts-remove-btn {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.allowed-hosts-remove-btn:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.1);
+  color: rgb(239, 68, 68);
+}
+
+.allowed-hosts-remove-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.allowed-hosts-empty {
+  padding: var(--space-4);
+  text-align: center;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  font-style: italic;
+}
+
+/* 添加新域名区域 */
+.allowed-hosts-add {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-color);
+}
+
+.allowed-hosts-add-input-wrapper {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.allowed-hosts-add-input {
+  flex: 1;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-code);
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-family: var(--font-mono);
+  transition: border-color 0.15s;
+}
+
+.allowed-hosts-add-input:focus {
+  outline: none;
+  border-color: var(--app-yep-green);
+}
+
+.allowed-hosts-add-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.allowed-hosts-add-btn {
+  flex-shrink: 0;
+  padding: var(--space-2) var(--space-4);
+  background: var(--app-yep-green);
+  border: none;
+  border-radius: var(--radius-sm);
+  color: white;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.05s;
+  white-space: nowrap;
+}
+
+.allowed-hosts-add-btn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.allowed-hosts-add-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.allowed-hosts-add-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.allowed-hosts-error {
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: var(--radius-sm);
+  color: rgb(239, 68, 68);
+  font-size: var(--font-size-sm);
+}
+
+.allowed-hosts-hint {
+  margin-top: var(--space-2);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* ==================== Radio Group for Settings ==================== */
+
+.settings-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.settings-radio-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: var(--bg-code);
+  border: 2px solid var(--border-color);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.settings-radio-option:hover {
+  border-color: var(--text-dimmed);
+  background: var(--bg-hover);
+}
+
+.settings-radio-option input[type="radio"] {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  margin-top: 2px;
+  cursor: pointer;
+  accent-color: var(--app-yep-green);
+}
+
+.settings-radio-option input[type="radio"]:checked {
+  /* Enhanced visual feedback when selected */
+}
+
+.settings-radio-option:has(input[type="radio"]:checked) {
+  border-color: var(--app-yep-green);
+  background: color-mix(in srgb, var(--app-yep-green) 5%, transparent);
+}
+
+.settings-radio-label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.settings-radio-label strong {
+  display: block;
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.settings-radio-label span {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+
+/* Nested content that appears when a radio option is selected */
+.settings-nested-content {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-color);
+}
+
