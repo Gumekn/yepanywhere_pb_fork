@@ -263,10 +263,12 @@ detect_run_mode() {
     local cmd=$(ps -p $pid -o command= 2>/dev/null || echo "")
 
     # 检查是否包含开发模式特征
-    if echo "$cmd" | grep -q "tsx\|--import tsx\|pnpm dev\|scripts/dev.js"; then
+    # 开发模式特征：tsx、pnpm dev、scripts/dev.js、packages/server/dist/index.js
+    if echo "$cmd" | grep -q "tsx\|--import tsx\|pnpm dev\|scripts/dev.js\|packages/server/dist/index.js"; then
         echo "开发模式"
     # 检查是否包含生产模式特征
-    elif echo "$cmd" | grep -q "dist/index.js\|pnpm start\|NODE_ENV=production"; then
+    # 生产模式特征：dist/npm-package/dist/cli.js、NODE_ENV=production、pnpm start（排除开发模式）
+    elif echo "$cmd" | grep -q "dist/npm-package/dist/cli.js\|NODE_ENV=production"; then
         echo "生产模式"
     else
         echo "未知"
