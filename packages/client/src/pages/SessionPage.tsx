@@ -274,7 +274,8 @@ function SessionPageContent({
           : "disconnected";
 
   // Effective provider for immediate display before session data loads
-  const effectiveProvider = session?.provider ?? initialProvider;
+  // Always provide a default to prevent undefined access errors
+  const effectiveProvider = session?.provider ?? initialProvider ?? "claude";
   const approvalAgentName = getApprovalAgentName(effectiveProvider);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
@@ -1359,12 +1360,24 @@ function SessionPageContent({
     }
   }, [displayTitle, showToast, t]);
 
-  if (error)
+  // Early return on error to prevent rendering with undefined data
+  if (error) {
     return (
       <div className="error">
         {t("sessionErrorPrefix")} {error.message}
       </div>
     );
+  }
+
+  // Additional safety check: if loading is done but session is null, show error
+  // This prevents crashes when session data is missing or corrupted
+  if (!loading && !session) {
+    return (
+      <div className="error">
+        {t("sessionErrorPrefix")} Session data could not be loaded
+      </div>
+    );
+  }
 
   // Sidebar icon component
   const SidebarIcon = () => (
