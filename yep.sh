@@ -639,9 +639,19 @@ rebuild() {
     # 获取当前版本号
     local npm_version=$(node -p "require('./package.json').version")
 
+    # 先构建客户端（前端）
+    print_info "构建客户端 (前端)..."
+    if pnpm --filter client build; then
+        print_success "客户端构建完成"
+    else
+        print_error "客户端构建失败"
+        return 1
+    fi
+
+    # 再构建服务端部署包
     print_info "构建部署包 (版本: ${npm_version})..."
     if NPM_VERSION="$npm_version" pnpm build:bundle; then
-        print_success "构建完成"
+        print_success "服务端构建完成"
 
         # 显示构建信息
         if [[ -f "$PROJECT_ROOT/dist/npm-package/build-info.json" ]]; then
@@ -656,7 +666,7 @@ rebuild() {
         chmod +x dist/npm-package/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true
         print_success "运行时依赖安装完成"
     else
-        print_error "构建失败"
+        print_error "服务端构建失败"
         return 1
     fi
 

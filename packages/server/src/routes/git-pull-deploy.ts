@@ -69,18 +69,31 @@ export async function startGitPullAndDeploy(
       logStream.write(installOutput);
       if (installError) logStream.write(installError);
 
-      // Step 3: Build project
-      logStream.write("\n==> 步骤 3/4: 构建项目 (pnpm build)\n");
-      const { stdout: buildOutput, stderr: buildError } = await execFileAsync(
+      // Step 3a: Build client (frontend)
+      logStream.write(
+        "\n==> 步骤 3a/5: 构建客户端 (pnpm --filter client build)\n",
+      );
+      const { stdout: clientBuildOutput, stderr: clientBuildError } =
+        await execFileAsync("pnpm", ["--filter", "client", "build"], {
+          cwd: repoRoot,
+          encoding: "utf-8",
+          timeout: 300000,
+        });
+      logStream.write(clientBuildOutput);
+      if (clientBuildError) logStream.write(clientBuildError);
+
+      // Step 3b: Build server bundle
+      logStream.write("\n==> 步骤 3b/5: 构建服务端 (pnpm build:bundle)\n");
+      const { stdout: bundleOutput, stderr: bundleError } = await execFileAsync(
         "pnpm",
-        ["build"],
+        ["build:bundle"],
         { cwd: repoRoot, encoding: "utf-8", timeout: 300000 },
       );
-      logStream.write(buildOutput);
-      if (buildError) logStream.write(buildError);
+      logStream.write(bundleOutput);
+      if (bundleError) logStream.write(bundleError);
 
       // Step 4: Restart service
-      logStream.write("\n==> 步骤 4/4: 重启服务\n");
+      logStream.write("\n==> 步骤 4/5: 重启服务\n");
       const deployScript = path.join(repoRoot, "scripts", "deploy.sh");
       const { stdout: deployOutput, stderr: deployError } = await execFileAsync(
         deployScript,
