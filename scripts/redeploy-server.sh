@@ -428,6 +428,14 @@ if $DO_RESTART; then
   # cleanly (see INFRA.md). The Hono app + client bundle both pick up BASE_PATH.
   # APK / direct-mode tcp tunnel callers are unaffected — they hit ws://host:8022
   # which still serves /yep/api/ws; only the URL prefix changes, not the port.
+
+  # 使用构建好的 CLI 路径，而不是依赖全局 yepanywhere 命令
+  CLI_PATH="$REPO_ROOT/dist/npm-package/dist/cli.js"
+  if [[ ! -f "$CLI_PATH" ]]; then
+    err "CLI not found at $CLI_PATH. Run build first."
+    exit 1
+  fi
+
   if launchd_label_loaded "$SERVER_LAUNCHD_LABEL"; then
     dim "using LaunchAgent ${SERVER_LAUNCHD_LABEL}; KeepAlive is not required"
     kickstart_launchd_label "$SERVER_LAUNCHD_LABEL"
@@ -440,12 +448,12 @@ if $DO_RESTART; then
       YEP_CODEX_BRIDGE_PORT="$CODEX_BRIDGE_PORT" \
       YEP_CLAUDE_BRIDGE_CONTROL_URL="$CLAUDE_BRIDGE_HTTP_URL" \
       YEP_CLAUDE_BRIDGE_PORT="$CLAUDE_BRIDGE_PORT" \
-      nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
+      nohup node "$CLI_PATH" --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
   else
     dim "LaunchAgent ${SERVER_LAUNCHD_LABEL} is not loaded; falling back to nohup (logs: /tmp/yep-server.log)"
     BASE_PATH="${SERVER_BASE_PATH:-/}" \
       ALLOWED_IMAGE_PATHS="$SERVER_ALLOWED_IMAGE_PATHS" \
-      nohup yepanywhere --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
+      nohup node "$CLI_PATH" --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
   fi
 
   # Health-check loop. Tries up to 15s; the server usually answers within 2s
