@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { getRuntimeBuildInfo } from "../build-info.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
 import { getDeploymentAvailability, startDeploymentJob } from "./deploy.js";
@@ -25,13 +26,23 @@ export function createServerAdminRoutes(deps: ServerAdminDeps): Hono {
     const deployAvailable = getDeploymentAvailability({
       dataDir: deps.dataDir,
     }).available;
-    if (process.env.NODE_ENV === "production" && deployAvailable) {
+
+    // Check if we're running in dev mode
+    const buildInfo = await getRuntimeBuildInfo();
+    const isDevMode = buildInfo.source === "dev";
+
+    // If deployment is available, use the deployment system
+    if (deployAvailable) {
       const response = c.json({
         ok: true,
-        message: "Server restart deploy job starting...",
+        message: isDevMode
+          ? "Stopping dev mode, building and starting production mode..."
+          : "Rebuilding and restarting server...",
       });
 
       setTimeout(() => {
+        // Always do a full build and restart (server action)
+        // This ensures the latest code is deployed
         void startDeploymentJob(
           { dataDir: deps.dataDir },
           { action: "server" },
@@ -44,6 +55,7 @@ export function createServerAdminRoutes(deps: ServerAdminDeps): Hono {
       return response;
     }
 
+    // Fallback: if no deployment system, just send SIGTERM
     // Respond before restarting.
     // Send SIGTERM to self so the registered gracefulShutdown handler aborts
     // active sessions and cleans up before the process supervisor (scripts/dev.js,

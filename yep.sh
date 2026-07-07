@@ -512,6 +512,100 @@ start_prod() {
     fi
 }
 
+# 验证部署
+verify_deployment() {
+    local base_url="$1"
+
+    print_info "验证部署..."
+
+    # 等待服务完全启动
+    sleep 2
+
+    if node scripts/verify-deploy.mjs --base-url "$base_url" --build-info "$PROJECT_ROOT/dist/npm-package/build-info.json"; then
+        print_success "部署验证通过：运行中的服务端和前端都已更新到最新构建"
+        return 0
+    else
+        print_error "部署验证失败：运行中的服务或前端可能仍在使用旧代码"
+        print_warning "请检查日志或手动验证"
+        return 1
+    fi
+}
+
+# 重启生产模式
+restart_production() {
+    stop_all_services
+    sleep 2
+
+    # 检查部署包是否存在
+    local cli_path="$PROJECT_ROOT/dist/npm-package/dist/cli.js"
+    if [[ ! -f "$cli_path" ]]; then
+        print_error "部署包不存在: $cli_path"
+        print_error "请先运行重构建"
+        return 1
+    fi
+
+    # 确保 cli.js 有执行权限
+    chmod +x "$cli_path"
+
+    # 启动生产模式（使用构建好的部署包）
+    print_info "后台启动生产服务（使用部署包）..."
+    print_info "运行命令: node $cli_path --port $MAIN_PORT"
+
+    nohup node "$cli_path" --port "$MAIN_PORT" > /private/tmp/yep-server.log 2>&1 &
+    local pid=$!
+
+    # 等待服务启动
+    sleep 5
+
+    if ps -p $pid > /dev/null 2>&1; then
+        print_success "服务已在后台启动 (PID: $pid)"
+
+        # 验证部署
+        local base_url="http://127.0.0.1:${MAIN_PORT}"
+        if verify_deployment "$base_url"; then
+            print_success "生产模式重启完成并已验证"
+        else
+            print_warning "服务已启动，但验证未通过"
+        fi
+    else
+        print_error "服务启动失败，请检查日志: /private/tmp/yep-server.log"
+        return 1
+    fi
+}
+
+# 重启开发模式
+restart_development() {
+    stop_all_services
+    sleep 2
+
+    # 启动开发模式（后台运行）
+    print_info "后台启动开发服务..."
+    nohup env PORT=$PORT pnpm dev > ~/.yep-anywhere/logs/dev-console.log 2>&1 &
+    local pid=$!
+
+    # 等待服务启动
+    sleep 5
+
+    if ps -p $pid > /dev/null 2>&1; then
+        print_success "服务已在后台启动 (PID: $pid)"
+
+        # 开发模式不需要验证 buildId（它使用源代码运行，buildId 总是 dev-xxx）
+        # 只检查服务是否响应
+        local base_url="http://127.0.0.1:${MAIN_PORT}"
+        print_info "检查服务响应..."
+        sleep 2
+
+        if curl -fsS "${base_url}/api/version" >/dev/null 2>&1; then
+            print_success "开发模式重启完成，服务正常响应"
+        else
+            print_warning "服务已启动，但未能访问 /api/version"
+        fi
+    else
+        print_error "服务启动失败，请检查日志: ~/.yep-anywhere/logs/dev-console.log"
+        return 1
+    fi
+}
+
 # 重构建项目
 rebuild() {
     print_header "重构建项目"
@@ -542,15 +636,70 @@ rebuild() {
         return 1
     fi
 
-    print_info "构建项目..."
-    if pnpm build; then
+    # 获取当前版本号
+    local npm_version=$(node -p "require('./package.json').version")
+
+    print_info "构建部署包 (版本: ${npm_version})..."
+    if NPM_VERSION="$npm_version" pnpm build:bundle; then
         print_success "构建完成"
+
+        # 显示构建信息
+        if [[ -f "$PROJECT_ROOT/dist/npm-package/build-info.json" ]]; then
+            local build_id=$(node -p "JSON.parse(require('fs').readFileSync('$PROJECT_ROOT/dist/npm-package/build-info.json', 'utf-8')).buildId")
+            print_info "Build ID: $build_id"
+        fi
+
+        # 安装运行时依赖（参考 redeploy-server.sh 第249-251行）
+        print_info "安装运行时依赖到 dist/npm-package ..."
+        (cd dist/npm-package && npm install --omit=dev --no-audit --no-fund --silent)
+        chmod +x dist/npm-package/dist/cli.js 2>/dev/null || true
+        chmod +x dist/npm-package/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true
+        print_success "运行时依赖安装完成"
     else
         print_error "构建失败"
         return 1
     fi
 
     print_success "重构建完成"
+    echo ""
+    print_warning "注意: 新代码已构建到 dist/npm-package/，但服务端进程还在运行旧代码"
+    echo ""
+    echo "是否重启服务端以应用新代码？"
+    echo "1) 重启生产模式"
+    echo "2) 重启开发模式"
+    echo "3) 稍后手动重启"
+    echo ""
+    read -p "请选择 (1-3，默认 3): " -n 1 -r
+    echo ""
+    echo ""
+
+    case ${REPLY:-3} in
+        1)
+            print_info "正在重启生产模式..."
+            if restart_production; then
+                echo ""
+                print_success "服务端已重启并验证，请刷新浏览器查看新版本"
+            else
+                echo ""
+                print_error "重启或验证失败，请手动检查"
+            fi
+            ;;
+        2)
+            print_info "正在重启开发模式..."
+            if restart_development; then
+                echo ""
+                print_success "服务端已重启并验证，开发模式会自动刷新浏览器"
+            else
+                echo ""
+                print_error "重启或验证失败，请手动检查"
+            fi
+            ;;
+        3)
+            print_info "跳过重启，你可以稍后运行:"
+            echo "  - 选项 5) 重启生产模式"
+            echo "  - 选项 4) 重启开发模式"
+            ;;
+    esac
 }
 
 # 显示帮助信息

@@ -519,6 +519,14 @@ export interface DeploymentApkInfo {
   downloadPath: string;
 }
 
+export interface GitVersionInfo {
+  commitHash: string;
+  commitHashFull: string;
+  commitDate: string;
+  branch: string;
+  version: string;
+}
+
 export interface DeploymentStatusResponse {
   available: boolean;
   reason?: string;
@@ -541,6 +549,11 @@ export interface DeploymentStatusResponse {
     artifacts: DeploymentApkInfo[];
   };
   currentJob: DeploymentJob | null;
+  localGitVersion?: GitVersionInfo | null;
+  githubVersion?: GitVersionInfo | null;
+  stableVersion?: GitVersionInfo | null;
+  hasLocalUpdate?: boolean;
+  hasGithubUpdate?: boolean;
 }
 
 export interface StartDeploymentRequest {

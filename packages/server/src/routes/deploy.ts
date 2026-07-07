@@ -78,6 +78,14 @@ interface DeploymentJobRecord extends Omit<DeploymentJob, "log"> {
   logPath: string;
 }
 
+export interface GitVersionInfo {
+  commitHash: string;
+  commitHashFull: string;
+  commitDate: string;
+  branch: string;
+  version: string;
+}
+
 export interface DeploymentStatusResponse {
   available: boolean;
   reason?: string;
@@ -100,6 +108,11 @@ export interface DeploymentStatusResponse {
     artifacts: DeploymentApkInfo[];
   };
   currentJob: DeploymentJob | null;
+  localGitVersion?: GitVersionInfo | null;
+  githubVersion?: GitVersionInfo | null;
+  stableVersion?: GitVersionInfo | null;
+  hasLocalUpdate?: boolean;
+  hasGithubUpdate?: boolean;
 }
 
 export interface StartDeploymentRequest {
@@ -676,6 +689,125 @@ async function readStagedBuildInfo(
   }
 }
 
+async function getGitVersionInfo(
+  repoRoot: string,
+  ref: string,
+): Promise<GitVersionInfo | null> {
+  try {
+    // Get commit hash
+    const { stdout: commitHashFull } = await execFileAsync(
+      "git",
+      ["rev-parse", ref],
+      { cwd: repoRoot, encoding: "utf-8" },
+    );
+    const fullHash = commitHashFull.trim();
+
+    // Get commit date
+    const { stdout: commitDate } = await execFileAsync(
+      "git",
+      ["log", "-1", "--format=%ci", ref],
+      { cwd: repoRoot, encoding: "utf-8" },
+    );
+
+    // Get branch name (only for HEAD)
+    let branch = "unknown";
+    if (ref === "HEAD") {
+      try {
+        const { stdout: branchOutput } = await execFileAsync(
+          "git",
+          ["rev-parse", "--abbrev-ref", "HEAD"],
+          { cwd: repoRoot, encoding: "utf-8" },
+        );
+        branch = branchOutput.trim();
+      } catch {
+        // Branch name is optional
+      }
+    } else {
+      branch = ref;
+    }
+
+    // Get version from package.json
+    const version = await readPackageVersion(repoRoot);
+
+    return {
+      commitHash: fullHash.slice(0, 8),
+      commitHashFull: fullHash,
+      commitDate: commitDate.trim(),
+      branch,
+      version: version ?? "unknown",
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getLocalGitVersion(
+  repoRoot?: string,
+): Promise<GitVersionInfo | null> {
+  if (!repoRoot) return null;
+  return getGitVersionInfo(repoRoot, "HEAD");
+}
+
+async function getGithubVersion(
+  repoRoot?: string,
+): Promise<GitVersionInfo | null> {
+  if (!repoRoot) return null;
+  try {
+    // Try to get origin/main info without fetching first
+    // This reads the last known state from local git cache
+    return getGitVersionInfo(repoRoot, "origin/main");
+  } catch {
+    return null;
+  }
+}
+
+async function getStableVersion(
+  repoRoot?: string,
+): Promise<GitVersionInfo | null> {
+  if (!repoRoot) return null;
+  try {
+    const raw = await fsp.readFile(
+      path.join(repoRoot, "dist", "npm-package", "build-info.json"),
+      "utf-8",
+    );
+    const info = JSON.parse(raw) as {
+      version?: string;
+      gitCommit?: string;
+      builtAt?: string;
+      gitBranch?: string;
+    };
+
+    if (!info.gitCommit || !info.builtAt) return null;
+
+    // Get commit date from git
+    let commitDate = info.builtAt;
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["log", "-1", "--format=%ci", info.gitCommit],
+        { cwd: repoRoot, encoding: "utf-8" },
+      );
+      commitDate = stdout.trim();
+    } catch {
+      // Use builtAt as fallback
+    }
+
+    return {
+      commitHash: info.gitCommit.slice(0, 8),
+      commitHashFull: info.gitCommit,
+      commitDate,
+      branch: info.gitBranch ?? "unknown",
+      version: info.version ?? "unknown",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function compareVersionDates(date1: string, date2: string): number {
+  return new Date(date1).getTime() - new Date(date2).getTime();
+}
+
 function getAdbPath(): string {
   if (process.env.ADB_PATH) return process.env.ADB_PATH;
   const androidHome =
@@ -745,6 +877,31 @@ async function buildStatus(
     successfulApkBuildTimes,
   );
 
+  // Get Git version information
+  const [localGitVersion, githubVersion, stableVersion] = await Promise.all([
+    getLocalGitVersion(availability.repoRoot),
+    getGithubVersion(availability.repoRoot),
+    getStableVersion(availability.repoRoot),
+  ]);
+
+  // Check if updates are available
+  let hasLocalUpdate = false;
+  let hasGithubUpdate = false;
+
+  if (stableVersion && localGitVersion) {
+    hasLocalUpdate =
+      compareVersionDates(
+        localGitVersion.commitDate,
+        stableVersion.commitDate,
+      ) > 0;
+  }
+
+  if (stableVersion && githubVersion) {
+    hasGithubUpdate =
+      compareVersionDates(githubVersion.commitDate, stableVersion.commitDate) >
+      0;
+  }
+
   return {
     ...availability,
     packageVersion,
@@ -756,6 +913,11 @@ async function buildStatus(
       artifacts: apkArtifacts.map(toPublicApkInfo),
     },
     currentJob,
+    localGitVersion,
+    githubVersion,
+    stableVersion,
+    hasLocalUpdate,
+    hasGithubUpdate,
   };
 }
 
