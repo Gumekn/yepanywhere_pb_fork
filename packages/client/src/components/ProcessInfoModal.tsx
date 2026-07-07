@@ -34,7 +34,7 @@ interface ProcessInfo {
 
 interface ProcessInfoModalProps {
   sessionId: string;
-  provider: ProviderName;
+  provider: ProviderName | undefined;
   model?: string;
   status: SessionStatus;
   processState: ProcessState;
@@ -220,13 +220,16 @@ export function ProcessInfoModal({
   }, [sessionId, status.owner, t]);
 
   // Format kebab-case to Title Case (e.g., "in-turn" -> "In Turn")
-  const formatKebab = (s: string) =>
-    s
+  const formatKebab = (s: string | undefined) => {
+    if (!s || typeof s !== "string") return "";
+    return s
       .split("-")
       .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
       .join(" ");
+  };
 
-  const getProviderDisplay = (p: string) => {
+  const getProviderDisplay = (p: string | undefined) => {
+    if (!p) return "Unknown";
     switch (p) {
       case "claude":
         return "Claude (Anthropic)";

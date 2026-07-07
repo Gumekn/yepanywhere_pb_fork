@@ -780,6 +780,8 @@
   "aboutUpdateHint": "运行 `npm i -g yepanywhere` 进行更新",
   "aboutChecking": "检查中...",
   "aboutCheckUpdates": "检查更新",
+  "aboutUpdateNow": "立即更新",
+  "aboutUpdating": "更新中...",
   "aboutReportBugTitle": "报告问题",
   "aboutReportBugDescription": "如果发现问题，可前往 GitHub 提交 issue，帮助改进 Yep Anywhere。",
   "aboutReportBug": "报告问题",

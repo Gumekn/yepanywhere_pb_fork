@@ -471,7 +471,8 @@ export type DeploymentActionId =
   | "server-build"
   | "apk"
   | "apk-build"
-  | "apk-install-existing";
+  | "apk-install-existing"
+  | "git-pull-update";
 
 export type DeploymentJobStatus = "running" | "succeeded" | "failed";
 

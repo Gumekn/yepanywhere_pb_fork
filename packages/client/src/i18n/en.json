@@ -780,6 +780,8 @@
   "aboutUpdateHint": "Run `npm i -g yepanywhere` to update",
   "aboutChecking": "Checking...",
   "aboutCheckUpdates": "Check for Updates",
+  "aboutUpdateNow": "Update Now",
+  "aboutUpdating": "Updating...",
   "aboutReportBugTitle": "Report a Bug",
   "aboutReportBugDescription": "Found an issue? Report it on GitHub to help improve Yep Anywhere.",
   "aboutReportBug": "Report Bug",

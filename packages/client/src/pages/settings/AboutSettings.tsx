@@ -161,6 +161,22 @@ export function AboutSettings() {
     !!versionInfo?.updateAvailable && !!versionInfo.latest;
   const showRegistryUpdate = hasRegistryUpdate && !usesLocalDeployment;
 
+  // Handler for "Update Now" button
+  const handleUpdateNow = useCallback(async () => {
+    setRestarting(true);
+    setDeploymentError(null);
+    try {
+      const { job } = await api.startDeployment({ action: "git-pull-update" });
+      setRestartJobId(job.id);
+      setDeploymentStatus((current) =>
+        current ? { ...current, currentJob: job } : current,
+      );
+    } catch (err) {
+      setDeploymentError(getErrorMessage(err));
+      setRestarting(false);
+    }
+  }, []);
+
   return (
     <section className="settings-section">
       <h2>{t("aboutTitle")}</h2>
@@ -230,6 +246,13 @@ export function AboutSettings() {
             {showRegistryUpdate && (
               <p className="settings-update-hint">{t("aboutUpdateHint")}</p>
             )}
+            {hasRegistryUpdate && usesLocalDeployment && (
+              <p className="settings-update-available">
+                {t("aboutVersionAvailable", {
+                  version: versionInfo?.latest ?? "",
+                })}
+              </p>
+            )}
             {deploymentStatus?.available && (
               <p>
                 {t("deploymentRepoVersion")}{" "}
@@ -259,14 +282,31 @@ export function AboutSettings() {
               <p className="settings-warning">{deploymentError}</p>
             )}
           </div>
-          <button
-            type="button"
-            className="settings-button"
-            onClick={() => void handleCheckUpdates()}
-            disabled={checkingUpdates}
-          >
-            {checkingUpdates ? t("aboutChecking") : t("aboutCheckUpdates")}
-          </button>
+          <div style={{ display: "flex", gap: "8px", flexDirection: "column" }}>
+            <button
+              type="button"
+              className="settings-button"
+              onClick={() => void handleCheckUpdates()}
+              disabled={checkingUpdates}
+            >
+              {checkingUpdates ? t("aboutChecking") : t("aboutCheckUpdates")}
+            </button>
+            {hasRegistryUpdate && usesLocalDeployment && (
+              <button
+                type="button"
+                className="settings-button settings-button-primary"
+                onClick={() => void handleUpdateNow()}
+                disabled={restarting}
+                style={{
+                  backgroundColor: "#4CAF50",
+                  color: "white",
+                  fontWeight: "bold",
+                }}
+              >
+                {restarting ? t("aboutUpdating") : t("aboutUpdateNow")}
+              </button>
+            )}
+          </div>
         </div>
         <div className="settings-item">
           <div className="settings-item-info">

@@ -112,7 +112,8 @@ export class ErrorBoundary extends Component<Props, State> {
               </div>
               {isVersionMismatch && (
                 <p style={styles.updateHint}>
-                  To update: <code>npm i -g yepanywhere</code>
+                  To update: <code>pnpm dev</code> or{" "}
+                  <code>scripts/deploy.sh</code>
                 </p>
               )}
             </div>
@@ -126,7 +127,7 @@ export class ErrorBoundary extends Component<Props, State> {
                 Reload Page
               </button>
               <a
-                href="https://github.com/anthropics/yep-anywhere/issues"
+                href="https://github.com/Gumekn/yepanywhere_pb_fork/issues"
                 target="_blank"
                 rel="noopener noreferrer"
                 style={styles.issueLink}

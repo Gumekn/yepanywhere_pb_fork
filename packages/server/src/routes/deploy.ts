@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
+import { startGitPullAndDeploy } from "./git-pull-deploy.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,7 +26,8 @@ export type DeploymentActionId =
   | "server-build"
   | "apk"
   | "apk-build"
-  | "apk-install-existing";
+  | "apk-install-existing"
+  | "git-pull-update";
 
 export type DeploymentJobStatus = "running" | "succeeded" | "failed";
 
@@ -121,6 +123,15 @@ export interface DeployRoutesOptions {
 }
 
 const DEPLOYMENT_ACTIONS: DeploymentAction[] = [
+  {
+    id: "git-pull-update",
+    args: ["--git-pull", "--server-only"],
+    requiresDevice: false,
+    supportsBuildType: false,
+    supportsInstall: false,
+    supportsSkipChecks: false,
+    supportsRestartTargets: true,
+  },
   {
     id: "server",
     args: ["--server-only"],
@@ -768,6 +779,11 @@ export async function startDeploymentJob(
     };
     error.status = 409;
     throw error;
+  }
+
+  // Handle git-pull-update action separately
+  if (input.action === "git-pull-update") {
+    return await startGitPullAndDeploy(options, availability.repoRoot);
   }
 
   const { action, args } = buildDeployArgs(input);
