@@ -69,7 +69,8 @@ function createBuildInfo() {
     gitDirty: gitStatus !== null ? gitStatus.length > 0 : null,
     builtAt: BUILD_DATE,
     buildProfile: process.env.YEP_BUILD_PROFILE ?? "production",
-    basePath: normalizeBasePath(process.env.BASE_PATH ?? "/yep"),
+    // 本地构建默认使用 "/" 以便本地访问，远程部署时通过 BASE_PATH 环境变量覆盖
+    basePath: normalizeBasePath(process.env.BASE_PATH ?? "/"),
   };
 }
 
@@ -142,14 +143,11 @@ step("Build shared package", () => {
 
 // Build client
 step("Build client", () => {
-  // Vite's `base` is baked into asset URLs at build time. The server starts with
-  // BASE_PATH=/yep (see scripts/redeploy-server.sh) so the two must match;
-  // otherwise index.html references /assets/* while the server only serves
-  // /yep/assets/*, and the SPA fails to bootstrap. Honor an explicit BASE_PATH
-  // override but default to /yep to match the deployed Caddy route.
-  const clientBasePath = process.env.BASE_PATH ?? "/yep";
+  // Vite's `base` is baked into asset URLs at build time. Must match BUILD_INFO.basePath
+  // 本地构建默认使用 "/" 以便本地访问，远程部署时通过 BASE_PATH 环境变量覆盖为 "/yep"
+  const clientBasePath = process.env.BASE_PATH ?? "/";
   log(
-    `Building @yep-anywhere/client (Vite production build, BASE_PATH=${clientBasePath || "/"})...`,
+    `Building @yep-anywhere/client (Vite production build, BASE_PATH=${clientBasePath})...`,
   );
   execStep("pnpm --filter @yep-anywhere/client build", undefined, {
     BASE_PATH: clientBasePath,

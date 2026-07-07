@@ -544,14 +544,25 @@ restart_production() {
         return 1
     fi
 
+    # 检查客户端静态文件是否存在
+    local client_dist="$PROJECT_ROOT/dist/npm-package/client-dist"
+    if [[ ! -d "$client_dist" ]] || [[ ! -f "$client_dist/index.html" ]]; then
+        print_error "客户端静态文件不存在或不完整: $client_dist"
+        print_error "请先运行重构建"
+        return 1
+    fi
+
     # 确保 cli.js 有执行权限
     chmod +x "$cli_path"
 
     # 启动生产模式（使用构建好的部署包）
+    # 注意：必须设置 BASE_PATH=/ 以匹配构建时的配置
     print_info "后台启动生产服务（使用部署包）..."
-    print_info "运行命令: node $cli_path --port $MAIN_PORT"
+    print_info "运行命令: BASE_PATH=/ CLIENT_DIST_PATH=$client_dist node $cli_path --port $MAIN_PORT"
 
-    nohup node "$cli_path" --port "$MAIN_PORT" > /private/tmp/yep-server.log 2>&1 &
+    nohup env BASE_PATH=/ \
+        CLIENT_DIST_PATH="$client_dist" \
+        node "$cli_path" --port "$MAIN_PORT" > /private/tmp/yep-server.log 2>&1 &
     local pid=$!
 
     # 等待服务启动
@@ -564,8 +575,10 @@ restart_production() {
         local base_url="http://127.0.0.1:${MAIN_PORT}"
         if verify_deployment "$base_url"; then
             print_success "生产模式重启完成并已验证"
+            print_info "访问地址: http://localhost:${MAIN_PORT}/"
         else
             print_warning "服务已启动，但验证未通过"
+            print_info "如果前端无法访问，请检查日志: tail -f /private/tmp/yep-server.log"
         fi
     else
         print_error "服务启动失败，请检查日志: /private/tmp/yep-server.log"
@@ -672,18 +685,45 @@ rebuild() {
 
     print_success "重构建完成"
     echo ""
-    print_warning "注意: 新代码已构建到 dist/npm-package/，但服务端进程还在运行旧代码"
+    print_warning "重要: 新代码已构建到 dist/npm-package/，但服务端进程还在运行旧代码"
+    print_warning "前端静态文件已更新，但后端 API 还是旧版本，会导致页面无法正常加载！"
     echo ""
-    echo "是否重启服务端以应用新代码？"
-    echo "1) 重启生产模式"
-    echo "2) 重启开发模式"
-    echo "3) 稍后手动重启"
+
+    # 检测当前运行模式
+    local current_mode="未知"
+    if check_port $MAIN_PORT; then
+        local pid=$(get_port_process $MAIN_PORT)
+        current_mode=$(detect_run_mode $pid)
+        print_info "检测到当前运行模式: $current_mode (PID: $pid)"
+    fi
     echo ""
-    read -p "请选择 (1-3，默认 3): " -n 1 -r
+
+    echo "必须重启服务端以应用新代码，选择重启模式："
+    if [[ "$current_mode" == "生产模式" ]]; then
+        echo "1) 重启生产模式 (推荐，当前正在运行)"
+        echo "2) 重启开发模式"
+        echo "3) 稍后手动重启 (不推荐，会导致前后端版本不一致)"
+    elif [[ "$current_mode" == "开发模式" ]]; then
+        echo "1) 重启生产模式"
+        echo "2) 重启开发模式 (推荐，当前正在运行)"
+        echo "3) 稍后手动重启 (不推荐，会导致前后端版本不一致)"
+    else
+        echo "1) 重启生产模式 (推荐)"
+        echo "2) 重启开发模式"
+        echo "3) 稍后手动重启 (不推荐，会导致前后端版本不一致)"
+    fi
+    echo ""
+
+    local default_choice="1"
+    if [[ "$current_mode" == "开发模式" ]]; then
+        default_choice="2"
+    fi
+
+    read -p "请选择 (1-3，默认 ${default_choice}): " -n 1 -r
     echo ""
     echo ""
 
-    case ${REPLY:-3} in
+    case ${REPLY:-$default_choice} in
         1)
             print_info "正在重启生产模式..."
             if restart_production; then
@@ -705,7 +745,10 @@ rebuild() {
             fi
             ;;
         3)
-            print_info "跳过重启，你可以稍后运行:"
+            print_error "警告: 跳过重启会导致前端和后端版本不匹配！"
+            print_error "页面可能无法正常加载，API 调用可能失败！"
+            echo ""
+            print_info "稍后必须手动重启，可以运行:"
             echo "  - 选项 5) 重启生产模式"
             echo "  - 选项 4) 重启开发模式"
             ;;

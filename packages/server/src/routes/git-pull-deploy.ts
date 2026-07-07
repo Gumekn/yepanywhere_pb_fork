@@ -94,14 +94,42 @@ export async function startGitPullAndDeploy(
 
       // Step 4: Restart service
       logStream.write("\n==> 步骤 4/5: 重启服务\n");
-      const deployScript = path.join(repoRoot, "scripts", "deploy.sh");
-      const { stdout: deployOutput, stderr: deployError } = await execFileAsync(
-        deployScript,
-        ["--server-only", "--restart-only"],
-        { cwd: repoRoot, encoding: "utf-8", timeout: 120000 },
-      );
-      logStream.write(deployOutput);
-      if (deployError) logStream.write(deployError);
+
+      // 使用 yep.sh 重启脚本以确保环境变量配置正确
+      const yepScript = path.join(repoRoot, "yep.sh");
+      if (fs.existsSync(yepScript)) {
+        logStream.write("使用 yep.sh 重启生产模式...\n");
+        // 需要以交互方式运行，但我们需要模拟选择
+        // 直接调用 restart-prod 命令
+        const { stdout: restartOutput, stderr: restartError } =
+          await execFileAsync("bash", [yepScript, "restart-prod"], {
+            cwd: repoRoot,
+            encoding: "utf-8",
+            timeout: 120000,
+          });
+        logStream.write(restartOutput);
+        if (restartError) logStream.write(restartError);
+      } else {
+        // 降级方案：使用 redeploy-server.sh
+        const deployScript = path.join(
+          repoRoot,
+          "scripts",
+          "redeploy-server.sh",
+        );
+        if (fs.existsSync(deployScript)) {
+          logStream.write("使用 redeploy-server.sh 重启...\n");
+          const { stdout: deployOutput, stderr: deployError } =
+            await execFileAsync(deployScript, ["--restart-only"], {
+              cwd: repoRoot,
+              encoding: "utf-8",
+              timeout: 120000,
+            });
+          logStream.write(deployOutput);
+          if (deployError) logStream.write(deployError);
+        } else {
+          throw new Error("未找到重启脚本");
+        }
+      }
 
       logStream.write("\n==> 更新完成!\n");
       job.status = "succeeded";
