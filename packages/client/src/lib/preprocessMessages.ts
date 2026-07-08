@@ -522,7 +522,7 @@ function processMessage(
     // Attach results to pending tool calls
     for (const block of content) {
       if (block.type === "tool_result" && block.tool_use_id) {
-        attachToolResult(block, msg, items, pendingToolCalls);
+        attachToolResult(block, msg, items, toolCallIndices, pendingToolCalls);
       }
     }
     return;
@@ -929,20 +929,32 @@ function attachToolResult(
   block: ContentBlock,
   resultMessage: Message,
   items: RenderItem[],
+  toolCallIndices: Map<string, number>,
   pendingToolCalls: Map<string, number>,
 ): void {
   const toolUseId = block.tool_use_id;
   if (!toolUseId) return;
 
-  const index = pendingToolCalls.get(toolUseId);
+  // First try pendingToolCalls (for actively pending tools)
+  let index = pendingToolCalls.get(toolUseId);
+
+  // Fallback to toolCallIndices (for tools that were already processed but appear in repeated messages)
   if (index === undefined) {
-    // Orphan result - shouldn't happen normally
-    console.warn(`Tool result for unknown tool_use: ${toolUseId}`);
-    return;
+    index = toolCallIndices.get(toolUseId);
+    if (index === undefined) {
+      // True orphan result - tool_use not found at all
+      console.warn(`Tool result for unknown tool_use: ${toolUseId}`);
+      return;
+    }
   }
 
   const item = items[index];
   if (!item || item.type !== "tool_call") return;
+
+  // Skip if result already attached (prevents duplicate processing)
+  if (item.toolResult !== undefined) {
+    return;
+  }
 
   // Attach result to existing tool call
   // Handle both camelCase (toolUseResult) and snake_case (tool_use_result) from SDK

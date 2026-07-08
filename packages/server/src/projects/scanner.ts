@@ -43,6 +43,12 @@ interface ProjectSnapshot {
   timestamp: number;
 }
 
+interface ProjectDirInfo {
+  projectPath: string;
+  sessionCount: number;
+  lastActivity: string | null;
+}
+
 export class ProjectScanner {
   private projectsDir: string;
   private codexScanner: CodexSessionScanner | null;
@@ -296,8 +302,8 @@ export class ProjectScanner {
       // On Unix/macOS: /home/user/project → -home-user-project (starts with -)
       // On Windows: C:\Users\kaa\project → c--Users-kaa-project (drive letter + --)
       if (dir.startsWith("-") || /^[a-zA-Z]--/.test(dir)) {
-        const info = await this.getProjectDirInfo(dirPath);
-        if (info) {
+        const infos = await this.getProjectDirInfos(dirPath);
+        for (const info of infos) {
           addOrMerge(
             info.projectPath,
             dirPath,
@@ -322,14 +328,15 @@ export class ProjectScanner {
 
       for (const projectDir of projectDirs) {
         const projectDirPath = join(dirPath, projectDir);
-        const info = await this.getProjectDirInfo(projectDirPath);
-        if (!info) continue;
-        addOrMerge(
-          info.projectPath,
-          projectDirPath,
-          info.sessionCount,
-          info.lastActivity,
-        );
+        const infos = await this.getProjectDirInfos(projectDirPath);
+        for (const info of infos) {
+          addOrMerge(
+            info.projectPath,
+            projectDirPath,
+            info.sessionCount,
+            info.lastActivity,
+          );
+        }
       }
     }
 
@@ -577,37 +584,56 @@ export class ProjectScanner {
     return project ? this.cloneProject(project) : null;
   }
 
+  /**
+   * Find the project for one concrete Claude session file.
+   *
+   * A single physical Claude session directory can contain jsonls from more
+   * than one cwd. Directory suffixes are therefore only a fallback; the jsonl
+   * cwd is the source of truth when it is available.
+   */
+  async getProjectBySessionFile(
+    sessionFilePath: string,
+  ): Promise<Project | null> {
+    const cwd = await readCwdFromSessionFile(sessionFilePath);
+    if (!cwd) return null;
+
+    const snapshot = await this.getSnapshot();
+    const project = snapshot.byId.get(
+      encodeProjectId(canonicalizeProjectPath(cwd)),
+    );
+    return project ? this.cloneProject(project) : null;
+  }
+
   dispose(): void {
     this.unsubscribeEventBus?.();
     this.unsubscribeEventBus = null;
   }
 
   /**
-   * Get project info from a session directory in a single readdir pass.
-   * Uses directory mtime as a cheap proxy for lastActivity (one stat
-   * on the dir itself instead of stat-ing every session file).
+   * Get project infos from a session directory in a single readdir pass.
+   *
+   * Claude normally stores one cwd per physical session directory, but moved
+   * projects, rsync workflows, and manual file moves can leave multiple cwd
+   * values in the same directory. Group by the cwd written inside each jsonl
+   * so project ownership is correct at the scanner source.
+   *
+   * Uses each jsonl file's mtime for lastActivity so each cwd group gets its
+   * own activity timestamp.
    */
-  private async getProjectDirInfo(projectDirPath: string): Promise<{
-    projectPath: string;
-    sessionCount: number;
-    lastActivity: string | null;
-  } | null> {
+  private async getProjectDirInfos(
+    projectDirPath: string,
+  ): Promise<ProjectDirInfo[]> {
     try {
       const files = await readdir(projectDirPath);
       const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
 
-      if (jsonlFiles.length === 0) return null;
-
-      // Count non-agent sessions
-      const sessionCount = jsonlFiles.filter(
-        (f) => !f.startsWith("agent-"),
-      ).length;
+      if (jsonlFiles.length === 0) return [];
 
       // Sort jsonl files by mtime descending. The newest file carries the
       // most recent `cwd` the SDK wrote — older jsonls may still record the
       // project's original location from before the user moved it on disk.
-      // Reading any older one would let a stale path leak into the project
-      // snapshot's id/path fields. Stat-ing N files is cheap (≈50µs each).
+      // Within each cwd group this keeps the group's lastActivity accurate.
+      // Stat-ing N files is cheap (≈50µs each).
       const withMtime: Array<{ file: string; mtime: number }> = [];
       for (const file of jsonlFiles) {
         try {
@@ -618,22 +644,43 @@ export class ProjectScanner {
         }
       }
       withMtime.sort((a, b) => b.mtime - a.mtime);
-      const lastActivity = withMtime[0]
-        ? new Date(withMtime[0].mtime).toISOString()
-        : null;
+      const byProjectPath = new Map<string, ProjectDirInfo>();
 
-      for (const { file } of withMtime) {
+      for (const { file, mtime } of withMtime) {
         const filePath = join(projectDirPath, file);
         const cwd = await readCwdFromSessionFile(filePath);
-        if (cwd) {
-          return { projectPath: cwd, sessionCount, lastActivity };
+        if (!cwd) continue;
+
+        const projectPath = canonicalizeProjectPath(cwd);
+        const existing = byProjectPath.get(projectPath);
+        if (existing) {
+          if (!file.startsWith("agent-")) {
+            existing.sessionCount += 1;
+          }
+          continue;
         }
+
+        byProjectPath.set(projectPath, {
+          projectPath,
+          sessionCount: file.startsWith("agent-") ? 0 : 1,
+          lastActivity: new Date(mtime).toISOString(),
+        });
       }
 
-      return null;
+      const infos = Array.from(byProjectPath.values());
+      const encodedDirName = basename(projectDirPath);
+      const matchingDirInfos = infos.filter(
+        (info) =>
+          this.encodeClaudeProjectDirName(info.projectPath) === encodedDirName,
+      );
+      return matchingDirInfos.length > 0 ? matchingDirInfos : infos;
     } catch {
-      return null;
+      return [];
     }
+  }
+
+  private encodeClaudeProjectDirName(projectPath: string): string {
+    return projectPath.replace(/[/\\:]/g, "-");
   }
 }
 

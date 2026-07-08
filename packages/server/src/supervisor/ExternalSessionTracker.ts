@@ -434,9 +434,11 @@ export class ExternalSessionTracker {
 
     // We don't own it and it's not in grace period - decide whether it is
     // still actively controlled by an external provider process.
+    const project = await this.scanner.getProjectBySessionFile(event.path);
     await this.handleUnownedSessionActivity(sessionId, {
       provider: event.provider,
       dirProjectId,
+      projectId: project?.id as UrlProjectId | undefined,
     });
   }
 

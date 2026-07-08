@@ -349,7 +349,10 @@ export function loadConfig(): Config {
     claudeBridgeServerUrl:
       process.env.YEP_SERVER_URL ??
       process.env.YEP_ANYWHERE_SERVER_URL ??
-      `http://127.0.0.1:${parseIntOrDefault(process.env.PORT, 3400)}`,
+      `http://127.0.0.1:${parseIntOrDefault(
+        process.env.PORT,
+        process.env.NODE_ENV === "production" ? 8022 : 3400,
+      )}`,
     codexWatchPeriodicRescanMs,
     sessionIndexFullValidationMs,
     sessionIndexWriteLockTimeoutMs,
@@ -357,7 +360,13 @@ export function loadConfig(): Config {
     projectScanCacheTtlMs,
     idleTimeoutMs: parseIntOrDefault(process.env.IDLE_TIMEOUT, 5 * 60) * 1000,
     defaultPermissionMode: parsePermissionMode(process.env.PERMISSION_MODE),
-    port: parseIntOrDefault(process.env.PORT, 3400),
+    // Port defaults based on NODE_ENV:
+    // - Development: 3400 (hot reload, source code)
+    // - Production: 8022 (bundled package)
+    port: parseIntOrDefault(
+      process.env.PORT,
+      process.env.NODE_ENV === "production" ? 8022 : 3400,
+    ),
     portFile: process.env.PORT_FILE ?? null,
     // Host defaults to 127.0.0.1 for security and consistency (avoids IPv6 ambiguity with "localhost")
     host: process.env.HOST ?? "127.0.0.1",
@@ -370,9 +379,13 @@ export function loadConfig(): Config {
       parseIntOrDefault(process.env.IDLE_PREEMPT_THRESHOLD, 10) * 1000,
     serveFrontend,
     // Vite port defaults to main port + 2, keeping all ports sequential
+    // Vite is only used in development, so always base on dev default (3400)
     vitePort: parseIntOrDefault(
       process.env.VITE_PORT,
-      parseIntOrDefault(process.env.PORT, 3400) + 2,
+      parseIntOrDefault(
+        process.env.PORT,
+        process.env.NODE_ENV === "production" ? 8022 : 3400,
+      ) + 2,
     ),
     // Client dist path: Check bundled location first (npm package), then monorepo (dev)
     clientDistPath:

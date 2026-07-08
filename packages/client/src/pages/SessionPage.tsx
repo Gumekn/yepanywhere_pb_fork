@@ -36,7 +36,6 @@ import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { getModelSetting, getThinkingSetting } from "../hooks/useModelSettings";
 import { useProject } from "../hooks/useProjects";
 import { useProviders } from "../hooks/useProviders";
-import { recordSessionVisit } from "../hooks/useRecentSessions";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import {
   type StreamingMarkdownCallbacks,
@@ -256,6 +255,26 @@ function SessionPageContent({
   // launches that land directly on a session URL).
   useHideSplashOnReady(!loading || error !== null);
   const preprocessCacheRef = useRef<PreprocessMessagesCache | null>(null);
+
+  // Early return on error to prevent rendering with undefined data
+  // This must come before any code that accesses session data
+  if (error) {
+    return (
+      <div className="error">
+        {t("sessionErrorPrefix")} {error.message}
+      </div>
+    );
+  }
+
+  // Additional safety check: if loading is done but session is null, show error
+  // This prevents crashes when session data is missing or corrupted
+  if (!loading && !session) {
+    return (
+      <div className="error">
+        {t("sessionErrorPrefix")} Session data could not be loaded
+      </div>
+    );
+  }
 
   // Developer mode settings
   const { holdModeEnabled, showConnectionBars } = useDeveloperMode();
@@ -522,11 +541,6 @@ function SessionPageContent({
     setLocalIsStarred(undefined);
     setLocalHasUnread(undefined);
   }, [sessionId]);
-
-  // Record session visit for recents tracking
-  useEffect(() => {
-    recordSessionVisit(sessionId, projectId);
-  }, [sessionId, projectId]);
 
   // Navigate to new session ID when temp ID is replaced with real SDK session ID
   // This ensures the URL stays in sync with the actual session
@@ -1359,25 +1373,6 @@ function SessionPageContent({
       showToast(msg, "error");
     }
   }, [displayTitle, showToast, t]);
-
-  // Early return on error to prevent rendering with undefined data
-  if (error) {
-    return (
-      <div className="error">
-        {t("sessionErrorPrefix")} {error.message}
-      </div>
-    );
-  }
-
-  // Additional safety check: if loading is done but session is null, show error
-  // This prevents crashes when session data is missing or corrupted
-  if (!loading && !session) {
-    return (
-      <div className="error">
-        {t("sessionErrorPrefix")} Session data could not be loaded
-      </div>
-    );
-  }
 
   // Sidebar icon component
   const SidebarIcon = () => (

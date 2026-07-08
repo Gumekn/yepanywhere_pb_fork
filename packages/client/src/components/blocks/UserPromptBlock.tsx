@@ -97,6 +97,9 @@ function isImageMimeType(mimeType: string): boolean {
  * Path format: /.../.yep-anywhere/uploads/{projectId}/{sessionId}/{filename}
  */
 function getUploadUrl(filePath: string): string | null {
+  // Guard against invalid input
+  if (!filePath || typeof filePath !== "string") return null;
+
   // Split path and get last 3 components: projectId, sessionId, filename
   const parts = filePath.split("/");
   if (parts.length < 3) return null;

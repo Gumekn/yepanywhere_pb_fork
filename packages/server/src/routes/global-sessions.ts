@@ -13,6 +13,7 @@ import {
   type SessionQuestion,
   type SessionRuntime,
   isSessionKind,
+  isUrlProjectId,
   sessionMatchesKind,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
@@ -23,6 +24,7 @@ import type { SessionMetadataService } from "../metadata/SessionMetadataService.
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
+import { decodeProjectId, getProjectName } from "../projects/paths.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
@@ -153,6 +155,27 @@ const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
 /** Stats cache TTL in milliseconds */
 const STATS_CACHE_TTL_MS = 5000;
+
+export function resolveSessionProjectName(
+  sessionProjectId: string,
+  scanningProject: Pick<Project, "name">,
+  projectById: ReadonlyMap<string, Pick<Project, "name">>,
+): string {
+  const actualProject = projectById.get(sessionProjectId);
+  if (actualProject) {
+    return actualProject.name;
+  }
+
+  if (isUrlProjectId(sessionProjectId)) {
+    try {
+      return getProjectName(decodeProjectId(sessionProjectId));
+    } catch {
+      return scanningProject.name;
+    }
+  }
+
+  return scanningProject.name;
+}
 
 function createEmptyStats(): GlobalSessionStats {
   return {
@@ -461,6 +484,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
     // Get all projects
     const allProjects = await deps.scanner.listProjects();
+    const projectById = new Map(allProjects.map((p) => [p.id, p]));
 
     // Filter to single project if projectId query param provided
     const projects = filterProjectId
@@ -516,7 +540,16 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
       // Enrich each session
       for (const session of sessions) {
+        if (filterProjectId && session.projectId !== filterProjectId) {
+          continue;
+        }
+
         knownSessionIds.add(session.id);
+        const sessionProjectName = resolveSessionProjectName(
+          session.projectId,
+          project,
+          projectById,
+        );
 
         // Get session metadata
         const metadata = deps.sessionMetadataService?.getMetadata(session.id);
@@ -571,7 +604,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
             ?.toLowerCase()
             .includes(searchQuery);
           const aiTitleMatch = aiTitle?.toLowerCase().includes(searchQuery);
-          const projectNameMatch = project.name
+          const projectNameMatch = sessionProjectName
             .toLowerCase()
             .includes(searchQuery);
 
@@ -628,7 +661,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
             userQuestions: session.userQuestions,
             provider: session.provider,
             projectId: session.projectId,
-            projectName: project.name,
+            projectName: sessionProjectName,
             ownership,
             pendingInputType,
             activity,

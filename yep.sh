@@ -6,15 +6,18 @@
 set -e
 
 # ==================== 配置区域 ====================
-# 修改此处的 PORT 值会影响所有端口：
-#   主服务端：PORT
-#   维护服务端：PORT + 1
-#   Vite dev：PORT + 2
+# 开发模式端口配置
+#   主服务端：DEV_PORT
+#   维护服务端：DEV_PORT + 1
+#   Vite dev：DEV_PORT + 2
 
-PORT=3400
+DEV_PORT=3400
 
-# 说明：此值会作为环境变量传递给 pnpm dev/start
-# 项目代码会自动计算其他端口
+# 生产模式端口配置（Bundle 独立部署包）
+PROD_PORT=8022
+
+# 说明：开发模式使用 DEV_PORT，生产模式使用 PROD_PORT
+# 两种模式可以同时运行，不会冲突
 # ================================================
 
 # 颜色定义
@@ -28,11 +31,21 @@ NC='\033[0m' # No Color
 # 项目根目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
+BUNDLE_DIR="$PROJECT_ROOT/dist/npm-package"
+BUNDLE_CLI="$BUNDLE_DIR/dist/cli.js"
+BUNDLE_CLIENT_DIST="$BUNDLE_DIR/client-dist"
+BUNDLE_BUILD_INFO="$BUNDLE_DIR/build-info.json"
+DEV_LOG_FILE="${YEP_DEV_LOG_FILE:-$HOME/.yep-anywhere/logs/dev-console.log}"
+PROD_LOG_FILE="${YEP_PROD_LOG_FILE:-/private/tmp/yep-bundle.log}"
+PROD_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-${BASE_PATH:-/}}"
+PROD_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
 
-# 计算端口
-MAIN_PORT=$PORT
-MAINTENANCE_PORT=$((PORT + 1))
-VITE_PORT=$((PORT + 2))
+# 计算开发模式端口
+DEV_MAIN_PORT=$DEV_PORT
+DEV_MAINTENANCE_PORT=$((DEV_PORT + 1))
+DEV_VITE_PORT=$((DEV_PORT + 2))
+
+# Bridge 端口（固定）
 CODEX_BRIDGE_PORT=4510
 CLAUDE_BRIDGE_PORT=4520
 
@@ -60,6 +73,98 @@ print_info() {
 
 print_header() {
     echo -e "\n${BLUE}===${NC} $1 ${BLUE}===${NC}\n"
+}
+
+normalize_base_path() {
+    local raw="${1:-/}"
+    if [[ -z "$raw" || "$raw" == "/" ]]; then
+        echo "/"
+        return
+    fi
+    raw="/${raw#/}"
+    raw="${raw%/}"
+    echo "$raw"
+}
+
+prod_base_path() {
+    normalize_base_path "$PROD_BASE_PATH"
+}
+
+prod_base_url() {
+    local base_path
+    base_path="$(prod_base_path)"
+    if [[ "$base_path" == "/" ]]; then
+        echo "http://127.0.0.1:${PROD_PORT}"
+    else
+        echo "http://127.0.0.1:${PROD_PORT}${base_path}"
+    fi
+}
+
+ensure_log_dirs() {
+    mkdir -p "$(dirname "$DEV_LOG_FILE")" "$(dirname "$PROD_LOG_FILE")"
+}
+
+check_bundle_layout() {
+    if [[ ! -f "$BUNDLE_CLI" ]]; then
+        print_error "生产 bundle 不存在: $BUNDLE_CLI"
+        print_info "请先运行: bash yep.sh rebuild"
+        return 1
+    fi
+    if [[ ! -d "$BUNDLE_CLIENT_DIST" ]] || [[ ! -f "$BUNDLE_CLIENT_DIST/index.html" ]]; then
+        print_error "客户端静态文件不存在或不完整: $BUNDLE_CLIENT_DIST"
+        print_info "请先运行: bash yep.sh rebuild"
+        return 1
+    fi
+}
+
+install_runtime_dependencies() {
+    check_bundle_layout || return 1
+
+    print_info "安装运行时依赖到 dist/npm-package ..."
+    (cd "$BUNDLE_DIR" && npm install --omit=dev --no-audit --no-fund --silent)
+    chmod +x "$BUNDLE_CLI" 2>/dev/null || true
+    chmod +x "$BUNDLE_DIR"/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true
+    print_success "运行时依赖安装完成"
+}
+
+ensure_runtime_dependencies() {
+    check_bundle_layout || return 1
+
+    if [[ -d "$BUNDLE_DIR/node_modules/@hono/node-server" ]]; then
+        chmod +x "$BUNDLE_CLI" 2>/dev/null || true
+        return 0
+    fi
+
+    print_warning "dist/npm-package/node_modules 缺失或不完整"
+    install_runtime_dependencies
+}
+
+run_production_foreground() {
+    local cli_path="$BUNDLE_CLI"
+    local base_path
+    base_path="$(prod_base_path)"
+
+    print_info "运行命令: NODE_ENV=production BASE_PATH=$base_path node $cli_path --port $PROD_PORT"
+    NODE_ENV=production \
+        BASE_PATH="$base_path" \
+        ALLOWED_IMAGE_PATHS="$PROD_ALLOWED_IMAGE_PATHS" \
+        node "$cli_path" --port "$PROD_PORT"
+}
+
+start_production_background() {
+    local cli_path="$BUNDLE_CLI"
+    local base_path
+    local pid
+    base_path="$(prod_base_path)"
+
+    ensure_log_dirs
+    print_info "运行命令: NODE_ENV=production BASE_PATH=$base_path node $cli_path --port $PROD_PORT"
+    nohup env NODE_ENV=production \
+        BASE_PATH="$base_path" \
+        ALLOWED_IMAGE_PATHS="$PROD_ALLOWED_IMAGE_PATHS" \
+        node "$cli_path" --port "$PROD_PORT" > "$PROD_LOG_FILE" 2>&1 &
+    pid=$!
+    STARTED_PID=$pid
 }
 
 # 检查端口是否被占用
@@ -209,9 +314,14 @@ start_launchd_service() {
 
     local plist_file=~/Library/LaunchAgents/${LAUNCHD_SERVICE}.plist
     if [ ! -f "$plist_file" ]; then
-        print_error "launchd 配置文件不存在: $plist_file"
-        print_info "请先运行: pnpm launchd:install"
-        return 1
+        print_warning "launchd 配置文件不存在: $plist_file"
+        print_info "正在安装生产服务 LaunchAgent..."
+        ensure_runtime_dependencies || return 1
+        YEP_DEPLOY_PORT="$PROD_PORT" \
+            YEP_DEPLOY_BASE_PATH="$(prod_base_path)" \
+            ALLOWED_IMAGE_PATHS="$PROD_ALLOWED_IMAGE_PATHS" \
+            "$PROJECT_ROOT/scripts/install-launchagents.sh" --server-only
+        return $?
     fi
 
     launchctl load "$plist_file"
@@ -233,14 +343,17 @@ stop_all_services() {
     # 先停止 launchd 服务（如果正在运行）
     stop_launchd_service
 
-    print_info "停止主服务端 (端口 $MAIN_PORT)..."
-    stop_service_by_port $MAIN_PORT
+    print_info "停止开发模式 (端口 $DEV_MAIN_PORT)..."
+    stop_service_by_port $DEV_MAIN_PORT
 
-    print_info "停止维护服务端 (端口 $MAINTENANCE_PORT)..."
-    stop_service_by_port $MAINTENANCE_PORT
+    print_info "停止开发维护服务端 (端口 $DEV_MAINTENANCE_PORT)..."
+    stop_service_by_port $DEV_MAINTENANCE_PORT
 
-    print_info "停止 Vite dev server (端口 $VITE_PORT)..."
-    stop_service_by_port $VITE_PORT
+    print_info "停止 Vite dev server (端口 $DEV_VITE_PORT)..."
+    stop_service_by_port $DEV_VITE_PORT
+
+    print_info "停止生产模式 (端口 $PROD_PORT)..."
+    stop_service_by_port $PROD_PORT
 
     print_info "停止 Codex Bridge (端口 $CODEX_BRIDGE_PORT)..."
     stop_service_by_port $CODEX_BRIDGE_PORT
@@ -262,14 +375,14 @@ detect_run_mode() {
     # 检查进程命令行
     local cmd=$(ps -p $pid -o command= 2>/dev/null || echo "")
 
+    # 检查是否包含生产模式特征（Bundle）
+    # 生产模式：dist/npm-package/dist/cli.js（独立部署包）
+    if echo "$cmd" | grep -q "dist/npm-package/dist/cli.js"; then
+        echo "生产模式 (Bundle)"
     # 检查是否包含开发模式特征
-    # 开发模式特征：tsx、pnpm dev、scripts/dev.js、packages/server/dist/index.js
-    if echo "$cmd" | grep -q "tsx\|--import tsx\|pnpm dev\|scripts/dev.js\|packages/server/dist/index.js"; then
+    # 开发模式：tsx、pnpm dev、scripts/dev.js
+    elif echo "$cmd" | grep -q "tsx\|--import tsx\|pnpm dev\|scripts/dev.js"; then
         echo "开发模式"
-    # 检查是否包含生产模式特征
-    # 生产模式特征：dist/npm-package/dist/cli.js、NODE_ENV=production、pnpm start（排除开发模式）
-    elif echo "$cmd" | grep -q "dist/npm-package/dist/cli.js\|NODE_ENV=production"; then
-        echo "生产模式"
     else
         echo "未知"
     fi
@@ -290,41 +403,53 @@ check_status() {
     echo "端口占用情况:"
     echo ""
 
-    # 主服务端
-    if check_port $MAIN_PORT; then
-        local pid=$(get_port_process $MAIN_PORT)
+    # 开发模式主服务端
+    if check_port $DEV_MAIN_PORT; then
+        local pid=$(get_port_process $DEV_MAIN_PORT)
         local cmd=$(ps -p $pid -o command= 2>/dev/null || echo "未知")
         local mode=$(detect_run_mode $pid)
-        print_success "主服务端 (端口 $MAIN_PORT): 运行中 [$mode]"
+        print_success "开发模式主服务端 (端口 $DEV_MAIN_PORT): 运行中 [$mode]"
         echo "  PID: $pid"
         echo "  命令: $cmd"
     else
-        print_warning "主服务端 (端口 $MAIN_PORT): 未运行"
+        print_warning "开发模式主服务端 (端口 $DEV_MAIN_PORT): 未运行"
     fi
     echo ""
 
-    # 维护服务端
-    if check_port $MAINTENANCE_PORT; then
-        local pid=$(get_port_process $MAINTENANCE_PORT)
+    # 开发模式维护服务端
+    if check_port $DEV_MAINTENANCE_PORT; then
+        local pid=$(get_port_process $DEV_MAINTENANCE_PORT)
         local cmd=$(ps -p $pid -o command= 2>/dev/null || echo "未知")
-        local mode=$(detect_run_mode $pid)
-        print_success "维护服务端 (端口 $MAINTENANCE_PORT): 运行中 [$mode]"
+        print_success "开发模式维护服务端 (端口 $DEV_MAINTENANCE_PORT): 运行中"
         echo "  PID: $pid"
         echo "  命令: $cmd"
     else
-        print_warning "维护服务端 (端口 $MAINTENANCE_PORT): 未运行"
+        print_warning "开发模式维护服务端 (端口 $DEV_MAINTENANCE_PORT): 未运行"
     fi
     echo ""
 
     # Vite dev server
-    if check_port $VITE_PORT; then
-        local pid=$(get_port_process $VITE_PORT)
+    if check_port $DEV_VITE_PORT; then
+        local pid=$(get_port_process $DEV_VITE_PORT)
         local cmd=$(ps -p $pid -o command= 2>/dev/null || echo "未知")
-        print_success "Vite dev server (端口 $VITE_PORT): 运行中"
+        print_success "Vite dev server (端口 $DEV_VITE_PORT): 运行中"
         echo "  PID: $pid"
         echo "  命令: $cmd"
     else
-        print_warning "Vite dev server (端口 $VITE_PORT): 未运行"
+        print_warning "Vite dev server (端口 $DEV_VITE_PORT): 未运行"
+    fi
+    echo ""
+
+    # 生产模式（Bundle）
+    if check_port $PROD_PORT; then
+        local pid=$(get_port_process $PROD_PORT)
+        local cmd=$(ps -p $pid -o command= 2>/dev/null || echo "未知")
+        local mode=$(detect_run_mode $pid)
+        print_success "生产模式 (端口 $PROD_PORT): 运行中 [$mode]"
+        echo "  PID: $pid"
+        echo "  命令: $cmd"
+    else
+        print_warning "生产模式 (端口 $PROD_PORT): 未运行"
     fi
     echo ""
 
@@ -351,11 +476,19 @@ check_status() {
         print_warning "Claude Bridge (端口 $CLAUDE_BRIDGE_PORT): 未运行"
     fi
 
+    # 端口配置说明
+    echo ""
+    print_info "端口配置说明:"
+    echo "  开发模式: 主服务 $DEV_MAIN_PORT, 维护 $DEV_MAINTENANCE_PORT, Vite $DEV_VITE_PORT"
+    echo "  生产模式: 主服务 $PROD_PORT"
+    echo "  说明: 两种模式使用不同端口，可以同时运行互不冲突"
+
     # 日志文件位置
     echo ""
     print_info "日志文件:"
     echo "  开发日志: ~/.yep-anywhere/logs/server.log"
-    echo "  生产日志: /private/tmp/yep-server.log"
+    echo "  开发后台日志: $DEV_LOG_FILE"
+    echo "  生产后台日志: $PROD_LOG_FILE"
 }
 
 # 启动开发模式
@@ -366,9 +499,9 @@ start_dev() {
     stop_launchd_service
 
     # 检查端口冲突
-    if check_port $MAIN_PORT; then
-        print_error "端口 $MAIN_PORT 已被占用"
-        local pid=$(get_port_process $MAIN_PORT)
+    if check_port $DEV_MAIN_PORT; then
+        print_error "端口 $DEV_MAIN_PORT 已被占用"
+        local pid=$(get_port_process $DEV_MAIN_PORT)
         print_info "占用进程 PID: $pid"
 
         echo ""
@@ -404,13 +537,14 @@ start_dev() {
     if [[ $run_mode == "2" ]]; then
         # 后台运行
         print_success "后台启动开发服务..."
-        print_info "运行命令: PORT=$PORT pnpm dev"
-        print_info "访问地址: http://localhost:$MAIN_PORT"
-        print_info "日志文件: ~/.yep-anywhere/logs/dev-console.log"
+        print_info "运行命令: PORT=$DEV_PORT pnpm dev"
+        print_info "访问地址: http://localhost:$DEV_MAIN_PORT"
+        print_info "日志文件: $DEV_LOG_FILE"
         echo ""
 
         # 使用 nohup + env 后台运行，输出重定向到日志
-        nohup env PORT=$PORT pnpm dev > ~/.yep-anywhere/logs/dev-console.log 2>&1 &
+        ensure_log_dirs
+        nohup env PORT=$DEV_PORT pnpm dev > "$DEV_LOG_FILE" 2>&1 &
         local pid=$!
 
         # 等待服务启动
@@ -421,32 +555,34 @@ start_dev() {
             print_info "查看日志: tail -f ~/.yep-anywhere/logs/server.log"
             print_info "停止服务: bash yep.sh stop"
         else
-            print_error "服务启动失败，请检查日志: ~/.yep-anywhere/logs/dev-console.log"
+            print_error "服务启动失败，请检查日志: $DEV_LOG_FILE"
             return 1
         fi
     else
         # 前台运行
         print_success "启动开发服务..."
-        print_info "运行命令: PORT=$PORT pnpm dev"
-        print_info "访问地址: http://localhost:$MAIN_PORT"
+        print_info "运行命令: PORT=$DEV_PORT pnpm dev"
+        print_info "访问地址: http://localhost:$DEV_MAIN_PORT"
         print_info "按 Ctrl+C 停止服务"
         echo ""
 
-        PORT=$PORT pnpm dev
+        PORT=$DEV_PORT pnpm dev
     fi
 }
 
-# 启动生产模式
+# 启动生产模式（Bundle 独立部署包）
 start_prod() {
-    print_header "启动生产模式"
+    print_header "启动生产模式 (Bundle)"
+
+    ensure_runtime_dependencies || return 1
 
     # 先停止 launchd 服务（如果正在运行）
     stop_launchd_service
 
     # 检查端口冲突
-    if check_port $MAIN_PORT; then
-        print_error "端口 $MAIN_PORT 已被占用"
-        local pid=$(get_port_process $MAIN_PORT)
+    if check_port $PROD_PORT; then
+        print_error "端口 $PROD_PORT 已被占用"
+        local pid=$(get_port_process $PROD_PORT)
         print_info "占用进程 PID: $pid"
 
         echo ""
@@ -457,7 +593,7 @@ start_prod() {
         echo ""
 
         if [[ $REPLY == "1" ]]; then
-            stop_all_services
+            stop_service_by_port $PROD_PORT
             echo ""
         else
             print_error "启动取消"
@@ -482,35 +618,32 @@ start_prod() {
     if [[ $run_mode == "2" ]]; then
         # 后台运行
         print_success "后台启动生产服务..."
-        print_info "运行命令: PORT=$PORT pnpm start"
-        print_info "访问地址: http://localhost:$MAIN_PORT"
-        print_info "日志文件: /private/tmp/yep-server.log"
+        print_info "访问地址: http://localhost:$PROD_PORT"
+        print_info "日志文件: $PROD_LOG_FILE"
         echo ""
 
-        # 使用 nohup + env 后台运行，输出重定向到日志
-        nohup env PORT=$PORT pnpm start > /private/tmp/yep-server.log 2>&1 &
-        local pid=$!
+        start_production_background
+        local pid=$STARTED_PID
 
         # 等待服务启动
         sleep 3
 
         if ps -p $pid > /dev/null 2>&1; then
             print_success "服务已在后台启动 (PID: $pid)"
-            print_info "查看日志: tail -f /private/tmp/yep-server.log"
+            print_info "查看日志: tail -f $PROD_LOG_FILE"
             print_info "停止服务: bash yep.sh stop"
         else
-            print_error "服务启动失败，请检查日志: /private/tmp/yep-server.log"
+            print_error "服务启动失败，请检查日志: $PROD_LOG_FILE"
             return 1
         fi
     else
         # 前台运行
         print_success "启动生产服务..."
-        print_info "运行命令: PORT=$PORT pnpm start"
-        print_info "访问地址: http://localhost:$MAIN_PORT"
+        print_info "访问地址: http://localhost:$PROD_PORT"
         print_info "按 Ctrl+C 停止服务"
         echo ""
 
-        PORT=$PORT pnpm start
+        run_production_foreground
     fi
 }
 
@@ -523,7 +656,7 @@ verify_deployment() {
     # 等待服务完全启动
     sleep 2
 
-    if node scripts/verify-deploy.mjs --base-url "$base_url" --build-info "$PROJECT_ROOT/dist/npm-package/build-info.json"; then
+    if node scripts/verify-deploy.mjs --base-url "$base_url" --build-info "$BUNDLE_BUILD_INFO"; then
         print_success "部署验证通过：运行中的服务端和前端都已更新到最新构建"
         return 0
     else
@@ -533,39 +666,22 @@ verify_deployment() {
     fi
 }
 
-# 重启生产模式
+# 重启生产模式（Bundle）
 restart_production() {
-    stop_all_services
+    print_header "重启生产模式"
+
+    # 停止生产模式服务
+    print_info "停止生产模式 (端口 $PROD_PORT)..."
+    stop_service_by_port $PROD_PORT
     sleep 2
 
-    # 检查部署包是否存在
-    local cli_path="$PROJECT_ROOT/dist/npm-package/dist/cli.js"
-    if [[ ! -f "$cli_path" ]]; then
-        print_error "部署包不存在: $cli_path"
-        print_error "请先运行重构建"
-        return 1
-    fi
-
-    # 检查客户端静态文件是否存在
-    local client_dist="$PROJECT_ROOT/dist/npm-package/client-dist"
-    if [[ ! -d "$client_dist" ]] || [[ ! -f "$client_dist/index.html" ]]; then
-        print_error "客户端静态文件不存在或不完整: $client_dist"
-        print_error "请先运行重构建"
-        return 1
-    fi
-
-    # 确保 cli.js 有执行权限
-    chmod +x "$cli_path"
+    ensure_runtime_dependencies || return 1
 
     # 启动生产模式（使用构建好的部署包）
-    # 注意：必须设置 BASE_PATH=/ 以匹配构建时的配置
-    print_info "后台启动生产服务（使用部署包）..."
-    print_info "运行命令: BASE_PATH=/ CLIENT_DIST_PATH=$client_dist node $cli_path --port $MAIN_PORT"
+    print_info "后台启动生产服务（Bundle 部署包）..."
 
-    nohup env BASE_PATH=/ \
-        CLIENT_DIST_PATH="$client_dist" \
-        node "$cli_path" --port "$MAIN_PORT" > /private/tmp/yep-server.log 2>&1 &
-    local pid=$!
+    start_production_background
+    local pid=$STARTED_PID
 
     # 等待服务启动
     sleep 5
@@ -574,28 +690,36 @@ restart_production() {
         print_success "服务已在后台启动 (PID: $pid)"
 
         # 验证部署
-        local base_url="http://127.0.0.1:${MAIN_PORT}"
+        local base_url
+        base_url="$(prod_base_url)"
         if verify_deployment "$base_url"; then
             print_success "生产模式重启完成并已验证"
-            print_info "访问地址: http://localhost:${MAIN_PORT}/"
+            print_info "访问地址: ${base_url}/"
         else
             print_warning "服务已启动，但验证未通过"
-            print_info "如果前端无法访问，请检查日志: tail -f /private/tmp/yep-server.log"
+            print_info "如果前端无法访问，请检查日志: tail -f $PROD_LOG_FILE"
         fi
     else
-        print_error "服务启动失败，请检查日志: /private/tmp/yep-server.log"
+        print_error "服务启动失败，请检查日志: $PROD_LOG_FILE"
         return 1
     fi
 }
 
 # 重启开发模式
 restart_development() {
-    stop_all_services
+    print_header "重启开发模式"
+
+    # 停止开发模式服务
+    print_info "停止开发模式 (端口 $DEV_MAIN_PORT)..."
+    stop_service_by_port $DEV_MAIN_PORT
+    stop_service_by_port $DEV_MAINTENANCE_PORT
+    stop_service_by_port $DEV_VITE_PORT
     sleep 2
 
     # 启动开发模式（后台运行）
     print_info "后台启动开发服务..."
-    nohup env PORT=$PORT pnpm dev > ~/.yep-anywhere/logs/dev-console.log 2>&1 &
+    ensure_log_dirs
+    nohup env PORT=$DEV_PORT pnpm dev > "$DEV_LOG_FILE" 2>&1 &
     local pid=$!
 
     # 等待服务启动
@@ -606,17 +730,18 @@ restart_development() {
 
         # 开发模式不需要验证 buildId（它使用源代码运行，buildId 总是 dev-xxx）
         # 只检查服务是否响应
-        local base_url="http://127.0.0.1:${MAIN_PORT}"
+        local base_url="http://127.0.0.1:${DEV_MAIN_PORT}"
         print_info "检查服务响应..."
         sleep 2
 
         if curl -fsS "${base_url}/api/version" >/dev/null 2>&1; then
             print_success "开发模式重启完成，服务正常响应"
+            print_info "访问地址: http://localhost:${DEV_MAIN_PORT}/"
         else
             print_warning "服务已启动，但未能访问 /api/version"
         fi
     else
-        print_error "服务启动失败，请检查日志: ~/.yep-anywhere/logs/dev-console.log"
+        print_error "服务启动失败，请检查日志: $DEV_LOG_FILE"
         return 1
     fi
 }
@@ -654,34 +779,22 @@ rebuild() {
     # 获取当前版本号
     local npm_version=$(node -p "require('./package.json').version")
 
-    # 先构建客户端（前端）
-    print_info "构建客户端 (前端)..."
-    if pnpm --filter client build; then
-        print_success "客户端构建完成"
-    else
-        print_error "客户端构建失败"
-        return 1
-    fi
+    local base_path
+    base_path="$(prod_base_path)"
 
-    # 再构建服务端部署包
-    print_info "构建部署包 (版本: ${npm_version})..."
-    if NPM_VERSION="$npm_version" pnpm build:bundle; then
-        print_success "服务端构建完成"
+    print_info "构建完整部署包 (版本: ${npm_version}, BASE_PATH=${base_path})..."
+    if NPM_VERSION="$npm_version" BASE_PATH="$base_path" pnpm build:bundle; then
+        print_success "部署包构建完成"
 
         # 显示构建信息
-        if [[ -f "$PROJECT_ROOT/dist/npm-package/build-info.json" ]]; then
-            local build_id=$(node -p "JSON.parse(require('fs').readFileSync('$PROJECT_ROOT/dist/npm-package/build-info.json', 'utf-8')).buildId")
+        if [[ -f "$BUNDLE_BUILD_INFO" ]]; then
+            local build_id=$(node -p "JSON.parse(require('fs').readFileSync('$BUNDLE_BUILD_INFO', 'utf-8')).buildId")
             print_info "Build ID: $build_id"
         fi
 
-        # 安装运行时依赖（参考 redeploy-server.sh 第249-251行）
-        print_info "安装运行时依赖到 dist/npm-package ..."
-        (cd dist/npm-package && npm install --omit=dev --no-audit --no-fund --silent)
-        chmod +x dist/npm-package/dist/cli.js 2>/dev/null || true
-        chmod +x dist/npm-package/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true
-        print_success "运行时依赖安装完成"
+        install_runtime_dependencies || return 1
     else
-        print_error "服务端构建失败"
+        print_error "部署包构建失败"
         return 1
     fi
 
@@ -693,19 +806,36 @@ rebuild() {
 
     # 检测当前运行模式
     local current_mode="未知"
-    if check_port $MAIN_PORT; then
-        local pid=$(get_port_process $MAIN_PORT)
-        current_mode=$(detect_run_mode $pid)
-        print_info "检测到当前运行模式: $current_mode (PID: $pid)"
+    local dev_running=false
+    local prod_running=false
+
+    if check_port $DEV_MAIN_PORT; then
+        local pid=$(get_port_process $DEV_MAIN_PORT)
+        local mode=$(detect_run_mode $pid)
+        if [[ "$mode" == "开发模式" ]]; then
+            dev_running=true
+            current_mode="开发模式"
+            print_info "检测到开发模式运行中 (端口 $DEV_MAIN_PORT, PID: $pid)"
+        fi
+    fi
+
+    if check_port $PROD_PORT; then
+        local pid=$(get_port_process $PROD_PORT)
+        local mode=$(detect_run_mode $pid)
+        if [[ "$mode" == "生产模式 (Bundle)" ]]; then
+            prod_running=true
+            current_mode="生产模式"
+            print_info "检测到生产模式运行中 (端口 $PROD_PORT, PID: $pid)"
+        fi
     fi
     echo ""
 
     echo "必须重启服务端以应用新代码，选择重启模式："
-    if [[ "$current_mode" == "生产模式" ]]; then
+    if $prod_running; then
         echo "1) 重启生产模式 (推荐，当前正在运行)"
         echo "2) 重启开发模式"
         echo "3) 稍后手动重启 (不推荐，会导致前后端版本不一致)"
-    elif [[ "$current_mode" == "开发模式" ]]; then
+    elif $dev_running; then
         echo "1) 重启生产模式"
         echo "2) 重启开发模式 (推荐，当前正在运行)"
         echo "3) 稍后手动重启 (不推荐，会导致前后端版本不一致)"
@@ -717,7 +847,7 @@ rebuild() {
     echo ""
 
     local default_choice="1"
-    if [[ "$current_mode" == "开发模式" ]]; then
+    if $dev_running; then
         default_choice="2"
     fi
 
@@ -759,15 +889,15 @@ rebuild() {
 
 # 显示帮助信息
 show_help() {
+    echo -e "${BLUE}Yep Anywhere 项目管理工具${NC}"
     cat << EOF
-${BLUE}Yep Anywhere 项目管理工具${NC}
 
 用法:
   $0 [命令]
 
 命令:
-  start-dev       启动开发模式
-  start-prod      启动生产模式
+  start-dev       启动开发模式 (端口 $DEV_PORT)
+  start-prod      启动生产模式 (端口 $PROD_PORT, Bundle 独立部署包)
   stop            停止所有服务
   restart-dev     重启开发模式
   restart-prod    重启生产模式
@@ -777,14 +907,18 @@ ${BLUE}Yep Anywhere 项目管理工具${NC}
   menu            显示交互式菜单 (默认)
   help            显示帮助信息
 
+模式说明:
+  开发模式 (dev):   pnpm dev, 端口 $DEV_PORT, 热重载
+  生产模式 (prod):  Bundle 独立部署包, 端口 $PROD_PORT
+
 示例:
   $0              # 显示交互式菜单
   $0 start-dev    # 启动开发模式
   $0 status       # 查看状态
 
 配置:
-  修改脚本开头的 PORT 变量可更改默认端口
-  当前配置: PORT=$PORT
+  修改脚本开头的 DEV_PORT 和 PROD_PORT 变量可更改默认端口
+  当前配置: 开发=$DEV_PORT, 生产=$PROD_PORT
 
 EOF
 }
@@ -797,8 +931,8 @@ show_menu() {
         echo -e "${BLUE}║   Yep Anywhere 项目管理工具            ║${NC}"
         echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
         echo ""
-        echo -e "  ${GREEN}1)${NC} 启动开发模式"
-        echo -e "  ${GREEN}2)${NC} 启动生产模式"
+        echo -e "  ${GREEN}1)${NC} 启动开发模式 (${CYAN}端口 $DEV_PORT, 热重载${NC})"
+        echo -e "  ${GREEN}2)${NC} 启动生产模式 (${CYAN}端口 $PROD_PORT, Bundle${NC})"
         echo -e "  ${GREEN}3)${NC} 停止所有服务"
         echo -e "  ${GREEN}4)${NC} 重启开发模式"
         echo -e "  ${GREEN}5)${NC} 重启生产模式"
@@ -809,7 +943,7 @@ show_menu() {
         echo -e "  ${YELLOW}h)${NC} 帮助信息"
         echo -e "  ${RED}0)${NC} 退出"
         echo ""
-        echo -e "${CYAN}当前端口配置: $MAIN_PORT / $MAINTENANCE_PORT / $VITE_PORT${NC}"
+        echo -e "${CYAN}端口配置: 开发=$DEV_PORT / 生产=$PROD_PORT${NC}"
         echo ""
         read -p "请选择操作 (输入数字或字母后按回车): " choice
 
@@ -827,15 +961,11 @@ show_menu() {
                 read -p "按回车继续..." -r
                 ;;
             4)
-                stop_all_services
-                sleep 1
-                start_dev
+                restart_development
                 read -p "按回车继续..." -r
                 ;;
             5)
-                stop_all_services
-                sleep 1
-                start_prod
+                restart_production
                 read -p "按回车继续..." -r
                 ;;
             6)
@@ -881,14 +1011,10 @@ main() {
             stop_all_services
             ;;
         restart-dev)
-            stop_all_services
-            sleep 1
-            start_dev
+            restart_development
             ;;
         restart-prod)
-            stop_all_services
-            sleep 1
-            start_prod
+            restart_production
             ;;
         status)
             check_status

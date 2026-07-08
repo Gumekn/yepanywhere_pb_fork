@@ -16,7 +16,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 const CURRENT_VERSION = 1;
-const DEFAULT_PORT = 3400;
+// Default port based on NODE_ENV:
+// - Development: 3400 (source code, hot reload)
+// - Production: 8022 (bundled package)
+const DEFAULT_PORT = process.env.NODE_ENV === "production" ? 8022 : 3400;
 
 export interface NetworkInterface {
   /** Interface name (e.g., "eth0", "wlan0") */
@@ -164,10 +167,17 @@ export class NetworkBindingService {
   }
 
   /**
-   * Get the effective localhost port (CLI override > saved > default).
+   * Get the effective localhost port (CLI override > default based on NODE_ENV).
+   *
+   * Note: We ignore the saved port in network-binding.json because:
+   * 1. Port should be determined by NODE_ENV (production=8022, dev=3400)
+   * 2. User can override with PORT env var or --port CLI flag
+   * 3. The saved port was creating confusion (always using 3400 regardless of NODE_ENV)
+   *
+   * Future: Add a "userModified" flag to distinguish user-set ports from defaults.
    */
   getLocalhostPort(): number {
-    return this.cliPortOverride ?? this.state.localhostPort;
+    return this.cliPortOverride ?? this.defaultPort;
   }
 
   /**

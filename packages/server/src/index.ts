@@ -427,7 +427,10 @@ const networkBindingService = new NetworkBindingService({
   dataDir: config.dataDir,
   cliPortOverride: config.cliPortOverride ? config.port : undefined,
   cliHostOverride: config.cliHostOverride ? config.host : undefined,
-  defaultPort: 3400,
+  // Default port based on NODE_ENV:
+  // - Development: 3400 (source code, hot reload)
+  // - Production: 8022 (bundled package)
+  defaultPort: process.env.NODE_ENV === "production" ? 8022 : 3400,
 });
 const connectedBrowsersService = new ConnectedBrowsersService(eventBus);
 const serverSettingsService = new ServerSettingsService({

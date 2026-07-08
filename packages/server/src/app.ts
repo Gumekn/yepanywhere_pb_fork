@@ -884,6 +884,7 @@ export function createApp(options: AppOptions): AppResult {
       geminiReaderFactory,
       serverSettingsService: options.serverSettingsService,
       modelInfoService: options.modelInfoService,
+      recentsService: options.recentsService,
       codexBridgeService: options.codexBridgeService,
       sessionArchiveService: options.sessionArchiveService,
       claudeProjectsDir: options.projectsDir ?? CLAUDE_PROJECTS_DIR,

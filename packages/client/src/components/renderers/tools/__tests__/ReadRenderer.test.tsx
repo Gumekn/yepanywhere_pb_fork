@@ -108,4 +108,24 @@ describe("ReadRenderer", () => {
     ).toBeNull();
     expect(screen.getByText(/continues in Shell/)).toBeDefined();
   });
+
+  it("renders historical image read results without filePath/content fields", () => {
+    render(
+      <div>
+        {readRenderer.renderToolResult(
+          {
+            type: "image",
+            file: {
+              base64:
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+            },
+          } as never,
+          false,
+          renderContext,
+        )}
+      </div>,
+    );
+
+    expect(screen.getByRole("img", { name: /file content/i })).toBeDefined();
+  });
 });

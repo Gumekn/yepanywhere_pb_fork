@@ -136,9 +136,9 @@ describe("ProjectScanner cache", () => {
 
     const spy = vi.spyOn(
       scanner as unknown as {
-        getProjectDirInfo: (projectDirPath: string) => Promise<unknown>;
+        getProjectDirInfos: (projectDirPath: string) => Promise<unknown>;
       },
-      "getProjectDirInfo",
+      "getProjectDirInfos",
     );
 
     await Promise.all([
@@ -366,5 +366,59 @@ describe("ProjectScanner stale-cwd recovery", () => {
       path: newPath,
       id: encodeProjectId(newPath),
     });
+  });
+
+  it("splits one physical Claude session directory by jsonl cwd", async () => {
+    const projectsDir = join(tmpdir(), `scanner-multi-cwd-${randomUUID()}`);
+    tempDirs.push(projectsDir);
+
+    const projectOne = "/Users/test/code/project-one";
+    const projectTwo = "/Users/test/code/project-two";
+    const sessionDir = join(projectsDir, "localhost", "-shared-session-dir");
+    await mkdir(sessionDir, { recursive: true });
+
+    await writeFile(
+      join(sessionDir, "one-a.jsonl"),
+      `{"type":"user","cwd":"${projectOne}","message":{"content":"one a"}}\n`,
+    );
+    await writeFile(
+      join(sessionDir, "one-b.jsonl"),
+      `{"type":"user","cwd":"${projectOne}","message":{"content":"one b"}}\n`,
+    );
+    await writeFile(
+      join(sessionDir, "two.jsonl"),
+      `{"type":"user","cwd":"${projectTwo}","message":{"content":"two"}}\n`,
+    );
+
+    const scanner = new ProjectScanner({
+      projectsDir,
+      enableCodex: false,
+      enableGemini: false,
+    });
+
+    const projects = await scanner.listProjects();
+
+    expect(projects).toHaveLength(2);
+    expect(projects).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: encodeProjectId(projectOne),
+          path: projectOne,
+          sessionCount: 2,
+          sessionDir,
+        }),
+        expect.objectContaining({
+          id: encodeProjectId(projectTwo),
+          path: projectTwo,
+          sessionCount: 1,
+          sessionDir,
+        }),
+      ]),
+    );
+
+    const projectForSession = await scanner.getProjectBySessionFile(
+      join(sessionDir, "two.jsonl"),
+    );
+    expect(projectForSession?.id).toBe(encodeProjectId(projectTwo));
   });
 });

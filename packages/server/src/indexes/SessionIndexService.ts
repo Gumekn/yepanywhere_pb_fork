@@ -68,12 +68,12 @@ export interface CachedSessionSummary {
 }
 
 export interface SessionIndexState {
-  version: 6;
+  version: 7;
   projectId: string;
   sessions: Record<string, CachedSessionSummary>;
 }
 
-const CURRENT_VERSION = 6;
+const CURRENT_VERSION = 7;
 
 interface SessionFileStat {
   mtimeMs: number;
@@ -223,7 +223,7 @@ export class SessionIndexService implements ISessionIndexService {
   ): Promise<SessionIndexState> {
     const scopeKey = this.getScopeKey(sessionDir, reader);
     const indexPath = this.getIndexPath(sessionDir, reader);
-    const cacheKey = scopeKey;
+    const cacheKey = this.getScopedLoadKey(sessionDir, projectId, reader);
 
     // Check memory cache first
     const cached = this.indexCache.get(cacheKey);
@@ -288,9 +288,10 @@ export class SessionIndexService implements ISessionIndexService {
    */
   private async saveIndex(
     sessionDir: string,
+    projectId: UrlProjectId,
     reader?: ISessionReader,
   ): Promise<void> {
-    const cacheKey = this.getScopeKey(sessionDir, reader);
+    const cacheKey = this.getScopedLoadKey(sessionDir, projectId, reader);
 
     // If a save is in progress, mark that we need another save
     if (this.savePromises.has(cacheKey)) {
@@ -298,7 +299,7 @@ export class SessionIndexService implements ISessionIndexService {
       return;
     }
 
-    const promise = this.doSaveIndex(sessionDir, reader);
+    const promise = this.doSaveIndex(sessionDir, projectId, reader);
     this.savePromises.set(cacheKey, promise);
 
     try {
@@ -310,16 +311,18 @@ export class SessionIndexService implements ISessionIndexService {
     // If another save was requested while we were saving, do it now
     if (this.pendingSaves.has(cacheKey)) {
       this.pendingSaves.delete(cacheKey);
-      await this.saveIndex(sessionDir, reader);
+      await this.saveIndex(sessionDir, projectId, reader);
     }
   }
 
   private async doSaveIndex(
     sessionDir: string,
+    projectId: UrlProjectId,
     reader?: ISessionReader,
   ): Promise<void> {
     const scopeKey = this.getScopeKey(sessionDir, reader);
-    const index = this.indexCache.get(scopeKey);
+    const cacheKey = this.getScopedLoadKey(sessionDir, projectId, reader);
+    const index = this.indexCache.get(cacheKey);
     if (!index) return;
 
     const indexPath = this.getIndexPath(sessionDir, reader);
@@ -806,7 +809,7 @@ export class SessionIndexService implements ISessionIndexService {
       }
 
       if (indexChanged) {
-        await this.saveIndex(sessionDir, reader);
+        await this.saveIndex(sessionDir, projectId, reader);
       }
 
       summaries.sort(
@@ -989,7 +992,7 @@ export class SessionIndexService implements ISessionIndexService {
       statCalls += incremental.statCalls;
       parseCalls += incremental.parseCalls;
       if (incremental.indexChanged) {
-        await this.saveIndex(sessionDir, reader);
+        await this.saveIndex(sessionDir, projectId, reader);
       }
     }
 
@@ -1043,7 +1046,7 @@ export class SessionIndexService implements ISessionIndexService {
         index,
       );
       if (incremental.indexChanged) {
-        await this.saveIndex(sessionDir, reader);
+        await this.saveIndex(sessionDir, projectId, reader);
       }
       const summaries = this.buildSummariesFromIndex(index, projectId);
       this.recordCallStats(
@@ -1078,9 +1081,11 @@ export class SessionIndexService implements ISessionIndexService {
    */
   invalidateSession(sessionDir: string, sessionId: string): void {
     this.markSessionDirty(sessionDir, sessionId);
-    const index = this.indexCache.get(sessionDir);
-    if (index) {
-      delete index.sessions[sessionId];
+    const scopePrefix = `${sessionDir}::`;
+    for (const [key, index] of this.indexCache.entries()) {
+      if (key === sessionDir || key.startsWith(scopePrefix)) {
+        delete index.sessions[sessionId];
+      }
     }
   }
 
@@ -1088,7 +1093,12 @@ export class SessionIndexService implements ISessionIndexService {
    * Clear all cached data for a session directory.
    */
   clearCache(sessionDir: string): void {
-    this.indexCache.delete(sessionDir);
+    const scopePrefix = `${sessionDir}::`;
+    for (const key of Array.from(this.indexCache.keys())) {
+      if (key === sessionDir || key.startsWith(scopePrefix)) {
+        this.indexCache.delete(key);
+      }
+    }
     this.clearDirDirtyState(sessionDir);
     this.lastFullValidationAt.delete(sessionDir);
   }
@@ -1165,12 +1175,12 @@ export class SessionIndexService implements ISessionIndexService {
       const summary = await reader.getSessionSummary(sessionId, projectId);
       if (summary) {
         index.sessions[sessionId] = this.toCachedSummary(summary, mtime, size);
-        await this.saveIndex(sessionDir, reader);
+        await this.saveIndex(sessionDir, projectId, reader);
         return summary.title;
       }
 
       index.sessions[sessionId] = this.toEmptyCachedSummary(mtime, size);
-      await this.saveIndex(sessionDir, reader);
+      await this.saveIndex(sessionDir, projectId, reader);
     } catch {
       // File error - return null
     }

@@ -51,13 +51,9 @@ bash yep.sh rebuild
 
 ## 端口配置
 
-项目有两种运行模式，使用不同的默认端口以避免冲突。**端口由 `NODE_ENV` 环境变量自动选择**。
-
 ### 开发模式（pnpm dev）
 
-**默认端口：3400**（当 `NODE_ENV != production` 时）
-
-所有端口都从单个 `PORT` 环境变量派生：
+所有端口都从单个 `PORT` 环境变量派生（默认：3400）：
 
 | 端口 | 用途 |
 |------|------|
@@ -74,60 +70,16 @@ PORT=4000 pnpm dev  # 使用 4000、4001、4002
 - `MAINTENANCE_PORT`：覆盖维护端口（设为 0 可禁用）
 - `VITE_PORT`：覆盖 Vite dev 端口
 
-### 生产模式（Bundle 独立部署包）
+### 生产模式
 
-**默认端口：8022**（当 `NODE_ENV=production` 时）
-
-生产模式运行打包后的独立 Bundle：
+生产部署默认使用端口 8022（通过 `YEP_DEPLOY_PORT` 环境变量控制）：
 
 ```bash
-# 启动生产模式（推荐：设置 NODE_ENV=production）
-NODE_ENV=production node dist/npm-package/dist/cli.js
-
-# 或使用 yep.sh（会自动使用正确端口）
-bash yep.sh start-prod
-
-# 手动指定端口（覆盖默认值）
-NODE_ENV=production node dist/npm-package/dist/cli.js --port 9000
-
-# 或使用 PORT 环境变量
-NODE_ENV=production PORT=9000 node dist/npm-package/dist/cli.js
-
-# 修改 LaunchAgent 部署端口
-YEP_DEPLOY_PORT=9000 scripts/install-launchagents.sh
+# 修改生产端口
+YEP_DEPLOY_PORT=3400 scripts/install-launchagents.sh
 ```
 
-### 端口选择规则
-
-**端口由 `NODE_ENV` 自动选择：**
-- `NODE_ENV=production` → 默认 8022（生产模式）
-- 其他情况（包括未设置） → 默认 3400（开发模式）
-
-**覆盖优先级（从高到低）：**
-1. `--port` CLI 参数
-2. `PORT` 环境变量
-3. `NODE_ENV` 自动选择的默认值
-
-**说明**：
-- 开发模式（3400）和生产模式（8022）使用不同的默认端口，两种模式可以同时运行互不冲突
-- 这是 Node.js 生态的标准实践：根据 `NODE_ENV` 自动调整配置
-- 如果直接运行 bundle 而不设置 `NODE_ENV=production`，会使用开发模式的默认端口（3400）
-
-### 端口配置示例
-
-```bash
-# 开发模式（默认 3400）
-pnpm dev
-
-# 生产模式（默认 8022）
-NODE_ENV=production node dist/npm-package/dist/cli.js
-
-# 未设置 NODE_ENV（退回开发模式默认 3400）
-node dist/npm-package/dist/cli.js
-
-# 手动指定端口（覆盖默认值）
-NODE_ENV=production PORT=9000 node dist/npm-package/dist/cli.js
-```
+**说明**：开发模式（3400）和生产模式（8022）使用不同的默认端口是设计行为，避免两者同时运行时冲突。
 
 ## 开发模式 vs 生产模式
 
@@ -136,41 +88,21 @@ NODE_ENV=production PORT=9000 node dist/npm-package/dist/cli.js
 **开发模式**：
 - 直接运行源代码，修改后自动重新编译
 - 命令：`pnpm dev` 或 `bash yep.sh start-dev`
-- 代码位置：`packages/server/src/`, `packages/client/src/`
+- 代码位置：`packages/server/dist/`, `packages/client/src/`
 - 默认端口：3400
 - 特点：Vite HMR 自动刷新，无需重构建
 
 **生产模式**：
 - 运行打包后的独立部署包
-- 命令：`NODE_ENV=production node dist/npm-package/dist/cli.js` 或 `bash yep.sh start-prod`
+- 命令：`node dist/npm-package/dist/cli.js --port 8022` 或 `bash yep.sh start-prod`
 - 代码位置：`dist/npm-package/`（完整打包产物）
-- 默认端口：8022（需要 `NODE_ENV=production`）
+- 默认端口：8022
 - 特点：需要重构建才能看到代码修改
 
 **重构建的含义**：
 - 将当前源代码重新打包成生产模式的部署包（`dist/npm-package/`）
 - 修改代码后，**只影响开发模式**（源码运行）
 - 生产模式继续运行旧的打包代码，**必须重构建 + 重启**才能应用修改
-
-### 模式详细说明
-
-详细的模式对比和使用指南请参考：[docs/DEPLOYMENT_MODES.md](docs/DEPLOYMENT_MODES.md)
-
-### 为什么不使用 `pnpm start`？
-
-你可能会在 `package.json` 中看到 `pnpm start` 命令。**这不是真正的生产模式！**
-
-`pnpm start` 运行的是 `NODE_ENV=production node packages/server/dist/index.js`，它：
-- 依赖 pnpm workspace 符号链接
-- 无法独立部署
-- 不是完整的 Bundle
-
-真正的生产模式应该使用：
-```bash
-NODE_ENV=production node dist/npm-package/dist/cli.js
-```
-
-这才是可以独立部署的完整 Bundle。详细区别见 [docs/DEPLOYMENT_MODES.md](docs/DEPLOYMENT_MODES.md)。
 
 ## 数据目录与 Profile
 
@@ -190,7 +122,7 @@ NODE_ENV=production node dist/npm-package/dist/cli.js
 
 ```bash
 # 生产环境（默认 profile，端口 8022）
-NODE_ENV=production node dist/npm-package/dist/cli.js
+PORT=8022 pnpm start
 
 # 开发环境（dev profile，端口 3400）
 PORT=3400 YEP_ANYWHERE_PROFILE=dev pnpm dev
@@ -366,11 +298,7 @@ tail -f ~/.yep-anywhere/logs/server-launchd.err.log
 
 **后台运行日志**（使用 yep.sh 脚本时）：
 ```bash
-# 开发模式
-tail -f ~/.yep-anywhere/logs/dev-console.log
-
-# 生产模式
-tail -f /private/tmp/yep-bundle.log
+tail -f /private/tmp/yep-server.log
 ```
 
 所有 `console.log/error/warn` 输出都会被捕获。应用日志文件通常是 JSON 格式；stdout/stderr 日志会 pretty-print。

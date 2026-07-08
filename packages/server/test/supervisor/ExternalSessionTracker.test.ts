@@ -86,6 +86,7 @@ describe("ExternalSessionTracker", () => {
       } as unknown as Supervisor,
       scanner: {
         getProject: vi.fn(async () => project),
+        getProjectBySessionFile: vi.fn(async () => null),
         getProjectBySessionDirSuffix: vi.fn(async () => project),
       } as never,
       decayMs: 10000,
@@ -106,6 +107,7 @@ describe("ExternalSessionTracker", () => {
       } as unknown as Supervisor,
       scanner: {
         getProject: vi.fn(async () => project),
+        getProjectBySessionFile: vi.fn(async () => null),
         getProjectBySessionDirSuffix,
       } as never,
       decayMs: 10000,
@@ -128,6 +130,43 @@ describe("ExternalSessionTracker", () => {
     expect(tracker.isExternal("sess-hosted")).toBe(true);
   });
 
+  it("uses concrete Claude session file cwd before directory suffix fallback", async () => {
+    const externalProcessProbe = vi.fn(async () => true);
+    const getProject = vi.fn(async () => project);
+    const getProjectBySessionFile = vi.fn(async () => project);
+    const getProjectBySessionDirSuffix = vi.fn(async () => null);
+    tracker = new ExternalSessionTracker({
+      eventBus,
+      supervisor: {
+        getProcessForSession: vi.fn(() => undefined),
+        getAllProcesses: vi.fn(() => []),
+      } as unknown as Supervisor,
+      scanner: {
+        getProject,
+        getProjectBySessionFile,
+        getProjectBySessionDirSuffix,
+      } as never,
+      decayMs: 10000,
+      processValidationMs: 0,
+      externalProcessProbe,
+      getSessionSummary: vi.fn(async (sessionId) => createSummary(sessionId)),
+    });
+
+    const event = createFileChange("sess-from-cwd");
+    eventBus.emit(event);
+    await flushTrackerWork();
+
+    expect(getProjectBySessionFile).toHaveBeenCalledWith(event.path);
+    expect(getProject).toHaveBeenCalledWith(projectId);
+    expect(getProjectBySessionDirSuffix).not.toHaveBeenCalled();
+    expect(externalProcessProbe).toHaveBeenCalledWith({
+      provider: "claude",
+      projectPath: project.path,
+      excludePids: [],
+    });
+    expect(tracker.isExternal("sess-from-cwd")).toBe(true);
+  });
+
   it("ignores nested workflow session files under subagents", async () => {
     const externalProcessProbe = vi.fn(async () => true);
     const getProjectBySessionDirSuffix = vi.fn(async () => project);
@@ -140,6 +179,7 @@ describe("ExternalSessionTracker", () => {
       } as unknown as Supervisor,
       scanner: {
         getProject: vi.fn(async () => project),
+        getProjectBySessionFile: vi.fn(async () => null),
         getProjectBySessionDirSuffix,
       } as never,
       decayMs: 10000,

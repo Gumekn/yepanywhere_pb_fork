@@ -9,7 +9,8 @@
  *   yepanywhere --version         # Show version
  *
  * Environment variables:
- *   PORT                          # Server port (default: 3400)
+ *   NODE_ENV                      # Environment mode (production/development)
+ *   PORT                          # Server port (default: 8022 in production, 3400 in dev)
  *   YEP_ANYWHERE_DATA_DIR         # Data directory override
  *   YEP_ANYWHERE_PROFILE          # Profile name (creates ~/.yep-anywhere-{profile}/)
  *   AUTH_ENABLED                  # Enable cookie auth (default: false)
@@ -81,7 +82,7 @@ USAGE:
 OPTIONS:
   --help, -h            Show this help message
   --version, -v         Show version number
-  --port <number>       Server port (default: 3400)
+  --port <number>       Server port (default: 8022 for bundle, 3400 for dev)
   --host <address>      Host/interface to bind to (default: localhost)
                         Use 0.0.0.0 to bind all interfaces
   --https-self-signed   Enable HTTPS using a self-signed certificate
@@ -99,7 +100,9 @@ SETUP OPTIONS (for headless installation):
                         (min 6 characters). Exits after setup.
 
 ENVIRONMENT VARIABLES:
-  PORT                          Server port (default: 3400)
+  NODE_ENV                      Environment mode: production or development
+                                (default: production for bundle, development for pnpm dev)
+  PORT                          Server port (default: 8022 in production, 3400 in dev)
   HOST                          Host/interface to bind (default: localhost)
   YEP_ANYWHERE_DATA_DIR         Data directory override
   YEP_ANYWHERE_PROFILE          Profile name (creates ~/.yep-anywhere-{profile}/)
@@ -120,8 +123,8 @@ ENVIRONMENT VARIABLES:
                                 Project scan cache TTL in ms (default: 5000, 0 = rescan every request)
 
 EXAMPLES:
-  # Start with defaults (port 3400, localhost only)
-  yepanywhere
+  # Start with defaults (port 8022 for bundle, localhost only)
+  NODE_ENV=production yepanywhere
 
   # Start on custom port
   yepanywhere --port 8000

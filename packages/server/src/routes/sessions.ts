@@ -1431,6 +1431,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       );
     }
 
+    // Record session visit with the REAL projectId from the session data.
+    // The session.projectId comes from the session file's cwd field (source of truth),
+    // not from the URL parameter. This ensures recents.json always has the correct
+    // project association, even if the user navigated with a stale/incorrect projectId.
+    if (deps.recentsService) {
+      await deps.recentsService.recordVisit(sessionId, session.projectId);
+    }
+
     return c.json({
       session: {
         ...session,

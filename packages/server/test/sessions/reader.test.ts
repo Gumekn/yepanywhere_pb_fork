@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { ClaudeSessionEntry, UrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { preprocessMessages } from "../../../client/src/lib/preprocessMessages.ts";
+import { encodeProjectId } from "../../src/projects/paths.js";
 import { normalizeSession } from "../../src/sessions/normalization.js";
 import {
   SessionReader,
@@ -45,6 +46,37 @@ describe("SessionReader", () => {
   });
 
   describe("title extraction", () => {
+    it("only lists sessions whose jsonl cwd matches the requested project", async () => {
+      const projectOne = "/Users/test/code/project-one";
+      const projectTwo = "/Users/test/code/project-two";
+      await writeFile(
+        join(testDir, "one.jsonl"),
+        `${JSON.stringify({
+          type: "user",
+          cwd: projectOne,
+          message: { content: "Project one" },
+          uuid: "msg-one",
+          timestamp: new Date().toISOString(),
+        })}\n`,
+      );
+      await writeFile(
+        join(testDir, "two.jsonl"),
+        `${JSON.stringify({
+          type: "user",
+          cwd: projectTwo,
+          message: { content: "Project two" },
+          uuid: "msg-two",
+          timestamp: new Date().toISOString(),
+        })}\n`,
+      );
+
+      const sessions = await reader.listSessions(encodeProjectId(projectOne));
+      expect(sessions.map((session) => session.id)).toEqual(["one"]);
+      await expect(
+        reader.getSessionSummary("two", encodeProjectId(projectOne)),
+      ).resolves.toBeNull();
+    });
+
     it("skips ide_opened_file blocks and uses actual message", async () => {
       const sessionId = "test-session-1";
       const jsonl = JSON.stringify({

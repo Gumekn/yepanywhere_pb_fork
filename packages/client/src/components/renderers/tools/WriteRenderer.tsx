@@ -28,8 +28,28 @@ function isMarkdownFile(filePath: string): boolean {
 /**
  * Extract filename from path
  */
-function getFileName(filePath: string): string {
-  return filePath.split("/").pop() || filePath;
+function getFileName(filePath: unknown): string {
+  if (typeof filePath !== "string") return "File";
+  const trimmed = filePath.trim();
+  if (!trimmed) return "File";
+  return trimmed.split("/").pop() || trimmed;
+}
+
+function getString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function getErrorMessage(result: unknown, fallback: string): string {
+  if (typeof result === "string") {
+    return result;
+  }
+  if (result && typeof result === "object") {
+    const content = (result as { content?: unknown }).content;
+    if (content) {
+      return String(content);
+    }
+  }
+  return fallback;
 }
 
 /**
@@ -51,11 +71,14 @@ function truncateHighlightedHtml(html: string, maxLines: number): string {
  */
 function WriteToolUse({ input }: { input: WriteInput }) {
   const fileName = getFileName(input.file_path);
-  const lineCount = input.content.split("\n").length;
+  const content = getString(input.content);
+  const lineCount = content ? content.split("\n").length : null;
   return (
     <div className="write-tool-use">
       <span className="file-path">{fileName}</span>
-      <span className="write-info">{lineCount} lines</span>
+      <span className="write-info">
+        {lineCount === null ? "invalid input" : `${lineCount} lines`}
+      </span>
     </div>
   );
 }
@@ -71,7 +94,7 @@ function WriteModalContent({
   input?: WriteInputWithAugment;
 }) {
   const [showPreview, setShowPreview] = useState(false);
-  const lines = file.content.split("\n");
+  const lines = getString(file.content).split("\n");
 
   const isMarkdown = isMarkdownFile(file.filePath);
   const hasMarkdownPreview = isMarkdown && !!input?._renderedMarkdownHtml;
@@ -134,17 +157,18 @@ function WriteModalContent({
   }
 
   // Fallback: plain text with line numbers
+  const startLine = typeof file.startLine === "number" ? file.startLine : 1;
   return (
     <div className="file-content-modal">
       {toggleButton}
       <div className="file-content-with-lines">
         <div className="line-numbers">
           {lines.map((_, i) => (
-            <div key={`ln-${i + 1}`}>{file.startLine + i}</div>
+            <div key={`ln-${i + 1}`}>{startLine + i}</div>
           ))}
         </div>
         <pre className="line-content">
-          <code>{file.content}</code>
+          <code>{getString(file.content)}</code>
         </pre>
       </div>
     </div>
@@ -187,16 +211,7 @@ function WriteToolResult({
     enabled && validationErrors && !isToolIgnored("Write");
 
   if (isError || !result?.file) {
-    // Extract error message - can be a string or object with content
-    let errorMessage = "Failed to write file";
-    if (typeof result === "string") {
-      errorMessage = result;
-    } else if (typeof result === "object" && result !== null) {
-      const errorResult = result as { content?: unknown };
-      if (errorResult.content) {
-        errorMessage = String(errorResult.content);
-      }
-    }
+    const errorMessage = getErrorMessage(result, "Failed to write file");
     return (
       <div className="write-error">
         {showValidationWarning && validationErrors && (
@@ -208,9 +223,11 @@ function WriteToolResult({
   }
 
   const { file } = result;
-  const lines = file.content.split("\n");
+  const content = getString(file.content);
+  const lines = content.split("\n");
   const needsCollapse = lines.length > MAX_LINES_COLLAPSED;
   const fileName = getFileName(file.filePath);
+  const startLine = typeof file.startLine === "number" ? file.startLine : 1;
 
   // Use highlighted HTML if available from input augment
   if (input?._highlightedContentHtml) {
@@ -255,7 +272,7 @@ function WriteToolResult({
       <div className="file-content-with-lines">
         <div className="line-numbers">
           {displayLines.map((_, i) => {
-            const lineNum = file.startLine + i;
+            const lineNum = startLine + i;
             return <div key={`line-${lineNum}`}>{lineNum}</div>;
           })}
           {needsCollapse && !isExpanded && <div>...</div>}
@@ -312,6 +329,15 @@ function WriteCollapsedPreview({
   const showValidationWarning =
     enabled && validationErrors && !isToolIgnored("Write");
 
+  // Truncate highlighted HTML for preview. Keep this hook before early returns.
+  const previewHtml = useMemo(() => {
+    if (!input?._highlightedContentHtml) return null;
+    return truncateHighlightedHtml(
+      input._highlightedContentHtml,
+      PREVIEW_LINES,
+    );
+  }, [input?._highlightedContentHtml]);
+
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
@@ -326,34 +352,8 @@ function WriteCollapsedPreview({
     setIsModalOpen(false);
   }, []);
 
-  // Use result data if available, otherwise fall back to input
-  const content = result?.file?.content ?? input.content;
-  const filePath = result?.file?.filePath ?? input.file_path;
-  const fileName = getFileName(filePath);
-  const lines = content.split("\n");
-  const lineCount = result?.file?.numLines ?? lines.length;
-  const isTruncated = lines.length > PREVIEW_LINES;
-
-  // Truncate highlighted HTML for preview
-  const previewHtml = useMemo(() => {
-    if (!input._highlightedContentHtml) return null;
-    return truncateHighlightedHtml(
-      input._highlightedContentHtml,
-      PREVIEW_LINES,
-    );
-  }, [input._highlightedContentHtml]);
-
   if (isError) {
-    // Extract error message from result - can be a string or object with content
-    let errorMessage = "Failed to write file";
-    if (typeof result === "string") {
-      errorMessage = result;
-    } else if (typeof result === "object" && result !== null) {
-      const errorResult = result as { content?: unknown };
-      if (errorResult.content) {
-        errorMessage = String(errorResult.content);
-      }
-    }
+    const errorMessage = getErrorMessage(result, "Failed to write file");
     return (
       <div className="write-collapsed-preview write-collapsed-error">
         {showValidationWarning && validationErrors && (
@@ -363,6 +363,17 @@ function WriteCollapsedPreview({
       </div>
     );
   }
+
+  // Use result data if available, otherwise fall back to input.
+  const content = getString(result?.file?.content ?? input?.content);
+  const filePath = result?.file?.filePath ?? input?.file_path;
+  const fileName = getFileName(filePath);
+  const lines = content.split("\n");
+  const lineCount =
+    typeof result?.file?.numLines === "number"
+      ? result.file.numLines
+      : lines.length;
+  const isTruncated = lines.length > PREVIEW_LINES;
 
   return (
     <>

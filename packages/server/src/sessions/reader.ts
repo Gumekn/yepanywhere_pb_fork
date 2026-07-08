@@ -38,6 +38,7 @@ import {
   isCompactBoundary,
   isConversationEntry,
 } from "@yep-anywhere/shared";
+import { canonicalizeProjectPath, encodeProjectId } from "../projects/paths.js";
 import {
   buildClaudeBranchView,
   collectVisibleClaudeEntries,
@@ -287,6 +288,22 @@ export class ClaudeSessionReader implements ISessionReader {
         })
         .filter((m): m is ClaudeSessionEntry => m !== null);
 
+      // Extract the real cwd from the session file (written by Claude SDK on every turn).
+      // This is the source of truth for which project the session actually belongs to,
+      // regardless of which directory the session file happens to be stored in.
+      let realCwd: string | null = null;
+      for (const msg of messages) {
+        if (
+          msg &&
+          typeof msg === "object" &&
+          "cwd" in msg &&
+          typeof msg.cwd === "string"
+        ) {
+          realCwd = msg.cwd;
+          break; // Use the first cwd found
+        }
+      }
+
       // Build DAG and get active branch (filters out dead branches from rewinds, etc.)
       const { activeBranch } = buildDag(messages);
 
@@ -335,9 +352,19 @@ export class ClaudeSessionReader implements ISessionReader {
       // message with end_turn/tool_use is a completed turn, not interrupted.
       const interrupted = this.isBranchInterrupted(conversationMessages);
 
+      // Use the real cwd from the session file if available, otherwise fall back to
+      // the projectId parameter. This ensures sessions show up under their actual
+      // working directory, not the directory where the .jsonl file happens to be stored.
+      const actualProjectId = realCwd
+        ? encodeProjectId(canonicalizeProjectPath(realCwd))
+        : projectId;
+      if (actualProjectId !== projectId) {
+        return null;
+      }
+
       return {
         id: sessionId,
-        projectId,
+        projectId: actualProjectId,
         title: this.extractTitle(firstUserMessage),
         fullTitle,
         createdAt: stats.birthtime.toISOString(),
@@ -372,6 +399,10 @@ export class ClaudeSessionReader implements ISessionReader {
     const filePath = await this.findSessionFile(sessionId);
     if (!filePath) return null;
     const content = await readFile(filePath, "utf-8");
+
+    // Guard against empty or invalid content
+    if (!content || typeof content !== "string") return null;
+
     const lines = content.trim().split("\n");
 
     const rawMessages: ClaudeSessionEntry[] = [];

@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { toUrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionIndexService } from "../../src/indexes/SessionIndexService.js";
+import { encodeProjectId } from "../../src/projects/paths.js";
 import { SessionReader } from "../../src/sessions/reader.js";
 import type { ISessionReader } from "../../src/sessions/types.js";
 import type { SessionSummary } from "../../src/supervisor/types.js";
@@ -60,6 +61,21 @@ describe("SessionIndexService", () => {
     await writeFile(join(sessionDir, `${sessionId}.jsonl`), `${jsonl}\n`);
   }
 
+  async function createSessionForCwd(
+    sessionId: string,
+    cwd: string,
+    content: string,
+  ): Promise<void> {
+    const jsonl = JSON.stringify({
+      type: "user",
+      cwd,
+      message: { content },
+      uuid: `msg-${sessionId}`,
+      timestamp: new Date().toISOString(),
+    });
+    await writeFile(join(sessionDir, `${sessionId}.jsonl`), `${jsonl}\n`);
+  }
+
   describe("initialization", () => {
     it("creates data directory on initialize", async () => {
       const newDataDir = join(testDir, "new-indexes");
@@ -76,6 +92,37 @@ describe("SessionIndexService", () => {
   });
 
   describe("cache hit", () => {
+    it("keeps separate in-memory indexes for different projectIds sharing one sessionDir", async () => {
+      const projectOne = "/Users/test/code/project-one";
+      const projectTwo = "/Users/test/code/project-two";
+      const projectOneId = encodeProjectId(projectOne);
+      const projectTwoId = encodeProjectId(projectTwo);
+
+      await createSessionForCwd("one", projectOne, "Project one");
+      await createSessionForCwd("two", projectTwo, "Project two");
+
+      const sessionsOne = await service.getSessionsWithCache(
+        sessionDir,
+        projectOneId,
+        reader,
+      );
+      expect(sessionsOne.map((session) => session.id)).toEqual(["one"]);
+
+      const sessionsTwo = await service.getSessionsWithCache(
+        sessionDir,
+        projectTwoId,
+        reader,
+      );
+      expect(sessionsTwo.map((session) => session.id)).toEqual(["two"]);
+
+      const sessionsOneAgain = await service.getSessionsWithCache(
+        sessionDir,
+        projectOneId,
+        reader,
+      );
+      expect(sessionsOneAgain.map((session) => session.id)).toEqual(["one"]);
+    });
+
     it("returns cached data when mtime/size match", async () => {
       await createSession("session-1", "Hello world");
 
