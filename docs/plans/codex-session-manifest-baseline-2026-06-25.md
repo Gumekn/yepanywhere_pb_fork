@@ -11,7 +11,7 @@ Scope: pre-manifest baseline, after the first optimization pass that split globa
 
 ## Running Service Log Snapshot
 
-Source: `/private/tmp/yep-server.log`
+历史来源：旧 nohup 生产运行器的本地日志快照。当前生产模式由 LaunchAgent 守护，日志位于 `~/.yep-anywhere/logs/server-launchd.*.log`。
 
 - `SessionIndexService mode=full dir=/Users/yueyuan/.codex/sessions`
 - Count: 233

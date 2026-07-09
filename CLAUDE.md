@@ -364,9 +364,8 @@ tail -f ~/.yep-anywhere/logs/server-launchd.out.log
 tail -f ~/.yep-anywhere/logs/server-launchd.err.log
 ```
 
-**后台运行日志**（使用 yep.sh 脚本时）：
+**开发后台控制台日志**：
 ```bash
-# 开发模式
 tail -f ~/.yep-anywhere/logs/dev-console.log
 ```
 

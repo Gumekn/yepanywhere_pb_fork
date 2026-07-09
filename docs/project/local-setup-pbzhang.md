@@ -101,9 +101,6 @@ scripts/install-launchagents.sh
 # LaunchAgent 日志（推荐）
 ~/.yep-anywhere/logs/server-launchd.out.log
 ~/.yep-anywhere/logs/server-launchd.err.log
-
-# 后台运行日志（使用 yep.sh 脚本时）
-/private/tmp/yep-server.log
 ```
 
 ### 客户端日志（可选）
@@ -301,9 +298,6 @@ tail -f ~/.yep-anywhere/logs/server.log
 # 生产模式（LaunchAgent）
 tail -f ~/.yep-anywhere/logs/server-launchd.out.log
 tail -f ~/.yep-anywhere/logs/server-launchd.err.log
-
-# 后台运行
-tail -f /private/tmp/yep-server.log
 ```
 
 ### 重启服务
@@ -336,14 +330,12 @@ pnpm build:bundle
 pnpm launchd:install
 ```
 
-## CLAUDE.md 中过时的内容
+## 本地说明
 
-以下是 CLAUDE.md 中的一些过时内容，以本文档为准：
+以下内容是当前本机环境的补充说明：
 
-1. **别名记录**（CLAUDE.md 第 226-231 行）：记录的 `yep-deploy` 和 `yep-server` 别名不存在，实际别名见本文档"本地别名配置"章节。
+1. **别名记录**：历史 `yep-deploy` 和 `yep-server` 别名不再作为标准入口，实际别名见本文档"本地别名配置"章节。
 
-2. **日志路径**（CLAUDE.md 第 214 行）：提到 `/private/tmp/yep-server.log` 是 LaunchAgent 日志，实际 LaunchAgent 日志位于 `~/.yep-anywhere/logs/server-launchd.*.log`。
+2. **外部工具路径**：`~/code/claw-starter` 和 `~/code/chromeos-testbed` 在当前环境中不存在，这些是可选工具。
 
-3. **外部工具路径**：CLAUDE.md 引用的 `~/code/claw-starter` 和 `~/code/chromeos-testbed` 在当前环境中不存在，这些是可选工具。
-
-4. **示例路径**：CLAUDE.md 中的示例路径 `/Users/yueyuan/` 来自原作者环境，当前环境为 `/Users/pbzhang/`。
+3. **示例路径**：旧文档中的示例路径 `/Users/yueyuan/` 来自原作者环境，当前环境为 `/Users/pbzhang/`。

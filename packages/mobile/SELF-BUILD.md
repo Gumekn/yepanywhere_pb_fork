@@ -36,8 +36,8 @@
 nohup node /Users/yueyuan/Desktop/work/before_work/yepanywhere/packages/relay/dist/index.js \
   > /tmp/yep-relay.log 2>&1 & disown
 
-# yepanywhere 主服务 (后台,自动连 relay)
-nohup yepanywhere > /tmp/yep-server.log 2>&1 & disown
+# yepanywhere 主服务 (LaunchAgent 守护,日志在 ~/.yep-anywhere/logs/server-launchd.*.log)
+bash yep.sh start-prod
 
 # 验证两个都起来了
 curl -s http://127.0.0.1:4400/health    # 应返回 {"status":"ok",...}
@@ -117,8 +117,7 @@ yepanywhere --setup-remote-access \
   --relay ws://新地址/ws
 
 # 然后重启 server 让它连新 relay
-pkill -f yepanywhere
-nohup yepanywhere > /tmp/yep-server.log 2>&1 & disown
+bash yep.sh restart-prod
 ```
 
 ### 3. frp 配置(在你的 frpc.toml)
@@ -151,8 +150,7 @@ yepanywhere --setup-remote-access \
   --relay ws://gd03.frp0.cc:28101/ws
 
 # 重启 yepanywhere
-pkill -f yepanywhere
-nohup yepanywhere > /tmp/yep-server.log 2>&1 & disown
+bash yep.sh restart-prod
 ```
 
 ⚠️ **不要随意改 username**:relay 端 SQLite (`~/.yep-relay/relay.db`) 会持久化 username 跟 `installId` 的所有权关系。如果你换 install(比如清空 `~/.yep-anywhere/install.json`),原 username 会被锁住直到 90 天后自动 reclaim。
@@ -168,8 +166,7 @@ yepanywhere --setup-remote-access \
   --password 新密码 \
   --relay ws://gd03.frp0.cc:28101/ws
 
-pkill -f yepanywhere
-nohup yepanywhere > /tmp/yep-server.log 2>&1 & disown
+bash yep.sh restart-prod
 
 # 然后手机重新登录,填新密码
 ```
@@ -425,7 +422,7 @@ yepanywhere --setup-remote-access \
   --relay ws://gd03.frp0.cc:28101/ws
 
 # 9. 启动 yepanywhere 主服务
-nohup yepanywhere > /tmp/yep-server.log 2>&1 & disown
+bash yep.sh start-prod
 
 # 10. 在 mobile 包里打 APK + 装手机
 cd packages/mobile && pnpm tauri android build --debug --apk
@@ -447,7 +444,7 @@ curl -s http://127.0.0.1:4400/status | python3 -m json.tool
 
 如果 waiting=0,看 server 日志:
 ```bash
-tail -20 /tmp/yep-server.log | grep -iE "relay|error"
+tail -20 ~/.yep-anywhere/logs/server-launchd.err.log | grep -iE "relay|error"
 # 常见原因:remote-access.json 不存在 / relay 离线 / frp 没通
 ```
 
@@ -457,15 +454,14 @@ tail -20 /tmp/yep-server.log | grep -iE "relay|error"
 ```bash
 yepanywhere --setup-remote-access --username yueyuan --password 正确的密码 \
   --relay ws://gd03.frp0.cc:28101/ws
-pkill -f yepanywhere
-nohup yepanywhere > /tmp/yep-server.log 2>&1 & disown
+bash yep.sh restart-prod
 ```
 
 ### `pairs=1` 但手机一直转圈不进列表
 
 通常是 yepanywhere server 后端 API 响应慢 / 失败。看:
 ```bash
-tail -30 /tmp/yep-server.log | grep -iE "error|warn"
+tail -30 ~/.yep-anywhere/logs/server-launchd.err.log | grep -iE "error|warn"
 ```
 
 ### `tauri android init` 报错 `expected identifier, found keyword 'self'`

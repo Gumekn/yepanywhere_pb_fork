@@ -59,7 +59,7 @@ USE_CODEX_BRIDGE_SIDECAR=true
 RESTART_CODEX_BRIDGE=false
 RESTART_CLAUDE_BRIDGE=false
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
-SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
+SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/}"
 SERVER_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
 if [[ "$SERVER_BASE_PATH" == "/" ]]; then
   SERVER_BASE_PATH=""
@@ -173,6 +173,28 @@ kickstart_launchd_label() {
   local label="$1"
 
   launchctl kickstart -k "$(launchd_domain)/${label}"
+}
+
+ensure_server_launchagent_loaded() {
+  if launchd_label_loaded "$SERVER_LAUNCHD_LABEL"; then
+    return 0
+  fi
+
+  log "服务端 LaunchAgent ${SERVER_LAUNCHD_LABEL} 未加载，正在安装 ..."
+  YEP_DEPLOY_PORT="$SERVER_PORT" \
+    YEP_DEPLOY_BASE_PATH="${SERVER_BASE_PATH:-/}" \
+    ALLOWED_IMAGE_PATHS="$SERVER_ALLOWED_IMAGE_PATHS" \
+    YEP_CODEX_BRIDGE_PORT="$CODEX_BRIDGE_PORT" \
+    YEP_CODEX_BRIDGE_CONTROL_URL="$CODEX_BRIDGE_HTTP_URL" \
+    YEP_CLAUDE_BRIDGE_PORT="$CLAUDE_BRIDGE_PORT" \
+    YEP_CLAUDE_BRIDGE_CONTROL_URL="$CLAUDE_BRIDGE_HTTP_URL" \
+    scripts/install-launchagents.sh --server-only
+
+  if ! launchd_label_loaded "$SERVER_LAUNCHD_LABEL"; then
+    err "服务端 LaunchAgent ${SERVER_LAUNCHD_LABEL} 安装后仍未加载。"
+    err "请检查 ~/.yep-anywhere/logs/server-launchd.err.log 中的启动错误。"
+    exit 1
+  fi
 }
 
 start_codex_bridge_sidecar() {
@@ -423,45 +445,25 @@ if $DO_RESTART; then
     start_claude_bridge_sidecar "$CLAUDE_BRIDGE_PORT" "$CLAUDE_BRIDGE_HTTP_URL" "$SERVER_BASE_URL"
   fi
 
-  log "Starting yepanywhere ..."
-  # Mount under /yep so Caddy at air.yueyuan.uk/yep/* reverse-proxies into us
-  # cleanly (see INFRA.md). The Hono app + client bundle both pick up BASE_PATH.
-  # APK / direct-mode tcp tunnel callers are unaffected — they hit ws://host:8022
-  # which still serves /yep/api/ws; only the URL prefix changes, not the port.
+  log "启动 yepanywhere ..."
+  # Hono app 和客户端 bundle 都读取 BASE_PATH。本地生产默认使用 "/"，
+  # 反向代理部署可通过 YEP_DEPLOY_BASE_PATH 覆盖。
 
   # 使用构建好的 CLI 路径，而不是依赖全局 yepanywhere 命令
   CLI_PATH="$REPO_ROOT/dist/npm-package/dist/cli.js"
   if [[ ! -f "$CLI_PATH" ]]; then
-    err "CLI not found at $CLI_PATH. Run build first."
+    err "未找到 CLI: $CLI_PATH。请先执行构建。"
     exit 1
   fi
 
-  if launchd_label_loaded "$SERVER_LAUNCHD_LABEL"; then
-    dim "using LaunchAgent ${SERVER_LAUNCHD_LABEL}; KeepAlive is not required"
-    kickstart_launchd_label "$SERVER_LAUNCHD_LABEL"
-  elif $USE_CODEX_BRIDGE_SIDECAR; then
-    dim "LaunchAgent ${SERVER_LAUNCHD_LABEL} is not loaded; falling back to nohup (logs: /tmp/yep-server.log)"
-    BASE_PATH="${SERVER_BASE_PATH:-/}" \
-      ALLOWED_IMAGE_PATHS="$SERVER_ALLOWED_IMAGE_PATHS" \
-      YEP_CODEX_BRIDGE_MODE=external \
-      YEP_CODEX_BRIDGE_CONTROL_URL="$CODEX_BRIDGE_HTTP_URL" \
-      YEP_CODEX_BRIDGE_PORT="$CODEX_BRIDGE_PORT" \
-      YEP_CLAUDE_BRIDGE_CONTROL_URL="$CLAUDE_BRIDGE_HTTP_URL" \
-      YEP_CLAUDE_BRIDGE_PORT="$CLAUDE_BRIDGE_PORT" \
-      nohup node "$CLI_PATH" --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
-  else
-    dim "LaunchAgent ${SERVER_LAUNCHD_LABEL} is not loaded; falling back to nohup (logs: /tmp/yep-server.log)"
-    BASE_PATH="${SERVER_BASE_PATH:-/}" \
-      ALLOWED_IMAGE_PATHS="$SERVER_ALLOWED_IMAGE_PATHS" \
-      nohup node "$CLI_PATH" --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
-  fi
+  ensure_server_launchagent_loaded
+  dim "使用 LaunchAgent ${SERVER_LAUNCHD_LABEL}；日志: ~/.yep-anywhere/logs/server-launchd.*.log"
+  kickstart_launchd_label "$SERVER_LAUNCHD_LABEL"
 
-  # Health-check loop. Tries up to 15s; the server usually answers within 2s
-  # but Tauri activity / large data dirs can stretch first-boot.
-  # /yep/api/version is a small JSON endpoint that exists on every server build —
-  # /api/health doesn't (unmatched routes fall through to the SPA shell).
-  # The /yep prefix matches the BASE_PATH set above.
-  log "Waiting for ${SERVER_BASE_URL}/api/version ..."
+  # 健康检查最多等待 15 秒；服务通常 2 秒内响应，Tauri 活动或大型数据目录可能拉长首次启动时间。
+  # /api/version 是每个服务端构建都存在的小型 JSON 端点；
+  # SERVER_BASE_URL 在配置 BASE_PATH 时已经包含该前缀。
+  log "等待 ${SERVER_BASE_URL}/api/version 响应 ..."
   HEALTH_OK=false
   for _ in $(seq 1 60); do
     if curl -fsS "${SERVER_BASE_URL}/api/version" >/dev/null 2>&1; then
@@ -472,8 +474,8 @@ if $DO_RESTART; then
   done
 
   if $HEALTH_OK; then
-    log "Server is up."
-    # Show what the freshly started server reports.
+    log "服务端已启动。"
+    # 输出刚启动的服务端报告的版本信息。
     SERVER_VERSION_LINE="$(curl -fsS "${SERVER_BASE_URL}/api/version" 2>/dev/null | node -e 'let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => { const d=JSON.parse(raw); console.log(`current=${d.current} protocol=${d.resumeProtocolVersion} buildId=${d.build?.buildId ?? "missing"}`); })' 2>/dev/null || true)"
     dim "${SERVER_BASE_URL}/api/version → ${SERVER_VERSION_LINE}"
 
@@ -483,16 +485,16 @@ if $DO_RESTART; then
       dim "pid ${LISTEN_PID}: ${LISTEN_CMD}"
     fi
 
-    log "Verifying deployed server/client build metadata ..."
+    log "验证已部署的服务端/客户端构建元数据 ..."
     node scripts/verify-deploy.mjs \
       --base-url "$SERVER_BASE_URL" \
       --build-info "$REPO_ROOT/dist/npm-package/build-info.json"
 
-    # Relay (4400) was retired in favor of self-hosted frp tcp tunnels.
-    # Skipping relay status check — see INFRA.md.
+    # Relay (4400) 已退役，改用自托管 frp tcp 隧道；跳过 relay 状态检查，见 INFRA.md。
   else
-    err "Server didn't answer /yep/api/version within 15s. Check /tmp/yep-server.log for crashes."
-    tail -20 /tmp/yep-server.log >&2 || true
+    err "服务端在 15 秒内没有响应 ${SERVER_BASE_URL}/api/version。"
+    err "请检查 ~/.yep-anywhere/logs/server-launchd.err.log 中的崩溃信息。"
+    tail -20 "$HOME/.yep-anywhere/logs/server-launchd.err.log" >&2 || true
     exit 1
   fi
 fi

@@ -62,7 +62,7 @@ perl -i -0777 -pe 's/`~\/\.zshrc` 中历史 shell alias 如下：\n\n```bash\nal
 
 # 修改 6: 更新服务端日志章节
 echo "6. 更新服务端日志章节..."
-perl -i -0777 -pe 's/- `server\.log`：主服务端日志（`pnpm dev` 开发模式）\n- `e2e-server\.log`：E2E 测试期间的服务端日志\n- `\/private\/tmp\/yep-server\.log`：当前本机 `yepanywhere --port 8022` \/ launchd 方式运行时的 stdout\/stderr 实际日志，排查生产本机实例优先看这里\n\n实时查看当前本机实例日志：`tail -f \/private\/tmp\/yep-server\.log`/- `server.log`：开发模式日志（`pnpm dev`）\n- `e2e-server.log`：E2E 测试期间的服务端日志\n- `server-launchd.out.log`：LaunchAgent 标准输出日志\n- `server-launchd.err.log`：LaunchAgent 错误输出日志\n\n**开发模式日志**：\n```bash\ntail -f ~\/.yep-anywhere\/logs\/server.log\n```\n\n**生产模式日志**（LaunchAgent）：\n```bash\ntail -f ~\/.yep-anywhere\/logs\/server-launchd.out.log\ntail -f ~\/.yep-anywhere\/logs\/server-launchd.err.log\n```\n\n**后台运行日志**（使用 yep.sh 脚本时）：\n```bash\ntail -f \/private\/tmp\/yep-server.log\n```/sg' "$CLAUDE_MD"
+perl -i -0777 -pe 's/## 服务端日志\n.*?(?=\n## |\z)/## 服务端日志\n\n服务端应用日志路径会在启动时打印为 `[Config] Log file: ...`，默认位于 `{dataDir}\/logs\/`（默认：`~\/.yep-anywhere\/logs\/`）：\n\n- `server.log`：开发模式日志（`pnpm dev`）\n- `e2e-server.log`：E2E 测试期间的服务端日志\n- `server-launchd.out.log`：LaunchAgent 标准输出日志\n- `server-launchd.err.log`：LaunchAgent 错误输出日志\n\n**开发模式日志**：\n```bash\ntail -f ~\/.yep-anywhere\/logs\/server.log\n```\n\n**生产模式日志**（LaunchAgent）：\n```bash\ntail -f ~\/.yep-anywhere\/logs\/server-launchd.out.log\ntail -f ~\/.yep-anywhere\/logs\/server-launchd.err.log\n```\n\n**开发后台控制台日志**：\n```bash\ntail -f ~\/.yep-anywhere\/logs\/dev-console.log\n```\n\n所有 `console.log\/error\/warn` 输出都会被捕获。应用日志文件通常是 JSON 格式；stdout\/stderr 日志会 pretty-print。\n/s' "$CLAUDE_MD"
 
 # 修改 7: 更新部署验证说明
 echo "7. 更新部署验证说明..."
