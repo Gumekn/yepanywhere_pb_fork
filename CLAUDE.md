@@ -46,7 +46,7 @@ bash yep.sh rebuild
 ```bash
 # 重构建并重启生产模式
 bash yep.sh rebuild
-# 选择 "1) 重启生产模式"
+# 构建完成后会自动重启并验证生产模式
 ```
 
 ## 端口配置
@@ -271,9 +271,9 @@ bash yep.sh rebuild        # 重构建项目
 4. `pnpm build:bundle` - 构建完整部署包
 5. `cd dist/npm-package && npm install --omit=dev` - 安装运行时依赖
 6. `chmod +x dist/npm-package/dist/cli.js` - 设置执行权限
-7. 提示用户选择重启模式（生产/开发）
+7. 自动重启生产模式（LaunchAgent 守护）并执行部署验证
 
-**关键**：重构建完成后，必须重启生产模式服务才能应用新代码。yep.sh 会自动提示并执行重启。
+**关键**：重构建完成后，必须重启生产模式服务才能应用新代码。`bash yep.sh rebuild` 会自动重启并验证生产模式，不再提示选择开发/生产重启模式。
 
 ### ⚠️ 重要：依赖安装方法
 
@@ -368,9 +368,6 @@ tail -f ~/.yep-anywhere/logs/server-launchd.err.log
 ```bash
 # 开发模式
 tail -f ~/.yep-anywhere/logs/dev-console.log
-
-# 生产模式
-tail -f /private/tmp/yep-bundle.log
 ```
 
 所有 `console.log/error/warn` 输出都会被捕获。应用日志文件通常是 JSON 格式；stdout/stderr 日志会 pretty-print。

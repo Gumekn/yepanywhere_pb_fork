@@ -36,7 +36,6 @@ BUNDLE_CLI="$BUNDLE_DIR/dist/cli.js"
 BUNDLE_CLIENT_DIST="$BUNDLE_DIR/client-dist"
 BUNDLE_BUILD_INFO="$BUNDLE_DIR/build-info.json"
 DEV_LOG_FILE="${YEP_DEV_LOG_FILE:-$HOME/.yep-anywhere/logs/dev-console.log}"
-PROD_LOG_FILE="${YEP_PROD_LOG_FILE:-/private/tmp/yep-bundle.log}"
 PROD_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-${BASE_PATH:-/}}"
 PROD_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
 
@@ -53,6 +52,8 @@ CLAUDE_BRIDGE_PORT=4520
 # 注意：此 label 名称来自原项目（yueyuan），保持不变以兼容已安装的 LaunchAgent
 # 如需自定义，可通过环境变量 YEP_LAUNCHD_SERVER_LABEL 覆盖
 LAUNCHD_SERVICE="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
+LAUNCHD_DOMAIN="gui/$(id -u)"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_SERVICE}.plist"
 
 # 辅助函数
 print_success() {
@@ -101,7 +102,7 @@ prod_base_url() {
 }
 
 ensure_log_dirs() {
-    mkdir -p "$(dirname "$DEV_LOG_FILE")" "$(dirname "$PROD_LOG_FILE")"
+    mkdir -p "$(dirname "$DEV_LOG_FILE")"
 }
 
 check_bundle_layout() {
@@ -137,34 +138,6 @@ ensure_runtime_dependencies() {
 
     print_warning "dist/npm-package/node_modules 缺失或不完整"
     install_runtime_dependencies
-}
-
-run_production_foreground() {
-    local cli_path="$BUNDLE_CLI"
-    local base_path
-    base_path="$(prod_base_path)"
-
-    print_info "运行命令: NODE_ENV=production BASE_PATH=$base_path node $cli_path --port $PROD_PORT"
-    NODE_ENV=production \
-        BASE_PATH="$base_path" \
-        ALLOWED_IMAGE_PATHS="$PROD_ALLOWED_IMAGE_PATHS" \
-        node "$cli_path" --port "$PROD_PORT"
-}
-
-start_production_background() {
-    local cli_path="$BUNDLE_CLI"
-    local base_path
-    local pid
-    base_path="$(prod_base_path)"
-
-    ensure_log_dirs
-    print_info "运行命令: NODE_ENV=production BASE_PATH=$base_path node $cli_path --port $PROD_PORT"
-    nohup env NODE_ENV=production \
-        BASE_PATH="$base_path" \
-        ALLOWED_IMAGE_PATHS="$PROD_ALLOWED_IMAGE_PATHS" \
-        node "$cli_path" --port "$PROD_PORT" > "$PROD_LOG_FILE" 2>&1 &
-    pid=$!
-    STARTED_PID=$pid
 }
 
 # 检查端口是否被占用
@@ -281,59 +254,163 @@ stop_service_by_port() {
     fi
 }
 
-# 检查 launchd 服务是否运行
+# 检查 launchd 服务是否已加载
 check_launchd_service() {
-    launchctl list | grep -q "$LAUNCHD_SERVICE" 2>/dev/null
+    launchctl print "$LAUNCHD_DOMAIN/$LAUNCHD_SERVICE" >/dev/null 2>&1
+}
+
+# 获取 LaunchAgent 当前管理的进程 PID
+get_launchd_service_pid() {
+    launchctl print "$LAUNCHD_DOMAIN/$LAUNCHD_SERVICE" 2>/dev/null | awk -F '= ' '/^[[:space:]]*pid = / {print $2; exit}'
+}
+
+# 检查生产端口是否由 LaunchAgent 管理的 Bundle 进程占用
+check_launchd_production_running() {
+    check_launchd_service || return 1
+    check_port $PROD_PORT || return 1
+
+    local port_pid
+    port_pid=$(get_port_process $PROD_PORT | head -1)
+    [ -n "$port_pid" ] || return 1
+
+    local launchd_pid
+    launchd_pid=$(get_launchd_service_pid)
+    [ -n "$launchd_pid" ] || return 1
+    [ "$port_pid" = "$launchd_pid" ] || return 1
+
+    local mode
+    mode=$(detect_run_mode "$port_pid")
+    [[ "$mode" == "生产模式 (Bundle)" ]]
+}
+
+# 等待 LaunchAgent 托管的生产进程进入监听状态
+wait_for_launchd_production() {
+    local timeout_seconds=${1:-15}
+    local attempts=$((timeout_seconds * 4))
+
+    for _ in $(seq 1 "$attempts"); do
+        if check_launchd_production_running; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    return 1
 }
 
 # 停止 launchd 服务
 stop_launchd_service() {
     if check_launchd_service; then
-        print_info "检测到 launchd 服务正在运行，正在停止..."
-        launchctl stop "$LAUNCHD_SERVICE" 2>/dev/null || true
-        launchctl unload ~/Library/LaunchAgents/${LAUNCHD_SERVICE}.plist 2>/dev/null || true
+        print_info "检测到 LaunchAgent 已加载，正在停止..."
+        launchctl bootout "$LAUNCHD_DOMAIN/$LAUNCHD_SERVICE" >/dev/null 2>&1 || true
+        launchctl bootout "$LAUNCHD_DOMAIN" "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+        launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
         sleep 2
         if check_launchd_service; then
-            print_warning "launchd 服务停止失败"
+            print_warning "LaunchAgent 停止失败"
             return 1
         else
-            print_success "launchd 服务已停止"
+            print_success "LaunchAgent 已停止"
         fi
     fi
     return 0
 }
 
-# 启用 launchd 服务
+# 安装或刷新生产服务 LaunchAgent
 start_launchd_service() {
-    print_header "启用 launchd 开机自启"
+    print_header "启用 LaunchAgent 生产服务"
 
-    if check_launchd_service; then
-        print_warning "launchd 服务已在运行"
-        return 0
-    fi
+    ensure_runtime_dependencies || return 1
 
-    local plist_file=~/Library/LaunchAgents/${LAUNCHD_SERVICE}.plist
-    if [ ! -f "$plist_file" ]; then
-        print_warning "launchd 配置文件不存在: $plist_file"
-        print_info "正在安装生产服务 LaunchAgent..."
-        ensure_runtime_dependencies || return 1
-        YEP_DEPLOY_PORT="$PROD_PORT" \
-            YEP_DEPLOY_BASE_PATH="$(prod_base_path)" \
-            ALLOWED_IMAGE_PATHS="$PROD_ALLOWED_IMAGE_PATHS" \
-            "$PROJECT_ROOT/scripts/install-launchagents.sh" --server-only
-        return $?
-    fi
+    print_info "写入并启动生产服务 LaunchAgent..."
+    YEP_DEPLOY_PORT="$PROD_PORT" \
+        YEP_DEPLOY_BASE_PATH="$(prod_base_path)" \
+        ALLOWED_IMAGE_PATHS="$PROD_ALLOWED_IMAGE_PATHS" \
+        "$PROJECT_ROOT/scripts/install-launchagents.sh" --server-only
 
-    launchctl load "$plist_file"
     sleep 2
 
     if check_launchd_service; then
-        print_success "launchd 服务已启动"
-        print_info "服务将在开机时自动启动"
+        print_success "LaunchAgent 已加载"
+        print_info "服务将在用户登录时自动启动，并在退出后自动拉起"
     else
-        print_error "launchd 服务启动失败"
+        print_error "LaunchAgent 启动失败"
         return 1
     fi
+}
+
+# 使用 LaunchAgent 启动生产服务
+start_production_launchagent() {
+    local base_url
+    base_url="$(prod_base_url)"
+
+    if check_port $PROD_PORT && ! check_launchd_production_running; then
+        local pid
+        pid=$(get_port_process $PROD_PORT)
+        print_error "端口 $PROD_PORT 已被非 LaunchAgent 生产服务占用"
+        print_info "占用进程 PID: $pid"
+        print_info "请先运行: bash yep.sh stop"
+        return 1
+    fi
+
+    if check_launchd_production_running; then
+        print_success "生产服务已由 LaunchAgent 管理并正在运行"
+        print_info "访问地址: ${base_url}/"
+        print_info "日志文件: ~/.yep-anywhere/logs/server-launchd.out.log"
+        return 0
+    fi
+
+    start_launchd_service || return 1
+
+    if wait_for_launchd_production 15; then
+        print_success "生产服务已启动并由 LaunchAgent 持续守护"
+        print_info "访问地址: ${base_url}/"
+        print_info "停止服务: bash yep.sh stop"
+        print_info "日志文件: ~/.yep-anywhere/logs/server-launchd.out.log"
+        return 0
+    fi
+
+    print_error "LaunchAgent 已加载，但生产端口 $PROD_PORT 未开始监听"
+    print_info "请检查日志: tail -f ~/.yep-anywhere/logs/server-launchd.err.log"
+    return 1
+}
+
+# 重启 LaunchAgent 管理的生产服务
+restart_production_launchagent() {
+    local base_url
+    base_url="$(prod_base_url)"
+
+    ensure_runtime_dependencies || return 1
+
+    if check_port $PROD_PORT && ! check_launchd_production_running; then
+        local pid
+        pid=$(get_port_process $PROD_PORT)
+        print_error "端口 $PROD_PORT 已被非 LaunchAgent 生产服务占用"
+        print_info "占用进程 PID: $pid"
+        print_info "请先运行: bash yep.sh stop"
+        return 1
+    fi
+
+    start_launchd_service || return 1
+
+    print_info "通过 LaunchAgent 重启生产服务..."
+    launchctl kickstart -k "$LAUNCHD_DOMAIN/$LAUNCHD_SERVICE" || return 1
+
+    if wait_for_launchd_production 20; then
+        print_success "生产服务已由 LaunchAgent 重启"
+        if verify_deployment "$base_url"; then
+            print_success "生产模式重启完成并已验证"
+            print_info "访问地址: ${base_url}/"
+        else
+            print_warning "服务已启动，但验证未通过"
+            print_info "如果前端无法访问，请检查日志: tail -f ~/.yep-anywhere/logs/server-launchd.err.log"
+        fi
+        return 0
+    fi
+
+    print_error "生产服务重启失败，端口 $PROD_PORT 未开始监听"
+    print_info "请检查日志: tail -f ~/.yep-anywhere/logs/server-launchd.err.log"
+    return 1
 }
 
 # 停止所有服务
@@ -394,9 +471,13 @@ check_status() {
 
     # LaunchAgent 状态
     if check_launchd_service; then
-        print_success "LaunchAgent (开机自启): 已启用"
+        if check_launchd_production_running; then
+            print_success "LaunchAgent (生产守护): 已加载，生产服务运行中"
+        else
+            print_warning "LaunchAgent (生产守护): 已加载，但生产端口未运行"
+        fi
     else
-        print_warning "LaunchAgent (开机自启): 未启用"
+        print_warning "LaunchAgent (生产守护): 未启用"
     fi
     echo ""
 
@@ -488,15 +569,13 @@ check_status() {
     print_info "日志文件:"
     echo "  开发日志: ~/.yep-anywhere/logs/server.log"
     echo "  开发后台日志: $DEV_LOG_FILE"
-    echo "  生产后台日志: $PROD_LOG_FILE"
+    echo "  生产 LaunchAgent 输出日志: ~/.yep-anywhere/logs/server-launchd.out.log"
+    echo "  生产 LaunchAgent 错误日志: ~/.yep-anywhere/logs/server-launchd.err.log"
 }
 
 # 启动开发模式
 start_dev() {
     print_header "启动开发模式"
-
-    # 先停止 launchd 服务（如果正在运行）
-    stop_launchd_service
 
     # 检查端口冲突
     if check_port $DEV_MAIN_PORT; then
@@ -512,7 +591,10 @@ start_dev() {
         echo ""
 
         if [[ $REPLY == "1" ]]; then
-            stop_all_services
+            print_info "仅停止开发模式相关服务..."
+            stop_service_by_port $DEV_MAIN_PORT
+            stop_service_by_port $DEV_MAINTENANCE_PORT
+            stop_service_by_port $DEV_VITE_PORT
             echo ""
         else
             print_error "启动取消"
@@ -575,76 +657,9 @@ start_prod() {
     print_header "启动生产模式 (Bundle)"
 
     ensure_runtime_dependencies || return 1
-
-    # 先停止 launchd 服务（如果正在运行）
-    stop_launchd_service
-
-    # 检查端口冲突
-    if check_port $PROD_PORT; then
-        print_error "端口 $PROD_PORT 已被占用"
-        local pid=$(get_port_process $PROD_PORT)
-        print_info "占用进程 PID: $pid"
-
-        echo ""
-        echo "1) 停止现有服务并重新启动"
-        echo "2) 取消"
-        echo ""
-        read -p "请选择 (1-2): " -n 1 -r
-        echo ""
-
-        if [[ $REPLY == "1" ]]; then
-            stop_service_by_port $PROD_PORT
-            echo ""
-        else
-            print_error "启动取消"
-            return 1
-        fi
-    fi
-
     cd "$PROJECT_ROOT"
 
-    # 询问运行模式
-    echo ""
-    echo "选择运行模式:"
-    echo "1) 前台运行 (终端关闭后服务停止，可看到实时日志)"
-    echo "2) 后台运行 (终端关闭后服务继续运行)"
-    echo ""
-    read -p "请选择 (1-2，默认 2): " -n 1 -r
-    echo ""
-    echo ""
-
-    local run_mode=${REPLY:-2}
-
-    if [[ $run_mode == "2" ]]; then
-        # 后台运行
-        print_success "后台启动生产服务..."
-        print_info "访问地址: http://localhost:$PROD_PORT"
-        print_info "日志文件: $PROD_LOG_FILE"
-        echo ""
-
-        start_production_background
-        local pid=$STARTED_PID
-
-        # 等待服务启动
-        sleep 3
-
-        if ps -p $pid > /dev/null 2>&1; then
-            print_success "服务已在后台启动 (PID: $pid)"
-            print_info "查看日志: tail -f $PROD_LOG_FILE"
-            print_info "停止服务: bash yep.sh stop"
-        else
-            print_error "服务启动失败，请检查日志: $PROD_LOG_FILE"
-            return 1
-        fi
-    else
-        # 前台运行
-        print_success "启动生产服务..."
-        print_info "访问地址: http://localhost:$PROD_PORT"
-        print_info "按 Ctrl+C 停止服务"
-        echo ""
-
-        run_production_foreground
-    fi
+    start_production_launchagent
 }
 
 # 验证部署
@@ -670,39 +685,7 @@ verify_deployment() {
 restart_production() {
     print_header "重启生产模式"
 
-    # 停止生产模式服务
-    print_info "停止生产模式 (端口 $PROD_PORT)..."
-    stop_service_by_port $PROD_PORT
-    sleep 2
-
-    ensure_runtime_dependencies || return 1
-
-    # 启动生产模式（使用构建好的部署包）
-    print_info "后台启动生产服务（Bundle 部署包）..."
-
-    start_production_background
-    local pid=$STARTED_PID
-
-    # 等待服务启动
-    sleep 5
-
-    if ps -p $pid > /dev/null 2>&1; then
-        print_success "服务已在后台启动 (PID: $pid)"
-
-        # 验证部署
-        local base_url
-        base_url="$(prod_base_url)"
-        if verify_deployment "$base_url"; then
-            print_success "生产模式重启完成并已验证"
-            print_info "访问地址: ${base_url}/"
-        else
-            print_warning "服务已启动，但验证未通过"
-            print_info "如果前端无法访问，请检查日志: tail -f $PROD_LOG_FILE"
-        fi
-    else
-        print_error "服务启动失败，请检查日志: $PROD_LOG_FILE"
-        return 1
-    fi
+    restart_production_launchagent
 }
 
 # 重启开发模式
@@ -804,87 +787,15 @@ rebuild() {
     print_warning "前端静态文件已更新，但后端 API 还是旧版本，会导致页面无法正常加载！"
     echo ""
 
-    # 检测当前运行模式
-    local current_mode="未知"
-    local dev_running=false
-    local prod_running=false
-
-    if check_port $DEV_MAIN_PORT; then
-        local pid=$(get_port_process $DEV_MAIN_PORT)
-        local mode=$(detect_run_mode $pid)
-        if [[ "$mode" == "开发模式" ]]; then
-            dev_running=true
-            current_mode="开发模式"
-            print_info "检测到开发模式运行中 (端口 $DEV_MAIN_PORT, PID: $pid)"
-        fi
-    fi
-
-    if check_port $PROD_PORT; then
-        local pid=$(get_port_process $PROD_PORT)
-        local mode=$(detect_run_mode $pid)
-        if [[ "$mode" == "生产模式 (Bundle)" ]]; then
-            prod_running=true
-            current_mode="生产模式"
-            print_info "检测到生产模式运行中 (端口 $PROD_PORT, PID: $pid)"
-        fi
-    fi
-    echo ""
-
-    echo "必须重启服务端以应用新代码，选择重启模式："
-    if $prod_running; then
-        echo "1) 重启生产模式 (推荐，当前正在运行)"
-        echo "2) 重启开发模式"
-        echo "3) 稍后手动重启 (不推荐，会导致前后端版本不一致)"
-    elif $dev_running; then
-        echo "1) 重启生产模式"
-        echo "2) 重启开发模式 (推荐，当前正在运行)"
-        echo "3) 稍后手动重启 (不推荐，会导致前后端版本不一致)"
+    print_info "正在自动重启生产模式..."
+    if restart_production; then
+        echo ""
+        print_success "生产服务已重启并验证，请刷新浏览器查看新版本"
     else
-        echo "1) 重启生产模式 (推荐)"
-        echo "2) 重启开发模式"
-        echo "3) 稍后手动重启 (不推荐，会导致前后端版本不一致)"
+        echo ""
+        print_error "生产服务重启或验证失败，请手动检查"
+        return 1
     fi
-    echo ""
-
-    local default_choice="1"
-    if $dev_running; then
-        default_choice="2"
-    fi
-
-    read -p "请选择 (1-3，默认 ${default_choice}): " -n 1 -r
-    echo ""
-    echo ""
-
-    case ${REPLY:-$default_choice} in
-        1)
-            print_info "正在重启生产模式..."
-            if restart_production; then
-                echo ""
-                print_success "服务端已重启并验证，请刷新浏览器查看新版本"
-            else
-                echo ""
-                print_error "重启或验证失败，请手动检查"
-            fi
-            ;;
-        2)
-            print_info "正在重启开发模式..."
-            if restart_development; then
-                echo ""
-                print_success "服务端已重启并验证，开发模式会自动刷新浏览器"
-            else
-                echo ""
-                print_error "重启或验证失败，请手动检查"
-            fi
-            ;;
-        3)
-            print_error "警告: 跳过重启会导致前端和后端版本不匹配！"
-            print_error "页面可能无法正常加载，API 调用可能失败！"
-            echo ""
-            print_info "稍后必须手动重启，可以运行:"
-            echo "  - 选项 5) 重启生产模式"
-            echo "  - 选项 4) 重启开发模式"
-            ;;
-    esac
 }
 
 # 显示帮助信息

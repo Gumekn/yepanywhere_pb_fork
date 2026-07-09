@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Install macOS LaunchAgents that start Yep Anywhere once when this user logs in.
-#
-# This intentionally does not set KeepAlive. The services start at login, but
-# manual stops/redeploys remain under the user's control.
+# 安装 macOS LaunchAgent，在当前用户登录期间持续守护 Yep Anywhere。
+# 如需停止托管服务，请运行 scripts/uninstall-launchagents.sh 或 bash yep.sh stop。
 
 set -euo pipefail
 
@@ -14,7 +12,7 @@ SERVER_LABEL="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
 BRIDGE_LABEL="${YEP_LAUNCHD_BRIDGE_LABEL:-com.yueyuan.yepanywhere.codex-bridge}"
 CLAUDE_BRIDGE_LABEL="${YEP_LAUNCHD_CLAUDE_BRIDGE_LABEL:-com.yueyuan.yepanywhere.claude-bridge}"
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
-SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
+SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/}"
 SERVER_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
 BRIDGE_PORT="${YEP_CODEX_BRIDGE_PORT:-${CODEX_BRIDGE_PORT:-4510}}"
 BRIDGE_URL="${YEP_CODEX_BRIDGE_CONTROL_URL:-${CODEX_BRIDGE_CONTROL_URL:-http://127.0.0.1:${BRIDGE_PORT}}}"
@@ -59,7 +57,7 @@ Options:
 
 Environment overrides:
   YEP_DEPLOY_PORT              Main server port (default: 8022)
-  YEP_DEPLOY_BASE_PATH         Main server base path (default: /yep)
+  YEP_DEPLOY_BASE_PATH         Main server base path (default: /)
   ALLOWED_IMAGE_PATHS          Extra local media paths for /api/local-image
                                (default: /tmp,$HOME/Downloads)
   YEP_CODEX_BRIDGE_PORT        Codex bridge port (default: 4510)
@@ -198,6 +196,8 @@ write_header() {
     printf '%s\n' '  <key>Label</key>'
     printf '  <string>%s</string>\n' "$(xml_escape "$label")"
     printf '%s\n' '  <key>RunAtLoad</key>'
+    printf '%s\n' '  <true/>'
+    printf '%s\n' '  <key>KeepAlive</key>'
     printf '%s\n' '  <true/>'
     printf '%s\n' '  <key>WorkingDirectory</key>'
     printf '  <string>%s</string>\n' "$(xml_escape "$REPO_ROOT")"
@@ -385,4 +385,4 @@ if $INSTALL_SERVER; then
     warn "session titles: no LLM API key was stored in the server LaunchAgent."
   fi
 fi
-dim "KeepAlive is intentionally not set; these agents start at login only."
+dim "KeepAlive 已启用；当前用户登录期间，launchd 会在服务退出后自动重启。"
