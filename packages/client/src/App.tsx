@@ -13,7 +13,6 @@ import { useNeedsAttentionBadge } from "./hooks/useNeedsAttentionBadge";
 import { useSyncNotifyInAppSetting } from "./hooks/useNotifyInApp";
 import { useOnboarding } from "./hooks/useOnboarding";
 import { useReloadNotifications } from "./hooks/useReloadNotifications";
-import { I18nProvider } from "./i18n";
 import { initTextSelectionTracking } from "./lib/clipboard";
 import { initClientLogCollection } from "./lib/diagnostics";
 
@@ -49,9 +48,11 @@ function AppContent({ children }: Props) {
     pendingReloads,
     reloadBackend,
     reloadFrontend,
+    reloadRuntime,
     dismiss,
     unsafeToRestart,
     workerActivity,
+    unsafeToReloadRuntime,
   } = useReloadNotifications();
 
   return (
@@ -73,6 +74,15 @@ function AppContent({ children }: Props) {
           onDismiss={() => dismiss("frontend")}
         />
       )}
+      {isManualReloadMode && pendingReloads.runtime && (
+        <ReloadBanner
+          target="runtime"
+          onReload={() => void reloadRuntime(workerActivity.hasActiveWork)}
+          onDismiss={() => dismiss("runtime")}
+          unsafeToRestart={unsafeToReloadRuntime}
+          activeWorkers={workerActivity.activeWorkers}
+        />
+      )}
       {children}
       <FloatingActionButton />
     </>
@@ -87,19 +97,17 @@ export function App({ children }: Props) {
   const { showWizard, isLoading, completeOnboarding } = useOnboarding();
 
   return (
-    <I18nProvider>
-      <ToastProvider>
-        <AuthProvider>
-          <InboxProvider>
-            <SchemaValidationProvider>
-              <AppContent>{children}</AppContent>
-              {!isLoading && showWizard && (
-                <OnboardingWizard onComplete={completeOnboarding} />
-              )}
-            </SchemaValidationProvider>
-          </InboxProvider>
-        </AuthProvider>
-      </ToastProvider>
-    </I18nProvider>
+    <ToastProvider>
+      <AuthProvider>
+        <InboxProvider>
+          <SchemaValidationProvider>
+            <AppContent>{children}</AppContent>
+            {!isLoading && showWizard && (
+              <OnboardingWizard onComplete={completeOnboarding} />
+            )}
+          </SchemaValidationProvider>
+        </InboxProvider>
+      </AuthProvider>
+    </ToastProvider>
   );
 }

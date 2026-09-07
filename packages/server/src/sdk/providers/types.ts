@@ -1,25 +1,20 @@
 // Provider abstraction types for multi-provider support
 import type {
   CodexMcpMode,
+  CodexServiceTier,
   ContextStatusSdkPayload,
+  LlmGatewaySessionConfig,
   ModelInfo,
   PermissionMode,
+  ProviderName,
+  SessionRetryStatus,
   SlashCommand,
 } from "@yep-anywhere/shared";
 import type { MessageQueue } from "../messageQueue.js";
 import type { CanUseTool, SDKMessage, UserMessage } from "../types.js";
+import type { CodexSessionControls } from "./codex-controls.js";
 
-/**
- * Provider names - extensible for future providers.
- */
-export type ProviderName =
-  | "claude"
-  | "claude-ollama"
-  | "codex"
-  | "codex-oss"
-  | "gemini"
-  | "gemini-acp"
-  | "opencode";
+export type { ProviderName } from "@yep-anywhere/shared";
 
 /**
  * Authentication status for a provider.
@@ -41,6 +36,8 @@ export interface AuthStatus {
  * Options for starting a new agent session.
  */
 export interface StartSessionOptions {
+  /** Correlates provider startup logs for one create/resume attempt. */
+  startupId?: string;
   /** Working directory for the session */
   cwd: string;
   /** Initial message to send (optional - session can wait for message) */
@@ -48,16 +45,23 @@ export interface StartSessionOptions {
   /** Session ID to resume (optional) */
   resumeSessionId?: string;
   /**
-   * Rewind/edit: resume only up to (and including) this message UUID, branching
-   * the conversation in place. Used with resumeSessionId. Maps to the SDK
+   * Internal provenance proof that `resumeSessionId` came from a create-only
+   * Codex process which never accepted a user turn. Only that narrow case may
+   * replace an exact `no rollout found` response with a fresh thread.
+   */
+  allowMissingRolloutReplacement?: boolean;
+  /**
+   * Provider-native edit boundary used with resumeSessionId. Claude resumes
+   * through the supplied ancestor UUID; Pi forks before the supplied native
+   * user message ID. Maps to the provider's
    * `resumeSessionAt` option.
    */
   resumeSessionAt?: string;
   /**
-   * Drop this many trailing user turns before continuing the same provider
-   * session. Currently used by Codex app-server `thread/rollback`; other
-   * providers should ignore it unless they expose equivalent same-thread
-   * history control.
+   * Legacy wire name for the number of trailing source turns excluded by a
+   * source-preserving Codex edit fork. The provider creates a new thread with
+   * stable `thread/fork.lastTurnId` (or a fresh thread for the first prompt)
+   * and never mutates the source thread.
    */
   rollbackNumTurns?: number;
   /** Permission mode for tool approvals */
@@ -68,14 +72,35 @@ export interface StartSessionOptions {
   thinking?: import("@yep-anywhere/shared").ThinkingConfig;
   /** Effort level for response quality (undefined = SDK default) */
   effort?: import("@yep-anywhere/shared").EffortLevel;
+  /** Exact provider reasoning effort / gateway model variant. */
+  reasoningEffort?: string;
+  /** Initial Codex service tier; omitted preserves the provider default. */
+  serviceTier?: CodexServiceTier;
   /** Codex MCP profile. Only consumed by the Codex provider. */
   codexMcpMode?: CodexMcpMode;
+  /** Codex model source (Codex `model_provider`). Only consumed by Codex. */
+  codexModelProvider?: string;
+  /** Optional stable account key for per-account Codex event-spine rollout. */
+  codexEventAccountId?: string;
+  /** Optional stable project key recorded on canonical Codex event envelopes. */
+  codexEventProjectId?: string;
+  /** Provider-neutral managed gateway settings. */
+  llmGatewayConfig?: LlmGatewaySessionConfig;
   /** Tool approval callback */
   onToolApproval?: CanUseTool;
-  /** SSH host for remote execution (undefined = local) */
+  /**
+   * Provider retry/backoff notification.
+   *
+   * A provider that retries a failed request internally keeps the turn open,
+   * so nothing in the message stream distinguishes "thinking" from "waiting to
+   * retry after a 429". Providers that expose retry events report them here;
+   * `undefined` clears the state. This is a side channel on purpose: the
+   * message stream is replayed into the transcript, and backoff state is
+   * transient status, not conversation.
+   */
+  onRetryStatus?: (status: SessionRetryStatus | undefined) => void;
+  /** Configured SSH host for Claude remote execution. */
   executor?: string;
-  /** Environment variables to set on remote (for testing: CLAUDE_SESSIONS_DIR) */
-  remoteEnv?: Record<string, string>;
   /** Global instructions to append to system prompt (from server settings) */
   globalInstructions?: string;
 }
@@ -99,9 +124,13 @@ export interface AgentSession {
   sessionId?: string;
   /**
    * Steer an active turn with additional user input.
-   * Returns true when steered immediately, false when caller should enqueue instead.
+   * A structured result can carry the provider-native turn accepted by the
+   * steer operation. Boolean results remain supported for providers without a
+   * stable turn identity.
    */
-  steer?: (message: UserMessage) => Promise<boolean>;
+  steer?: (message: UserMessage) => Promise<AgentSteerResult>;
+  /** Stable, capability-gated Codex app-server controls for this session. */
+  codexControls?: CodexSessionControls;
   /**
    * Change max thinking tokens without restarting the session.
    * Pass null to disable thinking mode.
@@ -130,6 +159,39 @@ export interface AgentSession {
    */
   setModel?: (model?: string) => Promise<void>;
   /**
+   * Change the provider-native permission/session mode without restarting.
+   * Providers that do not expose a native mode API may omit this.
+   */
+  setPermissionMode?: (mode: PermissionMode) => Promise<void>;
+  /**
+   * Trigger a provider-native context compaction for this session
+   * (e.g. ZCode `session/compact`). Providers without a compact capability
+   * omit this.
+   */
+  compact?: () => Promise<void>;
+  /**
+   * Change the provider-native reasoning effort / thought level mid-session
+   * (e.g. ZCode `session/setThoughtLevel`). Providers without a mid-session
+   * level API omit this. Implementations must fail closed when the level is
+   * not supported by the session's current model.
+   */
+  setReasoningEffort?: (effort: string) => Promise<void>;
+  /**
+   * Read the provider-native session goal status (e.g. ZCode
+   * `session/goal {action: "show"}`). The `response` field is the
+   * provider-rendered status text.
+   */
+  getGoal?: () => Promise<import("@yep-anywhere/shared").ProviderGoalState>;
+  /**
+   * Run a provider-native goal lifecycle action. `set`/`replace` require an
+   * objective and may start a model turn immediately (startedTurn) — that is
+   * the intended behavior of an explicit user action.
+   */
+  goalAction?: (
+    action: import("@yep-anywhere/shared").ProviderGoalAction,
+    objective?: string,
+  ) => Promise<import("@yep-anywhere/shared").ProviderGoalState>;
+  /**
    * Live context-window breakdown: how many tokens system prompt, tools,
    * skills, MCP servers, memory files, etc. each consume.
    * Returns null if the provider/SDK does not support it.
@@ -147,6 +209,13 @@ export interface AgentSession {
   } | null>;
 }
 
+export type AgentSteerResult =
+  | boolean
+  | {
+      accepted: boolean;
+      turnId?: string;
+    };
+
 /**
  * Agent provider interface.
  * All providers (Claude, Codex, Gemini, local) implement this interface.
@@ -158,6 +227,8 @@ export interface AgentProvider {
   readonly displayName: string;
   /** Whether this provider supports permission modes (default: true) */
   readonly supportsPermissionMode: boolean;
+  /** Non-empty permission modes with distinct provider behavior. */
+  readonly permissionModes?: readonly PermissionMode[];
   /** Whether this provider supports extended thinking toggle (default: true) */
   readonly supportsThinkingToggle: boolean;
   /** Whether this provider supports slash commands (default: false) */
@@ -191,6 +262,23 @@ export interface AgentProvider {
    * Get available models for this provider.
    * For local providers (Codex with Ollama), this queries the local model list.
    * For cloud providers (Claude, Gemini), this returns a static list.
+   *
+   * Listing endpoints may set `waitForRefresh` to false so providers backed by
+   * a slow remote catalog can return cached or fallback metadata immediately
+   * and refresh it in the background.
    */
-  getAvailableModels(): Promise<ModelInfo[]>;
+  getAvailableModels(options?: {
+    waitForRefresh?: boolean;
+  }): Promise<ModelInfo[]>;
+
+  /**
+   * List MCP server statuses for a workspace, when the provider can report
+   * them. Read-only introspection: providers must never open MCP connections
+   * here. Unsupported providers simply omit this method.
+   */
+  listMcpServers?(
+    cwd: string,
+  ): Promise<
+    Record<string, import("@yep-anywhere/shared").ProviderMcpServerStatus>
+  >;
 }

@@ -1,25 +1,13 @@
-import {
-  Link,
-  useNavigate,
-  useParams,
-  useSearchParams,
-} from "react-router-dom";
-import { FileEditor } from "../components/FileEditor";
+import { Link, useParams, useSearchParams } from "react-router-dom";
+import { FileViewer } from "../components/FileViewer";
 import { useI18n } from "../i18n";
 
 /**
- * FilePage - Standalone page for viewing/editing files.
+ * FilePage - Standalone page for viewing files.
  * Route: /projects/:projectId/file?path=<path>
- *
- * Renders the same FileEditor used by the in-app tab, so the standalone
- * page is identical in behaviour and appearance:
- *   - .md  → Tiptap WYSIWYG (consistent with the tab)
- *   - any other text file → FileViewer preview + textarea edit
- * The editor's own close button navigates back to the project.
  */
 export function FilePage() {
   const { t } = useI18n();
-  const navigate = useNavigate();
   const { projectId } = useParams<{ projectId: string }>();
   const [searchParams] = useSearchParams();
   const filePath = searchParams.get("path");
@@ -54,12 +42,37 @@ export function FilePage() {
 
   return (
     <div className="file-page">
-      <FileEditor
-        projectId={projectId}
-        filePath={filePath}
-        onClose={() => navigate(`/projects/${projectId}`)}
-        onDirtyChange={() => {}}
-      />
+      <div className="file-page-nav">
+        <Link
+          to={`/projects/${projectId}`}
+          className="file-page-back-link"
+          title={t("fileBackToProject" as never)}
+        >
+          <BackIcon />
+          <span>{t("fileBackToProject" as never)}</span>
+        </Link>
+      </div>
+      <div className="file-page-content">
+        <FileViewer projectId={projectId} filePath={filePath} standalone />
+      </div>
     </div>
+  );
+}
+
+function BackIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M10 12L6 8l4-4" />
+    </svg>
   );
 }

@@ -3,7 +3,7 @@
  *
  * This class encapsulates all the data needed to render session UI components:
  * - Title handling (auto, AI-generated, custom, display priority)
- * - Metadata (starred, archived)
+ * - Metadata (pinned via the legacy `isStarred` field, archived)
  * - Notification state (unread, pending input)
  * - Process state (running, idle, waiting)
  * - Context usage
@@ -20,6 +20,10 @@ import type {
   PendingInputType,
   SessionOwnership,
 } from "../app-types.js";
+import type {
+  ContextCompactEvent,
+  ContextCumulativeUsage,
+} from "../context-status.js";
 import type { UrlProjectId } from "../projectId.js";
 import { DEFAULT_PROVIDER, type ProviderName } from "../types.js";
 
@@ -48,7 +52,7 @@ export class SessionView {
     readonly ownership: SessionOwnership,
     /** Whether session is archived (hidden from default list) */
     readonly isArchived: boolean,
-    /** Whether session is starred/favorited */
+    /** Whether the session is pinned (legacy field name) */
     readonly isStarred: boolean,
     /** Type of pending input if session needs user action */
     readonly pendingInputType: PendingInputType | undefined,
@@ -64,6 +68,14 @@ export class SessionView {
     readonly provider: ProviderName,
     /** AI-generated title (overrides autoTitle, but not customTitle) */
     readonly aiTitle: string | undefined = undefined,
+    /** Cumulative token spend across the whole session */
+    readonly cumulativeUsage: ContextCumulativeUsage | undefined = undefined,
+    /** Number of context compactions recorded in the active session history */
+    readonly compactCount: number | undefined = undefined,
+    /** Best-effort details for each recorded context compaction */
+    readonly compactEvents: ContextCompactEvent[] | undefined = undefined,
+    /** Source session when this session is a source-preserving edit fork. */
+    readonly forkParentSessionId: string | undefined = undefined,
   ) {}
 
   // ===========================================================================
@@ -181,6 +193,10 @@ export class SessionView {
       summary.contextUsage,
       summary.provider,
       summary.aiTitle,
+      summary.cumulativeUsage,
+      summary.compactCount,
+      summary.compactEvents,
+      summary.forkParentSessionId,
     );
   }
 
@@ -206,6 +222,10 @@ export class SessionView {
     lastSeenAt?: string;
     hasUnread?: boolean;
     contextUsage?: ContextUsage;
+    cumulativeUsage?: ContextCumulativeUsage;
+    compactCount?: number;
+    compactEvents?: ContextCompactEvent[];
+    forkParentSessionId?: string;
     provider?: ProviderName;
   }): SessionView {
     const now = new Date().toISOString();
@@ -228,6 +248,10 @@ export class SessionView {
       data.contextUsage,
       data.provider ?? DEFAULT_PROVIDER,
       data.aiTitle,
+      data.cumulativeUsage,
+      data.compactCount,
+      data.compactEvents,
+      data.forkParentSessionId,
     );
   }
 }

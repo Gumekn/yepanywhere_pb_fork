@@ -60,6 +60,9 @@ describe("ProjectScanner missing projectsDir", () => {
       codexSessionsDir: codexDir,
       enableCodex: true,
       enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
     });
 
     const projects = await scanner.listProjects();
@@ -95,6 +98,9 @@ describe("ProjectScanner cache", () => {
       projectsDir,
       enableCodex: false,
       enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
       cacheTtlMs: 60000,
     });
 
@@ -116,35 +122,6 @@ describe("ProjectScanner cache", () => {
     expect(refreshed).toHaveLength(2);
   });
 
-  it("命中缓存时重新校验项目路径并使失效快照过期", async () => {
-    const projectsDir = join(tmpdir(), `project-scanner-${randomUUID()}`);
-    const projectPath = join(tmpdir(), `project-path-${randomUUID()}`);
-    tempDirs.push(projectsDir, projectPath);
-    await mkdir(projectPath, { recursive: true });
-    await createClaudeProject(
-      projectsDir,
-      "localhost",
-      projectPath,
-      "sess-stale",
-    );
-
-    const scanner = new ProjectScanner({
-      projectsDir,
-      enableCodex: false,
-      enableGemini: false,
-      cacheTtlMs: 60000,
-    });
-    const projectId = encodeProjectId(projectPath);
-    expect(await scanner.getOrCreateProject(projectId)).not.toBeNull();
-
-    await rm(projectPath, { recursive: true, force: true });
-    const stale = await scanner.getOrCreateProject(projectId);
-    expect(stale?.path).toBe(projectPath);
-    expect((scanner as unknown as { cacheDirty: boolean }).cacheDirty).toBe(
-      true,
-    );
-  });
-
   it("coalesces concurrent scans into one in-flight refresh", async () => {
     const projectsDir = join(tmpdir(), `project-scanner-${randomUUID()}`);
     tempDirs.push(projectsDir);
@@ -160,14 +137,17 @@ describe("ProjectScanner cache", () => {
       projectsDir,
       enableCodex: false,
       enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
       cacheTtlMs: 0,
     });
 
     const spy = vi.spyOn(
       scanner as unknown as {
-        getProjectDirInfos: (projectDirPath: string) => Promise<unknown>;
+        getProjectDirInfo: (projectDirPath: string) => Promise<unknown>;
       },
-      "getProjectDirInfos",
+      "getProjectDirInfo",
     );
 
     await Promise.all([
@@ -195,6 +175,9 @@ describe("ProjectScanner cache", () => {
       projectsDir,
       enableCodex: false,
       enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
       cacheTtlMs: 60000,
       eventBus,
     });
@@ -255,6 +238,9 @@ describe("ProjectScanner cache", () => {
       projectsDir,
       enableCodex: true,
       enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
       cacheTtlMs: 60000,
     });
 
@@ -308,6 +294,9 @@ describe("ProjectScanner cache", () => {
       codexScanner,
       enableCodex: true,
       enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
       cacheTtlMs: 60000,
       eventBus,
     });
@@ -387,6 +376,9 @@ describe("ProjectScanner stale-cwd recovery", () => {
       projectsDir,
       enableCodex: false,
       enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
     });
     const projects = await scanner.listProjects();
 
@@ -396,58 +388,149 @@ describe("ProjectScanner stale-cwd recovery", () => {
       id: encodeProjectId(newPath),
     });
   });
+});
 
-  it("splits one physical Claude session directory by jsonl cwd", async () => {
-    const projectsDir = join(tmpdir(), `scanner-multi-cwd-${randomUUID()}`);
-    tempDirs.push(projectsDir);
+describe("ProjectScanner shared Claude storage", () => {
+  const tempDirs: string[] = [];
 
-    const projectOne = "/Users/test/code/project-one";
-    const projectTwo = "/Users/test/code/project-two";
-    const sessionDir = join(projectsDir, "localhost", "-shared-session-dir");
+  afterEach(async () => {
+    await Promise.all(
+      tempDirs
+        .splice(0)
+        .map((dir) => rm(dir, { recursive: true, force: true })),
+    );
+  });
+
+  it("maps a shared JSONL remote cwd to the local project without rewriting it", async () => {
+    const localRoot = join(tmpdir(), `scanner-shared-${randomUUID()}`);
+    const projectsDir = join(localRoot, "claude", "projects");
+    const fallbackDir = join(localRoot, "local-replica");
+    const localProject = join(localRoot, "projects", "demo");
+    const remoteProject = "/mnt/utm/projects/demo";
+    const sessionDir = join(projectsDir, encodePath(remoteProject));
+    const sessionFile = join(sessionDir, "shared-session.jsonl");
+    tempDirs.push(localRoot);
     await mkdir(sessionDir, { recursive: true });
-
-    await writeFile(
-      join(sessionDir, "one-a.jsonl"),
-      `{"type":"user","cwd":"${projectOne}","message":{"content":"one a"}}\n`,
-    );
-    await writeFile(
-      join(sessionDir, "one-b.jsonl"),
-      `{"type":"user","cwd":"${projectOne}","message":{"content":"one b"}}\n`,
-    );
-    await writeFile(
-      join(sessionDir, "two.jsonl"),
-      `{"type":"user","cwd":"${projectTwo}","message":{"content":"two"}}\n`,
-    );
+    await mkdir(localProject, { recursive: true });
+    const original = `${JSON.stringify({
+      type: "user",
+      cwd: remoteProject,
+      message: { content: "keep /mnt/utm in the transcript" },
+    })}\n`;
+    await writeFile(sessionFile, original);
 
     const scanner = new ProjectScanner({
-      projectsDir,
+      projectsDir: fallbackDir,
+      remoteExecutors: [
+        {
+          host: "utm",
+          localRoot,
+          remoteRoot: "/mnt/utm",
+          sessionStorage: {
+            mode: "shared",
+            localProjectsDir: projectsDir,
+            remoteProjectsDir: "/mnt/utm/claude/projects",
+          },
+        },
+      ],
       enableCodex: false,
       enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
     });
 
-    const projects = await scanner.listProjects();
+    await expect(scanner.listProjects()).resolves.toEqual([
+      expect.objectContaining({
+        id: encodeProjectId(localProject),
+        path: localProject,
+        sessionDir,
+        sessionCount: 1,
+        isRemoteProject: true,
+      }),
+    ]);
+    await expect(
+      import("node:fs/promises").then(({ readFile }) =>
+        readFile(sessionFile, "utf8"),
+      ),
+    ).resolves.toBe(original);
+  });
 
-    expect(projects).toHaveLength(2);
-    expect(projects).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          id: encodeProjectId(projectOne),
-          path: projectOne,
-          sessionCount: 2,
-          sessionDir,
-        }),
-        expect.objectContaining({
-          id: encodeProjectId(projectTwo),
-          path: projectTwo,
-          sessionCount: 1,
-          sessionDir,
-        }),
-      ]),
-    );
+  it("uses the remote cwd encoding for a new virtual shared project", async () => {
+    const localRoot = join(tmpdir(), `scanner-shared-${randomUUID()}`);
+    const projectsDir = join(localRoot, "claude", "projects");
+    const localProject = join(localRoot, "projects", "new demo");
+    tempDirs.push(localRoot);
+    await mkdir(projectsDir, { recursive: true });
+    await mkdir(localProject, { recursive: true });
 
-    const projectForSession = await scanner.getProjectBySessionFile(
-      join(sessionDir, "two.jsonl"),
-    );
-    expect(projectForSession?.id).toBe(encodeProjectId(projectTwo));
+    const scanner = new ProjectScanner({
+      projectsDir: join(localRoot, "local-replica"),
+      remoteExecutors: [
+        {
+          host: "utm",
+          localRoot,
+          remoteRoot: "/mnt/utm",
+          sessionStorage: {
+            mode: "shared",
+            localProjectsDir: projectsDir,
+            remoteProjectsDir: "/mnt/utm/claude/projects",
+          },
+        },
+      ],
+      enableCodex: false,
+      enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
+    });
+
+    await expect(
+      scanner.getOrCreateProject(encodeProjectId(localProject), "claude"),
+    ).resolves.toMatchObject({
+      path: localProject,
+      sessionDir: join(projectsDir, encodePath("/mnt/utm/projects/new demo")),
+      isRemoteProject: true,
+    });
+  });
+
+  it("marks only same-name copies inside the configured remote projects root", async () => {
+    const localRoot = join(tmpdir(), `scanner-shared-${randomUUID()}`);
+    const remoteCopy = join(localRoot, "projects", "yepanywhere");
+    const localCopy = join(localRoot, "work", "yepanywhere");
+    tempDirs.push(localRoot);
+    await Promise.all([
+      mkdir(remoteCopy, { recursive: true }),
+      mkdir(localCopy, { recursive: true }),
+    ]);
+
+    const scanner = new ProjectScanner({
+      projectsDir: join(localRoot, "claude", "projects"),
+      remoteExecutors: [
+        {
+          host: "utm",
+          localRoot,
+          remoteRoot: "/mnt/utm",
+        },
+      ],
+      enableCodex: false,
+      enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
+    });
+
+    await expect(
+      scanner.getOrCreateProject(encodeProjectId(remoteCopy), "claude"),
+    ).resolves.toMatchObject({
+      name: "yepanywhere",
+      isRemoteProject: true,
+    });
+    await expect(
+      scanner.getOrCreateProject(encodeProjectId(localCopy), "claude"),
+    ).resolves.toMatchObject({
+      name: "yepanywhere",
+      isRemoteProject: false,
+    });
   });
 });

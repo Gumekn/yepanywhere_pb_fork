@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type {
   ReportDocumentResponse,
+  ReportImageUploadResponse,
   ReportsListResponse,
 } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -91,6 +92,44 @@ describe("Reports routes", () => {
       kind: "markdown",
       title: "Model Speed Report",
     });
+  });
+
+  it("anchors the default reports directory to the deployed repository", async () => {
+    const repoRoot = path.join(tempDir, "workspace", "yepanywhere");
+    const reportsRoot = path.join(tempDir, "workspace", "research_tasks");
+    await mkdir(repoRoot, { recursive: true });
+    await mkdir(reportsRoot, { recursive: true });
+    await writeFile(
+      path.join(reportsRoot, "deployment-report.md"),
+      "# Deployment Report",
+    );
+
+    const previousEnv = {
+      YEP_DEPLOY_REPO_ROOT: process.env.YEP_DEPLOY_REPO_ROOT,
+      YEP_REPORTS_DIR: process.env.YEP_REPORTS_DIR,
+      RESEARCH_TASKS_DIR: process.env.RESEARCH_TASKS_DIR,
+    };
+    process.env.YEP_DEPLOY_REPO_ROOT = repoRoot;
+    Reflect.deleteProperty(process.env, "YEP_REPORTS_DIR");
+    Reflect.deleteProperty(process.env, "RESEARCH_TASKS_DIR");
+
+    try {
+      const response = await createReportsRoutes().request("/");
+      expect(response.status).toBe(200);
+      const json = (await response.json()) as ReportsListResponse;
+      expect(json.rootPath).toBe(reportsRoot);
+      expect(json.documents.map((document) => document.path)).toEqual([
+        "deployment-report.md",
+      ]);
+    } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) {
+          Reflect.deleteProperty(process.env, key);
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
   });
 
   it("keeps prompt and intermediate markdown artifacts out of the list", async () => {
@@ -296,6 +335,96 @@ describe("Reports routes", () => {
     expect(documentJson.content).toBe("plain uploaded report");
   });
 
+  it("renders and securely serves report-relative images", async () => {
+    const researchDir = path.join(tempDir, "research");
+    const assetsDir = path.join(researchDir, "assets");
+    await mkdir(assetsDir, { recursive: true });
+    await writeFile(
+      path.join(researchDir, "image-report.md"),
+      "# Image report\n\n![Benchmark chart](assets/chart.png)",
+    );
+    await writeFile(path.join(assetsDir, "chart.png"), Buffer.from([1, 2, 3]));
+    const routes = createReportsRoutes({
+      reportsDir: tempDir,
+      basePath: "/yep",
+    });
+
+    const documentResponse = await routes.request(
+      "/document?path=research%2Fimage-report.md",
+    );
+    expect(documentResponse.status).toBe(200);
+    const documentJson =
+      (await documentResponse.json()) as ReportDocumentResponse;
+    expect(documentJson.renderedHtml).toContain(
+      'src="/yep/api/reports/image?path=research%2Fimage-report.md&amp;image=assets%2Fchart.png"',
+    );
+    expect(documentJson.renderedHtml).toContain('alt="Benchmark chart"');
+
+    const imageResponse = await routes.request(
+      "/image?path=research%2Fimage-report.md&image=assets%2Fchart.png",
+    );
+    expect(imageResponse.status).toBe(200);
+    expect(imageResponse.headers.get("content-type")).toBe("image/png");
+    expect(new Uint8Array(await imageResponse.arrayBuffer())).toEqual(
+      new Uint8Array([1, 2, 3]),
+    );
+
+    const traversalResponse = await routes.request(
+      "/image?path=research%2Fimage-report.md&image=..%2F..%2Foutside.png",
+    );
+    expect(traversalResponse.status).toBe(404);
+  });
+
+  it("uploads report images into a report-specific assets directory", async () => {
+    const researchDir = path.join(tempDir, "research");
+    await mkdir(researchDir, { recursive: true });
+    const reportPath = path.join(researchDir, "model-assessment.md");
+    await writeFile(reportPath, "# Model assessment");
+    const routes = createReportsRoutes({ reportsDir: tempDir });
+    const form = new FormData();
+    form.set("path", "research/model-assessment.md");
+    form.set(
+      "file",
+      new File([new Uint8Array([4, 5, 6])], "benchmark #50%.png", {
+        type: "image/png",
+      }),
+    );
+
+    const uploadResponse = await routes.request("/images/upload", {
+      method: "POST",
+      body: form,
+    });
+    expect(uploadResponse.status).toBe(201);
+    const uploaded = (await uploadResponse.json()) as ReportImageUploadResponse;
+    expect(uploaded.path).toMatch(
+      /^assets\/model-assessment\/[0-9a-f-]{36}_benchmark #50%\.png$/,
+    );
+    expect(uploaded.markdown).toMatch(
+      /^!\[benchmark #50%\]\(assets\/model-assessment\/[0-9a-f-]{36}_benchmark%20%2350%25\.png\)$/,
+    );
+    expect(await readFile(path.join(researchDir, uploaded.path))).toEqual(
+      Buffer.from([4, 5, 6]),
+    );
+
+    const imageResponse = await routes.request(
+      `/image?path=${encodeURIComponent(
+        "research/model-assessment.md",
+      )}&image=${encodeURIComponent(uploaded.path)}`,
+    );
+    expect(imageResponse.status).toBe(200);
+
+    await writeFile(reportPath, `# Model assessment\n\n${uploaded.markdown}`);
+    const documentResponse = await routes.request(
+      "/document?path=research%2Fmodel-assessment.md",
+    );
+    expect(documentResponse.status).toBe(200);
+    const documentJson =
+      (await documentResponse.json()) as ReportDocumentResponse;
+    expect(documentJson.renderedHtml).toContain(
+      `src="${uploaded.url.replaceAll("&", "&amp;")}"`,
+    );
+  });
+
   it("rejects unsupported report upload extensions", async () => {
     const routes = createReportsRoutes({ reportsDir: tempDir });
     const form = new FormData();
@@ -335,6 +464,71 @@ describe("Reports routes", () => {
     await expect(response.json()).resolves.toEqual({
       error: "File size exceeds maximum allowed size of 1MB",
     });
+  });
+
+  it("creates, loads, and edits persisted inline comments", async () => {
+    const reportPath = path.join(tempDir, "report.md");
+    const dataDir = path.join(tempDir, "app-data");
+    const originalContent = "# Report\n\nAlpha beta gamma";
+    await writeFile(reportPath, originalContent);
+    const routes = createReportsRoutes({ reportsDir: tempDir, dataDir });
+
+    const createResponse = await routes.request("/comments", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        path: "report.md",
+        anchor: {
+          exact: "beta",
+          prefix: "Alpha ",
+          suffix: " gamma",
+          start: 12,
+          end: 16,
+        },
+        body: "Check this claim",
+      }),
+    });
+
+    expect(createResponse.status).toBe(201);
+    const created = (await createResponse.json()) as {
+      comment: { id: string; body: string };
+    };
+    expect(created.comment.body).toBe("Check this claim");
+
+    const documentResponse = await routes.request("/document?path=report.md");
+    const documentJson =
+      (await documentResponse.json()) as ReportDocumentResponse;
+    expect(documentJson.comments).toHaveLength(1);
+    expect(documentJson.comments[0]).toMatchObject({
+      id: created.comment.id,
+      reportPath: "report.md",
+      body: "Check this claim",
+    });
+
+    const updateResponse = await routes.request(
+      `/comments/${created.comment.id}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          path: "report.md",
+          body: "Updated review note",
+        }),
+      },
+    );
+    expect(updateResponse.status).toBe(200);
+
+    const reloadedRoutes = createReportsRoutes({
+      reportsDir: tempDir,
+      dataDir,
+    });
+    const reloadedResponse = await reloadedRoutes.request(
+      "/document?path=report.md",
+    );
+    const reloadedJson =
+      (await reloadedResponse.json()) as ReportDocumentResponse;
+    expect(reloadedJson.comments[0]?.body).toBe("Updated review note");
+    expect(await readFile(reportPath, "utf-8")).toBe(originalContent);
   });
 
   it("rejects absolute document paths", async () => {

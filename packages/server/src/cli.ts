@@ -9,13 +9,12 @@
  *   yepanywhere --version         # Show version
  *
  * Environment variables:
- *   NODE_ENV                      # Environment mode (production/development)
- *   PORT                          # Server port (default: 8022 in production, 3400 in dev)
+ *   PORT                          # Server port (default: 3400)
  *   YEP_ANYWHERE_DATA_DIR         # Data directory override
  *   YEP_ANYWHERE_PROFILE          # Profile name (creates ~/.yep-anywhere-{profile}/)
  *   AUTH_ENABLED                  # Enable cookie auth (default: false)
  *   LOG_LEVEL                     # Log level: fatal, error, warn, info, debug, trace
- *   ... (see CLAUDE.md for full list)
+ *   ... (see AGENTS.md for full list)
  */
 
 import { execSync } from "node:child_process";
@@ -60,7 +59,7 @@ function checkClaudeCli(): void {
   } catch {
     console.warn("Warning: Claude CLI not found.");
     console.warn(
-      "Claude Code is the primary supported agent. Install it to use Claude sessions:",
+      "Claude provider sessions require the Claude CLI. Install it only if you plan to use Claude sessions:",
     );
     console.warn(
       os.platform() === "win32"
@@ -73,7 +72,7 @@ function checkClaudeCli(): void {
 
 function showHelp(): void {
   console.log(`
-yepanywhere - A mobile-first supervisor for Claude Code agents
+yepanywhere - A mobile-first supervisor for local coding agents
 
 USAGE:
   yepanywhere [OPTIONS]
@@ -82,28 +81,28 @@ USAGE:
 OPTIONS:
   --help, -h            Show this help message
   --version, -v         Show version number
-  --port <number>       Server port (default: 8022 for bundle, 3400 for dev)
+  --port <number>       Server port (default: 3400)
   --host <address>      Host/interface to bind to (default: localhost)
                         Use 0.0.0.0 to bind all interfaces
   --https-self-signed   Enable HTTPS using a self-signed certificate
                         stored in the app data directory
   --open                Open the dashboard in your default browser on startup
+  --auth-disable        Disable authentication (bypass auth even if enabled in settings)
+                        Emergency recovery mode; re-enable auth after fixing config
   --codex-bridge-only   Start only the Codex CLI bridge sidecar
-  --claude-bridge-only  Start only the Claude terminal bridge sidecar
-  claude                Start or attach to a Yep-managed Claude session
+  claude                Start or attach to a Yep-managed Claude provider session
 
 SETUP OPTIONS (for headless installation):
-  --setup-admin-password
-                        Set or reset the global administrator password interactively.
-                        Exits after setup.
+  --setup-auth <password>
+                        Set up local authentication with the given password
+                        (min 6 characters). Exits after setup.
 
 ENVIRONMENT VARIABLES:
-  NODE_ENV                      Environment mode: production or development
-                                (default: production for bundle, development for pnpm dev)
-  PORT                          Server port (default: 8022 in production, 3400 in dev)
+  PORT                          Server port (default: 3400)
   HOST                          Host/interface to bind (default: localhost)
   YEP_ANYWHERE_DATA_DIR         Data directory override
   YEP_ANYWHERE_PROFILE          Profile name (creates ~/.yep-anywhere-{profile}/)
+  AUTH_DISABLED                 Disable auth (bypass even if enabled in settings)
   HTTPS_SELF_SIGNED             Enable HTTPS with a self-signed certificate
   LOG_LEVEL                     Log level: fatal, error, warn, info, debug, trace
   LOG_PRETTY                    Pretty-print console logs (default: true)
@@ -120,8 +119,8 @@ ENVIRONMENT VARIABLES:
                                 Project scan cache TTL in ms (default: 5000, 0 = rescan every request)
 
 EXAMPLES:
-  # Start with defaults (port 8022 for bundle, localhost only)
-  NODE_ENV=production yepanywhere
+  # Start with defaults (port 3400, localhost only)
+  yepanywhere
 
   # Start on custom port
   yepanywhere --port 8000
@@ -138,17 +137,17 @@ EXAMPLES:
   # Use development profile (separate data directory)
   YEP_ANYWHERE_PROFILE=dev yepanywhere
 
-  # Set or reset the global administrator password
-  yepanywhere --setup-admin-password
+  # Reset local auth password (headless recovery)
+  yepanywhere --setup-auth "mypassword123"
 
-  # Start a Yep-managed Claude session from the terminal
+  # Emergency auth bypass (temporary)
+  yepanywhere --auth-disable
+
+  # Start a Yep-managed Claude provider session from the terminal
   yepanywhere claude "fix the failing tests"
 
-  # Start only the local Claude terminal bridge sidecar
-  yepanywhere --claude-bridge-only
-
 DOCUMENTATION:
-  For full documentation, see: https://github.com/kzahel/yepanywhere
+  For full documentation, see: https://github.com/hustc5622/yepanywhere
 
 DATA DIRECTORY:
   Default: ~/.yep-anywhere/
@@ -156,7 +155,7 @@ DATA DIRECTORY:
 
 REQUIREMENTS:
   - Node.js >= 20
-  - Claude CLI installed (curl -fsSL https://claude.ai/install.sh | bash)
+  - Provider CLI installed for the agent you want to supervise
 `);
 }
 
@@ -247,6 +246,13 @@ if (claudeWrapperInvocation) {
     args.splice(httpsSelfSignedIndex, 1);
   }
 
+  // Parse --auth-disable flag
+  const authDisableIndex = args.indexOf("--auth-disable");
+  if (authDisableIndex !== -1) {
+    process.env.AUTH_DISABLED = "true";
+    args.splice(authDisableIndex, 1);
+  }
+
   // Parse --codex-bridge-only flag
   const codexBridgeOnlyIndex = args.indexOf("--codex-bridge-only");
   const codexBridgeOnly = codexBridgeOnlyIndex !== -1;
@@ -254,37 +260,17 @@ if (claudeWrapperInvocation) {
     args.splice(codexBridgeOnlyIndex, 1);
   }
 
-  // Parse --claude-bridge-only flag
-  const claudeBridgeOnlyIndex = args.indexOf("--claude-bridge-only");
-  const claudeBridgeOnly = claudeBridgeOnlyIndex !== -1;
-  if (claudeBridgeOnlyIndex !== -1) {
-    args.splice(claudeBridgeOnlyIndex, 1);
-  }
-
-  // Parse the administrator setup flags. The stdin variant is reserved for
-  // the Windows PowerShell wrapper, which performs the hidden input itself.
-  const setupAdminPasswordIndex = args.indexOf("--setup-admin-password");
-  const setupAdminPasswordStdinIndex = args.indexOf(
-    "--setup-admin-password-stdin",
-  );
-  const setupAdminPassword =
-    setupAdminPasswordIndex !== -1 || setupAdminPasswordStdinIndex !== -1;
-  const setupAdminPasswordFromStdin = setupAdminPasswordStdinIndex !== -1;
-  if (setupAdminPasswordIndex !== -1) {
-    args.splice(setupAdminPasswordIndex, 1);
-  }
-  if (setupAdminPasswordStdinIndex !== -1) {
-    args.splice(args.indexOf("--setup-admin-password-stdin"), 1);
-  }
-  if (
-    setupAdminPassword &&
-    (args.length > 0 ||
-      (setupAdminPasswordIndex !== -1 && setupAdminPasswordFromStdin))
-  ) {
-    console.error(
-      "Error: Unknown arguments after --setup-admin-password. Password values are not accepted on the command line.",
-    );
-    process.exit(1);
+  // Parse --setup-auth flag
+  const setupAuthIndex = args.indexOf("--setup-auth");
+  let setupAuthPassword: string | undefined;
+  if (setupAuthIndex !== -1) {
+    const passwordValue = args[setupAuthIndex + 1];
+    if (!passwordValue || passwordValue.startsWith("-")) {
+      console.error("Error: --setup-auth requires a password value");
+      process.exit(1);
+    }
+    setupAuthPassword = passwordValue;
+    args.splice(setupAuthIndex, 2);
   }
 
   // If there are unknown arguments, show error and help
@@ -304,12 +290,10 @@ if (claudeWrapperInvocation) {
   }
 
   // Handle setup commands (exit after completion)
-  if (setupAdminPassword) {
-    runSetupAdminPassword(setupAdminPasswordFromStdin);
+  if (setupAuthPassword) {
+    runSetup(setupAuthPassword);
   } else if (codexBridgeOnly) {
     runCodexBridgeOnly();
-  } else if (claudeBridgeOnly) {
-    runClaudeBridgeOnly();
   } else {
     // Only check for Claude CLI when starting the server (not for setup commands)
     checkClaudeCli();
@@ -318,20 +302,13 @@ if (claudeWrapperInvocation) {
   }
 }
 
-async function runSetupAdminPassword(fromStdin: boolean): Promise<never> {
+async function runSetup(authPassword: string | undefined): Promise<never> {
   try {
-    const [
-      { setupAdminPassword },
-      { createBase64StdinPasswordPrompt, createTerminalPasswordPrompt },
-    ] = await Promise.all([
-      import("./cli-setup.js"),
-      import("./cli-password-prompt.js"),
-    ]);
-    await setupAdminPassword({
-      prompt: fromStdin
-        ? createBase64StdinPasswordPrompt()
-        : createTerminalPasswordPrompt(),
-    });
+    const { setupAuth } = await import("./cli-setup.js");
+
+    if (authPassword) {
+      await setupAuth({ password: authPassword });
+    }
 
     process.exit(0);
   } catch (error) {
@@ -358,15 +335,6 @@ function runCodexBridgeOnly(): void {
     .then(({ runCodexBridgeOnly }) => runCodexBridgeOnly())
     .catch((error) => {
       console.error("Failed to start Codex bridge:", error);
-      process.exit(1);
-    });
-}
-
-function runClaudeBridgeOnly(): void {
-  import("./claude-bridge/standalone.js")
-    .then(({ runClaudeBridgeOnly }) => runClaudeBridgeOnly())
-    .catch((error) => {
-      console.error("Failed to start Claude bridge:", error);
       process.exit(1);
     });
 }

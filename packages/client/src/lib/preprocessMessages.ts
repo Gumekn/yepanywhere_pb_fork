@@ -1,9 +1,12 @@
 import {
+  CODEX_THREAD_ITEM_TYPES,
+  type KimiGoalSnapshot,
   type MarkdownAugment,
-  isClaudeInternalUserPromptEntry,
+  parseKimiReadMediaOutput,
 } from "@yep-anywhere/shared";
 import type { ContentBlock, Message } from "../types";
 import type {
+  CodexNativeItem,
   RenderItem,
   SessionSetupItem,
   SystemItem,
@@ -11,9 +14,26 @@ import type {
   ToolResultData,
   UserPromptItem,
 } from "../types/renderItems";
+import { getCodexExecResultOverview } from "./codexExec";
 import { getMessageId } from "./mergeMessages";
 
 const CODEX_TURN_ABORTED_DISPLAY_TEXT = "Conversation stopped by user";
+
+const CODEX_KNOWN_THREAD_ITEM_TYPES = new Set<string>(CODEX_THREAD_ITEM_TYPES);
+const CODEX_NATIVE_ITEM_TYPES_WITH_DEDICATED_RENDERERS = new Set([
+  "threadGoal",
+  "plan",
+  "turnPlan",
+  "subAgentActivity",
+  "collabAgentToolCall",
+]);
+
+function shouldKeepCodexNativeItemType(type: string): boolean {
+  return (
+    CODEX_NATIVE_ITEM_TYPES_WITH_DEDICATED_RENDERERS.has(type) ||
+    !CODEX_KNOWN_THREAD_ITEM_TYPES.has(type)
+  );
+}
 
 interface TaskNotification {
   taskId: string;
@@ -89,7 +109,8 @@ export function preprocessMessages(
   }
 
   const enrichedItems = enrichWriteStdinWithCommand(items);
-  return collapsePlanProgressItems(collapseSessionSetupRuns(enrichedItems));
+  const compactWaits = collapseCodexWaitPolls(enrichedItems);
+  return collapsePlanProgressItems(collapseSessionSetupRuns(compactWaits));
 }
 
 const SESSION_SETUP_PREFIXES = [
@@ -290,11 +311,56 @@ function collapseSessionSetupRuns(items: RenderItem[]): RenderItem[] {
 
 function isPlanProgressToolName(toolName: string): boolean {
   const normalized = toolName.trim().toLowerCase().replace(/[_-]/g, "");
-  return normalized === "updateplan" || normalized === "todowrite";
+  return (
+    normalized === "updateplan" ||
+    normalized === "todowrite" ||
+    normalized === "todolist"
+  );
 }
 
 export function isPlanProgressItem(item: RenderItem): item is ToolCallItem {
-  return item.type === "tool_call" && isPlanProgressToolName(item.toolName);
+  if (item.type !== "tool_call" || !isPlanProgressToolName(item.toolName)) {
+    return false;
+  }
+
+  const normalized = item.toolName.trim().toLowerCase().replace(/[_-]/g, "");
+  if (normalized === "todolist") {
+    // Kimi uses the same tool for reads and writes. Only writes replace the
+    // plan snapshot; a query without `todos` remains a normal tool row.
+    return isRecord(item.toolInput) && Array.isArray(item.toolInput.todos);
+  }
+  return true;
+}
+
+export function isNativePlanProgressItem(
+  item: RenderItem,
+): item is CodexNativeItem {
+  return (
+    item.type === "codex_native_item" && item.threadItem.type === "turnPlan"
+  );
+}
+
+/**
+ * The canonical Codex overlay carries the current thread goal as a native
+ * item, but it is thread state rather than a chronological transcript row.
+ * Keep it available to the Session Inspector without pinning it to the latest
+ * message position.
+ */
+export function isNativeGoalStateItem(
+  item: RenderItem,
+): item is CodexNativeItem {
+  return (
+    item.type === "codex_native_item" && item.threadItem.type === "threadGoal"
+  );
+}
+
+export function isPlanTimelineItem(item: RenderItem): boolean {
+  return isPlanProgressItem(item) || isNativePlanProgressItem(item);
+}
+
+/** Render items represented by persistent state cards in Session Inspector. */
+export function isSessionInspectorOnlyItem(item: RenderItem): boolean {
+  return isPlanTimelineItem(item) || isNativeGoalStateItem(item);
 }
 
 function uniqueSourceMessages(messages: Message[]): Message[] {
@@ -395,6 +461,112 @@ export function collapsePlanProgressItems(items: RenderItem[]): RenderItem[] {
   return collapsed;
 }
 
+function isCodexWaitItem(item: RenderItem): item is ToolCallItem {
+  if (item.type !== "tool_call") return false;
+  const normalized = item.toolName.trim().toLowerCase().replace(/[_-]/g, "");
+  return normalized === "wait" || normalized === "codexwait";
+}
+
+function getWaitInputRecord(item: ToolCallItem): Record<string, unknown> {
+  return isRecord(item.toolInput) ? item.toolInput : {};
+}
+
+function getWaitCellId(item: ToolCallItem): string {
+  const input = getWaitInputRecord(item);
+  const cellId = input.cell_id ?? input.cellId;
+  return cellId === undefined ? "" : String(cellId);
+}
+
+function isSilentCodexWait(item: ToolCallItem): boolean {
+  if (item.status === "error") return false;
+  if (!item.toolResult) return true;
+  const overview = getCodexExecResultOverview(
+    item.toolResult.structured ?? item.toolResult.content,
+    item.toolResult.isError,
+  );
+  return (
+    !overview.output &&
+    (overview.status === "running" || overview.status === "terminated")
+  );
+}
+
+function collapseCodexWaitRun(run: ToolCallItem[]): ToolCallItem[] {
+  if (run.length < 2) return run;
+  const first = run[0];
+  const last = run[run.length - 1];
+  if (!first || !last) return run;
+
+  let totalWallTimeSeconds = 0;
+  let hasWallTime = false;
+  for (const item of run) {
+    if (!item.toolResult) continue;
+    const overview = getCodexExecResultOverview(
+      item.toolResult.structured ?? item.toolResult.content,
+      item.toolResult.isError,
+    );
+    if (overview.wallTimeSeconds !== undefined) {
+      totalWallTimeSeconds += overview.wallTimeSeconds;
+      hasWallTime = true;
+    }
+  }
+
+  return [
+    {
+      ...last,
+      id: first.id,
+      toolInput: {
+        ...getWaitInputRecord(last),
+        poll_count: run.length,
+        ...(hasWallTime && { total_wall_time_seconds: totalWallTimeSeconds }),
+      },
+      sourceMessages: uniqueSourceMessages(
+        run.flatMap((item) => item.sourceMessages),
+      ),
+    },
+  ];
+}
+
+/**
+ * Codex can poll the same long-running code-mode cell every ten seconds. Keep
+ * progress commentary in the timeline, but collapse adjacent silent polls so
+ * transport mechanics do not dominate the model's visible progress updates.
+ */
+export function collapseCodexWaitPolls(items: RenderItem[]): RenderItem[] {
+  const collapsed: RenderItem[] = [];
+  let index = 0;
+
+  while (index < items.length) {
+    const item = items[index];
+    if (!item || !isCodexWaitItem(item) || !isSilentCodexWait(item)) {
+      if (item) collapsed.push(item);
+      index += 1;
+      continue;
+    }
+
+    const cellId = getWaitCellId(item);
+    const run: ToolCallItem[] = [item];
+    let runIndex = index + 1;
+    while (runIndex < items.length) {
+      const candidate = items[runIndex];
+      if (
+        !candidate ||
+        !isCodexWaitItem(candidate) ||
+        !isSilentCodexWait(candidate) ||
+        getWaitCellId(candidate) !== cellId
+      ) {
+        break;
+      }
+      run.push(candidate);
+      runIndex += 1;
+    }
+
+    collapsed.push(...collapseCodexWaitRun(run));
+    index = runIndex;
+  }
+
+  return collapsed;
+}
+
 function processMessage(
   msg: Message,
   items: RenderItem[],
@@ -437,8 +609,49 @@ function processMessage(
   // Handle system entries (compact_boundary, status, etc.)
   if (msg.type === "system") {
     const subtype = (msg as { subtype?: string }).subtype ?? "unknown";
-    // Render compact_boundary as a visible system message
-    if (subtype === "compact_boundary" || subtype === "turn_aborted") {
+
+    // Codex canonical overlay projects native ThreadItems as system messages
+    // with a `codexThreadItem` payload. Split them out before the generic
+    // system-message filter drops them, so dedicated renderers can surface
+    // plan, sub-agent activity, and collaboration tool-call content.
+    if (subtype === "codex_native_item") {
+      const threadItem = (msg as { codexThreadItem?: unknown }).codexThreadItem;
+      if (isRecord(threadItem) && typeof threadItem.type === "string") {
+        // Known ThreadItems such as reasoning, commandExecution, and
+        // agentMessage already flow through the normalized transcript. Their
+        // canonical copies do not carry additional displayable content and
+        // otherwise become duplicate label-only cards. Keep the native types
+        // that have dedicated UI plus unknown future variants for diagnostics.
+        if (!shouldKeepCodexNativeItemType(threadItem.type)) {
+          return;
+        }
+        const lifecycle = (msg as { codexThreadItemLifecycle?: unknown })
+          .codexThreadItemLifecycle;
+        const nativeItem: CodexNativeItem = {
+          type: "codex_native_item",
+          id: msgId,
+          threadItem: threadItem as CodexNativeItem["threadItem"],
+          lifecycle: lifecycle === "completed" ? "completed" : "started",
+          ...(typeof msg.codexThreadId === "string"
+            ? { threadId: msg.codexThreadId }
+            : {}),
+          ...(typeof msg.codexTurnId === "string"
+            ? { turnId: msg.codexTurnId }
+            : {}),
+          sourceMessages: [msg],
+          isSubagent: msg.isSubagent,
+        };
+        items.push(nativeItem);
+      }
+      return;
+    }
+
+    // Render compact_boundary / turn_aborted / warning as visible markers
+    if (
+      subtype === "compact_boundary" ||
+      subtype === "turn_aborted" ||
+      subtype === "warning"
+    ) {
       const systemItem: SystemItem = {
         type: "system",
         id: msgId,
@@ -448,13 +661,35 @@ function processMessage(
             ? CODEX_TURN_ABORTED_DISPLAY_TEXT
             : typeof msg.content === "string"
               ? msg.content
-              : "Context compacted",
+              : subtype === "warning"
+                ? "Warning"
+                : "Context compacted",
         sourceMessages: [msg],
       };
       items.push(systemItem);
     }
     // Status messages (compacting indicator) are transient - handled separately via isCompacting state
     // Skip other system entries (init, status, etc.) - they're internal
+    return;
+  }
+
+  // Kimi goal lifecycle snapshots (goal.create/update/clear replayed by the
+  // server's normalization layer). Surface as a system item with the goal
+  // snapshot payload so the GoalInlineRenderer can render the objective,
+  // status badge, and budget consumption inline in the transcript.
+  if (msg.type === "kimi_goal") {
+    const goal = (msg as { goal?: unknown }).goal;
+    if (isRecord(goal)) {
+      const systemItem: SystemItem = {
+        type: "system",
+        id: msgId || `kimi-goal-${msg.timestamp ?? Date.now()}`,
+        subtype: "kimi_goal",
+        content: "",
+        sourceMessages: [msg],
+        goalSnapshot: goal as unknown as KimiGoalSnapshot,
+      };
+      items.push(systemItem);
+    }
     return;
   }
 
@@ -485,10 +720,6 @@ function processMessage(
     msg.role;
   const isUserMessage = msg.type === "user" || role === "user";
 
-  if (isClaudeInternalUserPromptEntry(msg)) {
-    return;
-  }
-
   // String content = user prompt (only if type is user)
   if (typeof content === "string") {
     if (isUserMessage) {
@@ -508,6 +739,7 @@ function processMessage(
         type: "text",
         id: msgId,
         text: content,
+        ...(msg.codexMessagePhase && { phase: msg.codexMessagePhase }),
         sourceMessages: [msg],
         isSubagent: msg.isSubagent,
         augmentHtml: messageHtml ?? augments?.markdown?.[msgId]?.html,
@@ -574,6 +806,7 @@ function processMessage(
           type: "text",
           id: blockId,
           text: block.text,
+          ...(msg.codexMessagePhase && { phase: msg.codexMessagePhase }),
           sourceMessages: [msg],
           isSubagent: msg.isSubagent,
           // Only show streaming cursor on the last text block
@@ -597,12 +830,50 @@ function processMessage(
     } else if (block.type === "tool_use") {
       if (block.id && block.name) {
         // Stream reconnects/resume can replay the same tool_use id from a
-        // different assistant message snapshot. Keep one render item per tool id.
+        // different assistant message snapshot. Keep one render item per tool
+        // id, but let a richer input snapshot refresh the arguments.
         const existingIndex = toolCallIndices.get(block.id);
         if (existingIndex !== undefined) {
           const existingItem = items[existingIndex];
           if (existingItem?.type === "tool_call") {
-            items[existingIndex] = appendSourceMessage(existingItem, msg);
+            const replayStatus = getInitialToolStatus(
+              block,
+              orphanedToolIds.has(block.id),
+            );
+            const incomingInput = normalizeToolInput(block);
+            const incomingHasInput =
+              incomingInput !== undefined &&
+              incomingInput !== null &&
+              (typeof incomingInput !== "object" ||
+                Object.keys(incomingInput as Record<string, unknown>).length >
+                  0);
+            const existingInput = existingItem.toolInput;
+            const existingIsEmpty =
+              existingInput === undefined ||
+              existingInput === null ||
+              (typeof existingInput === "object" &&
+                Object.keys(existingInput as Record<string, unknown>).length ===
+                  0);
+            const nextItem = appendSourceMessage(existingItem, msg);
+            const incomingPartialOutput =
+              typeof block.partialOutput === "string" &&
+              block.partialOutput.length >
+                (existingItem.partialOutput?.length ?? 0)
+                ? block.partialOutput
+                : existingItem.partialOutput;
+            const withInput =
+              incomingHasInput &&
+              (existingIsEmpty || existingItem.toolResult === undefined)
+                ? {
+                    ...nextItem,
+                    toolInput: incomingInput,
+                    partialOutput: incomingPartialOutput,
+                  }
+                : { ...nextItem, partialOutput: incomingPartialOutput };
+            items[existingIndex] =
+              existingItem.status === "pending" && replayStatus !== "pending"
+                ? { ...withInput, status: replayStatus }
+                : withInput;
             if (existingItem.status === "pending") {
               pendingToolCalls.set(block.id, existingIndex);
             }
@@ -612,23 +883,140 @@ function processMessage(
 
         // Check if this tool call is orphaned (process killed before result)
         const isOrphaned = orphanedToolIds.has(block.id);
+        const toolInput = normalizeToolInput(block);
         const toolCall: ToolCallItem = {
           type: "tool_call",
           id: block.id,
           toolName: block.name,
-          toolInput: block.input,
+          toolInput,
           toolResult: undefined,
-          status: isOrphaned ? "aborted" : "pending",
+          status: getInitialToolStatus(block, isOrphaned),
           sourceMessages: [msg],
           isSubagent: msg.isSubagent,
+          ...(typeof block.partialOutput === "string" &&
+          block.partialOutput.length > 0
+            ? { partialOutput: block.partialOutput }
+            : {}),
         };
         const itemIndex = items.length;
         toolCallIndices.set(block.id, itemIndex);
         pendingToolCalls.set(block.id, itemIndex);
         items.push(toolCall);
       }
+    } else if (block.type === "tool_result" && block.tool_use_id) {
+      // Some providers persist tool_use and tool_result blocks together in the
+      // assistant message; pair those results here too.
+      attachToolResult(block, msg, items, toolCallIndices, pendingToolCalls);
     }
   }
+}
+
+function getInitialToolStatus(
+  block: ContentBlock,
+  isOrphaned: boolean,
+): ToolCallItem["status"] {
+  if (isOrphaned) {
+    return "aborted";
+  }
+
+  const providerStatus = getStringField(block, "status");
+
+  switch (providerStatus?.toLowerCase()) {
+    case "complete":
+    case "completed":
+    case "success":
+      return "complete";
+    case "error":
+    case "failed":
+      return "error";
+    case "aborted":
+    case "cancelled":
+    case "canceled":
+      return "aborted";
+    default:
+      return "pending";
+  }
+}
+
+function normalizeToolInput(block: ContentBlock): unknown {
+  const input = isRecord(block.input) ? { ...block.input } : block.input;
+  if (!isRecord(input)) {
+    return input;
+  }
+
+  const name = typeof block.name === "string" ? block.name.toLowerCase() : "";
+  if (
+    (name === "read" || name === "write" || name === "edit") &&
+    typeof input.file_path !== "string"
+  ) {
+    const filePath =
+      typeof input.filePath === "string"
+        ? input.filePath
+        : typeof input.path === "string"
+          ? input.path
+          : undefined;
+    if (filePath) {
+      input.file_path = filePath;
+    }
+  }
+
+  if (
+    name === "read" &&
+    typeof input.line_offset === "number" &&
+    typeof input.offset !== "number"
+  ) {
+    input.offset = input.line_offset;
+  }
+
+  if (
+    name === "read" &&
+    typeof input.n_lines === "number" &&
+    typeof input.limit !== "number"
+  ) {
+    input.limit = input.n_lines;
+  }
+
+  if (
+    name === "edit" &&
+    typeof input.oldString === "string" &&
+    typeof input.old_string !== "string"
+  ) {
+    input.old_string = input.oldString;
+  }
+  if (
+    name === "edit" &&
+    typeof input.newString === "string" &&
+    typeof input.new_string !== "string"
+  ) {
+    input.new_string = input.newString;
+  }
+  if (
+    name === "edit" &&
+    typeof input.replaceAll === "boolean" &&
+    typeof input.replace_all !== "boolean"
+  ) {
+    input.replace_all = input.replaceAll;
+  }
+
+  if (
+    name === "grep" &&
+    typeof input.include === "string" &&
+    typeof input.glob !== "string"
+  ) {
+    input.glob = input.include;
+  }
+
+  return input;
+}
+
+function getStringField(value: unknown, field: string): string | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const fieldValue = value[field];
+  return typeof fieldValue === "string" && fieldValue.trim()
+    ? fieldValue.trim()
+    : undefined;
 }
 
 function parseTaskNotificationMessage(msg: Message): TaskNotification | null {
@@ -865,13 +1253,33 @@ export function parseAgentResultFromText(
 
   const displayContent = extractAgentDisplayContent(block);
 
-  // Extract agentId
-  const agentIdMatch = fullText.match(/^agentId:\s*(\S+)/m);
-  if (!agentIdMatch) return undefined;
+  // Extract agentId. Claude/SDK 0.2.76+ emit `agentId: <id>`; Kimi's Agent
+  // emits `agent_id: agent-0`, while AgentSwarm wraps each child in a
+  // `<subagent agent_id="agent-0" outcome="completed">` element. The current
+  // renderer and server mapping are 1:1, so use the first swarm child.
+  const directAgentId = fullText.match(/^agent(?:Id|_id):\s*(\S+)/m)?.[1];
+  const firstSubagentAttributes = fullText.match(/<subagent\b([^>]*)>/i)?.[1];
+  const swarmAgentId = firstSubagentAttributes?.match(
+    /\bagent_id\s*=\s*["']([^"']+)["']/i,
+  )?.[1];
+  const agentId = directAgentId ?? swarmAgentId;
+  if (!agentId) return undefined;
+
+  // Kimi Agent results carry `status:`, while AgentSwarm puts `outcome=` on
+  // each child. Honor terminal failures so interrupted children render as
+  // failed; successful and legacy results default to completed.
+  const explicitStatus =
+    fullText.match(/^status:\s*([^\s]+)/m)?.[1] ??
+    firstSubagentAttributes?.match(/\boutcome\s*=\s*["']([^"']+)["']/i)?.[1];
+  const status =
+    explicitStatus &&
+    /^(?:failed|error|cancelled|canceled|timeout)$/i.test(explicitStatus)
+      ? "failed"
+      : "completed";
 
   const result: Record<string, unknown> = {
-    agentId: agentIdMatch[1],
-    status: "completed",
+    agentId,
+    status,
   };
   if (displayContent && displayContent.length > 0) {
     result.content = displayContent;
@@ -932,6 +1340,98 @@ function extractAgentDisplayContent(
   return displayBlocks.length > 0 ? displayBlocks : undefined;
 }
 
+/**
+ * Count tool_result blocks carried by a message. The message-level
+ * `toolUseResult` field is only unambiguous when the message carries exactly
+ * one tool_result block; with parallel tool calls batched into one message the
+ * field belongs to an unknown block and must not be fanned out to all calls.
+ */
+function countToolResultBlocks(message: Message): number {
+  const content =
+    (message.message as { content?: string | ContentBlock[] } | undefined)
+      ?.content ?? message.content;
+  if (!Array.isArray(content)) return 0;
+  let count = 0;
+  for (const block of content) {
+    if (block?.type === "tool_result") count += 1;
+  }
+  return count;
+}
+
+/** Rough completeness score used to decide which duplicate result to keep. */
+function scoreToolResult(result: ToolResultData): number {
+  let score = result.content.length;
+  const structured = result.structured;
+  if (structured !== undefined && structured !== null) {
+    // Structured payloads unlock rich renderers; weigh them heavily so a
+    // JSONL-complete result beats a partial streaming snapshot.
+    score += 10_000;
+
+    if (isRecord(structured) && structured.type === "media") {
+      // Live Kimi media updates intentionally omit preview bytes, while the
+      // persisted projection can add a safe blob-backed preview. Prefer that
+      // richer snapshot even when both copies have identical display text.
+      if (typeof structured.previewUrl === "string") score += 256;
+      if (typeof structured.filePath === "string") score += 128;
+      if (typeof structured.path === "string") score += 16;
+      if (typeof structured.mimeType === "string") score += 8;
+      if (typeof structured.kind === "string") score += 4;
+      if (typeof structured.bytes === "number") score += 2;
+    }
+  }
+  // For question results, richer answer sets should outrank partial ones. A
+  // live-stream `{questions, answers:{}}` snapshot arrives
+  // before the completed tool_result carries the real `metadata.answers`;
+  // without this, the empty-answers copy scores equal to the filled one and
+  // `attachToolResult` keeps the stale copy on duplicate arrival.
+  if (
+    structured &&
+    typeof structured === "object" &&
+    !Array.isArray(structured)
+  ) {
+    const answers = (structured as { answers?: unknown }).answers;
+    if (answers && typeof answers === "object" && !Array.isArray(answers)) {
+      score += Object.keys(answers as Record<string, unknown>).length;
+    }
+  }
+  return score;
+}
+
+function normalizeKimiReadMediaResult(
+  toolName: string,
+  output: unknown,
+): Record<string, unknown> | undefined {
+  if (toolName.toLowerCase() !== "readmediafile") return undefined;
+  const summary = parseKimiReadMediaOutput(output);
+  if (!summary) return undefined;
+
+  return {
+    type: "media",
+    kind: summary.kind,
+    ...(summary.path ? { path: summary.path } : {}),
+    ...(summary.mimeType ? { mimeType: summary.mimeType } : {}),
+    ...(summary.bytes !== undefined ? { bytes: summary.bytes } : {}),
+    ...(summary.mediaUrl ? { previewUrl: summary.mediaUrl } : {}),
+  };
+}
+
+function getToolResultTextContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .flatMap((part) => {
+      if (
+        isRecord(part) &&
+        part.type === "text" &&
+        typeof part.text === "string"
+      ) {
+        return [part.text];
+      }
+      return [];
+    })
+    .join("\n");
+}
+
 function attachToolResult(
   block: ContentBlock,
   resultMessage: Message,
@@ -942,44 +1442,82 @@ function attachToolResult(
   const toolUseId = block.tool_use_id;
   if (!toolUseId) return;
 
-  // First try pendingToolCalls (for actively pending tools)
   let index = pendingToolCalls.get(toolUseId);
-
-  // Fallback to toolCallIndices (for tools that were already processed but appear in repeated messages)
+  let existingResult: ToolResultData | undefined;
   if (index === undefined) {
+    // Late duplicate: the SDK stream and JSONL persistence can both deliver a
+    // result for the same tool_use id (streaming partial vs complete). Allow
+    // the richer copy to upgrade the already-attached result instead of
+    // dropping it on the floor.
     index = toolCallIndices.get(toolUseId);
     if (index === undefined) {
-      // True orphan result - tool_use not found at all
+      // Orphan result - shouldn't happen normally
       console.warn(`Tool result for unknown tool_use: ${toolUseId}`);
       return;
     }
+    const existingItem = items[index];
+    if (!existingItem || existingItem.type !== "tool_call") return;
+    existingResult = existingItem.toolResult;
   }
 
   const item = items[index];
   if (!item || item.type !== "tool_call") return;
 
-  // Skip if result already attached (prevents duplicate processing)
-  if (item.toolResult !== undefined) {
-    return;
-  }
-
   // Attach result to existing tool call
   // Handle both camelCase (toolUseResult) and snake_case (tool_use_result) from SDK
+  const mediaResult = normalizeKimiReadMediaResult(
+    item.toolName,
+    block.content,
+  );
+  const content = mediaResult
+    ? `${String(mediaResult.kind)} loaded`
+    : getToolResultTextContent(block.content);
+  // Only trust the message-level structured result when it unambiguously
+  // belongs to this block (single tool_result per message).
   let structured =
-    resultMessage.toolUseResult ??
-    (resultMessage as Record<string, unknown>).tool_use_result;
+    countToolResultBlocks(resultMessage) <= 1
+      ? (resultMessage.toolUseResult ??
+        (resultMessage as Record<string, unknown>).tool_use_result)
+      : undefined;
+
+  structured ??= mediaResult;
+
+  if (!structured && item.toolName.toLowerCase() === "askuserquestion") {
+    structured = normalizeAskUserQuestionResult(item.toolInput, content);
+  }
+
+  if (!structured) {
+    structured = normalizeKimiFileToolResult(
+      item.toolName,
+      item.toolInput,
+      content,
+    );
+  }
 
   // SDK 0.2.76+: Agent tool has no structured tool_use_result.
   // Parse agentId and usage stats from the text content blocks instead.
-  if (!structured && (item.toolName === "Agent" || item.toolName === "Task")) {
+  if (
+    !structured &&
+    (item.toolName === "Agent" ||
+      item.toolName === "AgentSwarm" ||
+      item.toolName === "Task")
+  ) {
     structured = parseAgentResultFromText(block);
   }
 
   const resultData: ToolResultData = {
-    content: typeof block.content === "string" ? block.content : "",
+    content,
     isError: block.is_error || false,
     structured,
   };
+
+  if (
+    existingResult &&
+    scoreToolResult(existingResult) >= scoreToolResult(resultData)
+  ) {
+    // Existing copy is at least as complete; keep it.
+    return;
+  }
 
   // Create a new ToolCallItem to ensure React sees the change
   const updatedItem: ToolCallItem = {
@@ -995,6 +1533,103 @@ function attachToolResult(
 
   items[index] = updatedItem;
   pendingToolCalls.delete(toolUseId);
+}
+
+/**
+ * Kimi's native Read/Write tools persist string results and camel/snake-case
+ * input variants. Build the shared file result shape without depending on a
+ * retired provider's result normalizer.
+ */
+function normalizeKimiFileToolResult(
+  toolName: string,
+  input: unknown,
+  resultContent: string,
+): unknown {
+  if (!isRecord(input) || (toolName !== "Read" && toolName !== "Write")) {
+    return undefined;
+  }
+
+  const filePath = [input.file_path, input.path, input.filePath].find(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  if (!filePath) return undefined;
+
+  if (toolName === "Write") {
+    if (typeof input.content !== "string") return undefined;
+    const numLines = input.content.split("\n").length;
+    return {
+      type: "text",
+      file: {
+        filePath,
+        content: input.content,
+        numLines,
+        startLine: 1,
+        totalLines: numLines,
+      },
+    };
+  }
+
+  const numberedLines = resultContent.split("\n").map((line) => {
+    const match = /^(\d+)\t(.*)$/.exec(line);
+    return match?.[1]
+      ? { line: Number.parseInt(match[1], 10), text: match[2] }
+      : null;
+  });
+  if (numberedLines.some((line) => line === null)) return undefined;
+  const lines = numberedLines.filter(
+    (line): line is { line: number; text: string } => line !== null,
+  );
+  const firstLine = lines[0]?.line;
+  const lastLine = lines.at(-1)?.line;
+  if (firstLine === undefined || lastLine === undefined) return undefined;
+
+  return {
+    type: "text",
+    file: {
+      filePath,
+      content: lines.map((line) => line.text).join("\n"),
+      numLines: lines.length,
+      startLine: firstLine,
+      totalLines: lastLine,
+    },
+  };
+}
+
+/**
+ * Kimi persists AskUserQuestion results as JSON text instead of a structured
+ * tool result. Pair the answer object with the original prompts so the shared
+ * renderer can count and highlight only the questions actually answered.
+ */
+function normalizeAskUserQuestionResult(
+  input: unknown,
+  content: string,
+): unknown {
+  if (!isRecord(input) || !Array.isArray(input.questions)) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.answers)) return undefined;
+
+  const answers: Record<string, string | string[]> = {};
+  for (const [question, rawAnswer] of Object.entries(parsed.answers)) {
+    if (typeof rawAnswer === "string" && rawAnswer.length > 0) {
+      answers[question] = rawAnswer;
+      continue;
+    }
+    if (Array.isArray(rawAnswer)) {
+      const values = rawAnswer.filter(
+        (value): value is string =>
+          typeof value === "string" && value.length > 0,
+      );
+      if (values.length > 0) answers[question] = values;
+    }
+  }
+
+  return { questions: input.questions, answers };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

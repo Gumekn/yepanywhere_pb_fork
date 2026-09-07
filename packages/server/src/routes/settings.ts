@@ -8,14 +8,24 @@ import {
   ALL_PROVIDERS,
   type CodexMcpMode,
   type EffortLevel,
+  type LiveProviderName,
+  type LlmGatewayJsonObject,
+  type LlmGatewayModelLimits,
+  type LlmGatewaySessionConfig,
   type NewSessionDefaults,
+  type NewSessionProviderDefaults,
   type PermissionMode,
-  type ProviderName,
+  type RemoteExecutorConfig,
   type ThinkingOption,
+  mergeNewSessionDefaults,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
-import { updateClaudeCodeSettings } from "../sdk/providers/claude-settings.js";
-import { testSSHConnection } from "../sdk/remote-spawn.js";
+import {
+  parseRemoteExecutorConfig,
+  parseRemoteExecutorConfigs,
+} from "../sdk/remote-executor-config.js";
+import { testRemoteExecutor } from "../sdk/remote-spawn.js";
+import type { OhMyRouterBenchmarkService } from "../services/OhMyRouterBenchmarkService.js";
 import type {
   ServerSettings,
   ServerSettingsService,
@@ -29,20 +39,20 @@ const EFFORT_LEVELS: readonly EffortLevel[] = [
   "low",
   "medium",
   "high",
-  "max",
   "xhigh",
+  "max",
 ];
 
 export interface SettingsRoutesDeps {
   serverSettingsService: ServerSettingsService;
+  /** Runs and persists an OhMyRouter model throughput benchmark. */
+  ohmyrouterBenchmarkService?: OhMyRouterBenchmarkService;
   /** Callback to apply allowedHosts changes at runtime */
   onAllowedHostsChanged?: (value: string | undefined) => void;
-  /** Callback to apply Ollama URL changes at runtime */
-  onOllamaUrlChanged?: (url: string | undefined) => void;
-  /** Callback to apply Ollama system prompt changes at runtime */
-  onOllamaSystemPromptChanged?: (prompt: string | undefined) => void;
-  /** Callback to apply Ollama full system prompt toggle at runtime */
-  onOllamaUseFullSystemPromptChanged?: (enabled: boolean) => void;
+  /** Callback to refresh Claude provider discovery after executor changes. */
+  onRemoteExecutorsChanged?: (
+    executors: RemoteExecutorConfig[],
+  ) => void | Promise<void>;
 }
 
 function parseHostAliasList(rawHosts: unknown[]): {
@@ -78,15 +88,289 @@ function isThinkingOption(value: unknown): value is ThinkingOption {
   return isEffortLevel(value.slice(3));
 }
 
-function getEffortFromThinkingOption(
-  option: ThinkingOption | undefined,
-): EffortLevel | undefined {
-  if (!option || option === "off" || option === "auto") return undefined;
-  if (option.startsWith("on:")) {
-    const effort = option.slice(3);
-    return isEffortLevel(effort) ? effort : undefined;
+function isReasoningEffort(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 64 &&
+    /^[a-z0-9_-]+$/i.test(value)
+  );
+}
+
+function parsePositiveTokenLimit(value: unknown): number | null {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    !Number.isInteger(value) ||
+    value <= 0 ||
+    value > Number.MAX_SAFE_INTEGER
+  ) {
+    return null;
   }
-  return isEffortLevel(option) ? option : undefined;
+  return value;
+}
+
+function parseGatewayModelLimits(
+  raw: unknown,
+): LlmGatewayModelLimits | undefined | null {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw !== "object") return null;
+
+  const input = raw as Record<string, unknown>;
+  const hasContext = input.context !== undefined && input.context !== null;
+  const hasOutput = input.output !== undefined && input.output !== null;
+  if (!hasContext && !hasOutput) return undefined;
+  if (!hasContext || !hasOutput) return null;
+
+  const context = parsePositiveTokenLimit(input.context);
+  const inputLimit =
+    input.input === undefined || input.input === null
+      ? undefined
+      : parsePositiveTokenLimit(input.input);
+  const output = parsePositiveTokenLimit(input.output);
+
+  if (context === null || output === null || inputLimit === null) return null;
+  return {
+    context,
+    ...(inputLimit === undefined ? {} : { input: inputLimit }),
+    output,
+  };
+}
+
+function isJsonObject(value: unknown): value is LlmGatewayJsonObject {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "__proto__" || key === "prototype" || key === "constructor") {
+      return false;
+    }
+    if (!isJsonValue(item, 1)) return false;
+  }
+  return JSON.stringify(value).length <= 65_536;
+}
+
+function isJsonValue(value: unknown, depth: number): boolean {
+  if (depth > 12) return false;
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return true;
+  }
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    return value.every((item) => isJsonValue(item, depth + 1));
+  }
+  if (typeof value !== "object" || value === null) return false;
+  return Object.entries(value).every(
+    ([key, item]) =>
+      key !== "__proto__" &&
+      key !== "prototype" &&
+      key !== "constructor" &&
+      isJsonValue(item, depth + 1),
+  );
+}
+
+function parseLlmGatewaySessionConfig(
+  raw: unknown,
+): LlmGatewaySessionConfig | undefined | null {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) return null;
+  const input = raw as Record<string, unknown>;
+  const model = typeof input.model === "string" ? input.model.trim() : "";
+  if (
+    !model ||
+    model.length > 512 ||
+    model === "__proto__" ||
+    model === "prototype" ||
+    model === "constructor" ||
+    Array.from(model).some((character) => character.charCodeAt(0) < 32)
+  ) {
+    return null;
+  }
+  if (
+    input.requestProtocol !== "openai-compatible" &&
+    input.requestProtocol !== "anthropic"
+  ) {
+    return null;
+  }
+
+  const limits = parseGatewayModelLimits(input.limits);
+  if (limits === null) return null;
+
+  let capabilities: LlmGatewaySessionConfig["capabilities"];
+  if (input.capabilities !== undefined && input.capabilities !== null) {
+    if (
+      typeof input.capabilities !== "object" ||
+      Array.isArray(input.capabilities)
+    ) {
+      return null;
+    }
+    capabilities = {};
+    const rawCapabilities = input.capabilities as Record<string, unknown>;
+    for (const key of [
+      "attachment",
+      "reasoning",
+      "temperature",
+      "toolCall",
+    ] as const) {
+      const value = rawCapabilities[key];
+      if (value === undefined) continue;
+      if (typeof value !== "boolean") return null;
+      capabilities[key] = value;
+    }
+  }
+
+  let advanced: LlmGatewaySessionConfig["advanced"];
+  if (input.advanced !== undefined && input.advanced !== null) {
+    if (typeof input.advanced !== "object" || Array.isArray(input.advanced)) {
+      return null;
+    }
+    const rawAdvanced = input.advanced as Record<string, unknown>;
+    if (
+      rawAdvanced.provider !== undefined &&
+      !isJsonObject(rawAdvanced.provider)
+    ) {
+      return null;
+    }
+    if (rawAdvanced.model !== undefined && !isJsonObject(rawAdvanced.model)) {
+      return null;
+    }
+    advanced = {
+      provider: rawAdvanced.provider as LlmGatewayJsonObject | undefined,
+      model: rawAdvanced.model as LlmGatewayJsonObject | undefined,
+    };
+  }
+
+  const name =
+    typeof input.name === "string" && input.name.trim()
+      ? input.name.trim()
+      : undefined;
+  if (name && name.length > 200) return null;
+
+  return {
+    model,
+    requestProtocol: input.requestProtocol,
+    ...(name ? { name } : {}),
+    ...(limits ? { limits } : {}),
+    ...(capabilities && Object.keys(capabilities).length > 0
+      ? { capabilities }
+      : {}),
+    ...(advanced ? { advanced } : {}),
+  };
+}
+
+function parseNewSessionProviderDefaults(
+  raw: Record<string, unknown>,
+  provider?: LiveProviderName,
+): NewSessionProviderDefaults | undefined | null {
+  const parsed: NewSessionProviderDefaults = {};
+
+  if ("model" in raw) {
+    if (
+      raw.model !== undefined &&
+      raw.model !== null &&
+      raw.model !== "" &&
+      typeof raw.model !== "string"
+    ) {
+      return null;
+    }
+    if (typeof raw.model === "string" && raw.model.length > 0) {
+      parsed.model = raw.model;
+    }
+  }
+
+  if ("thinking" in raw) {
+    if (
+      raw.thinking !== undefined &&
+      raw.thinking !== null &&
+      raw.thinking !== "" &&
+      !isThinkingOption(raw.thinking)
+    ) {
+      return null;
+    }
+    if (isThinkingOption(raw.thinking)) {
+      parsed.thinking = raw.thinking;
+    }
+  }
+
+  if ("reasoningEffort" in raw) {
+    if (
+      raw.reasoningEffort !== undefined &&
+      raw.reasoningEffort !== null &&
+      raw.reasoningEffort !== "" &&
+      !isReasoningEffort(raw.reasoningEffort)
+    ) {
+      return null;
+    }
+    if (isReasoningEffort(raw.reasoningEffort)) {
+      parsed.reasoningEffort = raw.reasoningEffort;
+    }
+  }
+
+  if (raw.serviceTier !== undefined) {
+    if (
+      (raw.serviceTier !== "default" && raw.serviceTier !== "priority") ||
+      (provider !== undefined && provider !== "codex")
+    ) {
+      return null;
+    }
+    parsed.serviceTier = raw.serviceTier;
+  }
+
+  if ("permissionMode" in raw) {
+    if (
+      raw.permissionMode !== undefined &&
+      raw.permissionMode !== null &&
+      raw.permissionMode !== "" &&
+      !ALL_PERMISSION_MODES.includes(raw.permissionMode as PermissionMode)
+    ) {
+      return null;
+    }
+    if (
+      typeof raw.permissionMode === "string" &&
+      raw.permissionMode.length > 0
+    ) {
+      parsed.permissionMode = raw.permissionMode as PermissionMode;
+    }
+  }
+
+  if ("codexMcpMode" in raw) {
+    if (
+      raw.codexMcpMode !== undefined &&
+      raw.codexMcpMode !== null &&
+      raw.codexMcpMode !== "" &&
+      (!ALL_CODEX_MCP_MODES.includes(raw.codexMcpMode as CodexMcpMode) ||
+        (provider !== undefined && provider !== "codex"))
+    ) {
+      return null;
+    }
+    if (typeof raw.codexMcpMode === "string" && raw.codexMcpMode.length > 0) {
+      parsed.codexMcpMode = raw.codexMcpMode as CodexMcpMode;
+    }
+  }
+
+  if ("llmGatewayConfig" in raw) {
+    const config = parseLlmGatewaySessionConfig(raw.llmGatewayConfig);
+    if (config === null) return null;
+    if (config) {
+      if (provider !== undefined && provider !== "pi") {
+        return null;
+      }
+      parsed.llmGatewayConfig = config;
+    }
+  }
+
+  return Object.keys(parsed).length > 0 ? parsed : undefined;
+}
+
+function isSavedNewSessionProvider(value: string): value is LiveProviderName {
+  return (
+    value !== "claude-ollama" &&
+    ALL_PROVIDERS.includes(value as LiveProviderName)
+  );
 }
 
 /**
@@ -100,87 +384,68 @@ function parseNewSessionDefaults(
 ): NewSessionDefaults | undefined | null {
   if (raw === undefined) return null;
   if (raw === null || raw === "") return undefined;
-  if (typeof raw !== "object") return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) return null;
 
   const input = raw as Record<string, unknown>;
-  const parsed: NewSessionDefaults = {};
-
-  if ("provider" in input) {
+  let provider: LiveProviderName | undefined;
+  if (
+    input.provider !== undefined &&
+    input.provider !== null &&
+    input.provider !== ""
+  ) {
     if (
-      input.provider !== undefined &&
-      input.provider !== null &&
-      input.provider !== "" &&
-      !ALL_PROVIDERS.includes(input.provider as ProviderName)
+      typeof input.provider !== "string" ||
+      !isSavedNewSessionProvider(input.provider)
     ) {
       return null;
     }
-    if (typeof input.provider === "string" && input.provider.length > 0) {
-      parsed.provider = input.provider as ProviderName;
-    }
+    provider = input.provider;
   }
 
-  if ("model" in input) {
+  const flatDefaults = parseNewSessionProviderDefaults(input, provider);
+  if (flatDefaults === null) return null;
+
+  const byProvider: Partial<
+    Record<LiveProviderName, NewSessionProviderDefaults>
+  > = {};
+  if (
+    input.byProvider !== undefined &&
+    input.byProvider !== null &&
+    input.byProvider !== ""
+  ) {
     if (
-      input.model !== undefined &&
-      input.model !== null &&
-      input.model !== "" &&
-      typeof input.model !== "string"
+      typeof input.byProvider !== "object" ||
+      Array.isArray(input.byProvider)
     ) {
       return null;
     }
-    if (typeof input.model === "string" && input.model.length > 0) {
-      parsed.model = input.model;
+    for (const [providerName, rawProviderDefaults] of Object.entries(
+      input.byProvider,
+    )) {
+      if (
+        !isSavedNewSessionProvider(providerName) ||
+        typeof rawProviderDefaults !== "object" ||
+        rawProviderDefaults === null ||
+        Array.isArray(rawProviderDefaults)
+      ) {
+        return null;
+      }
+      const parsedProviderDefaults = parseNewSessionProviderDefaults(
+        rawProviderDefaults as Record<string, unknown>,
+        providerName,
+      );
+      if (parsedProviderDefaults === null) return null;
+      if (parsedProviderDefaults) {
+        byProvider[providerName] = parsedProviderDefaults;
+      }
     }
   }
 
-  if ("thinking" in input) {
-    if (
-      input.thinking !== undefined &&
-      input.thinking !== null &&
-      input.thinking !== "" &&
-      !isThinkingOption(input.thinking)
-    ) {
-      return null;
-    }
-    if (isThinkingOption(input.thinking)) {
-      parsed.thinking = input.thinking;
-    }
-  }
-
-  if ("permissionMode" in input) {
-    if (
-      input.permissionMode !== undefined &&
-      input.permissionMode !== null &&
-      input.permissionMode !== "" &&
-      !ALL_PERMISSION_MODES.includes(input.permissionMode as PermissionMode)
-    ) {
-      return null;
-    }
-    if (
-      typeof input.permissionMode === "string" &&
-      input.permissionMode.length > 0
-    ) {
-      parsed.permissionMode = input.permissionMode as PermissionMode;
-    }
-  }
-
-  if ("codexMcpMode" in input) {
-    if (
-      input.codexMcpMode !== undefined &&
-      input.codexMcpMode !== null &&
-      input.codexMcpMode !== "" &&
-      !ALL_CODEX_MCP_MODES.includes(input.codexMcpMode as CodexMcpMode)
-    ) {
-      return null;
-    }
-    if (
-      typeof input.codexMcpMode === "string" &&
-      input.codexMcpMode.length > 0
-    ) {
-      parsed.codexMcpMode = input.codexMcpMode as CodexMcpMode;
-    }
-  }
-
+  const parsed: NewSessionDefaults = {
+    ...(provider ? { provider } : {}),
+    ...flatDefaults,
+    ...(Object.keys(byProvider).length > 0 ? { byProvider } : {}),
+  };
   return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
 
@@ -189,10 +454,24 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
   const {
     serverSettingsService,
     onAllowedHostsChanged,
-    onOllamaUrlChanged,
-    onOllamaSystemPromptChanged,
-    onOllamaUseFullSystemPromptChanged,
+    onRemoteExecutorsChanged,
+    ohmyrouterBenchmarkService,
   } = deps;
+
+  if (ohmyrouterBenchmarkService) {
+    app.get("/ohmyrouter-throughput", (c) =>
+      c.json(ohmyrouterBenchmarkService.getStatus()),
+    );
+    app.post("/ohmyrouter-throughput", async (c) => {
+      try {
+        const benchmark = await ohmyrouterBenchmarkService.start();
+        return c.json({ benchmark }, 202);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return c.json({ error: message }, 400);
+      }
+    });
+  }
 
   /**
    * GET /api/settings
@@ -216,18 +495,16 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
     if (typeof body.serviceWorkerEnabled === "boolean") {
       updates.serviceWorkerEnabled = body.serviceWorkerEnabled;
     }
-    // Handle remoteExecutors array
-    if (Array.isArray(body.remoteExecutors)) {
-      const { hosts, invalidHost } = parseHostAliasList(body.remoteExecutors);
-      if (invalidHost) {
+    if ("remoteExecutors" in body) {
+      const parsed = parseRemoteExecutorConfigs(body.remoteExecutors);
+      if (!parsed.executors) {
         return c.json(
-          { error: `Invalid remote executor host alias: ${invalidHost}` },
+          { error: parsed.error ?? "Invalid remoteExecutors setting" },
           400,
         );
       }
-      updates.remoteExecutors = hosts;
+      updates.remoteExecutors = parsed.executors;
     }
-
     // Handle chromeOsHosts array
     if (Array.isArray(body.chromeOsHosts)) {
       const { hosts, invalidHost } = parseHostAliasList(body.chromeOsHosts);
@@ -266,37 +543,6 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
       }
     }
 
-    // Handle ollamaUrl string (URL, or undefined/null/"" to clear)
-    if ("ollamaUrl" in body) {
-      if (
-        body.ollamaUrl === undefined ||
-        body.ollamaUrl === null ||
-        body.ollamaUrl === ""
-      ) {
-        updates.ollamaUrl = undefined;
-      } else if (typeof body.ollamaUrl === "string") {
-        updates.ollamaUrl = body.ollamaUrl;
-      }
-    }
-
-    // Handle ollamaSystemPrompt string (free-form text, or undefined/null/"" to clear)
-    if ("ollamaSystemPrompt" in body) {
-      if (
-        body.ollamaSystemPrompt === undefined ||
-        body.ollamaSystemPrompt === null ||
-        body.ollamaSystemPrompt === ""
-      ) {
-        updates.ollamaSystemPrompt = undefined;
-      } else if (typeof body.ollamaSystemPrompt === "string") {
-        updates.ollamaSystemPrompt = body.ollamaSystemPrompt.slice(0, 10000);
-      }
-    }
-
-    // Handle ollamaUseFullSystemPrompt boolean
-    if (typeof body.ollamaUseFullSystemPrompt === "boolean") {
-      updates.ollamaUseFullSystemPrompt = body.ollamaUseFullSystemPrompt;
-    }
-
     // Handle deviceBridgeEnabled boolean
     if (typeof body.deviceBridgeEnabled === "boolean") {
       updates.deviceBridgeEnabled = body.deviceBridgeEnabled;
@@ -307,35 +553,21 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
       if (parsedDefaults === null) {
         return c.json({ error: "Invalid newSessionDefaults setting" }, 400);
       }
-      if (parsedDefaults?.provider === "claude") {
-        try {
-          const claudeSettingsPatch: Parameters<
-            typeof updateClaudeCodeSettings
-          >[0] = {};
-          if (parsedDefaults.model !== undefined) {
-            claudeSettingsPatch.model = parsedDefaults.model;
-          }
-          const effortLevel = getEffortFromThinkingOption(
-            parsedDefaults.thinking,
-          );
-          if (effortLevel !== undefined) {
-            claudeSettingsPatch.effortLevel = effortLevel;
-          }
-          if (Object.keys(claudeSettingsPatch).length > 0) {
-            await updateClaudeCodeSettings(claudeSettingsPatch);
-          }
-        } catch (error) {
-          const message =
-            error instanceof Error
-              ? error.message
-              : "Unknown Claude Code settings error";
-          return c.json(
-            { error: `Failed to update Claude Code settings: ${message}` },
-            500,
-          );
-        }
+      if (parsedDefaults === undefined) {
+        updates.newSessionDefaults = undefined;
+      } else {
+        const currentDefaults =
+          serverSettingsService.getSetting("newSessionDefaults");
+        const scopedDefaults =
+          parsedDefaults.provider !== undefined ||
+          currentDefaults?.provider === undefined
+            ? parsedDefaults
+            : { ...parsedDefaults, provider: currentDefaults.provider };
+        updates.newSessionDefaults = mergeNewSessionDefaults(
+          currentDefaults,
+          scopedDefaults,
+        );
       }
-      updates.newSessionDefaults = parsedDefaults;
     }
 
     if (typeof body.lifecycleWebhooksEnabled === "boolean") {
@@ -380,77 +612,48 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
     if ("allowedHosts" in updates && onAllowedHostsChanged) {
       onAllowedHostsChanged(settings.allowedHosts);
     }
-    if ("ollamaUrl" in updates && onOllamaUrlChanged) {
-      onOllamaUrlChanged(settings.ollamaUrl);
+    if ("remoteExecutors" in updates && onRemoteExecutorsChanged) {
+      await onRemoteExecutorsChanged(settings.remoteExecutors ?? []);
     }
-    if ("ollamaSystemPrompt" in updates && onOllamaSystemPromptChanged) {
-      onOllamaSystemPromptChanged(settings.ollamaSystemPrompt);
-    }
-    if (
-      "ollamaUseFullSystemPrompt" in updates &&
-      onOllamaUseFullSystemPromptChanged
-    ) {
-      onOllamaUseFullSystemPromptChanged(
-        settings.ollamaUseFullSystemPrompt ?? false,
-      );
-    }
-
     return c.json({ settings });
   });
 
-  /**
-   * GET /api/settings/remote-executors
-   * Get list of configured remote executors
-   */
   app.get("/remote-executors", (c) => {
-    const settings = serverSettingsService.getSettings();
+    return c.json({
+      executors: serverSettingsService.getSetting("remoteExecutors") ?? [],
+    });
+  });
+
+  app.put("/remote-executors", async (c) => {
+    let body: { executors?: unknown };
+    try {
+      body = await c.req.json<{ executors?: unknown }>();
+    } catch {
+      return c.json({ error: "Invalid JSON body" }, 400);
+    }
+    const parsed = parseRemoteExecutorConfigs(body.executors);
+    if (!parsed.executors) {
+      return c.json({ error: parsed.error ?? "Invalid executors" }, 400);
+    }
+    const settings = await serverSettingsService.updateSettings({
+      remoteExecutors: parsed.executors,
+    });
+    await onRemoteExecutorsChanged?.(parsed.executors);
     return c.json({ executors: settings.remoteExecutors ?? [] });
   });
 
-  /**
-   * PUT /api/settings/remote-executors
-   * Update list of remote executors
-   */
-  app.put("/remote-executors", async (c) => {
-    const body = await c.req.json<{ executors: string[] }>();
-
-    if (!Array.isArray(body.executors)) {
-      return c.json({ error: "executors must be an array" }, 400);
+  app.post("/remote-executors/test", async (c) => {
+    let body: { executor?: unknown };
+    try {
+      body = await c.req.json<{ executor?: unknown }>();
+    } catch {
+      return c.json({ error: "Invalid JSON body" }, 400);
     }
-
-    const { hosts: validExecutors, invalidHost } = parseHostAliasList(
-      body.executors,
-    );
-    if (invalidHost) {
-      return c.json(
-        { error: `Invalid remote executor host alias: ${invalidHost}` },
-        400,
-      );
+    const parsed = parseRemoteExecutorConfig(body.executor);
+    if (!parsed.executor) {
+      return c.json({ error: parsed.error ?? "Invalid executor" }, 400);
     }
-
-    await serverSettingsService.updateSettings({
-      remoteExecutors: validExecutors,
-    });
-
-    return c.json({ executors: validExecutors });
-  });
-
-  /**
-   * POST /api/settings/remote-executors/:host/test
-   * Test SSH connection to a remote executor
-   */
-  app.post("/remote-executors/:host/test", async (c) => {
-    const host = normalizeSshHostAlias(c.req.param("host"));
-
-    if (!host) {
-      return c.json({ error: "host is required" }, 400);
-    }
-    if (!isValidSshHostAlias(host)) {
-      return c.json({ error: "host must be a valid SSH host alias" }, 400);
-    }
-
-    const result = await testSSHConnection(host);
-    return c.json(result);
+    return c.json(await testRemoteExecutor(parsed.executor));
   });
 
   return app;

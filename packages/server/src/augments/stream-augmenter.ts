@@ -78,6 +78,14 @@ export interface StreamAugmenterConfig {
   onError?: (error: unknown, context: string) => void;
 }
 
+export interface StreamAugmenterProcessOptions {
+  /**
+   * Replay messages need the same embedded renderer augments as live messages,
+   * but must not enter the streaming markdown coordinator as fresh text.
+   */
+  mode?: "live" | "replay";
+}
+
 /** Stream augmenter instance */
 export interface StreamAugmenter {
   /**
@@ -88,7 +96,10 @@ export interface StreamAugmenter {
    * For final assistant messages (with uuid), this also emits a markdown-augment
    * event with the fully rendered HTML.
    */
-  processMessage(message: Record<string, unknown>): Promise<void>;
+  processMessage(
+    message: Record<string, unknown>,
+    options?: StreamAugmenterProcessOptions,
+  ): Promise<void>;
 
   /**
    * Process text through the streaming coordinator.
@@ -135,6 +146,11 @@ export async function createStreamAugmenter(
   let coordinator: StreamCoordinator | null = null;
   let coordinatorInitPromise: Promise<StreamCoordinator> | null = null;
   let currentStreamingMessageId: string | null = null;
+  // Message ids the provider streamed token-by-token via stream_event deltas.
+  // Their final assistant message repeats the same text, so it must not be fed
+  // back into the coordinator: that both duplicates the rendered blocks and
+  // leaves buffered text behind for the next message.
+  const streamedMessageIds = new Set<string>();
 
   const getCoordinator = async (): Promise<StreamCoordinator> => {
     if (coordinator) return coordinator;
@@ -495,12 +511,23 @@ export async function createStreamAugmenter(
   };
 
   return {
-    async processMessage(message: Record<string, unknown>): Promise<void> {
-      // Track message ID from message_start or assistant messages
-      const messageId =
-        extractMessageIdFromStart(message) ?? extractIdFromAssistant(message);
-      if (messageId) {
-        currentStreamingMessageId = messageId;
+    async processMessage(
+      message: Record<string, unknown>,
+      options?: StreamAugmenterProcessOptions,
+    ): Promise<void> {
+      const mode = options?.mode ?? "live";
+
+      if (mode === "live") {
+        // Track message ID from message_start or assistant messages.
+        const streamStartMessageId = extractMessageIdFromStart(message);
+        if (streamStartMessageId) {
+          streamedMessageIds.add(streamStartMessageId);
+        }
+        const messageId =
+          streamStartMessageId ?? extractIdFromAssistant(message);
+        if (messageId) {
+          currentStreamingMessageId = messageId;
+        }
       }
 
       // Render final markdown augment BEFORE the message is sent
@@ -512,9 +539,21 @@ export async function createStreamAugmenter(
       await augmentWriteInputs(message);
       await augmentExitPlanMode(message);
 
-      // Process text deltas for streaming markdown
+      // Replay carries complete historical messages. Feeding their text into
+      // the coordinator would generate duplicate pending/delta UI and could
+      // contaminate the next live message's streaming state.
+      if (mode === "replay") return;
+
+      // Process text deltas for streaming markdown.
+      // `extractTextFromAssistant` exists for providers that never stream
+      // (whole-text assistant messages). Providers that stream deltas and then
+      // land the same text as a final message must skip it.
+      const finalId = extractIdFromAssistant(message);
+      const alreadyStreamed =
+        finalId !== null && streamedMessageIds.has(finalId);
       const textDelta =
-        extractTextDelta(message) ?? extractTextFromAssistant(message);
+        extractTextDelta(message) ??
+        (alreadyStreamed ? null : extractTextFromAssistant(message));
       if (textDelta) {
         await processTextChunk(textDelta);
       }
@@ -539,6 +578,7 @@ export async function createStreamAugmenter(
         coordinator.reset();
       }
       currentStreamingMessageId = null;
+      streamedMessageIds.clear();
     },
 
     getCurrentMessageId(): string | null {

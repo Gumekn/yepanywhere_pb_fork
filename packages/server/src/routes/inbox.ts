@@ -11,10 +11,19 @@
 
 import {
   type SessionCreatedBy,
+  type SessionOriginChannel,
   getSessionDisplayTitle,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
-import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
+import {
+  getAnyBridgePendingInputRequest,
+  listAllBridgeSessionViews,
+} from "../bridge-common/multi.js";
+import {
+  isActiveBridgeSessionView,
+  isLiveBridgeSessionView,
+} from "../bridge-common/session-state.js";
+import type { BridgeSessionView } from "../bridge-common/types.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
 import type { SessionIndexService } from "../indexes/index.js";
 import { getLogger } from "../logging/logger.js";
@@ -22,11 +31,23 @@ import type { SessionMetadataService } from "../metadata/SessionMetadataService.
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
+import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
+import type { RuntimeController } from "../runtime/types.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
+import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { listSessionsAcrossProviders } from "../sessions/provider-resolution.js";
+import {
+  type SessionRuntimeProcess,
+  getProcessActivity,
+  pendingInputRequestIdFromProcess,
+  pendingInputTypeFromProcess,
+} from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
+import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
 import type {
   AgentActivity,
@@ -40,6 +61,7 @@ export interface InboxDeps {
   scanner: ProjectScanner;
   readerFactory: (project: Project) => ISessionReader;
   supervisor?: Supervisor;
+  runtimeController?: RuntimeController;
   notificationService?: NotificationService;
   sessionIndexService?: SessionIndexService;
   sessionMetadataService?: SessionMetadataService;
@@ -49,7 +71,45 @@ export interface InboxDeps {
   geminiScanner?: GeminiSessionScanner;
   geminiSessionsDir?: string;
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
+  piScanner?: PiSessionScanner;
+  zcodeDbPath?: string;
+  piSessionsDir?: string;
+  piReaderFactory?: (projectPath: string) => PiSessionReader;
+  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
+  kimiScanner?: KimiSessionScanner;
+  kimiSessionsDir?: string;
+  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
   codexBridgeService?: CodexBridgeController;
+}
+
+async function listBridgeSessionViews(
+  deps: Pick<InboxDeps, "codexBridgeService">,
+): Promise<BridgeSessionView[]> {
+  return listAllBridgeSessionViews([deps.codexBridgeService]);
+}
+
+/**
+ * Request id of a bridge session's pending input. Only called for sessions
+ * that already report a pendingInputType, so the extra sidecar round-trip is
+ * bounded by the number of sessions actually waiting on the user.
+ */
+async function getBridgePendingRequestId(
+  deps: Pick<InboxDeps, "codexBridgeService">,
+  sessionId: string,
+): Promise<string | undefined> {
+  try {
+    const request = await getAnyBridgePendingInputRequest(
+      [deps.codexBridgeService],
+      sessionId,
+    );
+    return request?.id;
+  } catch {
+    return undefined;
+  }
+}
+
+function isLiveAnyBridgeSessionView(view: BridgeSessionView): boolean {
+  return isLiveBridgeSessionView(view);
 }
 
 export interface InboxItem {
@@ -59,9 +119,12 @@ export interface InboxItem {
   sessionTitle: string;
   updatedAt: string;
   pendingInputType?: PendingInputType;
+  /** Pending request id, so notification actions can respond directly. */
+  pendingRequestId?: string;
   activity?: AgentActivity;
   hasUnread?: boolean;
   createdBy?: SessionCreatedBy;
+  originChannel?: SessionOriginChannel;
   originator?: string;
   source?: string;
 }
@@ -114,11 +177,19 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
     const projects = filterProjectId
       ? allProjects.filter((p) => p.id === filterProjectId)
       : allProjects;
-    const activeProcessProjectIds = new Set(
-      deps.supervisor
-        ?.getAllProcesses?.()
-        .map((process) => process.projectId) ?? [],
-    );
+    const processBySessionId = new Map<string, SessionRuntimeProcess>();
+    const activeProcessProjectIds = new Set<string>();
+    if (deps.runtimeController) {
+      for (const process of await deps.runtimeController.listProcessSnapshots()) {
+        processBySessionId.set(process.sessionId, process);
+        activeProcessProjectIds.add(process.projectId);
+      }
+    } else {
+      for (const process of deps.supervisor?.getAllProcesses?.() ?? []) {
+        processBySessionId.set(process.sessionId, process);
+        activeProcessProjectIds.add(process.projectId);
+      }
+    }
     const oldestInboxActivityTime = now - TWENTY_FOUR_HOURS_MS;
     const projectsForInboxScan = filterProjectId
       ? projects
@@ -137,11 +208,13 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       session: SessionSummary;
       projectName: string;
       pendingInputType?: PendingInputType;
+      pendingRequestId?: string;
       activity?: AgentActivity;
       hasUnread?: boolean;
       customTitle?: string;
       aiTitle?: string;
       createdBy?: SessionCreatedBy;
+      originChannel?: SessionOriginChannel;
       originator?: string;
       source?: string;
     }> = [];
@@ -150,23 +223,21 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
     const providerCatalog = await buildProviderProjectCatalog({
       codexScanner: deps.codexScanner,
       geminiScanner: deps.geminiScanner,
+      piScanner: deps.piScanner,
+      kimiScanner: deps.kimiScanner,
     });
-    const bridgeSessionViews =
-      (await deps.codexBridgeService?.listSessionViews()) ?? [];
+    const bridgeSessionViews = await listBridgeSessionViews(deps);
     const bridgedSessionById = new Map(
       bridgeSessionViews.map((item) => [item.session.id, item]),
     );
-    const activeBridgeSessionIds = new Set<string>();
-    await Promise.all(
-      bridgeSessionViews.map(async (item) => {
-        if (!isLiveBridgeSessionView(item)) return;
-        const isActive =
-          (await deps.codexBridgeService?.isSessionActive(item.session.id)) ??
-          false;
-        if (isActive) {
-          activeBridgeSessionIds.add(item.session.id);
-        }
-      }),
+    // The sidecar's liveness verdict rides along in the bulk snapshot, so this
+    // no longer costs one extra bridge request per bridge session. Semantics
+    // are unchanged: a stale view that still claims `in-turn` while the CLI
+    // holds no connection stays out of the active/needs-attention tiers.
+    const activeBridgeSessionIds = new Set(
+      bridgeSessionViews
+        .filter((item) => isActiveBridgeSessionView(item))
+        .map((item) => item.session.id),
     );
 
     // Fetch sessions from all projects in parallel
@@ -177,12 +248,17 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
             project,
             {
               readerFactory: deps.readerFactory,
+              sessionMetadataService: deps.sessionMetadataService,
               sessionIndexService: deps.sessionIndexService,
               codexSessionsDir: deps.codexSessionsDir,
               codexReaderFactory: deps.codexReaderFactory,
               geminiSessionsDir: deps.geminiSessionsDir,
               geminiReaderFactory: deps.geminiReaderFactory,
               geminiHashToCwd: providerCatalog.geminiHashToCwd,
+              piSessionsDir: deps.piSessionsDir,
+              piReaderFactory: deps.piReaderFactory,
+              kimiSessionsDir: deps.kimiSessionsDir,
+              kimiReaderFactory: deps.kimiReaderFactory,
               allowStaleSessionCache: true,
             },
             providerCatalog,
@@ -198,7 +274,11 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       }),
     );
 
-    // Enrich each session with process state and notification data
+    // Enrich each session with process state and notification data.
+    // Bridge request-id lookups are deferred: resolving them inline turned one
+    // inbox poll into a serialized round-trip per waiting session.
+    const bridgeRequestIdTargets = new Set<string>();
+
     for (const { project, sessions } of projectSessionResults) {
       for (const session of sessions) {
         const metadata = deps.sessionMetadataService?.getMetadata(session.id);
@@ -206,29 +286,32 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
         if (isArchived) continue;
 
         let pendingInputType: PendingInputType | undefined;
+        let pendingRequestId: string | undefined;
         let activity: AgentActivity | undefined;
 
-        const process = deps.supervisor?.getProcessForSession(session.id);
+        const process =
+          processBySessionId.get(session.id) ??
+          deps.supervisor?.getProcessForSession?.(session.id);
         if (process) {
-          const pendingRequest = process.getPendingInputRequest();
-          if (pendingRequest) {
-            pendingInputType =
-              pendingRequest.type === "tool-approval"
-                ? "tool-approval"
-                : "user-question";
-          }
-          const state = process.state.type;
+          pendingInputType = pendingInputTypeFromProcess(process);
+          pendingRequestId = pendingInputRequestIdFromProcess(process);
+          const state = getProcessActivity(process);
           if (state === "in-turn" || state === "waiting-input") {
             activity = state;
           }
-        } else {
+        }
+        if (!pendingInputType) {
+          // Same owner priority as the session routes: an owned process with no
+          // pending request of its own must still surface a bridge-held one,
+          // otherwise a blocked session never reaches needs-attention.
           const bridgedSession = bridgedSessionById.get(session.id) ?? null;
           if (
             bridgedSession &&
             activeBridgeSessionIds.has(bridgedSession.session.id)
           ) {
             pendingInputType = bridgedSession.pendingInputType;
-            activity = bridgedSession.activity;
+            activity ??= bridgedSession.activity;
+            if (pendingInputType) bridgeRequestIdTargets.add(session.id);
           }
         }
 
@@ -240,11 +323,13 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
           session,
           projectName: project.name,
           pendingInputType,
+          pendingRequestId,
           activity,
           hasUnread,
           customTitle: metadata?.customTitle ?? session.customTitle,
           aiTitle: metadata?.aiTitle ?? session.aiTitle,
           createdBy: metadata?.createdBy ?? session.createdBy,
+          originChannel: metadata?.originChannel ?? session.originChannel,
           originator: session.originator,
           source: session.source,
         });
@@ -272,22 +357,42 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
           )
         : undefined;
 
+      const bridgeOnlyActive = activeBridgeSessionIds.has(item.session.id);
+      const bridgeOnlyPendingType = bridgeOnlyActive
+        ? item.pendingInputType
+        : undefined;
+      if (bridgeOnlyPendingType) bridgeRequestIdTargets.add(item.session.id);
       allSessions.push({
         session: item.session,
         projectName: item.projectName,
-        pendingInputType: activeBridgeSessionIds.has(item.session.id)
-          ? item.pendingInputType
-          : undefined,
-        activity: activeBridgeSessionIds.has(item.session.id)
-          ? item.activity
-          : undefined,
+        pendingInputType: bridgeOnlyPendingType,
+        activity: bridgeOnlyActive ? item.activity : undefined,
         hasUnread,
         customTitle: metadata?.customTitle ?? item.session.customTitle,
         aiTitle: metadata?.aiTitle ?? item.session.aiTitle,
         createdBy: metadata?.createdBy ?? item.session.createdBy,
+        originChannel: metadata?.originChannel ?? item.session.originChannel,
         originator: item.session.originator,
         source: item.session.source,
       });
+    }
+
+    if (bridgeRequestIdTargets.size > 0) {
+      const resolved = new Map(
+        await Promise.all(
+          Array.from(bridgeRequestIdTargets, async (sessionId) => {
+            return [
+              sessionId,
+              await getBridgePendingRequestId(deps, sessionId),
+            ] as const;
+          }),
+        ),
+      );
+      for (const item of allSessions) {
+        if (item.pendingRequestId) continue;
+        const requestId = resolved.get(item.session.id);
+        if (requestId) item.pendingRequestId = requestId;
+      }
     }
 
     // Build the inbox response by categorizing into tiers
@@ -312,9 +417,11 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       }),
       updatedAt: item.session.updatedAt,
       pendingInputType: item.pendingInputType,
+      pendingRequestId: item.pendingRequestId,
       activity: item.activity,
       hasUnread: item.hasUnread,
       createdBy: item.createdBy,
+      originChannel: item.originChannel,
       originator: item.originator,
       source: item.source,
     });

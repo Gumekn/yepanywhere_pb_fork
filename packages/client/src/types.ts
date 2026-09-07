@@ -6,8 +6,11 @@ import type {
   CodexBranchOption,
   CodexBranchState,
   ContextUsage,
+  ProjectGitStatusSummary,
   SessionBranchOption,
   SessionBranchState,
+  SubagentDescriptor,
+  SubagentMetrics,
 } from "@yep-anywhere/shared";
 
 // Re-export shared types
@@ -43,6 +46,8 @@ export type {
   PendingInputType,
   AgentActivity,
   ContextUsage,
+  ContextCompactEvent,
+  ContextCumulativeUsage,
   SessionCreatedBy,
   SessionBranchOption,
   SessionBranchState,
@@ -50,6 +55,8 @@ export type {
   CodexBranchState,
   SessionOwnership,
   SessionRuntime,
+  SessionLastTurnStatus,
+  SessionRetryStatus,
   AppSessionSummary,
   AppSession,
   AgentStatus,
@@ -126,6 +133,12 @@ export interface Message {
   orphanedToolUseIds?: string[];
   /** Source tracking: "sdk" for streaming, "jsonl" for persisted */
   _source?: "sdk" | "jsonl";
+  /** Raw detail restored only for the active display live tail. */
+  _displayLiveTail?: boolean;
+  /** User prompt that owns a body-free Session Inspector index row. */
+  inspectorNavigationMessageId?: string;
+  /** Body-free boundary used to reconnect paginated Inspector rows to a turn. */
+  inspectorQuestionBoundary?: boolean;
   /** True if this message is from a Task subagent */
   isSubagent?: boolean;
   /** True if message is still being streamed (incomplete) */
@@ -163,25 +176,38 @@ export interface Message {
 // Type aliases for session types
 import type {
   AppSessionSummary,
+  ProviderName as ProviderNameType,
   SessionOwnership as SessionOwnershipType,
 } from "@yep-anywhere/shared";
 
 export type SessionStatus = SessionOwnershipType;
 export type SessionSummary = AppSessionSummary;
 
+/** Router state used while entering or deep-linking to a session page. */
+export interface SessionNavigationState {
+  initialStatus?: Extract<SessionOwnershipType, { owner: "self" }>;
+  initialTitle?: string;
+  initialProvider?: ProviderNameType;
+  targetMessageId?: string;
+  targetBranchId?: string;
+  /** Poll the newly-created native edit fork until its sibling graph lands. */
+  refreshBranchAfterNavigation?: boolean;
+}
+
 /**
- * Full session with messages.
- * Uses Message type (AppMessage with required id).
+ * Full session metadata for the session page.
+ *
+ * Messages are intentionally NOT part of this type. The API returns them once,
+ * as a sibling `messages` field, and message state is owned by
+ * `useSessionMessages`. Keeping a `messages` array here previously invited the
+ * server to serialize a second, unread copy of the whole window.
  */
 export interface Session extends SessionSummary {
-  messages: Message[];
   /** Provider-agnostic branch state for sessions with editable DAG/rollback history. */
   branchState?: SessionBranchState;
   /** Codex-only branch state derived from thread_rolled_back markers. */
   codexBranchState?: CodexBranchState;
 }
-
-export type BrowserSessionMetadata = Omit<Session, "messages">;
 
 /**
  * Agent session content for Task subagents.
@@ -190,6 +216,12 @@ export type BrowserSessionMetadata = Omit<Session, "messages">;
 export interface AgentSession {
   messages: Message[];
   status: AgentStatusType;
+  /** Resolved subagent type/profile (e.g. `explore`), when known. */
+  agentType?: string;
+  /** Derived run metrics (usage breakdown, tool/step counts, duration). */
+  metrics?: SubagentMetrics;
+  /** Rich identity + lifecycle descriptor, when the provider supplies it. */
+  descriptor?: SubagentDescriptor;
 }
 
 /**
@@ -203,4 +235,7 @@ export interface Project {
   activeOwnedCount: number;
   activeExternalCount: number;
   lastActivity: string | null;
+  /** Working copy used through a configured remote Claude executor. */
+  isRemoteProject?: boolean;
+  gitStatus?: ProjectGitStatusSummary | null;
 }

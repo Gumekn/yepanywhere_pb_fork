@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readRenderer } from "../ReadRenderer";
 
@@ -18,6 +18,9 @@ const renderContext = {
   theme: "dark" as const,
 };
 
+const originalCreateObjectUrl = URL.createObjectURL;
+const originalRevokeObjectUrl = URL.revokeObjectURL;
+
 if (!readRenderer.renderInteractiveSummary) {
   throw new Error("Read renderer must provide interactive summary");
 }
@@ -25,6 +28,24 @@ if (!readRenderer.renderInteractiveSummary) {
 describe("ReadRenderer", () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    if (originalCreateObjectUrl) {
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: originalCreateObjectUrl,
+      });
+    } else {
+      Reflect.deleteProperty(URL, "createObjectURL");
+    }
+    if (originalRevokeObjectUrl) {
+      Object.defineProperty(URL, "revokeObjectURL", {
+        configurable: true,
+        value: originalRevokeObjectUrl,
+      });
+    } else {
+      Reflect.deleteProperty(URL, "revokeObjectURL");
+    }
   });
 
   it("keeps normal text reads clickable", () => {
@@ -109,23 +130,69 @@ describe("ReadRenderer", () => {
     expect(screen.getByText(/continues in Shell/)).toBeDefined();
   });
 
-  it("renders historical image read results without filePath/content fields", () => {
+  it("renders tagged read output instead of a failed read fallback", () => {
+    const rawResult =
+      '<path>/repo/data/benchmark_runs/j-9oi4c3ufw4__aime_25_hf/task.json</path>\n<type>file</type>\n<content>\n1: {\n2:   "task_id": "j-9oi4c3ufw4"\n3: }\n(End of file - total 3 lines)\n</content>';
+
+    render(
+      <div>
+        {readRenderer.renderToolResult(
+          rawResult as never,
+          false,
+          renderContext,
+          {
+            file_path:
+              "/repo/data/benchmark_runs/j-9oi4c3ufw4__aime_25_hf/task.json",
+          },
+        )}
+      </div>,
+    );
+
+    expect(screen.getByRole("button", { name: /task\.json/i })).toBeDefined();
+    expect(screen.queryByText("Failed to read file")).toBeNull();
+    expect(
+      readRenderer.getResultSummary?.(rawResult as never, false, {
+        file_path:
+          "/repo/data/benchmark_runs/j-9oi4c3ufw4__aime_25_hf/task.json",
+      } as never),
+    ).toBe("task.json");
+  });
+
+  it("releases temporary PDF object URLs after the viewer consumes them", () => {
+    vi.useFakeTimers();
+    const createObjectUrl = vi.fn(() => "blob:yep-pdf");
+    const revokeObjectUrl = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectUrl,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectUrl,
+    });
+    vi.spyOn(window, "open").mockReturnValue(window);
+
     render(
       <div>
         {readRenderer.renderToolResult(
           {
-            type: "image",
+            type: "pdf",
             file: {
-              base64:
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+              base64: "JVBERi0xLjQ=",
+              type: "application/pdf",
             },
-          } as never,
+          },
           false,
           renderContext,
         )}
       </div>,
     );
 
-    expect(screen.getByRole("img", { name: /file content/i })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /Open PDF/i }));
+    expect(createObjectUrl).toHaveBeenCalledOnce();
+    expect(revokeObjectUrl).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(60_000);
+    expect(revokeObjectUrl).toHaveBeenCalledWith("blob:yep-pdf");
   });
 });

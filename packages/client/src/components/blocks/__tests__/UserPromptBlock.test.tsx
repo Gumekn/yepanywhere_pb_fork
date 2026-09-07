@@ -1,5 +1,11 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "../../../i18n";
 import type { ContentBlock } from "../../../types";
 import { UserPromptBlock } from "../UserPromptBlock";
@@ -7,6 +13,89 @@ import { UserPromptBlock } from "../UserPromptBlock";
 describe("UserPromptBlock", () => {
   afterEach(() => {
     cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps a one-click copy action inside the user prompt bubble", () => {
+    const text = "授权 G-M-TARGET-ROLLOUT-001 执行真实 live gate。";
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={text} />
+      </I18nProvider>,
+    );
+
+    const bubble = screen.getByText(text).closest(".message-user-prompt");
+    const copyButton = screen.getByRole("button", { name: "Copy message" });
+
+    expect(bubble?.contains(copyButton)).toBe(true);
+    expect(copyButton.closest(".message-actions-bubble")).not.toBeNull();
+  });
+
+  it("switches from an edited Codex prompt to its parent-session sibling", () => {
+    const onSelectBranch = vi.fn();
+    const alternatives = [
+      {
+        id: "b1",
+        sessionId: "parent-session",
+        parentId: "a",
+        prompt: "b",
+        title: "b",
+        depth: 2,
+        index: 2,
+        siblingIndex: 1,
+        siblingCount: 2,
+        isActive: false,
+        provider: "codex" as const,
+      },
+      {
+        id: "b2",
+        sessionId: "child-session",
+        parentId: "a",
+        prompt: "b2",
+        title: "b2",
+        depth: 2,
+        index: 4,
+        siblingIndex: 2,
+        siblingCount: 2,
+        isActive: true,
+        provider: "codex" as const,
+      },
+    ];
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock
+          content="b2"
+          branch={{
+            sessionId: "child-session",
+            branchId: "b2",
+            activeBranchId: "d",
+            selectedBranchId: "d",
+            parentId: "a",
+            siblingIndex: 2,
+            siblingCount: 2,
+            alternatives,
+          }}
+          onSelectBranch={onSelectBranch}
+        />
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText("Branch 2/2")).toBeDefined();
+    expect(screen.getByText("Session child-session")).toBeDefined();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Previous conversation branch" }),
+    );
+    expect(onSelectBranch).toHaveBeenCalledWith("b1");
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Next conversation branch",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
   });
 
   it("renders Codex input_image blocks as uploaded file metadata", () => {
@@ -32,6 +121,161 @@ describe("UserPromptBlock", () => {
     expect(screen.queryByText("<image>")).toBeNull();
     expect(screen.getByText(/pasted-image-1\.png/)).toBeDefined();
     expect(screen.queryByText(/data:image\/png;base64/i)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Copy message and images" }),
+    ).toBeDefined();
+  });
+
+  it("keeps the copy action for an image-only user input", () => {
+    const content: ContentBlock[] = [
+      {
+        type: "input_image",
+        image_url: "data:image/png;base64,AAAA",
+        mime_type: "image/png",
+      },
+    ];
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    const copyButton = screen.getByRole("button", {
+      name: "Copy message and images",
+    });
+    expect(copyButton.closest(".message-user-prompt")).not.toBeNull();
+    expect(screen.getByText(/pasted-image-1\.png/)).toBeDefined();
+  });
+
+  it("renders Feishu prompts without raw manifests and keeps image preview", () => {
+    const downloadUrl =
+      "/api/projects/cHJvamVjdA/sessions/session-1/upload/123e4567-e89b-12d3-a456-426614174000_feishu-1.image";
+    const content: ContentBlock[] = [
+      {
+        type: "text",
+        text: `![image](img_v3_fixture)
+怎么回复
+
+<feishu_context_manifest>
+mode: current
+effective_mode: current
+messages: 1
+attachments: 1
+operator: ou_private
+complete: true
+warnings: none
+</feishu_context_manifest>
+
+<feishu_attachment_manifest>
+- private_feishu-1.image | kind=image | mime=image/png | bytes=4 | sha256=private | ref=upload:private | status=downloaded
+</feishu_attachment_manifest>
+
+User uploaded files:
+- feishu-1.image (4 B, image/png): ${downloadUrl}`,
+      },
+      {
+        type: "input_image",
+        image_url: "data:image/png;base64,AAAA",
+        mime_type: "image/png",
+      },
+    ];
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText("From Feishu")).toBeDefined();
+    expect(screen.getByText("怎么回复")).toBeDefined();
+    expect(screen.queryByText(/feishu_context_manifest/)).toBeNull();
+    expect(screen.queryByText(/ou_private/)).toBeNull();
+    expect(screen.queryByText(/img_v3_fixture/)).toBeNull();
+
+    const imageButton = screen.getByRole("button", { name: "Open Image 1" });
+    fireEvent.click(imageButton);
+    expect(screen.getByRole("img", { name: "Image 1" })).toBeDefined();
+  });
+
+  it("opens Feishu document links and downloaded files", () => {
+    const downloadUrl =
+      "/api/projects/cHJvamVjdA/sessions/session-1/upload/123e4567-e89b-12d3-a456-426614174000_report.pdf";
+    const content = `请查看 [项目文档](https://example.test/doc)
+
+<feishu_context_manifest>
+mode: current
+effective_mode: current
+messages: 1
+attachments: 1
+complete: true
+warnings: none
+</feishu_context_manifest>
+
+<feishu_attachment_manifest>
+- report.pdf | kind=pdf | mime=application/pdf | bytes=1024 | sha256=private | ref=upload:private | status=downloaded
+</feishu_attachment_manifest>
+
+User uploaded files:
+- report.pdf (1 KB, application/pdf): ${downloadUrl}`;
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    const documentLink = screen.getByRole("link", { name: "项目文档" });
+    expect(documentLink.getAttribute("href")).toBe("https://example.test/doc");
+    expect(documentLink.getAttribute("target")).toBe("_blank");
+
+    const attachmentLink = screen.getByRole("link", {
+      name: "Open report.pdf",
+    });
+    expect(attachmentLink.getAttribute("href")).toContain(
+      "/api/projects/cHJvamVjdA/sessions/session-1/upload/123e4567-e89b-12d3-a456-426614174000_report.pdf",
+    );
+  });
+
+  it("stops bare URL autolinks at CJK punctuation and prose", () => {
+    const content =
+      "线上域名是 https://api-testing.xaminim.com/，完成上线验收；备用 https://example.test/path。";
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    const links = screen.getAllByRole("link");
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([
+      "https://api-testing.xaminim.com/",
+      "https://example.test/path",
+    ]);
+    expect(links.map((link) => link.textContent)).toEqual([
+      "https://api-testing.xaminim.com/",
+      "https://example.test/path",
+    ]);
+    expect(screen.getByText(/，完成上线验收；备用/)).toBeDefined();
+  });
+
+  it("trims trailing sentence punctuation but keeps balanced parentheses", () => {
+    const content =
+      "see https://example.test/a. and https://example.test/wiki/Foo_(bar) plus (https://example.test/b)";
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    expect(
+      screen.getAllByRole("link").map((link) => link.getAttribute("href")),
+    ).toEqual([
+      "https://example.test/a",
+      "https://example.test/wiki/Foo_(bar)",
+      "https://example.test/b",
+    ]);
   });
 
   it("opens preview modal for Codex inline input_image attachments", () => {
@@ -88,6 +332,140 @@ describe("UserPromptBlock", () => {
     expect(screen.getByText(/annotated-shot\.jpg/)).toBeDefined();
   });
 
+  it("shows detailed request errors for uploaded image attachments", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: "File not found" }), {
+          status: 404,
+          statusText: "Not Found",
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    const content =
+      "Check this image.\n\nUser uploaded files:\n- screenshot.jpg (1 KB, image/jpeg): /Users/test/.yep-anywhere/uploads/project-id/session-id/76285622-cb0a-47e3-a0d9-ffcdae95af9b_screenshot.jpg";
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /screenshot\.jpg/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain(
+        "HTTP 404 Not Found",
+      );
+    });
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Content-Type: application/json",
+    );
+    expect(screen.getByRole("alert").textContent).toContain("File not found");
+  });
+
+  it.each(["url", "posix", "windows"])(
+    "opens authenticated upload previews from %s locations",
+    async (kind) => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: "Synthetic preview failure" }), {
+          status: 503,
+          statusText: "Unavailable",
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const downloadUrl =
+        "/api/projects/cHJvamVjdA/sessions/session-1/upload/123e4567-e89b-12d3-a456-426614174000_screenshot.png";
+      const localPath =
+        "/Users/test/.yep-anywhere/uploads/cHJvamVjdA/session-1/123e4567-e89b-12d3-a456-426614174000_screenshot.png";
+      const location =
+        kind === "url"
+          ? downloadUrl
+          : kind === "windows"
+            ? `C:${localPath.replaceAll("/", "\\")}`
+            : localPath;
+      const content = `Check this image.\n\nUser uploaded files:\n- screenshot.png (1 KB, image/png): ${location}`;
+
+      render(
+        <I18nProvider>
+          <UserPromptBlock content={content} />
+        </I18nProvider>,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: /screenshot\.png/i }));
+
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith(downloadUrl, {
+          credentials: "include",
+        });
+      });
+      expect(screen.getByRole("dialog")).toBeDefined();
+      expect(
+        screen
+          .getByRole("button", { name: /screenshot\.png/i })
+          .getAttribute("title"),
+      ).toContain(location);
+    },
+  );
+
+  it("merges persisted Codex image data into the named managed attachment", () => {
+    const downloadUrl =
+      "/api/projects/cHJvamVjdA/sessions/session-1/upload/123e4567-e89b-12d3-a456-426614174000_screenshot.png";
+    const content: ContentBlock[] = [
+      {
+        type: "text",
+        text: `Check this image.\n\nUser uploaded files:\n- screenshot.png (1 KB, image/png): ${downloadUrl}`,
+      },
+      {
+        type: "input_image",
+        image_url: "data:image/png;base64,AAAA",
+        mime_type: "image/png",
+      },
+    ];
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    expect(
+      screen.getByRole("button", { name: /screenshot\.png/i }),
+    ).toBeDefined();
+    expect(screen.queryByText(/pasted-image-1\.png/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /screenshot\.png/i }));
+    expect(screen.getByRole("img", { name: /screenshot\.png/i })).toBeDefined();
+  });
+
+  it("does not duplicate a managed attachment when the Codex image is deferred", () => {
+    const downloadUrl =
+      "/api/projects/cHJvamVjdA/sessions/session-1/upload/123e4567-e89b-12d3-a456-426614174000_screenshot.png";
+    const content: ContentBlock[] = [
+      {
+        type: "text",
+        text: `Check this image.\n\nUser uploaded files:\n- screenshot.png (1 KB, image/png): ${downloadUrl}`,
+      },
+      // Display projection strips image_url/mime_type and only leaves a marker.
+      { type: "input_image", deferred: true },
+    ];
+
+    render(
+      <I18nProvider>
+        <UserPromptBlock content={content} />
+      </I18nProvider>,
+    );
+
+    expect(
+      screen.getAllByRole("button", { name: /screenshot\.png/i }),
+    ).toHaveLength(1);
+    expect(screen.queryByText(/pasted-image-1/i)).toBeNull();
+  });
+
   it("renders injected skill blocks as clickable skill references", () => {
     const content = `<skill>
 <name>git-commit-push</name>
@@ -125,29 +503,5 @@ Commit and push current changes.
       screen.getByText("Review repository changes and push them."),
     ).toBeDefined();
     expect(screen.getByText(/# Git Commit Push/)).toBeDefined();
-  });
-
-  it("renders a file-only Codex Desktop prompt without provider wrapper text", () => {
-    const content = `# Files mentioned by the user:
-
-## E1089999.BIN: F:/DCOLYMP/E1089999.BIN
-
-<in-app-browser-context source="ambient-ui-state">
-hidden browser state
-</in-app-browser-context>
-
-## My request:
-`;
-
-    render(
-      <I18nProvider>
-        <UserPromptBlock content={content} />
-      </I18nProvider>,
-    );
-
-    expect(screen.getByText(/E1089999\.BIN/)).toBeDefined();
-    expect(screen.queryByText(/Files mentioned by the user/)).toBeNull();
-    expect(screen.queryByText(/in-app-browser-context/)).toBeNull();
-    expect(screen.queryByText(/My request/)).toBeNull();
   });
 });

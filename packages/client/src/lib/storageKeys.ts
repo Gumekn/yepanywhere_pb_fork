@@ -47,9 +47,10 @@ export const UI_KEYS = {
   fontSize: "yep-anywhere-font-size",
   tabSize: "yep-anywhere-tab-size",
   sidebarWidth: "yep-anywhere-sidebar-width",
+  detailPanelWidthRatio: "yep-anywhere-detail-panel-width-ratio",
   sidebarExpanded: "yep-anywhere-sidebar-expanded",
-  outlineWidth: "yep-anywhere-outline-width",
-  inspectorWidth: "yep-anywhere-inspector-width",
+  sessionInspectorExpanded: "yep-anywhere-session-inspector-expanded",
+  reportsDocumentPanelExpanded: "yep-anywhere-reports-document-panel-expanded",
   funPhrases: "yep-anywhere-fun-phrases-enabled",
   streamingEnabled: "yep-anywhere-streaming-enabled",
   developerMode: "yep-anywhere-developer-mode",
@@ -58,6 +59,7 @@ export const UI_KEYS = {
   emulatorMaxWidth: "yep-anywhere-emulator-max-width",
   emulatorQuality: "yep-anywhere-emulator-quality",
   emulatorAdaptiveFps: "yep-anywhere-emulator-adaptive-fps",
+  searchSort: "yep-anywhere-search-sort",
 } as const;
 
 // ============================================================================
@@ -74,7 +76,6 @@ export const SERVER_SCOPED_KEYS = {
   browserProfileId: "browser-profile-id",
   notifyInApp: "notify-in-app",
   recentProject: "recent-project",
-  thinkingOption: "thinking-option",
 } as const;
 
 /** Build a server-scoped storage key */

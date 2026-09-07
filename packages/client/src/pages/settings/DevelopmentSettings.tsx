@@ -16,12 +16,15 @@ import { useSchemaValidation } from "../../hooks/useSchemaValidation";
 import { useServerSettings } from "../../hooks/useServerSettings";
 import { useVersion } from "../../hooks/useVersion";
 import { useI18n } from "../../i18n";
+import {
+  isMobileShellDocument,
+  uploadNativeLogs,
+} from "../../lib/nativePushBridge";
 
 const LAST_DEPLOY_JOB_KEY = "yepanywhere:lastDeployJobId";
 const DEFAULT_RESTART_TARGETS: Required<DeploymentRestartTargets> = {
   server: true,
   codexBridge: false,
-  claudeBridge: false,
 };
 
 function getErrorMessage(err: unknown): string {
@@ -70,6 +73,30 @@ export function DevelopmentSettings() {
   const activeAgentsCount = useGlobalActiveAgents();
   const { holdModeEnabled, setHoldModeEnabled } = useDeveloperMode();
   const { ignoredTools, clearIgnoredTools } = useSchemaValidationContext();
+  const [uploadingNativeLogs, setUploadingNativeLogs] = useState(false);
+  const [nativeLogUploadStatus, setNativeLogUploadStatus] = useState<
+    string | null
+  >(null);
+  const isMobileShell = isMobileShellDocument();
+
+  const handleUploadNativeLogs = useCallback(async () => {
+    setUploadingNativeLogs(true);
+    setNativeLogUploadStatus(null);
+    try {
+      const result = await uploadNativeLogs();
+      setNativeLogUploadStatus(
+        t("developmentNativeLogsUploaded", { count: result.uploaded }),
+      );
+    } catch (err) {
+      setNativeLogUploadStatus(
+        t("developmentNativeLogsUploadFailed", {
+          message: getErrorMessage(err),
+        }),
+      );
+    } finally {
+      setUploadingNativeLogs(false);
+    }
+  }, [t]);
   const { settings: serverSettings, updateSetting: updateServerSetting } =
     useServerSettings();
   const {
@@ -105,6 +132,7 @@ export function DevelopmentSettings() {
   }, [restarting, connected]);
 
   const handleRestartServer = async () => {
+    if (unsafeToRestart) return;
     setRestarting(true);
     await reloadBackend();
   };
@@ -150,16 +178,39 @@ export function DevelopmentSettings() {
   }, [refreshDeployment, shouldProbeDeployment]);
 
   useEffect(() => {
-    if (deployJob?.status !== "running") return;
+    if (deployJob?.status !== "running" || !deployJob.id) return;
     const interval = window.setInterval(() => {
-      void refreshDeployment();
+      void api
+        .getDeploymentJob(deployJob.id)
+        .then(({ job }) => {
+          setDeployJob(job);
+          if (isTerminalDeployJob(job)) {
+            localStorage.removeItem(LAST_DEPLOY_JOB_KEY);
+            if (job.status === "succeeded") {
+              void refetchVersionFresh();
+            }
+            void refreshDeployment();
+          }
+        })
+        .catch(() => {
+          // A server deploy temporarily makes the API unavailable. Keep the
+          // running job visible and retry the lightweight job endpoint.
+        });
     }, 2500);
     return () => window.clearInterval(interval);
-  }, [deployJob?.status, refreshDeployment]);
+  }, [
+    deployJob?.id,
+    deployJob?.status,
+    refetchVersionFresh,
+    refreshDeployment,
+  ]);
 
   const handleStartDeployment = async (
     action: DeploymentActionId,
-    options?: { restartTargets?: DeploymentRestartTargets },
+    options?: {
+      allowSessionInterrupt?: boolean;
+      restartTargets?: DeploymentRestartTargets;
+    },
   ) => {
     setStartingAction(action);
     setDeployError(null);
@@ -170,6 +221,7 @@ export function DevelopmentSettings() {
         install: apkInstall,
         deviceId: apkDeviceId || undefined,
         skipChecks,
+        allowSessionInterrupt: options?.allowSessionInterrupt,
         restartTargets: options?.restartTargets,
       });
       setDeployJob(job);
@@ -203,9 +255,7 @@ export function DevelopmentSettings() {
   const stagedBuildId = deployStatus?.stagedBuild?.buildId?.slice(0, 12);
   const latestApk = deployStatus?.apk.latest ?? null;
   const hasSelectedRestartTarget =
-    restartTargets.server ||
-    restartTargets.codexBridge ||
-    restartTargets.claudeBridge;
+    restartTargets.server || restartTargets.codexBridge;
 
   const setRestartTarget = (
     target: keyof Required<DeploymentRestartTargets>,
@@ -289,6 +339,17 @@ export function DevelopmentSettings() {
               <div className="settings-item-info">
                 <strong>{t("deploymentServerTitle")}</strong>
                 <p>{t("deploymentServerDescription")}</p>
+                <p className="settings-hint">
+                  {t("deploymentDevServerDescription")}
+                </p>
+                {unsafeToRestart && (
+                  <p className="settings-warning">
+                    {t("deploymentWaitForIdleWarning", {
+                      count: workerActivity.activeWorkers,
+                      suffix: workerActivity.activeWorkers !== 1 ? "s " : " ",
+                    })}
+                  </p>
+                )}
                 <label className="settings-checkbox-row">
                   <input
                     type="checkbox"
@@ -302,12 +363,32 @@ export function DevelopmentSettings() {
                 <button
                   type="button"
                   className="settings-button"
-                  onClick={() => void handleStartDeployment("server")}
+                  onClick={() =>
+                    void handleStartDeployment("server", {
+                      // A server deploy always rebuilds/restarts 8022. Include
+                      // the selected bridge sidecar so it restarts onto the
+                      // same freshly built bundle instead of keeping the old
+                      // JavaScript loaded in memory.
+                      restartTargets: {
+                        codexBridge: restartTargets.codexBridge,
+                      },
+                    })
+                  }
                   disabled={!deployStatus?.available || deployRunning}
                 >
                   {startingAction === "server"
                     ? t("deploymentStarting")
                     : t("deploymentRedeployServer")}
+                </button>
+                <button
+                  type="button"
+                  className="settings-button settings-button-secondary"
+                  onClick={() => void handleStartDeployment("server-dev")}
+                  disabled={!deployStatus?.available || deployRunning}
+                >
+                  {startingAction === "server-dev"
+                    ? t("deploymentStarting")
+                    : t("deploymentStartDevServer")}
                 </button>
               </div>
             </div>
@@ -331,17 +412,6 @@ export function DevelopmentSettings() {
                   disabled={deployRunning}
                 />
                 <span>{t("deploymentRestartTargetCodexBridge")}</span>
-              </label>
-              <label className="settings-checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={restartTargets.claudeBridge}
-                  onChange={(e) =>
-                    setRestartTarget("claudeBridge", e.target.checked)
-                  }
-                  disabled={deployRunning}
-                />
-                <span>{t("deploymentRestartTargetClaudeBridge")}</span>
               </label>
               <button
                 type="button"
@@ -497,6 +567,30 @@ export function DevelopmentSettings() {
         </div>
       )}
 
+      {isMobileShell && (
+        <div className="settings-group">
+          <div className="settings-item">
+            <div className="settings-item-info">
+              <strong>{t("developmentNativeLogsTitle")}</strong>
+              <p>{t("developmentNativeLogsDescription")}</p>
+              {nativeLogUploadStatus && (
+                <p className="settings-pending">{nativeLogUploadStatus}</p>
+              )}
+            </div>
+            <button
+              type="button"
+              className="settings-button"
+              onClick={handleUploadNativeLogs}
+              disabled={uploadingNativeLogs}
+            >
+              {uploadingNativeLogs
+                ? t("developmentNativeLogsUploading")
+                : t("developmentNativeLogsUpload")}
+            </button>
+          </div>
+        </div>
+      )}
+
       {isManualReloadMode && (
         <>
           <div className="settings-group">
@@ -586,7 +680,7 @@ export function DevelopmentSettings() {
                 </p>
                 {unsafeToRestart && (
                   <p className="settings-warning">
-                    {t("developmentInterruptedWarning", {
+                    {t("developmentRestartBlockedWarning", {
                       count: workerActivity.activeWorkers,
                       suffix: workerActivity.activeWorkers !== 1 ? "s " : " ",
                     })}
@@ -595,15 +689,13 @@ export function DevelopmentSettings() {
               </div>
               <button
                 type="button"
-                className={`settings-button ${unsafeToRestart ? "settings-button-danger" : ""}`}
+                className="settings-button"
                 onClick={handleRestartServer}
-                disabled={restarting}
+                disabled={restarting || unsafeToRestart}
               >
                 {restarting
                   ? t("developmentRestarting")
-                  : unsafeToRestart
-                    ? t("developmentRestartAnyway")
-                    : t("developmentRestart")}
+                  : t("developmentRestart")}
               </button>
             </div>
           </div>

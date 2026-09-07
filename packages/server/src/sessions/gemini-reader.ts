@@ -13,6 +13,7 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
+  type ContextCumulativeUsage,
   type GeminiAssistantMessage,
   type GeminiSessionFile,
   type GeminiSessionMessage,
@@ -32,6 +33,7 @@ import type {
   Session,
   SessionSummary,
 } from "../supervisor/types.js";
+import { sanitizePublicUserPrompt } from "./public-user-prompt.js";
 import type {
   GetSessionOptions,
   ISessionReader,
@@ -144,6 +146,9 @@ export class GeminiSessionReader implements ISessionReader {
       const messageCount = session.messages.length;
       const model = this.extractModel(session.messages);
       const contextUsage = this.extractContextUsage(session.messages, model);
+      const cumulativeUsage = this.extractCumulativeTokenUsage(
+        session.messages,
+      );
 
       // Skip sessions with no actual conversation messages
       if (messageCount === 0) return null;
@@ -159,6 +164,7 @@ export class GeminiSessionReader implements ISessionReader {
         userQuestions,
         ownership: { owner: "none" },
         contextUsage,
+        cumulativeUsage,
         provider: "gemini",
         model,
       };
@@ -445,7 +451,9 @@ export class GeminiSessionReader implements ISessionReader {
     for (const msg of messages) {
       if (msg.type === "user") {
         const userMsg = msg as GeminiUserMessage;
-        const fullTitle = getGeminiUserMessageText(userMsg.content).trim();
+        const fullTitle = sanitizePublicUserPrompt(
+          getGeminiUserMessageText(userMsg.content),
+        ).trim();
         const title =
           fullTitle.length <= SESSION_TITLE_MAX_LENGTH
             ? fullTitle
@@ -513,6 +521,44 @@ export class GeminiSessionReader implements ISessionReader {
     }
 
     return undefined;
+  }
+
+  private extractCumulativeTokenUsage(
+    messages: GeminiSessionMessage[],
+  ): ContextCumulativeUsage | undefined {
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    let totalTokens = 0;
+    let turnCount = 0;
+
+    for (const msg of messages) {
+      if (msg.type !== "gemini") continue;
+      const tokens = (msg as GeminiAssistantMessage).tokens;
+      if (!tokens) continue;
+
+      const input = tokens.input ?? 0;
+      const output = tokens.output ?? 0;
+      const cached = tokens.cached ?? 0;
+      const total = tokens.total ?? input + output + cached;
+
+      inputTokens += input;
+      outputTokens += output;
+      cacheReadTokens += cached;
+      totalTokens += total;
+      turnCount += 1;
+    }
+
+    if (turnCount === 0) return undefined;
+
+    return {
+      totalTokens,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens: 0,
+      turnCount,
+    };
   }
 
   /**

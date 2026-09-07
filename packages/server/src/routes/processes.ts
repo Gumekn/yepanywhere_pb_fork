@@ -6,11 +6,14 @@ import { Hono } from "hono";
 import type { SessionIndexService } from "../indexes/index.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { ProjectScanner } from "../projects/scanner.js";
+import { EmbeddedRuntimeController } from "../runtime/EmbeddedRuntimeController.js";
+import type { RuntimeController } from "../runtime/types.js";
 import type { ISessionReader } from "../sessions/types.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
 import type { ProcessInfo, Project } from "../supervisor/types.js";
 
 export interface ProcessesDeps {
+  runtimeController?: RuntimeController;
   supervisor: Supervisor;
   scanner: ProjectScanner;
   readerFactory: (project: Project) => ISessionReader;
@@ -90,7 +93,9 @@ async function enrichProcessInfo(
     // This fixes stale terminated-process rows that were started with the wrong
     // provider but whose session metadata and on-disk transcript are correct.
     enriched.provider =
-      summary?.provider ?? metadata?.provider ?? process.provider;
+      summary?.provider ??
+      deps.sessionMetadataService?.getProvider(process.sessionId) ??
+      process.provider;
 
     // Add context usage if available
     if (summary?.contextUsage) {
@@ -106,13 +111,15 @@ async function enrichProcessInfo(
 
 export function createProcessesRoutes(deps: ProcessesDeps): Hono {
   const routes = new Hono();
+  const runtimeController =
+    deps.runtimeController ?? new EmbeddedRuntimeController(deps.supervisor);
 
   // GET /api/processes - List all active processes
   // Query params:
   //   - includeTerminated: if "true", also includes recently terminated processes
   routes.get("/", async (c) => {
     const includeTerminated = c.req.query("includeTerminated") === "true";
-    const processes = deps.supervisor.getProcessInfoList();
+    const processes = await runtimeController.listProcesses();
 
     // Enrich all processes with session titles and model info
     const enrichedProcesses = await Promise.all(
@@ -121,7 +128,7 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
 
     if (includeTerminated) {
       const terminatedProcesses =
-        deps.supervisor.getRecentlyTerminatedProcesses();
+        await runtimeController.listRecentlyTerminatedProcesses();
       // Also enrich terminated processes
       const enrichedTerminated = await Promise.all(
         terminatedProcesses.map((p) => enrichProcessInfo(p, deps)),
@@ -139,7 +146,7 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
   routes.post("/:processId/abort", async (c) => {
     const processId = c.req.param("processId");
 
-    const aborted = await deps.supervisor.abortProcess(processId);
+    const { aborted } = await runtimeController.abortProcess(processId);
     if (!aborted) {
       return c.json({ error: "Process not found" }, 404);
     }
@@ -152,11 +159,13 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
   routes.post("/:processId/interrupt", async (c) => {
     const processId = c.req.param("processId");
 
-    const result = await deps.supervisor.interruptProcess(processId);
+    const result = await runtimeController.interruptProcess(processId);
     if (!result.success && !result.supported) {
       // Process not found or doesn't support interrupt
       if (
-        !deps.supervisor.getProcessInfoList().some((p) => p.id === processId)
+        !(await runtimeController.listProcesses()).some(
+          (p) => p.id === processId,
+        )
       ) {
         return c.json({ error: "Process not found" }, 404);
       }
@@ -172,12 +181,12 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
   routes.get("/:processId/models", async (c) => {
     const processId = c.req.param("processId");
 
-    const process = deps.supervisor.getProcess(processId);
+    const process = await runtimeController.getProcess(processId);
     if (!process) {
       return c.json({ error: "Process not found" }, 404);
     }
 
-    const models = await process.supportedModels();
+    const models = await runtimeController.getSupportedModels(processId);
     if (models === null) {
       // Process doesn't support dynamic model listing
       return c.json(
@@ -194,12 +203,12 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
   routes.get("/:processId/commands", async (c) => {
     const processId = c.req.param("processId");
 
-    const process = deps.supervisor.getProcess(processId);
+    const process = await runtimeController.getProcess(processId);
     if (!process) {
       return c.json({ error: "Process not found" }, 404);
     }
 
-    const commands = await process.supportedCommands();
+    const commands = await runtimeController.getSupportedCommands(processId);
     if (commands === null) {
       // Process doesn't support dynamic command listing
       return c.json(
@@ -216,13 +225,13 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
   routes.post("/:processId/model", async (c) => {
     const processId = c.req.param("processId");
 
-    const process = deps.supervisor.getProcess(processId);
+    const process = await runtimeController.getProcess(processId);
     if (!process) {
       return c.json({ error: "Process not found" }, 404);
     }
 
     const body = await c.req.json<{ model?: string }>();
-    const success = await process.setModel(body.model);
+    const { success } = await runtimeController.setModel(processId, body.model);
 
     if (!success) {
       return c.json(
@@ -231,7 +240,142 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
       );
     }
 
-    return c.json({ success: true, model: body.model });
+    return c.json({
+      success: true,
+      model: body.model,
+      reasoningEffort:
+        process.provider === "pi"
+          ? (process.reasoningEffort ??
+            process.requestedReasoningEffort ??
+            "default")
+          : undefined,
+    });
+  });
+
+  // POST /api/processes/:processId/compact - Trigger a provider-native
+  // context compaction (Pi compact / ZCode session/compact).
+  routes.post("/:processId/compact", async (c) => {
+    const processId = c.req.param("processId");
+
+    const process = await runtimeController.getProcess(processId);
+    if (!process) {
+      return c.json({ error: "Process not found" }, 404);
+    }
+
+    try {
+      const { success } = await runtimeController.compact(processId);
+      if (!success) {
+        return c.json(
+          { error: "Context compaction not supported for this process" },
+          400,
+        );
+      }
+      return c.json({ success: true });
+    } catch (error) {
+      return c.json(
+        { error: error instanceof Error ? error.message : "Compact failed" },
+        502,
+      );
+    }
+  });
+
+  // POST /api/processes/:processId/reasoning-effort - Change the
+  // provider-native reasoning effort mid-session (Pi set_thinking_level /
+  // ZCode session/setThoughtLevel). Body: { effort: string }
+  routes.post("/:processId/reasoning-effort", async (c) => {
+    const processId = c.req.param("processId");
+
+    const process = await runtimeController.getProcess(processId);
+    if (!process) {
+      return c.json({ error: "Process not found" }, 404);
+    }
+
+    const body = await c.req.json<{ effort?: string }>();
+    const effort = body.effort?.trim();
+    if (!effort) {
+      return c.json({ error: "effort is required" }, 400);
+    }
+
+    try {
+      const { success } = await runtimeController.setReasoningEffort(
+        processId,
+        effort,
+      );
+      if (!success) {
+        return c.json(
+          {
+            error: "Reasoning effort switching not supported for this process",
+          },
+          400,
+        );
+      }
+      return c.json({ success: true, effort });
+    } catch (error) {
+      return c.json(
+        {
+          error:
+            error instanceof Error ? error.message : "Effort switch failed",
+        },
+        400,
+      );
+    }
+  });
+
+  // POST /api/processes/:processId/goal - Goal lifecycle actions (ZCode
+  // session/goal and Codex thread/goal native controls). Body: { action:
+  // "show"|"set"|"replace"|"pause"|"resume"|"clear", objective?: string }.
+  // set/replace require objective.
+  routes.post("/:processId/goal", async (c) => {
+    const processId = c.req.param("processId");
+
+    const process = await runtimeController.getProcess(processId);
+    if (!process) {
+      return c.json({ error: "Process not found" }, 404);
+    }
+
+    const body = await c.req.json<{
+      action?: string;
+      objective?: string;
+    }>();
+    const action = body.action;
+    if (
+      action !== "show" &&
+      action !== "set" &&
+      action !== "replace" &&
+      action !== "pause" &&
+      action !== "resume" &&
+      action !== "clear"
+    ) {
+      return c.json({ error: "Invalid action" }, 400);
+    }
+    const objective = body.objective?.trim();
+    if ((action === "set" || action === "replace") && !objective) {
+      return c.json(
+        { error: "objective is required for set/replace actions" },
+        400,
+      );
+    }
+
+    try {
+      const result =
+        action === "show"
+          ? await runtimeController.getGoal(processId)
+          : await runtimeController.goalAction(processId, action, objective);
+      if (!result) {
+        return c.json(
+          { error: "Goal actions not supported for this process" },
+          400,
+        );
+      }
+      return c.json(result);
+    } catch (error) {
+      return c.json(
+        {
+          error: error instanceof Error ? error.message : "Goal action failed",
+        },
+        502,
+      );
+    }
   });
 
   return routes;

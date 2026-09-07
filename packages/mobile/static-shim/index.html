@@ -11,20 +11,119 @@
     <link rel="dns-prefetch" href="//air.yueyuan.uk" />
     <link rel="preconnect" href="https://air.yueyuan.uk" crossorigin />
     <script src="./loader.js" defer></script>
+    <script>
+      // Paint the shell with the system fallback before the remote client can
+      // report its saved theme. This prevents a light safe-area flash at boot.
+      (function () {
+        var resolvedTheme =
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-color-scheme: light)").matches
+            ? "light"
+            : "dark";
+        document.documentElement.setAttribute("data-app-theme", "auto");
+        document.documentElement.setAttribute(
+          "data-resolved-theme",
+          resolvedTheme
+        );
+        document.documentElement.style.colorScheme = resolvedTheme;
+        try {
+          if (
+            window.YepNativePush &&
+            typeof window.YepNativePush.setSystemBarTheme === "function"
+          ) {
+            window.YepNativePush.setSystemBarTheme(resolvedTheme);
+          }
+        } catch (_) {}
+      })();
+    </script>
     <style>
-      html { height: 100%; color-scheme: light dark; }
+      html {
+        height: 100%;
+        color-scheme: light dark;
+        --shell-page-bg: #faf9f5;
+        --shell-page-fg: #1f2937;
+        --shell-panel-border: rgba(95, 107, 122, 0.14);
+        --shell-panel-bg: rgba(255, 255, 255, 0.72);
+        --shell-panel-shadow: 0 20px 60px rgba(32, 36, 44, 0.12);
+        --shell-title: #20242c;
+        --shell-control-border: rgba(95, 107, 122, 0.22);
+        --shell-muted: #5f6b7a;
+        --shell-mark-bg: #20242c;
+        --shell-mark-fg: #ffffff;
+        --shell-mark-shadow: 0 14px 34px rgba(32, 36, 44, 0.18);
+        --shell-spinner-border: rgba(32, 36, 44, 0.14);
+        --shell-spinner-top: #20242c;
+        --shell-error-spinner-border: rgba(180, 35, 24, 0.18);
+        --shell-error-spinner-top: #b42318;
+        --shell-label: #374151;
+        --shell-input-border: rgba(95, 107, 122, 0.24);
+        --shell-input-bg: rgba(255, 255, 255, 0.76);
+        --shell-input-fg: #20242c;
+        --shell-focus-border: #20242c;
+        --shell-focus-ring: 0 0 0 3px rgba(32, 36, 44, 0.12);
+        --shell-primary-bg: #20242c;
+        --shell-primary-fg: #ffffff;
+        --shell-button-bg: rgba(255, 255, 255, 0.72);
+        --shell-button-fg: #374151;
+        --shell-active-bg: #ffffff;
+        --shell-active-fg: #20242c;
+        --shell-active-shadow: 0 8px 18px rgba(32, 36, 44, 0.1);
+        --shell-error: #b42318;
+        --shell-diagnostics-fg: #374151;
+        --shell-diagnostic-label: #6b7280;
+      }
+
+      html[data-resolved-theme="dark"] {
+        --shell-page-bg: #2f2f2f;
+        --shell-page-fg: #f4f4f5;
+        --shell-panel-border: rgba(229, 231, 235, 0.14);
+        --shell-panel-bg: rgba(30, 30, 30, 0.9);
+        --shell-panel-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+        --shell-title: #f4f4f5;
+        --shell-control-border: rgba(229, 231, 235, 0.18);
+        --shell-muted: #c9ced6;
+        --shell-mark-bg: #faf9f5;
+        --shell-mark-fg: #20242c;
+        --shell-mark-shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
+        --shell-spinner-border: rgba(250, 249, 245, 0.16);
+        --shell-spinner-top: #faf9f5;
+        --shell-error-spinner-border: rgba(248, 113, 113, 0.24);
+        --shell-error-spinner-top: #fca5a5;
+        --shell-label: #e5e7eb;
+        --shell-input-border: rgba(229, 231, 235, 0.18);
+        --shell-input-bg: rgba(255, 255, 255, 0.08);
+        --shell-input-fg: #f4f4f5;
+        --shell-focus-border: #faf9f5;
+        --shell-focus-ring: 0 0 0 3px rgba(250, 249, 245, 0.12);
+        --shell-primary-bg: #faf9f5;
+        --shell-primary-fg: #20242c;
+        --shell-button-bg: rgba(255, 255, 255, 0.08);
+        --shell-button-fg: #e5e7eb;
+        --shell-active-bg: rgba(250, 249, 245, 0.16);
+        --shell-active-fg: #ffffff;
+        --shell-active-shadow: none;
+        --shell-error: #fca5a5;
+        --shell-diagnostics-fg: #e5e7eb;
+        --shell-diagnostic-label: #aeb6c2;
+      }
+
+      html[data-app-theme="verydark"] {
+        --shell-page-bg: #181818;
+        --shell-panel-bg: rgba(24, 24, 24, 0.94);
+      }
+
       /* Android draws edge-to-edge. Chromium only exposes env(safe-area-inset-*)
          to the top-level document (this shim), NOT to cross-origin iframes, so
          the app inside cannot pad itself. We inset only the TOP (status bar)
-         here in the shell and paint that strip the app's light background so it
-         blends with the UI. The bottom is intentionally NOT inset — the app
-         runs full-height under the gesture nav bar (no black cut-off). */
+         here in the shell and paint that strip with the embedded app's current
+         theme so it blends with the UI. The bottom is intentionally NOT inset —
+         the app runs full-height under the gesture nav bar (no black cut-off). */
       body {
         margin: 0;
         height: 100%;
         box-sizing: border-box;
-        background: #faf9f5;
-        color: #1f2937;
+        background: var(--shell-page-bg);
+        color: var(--shell-page-fg);
         font-family:
           Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
           "Segoe UI", sans-serif;
@@ -41,7 +140,7 @@
         width: 100%;
         height: 100%;
         border: 0;
-        background: #faf9f5;
+        background: var(--shell-page-bg);
         opacity: 0;
         transition: opacity 180ms ease;
       }
@@ -50,14 +149,17 @@
         position: fixed;
         inset: 0;
         z-index: 2;
-        display: grid;
-        place-items: center;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: auto;
         padding:
-          env(safe-area-inset-top)
-          env(safe-area-inset-right)
-          env(safe-area-inset-bottom)
-          env(safe-area-inset-left);
-        background: #faf9f5;
+          calc(env(safe-area-inset-top) + 16px)
+          calc(env(safe-area-inset-right) + 16px)
+          calc(env(safe-area-inset-bottom) + 16px)
+          calc(env(safe-area-inset-left) + 16px);
+        box-sizing: border-box;
+        background: var(--shell-page-bg);
         opacity: 1;
         visibility: visible;
         transition:
@@ -66,11 +168,86 @@
       }
 
       .shell-loader__content {
+        position: relative;
         display: grid;
         justify-items: center;
-        gap: 14px;
-        width: calc(100% - 40px);
-        max-width: 360px;
+        gap: 12px;
+        width: 100%;
+        max-width: 400px;
+        margin: auto;
+        padding: 20px;
+        box-sizing: border-box;
+        border: 1px solid var(--shell-panel-border);
+        border-radius: 18px;
+        background: var(--shell-panel-bg);
+        box-shadow: var(--shell-panel-shadow);
+      }
+
+      .shell-loader__header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+      }
+
+      .shell-loader__title {
+        color: var(--shell-title);
+        font-size: 16px;
+        font-weight: 720;
+      }
+
+      .shell-loader__close {
+        display: none;
+        min-width: 36px;
+        min-height: 32px;
+        border: 1px solid var(--shell-control-border);
+        border-radius: 8px;
+        padding: 0 10px;
+        background: transparent;
+        color: var(--shell-muted);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 650;
+      }
+
+      body.is-loaded .shell-loader__close {
+        display: block;
+      }
+
+      /* A normal, verified page opens these controls from Settings → Local
+         Access, so no shell UI sits on top of the app header. Keep this escape
+         hatch only after the user explicitly opens an unverified page. */
+      .shell-toolbar {
+        position: fixed;
+        z-index: 4;
+        top: calc(env(safe-area-inset-top) + 8px);
+        right: calc(env(safe-area-inset-right) + 8px);
+        display: none;
+        align-items: center;
+        gap: 7px;
+        min-height: 34px;
+        border: 1px solid var(--shell-control-border);
+        border-radius: 999px;
+        padding: 0 12px;
+        background: var(--shell-panel-bg);
+        color: var(--shell-title);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 680;
+        box-shadow: var(--shell-panel-shadow);
+        backdrop-filter: blur(12px);
+      }
+
+      body.is-loaded:not(.is-panel-open)[data-connection-state="unverified"]
+        .shell-toolbar {
+        display: flex;
+      }
+
+      .shell-toolbar__dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #d97706;
       }
 
       .shell-loader__mark {
@@ -79,26 +256,32 @@
         width: 48px;
         height: 48px;
         border-radius: 14px;
-        background: #20242c;
-        color: #ffffff;
+        background: var(--shell-mark-bg);
+        color: var(--shell-mark-fg);
         font-size: 22px;
         font-weight: 700;
         letter-spacing: 0;
-        box-shadow: 0 14px 34px rgba(32, 36, 44, 0.18);
+        box-shadow: var(--shell-mark-shadow);
       }
 
       .shell-loader__spinner {
         width: 28px;
         height: 28px;
-        border: 3px solid rgba(32, 36, 44, 0.14);
-        border-top-color: #20242c;
+        border: 3px solid var(--shell-spinner-border);
+        border-top-color: var(--shell-spinner-top);
         border-radius: 999px;
         animation: shell-spin 760ms linear infinite;
       }
 
+      body.has-connection-error .shell-loader__spinner {
+        border-color: var(--shell-error-spinner-border);
+        border-top-color: var(--shell-error-spinner-top);
+        animation: none;
+      }
+
       .shell-loader__status {
         min-height: 20px;
-        color: #5f6b7a;
+        color: var(--shell-muted);
         font-size: 14px;
         line-height: 20px;
         text-align: center;
@@ -112,7 +295,7 @@
       }
 
       .shell-loader__node-label {
-        color: #374151;
+        color: var(--shell-label);
         font-size: 12px;
         font-weight: 650;
         line-height: 16px;
@@ -129,26 +312,28 @@
         min-width: 0;
         height: 40px;
         box-sizing: border-box;
-        border: 1px solid rgba(95, 107, 122, 0.24);
+        border: 1px solid var(--shell-input-border);
         border-radius: 8px;
         padding: 0 10px;
-        background: rgba(255, 255, 255, 0.76);
-        color: #20242c;
+        background: var(--shell-input-bg);
+        color: var(--shell-input-fg);
         font: inherit;
         font-size: 14px;
         outline: none;
       }
 
       .shell-loader__node-input:focus {
-        border-color: #20242c;
-        box-shadow: 0 0 0 3px rgba(32, 36, 44, 0.12);
+        border-color: var(--shell-focus-border);
+        box-shadow: var(--shell-focus-ring);
       }
 
       .shell-loader__node-submit,
       .shell-loader__channel-button,
-      .shell-loader__history-button {
+      .shell-loader__history-button,
+      .shell-loader__action-button,
+      .shell-loader__diagnostic-button {
         min-height: 36px;
-        border: 1px solid rgba(95, 107, 122, 0.22);
+        border: 1px solid var(--shell-control-border);
         border-radius: 8px;
         padding: 0 12px;
         font: inherit;
@@ -160,23 +345,25 @@
 
       .shell-loader__node-submit {
         height: 40px;
-        border-color: #20242c;
-        background: #20242c;
-        color: #ffffff;
+        border-color: var(--shell-primary-bg);
+        background: var(--shell-primary-bg);
+        color: var(--shell-primary-fg);
       }
 
       .shell-loader__channel-button,
-      .shell-loader__history-button {
-        background: rgba(255, 255, 255, 0.72);
-        color: #374151;
+      .shell-loader__history-button,
+      .shell-loader__action-button,
+      .shell-loader__diagnostic-button {
+        background: var(--shell-button-bg);
+        color: var(--shell-button-fg);
       }
 
       .shell-loader__channel-button.is-active,
       .shell-loader__history-button.is-active {
-        border-color: #20242c;
-        background: #ffffff;
-        color: #20242c;
-        box-shadow: 0 8px 18px rgba(32, 36, 44, 0.1);
+        border-color: var(--shell-focus-border);
+        background: var(--shell-active-bg);
+        color: var(--shell-active-fg);
+        box-shadow: var(--shell-active-shadow);
       }
 
       .shell-loader__history {
@@ -196,17 +383,75 @@
 
       .shell-loader__node-error {
         min-height: 16px;
-        color: #b42318;
+        color: var(--shell-error);
         font-size: 12px;
         line-height: 16px;
         text-align: center;
+      }
+
+      .shell-loader__actions {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+        width: 100%;
+      }
+
+      .shell-loader__action-button {
+        min-width: 0;
+        padding: 0 8px;
+      }
+
+      .shell-loader__diagnostics {
+        width: 100%;
+        border-top: 1px solid var(--shell-panel-border);
+        padding-top: 10px;
+        color: var(--shell-diagnostics-fg);
+        font-size: 12px;
+      }
+
+      .shell-loader__diagnostics summary {
+        cursor: pointer;
+        font-weight: 680;
+        line-height: 24px;
+      }
+
+      .shell-loader__diagnostic-list {
+        display: grid;
+        grid-template-columns: minmax(92px, auto) minmax(0, 1fr);
+        gap: 6px 10px;
+        margin: 10px 0;
+      }
+
+      .shell-loader__diagnostic-list dt {
+        color: var(--shell-diagnostic-label);
+      }
+
+      .shell-loader__diagnostic-list dd {
+        min-width: 0;
+        margin: 0;
+        overflow-wrap: anywhere;
+        text-align: right;
+      }
+
+      .shell-loader__diagnostic-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+      }
+
+      .shell-loader__open-anyway {
+        display: none;
+      }
+
+      body.has-connection-error .shell-loader__open-anyway {
+        display: block;
       }
 
       body.is-loaded iframe {
         opacity: 1;
       }
 
-      body.is-loaded .shell-loader {
+      body.is-loaded:not(.is-panel-open) .shell-loader {
         opacity: 0;
         visibility: hidden;
         pointer-events: none;
@@ -214,76 +459,6 @@
 
       @keyframes shell-spin {
         to { transform: rotate(360deg); }
-      }
-
-      @media (prefers-color-scheme: dark) {
-        body {
-          background: #232323;
-          color: #f4f4f5;
-        }
-
-        iframe {
-          background: #232323;
-        }
-
-        .shell-loader {
-          background: #232323;
-        }
-
-        .shell-loader__mark {
-          background: #faf9f5;
-          color: #20242c;
-          box-shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
-        }
-
-        .shell-loader__spinner {
-          border-color: rgba(250, 249, 245, 0.16);
-          border-top-color: #faf9f5;
-        }
-
-        .shell-loader__status {
-          color: #c9ced6;
-        }
-
-        .shell-loader__node-label {
-          color: #e5e7eb;
-        }
-
-        .shell-loader__node-input {
-          border-color: rgba(229, 231, 235, 0.18);
-          background: rgba(255, 255, 255, 0.08);
-          color: #f4f4f5;
-        }
-
-        .shell-loader__node-input:focus {
-          border-color: #faf9f5;
-          box-shadow: 0 0 0 3px rgba(250, 249, 245, 0.12);
-        }
-
-        .shell-loader__node-submit {
-          border-color: #faf9f5;
-          background: #faf9f5;
-          color: #20242c;
-        }
-
-        .shell-loader__channel-button,
-        .shell-loader__history-button {
-          border-color: rgba(229, 231, 235, 0.18);
-          background: rgba(255, 255, 255, 0.08);
-          color: #e5e7eb;
-        }
-
-        .shell-loader__channel-button.is-active,
-        .shell-loader__history-button.is-active {
-          border-color: #faf9f5;
-          background: rgba(250, 249, 245, 0.16);
-          color: #ffffff;
-          box-shadow: none;
-        }
-
-        .shell-loader__node-error {
-          color: #fca5a5;
-        }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -299,8 +474,38 @@
     </style>
   </head>
   <body>
+    <button
+      class="shell-toolbar"
+      type="button"
+      data-open-settings
+      data-i18n-label="connection"
+    >
+      <span class="shell-toolbar__dot" aria-hidden="true"></span>
+      <span data-i18n="connection">Connection</span>
+    </button>
     <div class="shell-loader">
-      <div class="shell-loader__content">
+      <div
+        class="shell-loader__content"
+        role="dialog"
+        aria-labelledby="shell-loader-title"
+      >
+        <div class="shell-loader__header">
+          <div
+            class="shell-loader__title"
+            id="shell-loader-title"
+            data-i18n="connection"
+          >
+            Connection
+          </div>
+          <button
+            class="shell-loader__close"
+            type="button"
+            data-close-settings
+            data-i18n="close"
+          >
+            Close
+          </button>
+        </div>
         <div class="shell-loader__mark" aria-hidden="true">Y</div>
         <div class="shell-loader__spinner" aria-hidden="true"></div>
         <div
@@ -308,11 +513,16 @@
           data-loader-status
           role="status"
           aria-live="polite"
+          data-i18n="loading"
         >
           Loading Yep Anywhere
         </div>
         <form class="shell-loader__node-form" data-node-form>
-          <label class="shell-loader__node-label" for="shell-node-input">
+          <label
+            class="shell-loader__node-label"
+            for="shell-node-input"
+            data-i18n="serverNode"
+          >
             Server node
           </label>
           <div class="shell-loader__node-row">
@@ -328,7 +538,11 @@
               placeholder="43.226.60.75:46789"
               aria-describedby="shell-node-error"
             />
-            <button class="shell-loader__node-submit" type="submit">
+            <button
+              class="shell-loader__node-submit"
+              type="submit"
+              data-i18n="connect"
+            >
               Connect
             </button>
           </div>
@@ -343,14 +557,75 @@
           class="shell-loader__history"
           data-node-history
           aria-label="Saved nodes"
+          data-i18n-label="savedNodes"
         ></div>
-        <button
-          class="shell-loader__channel-button"
-          type="button"
-          data-http-channel
-        >
-          HTTPS relay
-        </button>
+        <div class="shell-loader__actions">
+          <button
+            class="shell-loader__channel-button"
+            type="button"
+            data-http-channel
+            data-i18n="httpsRelay"
+          >
+            HTTPS relay
+          </button>
+          <button
+            class="shell-loader__action-button"
+            type="button"
+            data-retry-connection
+            data-i18n="retry"
+          >
+            Retry
+          </button>
+          <button
+            class="shell-loader__action-button"
+            type="button"
+            data-use-default
+            data-i18n="useDefault"
+          >
+            Use default
+          </button>
+        </div>
+        <details class="shell-loader__diagnostics">
+          <summary data-i18n="diagnostics">Diagnostics</summary>
+          <dl class="shell-loader__diagnostic-list">
+            <dt data-i18n="currentTarget">Current target</dt>
+            <dd data-diagnostic-target>Unknown</dd>
+            <dt data-i18n="defaultTarget">Default target</dt>
+            <dd data-diagnostic-default>Unknown</dd>
+            <dt data-i18n="connectionState">Connection state</dt>
+            <dd data-diagnostic-state>Connecting</dd>
+            <dt data-i18n="network">Network</dt>
+            <dd data-diagnostic-network>Unknown</dd>
+            <dt data-i18n="frameLoad">Frame load</dt>
+            <dd data-diagnostic-frame>Not seen</dd>
+            <dt data-i18n="attemptStarted">Attempt started</dt>
+            <dd data-diagnostic-attempt>Never</dd>
+            <dt data-i18n="appVersion">App version</dt>
+            <dd data-diagnostic-version>Unknown</dd>
+            <dt data-i18n="androidWebView">Android / WebView</dt>
+            <dd data-diagnostic-webview>Unknown</dd>
+            <dt data-i18n="nativeBridge">Native bridge</dt>
+            <dd data-diagnostic-bridge>Unknown</dd>
+          </dl>
+          <div class="shell-loader__diagnostic-actions">
+            <button
+              class="shell-loader__diagnostic-button"
+              type="button"
+              data-copy-diagnostics
+              data-i18n="copyDiagnostics"
+            >
+              Copy diagnostics
+            </button>
+            <button
+              class="shell-loader__diagnostic-button shell-loader__open-anyway"
+              type="button"
+              data-open-anyway
+              data-i18n="openAnyway"
+            >
+              Open page anyway
+            </button>
+          </div>
+        </details>
       </div>
     </div>
     <iframe

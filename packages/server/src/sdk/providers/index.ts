@@ -14,15 +14,23 @@ export type {
   StartSessionOptions,
 } from "./types.js";
 
-// Claude provider (uses @anthropic-ai/claude-agent-sdk)
+// Claude provider (Agent SDK protocol, remote CLI over SSH only)
 import { claudeProvider } from "./claude.js";
-export { ClaudeProvider, claudeProvider } from "./claude.js";
+export {
+  ClaudeProvider,
+  claudeProvider,
+  configureClaudeRemoteExecutors,
+  configureClaudeSessionFileObserver,
+  type ClaudeProviderConfig,
+  type ClaudeSessionFileUpdate,
+} from "./claude.js";
 
 // Codex provider (uses codex CLI)
 import { codexProvider } from "./codex.js";
 export {
   CodexProvider,
   codexProvider,
+  type CodexBridgeExecutionConfig,
   type CodexProviderConfig,
 } from "./codex.js";
 
@@ -50,34 +58,42 @@ export {
   type CodexOSSProviderConfig,
 } from "./codex-oss.js";
 
-// Claude + Ollama provider (uses Claude SDK with Ollama backend)
-import { claudeOllamaProvider } from "./claude-ollama.js";
-export {
-  ClaudeOllamaProvider,
-  claudeOllamaProvider,
-} from "./claude-ollama.js";
+// Pi provider (uses `pi --mode rpc` with a process-local Yep extension)
+import { piProvider } from "./pi.js";
+export { PiProvider, piProvider, type PiProviderConfig } from "./pi.js";
 
-// OpenCode provider (uses opencode serve for multi-provider agent)
-import { opencodeProvider } from "./opencode.js";
+// Kimi provider (uses `kimi acp` for ACP-based agent execution)
+import { kimiProvider } from "./kimi.js";
 export {
-  OpenCodeProvider,
-  opencodeProvider,
-  type OpenCodeProviderConfig,
-} from "./opencode.js";
+  KimiProvider,
+  kimiProvider,
+  type KimiProviderConfig,
+} from "./kimi.js";
+
+// ZCode provider (uses `zcode app-server` for JSON-RPC over stdio)
+import { zcodeProvider } from "./zcode.js";
+export {
+  ZCodeProvider,
+  zcodeProvider,
+  type ZCodeProviderConfig,
+} from "./zcode.js";
 
 /**
- * Get all available provider instances.
- * Useful for provider detection UI.
+ * Get all active provider instances exposed by the provider catalog.
+ *
+ * Claude remains available through getProvider() for historical session
+ * compatibility, but its retired SSH channel must not participate in provider
+ * discovery because that would trigger a remote control probe.
  */
 export function getAllProviders(): AgentProvider[] {
   return [
-    claudeProvider,
-    claudeOllamaProvider,
     codexProvider,
     codexOSSProvider,
     geminiProvider,
     geminiACPProvider,
-    opencodeProvider,
+    piProvider,
+    kimiProvider,
+    zcodeProvider,
   ];
 }
 
@@ -88,12 +104,10 @@ export function getAllProviders(): AgentProvider[] {
  * implementation with proper permission handling. The non-ACP stream-json
  * provider is deprecated and will be removed.
  */
-export function getProvider(name: ProviderName): AgentProvider | null {
+export function getProvider(name: ProviderName | string): AgentProvider | null {
   switch (name) {
     case "claude":
       return claudeProvider;
-    case "claude-ollama":
-      return claudeOllamaProvider;
     case "codex":
       return codexProvider;
     case "codex-oss":
@@ -102,8 +116,12 @@ export function getProvider(name: ProviderName): AgentProvider | null {
     case "gemini-acp":
       // Both map to ACP provider - "gemini" is legacy name for backward compatibility
       return geminiACPProvider;
-    case "opencode":
-      return opencodeProvider;
+    case "pi":
+      return piProvider;
+    case "kimi":
+      return kimiProvider;
+    case "zcode":
+      return zcodeProvider;
     default:
       return null;
   }

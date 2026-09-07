@@ -1,6 +1,10 @@
-import { DEFAULT_PERMISSION_MODE } from "@yep-anywhere/shared";
+import {
+  DEFAULT_PERMISSION_MODE,
+  type ProviderName,
+} from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useProviderPermissionModeConfig } from "../hooks/useProviderPermissionModeConfig";
 import { useI18n } from "../i18n";
 import type { PermissionMode } from "../types";
 
@@ -11,14 +15,6 @@ const MODE_ORDER: PermissionMode[] = [
   "plan",
   "bypassPermissions",
 ];
-
-const MODE_LABELS: Record<PermissionMode, string> = {
-  auto: "Auto mode",
-  default: "Ask before edits",
-  acceptEdits: "Edit automatically",
-  plan: "Plan mode",
-  bypassPermissions: "Bypass permissions",
-};
 
 // Breakpoint for desktop behavior (should match CSS)
 const DESKTOP_BREAKPOINT = 769;
@@ -31,6 +27,10 @@ interface ModeSelectorProps {
   isHeld?: boolean;
   /** Callback when hold state changes */
   onHoldChange?: (held: boolean) => void;
+  /** Provider used for native mode labels. */
+  provider?: ProviderName;
+  /** Provider-advertised modes in display order. */
+  permissionModes?: readonly PermissionMode[];
 }
 
 /**
@@ -44,8 +44,17 @@ export function ModeSelector({
   disabled,
   isHeld = false,
   onHoldChange,
+  provider,
+  permissionModes,
 }: ModeSelectorProps) {
   const { t } = useI18n();
+  const {
+    labels: modeLabels,
+    descriptions: modeDescriptions,
+    title: modeSelectorTitle,
+    description: modeSelectorDescription,
+  } = useProviderPermissionModeConfig(provider);
+  const visibleModes = permissionModes ?? MODE_ORDER;
   const [isOpen, setIsOpen] = useState(false);
   const [isDesktop, setIsDesktop] = useState(
     () => window.innerWidth >= DESKTOP_BREAKPOINT,
@@ -150,7 +159,7 @@ export function ModeSelector({
   };
 
   // Display text: show "Hold" when held, otherwise show mode label
-  const displayLabel = isHeld ? t("modeHold" as never) : MODE_LABELS[mode];
+  const displayLabel = isHeld ? t("modeHold" as never) : modeLabels[mode];
   const displayDotClass = isHeld ? "mode-hold" : `mode-${mode}`;
 
   // Shared options content used by both mobile sheet and desktop dropdown
@@ -165,13 +174,15 @@ export function ModeSelector({
           aria-pressed={isHeld}
         >
           <span className="mode-dot mode-hold" />
-          <span className="mode-selector-label">
-            {isHeld ? t("modeResume" as never) : t("modeHold" as never)}
-          </span>
-          <span className="mode-selector-description">
-            {isHeld
-              ? t("modeContinueExecution" as never)
-              : t("modePauseExecution" as never)}
+          <span className="mode-selector-option-copy">
+            <span className="mode-selector-label">
+              {isHeld ? t("modeResume" as never) : t("modeHold" as never)}
+            </span>
+            <span className="mode-selector-description">
+              {isHeld
+                ? t("modeContinueExecution" as never)
+                : t("modePauseExecution" as never)}
+            </span>
           </span>
           {isHeld && (
             <span className="mode-selector-check" aria-hidden="true">
@@ -197,7 +208,7 @@ export function ModeSelector({
       {onHoldChange && <div className="mode-selector-divider" />}
 
       {/* Permission mode options */}
-      {MODE_ORDER.map((m) => (
+      {visibleModes.map((m) => (
         <button
           key={m}
           type="button"
@@ -206,7 +217,12 @@ export function ModeSelector({
           aria-pressed={!isHeld && mode === m}
         >
           <span className={`mode-dot mode-${m}`} />
-          <span className="mode-selector-label">{MODE_LABELS[m]}</span>
+          <span className="mode-selector-option-copy">
+            <span className="mode-selector-label">{modeLabels[m]}</span>
+            <span className="mode-selector-description">
+              {modeDescriptions[m]}
+            </span>
+          </span>
           {!isHeld && mode === m && (
             <span className="mode-selector-check" aria-hidden="true">
               <svg
@@ -229,6 +245,17 @@ export function ModeSelector({
     </>
   );
 
+  const selectorHeader = (
+    <div className="mode-selector-header">
+      <span className="mode-selector-title">{modeSelectorTitle}</span>
+      {modeSelectorDescription && (
+        <span className="mode-selector-subtitle">
+          {modeSelectorDescription}
+        </span>
+      )}
+    </div>
+  );
+
   // Mobile: bottom sheet with overlay (portaled)
   const mobileSheet =
     isOpen && !isDesktop
@@ -245,11 +272,7 @@ export function ModeSelector({
               tabIndex={-1}
               aria-label={t("modeSelectLabel" as never)}
             >
-              <div className="mode-selector-header">
-                <span className="mode-selector-title">
-                  {t("modeSessionTitle" as never)}
-                </span>
-              </div>
+              {selectorHeader}
               <div className="mode-selector-options">{optionsContent}</div>
             </div>
           </div>,
@@ -266,6 +289,7 @@ export function ModeSelector({
         tabIndex={-1}
         aria-label={t("modeSelectLabel" as never)}
       >
+        {selectorHeader}
         <div className="mode-selector-options">{optionsContent}</div>
       </div>
     ) : null;

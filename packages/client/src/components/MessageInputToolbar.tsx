@@ -1,5 +1,6 @@
-import type { UploadedFile } from "@yep-anywhere/shared";
+import type { ProviderName, UploadedFile } from "@yep-anywhere/shared";
 import { type RefObject, useState } from "react";
+import { useModelSettings } from "../hooks/useModelSettings";
 import { useI18n } from "../i18n";
 import type { AgentCommandConfig } from "../lib/agentCommands";
 import type { ContextUsage, PermissionMode } from "../types";
@@ -19,6 +20,8 @@ export interface MessageInputToolbarProps {
   // Provider capability flags (default to true for backwards compatibility)
   supportsPermissionMode?: boolean;
   supportsThinkingToggle?: boolean;
+  provider?: ProviderName;
+  permissionModes?: readonly PermissionMode[];
 
   // Attachments
   canAttach?: boolean;
@@ -70,6 +73,9 @@ export function MessageInputToolbar({
   isHeld,
   onHoldChange,
   supportsPermissionMode = true,
+  supportsThinkingToggle = true,
+  provider,
+  permissionModes,
   canAttach,
   attachmentCount = 0,
   onAttachClick,
@@ -97,7 +103,9 @@ export function MessageInputToolbar({
   pendingApproval,
 }: MessageInputToolbarProps) {
   const { t } = useI18n();
+  const { thinkingMode, cycleThinkingMode, thinkingLevel } = useModelSettings();
   const [isContextModalOpen, setIsContextModalOpen] = useState(false);
+  const showStop = isRunning && onStop && isThinking;
   const visibleCommandButtons =
     commandButtons?.filter((button) => button.showButton) ??
     (showCommandButton
@@ -112,7 +120,9 @@ export function MessageInputToolbar({
       : []);
 
   return (
-    <div className="message-input-toolbar">
+    <div
+      className={`message-input-toolbar${onQueue ? " message-input-toolbar-send-options" : ""}`}
+    >
       <div className="message-input-left">
         {onModeChange && supportsPermissionMode && (
           <ModeSelector
@@ -120,6 +130,8 @@ export function MessageInputToolbar({
             onModeChange={onModeChange}
             isHeld={isHeld}
             onHoldChange={onHoldChange}
+            provider={provider}
+            permissionModes={permissionModes}
           />
         )}
         <button
@@ -146,6 +158,60 @@ export function MessageInputToolbar({
             <span className="attach-count">{attachmentCount}</span>
           )}
         </button>
+        {supportsThinkingToggle && (
+          <button
+            type="button"
+            className={`thinking-toggle-button ${thinkingMode !== "off" ? `active ${thinkingMode}` : ""}`}
+            onClick={cycleThinkingMode}
+            title={
+              thinkingMode === "off"
+                ? t("newSessionThinkingOff")
+                : thinkingMode === "auto"
+                  ? t("newSessionThinkingAuto")
+                  : t("newSessionThinkingOn", { level: thinkingLevel })
+            }
+            aria-label={t("newSessionThinkingMode", { mode: thinkingMode })}
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="10" />
+              <polyline points="12 6 12 12 16 14" />
+              {thinkingMode === "auto" && (
+                <g>
+                  <circle
+                    cx="19"
+                    cy="5"
+                    r="5.5"
+                    fill="currentColor"
+                    stroke="none"
+                  />
+                  <text
+                    x="19"
+                    y="5"
+                    textAnchor="middle"
+                    dominantBaseline="central"
+                    fill="var(--bg-primary, #1a1a2e)"
+                    fontSize="8"
+                    fontWeight="700"
+                    fontFamily="system-ui, sans-serif"
+                    stroke="none"
+                  >
+                    A
+                  </text>
+                </g>
+              )}
+            </svg>
+          </button>
+        )}
         {voiceButtonRef && onVoiceTranscript && onInterimTranscript && (
           <VoiceInputButton
             ref={voiceButtonRef}
@@ -191,6 +257,7 @@ export function MessageInputToolbar({
         <ContextUsageIndicator
           usage={contextUsage}
           size={16}
+          labelMode="tokens"
           onClick={
             projectId && sessionId
               ? () => setIsContextModalOpen(true)
@@ -198,12 +265,13 @@ export function MessageInputToolbar({
           }
           ariaLabel={t("contextBreakdownTitle")}
         />
-        {/* Queue button - shown when agent is running and there's content to queue */}
-        {onQueue && canSend && (
+        {/* Keep both submission choices visible while the agent is running. */}
+        {onQueue && (
           <button
             type="button"
             onClick={onQueue}
-            className="queue-button"
+            disabled={disabled || !canSend}
+            className="queue-button message-submit-choice"
             title={t("toolbarQueueTitle")}
             aria-label={t("toolbarQueueLabel")}
           >
@@ -225,29 +293,35 @@ export function MessageInputToolbar({
               <line x1="3" y1="12" x2="3.01" y2="12" />
               <line x1="3" y1="18" x2="3.01" y2="18" />
             </svg>
+            <span>{t("toolbarQueueLabel")}</span>
           </button>
         )}
-        {/* Show stop button when thinking and nothing to send, otherwise show send */}
-        {isRunning && onStop && isThinking && !canSend ? (
-          <button
-            type="button"
-            onClick={onStop}
-            className="stop-button"
-            aria-label={t("toolbarStop")}
-          >
-            <span className="stop-icon" />
-          </button>
-        ) : onSend ? (
+        {onSend && (onQueue || !showStop || canSend) && (
           <button
             type="button"
             onClick={onSend}
             disabled={disabled || !canSend}
-            className="send-button"
-            aria-label={t("toolbarSend")}
+            className={`send-button${onQueue ? " message-submit-choice" : ""}`}
+            title={onQueue ? t("toolbarInsertTitle") : undefined}
+            aria-label={onQueue ? t("toolbarInsertLabel") : t("toolbarSend")}
           >
-            <span className="send-icon">↑</span>
+            <span className="send-icon" aria-hidden="true">
+              ↑
+            </span>
+            {onQueue && <span>{t("toolbarInsertLabel")}</span>}
           </button>
-        ) : null}
+        )}
+        {showStop && (onQueue || !canSend) && (
+          <button
+            type="button"
+            onClick={onStop}
+            className="stop-button"
+            title={t("toolbarStop")}
+            aria-label={t("toolbarStop")}
+          >
+            <span className="stop-icon" />
+          </button>
+        )}
       </div>
       {isContextModalOpen && projectId && sessionId && (
         <ContextStatusModal

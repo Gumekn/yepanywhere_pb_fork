@@ -1,38 +1,56 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import { statSync } from "node:fs";
+import type { ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { copyFileSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
-  type SDKMessage as AgentSDKMessage,
+  type CanUseTool as ClaudeCanUseTool,
+  type SDKMessage as ClaudeSDKMessage,
   type Query,
-  type CanUseTool as SDKCanUseTool,
-  type SpawnedProcess,
+  type SDKUserMessage,
   query,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
+  ALL_PERMISSION_MODES,
   type ContextStatusSdkPayload,
   DEFAULT_PERMISSION_MODE,
   type ModelInfo,
+  type RemoteExecutorConfig,
   type SlashCommand,
-  getModelContextWindow,
 } from "@yep-anywhere/shared";
 import { getLogger } from "../../logging/logger.js";
-import { detectClaudeCli } from "../cli-detection.js";
-import { logSDKMessage } from "../messageLogger.js";
+import {
+  logSDKMessage,
+  sanitizeSDKMessageForPublic,
+} from "../messageLogger.js";
 import { MessageQueue } from "../messageQueue.js";
+import { getRemoteSessionStorageMode } from "../remote-executor-config.js";
 import {
-  checkRemotePath,
+  isLocalPathWithin,
+  isRemotePathWithin,
+} from "../remote-path-mapping.js";
+import {
   createRemoteSpawn,
-  getRemoteHome,
-  testSSHConnection,
-  translateHomePath,
+  executorLabel,
+  inLoginShell,
+  quoteShell,
+  runRemoteCommand,
+  testRemoteExecutor,
+  translateSharedPath,
 } from "../remote-spawn.js";
-import { getProjectDirFromCwd, syncSessionFile } from "../session-sync.js";
-import type { ContentBlock, SDKMessage } from "../types.js";
+import { materializeRemoteSessionFile } from "../session-sync.js";
+import type {
+  ContentBlock,
+  QueuedUserMessage,
+  SDKMessage,
+  UserMessage,
+} from "../types.js";
 import {
-  fetchClaudeModelCatalog,
-  getConfiguredClaudeModels,
-} from "./claude-settings.js";
+  type ClaudeControlProbeResult,
+  type ClaudeUsageResponse,
+  mapClaudeSdkModel,
+  probeRemoteClaudeControl,
+} from "./claude-control.js";
 import { filterEnvForChildProcess } from "./env-filter.js";
 import type {
   AgentProvider,
@@ -42,402 +60,620 @@ import type {
   StartSessionOptions,
 } from "./types.js";
 
-/**
- * Use a spawn wrapper to capture the child process reference for liveness checks.
- * When true, stale detection can distinguish "process died silently" from
- * "process is busy with a long tool call". Set to false to revert to the
- * old time-only heuristic if the wrapper causes issues.
- */
-const USE_SPAWN_WRAPPER = true;
+const CLAUDE_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"].map(
+  (reasoningEffort) => ({ reasoningEffort }),
+);
 
-/** Static fallback list of Claude models (used if probe fails) */
 const CLAUDE_MODELS_FALLBACK: ModelInfo[] = [
   {
     id: "default",
-    name: "Default (recommended)",
-    description: "Claude Code chooses the recommended model for your account",
-    contextWindow: getModelContextWindow("default", "claude"),
-  },
-  {
-    id: "best",
-    name: "Best",
-    description: "Highest-capability Claude Code alias for complex work",
-    contextWindow: getModelContextWindow("best", "claude"),
+    resolvedModel: "claude-sonnet-5",
+    name: "Default (Sonnet 5)",
+    description: "Sonnet 5 · Efficient for routine tasks",
+    contextWindow: 1_000_000,
+    supportsEffort: true,
+    supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS,
+    supportsAdaptiveThinking: true,
+    supportsAutoMode: true,
   },
   {
     id: "sonnet",
-    name: "Sonnet",
-    description: "Standard-context Sonnet for everyday coding tasks",
-    contextWindow: getModelContextWindow("sonnet", "claude"),
+    resolvedModel: "claude-sonnet-5",
+    name: "Sonnet 5",
+    description: "Sonnet 5 · Efficient for routine tasks",
+    contextWindow: 1_000_000,
+    supportsEffort: true,
+    supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS,
+    supportsAdaptiveThinking: true,
+    supportsAutoMode: true,
   },
   {
-    id: "sonnet[1m]",
-    name: "Sonnet 1M",
-    description: "Sonnet with 1M context for long sessions and large codebases",
-    contextWindow: getModelContextWindow("sonnet[1m]", "claude"),
+    id: "claude-fable-5[1m]",
+    resolvedModel: "claude-fable-5",
+    name: "Fable 5",
+    description:
+      "Fable 5 · Most capable for your hardest and longest-running tasks",
+    contextWindow: 1_000_000,
+    supportsEffort: true,
+    supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS,
+    supportsAdaptiveThinking: true,
+    supportsAutoMode: true,
   },
   {
     id: "opus",
-    name: "Opus",
-    description: "Standard-context Opus for the most demanding reasoning",
-    contextWindow: getModelContextWindow("opus", "claude"),
-  },
-  {
-    id: "opus[1m]",
-    name: "Opus 1M",
-    description: "Opus with 1M context for the largest working sets",
-    contextWindow: getModelContextWindow("opus[1m]", "claude"),
+    resolvedModel: "claude-opus-4-8",
+    name: "Opus 4.8",
+    description:
+      "Opus 4.8 · Best for everyday, complex tasks · ~2× usage vs Sonnet",
+    contextWindow: 1_000_000,
+    supportsEffort: true,
+    supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS,
+    supportsAdaptiveThinking: true,
+    supportsFastMode: true,
+    supportsAutoMode: true,
   },
   {
     id: "haiku",
-    name: "Haiku",
-    description: "Fastest model for simple tasks",
-    contextWindow: getModelContextWindow("haiku", "claude"),
-  },
-  {
-    id: "opusplan",
-    name: "Opus Plan",
-    description: "Uses Opus for planning, then Sonnet for execution",
-    contextWindow: getModelContextWindow("opus", "claude"),
+    resolvedModel: "claude-haiku-4-5-20251001",
+    name: "Haiku 4.5",
+    description: "Haiku 4.5 · Fastest for quick answers",
+    contextWindow: 200_000,
+    supportsEffort: false,
+    supportsAdaptiveThinking: false,
+    supportsFastMode: false,
+    supportsAutoMode: false,
   },
 ];
 
-function enrichClaudeModel(model: ModelInfo): ModelInfo {
-  return {
+const CLAUDE_USAGE_CACHE_TTL_MS = 30_000;
+const CLAUDE_CONTROL_FAILURE_CACHE_TTL_MS = 30_000;
+
+function cloneClaudeModels(models: ModelInfo[]): ModelInfo[] {
+  return models.map((model) => ({
     ...model,
-    contextWindow:
-      model.contextWindow ?? getModelContextWindow(model.id, "claude"),
+    supportedReasoningEfforts: model.supportedReasoningEfforts?.map(
+      (effort) => ({ ...effort }),
+    ),
+  }));
+}
+
+export interface ClaudeProviderConfig {
+  remoteExecutors?: RemoteExecutorConfig[];
+  /** Local Claude projects root used for the remote JSONL replicas. */
+  localSessionsDir?: string;
+  onSessionFileUpdated?: (update: ClaudeSessionFileUpdate) => void;
+}
+
+export interface ClaudeSessionFileUpdate {
+  executor: RemoteExecutorConfig;
+  sessionId: string;
+  localPath: string;
+  projectsDir: string;
+  mode: "shared" | "ssh-replica";
+}
+
+function assertLocalSharedRoot(executor: RemoteExecutorConfig): void {
+  try {
+    if (statSync(executor.localRoot).isDirectory()) return;
+  } catch {
+    // Throw the purpose-built error below.
+  }
+  throw new Error(
+    `Claude remote shared root does not exist locally: ${executor.localRoot}`,
+  );
+}
+
+export function safeAttachmentName(
+  messageId: string,
+  originalName: string,
+): string {
+  const safeMessageId = messageId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+  const safeName = basename(originalName)
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .slice(0, 160);
+  return `${safeMessageId || "message"}-${safeName || "attachment"}`;
+}
+
+/**
+ * Translate attachment paths to the VM. Uploads outside the shared root are
+ * copied into a transient directory inside that root first.
+ */
+class RemoteMessageQueue extends MessageQueue {
+  private readonly uploadDir: string;
+  private handedMessageCount = 0;
+
+  constructor(
+    private readonly executor: RemoteExecutorConfig,
+    sessionToken: string,
+    private readonly startupId?: string,
+  ) {
+    super();
+    this.uploadDir = join(
+      executor.localRoot,
+      ".yep-anywhere",
+      "remote-uploads",
+      sessionToken,
+    );
+  }
+
+  override push(message: UserMessage): number {
+    if (!message.attachments?.length) return super.push(message);
+
+    const attachments = message.attachments.map((attachment) => {
+      try {
+        return {
+          ...attachment,
+          path: translateSharedPath(attachment.path, this.executor),
+        };
+      } catch {
+        mkdirSync(this.uploadDir, { recursive: true });
+        const localCopy = join(
+          this.uploadDir,
+          safeAttachmentName(
+            message.uuid ?? "message",
+            attachment.originalName,
+          ),
+        );
+        copyFileSync(attachment.path, localCopy);
+        return {
+          ...attachment,
+          path: translateSharedPath(localCopy, this.executor),
+        };
+      }
+    });
+
+    return super.push({ ...message, attachments });
+  }
+
+  override async *generator(): AsyncGenerator<QueuedUserMessage> {
+    for await (const message of super.generator()) {
+      this.handedMessageCount += 1;
+      getLogger().info(
+        {
+          event: "claude_remote_prompt_handed_to_sdk",
+          startupId: this.startupId,
+          executor: executorLabel(this.executor),
+          messageUuid: message.uuid,
+          promptSequence: this.handedMessageCount,
+          queueDepth: this.depth,
+        },
+        "Handed remote Claude prompt to the Agent SDK",
+      );
+      yield message;
+    }
+  }
+
+  cleanup(): void {
+    rmSync(this.uploadDir, { recursive: true, force: true });
+  }
+}
+
+function mapContextUsage(
+  usage: Awaited<ReturnType<Query["getContextUsage"]>>,
+): ContextStatusSdkPayload | null {
+  if (!usage) return null;
+  return {
+    source: "sdk",
+    model: usage.model,
+    totalTokens: usage.totalTokens,
+    maxTokens: usage.maxTokens,
+    rawMaxTokens: usage.rawMaxTokens,
+    percentage: usage.percentage,
+    autoCompactThreshold: usage.autoCompactThreshold,
+    categories: usage.categories.map((category) => ({
+      name: category.name,
+      tokens: category.tokens,
+      color: category.color,
+    })),
+    mcpTools: usage.mcpTools.map((tool) => ({
+      name: tool.name,
+      serverName: tool.serverName,
+      tokens: tool.tokens,
+      isLoaded: tool.isLoaded,
+    })),
+    memoryFiles: usage.memoryFiles.map((file) => ({
+      path: file.path,
+      type: file.type,
+      tokens: file.tokens,
+    })),
+    agents: usage.agents.map((agent) => ({
+      agentType: agent.agentType,
+      source: agent.source,
+      tokens: agent.tokens,
+    })),
+    slashCommands: usage.slashCommands
+      ? {
+          totalCommands: usage.slashCommands.totalCommands,
+          includedCommands: usage.slashCommands.includedCommands,
+          tokens: usage.slashCommands.tokens,
+        }
+      : undefined,
+    skills: usage.skills
+      ? {
+          totalSkills: usage.skills.totalSkills,
+          includedSkills: usage.skills.includedSkills,
+          tokens: usage.skills.tokens,
+          skillFrontmatter: usage.skills.skillFrontmatter.map((skill) => ({
+            name: skill.name,
+            source: skill.source,
+            tokens: skill.tokens,
+          })),
+        }
+      : undefined,
+    systemPromptSections: usage.systemPromptSections?.map((section) => ({
+      name: section.name,
+      tokens: section.tokens,
+    })),
+    systemTools: usage.systemTools?.map((tool) => ({
+      name: tool.name,
+      tokens: tool.tokens,
+    })),
+    deferredBuiltinTools: usage.deferredBuiltinTools?.map((tool) => ({
+      name: tool.name,
+      tokens: tool.tokens,
+      isLoaded: tool.isLoaded,
+    })),
   };
 }
 
-function mergeClaudeModels(models: ModelInfo[]): ModelInfo[] {
-  const byId = new Map<string, ModelInfo>();
-
-  for (const model of CLAUDE_MODELS_FALLBACK) {
-    byId.set(model.id, enrichClaudeModel(model));
-  }
-
-  for (const model of models) {
-    byId.set(model.id, enrichClaudeModel(model));
-  }
-
-  const orderedIds = [
-    ...CLAUDE_MODELS_FALLBACK.map((model) => model.id),
-    ...models.map((model) => model.id),
-  ];
-
-  return [...new Set(orderedIds)]
-    .map((id) => byId.get(id))
-    .filter((model): model is ModelInfo => model !== undefined);
-}
-
-/** Cached models from SDK probe */
-let cachedModels: ModelInfo[] | null = null;
-
-/** Promise for in-flight probe (to avoid duplicate probes) */
-let probePromise: Promise<ModelInfo[]> | null = null;
-
-/**
- * Claude provider implementation using @anthropic-ai/claude-agent-sdk.
- *
- * This class wraps the SDK's query() function and provides:
- * - MessageQueue for queuing user messages
- * - AbortController for cancellation
- * - Tool approval callbacks
- */
+/** Claude Code provider whose CLI is intentionally remote-only. */
 export class ClaudeProvider implements AgentProvider {
   readonly name: ProviderName = "claude";
-  readonly displayName: string = "Claude";
+  readonly displayName = "Claude Code (SSH)";
   readonly supportsPermissionMode = true;
+  readonly permissionModes = ALL_PERMISSION_MODES;
   readonly supportsThinkingToggle = true;
   readonly supportsSlashCommands = true;
 
-  /**
-   * Check if Claude SDK is available.
-   * Since we bundle the SDK, this is always true.
-   */
+  private remoteExecutors: RemoteExecutorConfig[];
+  private readonly localSessionsDir: string;
+  private onSessionFileUpdated:
+    | ((update: ClaudeSessionFileUpdate) => void)
+    | undefined;
+  private cachedModels: ModelInfo[] | null = null;
+  private cachedUsage: ClaudeUsageResponse | null = null;
+  private cachedUsageExpiresAt = 0;
+  private modelRefreshRetryAt = 0;
+  private controlProbe: Promise<ClaudeControlProbeResult> | null = null;
+
+  constructor(config: ClaudeProviderConfig = {}) {
+    this.remoteExecutors = [...(config.remoteExecutors ?? [])];
+    this.localSessionsDir =
+      config.localSessionsDir ??
+      process.env.CLAUDE_SESSIONS_DIR ??
+      join(
+        process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"),
+        "projects",
+      );
+    this.onSessionFileUpdated = config.onSessionFileUpdated;
+  }
+
+  setRemoteExecutors(executors: RemoteExecutorConfig[]): void {
+    this.remoteExecutors = executors.map((executor) => ({ ...executor }));
+    this.cachedModels = null;
+    this.cachedUsage = null;
+    this.cachedUsageExpiresAt = 0;
+    this.modelRefreshRetryAt = 0;
+  }
+
+  setSessionFileObserver(
+    observer: ((update: ClaudeSessionFileUpdate) => void) | undefined,
+  ): void {
+    this.onSessionFileUpdated = observer;
+  }
+
   async isInstalled(): Promise<boolean> {
-    return true;
+    return this.remoteExecutors.length > 0;
   }
 
-  /**
-   * Check if Claude is authenticated.
-   * Returns true if ANTHROPIC_API_KEY is set or OAuth credentials exist.
-   */
   async isAuthenticated(): Promise<boolean> {
-    const authStatus = await this.getAuthStatus();
-    return authStatus.authenticated;
+    // Credentials live in the VM and are verified by Claude itself at launch.
+    return this.remoteExecutors.length > 0;
   }
 
-  /**
-   * Get detailed authentication status.
-   * If Claude CLI is installed, assume it's authenticated.
-   * The SDK handles auth internally and will error at session start if not authenticated.
-   */
   async getAuthStatus(): Promise<AuthStatus> {
-    const installed = await this.isClaudeCliInstalled();
+    const firstExecutor = this.remoteExecutors[0];
+    const configured = firstExecutor !== undefined;
     return {
-      installed,
-      authenticated: installed,
-      enabled: installed,
+      installed: configured,
+      authenticated: configured,
+      enabled: configured,
+      user: firstExecutor ? { name: executorLabel(firstExecutor) } : undefined,
     };
   }
 
-  /**
-   * Check if Claude CLI is installed.
-   * Uses detectClaudeCli() which checks PATH and common installation locations.
-   */
-  private async isClaudeCliInstalled(): Promise<boolean> {
-    const cliInfo = detectClaudeCli();
-    return cliInfo.found;
+  async getAvailableModels(
+    options: { waitForRefresh?: boolean } = {},
+  ): Promise<ModelInfo[]> {
+    if (this.cachedModels) return cloneClaudeModels(this.cachedModels);
+    if (this.remoteExecutors.length === 0) {
+      return cloneClaudeModels(CLAUDE_MODELS_FALLBACK);
+    }
+
+    if (this.modelRefreshRetryAt > Date.now()) {
+      return cloneClaudeModels(CLAUDE_MODELS_FALLBACK);
+    }
+
+    if (options.waitForRefresh === false) {
+      void this.refreshAvailableModels();
+      return cloneClaudeModels(CLAUDE_MODELS_FALLBACK);
+    }
+
+    const models = await this.refreshAvailableModels();
+    return models ?? cloneClaudeModels(CLAUDE_MODELS_FALLBACK);
   }
 
-  /**
-   * Get available Claude models.
-   * Fetches dynamically from SDK via a probe session, with caching.
-   * Falls back to static list if probe fails or user is not authenticated.
-   */
-  async getAvailableModels(): Promise<ModelInfo[]> {
-    // Return cached models if available
-    if (cachedModels) {
-      return mergeClaudeModels([
-        ...(await getConfiguredClaudeModels()),
-        ...cachedModels,
-      ]);
-    }
-
-    const configuredModels = await getConfiguredClaudeModels();
-    const catalogPromise = fetchClaudeModelCatalog();
-
-    // Check if user is authenticated before trying to probe
-    const authStatus = await this.getAuthStatus();
-    if (!authStatus.authenticated) {
-      return mergeClaudeModels([
-        ...configuredModels,
-        ...(await catalogPromise),
-      ]);
-    }
-
-    // If probe is already in progress, wait for it
-    if (probePromise) {
-      try {
-        const [probedModels, catalogModels] = await Promise.all([
-          probePromise,
-          catalogPromise,
-        ]);
-        return mergeClaudeModels([
-          ...configuredModels,
-          ...probedModels,
-          ...catalogModels,
-        ]);
-      } catch (error) {
-        console.warn("[Claude] Failed to probe models, using fallback:", error);
-        return mergeClaudeModels([
-          ...configuredModels,
-          ...(await catalogPromise),
-        ]);
-      }
-    }
-
-    // Start a new probe
-    probePromise = this.probeModels();
+  private async refreshAvailableModels(): Promise<ModelInfo[] | null> {
     try {
-      const [models, catalogModels] = await Promise.all([
-        probePromise,
-        catalogPromise,
-      ]);
-      cachedModels = mergeClaudeModels([
-        ...configuredModels,
-        ...models,
-        ...catalogModels,
-      ]);
-      return cachedModels;
-    } catch (error) {
-      console.warn("[Claude] Failed to probe models, using fallback:", error);
-      return mergeClaudeModels([
-        ...configuredModels,
-        ...(await catalogPromise),
-      ]);
-    } finally {
-      probePromise = null;
-    }
-  }
-
-  /**
-   * Get filtered environment variables for child processes.
-   * Subclasses can override to inject custom env vars (e.g., ANTHROPIC_BASE_URL).
-   */
-  protected getEnv(): Record<string, string | undefined> {
-    return filterEnvForChildProcess();
-  }
-
-  /**
-   * Build the systemPrompt option for the SDK query.
-   * Default: use the full claude_code preset. Subclasses (e.g., Ollama) can
-   * override to provide a simpler prompt that smaller models can follow.
-   */
-  protected getSystemPrompt(
-    globalInstructions?: string,
-  ):
-    | string
-    | { type: "preset"; preset: "claude_code"; append?: string }
-    | undefined {
-    return globalInstructions
-      ? {
-          type: "preset" as const,
-          preset: "claude_code" as const,
-          append: globalInstructions,
-        }
-      : { type: "preset" as const, preset: "claude_code" as const };
-  }
-
-  /**
-   * Probe for available models by starting a minimal session.
-   * The session doesn't send any messages - it just calls supportedModels()
-   * on the SDK query and then aborts.
-   */
-  private async probeModels(): Promise<ModelInfo[]> {
-    const abortController = new AbortController();
-
-    // Generator that waits indefinitely — keeps the SDK process alive
-    // while we query supportedModels() from the initialization handshake.
-    // Resolves (rather than rejects) on abort to avoid unhandled rejections.
-    async function* waitForever(): AsyncGenerator<never> {
-      await new Promise<never>((resolve) => {
-        abortController.signal.addEventListener("abort", () =>
-          resolve(undefined as never),
-        );
-      });
-    }
-
-    try {
-      const sdkQuery = query({
-        prompt: waitForever(),
-        options: {
-          cwd: homedir(),
-          abortController,
-          permissionMode: "default",
-          persistSession: false,
-          env: this.getEnv(),
-        },
-      });
-
-      // The SDK's internal readMessages loop must be running for
-      // the initialize control_response to be processed. Start
-      // consuming the async iterator in the background.
-      const drain = (async () => {
-        try {
-          for await (const _ of sdkQuery) {
-            // drain
-          }
-        } catch {
-          // Expected — abort causes an error
-        }
-      })();
-
-      // supportedModels() resolves once the initialize handshake completes.
-      // Race against a timeout in case the process hangs.
-      const models = await Promise.race([
-        sdkQuery.supportedModels(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Model probe timed out")), 15000),
-        ),
-      ]);
-
-      return mergeClaudeModels(
-        models.map((m) => ({
-          id: m.value,
-          name: m.displayName,
-          description: m.description,
-        })),
-      );
-    } finally {
-      abortController.abort();
-    }
-  }
-
-  /**
-   * Start a new Claude session.
-   */
-  async startSession(options: StartSessionOptions): Promise<AgentSession> {
-    const log = getLogger();
-    const queue = new MessageQueue();
-    const abortController = new AbortController();
-
-    // Effective cwd for the session (may be translated for remote executors)
-    let effectiveCwd = options.cwd;
-
-    // If remote executor specified, test connection first
-    if (options.executor) {
-      log.info(
+      const result = await this.refreshRemoteControl();
+      if (result.models?.length) return cloneClaudeModels(result.models);
+      getLogger().warn(
         {
-          event: "remote_session_start",
-          executor: options.executor,
-          cwd: options.cwd,
+          event: "claude_remote_model_probe_failed",
+          error: result.modelsError,
         },
-        `Starting remote session on ${options.executor}`,
+        "Unable to read the remote Claude model catalog; using fallback metadata",
       );
+    } catch (error) {
+      getLogger().warn(
+        {
+          event: "claude_remote_model_probe_failed",
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Unable to read the remote Claude model catalog; using fallback metadata",
+      );
+    }
+    return null;
+  }
 
-      const testResult = await testSSHConnection(options.executor);
-      if (!testResult.success) {
+  async getUsage(
+    options: { fresh?: boolean } = {},
+  ): Promise<ClaudeUsageResponse> {
+    if (this.remoteExecutors.length === 0) {
+      return { usage: null, error: "No Claude SSH executor is configured" };
+    }
+    if (
+      !options.fresh &&
+      this.cachedUsage &&
+      this.cachedUsageExpiresAt > Date.now()
+    ) {
+      return this.cachedUsage;
+    }
+
+    try {
+      const result = await this.refreshRemoteControl();
+      if (result.usage) {
+        return { usage: result.usage, error: null };
+      }
+      return {
+        usage: null,
+        error: result.usageError ?? "Claude plan usage is unavailable",
+      };
+    } catch (error) {
+      return {
+        usage: null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private async refreshRemoteControl(): Promise<ClaudeControlProbeResult> {
+    if (this.controlProbe) return this.controlProbe;
+    const executor = this.remoteExecutors[0];
+    if (!executor) throw new Error("No Claude SSH executor is configured");
+
+    this.controlProbe = probeRemoteClaudeControl(executor)
+      .then((result) => {
+        if (result.models?.length) {
+          this.cachedModels = cloneClaudeModels(result.models);
+          this.modelRefreshRetryAt = 0;
+        } else {
+          this.modelRefreshRetryAt =
+            Date.now() + CLAUDE_CONTROL_FAILURE_CACHE_TTL_MS;
+        }
+        if (result.usage) {
+          this.cachedUsage = { usage: result.usage, error: null };
+        } else {
+          this.cachedUsage = {
+            usage: null,
+            error: result.usageError ?? "Claude plan usage is unavailable",
+          };
+        }
+        this.cachedUsageExpiresAt = Date.now() + CLAUDE_USAGE_CACHE_TTL_MS;
+        return result;
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.modelRefreshRetryAt =
+          Date.now() + CLAUDE_CONTROL_FAILURE_CACHE_TTL_MS;
+        this.cachedUsage = { usage: null, error: message };
+        this.cachedUsageExpiresAt = Date.now() + CLAUDE_USAGE_CACHE_TTL_MS;
+        throw error;
+      })
+      .finally(() => {
+        this.controlProbe = null;
+      });
+    return this.controlProbe;
+  }
+
+  private resolveExecutor(options: StartSessionOptions): RemoteExecutorConfig {
+    if (options.executor) {
+      const configured = this.remoteExecutors.find(
+        (candidate) =>
+          candidate.host === options.executor ||
+          executorLabel(candidate) === options.executor,
+      );
+      if (configured) return configured;
+    }
+    const onlyExecutor = this.remoteExecutors[0];
+    if (
+      !options.executor &&
+      this.remoteExecutors.length === 1 &&
+      onlyExecutor
+    ) {
+      return onlyExecutor;
+    }
+    throw new Error(
+      "Claude Code is remote-only. Select a configured SSH executor before starting the session.",
+    );
+  }
+
+  async startSession(options: StartSessionOptions): Promise<AgentSession> {
+    const startupStartedAt = Date.now();
+    const executor = this.resolveExecutor(options);
+    assertLocalSharedRoot(executor);
+    const remoteCwd = translateSharedPath(options.cwd, executor);
+    getLogger().info(
+      {
+        event: "claude_remote_preflight_start",
+        startupId: options.startupId,
+        executor: executorLabel(executor),
+        localCwd: options.cwd,
+        remoteCwd,
+        resumeSessionId: options.resumeSessionId,
+      },
+      "Starting remote Claude preflight",
+    );
+    const preflightStartedAt = Date.now();
+    const remoteStatus = await testRemoteExecutor(executor);
+    getLogger().info(
+      {
+        event: "claude_remote_preflight_complete",
+        startupId: options.startupId,
+        executor: executorLabel(executor),
+        remoteCwd,
+        success: remoteStatus.success,
+        durationMs: Date.now() - preflightStartedAt,
+        claudeVersion: remoteStatus.claudeVersion,
+        sessionStorageMode: remoteStatus.sessionStorageMode,
+        error: remoteStatus.error,
+      },
+      "Completed remote Claude preflight",
+    );
+    if (!remoteStatus.success) {
+      throw new Error(
+        `SSH connection to ${executorLabel(executor)} failed: ${remoteStatus.error ?? "unknown error"}`,
+      );
+    }
+    if (!remoteStatus.claudeAvailable) {
+      throw new Error(
+        `Claude CLI is unavailable on ${executorLabel(executor)}: ${remoteStatus.error ?? "command not found"}`,
+      );
+    }
+    if (!remoteStatus.sharedRootAvailable) {
+      throw new Error(
+        `The shared root is not mounted read/write on ${executorLabel(executor)}: ${executor.remoteRoot}`,
+      );
+    }
+    if (!remoteStatus.localRootAvailable) {
+      throw new Error(
+        `The shared root is unavailable locally: ${executor.localRoot}`,
+      );
+    }
+
+    if (getRemoteSessionStorageMode(executor) === "shared") {
+      const storage = executor.sessionStorage;
+      if (!storage?.localProjectsDir || !storage.remoteProjectsDir) {
         throw new Error(
-          `SSH connection to ${options.executor} failed: ${testResult.error}`,
+          "Shared Claude session storage requires localProjectsDir and remoteProjectsDir",
         );
       }
-      if (!testResult.claudeAvailable) {
+      if (
+        isLocalPathWithin(options.cwd, storage.localProjectsDir) ||
+        isLocalPathWithin(storage.localProjectsDir, options.cwd) ||
+        isRemotePathWithin(remoteCwd, storage.remoteProjectsDir) ||
+        isRemotePathWithin(storage.remoteProjectsDir, remoteCwd)
+      ) {
         throw new Error(
-          `Claude CLI not found on ${options.executor}. Install with: curl -fsSL https://claude.ai/install.sh | bash`,
+          "The shared Claude projects directory cannot overlap the project working directory",
         );
       }
-
-      // Translate the working directory path for the remote host
-      // (e.g., /home/user/... on Linux -> /Users/user/... on macOS)
-      if (options.cwd) {
-        const remoteHome = await getRemoteHome(options.executor);
-        if (remoteHome) {
-          const localHome = homedir();
-          effectiveCwd = translateHomePath(options.cwd, localHome, remoteHome);
-          if (effectiveCwd !== options.cwd) {
-            log.info(
-              {
-                event: "remote_path_translated",
-                executor: options.executor,
-                localPath: options.cwd,
-                remotePath: effectiveCwd,
-                localHome,
-                remoteHome,
-              },
-              `Translated path for ${options.executor}: ${options.cwd} -> ${effectiveCwd}`,
-            );
-          }
-        }
-
-        // Check if the (translated) working directory exists on the remote
-        const pathCheck = await checkRemotePath(options.executor, effectiveCwd);
-        if (!pathCheck.exists) {
-          throw new Error(
-            `Directory does not exist on ${options.executor}: ${effectiveCwd}`,
-          );
-        }
+      if (!remoteStatus.localProjectsDirAvailable) {
+        throw new Error(
+          "The shared Claude projects directory is unavailable locally",
+        );
+      }
+      if (!remoteStatus.localProjectsDirPermissionsSecure) {
+        throw new Error(
+          "The shared Claude projects directory must use 0700 or 0750 permissions",
+        );
+      }
+      if (!remoteStatus.remoteProjectsDirAvailable) {
+        throw new Error(
+          "The shared Claude projects directory is unavailable remotely",
+        );
+      }
+      if (!remoteStatus.remoteSessionStoreLinked) {
+        throw new Error(
+          "Remote ~/.claude/projects is not linked to the configured shared projects directory",
+        );
+      }
+      if (!remoteStatus.credentialStoragePrivate) {
+        throw new Error(
+          "Remote Claude credentials must remain outside the shared root",
+        );
+      }
+      if (!remoteStatus.remoteClaudeConfigDirUnset) {
+        throw new Error(
+          "Remote CLAUDE_CONFIG_DIR must be unset for shared session storage",
+        );
       }
     }
 
-    // Push the initial message into the queue (if provided)
-    // If no message, the agent will wait until one is pushed
+    const cwdCheckStartedAt = Date.now();
+    const cwdCheck = await runRemoteCommand(
+      executor,
+      inLoginShell(
+        `test -d ${quoteShell(remoteCwd)} && test -r ${quoteShell(remoteCwd)} && test -w ${quoteShell(remoteCwd)}`,
+      ),
+    );
+    getLogger().info(
+      {
+        event: "claude_remote_cwd_check_complete",
+        startupId: options.startupId,
+        executor: executorLabel(executor),
+        remoteCwd,
+        success: cwdCheck.success,
+        durationMs: Date.now() - cwdCheckStartedAt,
+        error: cwdCheck.error,
+      },
+      "Completed remote Claude project directory check",
+    );
+    if (!cwdCheck.success) {
+      throw new Error(
+        `Project directory is unavailable on ${executorLabel(executor)}: ${remoteCwd}`,
+      );
+    }
+
+    const abortController = new AbortController();
+    const queue = new RemoteMessageQueue(
+      executor,
+      randomUUID(),
+      options.startupId,
+    );
     if (options.initialMessage) {
-      queue.push(options.initialMessage);
+      const queueDepth = queue.push(options.initialMessage);
+      getLogger().info(
+        {
+          event: "claude_remote_initial_prompt_queued",
+          startupId: options.startupId,
+          executor: executorLabel(executor),
+          remoteCwd,
+          messageUuid: options.initialMessage.uuid,
+          messageChars: options.initialMessage.text.length,
+          attachmentCount: options.initialMessage.attachments?.length ?? 0,
+          imageCount: options.initialMessage.images?.length ?? 0,
+          queueDepth,
+          requestElapsedMs: Date.now() - startupStartedAt,
+        },
+        "Queued initial prompt for remote Claude",
+      );
     }
 
-    // Wrap our canUseTool to match SDK's expected type
     const onToolApproval = options.onToolApproval;
-    const canUseTool: SDKCanUseTool | undefined = onToolApproval
-      ? async (toolName, input, opts) => {
-          console.log(`[canUseTool] Called for tool: ${toolName}`);
-          const result = await onToolApproval(toolName, input, opts);
-          console.log(
-            `[canUseTool] Result for ${toolName}: ${result.behavior}`,
-          );
-          // Convert our result to SDK's PermissionResult format
+    const canUseTool: ClaudeCanUseTool | undefined = onToolApproval
+      ? async (toolName, input, approvalOptions) => {
+          const result = await onToolApproval(toolName, input, approvalOptions);
           if (result.behavior === "allow") {
             return {
               behavior: "allow" as const,
@@ -455,408 +691,254 @@ export class ClaudeProvider implements AgentProvider {
         }
       : undefined;
 
-    // Create spawn function: remote spawn for SSH executors, local wrapper for liveness checks
-    let spawnClaudeCodeProcess:
-      | ((
-          opts: import("@anthropic-ai/claude-agent-sdk").SpawnOptions,
-        ) => SpawnedProcess)
-      | undefined;
-    let capturedProcess: SpawnedProcess | null = null;
+    let capturedProcess: ChildProcess | null = null;
+    const spawnClaudeCodeProcess = createRemoteSpawn({
+      executor,
+      startupId: options.startupId,
+      onSpawn: (process) => {
+        capturedProcess = process;
+      },
+    });
 
-    if (options.executor) {
-      spawnClaudeCodeProcess = createRemoteSpawn({
-        host: options.executor,
-        remoteEnv: options.remoteEnv,
-      });
-    } else if (USE_SPAWN_WRAPPER) {
-      // Local spawn wrapper: delegates to child_process.spawn but captures the
-      // SpawnedProcess reference so we can check liveness (exitCode) later.
-      spawnClaudeCodeProcess = (spawnOpts) => {
-        // Pre-validate cwd. Without this, a missing cwd causes spawn() to emit
-        // 'error' with code=ENOENT and path=<binary>; the SDK then mis-renders
-        // it as "binary exists but failed to launch" — leading the user to
-        // suspect the Claude binary, not the cwd. Catch it here with a clear
-        // message instead.
-        const cwd = spawnOpts.cwd;
-        if (cwd) {
-          let cwdOk = false;
-          try {
-            cwdOk = statSync(cwd).isDirectory();
-          } catch {
-            cwdOk = false;
-          }
-          if (!cwdOk) {
-            throw new Error(
-              `Cannot spawn Claude: working directory does not exist: ${cwd}`,
-            );
-          }
-        }
-
-        const proc = spawn(spawnOpts.command, spawnOpts.args, {
-          cwd: spawnOpts.cwd,
-          env: spawnOpts.env as NodeJS.ProcessEnv,
-          stdio: ["pipe", "pipe", "pipe"],
-          shell: process.platform === "win32",
-        });
-
-        // Wire up abort signal → SIGTERM, matching remote-spawn behavior
-        const abortHandler = () => {
-          proc.kill("SIGTERM");
-        };
-        spawnOpts.signal.addEventListener("abort", abortHandler);
-        proc.on("exit", () => {
-          spawnOpts.signal.removeEventListener("abort", abortHandler);
-        });
-
-        capturedProcess = proc;
-        return proc;
-      };
-    }
-
-    // Create the SDK query with our message generator
     let sdkQuery: Query;
+    const queryCreateStartedAt = Date.now();
+    getLogger().info(
+      {
+        event: "claude_remote_sdk_query_create_start",
+        startupId: options.startupId,
+        executor: executorLabel(executor),
+        remoteCwd,
+        requestElapsedMs: queryCreateStartedAt - startupStartedAt,
+      },
+      "Creating remote Claude Agent SDK query",
+    );
     try {
       sdkQuery = query({
-        prompt: queue.generator(),
+        prompt: queue.generator() as AsyncGenerator<SDKUserMessage>,
         options: {
-          cwd: effectiveCwd,
+          cwd: remoteCwd,
           resume: options.resumeSessionId,
-          // Rewind/edit: resume only up to (and including) this message UUID,
-          // branching the conversation in place (same session id).
           resumeSessionAt: options.resumeSessionAt,
           abortController,
-          // Pass permission mode to SDK for system prompt configuration.
-          // However, for "bypassPermissions" we pass "default" to the SDK so it always
-          // calls our canUseTool callback - we handle the bypass logic ourselves to
-          // allow exceptions (e.g., always prompting for AskUserQuestion/ExitPlanMode).
           permissionMode:
             options.permissionMode === "bypassPermissions"
               ? "default"
               : (options.permissionMode ?? DEFAULT_PERMISSION_MODE),
           canUseTool,
-          systemPrompt: this.getSystemPrompt(options.globalInstructions),
+          systemPrompt: options.globalInstructions
+            ? {
+                type: "preset",
+                preset: "claude_code",
+                append: options.globalInstructions,
+              }
+            : { type: "preset", preset: "claude_code" },
           settingSources: ["user", "project", "local"],
           includePartialMessages: true,
-          // Model, thinking, and effort options
           model: options.model,
           thinking: options.thinking,
           effort: options.effort,
-          // Filter env to exclude npm_*, yep-anywhere specific, and other irrelevant vars
-          env: this.getEnv(),
-          // Remote execution via SSH
+          env: filterEnvForChildProcess(),
           spawnClaudeCodeProcess,
         },
       });
+      getLogger().info(
+        {
+          event: "claude_remote_sdk_query_created",
+          startupId: options.startupId,
+          executor: executorLabel(executor),
+          remoteCwd,
+          durationMs: Date.now() - queryCreateStartedAt,
+          requestElapsedMs: Date.now() - startupStartedAt,
+        },
+        "Created remote Claude Agent SDK query",
+      );
     } catch (error) {
-      // Handle common SDK initialization errors
-      if (error instanceof Error) {
-        if (error.message.includes("Claude Code executable not found")) {
-          throw new Error(
-            "Claude CLI not installed. Run: curl -fsSL https://claude.ai/install.sh | bash",
-          );
-        }
-        if (
-          error.message.includes("SPAWN") ||
-          error.message.includes("spawn")
-        ) {
-          throw new Error(
-            `Failed to spawn Claude CLI process: ${error.message}`,
-          );
-        }
-      }
-      throw error;
+      queue.cleanup();
+      throw new Error(
+        `Failed to start remote Claude CLI: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
 
-    // Wrap the iterator to convert SDK message types to our internal types
-    // Pass executor info for session sync after result messages
-    // Use effectiveCwd (the translated remote path) so sync uses the correct project dir
-    const wrappedIterator = this.wrapIterator(sdkQuery, {
-      executor: options.executor,
-      cwd: effectiveCwd,
-      remoteEnv: options.remoteEnv,
+    const iterator = this.wrapIterator(sdkQuery, {
+      executor,
+      localCwd: options.cwd,
+      remoteCwd,
+      cleanup: () => queue.cleanup(),
     });
 
     return {
-      iterator: wrappedIterator,
+      iterator,
       queue,
-      abort: () => abortController.abort(),
-      isProcessAlive:
-        USE_SPAWN_WRAPPER && !options.executor
-          ? () =>
-              capturedProcess !== null &&
-              capturedProcess.exitCode === null &&
-              !capturedProcess.killed
-          : undefined,
+      abort: () => {
+        abortController.abort();
+        queue.cleanup();
+      },
+      steer: async (message) => {
+        queue.push(message);
+        return true;
+      },
+      isProcessAlive: () =>
+        capturedProcess !== null &&
+        capturedProcess.exitCode === null &&
+        !capturedProcess.killed,
       get pid() {
         return (capturedProcess as ChildProcess | null)?.pid;
       },
-      setMaxThinkingTokens: (tokens: number | null) =>
-        sdkQuery.setMaxThinkingTokens(tokens),
+      setMaxThinkingTokens: (tokens) => sdkQuery.setMaxThinkingTokens(tokens),
       interrupt: async () => {
         await sdkQuery.interrupt();
       },
-      supportedModels: async (): Promise<ModelInfo[]> => {
+      supportedModels: async () => {
         const models = await sdkQuery.supportedModels();
-        // Map SDK ModelInfo (value, displayName, description) to our ModelInfo (id, name, description)
-        const mappedModels = mergeClaudeModels(
-          models.map((m) => ({
-            id: m.value,
-            name: m.displayName,
-            description: m.description,
-          })),
+        const mappedModels = models.map((model) =>
+          mapClaudeSdkModel(
+            model,
+            (model as { contextWindow?: number }).contextWindow,
+          ),
         );
-        // Update cache for future getAvailableModels() calls
-        cachedModels = mappedModels;
-        return mappedModels;
+        this.cachedModels = cloneClaudeModels(mappedModels);
+        return cloneClaudeModels(mappedModels);
       },
       supportedCommands: async (): Promise<SlashCommand[]> => {
         const commands = await sdkQuery.supportedCommands();
-        // Map SDK SlashCommand to our SlashCommand (same fields, just normalize)
-        return commands.map((c) => ({
-          name: c.name,
-          description: c.description,
-          argumentHint: c.argumentHint || undefined,
+        return commands.map((command) => ({
+          name: command.name,
+          description: command.description,
+          argumentHint: command.argumentHint || undefined,
         }));
       },
-      setModel: (model?: string) => sdkQuery.setModel(model),
-      getContextUsage: async (): Promise<ContextStatusSdkPayload | null> => {
+      setModel: (model) => sdkQuery.setModel(model),
+      getContextUsage: async () => {
         try {
-          const usage = await sdkQuery.getContextUsage();
-          if (!usage) return null;
-          return {
-            source: "sdk",
-            model: usage.model,
-            totalTokens: usage.totalTokens,
-            maxTokens: usage.maxTokens,
-            rawMaxTokens: usage.rawMaxTokens,
-            percentage: usage.percentage,
-            autoCompactThreshold: usage.autoCompactThreshold,
-            categories: usage.categories.map((c) => ({
-              name: c.name,
-              tokens: c.tokens,
-              color: c.color,
-            })),
-            mcpTools: usage.mcpTools.map((t) => ({
-              name: t.name,
-              serverName: t.serverName,
-              tokens: t.tokens,
-              isLoaded: t.isLoaded,
-            })),
-            memoryFiles: usage.memoryFiles.map((f) => ({
-              path: f.path,
-              type: f.type,
-              tokens: f.tokens,
-            })),
-            agents: usage.agents.map((a) => ({
-              agentType: a.agentType,
-              source: a.source,
-              tokens: a.tokens,
-            })),
-            slashCommands: usage.slashCommands
-              ? {
-                  totalCommands: usage.slashCommands.totalCommands,
-                  includedCommands: usage.slashCommands.includedCommands,
-                  tokens: usage.slashCommands.tokens,
-                }
-              : undefined,
-            skills: usage.skills
-              ? {
-                  totalSkills: usage.skills.totalSkills,
-                  includedSkills: usage.skills.includedSkills,
-                  tokens: usage.skills.tokens,
-                  skillFrontmatter: usage.skills.skillFrontmatter.map((s) => ({
-                    name: s.name,
-                    source: s.source,
-                    tokens: s.tokens,
-                  })),
-                }
-              : undefined,
-            systemPromptSections: usage.systemPromptSections?.map((s) => ({
-              name: s.name,
-              tokens: s.tokens,
-            })),
-            systemTools: usage.systemTools?.map((s) => ({
-              name: s.name,
-              tokens: s.tokens,
-            })),
-            deferredBuiltinTools: usage.deferredBuiltinTools?.map((t) => ({
-              name: t.name,
-              tokens: t.tokens,
-              isLoaded: t.isLoaded,
-            })),
-          };
-        } catch (err) {
+          return mapContextUsage(await sdkQuery.getContextUsage());
+        } catch (error) {
           getLogger().warn(
-            { err: (err as Error).message },
-            "[ClaudeProvider] getContextUsage failed",
+            {
+              event: "claude_remote_context_usage_failed",
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "Unable to read Claude context usage",
           );
           return null;
         }
       },
       initializationResult: async () => {
-        try {
-          const init = await sdkQuery.initializationResult();
-          if (!init || !Array.isArray(init.models)) return null;
-          // SDK returns ModelInfo with { value, displayName, ... }; some
-          // entries (esp. [1m] variants) carry a contextWindow field.
-          // Map to the lean { id, contextWindow } pair the supervisor uses.
-          return {
-            models: init.models.map((m) => {
-              const raw = m as unknown as {
-                value: string;
-                contextWindow?: number;
-              };
-              return {
-                id: raw.value,
-                contextWindow:
-                  typeof raw.contextWindow === "number"
-                    ? raw.contextWindow
-                    : undefined,
-              };
-            }),
-          };
-        } catch (err) {
-          getLogger().warn(
-            { err: (err as Error).message },
-            "[ClaudeProvider] initializationResult failed",
-          );
-          return null;
-        }
+        const result = await sdkQuery.initializationResult();
+        if (!result?.models) return null;
+        return {
+          models: result.models.map((model) => ({
+            id: model.value,
+            contextWindow: (model as { contextWindow?: number }).contextWindow,
+          })),
+        };
       },
     };
   }
 
-  /**
-   * Wrap the SDK iterator to convert message types.
-   * The SDK emits its own message types which we convert to our SDKMessage type.
-   *
-   * For remote sessions, syncs session files after each result message.
-   */
   private async *wrapIterator(
-    iterator: AsyncIterable<AgentSDKMessage>,
-    remoteOptions?: {
-      executor?: string;
-      cwd: string;
-      remoteEnv?: Record<string, string>;
+    iterator: AsyncIterable<ClaudeSDKMessage>,
+    options: {
+      executor: RemoteExecutorConfig;
+      localCwd: string;
+      remoteCwd: string;
+      cleanup: () => void;
     },
   ): AsyncIterableIterator<SDKMessage> {
-    const log = getLogger();
     let sessionId = "unknown";
-
     try {
       for await (const message of iterator) {
-        // Log raw SDK message for analysis (if LOG_SDK_MESSAGES=true)
         sessionId =
           (message as { session_id?: string }).session_id ?? sessionId;
         logSDKMessage(sessionId, message, { provider: "claude" });
+        const converted = sanitizeSDKMessageForPublic(
+          this.convertMessage(message),
+        ) as SDKMessage;
 
-        const converted = this.convertMessage(message);
-        yield converted;
-
-        // For remote sessions, sync session files after result messages
-        // This keeps the local UI up-to-date with remote progress
-        if (
-          remoteOptions?.executor &&
-          converted.type === "result" &&
-          sessionId !== "unknown"
-        ) {
-          const projectDir = getProjectDirFromCwd(remoteOptions.cwd);
-          log.debug(
-            {
-              event: "remote_session_sync",
-              executor: remoteOptions.executor,
-              sessionId,
-              projectDir,
-            },
-            "Syncing session from remote after turn",
-          );
-
-          // Sync in background - don't block the iterator
-          syncSessionFile(
-            remoteOptions.executor,
-            projectDir,
+        if (converted.type === "result" && sessionId !== "unknown") {
+          const sync = await materializeRemoteSessionFile({
+            executor: options.executor,
+            localCwd: options.localCwd,
+            remoteCwd: options.remoteCwd,
             sessionId,
-            undefined,
-            remoteOptions.remoteEnv?.CLAUDE_SESSIONS_DIR,
-          ).catch((error) => {
-            log.warn(
-              {
-                event: "remote_session_sync_error",
-                executor: remoteOptions.executor,
-                sessionId,
-                error: error instanceof Error ? error.message : String(error),
-              },
-              `Failed to sync session from remote: ${error}`,
-            );
+            localSessionsDir: this.localSessionsDir,
           });
+          if (!sync.success) {
+            getLogger().warn(
+              {
+                event:
+                  sync.mode === "shared"
+                    ? "claude_shared_session_not_visible"
+                    : "claude_remote_session_sync_failed",
+                executor: executorLabel(options.executor),
+                sessionId,
+                error: sync.error,
+              },
+              sync.mode === "shared"
+                ? "Remote Claude turn completed, but the shared JSONL was not visible locally"
+                : "Remote Claude turn completed, but its JSONL replica could not be updated",
+            );
+          } else if (sync.localPath) {
+            this.onSessionFileUpdated?.({
+              executor: options.executor,
+              sessionId,
+              localPath: sync.localPath,
+              projectsDir:
+                sync.mode === "shared"
+                  ? (options.executor.sessionStorage?.localProjectsDir ??
+                    this.localSessionsDir)
+                  : this.localSessionsDir,
+              mode: sync.mode,
+            });
+          }
         }
+
+        yield converted;
       }
     } catch (error) {
-      // Handle abort errors gracefully
-      if (error instanceof Error && error.name === "AbortError") {
-        return;
-      }
-      // Re-throw process termination errors for Process to handle
-      // These include: "ProcessTransport is not ready for writing"
+      if (error instanceof Error && error.name === "AbortError") return;
       throw error;
+    } finally {
+      options.cleanup();
     }
   }
 
-  /**
-   * Convert an SDK message to our internal SDKMessage format.
-   *
-   * We pass through all fields from the SDK without stripping.
-   * This preserves debugging info, DAG structure, and metadata.
-   */
-  private convertMessage(message: AgentSDKMessage): SDKMessage {
-    // Pass through all fields, only normalize content blocks
+  private convertMessage(message: ClaudeSDKMessage): SDKMessage {
     const sdkMessage = message as unknown as SDKMessage;
-
-    // For messages with content, normalize the content blocks
-    if (sdkMessage.message?.content) {
-      return {
-        ...sdkMessage,
-        message: {
-          ...sdkMessage.message,
-          content: this.normalizeContent(sdkMessage.message.content),
-        },
-      };
-    }
-
-    // Pass through as-is for messages without content
-    return sdkMessage;
+    if (!sdkMessage.message?.content) return sdkMessage;
+    return {
+      ...sdkMessage,
+      message: {
+        ...sdkMessage.message,
+        content: this.normalizeContent(sdkMessage.message.content),
+      },
+    };
   }
 
-  /**
-   * Normalize content to ensure consistent format.
-   * Preserves all fields, only converts strings to text blocks.
-   */
   private normalizeContent(
     content: string | ContentBlock[] | unknown,
   ): string | ContentBlock[] {
-    // String content stays as string
-    if (typeof content === "string") {
-      return content;
-    }
-
-    // Array content - normalize each block
+    if (typeof content === "string") return content;
     if (Array.isArray(content)) {
-      return content.map((block): ContentBlock => {
-        if (typeof block === "string") {
-          return { type: "text", text: block };
-        }
-        // Pass through all block fields - don't strip anything
-        return block as ContentBlock;
-      });
+      return content.map(
+        (block): ContentBlock =>
+          typeof block === "string" ? { type: "text", text: block } : block,
+      );
     }
-
-    // Unknown content type - stringify for safety
     return String(content);
   }
 }
 
-/**
- * Default Claude provider instance.
- * Can be imported for convenience or instantiated directly.
- */
 export const claudeProvider = new ClaudeProvider();
+
+/** Update the singleton used by provider discovery and Supervisor resolution. */
+export function configureClaudeRemoteExecutors(
+  executors: RemoteExecutorConfig[],
+): void {
+  claudeProvider.setRemoteExecutors(executors);
+}
+
+export function configureClaudeSessionFileObserver(
+  observer: ((update: ClaudeSessionFileUpdate) => void) | undefined,
+): void {
+  claudeProvider.setSessionFileObserver(observer);
+}

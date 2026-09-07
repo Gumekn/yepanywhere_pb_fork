@@ -61,6 +61,10 @@ export class Session extends SessionView {
       summary.contextUsage,
       summary.provider,
       summary.aiTitle,
+      summary.cumulativeUsage,
+      summary.compactCount,
+      summary.compactEvents,
+      summary.forkParentSessionId,
     );
     this.deps = deps;
   }
@@ -98,6 +102,9 @@ export class Session extends SessionView {
       isStarred: metadata?.isStarred,
       executor: metadata?.executor,
       createdBy: metadata?.createdBy ?? summary.createdBy,
+      originChannel: metadata?.originChannel ?? summary.originChannel,
+      forkParentSessionId:
+        metadata?.forkParentSessionId ?? summary.forkParentSessionId,
     };
 
     return new Session(enrichedSummary, deps);
@@ -176,6 +183,10 @@ export class Session extends SessionView {
       lastSeenAt: this.lastSeenAt,
       hasUnread: this.hasUnread,
       contextUsage: this.contextUsage,
+      cumulativeUsage: this.cumulativeUsage,
+      compactCount: this.compactCount,
+      compactEvents: this.compactEvents,
+      forkParentSessionId: this.forkParentSessionId,
       provider: this.provider,
     };
   }

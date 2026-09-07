@@ -1,7 +1,9 @@
+import type { Stats } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   type AgentStatus,
+  type ContextCompactEvent,
   type ContextCumulativeUsage,
   type ProviderName,
   SESSION_TITLE_MAX_LENGTH,
@@ -9,7 +11,6 @@ import {
   type UrlProjectId,
   escalateContextWindow,
   getModelContextWindow,
-  isClaudeInternalUserPromptEntry,
   isIdeMetadata,
   stripBridgeMetadata,
   stripIdeMetadata,
@@ -39,12 +40,13 @@ import {
   isCompactBoundary,
   isConversationEntry,
 } from "@yep-anywhere/shared";
-import { canonicalizeProjectPath, encodeProjectId } from "../projects/paths.js";
+import type { SubagentDescriptor, SubagentMetrics } from "@yep-anywhere/shared";
 import {
   buildClaudeBranchView,
   collectVisibleClaudeEntries,
 } from "./claude-messages.js";
 import { buildDag } from "./dag.js";
+import { sanitizePublicUserPrompt } from "./public-user-prompt.js";
 
 export interface ClaudeSessionReaderOptions {
   sessionDir: string;
@@ -73,6 +75,13 @@ export interface AgentSession {
   status: AgentStatus;
   /** Agent type from meta.json (SDK 0.2.76+), e.g. "Explore", "Plan" */
   agentType?: string;
+  /**
+   * Derived run metrics (usage breakdown, tool/step counts, duration).
+   * Providers that cannot measure them omit the field.
+   */
+  metrics?: SubagentMetrics;
+  /** Rich identity + lifecycle descriptor, when the provider can supply it. */
+  descriptor?: SubagentDescriptor;
 }
 
 /**
@@ -267,6 +276,31 @@ export class ClaudeSessionReader implements ISessionReader {
     sessionId: string,
     projectId: UrlProjectId,
   ): Promise<SessionSummary | null> {
+    const loaded = await this.loadSessionEntriesFromDir(dir, sessionId);
+    if (!loaded) return null;
+    return this.buildSummaryFromEntries(
+      loaded.messages,
+      loaded.stats,
+      sessionId,
+      projectId,
+    );
+  }
+
+  /**
+   * Read and parse a session JSONL file exactly once.
+   *
+   * Returns the parsed entries alongside the file stats so callers can derive
+   * both the summary and the branch projection without re-reading or
+   * re-parsing the file. Returns null when the file is missing or empty.
+   */
+  private async loadSessionEntriesFromDir(
+    dir: string,
+    sessionId: string,
+  ): Promise<{
+    filePath: string;
+    stats: Stats;
+    messages: ClaudeSessionEntry[];
+  } | null> {
     const filePath = join(dir, `${sessionId}.jsonl`);
 
     try {
@@ -289,31 +323,34 @@ export class ClaudeSessionReader implements ISessionReader {
         })
         .filter((m): m is ClaudeSessionEntry => m !== null);
 
-      // Extract the real cwd from the session file (written by Claude SDK on every turn).
-      // This is the source of truth for which project the session actually belongs to,
-      // regardless of which directory the session file happens to be stored in.
-      let realCwd: string | null = null;
-      for (const msg of messages) {
-        if (
-          msg &&
-          typeof msg === "object" &&
-          "cwd" in msg &&
-          typeof msg.cwd === "string"
-        ) {
-          realCwd = msg.cwd;
-          break; // Use the first cwd found
-        }
-      }
+      const stats = await stat(filePath);
+      return { filePath, stats, messages };
+    } catch {
+      return null;
+    }
+  }
 
+  /**
+   * Derive a session summary from already-parsed entries.
+   *
+   * Pure with respect to I/O — the file has already been read and stat'd by
+   * {@link loadSessionEntriesFromDir}. Returns null for metadata-only files
+   * that have no user/assistant conversation messages yet.
+   */
+  private buildSummaryFromEntries(
+    messages: ClaudeSessionEntry[],
+    stats: Stats,
+    sessionId: string,
+    projectId: UrlProjectId,
+  ): SessionSummary | null {
+    try {
       // Build DAG and get active branch (filters out dead branches from rewinds, etc.)
       const { activeBranch } = buildDag(messages);
 
       // Filter active branch to user/assistant messages only
       const conversationMessages = activeBranch
         .filter(
-          (node) =>
-            (node.raw.type === "user" || node.raw.type === "assistant") &&
-            !isClaudeInternalUserPromptEntry(node.raw),
+          (node) => node.raw.type === "user" || node.raw.type === "assistant",
         )
         .map((node) => node.raw);
 
@@ -324,9 +361,11 @@ export class ClaudeSessionReader implements ISessionReader {
         return null;
       }
 
-      const stats = await stat(filePath);
       const firstUserMessage = this.findFirstUserMessage(messages);
-      const fullTitle = firstUserMessage || null;
+      const publicFirstUserMessage = firstUserMessage
+        ? sanitizePublicUserPrompt(firstUserMessage)
+        : null;
+      const fullTitle = publicFirstUserMessage || null;
       const model = this.extractModel(conversationMessages);
       const activeBranchMessages = activeBranch.map((node) => node.raw);
       const userQuestions = this.extractUserQuestions(activeBranchMessages);
@@ -346,6 +385,8 @@ export class ClaudeSessionReader implements ISessionReader {
 
       const cumulativeUsage =
         this.extractCumulativeTokenUsage(activeBranchMessages);
+      const compactCount = this.countCompactions(activeBranchMessages);
+      const compactEvents = this.extractCompactEvents(activeBranchMessages);
 
       // A session is "interrupted" when its last turn was cut short (e.g. by a
       // server restart) and the session can be resumed. The reliable signal is
@@ -355,20 +396,10 @@ export class ClaudeSessionReader implements ISessionReader {
       // message with end_turn/tool_use is a completed turn, not interrupted.
       const interrupted = this.isBranchInterrupted(conversationMessages);
 
-      // Use the real cwd from the session file if available, otherwise fall back to
-      // the projectId parameter. This ensures sessions show up under their actual
-      // working directory, not the directory where the .jsonl file happens to be stored.
-      const actualProjectId = realCwd
-        ? encodeProjectId(canonicalizeProjectPath(realCwd))
-        : projectId;
-      if (actualProjectId !== projectId) {
-        return null;
-      }
-
       return {
         id: sessionId,
-        projectId: actualProjectId,
-        title: this.extractTitle(firstUserMessage),
+        projectId,
+        title: this.extractTitle(publicFirstUserMessage),
         fullTitle,
         createdAt: stats.birthtime.toISOString(),
         updatedAt:
@@ -379,6 +410,8 @@ export class ClaudeSessionReader implements ISessionReader {
         ownership: { owner: "none" }, // Will be updated by Supervisor
         contextUsage,
         cumulativeUsage,
+        compactCount,
+        compactEvents,
         provider,
         model,
         serviceTier: runtimeConfig.serviceTier,
@@ -395,60 +428,60 @@ export class ClaudeSessionReader implements ISessionReader {
     afterMessageId?: string,
     _options?: GetSessionOptions,
   ): Promise<LoadedSession | null> {
-    const summary = await this.getSessionSummary(sessionId, projectId);
-    if (!summary) return null;
+    // Read + parse the session file exactly once, then derive both the summary
+    // and the branch projection from the same entries. Previously this method
+    // called getSessionSummary() (which read + parsed the file) and then
+    // re-read + re-parsed the same file for buildClaudeBranchView, doubling the
+    // I/O and JSON.parse cost on every open / page / branch switch.
+    for (const dir of this.allSessionDirs) {
+      const loaded = await this.loadSessionEntriesFromDir(dir, sessionId);
+      if (!loaded) continue;
 
-    // Find the session file across all dirs
-    const filePath = await this.findSessionFile(sessionId);
-    if (!filePath) return null;
-    const content = await readFile(filePath, "utf-8");
-
-    // Guard against empty or invalid content
-    if (!content || typeof content !== "string") return null;
-
-    const lines = content.trim().split("\n");
-
-    const rawMessages: ClaudeSessionEntry[] = [];
-    for (const line of lines) {
-      try {
-        rawMessages.push(JSON.parse(line) as ClaudeSessionEntry);
-      } catch {
-        // Skip malformed lines
-      }
-    }
-
-    const branchView = buildClaudeBranchView(
-      rawMessages,
-      sessionId,
-      _options?.branchId,
-      { includeOrphans: _options?.includeOrphans },
-    );
-
-    // Filter messages for incremental fetching if needed. Use the selected
-    // branch projection so a historical branch does not append active-branch
-    // siblings during branch navigation.
-    let finalMessages = branchView.entries;
-    if (afterMessageId) {
-      const afterIndex = finalMessages.findIndex(
-        (m) => "uuid" in m && m.uuid === afterMessageId,
+      const summary = this.buildSummaryFromEntries(
+        loaded.messages,
+        loaded.stats,
+        sessionId,
+        projectId,
       );
-      if (afterIndex !== -1) {
-        finalMessages = finalMessages.slice(afterIndex + 1);
+      // Skip metadata-only files with no conversation yet, matching the
+      // dir-scanning behaviour of getSessionSummary().
+      if (!summary) continue;
+
+      const branchView = buildClaudeBranchView(
+        loaded.messages,
+        sessionId,
+        _options?.branchId,
+        { includeOrphans: _options?.includeOrphans },
+      );
+
+      // Filter messages for incremental fetching if needed. Use the selected
+      // branch projection so a historical branch does not append active-branch
+      // siblings during branch navigation.
+      let finalMessages = branchView.entries;
+      if (afterMessageId) {
+        const afterIndex = finalMessages.findIndex(
+          (m) => "uuid" in m && m.uuid === afterMessageId,
+        );
+        if (afterIndex !== -1) {
+          finalMessages = finalMessages.slice(afterIndex + 1);
+        }
       }
+
+      return {
+        summary,
+        data: {
+          provider: summary.provider as "claude" | "claude-ollama",
+          session: {
+            messages: finalMessages,
+          },
+        },
+        messagesAlreadyProjected: true,
+        orphanedToolUses: branchView.orphanedToolUses,
+        branchState: branchView.branchState,
+      };
     }
 
-    return {
-      summary,
-      data: {
-        provider: summary.provider as "claude" | "claude-ollama",
-        session: {
-          messages: finalMessages,
-        },
-      },
-      messagesAlreadyProjected: true,
-      orphanedToolUses: branchView.orphanedToolUses,
-      branchState: branchView.branchState,
-    };
+    return null;
   }
 
   /**
@@ -705,7 +738,7 @@ export class ClaudeSessionReader implements ISessionReader {
 
   private findFirstUserMessage(messages: ClaudeSessionEntry[]): string | null {
     for (const msg of messages) {
-      if (msg.type === "user" && !isClaudeInternalUserPromptEntry(msg)) {
+      if (msg.type === "user") {
         const content = msg.message.content;
         if (content) {
           // Content can be string or array of content blocks
@@ -730,9 +763,7 @@ export class ClaudeSessionReader implements ISessionReader {
 
     for (let index = 0; index < messages.length; index++) {
       const msg = messages[index];
-      if (!msg || msg.type !== "user" || isClaudeInternalUserPromptEntry(msg)) {
-        continue;
-      }
+      if (!msg || msg.type !== "user") continue;
 
       const content = msg.message.content;
       if (!content) continue;
@@ -903,12 +934,113 @@ export class ClaudeSessionReader implements ISessionReader {
 
     if (turnCount === 0) return undefined;
     return {
+      totalTokens:
+        inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens,
       inputTokens,
       outputTokens,
       cacheReadTokens,
       cacheCreationTokens,
       turnCount,
     };
+  }
+
+  private countCompactions(messages: ClaudeSessionEntry[]): number {
+    return messages.reduce(
+      (count, msg) => count + (isCompactBoundary(msg) ? 1 : 0),
+      0,
+    );
+  }
+
+  private extractCompactEvents(
+    messages: ClaudeSessionEntry[],
+  ): ContextCompactEvent[] | undefined {
+    const events: ContextCompactEvent[] = [];
+
+    for (let index = 0; index < messages.length; index += 1) {
+      const msg = messages[index];
+      if (!msg || !isCompactBoundary(msg)) continue;
+
+      const metadata = (
+        msg as {
+          compactMetadata?: {
+            preTokens?: number;
+            trigger?: string;
+          };
+        }
+      ).compactMetadata;
+      const previousAssistantTokens = this.findAssistantInputTokens(
+        messages,
+        index - 1,
+        -1,
+      );
+      const preTokens =
+        typeof metadata?.preTokens === "number" && metadata.preTokens > 0
+          ? metadata.preTokens
+          : undefined;
+      const overhead =
+        preTokens !== undefined && previousAssistantTokens !== undefined
+          ? Math.max(0, preTokens - previousAssistantTokens)
+          : 0;
+      const beforeTokens =
+        preTokens !== undefined ? preTokens : previousAssistantTokens;
+      const afterAssistantTokens = this.findAssistantInputTokens(
+        messages,
+        index + 1,
+        1,
+      );
+      const afterTokens =
+        afterAssistantTokens !== undefined
+          ? afterAssistantTokens + overhead
+          : undefined;
+      const event: ContextCompactEvent = {};
+
+      if ("timestamp" in msg && typeof msg.timestamp === "string") {
+        event.timestamp = msg.timestamp;
+      }
+      if (typeof metadata?.trigger === "string" && metadata.trigger) {
+        event.trigger = metadata.trigger;
+      }
+      if (beforeTokens !== undefined) {
+        event.beforeTokens = beforeTokens;
+      }
+      if (afterTokens !== undefined) {
+        event.afterTokens = afterTokens;
+      }
+      if (beforeTokens !== undefined && afterTokens !== undefined) {
+        const reclaimedTokens = beforeTokens - afterTokens;
+        if (reclaimedTokens > 0) {
+          event.reclaimedTokens = reclaimedTokens;
+        }
+      }
+
+      events.push(event);
+    }
+
+    return events.length > 0 ? events : undefined;
+  }
+
+  private findAssistantInputTokens(
+    messages: ClaudeSessionEntry[],
+    startIndex: number,
+    direction: -1 | 1,
+  ): number | undefined {
+    for (
+      let index = startIndex;
+      index >= 0 && index < messages.length;
+      index += direction
+    ) {
+      const msg = messages[index];
+      if (!msg || msg.type !== "assistant") continue;
+
+      const usage = (msg as { message?: { usage?: UsageFields } }).message
+        ?.usage;
+      if (!usage) continue;
+
+      const inputTokens = getTotalInputTokens(usage);
+      if (inputTokens > 0) return inputTokens;
+    }
+
+    return undefined;
   }
 
   /**

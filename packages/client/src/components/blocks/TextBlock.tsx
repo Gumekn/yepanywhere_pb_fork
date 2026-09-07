@@ -1,11 +1,18 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { useFileTabOpener } from "../../contexts/FileTabOpenerContext";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useOptionalSessionMetadata } from "../../contexts/SessionMetadataContext";
 import { useStreamingMarkdownContext } from "../../contexts/StreamingMarkdownContext";
+import { useMarkdownCodeCopy } from "../../hooks/useMarkdownCodeCopy";
 import { useStreamingMarkdown } from "../../hooks/useStreamingMarkdown";
+import { useOptionalI18n } from "../../i18n";
 import { appPath } from "../../lib/apiPath";
-import { getSelectionAwareCopyText } from "../../lib/clipboard";
 import {
   parseLineColumn,
   splitTextWithFilePaths,
@@ -21,10 +28,15 @@ import {
   extractPathFromLocalImageUrl,
   useLocalMediaClick,
 } from "../LocalMediaModal";
+import {
+  BenchmarkEvalResult,
+  parseBenchmarkEvalResultBlock,
+} from "./BenchmarkEvalResult";
 
 interface Props {
   text: string;
   isStreaming?: boolean;
+  phase?: "commentary" | "final_answer";
   /** Pre-rendered HTML from server (for completed messages) */
   augmentHtml?: string;
 }
@@ -33,12 +45,10 @@ function getProjectRelativePath(
   filePath: string,
   projectPath: string | null | undefined,
 ): string | null {
-  // Normalize Windows backslashes so comparison works cross-platform.
-  const normPath = filePath?.replace(/\\/g, "/");
-  const root = projectPath?.replace(/\\/g, "/").replace(/\/+$/, "");
+  const root = projectPath?.replace(/\/+$/, "");
   if (!root) return null;
-  if (!normPath.startsWith(`${root}/`)) return null;
-  return normPath.slice(root.length + 1);
+  if (!filePath.startsWith(`${root}/`)) return null;
+  return filePath.slice(root.length + 1);
 }
 
 function isModifiedClick(e: React.MouseEvent): boolean {
@@ -140,9 +150,10 @@ function renderPlainTextWithLocalMediaLinks(text: string): React.ReactNode {
 export const TextBlock = memo(function TextBlock({
   text,
   isStreaming = false,
+  phase,
   augmentHtml,
 }: Props) {
-  const [copied, setCopied] = useState(false);
+  const i18n = useOptionalI18n();
   const [fileModal, setFileModal] = useState<{
     filePath: string;
     lineNumber?: number;
@@ -151,8 +162,12 @@ export const TextBlock = memo(function TextBlock({
     null,
   );
   const blockRef = useRef<HTMLDivElement | null>(null);
+  const handleCodeBlockCopyClick = useMarkdownCodeCopy(blockRef);
   const sessionMetadata = useOptionalSessionMetadata();
-  const fileTabOpener = useFileTabOpener();
+  const benchmarkEval = useMemo(
+    () => parseBenchmarkEvalResultBlock(text),
+    [text],
+  );
 
   // Streaming markdown hook for server-rendered content
   const streamingMarkdown = useStreamingMarkdown();
@@ -188,18 +203,6 @@ export const TextBlock = memo(function TextBlock({
     return unregister;
   }, [isStreaming, streamingContext, streamingMarkdown]);
 
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(
-        getSelectionAwareCopyText(text, blockRef.current),
-      );
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error("Failed to copy text:", err);
-    }
-  }, [text]);
-
   const {
     modal,
     handleClick: handleLocalMediaClick,
@@ -208,6 +211,7 @@ export const TextBlock = memo(function TextBlock({
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
+      if (handleCodeBlockCopyClick(e)) return;
       if (handleLocalMediaClick(e)) return;
 
       const target = (e.target as HTMLElement).closest?.(
@@ -245,23 +249,37 @@ export const TextBlock = memo(function TextBlock({
         return;
       }
 
-      // Unified entry: open the file in the same editor tab used by the
-      // project repo explorer (Win/Mac consistent). Falls back to the old
-      // modal when no tab opener is available (e.g. archive/inbox pages).
-      if (fileTabOpener) {
-        fileTabOpener.openFileTab(relativePath);
-        return;
-      }
-
       setFileModal({
         filePath: relativePath,
         lineNumber: localFileTarget.lineNumber,
       });
     },
-    [handleLocalMediaClick, sessionMetadata, fileTabOpener],
+    [handleCodeBlockCopyClick, handleLocalMediaClick, sessionMetadata],
   );
 
   const showStreamingContent = isStreaming && useStreamingContent;
+
+  // Server-rendered markdown is applied imperatively instead of through
+  // `dangerouslySetInnerHTML` so identical HTML is never re-applied. React
+  // re-runs that prop on some commits (a load-older prepend applies the exact
+  // same string twice), and every re-application recreates every node inside —
+  // which silently destroys a text selection the user is making inside it.
+  const augmentHostRef = useRef<HTMLDivElement | null>(null);
+  const appliedAugmentRef = useRef<{ host: HTMLElement; html: string } | null>(
+    null,
+  );
+  const showAugmentHost =
+    !showStreamingContent && !benchmarkEval && augmentHtml;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: showAugmentHost re-runs this when the branch (and therefore the host node) changes
+  useLayoutEffect(() => {
+    const host = augmentHostRef.current;
+    if (!host || !augmentHtml) return;
+    const applied = appliedAugmentRef.current;
+    if (applied && applied.host === host && applied.html === augmentHtml)
+      return;
+    host.innerHTML = augmentHtml;
+    appliedAugmentRef.current = { host, html: augmentHtml };
+  }, [augmentHtml, showAugmentHost]);
 
   // Always render streaming container when isStreaming so refs are attached
   // before first augment arrives. Hidden until useStreamingContent becomes true.
@@ -271,19 +289,14 @@ export const TextBlock = memo(function TextBlock({
     // biome-ignore lint/a11y/useKeyWithClickEvents: click handler intercepts local media links only
     <div
       ref={blockRef}
-      className={`text-block timeline-item${isStreaming ? " streaming" : ""}`}
+      className={`text-block timeline-item${isStreaming ? " streaming" : ""}${phase === "commentary" ? " text-block-commentary" : ""}`}
       onClick={handleClick}
     >
-      <button
-        type="button"
-        className={`text-block-copy ${copied ? "copied" : ""}`}
-        onClick={handleCopy}
-        title={copied ? "Copied!" : "Copy markdown"}
-        aria-label={copied ? "Copied!" : "Copy markdown"}
-      >
-        {copied ? <CheckIcon /> : <CopyIcon />}
-      </button>
-
+      {phase === "commentary" && (
+        <div className="text-block-phase">
+          {i18n?.t("messagePhaseProgress") ?? "Progress"}
+        </div>
+      )}
       {/* Always render streaming elements when streaming so refs are ready for augments */}
       {renderStreamingContainer && (
         <div style={showStreamingContent ? undefined : { display: "none" }}>
@@ -300,9 +313,11 @@ export const TextBlock = memo(function TextBlock({
 
       {/* Show fallback content when not actively streaming */}
       {!showStreamingContent &&
-        (augmentHtml ? (
-          // biome-ignore lint/security/noDangerouslySetInnerHtml: server-rendered HTML
-          <div dangerouslySetInnerHTML={{ __html: augmentHtml }} />
+        (benchmarkEval ? (
+          <BenchmarkEvalResult block={benchmarkEval} />
+        ) : augmentHtml ? (
+          // Content is written by the layout effect above (see why there).
+          <div ref={augmentHostRef} />
         ) : (
           // Plain text fallback (no server augment available)
           <p className="text-block-plain">
@@ -316,17 +331,14 @@ export const TextBlock = memo(function TextBlock({
           onClose={closeModal}
         />
       )}
-      {fileModal &&
-        sessionMetadata?.projectId &&
-        createPortal(
-          <FileViewerModal
-            projectId={sessionMetadata.projectId}
-            filePath={fileModal.filePath}
-            lineNumber={fileModal.lineNumber}
-            onClose={() => setFileModal(null)}
-          />,
-          document.body,
-        )}
+      {fileModal && sessionMetadata?.projectId && (
+        <FileViewerModal
+          projectId={sessionMetadata.projectId}
+          filePath={fileModal.filePath}
+          lineNumber={fileModal.lineNumber}
+          onClose={() => setFileModal(null)}
+        />
+      )}
       {localFileModal && (
         <LocalFileModal
           path={localFileModal.path}
@@ -338,40 +350,3 @@ export const TextBlock = memo(function TextBlock({
     </div>
   );
 });
-
-function CopyIcon() {
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <rect x="5" y="5" width="9" height="9" rx="1.5" />
-      <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2H3.5A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" />
-    </svg>
-  );
-}
-
-function CheckIcon() {
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M3 8.5L6.5 12L13 4" />
-    </svg>
-  );
-}

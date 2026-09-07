@@ -8,9 +8,18 @@ import {
 } from "@yep-anywhere/shared";
 import type { Level as LogLevel } from "pino";
 import {
+  type CodexBridgeJournalMode,
+  resolveCodexBridgeJournalMode,
+} from "./codex-bridge/journal-policy.js";
+import {
   CODEX_CLEAR_MCP_APP_SERVER_ARGS,
+  CODEX_FULL_MCP_APP_SERVER_ARGS,
   CODEX_STANDARD_MCP_APP_SERVER_ARGS,
 } from "./codex/mcp-profile.js";
+import {
+  DEFAULT_LLM_GATEWAY_API_BASE,
+  defaultSubModuleForApiBase,
+} from "./llm-gateways/index.js";
 import {
   getDefaultCodexHomeDir,
   getDefaultCodexSessionsDir,
@@ -50,12 +59,16 @@ export interface Config {
   geminiSessionsDir: string;
   /** Codex sessions directory (~/.codex/sessions) */
   codexSessionsDir: string;
-  /** AI title generation for completed first-turn sessions. */
+  /** Kimi sessions directory (~/.kimi-code/sessions) */
+  kimiSessionsDir: string;
+  /** User-triggered AI session title generation. */
   sessionTitleGeneration: SessionTitleGenerationConfig;
   /** Whether to run the local Codex CLI bridge for `codex --remote ws://...`. */
   codexBridgeEnabled: boolean;
   /** How the Codex CLI bridge is hosted. */
   codexBridgeMode: "embedded" | "external" | "disabled";
+  /** Bridge-local persistence policy. Defaults to compact lifecycle mode. */
+  codexBridgeJournalMode: CodexBridgeJournalMode;
   /** Host/interface for the Codex bridge. Defaults to localhost for safety. */
   codexBridgeHost: string;
   /** Port for the Codex bridge WebSocket listener. */
@@ -72,14 +85,6 @@ export interface Config {
   codexBridgeClearUpstreamArgs: string[];
   /** Extra args passed to the managed full `codex app-server` upstream. */
   codexBridgeFullUpstreamArgs: string[];
-  /** Host/interface for the Claude terminal bridge. Defaults to localhost for safety. */
-  claudeBridgeHost: string;
-  /** Port for the Claude terminal bridge HTTP listener. */
-  claudeBridgePort: number;
-  /** HTTP control URL for the Claude terminal bridge sidecar. */
-  claudeBridgeControlUrl: string;
-  /** Yep server URL that the Claude bridge sidecar forwards requests to. */
-  claudeBridgeServerUrl: string;
   /**
    * Periodic full-tree rescan interval for codex session watcher (ms).
    * Helps recover from missed fs.watch events on macOS. 0 disables it.
@@ -90,6 +95,8 @@ export interface Config {
    * 0 = validate every request (legacy behavior).
    */
   sessionIndexFullValidationMs: number;
+  sessionIndexFullValidationMinMs: number;
+  sessionIndexMaxConcurrentFullValidations: number;
   /** Session index write lock timeout (ms) for cross-process coordination. */
   sessionIndexWriteLockTimeoutMs: number;
   /** Session index lock staleness threshold (ms). */
@@ -100,6 +107,14 @@ export interface Config {
   idleTimeoutMs: number;
   /** Default permission mode for new sessions */
   defaultPermissionMode: PermissionMode;
+  /** Whether live agent processes are embedded in this server or external. */
+  runtimeMode: "embedded" | "external";
+  /** Loopback control URL for the external agent runtime. */
+  runtimeControlUrl: string;
+  /** External agent runtime control port. */
+  runtimePort: number;
+  /** Bearer token file shared with the external agent runtime. */
+  runtimeTokenFile: string;
   /** Server port */
   port: number;
   /** File to write the actual port to after binding (for test harnesses) */
@@ -149,6 +164,8 @@ export interface Config {
   /** Allowed directory prefixes for serving local markdown/text files. Empty = disabled. */
   allowedLocalFilePaths: string[];
 
+  /** Whether cookie-based auth is disabled by env var (--auth-disable or AUTH_DISABLED=true). Used for recovery. */
+  authDisabled: boolean;
   /** Cookie signing secret. Auto-generated if not provided. */
   authCookieSecret?: string;
   /** Session TTL in milliseconds. Default: 30 days */
@@ -184,6 +201,12 @@ export interface SessionTitleGenerationConfig {
   subModule?: string;
   /** Request timeout in milliseconds. */
   requestTimeoutMs: number;
+  /** Total model attempts for a recoverable title failure. */
+  retryMaxAttempts: number;
+  /** Initial retry delay; subsequent attempts use exponential backoff. */
+  retryBaseDelayMs: number;
+  /** Upper bound for retry backoff and Retry-After delays. */
+  retryMaxDelayMs: number;
 }
 
 /**
@@ -196,6 +219,15 @@ export function loadConfig(): Config {
 
   // Get data directory (supports profiles for multiple instances)
   const dataDir = getDataDir();
+  const serverPort = parseIntOrDefault(process.env.PORT, 3400);
+  const runtimeMode =
+    process.env.YEP_RUNTIME_MODE?.trim().toLowerCase() === "external"
+      ? "external"
+      : "embedded";
+  const runtimePort = parseIntOrDefault(
+    process.env.YEP_RUNTIME_PORT,
+    serverPort + 3,
+  );
 
   // Session directories can be overridden via env vars for test isolation
   const claudeSessionsDir =
@@ -209,19 +241,28 @@ export function loadConfig(): Config {
     path.join(os.homedir(), ".gemini", "tmp");
   const codexSessionsDir =
     process.env.CODEX_SESSIONS_DIR ?? getDefaultCodexSessionsDir();
+  // Empty env values must not become an empty local-image allowlist prefix:
+  // `${prefix}/` would be "/" and match every absolute path.
+  const configuredKimiSessionsDir = process.env.KIMI_SESSIONS_DIR?.trim();
+  const configuredKimiCodeHome = process.env.KIMI_CODE_HOME?.trim();
+  const kimiSessionsDir =
+    configuredKimiSessionsDir ||
+    path.join(
+      configuredKimiCodeHome || path.join(os.homedir(), ".kimi-code"),
+      "sessions",
+    );
   const codexBridgePort = parseIntOrDefault(
     process.env.YEP_CODEX_BRIDGE_PORT ?? process.env.CODEX_BRIDGE_PORT,
     4510,
-  );
-  const claudeBridgePort = parseIntOrDefault(
-    process.env.YEP_CLAUDE_BRIDGE_PORT ?? process.env.CLAUDE_BRIDGE_PORT,
-    4520,
   );
   const codexBridgeMode = parseCodexBridgeMode(
     process.env.YEP_CODEX_BRIDGE_MODE ??
       process.env.CODEX_BRIDGE_MODE ??
       process.env.YEP_CODEX_BRIDGE ??
       process.env.CODEX_BRIDGE,
+  );
+  const codexBridgeJournalMode = resolveCodexBridgeJournalMode(
+    process.env.YEP_CODEX_BRIDGE_JOURNAL_MODE,
   );
   const legacyCodexBridgeUpstreamArgs =
     process.env.YEP_CODEX_BRIDGE_UPSTREAM_ARGS ??
@@ -240,6 +281,20 @@ export function loadConfig(): Config {
   const sessionIndexFullValidationMs = Math.max(
     0,
     parseIntOrDefault(process.env.SESSION_INDEX_FULL_VALIDATION_MS, 30000),
+  );
+  // Watcher events for non-Claude providers mark every scope of that provider
+  // dirty, which used to force a full validation per scope per event. This is
+  // the floor between dir-dirty-driven full passes for one scope.
+  const sessionIndexFullValidationMinMs = Math.max(
+    0,
+    parseIntOrDefault(process.env.SESSION_INDEX_FULL_VALIDATION_MIN_MS, 5000),
+  );
+  const sessionIndexMaxConcurrentFullValidations = Math.max(
+    1,
+    parseIntOrDefault(
+      process.env.SESSION_INDEX_MAX_CONCURRENT_FULL_VALIDATIONS,
+      1,
+    ),
   );
   const sessionIndexWriteLockTimeoutMs = Math.max(
     0,
@@ -276,7 +331,7 @@ export function loadConfig(): Config {
   const sessionTitleApiBase =
     process.env.SESSION_TITLE_LLM_API_BASE ??
     process.env.LLM_API_BASE ??
-    "https://api.ohmyrouter.com";
+    DEFAULT_LLM_GATEWAY_API_BASE;
   const sessionTitleGenerationRequested = parseBooleanOrDefault(
     process.env.SESSION_TITLE_GENERATION,
     Boolean(sessionTitleApiKey),
@@ -285,14 +340,26 @@ export function loadConfig(): Config {
     enabled: sessionTitleGenerationRequested && Boolean(sessionTitleApiKey),
     apiBase: sessionTitleApiBase,
     apiKey: sessionTitleApiKey,
-    model: process.env.SESSION_TITLE_MODEL ?? "deepseek-v4-pro",
+    model: process.env.SESSION_TITLE_MODEL ?? "deepseek-v4-flash",
     subModule:
       process.env.SESSION_TITLE_SUB_MODULE ??
       process.env.LLM_SUB_MODULE ??
-      getDefaultSessionTitleSubModule(sessionTitleApiBase),
+      defaultSubModuleForApiBase(sessionTitleApiBase),
     requestTimeoutMs: Math.max(
       1000,
       parseIntOrDefault(process.env.SESSION_TITLE_TIMEOUT_MS, 120000),
+    ),
+    retryMaxAttempts: Math.max(
+      1,
+      parseIntOrDefault(process.env.SESSION_TITLE_RETRY_MAX_ATTEMPTS, 3),
+    ),
+    retryBaseDelayMs: Math.max(
+      0,
+      parseIntOrDefault(process.env.SESSION_TITLE_RETRY_BASE_DELAY_MS, 5000),
+    ),
+    retryMaxDelayMs: Math.max(
+      0,
+      parseIntOrDefault(process.env.SESSION_TITLE_RETRY_MAX_DELAY_MS, 60000),
     ),
   };
 
@@ -302,9 +369,11 @@ export function loadConfig(): Config {
     claudeSessionsDir,
     geminiSessionsDir,
     codexSessionsDir,
+    kimiSessionsDir,
     sessionTitleGeneration,
     codexBridgeEnabled: codexBridgeMode !== "disabled",
     codexBridgeMode,
+    codexBridgeJournalMode,
     codexBridgeHost:
       process.env.YEP_CODEX_BRIDGE_HOST ??
       process.env.CODEX_BRIDGE_HOST ??
@@ -333,38 +402,25 @@ export function loadConfig(): Config {
     ),
     codexBridgeFullUpstreamArgs: parseCodexBridgeUpstreamArgs(
       process.env.YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS,
-      [],
+      DEFAULT_CODEX_BRIDGE_FULL_UPSTREAM_ARGS,
     ),
-    claudeBridgeHost:
-      process.env.YEP_CLAUDE_BRIDGE_HOST ??
-      process.env.CLAUDE_BRIDGE_HOST ??
-      "127.0.0.1",
-    claudeBridgePort,
-    claudeBridgeControlUrl:
-      process.env.YEP_CLAUDE_BRIDGE_CONTROL_URL ??
-      process.env.CLAUDE_BRIDGE_CONTROL_URL ??
-      `http://127.0.0.1:${claudeBridgePort}`,
-    claudeBridgeServerUrl:
-      process.env.YEP_SERVER_URL ??
-      process.env.YEP_ANYWHERE_SERVER_URL ??
-      `http://127.0.0.1:${parseIntOrDefault(
-        process.env.PORT,
-        process.env.NODE_ENV === "production" ? 8022 : 3400,
-      )}`,
     codexWatchPeriodicRescanMs,
     sessionIndexFullValidationMs,
+    sessionIndexFullValidationMinMs,
+    sessionIndexMaxConcurrentFullValidations,
     sessionIndexWriteLockTimeoutMs,
     sessionIndexWriteLockStaleMs,
     projectScanCacheTtlMs,
     idleTimeoutMs: parseIntOrDefault(process.env.IDLE_TIMEOUT, 5 * 60) * 1000,
     defaultPermissionMode: parsePermissionMode(process.env.PERMISSION_MODE),
-    // Port defaults based on NODE_ENV:
-    // - Development: 3400 (hot reload, source code)
-    // - Production: 8022 (bundled package)
-    port: parseIntOrDefault(
-      process.env.PORT,
-      process.env.NODE_ENV === "production" ? 8022 : 3400,
-    ),
+    runtimeMode,
+    runtimeControlUrl:
+      process.env.YEP_RUNTIME_CONTROL_URL ?? `http://127.0.0.1:${runtimePort}`,
+    runtimePort,
+    runtimeTokenFile:
+      process.env.YEP_RUNTIME_TOKEN_FILE ??
+      path.join(dataDir, "runtime", "token"),
+    port: serverPort,
     portFile: process.env.PORT_FILE ?? null,
     // Host defaults to 127.0.0.1 for security and consistency (avoids IPv6 ambiguity with "localhost")
     host: process.env.HOST ?? "127.0.0.1",
@@ -377,13 +433,9 @@ export function loadConfig(): Config {
       parseIntOrDefault(process.env.IDLE_PREEMPT_THRESHOLD, 10) * 1000,
     serveFrontend,
     // Vite port defaults to main port + 2, keeping all ports sequential
-    // Vite is only used in development, so always base on dev default (3400)
     vitePort: parseIntOrDefault(
       process.env.VITE_PORT,
-      parseIntOrDefault(
-        process.env.PORT,
-        process.env.NODE_ENV === "production" ? 8022 : 3400,
-      ) + 2,
+      parseIntOrDefault(process.env.PORT, 3400) + 2,
     ),
     // Client dist path: Check bundled location first (npm package), then monorepo (dev)
     clientDistPath:
@@ -425,16 +477,23 @@ export function loadConfig(): Config {
     voiceInputEnabled: process.env.VOICE_INPUT !== "false",
     // Always allow yep-managed uploads. ALLOWED_IMAGE_PATHS adds external paths
     // like /tmp; an empty value disables only those extras.
+    // kimiSessionsDir is included so transcripts can render the prompt images
+    // Kimi persists content-addressed under `<session>/agents/*/blobs/`.
     allowedImagePaths: Array.from(
-      new Set([
-        managedUploadsDir,
-        codexGeneratedImagesDir,
-        ...extraAllowedImagePaths,
-      ]),
+      new Set(
+        [
+          managedUploadsDir,
+          codexGeneratedImagesDir,
+          kimiSessionsDir,
+          ...extraAllowedImagePaths,
+        ].filter((allowedPath) => allowedPath.trim().length > 0),
+      ),
     ),
     allowedLocalFilePaths: Array.from(
       new Set([codexHomeDir, ...extraAllowedLocalFilePaths]),
     ),
+    // Auth disabled override (for recovery if user forgets password)
+    authDisabled: process.env.AUTH_DISABLED === "true",
     authCookieSecret: process.env.AUTH_COOKIE_SECRET,
     authSessionTtlMs:
       parseIntOrDefault(process.env.AUTH_SESSION_TTL_DAYS, 30) *
@@ -459,18 +518,6 @@ export function loadConfig(): Config {
     // `${basePath}/api/...`. Empty string keeps the legacy "no prefix" mode.
     basePath: normalizeBasePath(process.env.BASE_PATH),
   };
-}
-
-function getDefaultSessionTitleSubModule(apiBase: string): string | undefined {
-  try {
-    const hostname = new URL(apiBase).hostname;
-    if (hostname === "api.ohmyrouter.com") {
-      return "claude-code-internal";
-    }
-  } catch {
-    // Invalid API bases are handled by fetch at request time.
-  }
-  return undefined;
 }
 
 function normalizeBasePath(raw: string | undefined): string {
@@ -561,6 +608,10 @@ const DEFAULT_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS = [
 
 const DEFAULT_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS = [
   ...CODEX_CLEAR_MCP_APP_SERVER_ARGS,
+];
+
+const DEFAULT_CODEX_BRIDGE_FULL_UPSTREAM_ARGS = [
+  ...CODEX_FULL_MCP_APP_SERVER_ARGS,
 ];
 
 function parseCodexBridgeUpstreamArgs(

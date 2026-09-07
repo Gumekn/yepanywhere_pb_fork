@@ -1,4 +1,3 @@
-import { ClaudeOllamaProvider } from "./implementations/ClaudeOllamaProvider";
 import { ClaudeProvider } from "./implementations/ClaudeProvider";
 import {
   CodexOssProvider,
@@ -6,24 +5,33 @@ import {
 } from "./implementations/CodexProvider";
 import { GeminiACPProvider } from "./implementations/GeminiACPProvider";
 import { GeminiProvider } from "./implementations/GeminiProvider";
-import { OpenCodeProvider } from "./implementations/OpenCodeProvider";
+import { KimiProvider } from "./implementations/KimiProvider";
+import { PiProvider } from "./implementations/PiProvider";
+import { ZCodeProvider } from "./implementations/ZCodeProvider";
 import type { Provider, ProviderMetadata } from "./types";
 
-const providers: Record<string, Provider> = {
-  claude: new ClaudeProvider(),
-  "claude-ollama": new ClaudeOllamaProvider(),
+const activeProviders: Record<string, Provider> = {
   gemini: new GeminiProvider(),
   "gemini-acp": new GeminiACPProvider(),
   codex: new CodexProvider(),
   "codex-oss": new CodexOssProvider(),
-  opencode: new OpenCodeProvider(),
+  pi: new PiProvider(),
+  kimi: new KimiProvider(),
+  zcode: new ZCodeProvider(),
+};
+
+const providers: Record<string, Provider> = {
+  // Retain Claude capabilities for rendering historical sessions, but keep the
+  // retired SSH channel out of settings and new-session provider discovery.
+  claude: new ClaudeProvider(),
+  ...activeProviders,
 };
 
 /**
- * Get all registered providers for settings display.
+ * Get all active providers for settings display.
  */
 export function getAllProviders(): Provider[] {
-  return Object.values(providers);
+  return Object.values(activeProviders);
 }
 
 /**

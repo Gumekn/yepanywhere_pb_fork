@@ -1,4 +1,10 @@
-import type { ProviderName, UploadedFile } from "@yep-anywhere/shared";
+import type {
+  ProviderName,
+  SessionDisplayPage,
+  SessionDisplaySegment,
+  UploadedFile,
+  UserQuestionAnswers,
+} from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Link,
@@ -7,22 +13,24 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { api } from "../api/client";
-import { FileEditor } from "../components/FileEditor";
+import { api, isQueuedResumeSessionResponse } from "../api/client";
+import { ExpandableSessionTitle } from "../components/ExpandableSessionTitle";
+import { GoalModal } from "../components/GoalModal";
 import { MessageInput, type UploadProgress } from "../components/MessageInput";
 import { MessageInputToolbar } from "../components/MessageInputToolbar";
 import { MessageList } from "../components/MessageList";
 import { ModelSwitchModal } from "../components/ModelSwitchModal";
+import { PinIcon } from "../components/PinIcon";
 import { ProcessInfoModal } from "../components/ProcessInfoModal";
 import { QuestionAnswerPanel } from "../components/QuestionAnswerPanel";
-import { RecentSessionsDropdown } from "../components/RecentSessionsDropdown";
+import { RemoteProjectIcon } from "../components/RemoteProjectIcon";
 import { SessionInspector } from "../components/SessionInspector";
 import { SessionMenu } from "../components/SessionMenu";
+import { SessionSearchBar } from "../components/SessionSearchBar";
+import { SessionTitleGenerationStatus } from "../components/SessionTitleGenerationStatus";
 import { SessionMessagesSkeleton } from "../components/Skeleton";
 import { ToolApprovalPanel } from "../components/ToolApprovalPanel";
-import { Modal } from "../components/ui/Modal";
 import { AgentContentProvider } from "../contexts/AgentContentContext";
-import { FileTabOpenerContext } from "../contexts/FileTabOpenerContext";
 import { SessionMetadataProvider } from "../contexts/SessionMetadataContext";
 import {
   StreamingMarkdownProvider,
@@ -36,29 +44,53 @@ import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import type { DraftControls } from "../hooks/useDraftPersistence";
 import { useEngagementTracking } from "../hooks/useEngagementTracking";
 import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
-import { useInspectorWidth } from "../hooks/useInspectorWidth";
 import { getModelSetting, getThinkingSetting } from "../hooks/useModelSettings";
 import { useProject } from "../hooks/useProjects";
 import { useProviders } from "../hooks/useProviders";
+import { recordSessionVisit } from "../hooks/useRecentSessions";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import {
   type StreamingMarkdownCallbacks,
   useSession,
 } from "../hooks/useSession";
+import { useSessionInspectorPreference } from "../hooks/useSessionInspectorPreference";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
 import {
   getAgentCommandConfig,
-  getStaticAgentCommandConfigs,
+  getAgentCommandConfigs,
 } from "../lib/agentCommands";
+import {
+  type CodexSkillCommand,
+  parseCodexSkillsList,
+  parseCodexSlashCommand,
+  resolveCodexSkillInputs,
+} from "../lib/codexInputCommands";
+import { normalizeExternalHttpUrl } from "../lib/externalUrl";
+import { groupToolsBeforeAssistantOutput } from "../lib/liveToolGrouping";
 import { getMessageId } from "../lib/mergeMessages";
+import { isStalePendingInputError } from "../lib/pendingInputError";
 import { preprocessMessages } from "../lib/preprocessMessages";
 import {
   type PreprocessMessagesCache,
   preprocessMessagesCached,
 } from "../lib/preprocessMessagesCache";
+import { getProviderPermissionModes } from "../lib/providerPermissionModes";
+import {
+  requireStartedHistoricalEdit,
+  resolveBranchNavigationFocus,
+  resolveBranchNavigationTarget,
+  resolveSessionEditSubmission,
+  shouldRestoreHistoricalEditAfterFailure,
+  supportsHistoricalMessageEditing,
+} from "../lib/sessionBranching";
+import {
+  buildSessionDisplayRenderItems,
+  mergeSessionInspectorMessages,
+  resolveSessionInspectorNavigation,
+} from "../lib/sessionDisplay";
 import { generateUUID } from "../lib/uuid";
-import type { BrowserSessionMetadata, Message } from "../types";
+import type { Message, Session, SessionNavigationState } from "../types";
 import { getSessionDisplayTitle } from "../utils";
 
 export function SessionPage() {
@@ -96,6 +128,60 @@ function isCodexAppServerProvider(
   return provider === "codex";
 }
 
+type DisplayNotice = Extract<SessionDisplaySegment, { type: "notice" }>;
+type Translate = ReturnType<typeof useI18n>["t"];
+
+function formatDisplayNotice(notice: DisplayNotice, t: Translate): string {
+  const detail = notice.message ?? notice.title;
+  const withDetail = (label: string) =>
+    detail && detail !== label ? `${label}: ${detail}` : label;
+  switch (notice.kind) {
+    case "session_setup":
+      return t("sessionDisplaySetup", { count: notice.count ?? 1 });
+    case "compaction":
+      return t("sessionDisplayCompaction");
+    case "warning":
+      return withDetail(t("sessionDisplayWarning"));
+    case "turn_aborted":
+      return t("sessionDisplayTurnAborted");
+    case "goal":
+      return withDetail(t("sessionDisplayGoal"));
+    case "plan":
+      return withDetail(t("sessionDisplayPlan"));
+    case "subagent":
+      return withDetail(t("sessionDisplaySubagent"));
+    case "provider_event":
+      return withDetail(t("sessionDisplayProviderEvent"));
+  }
+}
+
+function calculateDisplayForkExcludedTurns(
+  page: SessionDisplayPage | null,
+  messageId: string,
+): number | null {
+  if (!page) return null;
+  const questions = page.turns.flatMap((turn) =>
+    turn.question ? [turn.question] : [],
+  );
+  const index = questions.findIndex(
+    (question) => question.messageId === messageId,
+  );
+  if (index < 0) return null;
+  const excluded = questions.length - index;
+  return excluded > 0 ? excluded : null;
+}
+
+function isRetryableInspectorHistoryError(error: unknown): boolean {
+  const code =
+    error && typeof error === "object"
+      ? (error as { code?: unknown }).code
+      : undefined;
+  return (
+    code === "SESSION_HISTORY_CURSOR_STALE" ||
+    code === "SESSION_HISTORY_CHANGED"
+  );
+}
+
 function getApprovalAgentName(
   provider: ProviderName | string | undefined | null,
 ): string {
@@ -106,8 +192,12 @@ function getApprovalAgentName(
     case "gemini":
     case "gemini-acp":
       return "Gemini";
-    case "opencode":
-      return "OpenCode";
+    case "pi":
+      return "Pi";
+    case "kimi":
+      return "Kimi";
+    case "zcode":
+      return "ZCode";
     default:
       return "Claude";
   }
@@ -132,7 +222,7 @@ function getArchiveBlockReasonForState(
   return "This session cannot be archived right now.";
 }
 
-function calculateCodexRollbackNumTurns(
+function calculateCodexForkExcludedTurns(
   messages: Message[],
   editedUuid: string,
 ): number | null {
@@ -144,20 +234,18 @@ function calculateCodexRollbackNumTurns(
   );
   if (editedIndex < 0) return null;
 
-  const rollbackNumTurns = userPrompts.length - editedIndex;
-  return rollbackNumTurns > 0 ? rollbackNumTurns : null;
+  const excludedTurns = userPrompts.length - editedIndex;
+  return excludedTurns > 0 ? excludedTurns : null;
 }
 
-function hasBranchChoices(
-  session: BrowserSessionMetadata | null | undefined,
-): boolean {
+function hasBranchChoices(session: Session | null | undefined): boolean {
   const branchState = session?.branchState ?? session?.codexBranchState;
   return (
     branchState?.branches.some((branch) => branch.siblingCount > 1) ?? false
   );
 }
 
-export function SessionPageContent({
+function SessionPageContent({
   projectId,
   sessionId,
 }: {
@@ -165,28 +253,25 @@ export function SessionPageContent({
   sessionId: string;
 }) {
   const { t } = useI18n();
-  const { openSidebar, isWideScreen, toggleSidebar, isSidebarCollapsed } =
-    useNavigationLayout();
-  const inspector = useInspectorWidth();
+  const { openSidebar, isWideScreen } = useNavigationLayout();
   const basePath = useRemoteBasePath();
   const { project } = useProject(projectId);
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const selectedBranchId = searchParams.get("branch") || undefined;
+  const displayHistoryEnabled = searchParams.get("history") !== "legacy";
   // Get initial status and title from navigation state (passed by NewSessionPage)
   // This allows SSE to connect immediately and show optimistic title without waiting for getSession
   // Also get provider so provider-specific controls can render immediately
-  const navState = location.state as {
-    initialStatus?: { owner: "self"; processId: string };
-    initialTitle?: string;
-    initialProvider?: ProviderName;
-    /** Message id to scroll to + highlight (set by search deep-links). */
-    targetMessageId?: string;
-  } | null;
+  const navState = location.state as SessionNavigationState | null;
   const initialStatus = navState?.initialStatus;
   const initialTitle = navState?.initialTitle;
   const initialProvider = navState?.initialProvider;
+  const initialBranchFocus = resolveBranchNavigationFocus(
+    navState,
+    selectedBranchId,
+  );
 
   // Get streaming markdown context for server-rendered markdown streaming
   const streamingMarkdownContext = useStreamingMarkdownContext();
@@ -208,19 +293,24 @@ export function SessionPageContent({
   const {
     session,
     messages,
+    displayPage,
+    displayQuestions,
+    displayQuestionCoverage,
+    hydratedLiveTailDetailRef,
     agentContent,
     setAgentContent,
     toolUseToAgent,
+    toolUseToAgentIds,
     markdownAugments,
     status,
     processState,
+    turnHealth,
     isCompacting,
     pendingInputRequest,
     actualSessionId,
     permissionMode,
     loading,
     error,
-    retryInitialLoad,
     connected,
     sessionUpdatesConnected,
     lastStreamActivityAt,
@@ -245,9 +335,13 @@ export function SessionPageContent({
     loadOlderMessages,
     loadNewerMessages,
     loadTargetMessageWindow,
+    updateActiveWindowFollowingBottom,
+    activeWindowTrimRevision,
     reconnectStream,
     truncateMessagesBefore,
     refreshSessionMessages,
+    beginHistoryRewriteSync,
+    historyRewritePending,
     markPendingInputResolved,
   } = useSession(
     projectId,
@@ -255,10 +349,13 @@ export function SessionPageContent({
     initialStatus,
     streamingMarkdownCallbacks,
     selectedBranchId,
+    displayHistoryEnabled,
+  );
+  const retryActionLink = normalizeExternalHttpUrl(
+    turnHealth?.retryStatus?.actionLink,
   );
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
-  const isSessionReady = !loading && error === null && session !== null;
 
   // Dismiss cold-start splash once the session has loaded (covers deep-link
   // launches that land directly on a session URL).
@@ -282,8 +379,7 @@ export function SessionPageContent({
           : "disconnected";
 
   // Effective provider for immediate display before session data loads
-  // Always provide a default to prevent undefined access errors
-  const effectiveProvider = session?.provider ?? initialProvider ?? "claude";
+  const effectiveProvider = session?.provider ?? initialProvider;
   const approvalAgentName = getApprovalAgentName(effectiveProvider);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
@@ -293,130 +389,240 @@ export function SessionPageContent({
   }, []);
   const { showToast } = useToastContext();
 
-  // Edit/rewind: when set, the next send rewinds from a past user message.
-  // Claude uses `parentUuid` as the SDK resume point. Codex app-server uses
-  // `rollbackNumTurns` to match Codex CLI Esc Esc backtrack semantics.
-  // `uuid` is the edited message's own id, used to optimistically trim the
-  // local list. `preview` is shown in the banner.
+  // Historical edit boundary for the next send.
+  // Claude uses `parentUuid` as its resume point. Native edit-fork providers
+  // use the persisted prompt's own `uuid`. Codex keeps the legacy
+  // `rollbackNumTurns` wire field as a trailing-turn exclusion count for a
+  // source-preserving native fork.
   const [editRewind, setEditRewind] = useState<{
     parentUuid: string | null;
     uuid: string;
     preview: string;
     rollbackNumTurns?: number | null;
+    /** Entry timestamp used to resolve the authoritative Codex fork boundary. */
+    timestamp?: string;
   } | null>(null);
   const [pendingBranchFocusId, setPendingBranchFocusId] = useState<
     string | null
-  >(null);
+  >(initialBranchFocus.branchId);
   const [pendingEditBranchRefresh, setPendingEditBranchRefresh] =
     useState(false);
   const editBranchRefreshAttemptsRef = useRef(0);
   const editBranchRefreshTimerRef = useRef<ReturnType<
     typeof setTimeout
   > | null>(null);
-  // Deep-link target message (from search). Seeded from navigation state once.
+  const forkBranchRefreshSessionRef = useRef<string | null>(null);
+  // Deep-link target message (from search or cross-session branch navigation).
   const [targetMessageId, setTargetMessageId] = useState<string | null>(
-    navState?.targetMessageId ?? null,
+    initialBranchFocus.messageId,
   );
-  const [isInspectorOpen, setInspectorOpen] = useState(false);
-  // In-page file tabs (VS Code-style): the chat is one tab, opened files are others.
-  const [openFileTabs, setOpenFileTabs] = useState<string[]>([]);
-  const [activeTab, setActiveTab] = useState<string>("chat");
-  const [dirtyTabs, setDirtyTabs] = useState<Set<string>>(new Set());
-  const [pendingCloseTab, setPendingCloseTab] = useState<string | null>(null);
-  const saveHandlers = useRef<Map<string, () => Promise<void>>>(new Map());
-
-  const updateSaveHandler = useCallback(
-    (path: string, fn: (() => Promise<void>) | null) => {
-      if (fn) saveHandlers.current.set(path, fn);
-      else saveHandlers.current.delete(path);
-    },
-    [],
-  );
-
-  const openOrFocusFileTab = useCallback((path: string) => {
-    setOpenFileTabs((prev) => (prev.includes(path) ? prev : [...prev, path]));
-    setActiveTab(path);
-  }, []);
-
-  const handleTabDirty = useCallback((path: string, dirty: boolean) => {
-    setDirtyTabs((prev) => {
-      const next = new Set(prev);
-      if (dirty) next.add(path);
-      else next.delete(path);
-      return next;
-    });
-  }, []);
-
-  const closeTab = useCallback((path: string) => {
-    setOpenFileTabs((prev) => {
-      const idx = prev.indexOf(path);
-      const next = prev.filter((p) => p !== path);
-      setActiveTab((cur) => {
-        if (cur !== path) return cur;
-        return next.length > 0
-          ? (next[Math.max(0, idx - 1)] ?? "chat")
-          : "chat";
-      });
-      return next;
-    });
-    setDirtyTabs((prev) => {
-      const next = new Set(prev);
-      next.delete(path);
-      return next;
-    });
-    saveHandlers.current.delete(path);
-  }, []);
-
-  const requestCloseTab = useCallback(
-    (path: string) => {
-      if (dirtyTabs.has(path)) setPendingCloseTab(path);
-      else closeTab(path);
-    },
-    [dirtyTabs, closeTab],
-  );
-
-  const confirmCloseTab = useCallback(
-    async (save: boolean) => {
-      const path = pendingCloseTab;
-      setPendingCloseTab(null);
-      if (!path) return;
-      if (save) {
-        try {
-          await saveHandlers.current.get(path)?.();
-        } catch {
-          // editor shows the save error; still close per user intent
-        }
-      }
-      closeTab(path);
-    },
-    [pendingCloseTab, closeTab],
-  );
-
-  // Warn before unload while there are unsaved edits.
+  const [isInspectorDrawerOpen, setInspectorDrawerOpen] = useState(false);
+  const {
+    isExpanded: isInspectorExpanded,
+    setIsExpanded: setInspectorExpanded,
+  } = useSessionInspectorPreference();
+  const [isSessionSearchOpen, setSessionSearchOpen] = useState(false);
+  const [legacyInspectorMessages, setLegacyInspectorMessages] = useState<
+    Message[] | null
+  >(null);
+  const [legacyInspectorLoading, setLegacyInspectorLoading] = useState(false);
+  const [legacyInspectorError, setLegacyInspectorError] = useState(false);
+  const legacyInspectorLoadGenerationRef = useRef(0);
+  const legacyInspectorRevisionRef = useRef<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: session/branch identity intentionally invalidates the derived Inspector index
   useEffect(() => {
-    if (dirtyTabs.size === 0) return;
-    const handler = (e: BeforeUnloadEvent) => {
-      e.preventDefault();
-      e.returnValue = "";
-    };
-    window.addEventListener("beforeunload", handler);
-    return () => window.removeEventListener("beforeunload", handler);
-  }, [dirtyTabs.size]);
-
-  // Keep activeTab valid (fall back to chat if its file tab disappeared).
+    legacyInspectorLoadGenerationRef.current += 1;
+    legacyInspectorRevisionRef.current = null;
+    setLegacyInspectorMessages(null);
+    setLegacyInspectorLoading(false);
+    setLegacyInspectorError(false);
+  }, [actualSessionId, selectedBranchId]);
   useEffect(() => {
-    if (activeTab !== "chat" && !openFileTabs.includes(activeTab)) {
-      setActiveTab("chat");
-    }
-  }, [openFileTabs, activeTab]);
-
+    if (processState !== "in-turn") return;
+    // The lightweight display and live tail remain authoritative while a turn
+    // is changing. A complete Inspector index spans multiple persisted-history
+    // pages, so cancel its logical generation instead of mixing pages from
+    // different active snapshots or surfacing a transient stale cursor.
+    legacyInspectorLoadGenerationRef.current += 1;
+    legacyInspectorRevisionRef.current = null;
+    setLegacyInspectorLoading(false);
+    setLegacyInspectorError(false);
+  }, [processState]);
   const handleTargetFocused = useCallback(() => {
     setTargetMessageId(null);
   }, []);
-  const handleInspectorSelectMessage = useCallback((messageId: string) => {
+  const handleSelectMessage = useCallback((messageId: string) => {
     if (!messageId) return;
     setTargetMessageId(messageId);
   }, []);
+  const handleOpenSessionSearch = useCallback(() => {
+    setSessionSearchOpen(true);
+  }, []);
+  const handleCloseSessionSearch = useCallback(() => {
+    setSessionSearchOpen(false);
+  }, []);
+
+  const loadLegacyInspectorHistory = useCallback(
+    async (force = false) => {
+      if (
+        !displayPage ||
+        processState === "in-turn" ||
+        (!force && legacyInspectorMessages) ||
+        legacyInspectorLoading
+      )
+        return;
+      const generation = ++legacyInspectorLoadGenerationRef.current;
+      const projectedRevision = displayPage.revision;
+      setLegacyInspectorLoading(true);
+      setLegacyInspectorError(false);
+      try {
+        let loaded: Message[] | null = null;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            let data = await api.getSession(
+              projectId,
+              actualSessionId,
+              undefined,
+              {
+                view: "canonical",
+                inspectorProjection: true,
+                tailCompactions: 2,
+                maxMessages: 100,
+                branchId: selectedBranchId,
+              },
+            );
+            if (generation !== legacyInspectorLoadGenerationRef.current) return;
+            let snapshot = data.messages.map((message) => ({
+              ...message,
+              _source: "jsonl" as const,
+            }));
+            for (let pageIndex = 0; pageIndex < 1_000; pageIndex += 1) {
+              const paginationInfo = data.pagination;
+              if (
+                !paginationInfo?.hasOlderMessages ||
+                !paginationInfo.truncatedBeforeMessageId
+              ) {
+                break;
+              }
+              data = await api.getSession(
+                projectId,
+                actualSessionId,
+                undefined,
+                {
+                  view: "canonical",
+                  inspectorProjection: true,
+                  tailCompactions: 2,
+                  maxMessages: 100,
+                  beforeMessageId: paginationInfo.truncatedBeforeMessageId,
+                  rolloutRevision: paginationInfo.rolloutRevision,
+                  branchId: selectedBranchId,
+                },
+              );
+              if (generation !== legacyInspectorLoadGenerationRef.current)
+                return;
+              snapshot = [
+                ...data.messages.map((message) => ({
+                  ...message,
+                  _source: "jsonl" as const,
+                })),
+                ...snapshot,
+              ];
+            }
+            if (data.pagination?.hasOlderMessages) {
+              throw new Error(
+                "Session index exceeds the safe pagination budget",
+              );
+            }
+            loaded = snapshot;
+            break;
+          } catch (error) {
+            lastError = error;
+            if (generation !== legacyInspectorLoadGenerationRef.current) return;
+            if (attempt === 0 && isRetryableInspectorHistoryError(error)) {
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (!loaded)
+          throw lastError ?? new Error("Session index is unavailable");
+        if (generation !== legacyInspectorLoadGenerationRef.current) return;
+        const seen = new Set<string>();
+        setLegacyInspectorMessages(
+          resolveSessionInspectorNavigation(
+            loaded.filter((message) => {
+              const id = getMessageId(message);
+              if (seen.has(id)) return false;
+              seen.add(id);
+              return true;
+            }),
+          ),
+        );
+        legacyInspectorRevisionRef.current = projectedRevision;
+      } catch (error) {
+        if (generation !== legacyInspectorLoadGenerationRef.current) return;
+        console.error("Failed to load session inspector index:", error);
+        if (force && legacyInspectorMessages) {
+          // Keep the last complete safe index and wait for the next revision
+          // instead of turning one transient idle refresh into a retry loop.
+          legacyInspectorRevisionRef.current = projectedRevision;
+          return;
+        }
+        setLegacyInspectorError(true);
+        showToast(t("sessionInspectorDetailsLoadFailed"), "error");
+      } finally {
+        if (generation === legacyInspectorLoadGenerationRef.current) {
+          setLegacyInspectorLoading(false);
+        }
+      }
+    },
+    [
+      actualSessionId,
+      displayPage,
+      legacyInspectorLoading,
+      legacyInspectorMessages,
+      projectId,
+      processState,
+      selectedBranchId,
+      showToast,
+      t,
+    ],
+  );
+
+  useEffect(() => {
+    if (
+      !displayPage ||
+      !legacyInspectorMessages ||
+      legacyInspectorLoading ||
+      processState !== "idle" ||
+      legacyInspectorRevisionRef.current === displayPage.revision
+    ) {
+      return;
+    }
+    void loadLegacyInspectorHistory(true);
+  }, [
+    displayPage,
+    legacyInspectorLoading,
+    legacyInspectorMessages,
+    loadLegacyInspectorHistory,
+    processState,
+  ]);
+
+  const inspectorMessages = useMemo(
+    () => mergeSessionInspectorMessages(legacyInspectorMessages, messages),
+    [legacyInspectorMessages, messages],
+  );
+
+  // React Router can reuse this component when only the session parameter
+  // changes, so useState initializers alone are not enough for cross-session
+  // branch focus. Reset both targets whenever a different session is entered.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: navigation focus is intentionally consumed on session changes
+  useEffect(() => {
+    const focus = resolveBranchNavigationFocus(navState, selectedBranchId);
+    setPendingBranchFocusId(focus.branchId);
+    setTargetMessageId(focus.messageId);
+  }, [sessionId]);
 
   const sessionBranchState = session?.branchState ?? session?.codexBranchState;
   const isViewingHistoricalBranch = useMemo(() => {
@@ -435,17 +641,54 @@ export function SessionPageContent({
     }: { text: string; uuid: string; parentUuid: string | null }) => {
       if (isViewingHistoricalBranch) return;
       const rollbackNumTurns = isCodexAppServerProvider(effectiveProvider)
-        ? calculateCodexRollbackNumTurns(messagesRef.current, uuid)
+        ? (calculateDisplayForkExcludedTurns(displayPage, uuid) ??
+          calculateCodexForkExcludedTurns(messagesRef.current, uuid))
         : null;
-      setEditRewind({ parentUuid, uuid, preview: text, rollbackNumTurns });
+      const editedMessage = messagesRef.current.find(
+        (message) => getMessageId(message) === uuid,
+      );
+      const displayQuestion = displayPage?.turns
+        .flatMap((turn) => (turn.question ? [turn.question] : []))
+        .find((question) => question.messageId === uuid);
+      const timestamp =
+        typeof editedMessage?.timestamp === "string"
+          ? editedMessage.timestamp
+          : displayQuestion?.timestamp;
+      setEditRewind({
+        parentUuid,
+        uuid,
+        preview: text,
+        rollbackNumTurns,
+        timestamp,
+      });
       draftControlsRef.current?.setText(text);
       setScrollTrigger((prev) => prev + 1);
     },
-    [effectiveProvider, isViewingHistoricalBranch],
+    [displayPage, effectiveProvider, isViewingHistoricalBranch],
   );
 
   const handleSelectBranch = useCallback(
     (branchId: string) => {
+      const target = resolveBranchNavigationTarget(
+        branchId,
+        sessionId,
+        sessionBranchState,
+      );
+      if (target.crossesSession) {
+        const nextSearch = new URLSearchParams({ branch: target.branchId });
+        navigate(
+          `${basePath}/projects/${projectId}/sessions/${target.sessionId}?${nextSearch.toString()}`,
+          {
+            state: {
+              initialProvider: effectiveProvider,
+              targetBranchId: target.focusBranchId,
+              targetMessageId: target.focusMessageId,
+            },
+          },
+        );
+        return;
+      }
+
       setPendingBranchFocusId(branchId);
       setSearchParams(
         (current) => {
@@ -456,7 +699,15 @@ export function SessionPageContent({
         { replace: false },
       );
     },
-    [setSearchParams],
+    [
+      basePath,
+      effectiveProvider,
+      navigate,
+      projectId,
+      sessionBranchState,
+      sessionId,
+      setSearchParams,
+    ],
   );
 
   const handleBranchFocused = useCallback(() => {
@@ -470,11 +721,27 @@ export function SessionPageContent({
     }
   }, []);
 
-  const queueEditBranchRefresh = useCallback(() => {
-    editBranchRefreshAttemptsRef.current = 0;
-    clearEditBranchRefreshTimer();
-    setPendingEditBranchRefresh(true);
-  }, [clearEditBranchRefreshTimer]);
+  const queueEditBranchRefresh = useCallback(
+    (expectedPrompt: string) => {
+      if (isCodexAppServerProvider(effectiveProvider)) {
+        beginHistoryRewriteSync({
+          expectedPrompt,
+          previousActiveBranchId: sessionBranchState?.activeBranchId ?? null,
+        });
+        setPendingEditBranchRefresh(false);
+        return;
+      }
+      editBranchRefreshAttemptsRef.current = 0;
+      clearEditBranchRefreshTimer();
+      setPendingEditBranchRefresh(true);
+    },
+    [
+      beginHistoryRewriteSync,
+      clearEditBranchRefreshTimer,
+      effectiveProvider,
+      sessionBranchState?.activeBranchId,
+    ],
+  );
 
   const clearSelectedBranchAfterEdit = useCallback(() => {
     setPendingBranchFocusId(null);
@@ -492,8 +759,20 @@ export function SessionPageContent({
   useEffect(() => clearEditBranchRefreshTimer, [clearEditBranchRefreshTimer]);
 
   useEffect(() => {
+    if (
+      !navState?.refreshBranchAfterNavigation ||
+      forkBranchRefreshSessionRef.current === sessionId
+    ) {
+      return;
+    }
+    forkBranchRefreshSessionRef.current = sessionId;
+    editBranchRefreshAttemptsRef.current = 0;
+    clearEditBranchRefreshTimer();
+    setPendingEditBranchRefresh(true);
+  }, [clearEditBranchRefreshTimer, navState, sessionId]);
+
+  useEffect(() => {
     if (!pendingEditBranchRefresh) return;
-    if (processState !== "idle" && status.owner === "self") return;
 
     let cancelled = false;
     const refreshActiveBranch = async () => {
@@ -502,16 +781,16 @@ export function SessionPageContent({
       if (cancelled) return;
 
       const attempt = editBranchRefreshAttemptsRef.current;
-      if (
-        (hasBranchChoices(refreshedSession) && attempt >= 1) ||
-        attempt >= 2
-      ) {
+      if (hasBranchChoices(refreshedSession) || attempt >= 9) {
         setPendingEditBranchRefresh(false);
         return;
       }
 
       editBranchRefreshAttemptsRef.current = attempt + 1;
-      editBranchRefreshTimerRef.current = setTimeout(refreshActiveBranch, 600);
+      editBranchRefreshTimerRef.current = setTimeout(
+        refreshActiveBranch,
+        Math.min(1_500, 300 + attempt * 200),
+      );
     };
 
     clearEditBranchRefreshTimer();
@@ -525,9 +804,7 @@ export function SessionPageContent({
     clearEditBranchRefreshTimer,
     clearSelectedBranchAfterEdit,
     pendingEditBranchRefresh,
-    processState,
     refreshSessionMessages,
-    status.owner,
   ]);
 
   const handleCancelEdit = useCallback(() => {
@@ -557,6 +834,31 @@ export function SessionPageContent({
     return slashCommands;
   }, [slashCommands, status.owner]);
 
+  const [codexSkills, setCodexSkills] = useState<CodexSkillCommand[]>([]);
+  const ownedProcessId = status.owner === "self" ? status.processId : undefined;
+  useEffect(() => {
+    if (effectiveProvider !== "codex" || !ownedProcessId) {
+      setCodexSkills([]);
+      return;
+    }
+
+    let cancelled = false;
+    api
+      .executeCodexControl(actualSessionId ?? sessionId, {
+        control: "skills/list",
+      })
+      .then((response) => {
+        if (!cancelled) setCodexSkills(parseCodexSkillsList(response.data));
+      })
+      .catch(() => {
+        if (!cancelled) setCodexSkills([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [actualSessionId, effectiveProvider, sessionId, ownedProcessId]);
+
   // Get provider capabilities based on session's provider
   const { providers } = useProviders();
   const currentProviderInfo = useMemo(() => {
@@ -566,6 +868,14 @@ export function SessionPageContent({
   // Default to true for backwards compatibility (except slash commands)
   const supportsPermissionMode =
     currentProviderInfo?.supportsPermissionMode ?? true;
+  const permissionModes = useMemo(
+    () =>
+      getProviderPermissionModes(
+        effectiveProvider,
+        currentProviderInfo?.permissionModes,
+      ),
+    [currentProviderInfo?.permissionModes, effectiveProvider],
+  );
   const supportsThinkingToggle =
     currentProviderInfo?.supportsThinkingToggle ?? true;
   const supportsSlashCommands = currentProviderInfo?.supportsSlashCommands;
@@ -585,8 +895,25 @@ export function SessionPageContent({
   const commandLabel = commandConfig.label;
   const commandButtons = useMemo(() => {
     if (status.owner !== "self") return [];
-    return getStaticAgentCommandConfigs(allSlashCommands);
-  }, [allSlashCommands, status.owner]);
+    return getAgentCommandConfigs(
+      effectiveProvider,
+      supportsSlashCommands,
+      allSlashCommands,
+      codexSkills.map((skill) => skill.name),
+      {
+        codexCommands: t("codexCommandsLabel"),
+        skills: t("codexSkillsLabel"),
+        slashCommands: t("slashCommandsLabel"),
+      },
+    );
+  }, [
+    allSlashCommands,
+    codexSkills,
+    effectiveProvider,
+    status.owner,
+    supportsSlashCommands,
+    t,
+  ]);
 
   // Inline title editing state
   const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -594,10 +921,6 @@ export function SessionPageContent({
   const [isRenaming, setIsRenaming] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const isSavingTitleRef = useRef(false);
-
-  // Recent sessions dropdown state
-  const [showRecentSessions, setShowRecentSessions] = useState(false);
-  const titleButtonRef = useRef<HTMLButtonElement>(null);
 
   // Local metadata state (for optimistic updates)
   // Reset when session changes to avoid showing stale data from previous session
@@ -607,21 +930,28 @@ export function SessionPageContent({
   const [localIsArchived, setLocalIsArchived] = useState<boolean | undefined>(
     undefined,
   );
-  const [localIsStarred, setLocalIsStarred] = useState<boolean | undefined>(
+  const [localIsPinned, setLocalIsPinned] = useState<boolean | undefined>(
     undefined,
   );
   const [localHasUnread, setLocalHasUnread] = useState<boolean | undefined>(
     undefined,
   );
+  const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
 
   // Reset local metadata state when sessionId changes
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally reset on sessionId change
   useEffect(() => {
     setLocalCustomTitle(undefined);
     setLocalIsArchived(undefined);
-    setLocalIsStarred(undefined);
+    setLocalIsPinned(undefined);
     setLocalHasUnread(undefined);
+    setIsGeneratingTitle(false);
   }, [sessionId]);
+
+  // Record session visit for recents tracking
+  useEffect(() => {
+    recordSessionVisit(sessionId, projectId);
+  }, [sessionId, projectId]);
 
   // Navigate to new session ID when temp ID is replaced with real SDK session ID
   // This ensures the URL stays in sync with the actual session
@@ -661,6 +991,9 @@ export function SessionPageContent({
 
   // Model switch modal state
   const [showModelSwitchModal, setShowModelSwitchModal] = useState(false);
+  const [showGoalModal, setShowGoalModal] = useState(false);
+  const [isStartingCodexCompaction, setIsStartingCodexCompaction] =
+    useState(false);
 
   // Track user engagement to mark session as "seen".
   // Opening a session counts as reading the current content even when an
@@ -684,7 +1017,6 @@ export function SessionPageContent({
       ? sessionUpdatedAt
       : lastStreamActivityAt;
   }, [sessionUpdatedAt, lastStreamActivityAt]);
-
   useEngagementTracking({
     sessionId,
     activityAt,
@@ -694,11 +1026,89 @@ export function SessionPageContent({
     enabled: Boolean(session),
   });
 
+  const requestCodexCompaction = async (): Promise<boolean> => {
+    if (status.owner === "external") {
+      showToast(t("codexCompactExternalSessionRequired"), "error");
+      return false;
+    }
+    if (
+      status.owner === "self" &&
+      status.processId &&
+      processState !== "idle"
+    ) {
+      showToast(t("codexCompactActiveSessionRequired"), "error");
+      return false;
+    }
+    if (isCompacting || isStartingCodexCompaction) {
+      showToast(t("codexCompactAlreadyRunning"), "info");
+      return false;
+    }
+
+    setIsStartingCodexCompaction(true);
+    try {
+      if (status.owner === "self" && status.processId) {
+        await api.executeCodexControl(actualSessionId ?? sessionId, {
+          control: "thread/compact/start",
+        });
+      } else {
+        const result = await api.resumeAndExecuteCodexControl(
+          projectId,
+          actualSessionId ?? sessionId,
+          { control: "thread/compact/start" },
+          {
+            mode: permissionMode,
+            model: session?.model ?? getModelSetting(),
+            thinking: getThinkingSetting(),
+            reasoningEffort: session?.reasoningEffort,
+            provider: "codex",
+            codexModelProvider: session?.codexModelProvider,
+            executor: session?.executor,
+          },
+        );
+        setStatus({ owner: "self", processId: result.processId });
+        setProcessState("idle");
+      }
+      showToast(t("sessionCompactionStarted"), "success");
+      return true;
+    } catch (err) {
+      console.error("Failed to compact Codex session:", err);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      showToast(t("sessionCompactFailed", { message: errorMsg }), "error");
+      return false;
+    } finally {
+      setIsStartingCodexCompaction(false);
+    }
+  };
+
   const handleSend = async (text: string) => {
-    if (!isSessionReady) return;
+    if (effectiveProvider === "codex") {
+      const command = parseCodexSlashCommand(text);
+      if (command.kind === "invalid-compact-args") {
+        draftControlsRef.current?.restoreFromStorage();
+        showToast(t("codexCompactBareCommandRequired"), "error");
+        return;
+      }
+      if (command.kind === "compact") {
+        if (await requestCodexCompaction()) {
+          draftControlsRef.current?.clearDraft();
+        } else {
+          draftControlsRef.current?.restoreFromStorage();
+        }
+        return;
+      }
+    }
+
+    const resolvedCodexInputs =
+      effectiveProvider === "codex"
+        ? resolveCodexSkillInputs(text, codexSkills)
+        : [];
+    const codexInputs =
+      resolvedCodexInputs.length > 0 ? resolvedCodexInputs : undefined;
 
     // Add to pending queue and get tempId to pass to server
     const tempId = addPendingMessage(text);
+    let historicalEditPostAttempted = false;
+    let historicalEditRequestStarted = false;
     setProcessState("in-turn"); // Optimistic: show processing indicator immediately
     setScrollTrigger((prev) => prev + 1); // Force scroll to bottom
 
@@ -725,13 +1135,9 @@ export function SessionPageContent({
     }
 
     try {
-      // Edit/rewind: branch the conversation from the chosen message.
-      // For a message with a parent we rewind IN PLACE (same session): the SDK
-      // resumes only up to the parent, the old tail becomes a dead branch the
-      // server filters out, and the edited turn streams in. We optimistically
-      // trim the local tail so it doesn't linger before the stream arrives.
-      // Editing the very first message has no parent to rewind to, so we fall
-      // back to starting a fresh session.
+      // Provider-specific edit semantics: Codex, Pi and ZCode create a
+      // new native session while preserving the source; Claude resumes
+      // through the prompt parent.
       if (editRewind) {
         const model = session?.model ?? getModelSetting();
         const thinking = getThinkingSetting();
@@ -739,61 +1145,159 @@ export function SessionPageContent({
           mode: permissionMode,
           model,
           thinking,
+          reasoningEffort: session?.reasoningEffort,
           provider: effectiveProvider,
           executor: session?.executor,
+          codexInputs,
         };
         const attachmentsArg =
           currentAttachments.length > 0 ? currentAttachments : undefined;
-        setEditRewind(null);
-        if (isCodexAppServerProvider(effectiveProvider)) {
-          const rollbackNumTurns =
-            editRewind.rollbackNumTurns ??
-            calculateCodexRollbackNumTurns(messages, editRewind.uuid);
-          if (!rollbackNumTurns) {
-            throw new Error("Could not determine Codex rollback point");
+        const rollbackNumTurns = isCodexAppServerProvider(effectiveProvider)
+          ? (editRewind.rollbackNumTurns ??
+            calculateDisplayForkExcludedTurns(displayPage, editRewind.uuid) ??
+            calculateCodexForkExcludedTurns(messages, editRewind.uuid))
+          : editRewind.rollbackNumTurns;
+        const editSubmission = resolveSessionEditSubmission(effectiveProvider, {
+          ...editRewind,
+          rollbackNumTurns,
+        });
+        if (editSubmission.kind === "codex-fork") {
+          historicalEditPostAttempted = true;
+          const result = await requireStartedHistoricalEdit(
+            await api.resumeSession(
+              projectId,
+              sessionId,
+              text,
+              sessionOptions,
+              attachmentsArg,
+              tempId,
+              undefined,
+              editSubmission.rollbackNumTurns,
+              // Original prompt identity so the server can recompute the
+              // fork exclusion count from the persisted Codex turn tree.
+              {
+                messageId: editRewind.uuid,
+                timestamp: editRewind.timestamp,
+                text: editRewind.preview,
+              },
+            ),
+            api.cancelQueuedRequest,
+          );
+          historicalEditRequestStarted = true;
+          if (result.sessionId === sessionId) {
+            throw new Error(
+              "Codex edit fork did not return a new native session ID",
+            );
           }
-          truncateMessagesBefore(editRewind.uuid);
-          const result = await api.resumeSession(
-            projectId,
-            sessionId,
-            text,
-            sessionOptions,
-            attachmentsArg,
-            tempId,
-            undefined,
-            rollbackNumTurns,
+          setEditRewind(null);
+          draftControlsRef.current?.clearDraft();
+          clearSelectedBranchAfterEdit();
+          // This optimistic message belongs to the unchanged source page.
+          // The fork receives its own provider echo/history after navigation.
+          removePendingMessage(tempId);
+          navigate(
+            `${basePath}/projects/${projectId}/sessions/${result.sessionId}`,
+            {
+              state: {
+                initialStatus: {
+                  owner: "self",
+                  processId: result.processId,
+                },
+                initialProvider: effectiveProvider,
+                initialTitle: session?.title ?? undefined,
+                refreshBranchAfterNavigation: true,
+              },
+            },
           );
+        } else if (editSubmission.kind === "claude-resume") {
+          historicalEditPostAttempted = true;
+          const result = await requireStartedHistoricalEdit(
+            await api.resumeSession(
+              projectId,
+              sessionId,
+              text,
+              sessionOptions,
+              attachmentsArg,
+              tempId,
+              editSubmission.resumeSessionAt,
+            ),
+            api.cancelQueuedRequest,
+          );
+          historicalEditRequestStarted = true;
+          truncateMessagesBefore(editRewind.uuid, tempId);
+          setEditRewind(null);
           draftControlsRef.current?.clearDraft();
           setStatus({ owner: "self", processId: result.processId });
-          queueEditBranchRefresh();
-          reconnectStream();
-        } else if (editRewind.parentUuid) {
-          truncateMessagesBefore(editRewind.uuid);
-          const result = await api.resumeSession(
-            projectId,
-            sessionId,
-            text,
-            sessionOptions,
-            attachmentsArg,
-            tempId,
-            editRewind.parentUuid,
+          clearSelectedBranchAfterEdit();
+          queueEditBranchRefresh(text);
+          if (result.sessionId !== sessionId) {
+            navigate(
+              `${basePath}/projects/${projectId}/sessions/${result.sessionId}`,
+            );
+          } else {
+            reconnectStream();
+          }
+        } else if (editSubmission.kind === "edit-fork") {
+          historicalEditPostAttempted = true;
+          const result = await requireStartedHistoricalEdit(
+            await api.resumeSession(
+              projectId,
+              sessionId,
+              text,
+              sessionOptions,
+              attachmentsArg,
+              tempId,
+              editSubmission.resumeSessionAt,
+            ),
+            api.cancelQueuedRequest,
           );
+          historicalEditRequestStarted = true;
+          if (result.sessionId === sessionId) {
+            throw new Error(
+              `${effectiveProvider ?? "The provider"} edit fork did not return a new native session ID`,
+            );
+          }
+          setEditRewind(null);
           draftControlsRef.current?.clearDraft();
-          setStatus({ owner: "self", processId: result.processId });
-          queueEditBranchRefresh();
-          reconnectStream();
-        } else {
-          // Edited the first message — no parent to rewind to; start fresh.
-          const result = await api.startSession(
-            projectId,
-            text,
-            sessionOptions,
-            attachmentsArg,
+          // This pending bubble belongs to the old page. The new session gets
+          // its own provider echo/history after navigation.
+          removePendingMessage(tempId);
+          navigate(
+            `${basePath}/projects/${projectId}/sessions/${result.sessionId}`,
+            {
+              state: {
+                initialStatus: {
+                  owner: "self",
+                  processId: result.processId,
+                },
+                initialProvider: effectiveProvider,
+              },
+            },
           );
+        } else if (editSubmission.kind === "start-new") {
+          // Existing Claude behavior for its first prompt: no ancestor exists.
+          historicalEditPostAttempted = true;
+          const result = await requireStartedHistoricalEdit(
+            await api.startSession(
+              projectId,
+              text,
+              sessionOptions,
+              attachmentsArg,
+            ),
+            api.cancelQueuedRequest,
+          );
+          historicalEditRequestStarted = true;
+          setEditRewind(null);
           draftControlsRef.current?.clearDraft();
           removePendingMessage(tempId);
           navigate(
             `${basePath}/projects/${projectId}/sessions/${result.sessionId}`,
+          );
+        } else if (editSubmission.kind === "invalid-codex-boundary") {
+          throw new Error("Could not determine Codex fork point");
+        } else {
+          throw new Error(
+            `Editing historical messages is not supported for ${effectiveProvider ?? "this provider"}`,
           );
         }
         return;
@@ -815,14 +1319,33 @@ export function SessionPageContent({
             mode: permissionMode,
             model,
             thinking,
+            reasoningEffort: session?.reasoningEffort,
             provider: effectiveProvider,
             executor: session?.executor,
+            codexInputs,
           },
           currentAttachments.length > 0 ? currentAttachments : undefined,
           tempId,
         );
+        if (isQueuedResumeSessionResponse(result)) {
+          updatePendingMessage(tempId, {
+            status: `Queued (#${result.position}) — waiting to start`,
+          });
+          setProcessState("idle");
+          draftControlsRef.current?.clearDraft();
+          showToast(
+            `Request queued at position ${result.position}. It has not started yet.`,
+            "info",
+          );
+          return;
+        }
         // Update status to trigger SSE connection
         setStatus({ owner: "self", processId: result.processId });
+        if (result.sessionId !== sessionId) {
+          navigate(
+            `${basePath}/projects/${projectId}/sessions/${result.sessionId}`,
+          );
+        }
       } else {
         // Queue to existing process with current permission mode and thinking setting
         const thinking = getThinkingSetting();
@@ -833,6 +1356,9 @@ export function SessionPageContent({
           currentAttachments.length > 0 ? currentAttachments : undefined,
           tempId,
           thinking,
+          session?.reasoningEffort,
+          false,
+          codexInputs,
         );
         // If process was restarted due to thinking mode change, reconnect stream
         if (result.restarted && result.processId) {
@@ -850,7 +1376,7 @@ export function SessionPageContent({
         err instanceof Error &&
         (err.message.includes("404") ||
           err.message.includes("No active process"));
-      if (is404) {
+      if (is404 && !editRewind) {
         try {
           const model = session?.model ?? getModelSetting();
           const thinking = getThinkingSetting();
@@ -862,13 +1388,32 @@ export function SessionPageContent({
               mode: permissionMode,
               model,
               thinking,
+              reasoningEffort: session?.reasoningEffort,
               provider: effectiveProvider,
               executor: session?.executor,
+              codexInputs,
             },
             currentAttachments.length > 0 ? currentAttachments : undefined,
             tempId,
           );
+          if (isQueuedResumeSessionResponse(result)) {
+            updatePendingMessage(tempId, {
+              status: `Queued (#${result.position}) — waiting to start`,
+            });
+            setProcessState("idle");
+            draftControlsRef.current?.clearDraft();
+            showToast(
+              `Request queued at position ${result.position}. It has not started yet.`,
+              "info",
+            );
+            return;
+          }
           setStatus({ owner: "self", processId: result.processId });
+          if (result.sessionId !== sessionId) {
+            navigate(
+              `${basePath}/projects/${projectId}/sessions/${result.sessionId}`,
+            );
+          }
           draftControlsRef.current?.clearDraft();
           return;
         } catch (retryErr) {
@@ -879,8 +1424,26 @@ export function SessionPageContent({
 
       // Remove from pending queue and restore draft on error
       removePendingMessage(tempId);
-      draftControlsRef.current?.restoreFromStorage();
-      setAttachments(currentAttachments); // Restore attachments on error
+      const restoreHistoricalEdit =
+        !editRewind ||
+        shouldRestoreHistoricalEditAfterFailure(
+          err,
+          historicalEditRequestStarted,
+          historicalEditPostAttempted,
+        );
+      if (editRewind && restoreHistoricalEdit) {
+        setEditRewind(editRewind);
+      }
+      if (restoreHistoricalEdit) {
+        draftControlsRef.current?.restoreFromStorage();
+        setAttachments(currentAttachments); // Restore attachments on error
+      } else {
+        // The POST may already be running. Remove all retry affordances so the
+        // user cannot accidentally create a duplicate historical fork.
+        setEditRewind(null);
+        draftControlsRef.current?.clearDraft();
+        setAttachments([]);
+      }
       setProcessState("idle");
       const errorMsg = err instanceof Error ? err.message : String(err);
       showToast(t("sessionSendFailed", { message: errorMsg }), "error");
@@ -888,8 +1451,6 @@ export function SessionPageContent({
   };
 
   const handleQueue = async (text: string) => {
-    if (!isSessionReady) return;
-
     const tempId = addPendingMessage(text);
     setScrollTrigger((prev) => prev + 1);
 
@@ -914,6 +1475,10 @@ export function SessionPageContent({
 
     try {
       const thinking = getThinkingSetting();
+      const resolvedCodexInputs =
+        effectiveProvider === "codex"
+          ? resolveCodexSkillInputs(text, codexSkills)
+          : [];
       await api.queueMessage(
         sessionId,
         text,
@@ -921,7 +1486,9 @@ export function SessionPageContent({
         currentAttachments.length > 0 ? currentAttachments : undefined,
         tempId,
         thinking,
+        session?.reasoningEffort,
         true, // deferred
+        resolvedCodexInputs.length > 0 ? resolvedCodexInputs : undefined,
       );
       removePendingMessage(tempId);
       draftControlsRef.current?.clearDraft();
@@ -936,8 +1503,8 @@ export function SessionPageContent({
   };
 
   const handleModelChanged = useCallback(
-    (model: string) => {
-      setSessionModel(model);
+    (model: string, reasoningEffort?: string) => {
+      setSessionModel(model, reasoningEffort);
       showToast(t("sessionSwitchedModel", { model }), "success");
     },
     [setSessionModel, showToast, t],
@@ -980,7 +1547,7 @@ export function SessionPageContent({
         markPendingInputResolved("in-turn");
       } catch (err) {
         const status = (err as { status?: number }).status;
-        if (status === 404) {
+        if (isStalePendingInputError(err)) {
           handleStalePendingInput();
           return;
         }
@@ -1011,7 +1578,7 @@ export function SessionPageContent({
         markPendingInputResolved("in-turn");
       } catch (err) {
         const status = (err as { status?: number }).status;
-        if (status === 404) {
+        if (isStalePendingInputError(err)) {
           handleStalePendingInput();
           return;
         }
@@ -1040,7 +1607,35 @@ export function SessionPageContent({
         markPendingInputResolved("in-turn");
       } catch (err) {
         const status = (err as { status?: number }).status;
-        if (status === 404) {
+        if (isStalePendingInputError(err)) {
+          handleStalePendingInput();
+          return;
+        }
+        const msg = status ? `Error ${status}` : t("sessionApproveFailed");
+        showToast(msg, "error");
+      }
+    }
+  }, [
+    sessionId,
+    pendingInputRequest,
+    markPendingInputResolved,
+    handleStalePendingInput,
+    showToast,
+    t,
+  ]);
+
+  const handleApproveStrictAutoReview = useCallback(async () => {
+    if (pendingInputRequest) {
+      try {
+        await api.respondToInput(
+          sessionId,
+          pendingInputRequest.id,
+          "approve_strict_auto_review",
+        );
+        markPendingInputResolved("in-turn");
+      } catch (err) {
+        const status = (err as { status?: number }).status;
+        if (isStalePendingInputError(err)) {
           handleStalePendingInput();
           return;
         }
@@ -1068,7 +1663,7 @@ export function SessionPageContent({
         markPendingInputResolved("in-turn");
       } catch (err) {
         const status = (err as { status?: number }).status;
-        if (status === 404) {
+        if (isStalePendingInputError(err)) {
           handleStalePendingInput();
           return;
         }
@@ -1092,7 +1687,7 @@ export function SessionPageContent({
         markPendingInputResolved("in-turn");
       } catch (err) {
         const status = (err as { status?: number }).status;
-        if (status === 404) {
+        if (isStalePendingInputError(err)) {
           handleStalePendingInput();
           return;
         }
@@ -1123,7 +1718,7 @@ export function SessionPageContent({
           markPendingInputResolved("in-turn");
         } catch (err) {
           const status = (err as { status?: number }).status;
-          if (status === 404) {
+          if (isStalePendingInputError(err)) {
             handleStalePendingInput();
             return;
           }
@@ -1143,7 +1738,7 @@ export function SessionPageContent({
   );
 
   const handleQuestionSubmit = useCallback(
-    async (answers: Record<string, string>) => {
+    async (answers: UserQuestionAnswers) => {
       if (pendingInputRequest) {
         try {
           await api.respondToInput(
@@ -1155,7 +1750,7 @@ export function SessionPageContent({
           markPendingInputResolved("in-turn");
         } catch (err) {
           const status = (err as { status?: number }).status;
-          if (status === 404) {
+          if (isStalePendingInputError(err)) {
             handleStalePendingInput();
             return;
           }
@@ -1263,8 +1858,20 @@ export function SessionPageContent({
     (hasSessionUpdateStream && !sessionUpdatesConnected);
 
   const renderItems = useMemo(() => {
+    const displayItems = displayPage
+      ? buildSessionDisplayRenderItems(displayPage, {
+          projectId,
+          branchId: selectedBranchId,
+          branchState: session?.branchState ?? session?.codexBranchState,
+          omitToolGroupDetailRef: hydratedLiveTailDetailRef,
+          formatNotice: (notice) => formatDisplayNotice(notice, t),
+        })
+      : [];
+    const timelineMessages = displayPage
+      ? messages.filter((message) => message._source !== "jsonl")
+      : messages;
     const result = preprocessMessagesCached(
-      messages,
+      timelineMessages,
       {
         markdown: markdownAugments,
         activeToolApproval,
@@ -1272,8 +1879,23 @@ export function SessionPageContent({
       preprocessCacheRef.current,
     );
     preprocessCacheRef.current = result.cache;
-    return result.renderItems;
-  }, [messages, markdownAugments, activeToolApproval]);
+    const combined = [...displayItems, ...result.renderItems];
+    return displayHistoryEnabled
+      ? groupToolsBeforeAssistantOutput(combined)
+      : combined;
+  }, [
+    displayPage,
+    hydratedLiveTailDetailRef,
+    messages,
+    markdownAugments,
+    activeToolApproval,
+    projectId,
+    selectedBranchId,
+    session?.branchState,
+    session?.codexBranchState,
+    t,
+    displayHistoryEnabled,
+  ]);
 
   // Detect if session has pending tool calls without results
   // This can happen when the session is unowned but was active in another process (VS Code, CLI)
@@ -1281,7 +1903,16 @@ export function SessionPageContent({
   const hasPendingToolCalls = useMemo(() => {
     if (status.owner !== "none") return false;
     return renderItems.some(
-      (item) => item.type === "tool_call" && item.status === "pending",
+      (item) =>
+        (item.type === "tool_call" &&
+          item.status === "pending" &&
+          item.toolResult === undefined) ||
+        (item.type === "assistant_output_tool_group" &&
+          item.tools.some(
+            (tool) =>
+              tool.status === "pending" && tool.toolResult === undefined,
+          )) ||
+        (item.type === "display_tool_group" && item.group.status === "running"),
     );
   }, [renderItems, status.owner]);
 
@@ -1297,7 +1928,9 @@ export function SessionPageContent({
     initialTitle ??
     t("sessionUntitled");
   const isArchived = localIsArchived ?? session?.isArchived ?? false;
-  const isStarred = localIsStarred ?? session?.isStarred ?? false;
+  // `isStarred` is the persisted compatibility bit; the product semantics are
+  // now pinning, so existing favorites become pins without a migration.
+  const isPinned = localIsPinned ?? session?.isStarred ?? false;
   const isRuntimeBusy =
     processState === "in-turn" ||
     processState === "waiting-input" ||
@@ -1394,18 +2027,18 @@ export function SessionPageContent({
     }
   };
 
-  const handleToggleStar = async () => {
-    const newStarred = !isStarred;
+  const handleTogglePin = async () => {
+    const newPinned = !isPinned;
     try {
-      await api.updateSessionMetadata(sessionId, { starred: newStarred });
-      setLocalIsStarred(newStarred);
+      await api.updateSessionMetadata(sessionId, { pinned: newPinned });
+      setLocalIsPinned(newPinned);
       showToast(
-        newStarred ? t("sessionStarred") : t("sessionUnstarred"),
+        newPinned ? t("sessionPinned") : t("sessionUnpinned"),
         "success",
       );
     } catch (err) {
-      console.error("Failed to update star status:", err);
-      showToast(t("sessionStarFailed"), "error");
+      console.error("Failed to update pin status:", err);
+      showToast(t("sessionPinFailed"), "error");
     }
   };
 
@@ -1444,6 +2077,23 @@ export function SessionPageContent({
     }
   };
 
+  const handleCompact = async () => {
+    if (effectiveProvider === "codex") {
+      await requestCodexCompaction();
+      return;
+    }
+    if (status.owner === "self" && status.processId) {
+      try {
+        await api.compactProcess(status.processId);
+        showToast(t("sessionCompacted"), "success");
+      } catch (err) {
+        console.error("Failed to compact session:", err);
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        showToast(t("sessionCompactFailed", { message: errorMsg }), "error");
+      }
+    }
+  };
+
   const handleShare = useCallback(async () => {
     try {
       const { snapshotSession } = await import(
@@ -1458,6 +2108,13 @@ export function SessionPageContent({
       showToast(msg, "error");
     }
   }, [displayTitle, showToast, t]);
+
+  if (error)
+    return (
+      <div className="error">
+        {t("sessionErrorPrefix")} {error.message}
+      </div>
+    );
 
   // Sidebar icon component
   const SidebarIcon = () => (
@@ -1495,6 +2152,23 @@ export function SessionPageContent({
     </svg>
   );
 
+  const SessionSearchIcon = () => (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="11" cy="11" r="8" />
+      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </svg>
+  );
+
   const SessionInfoIcon = () => (
     <svg
       width="20"
@@ -1513,647 +2187,611 @@ export function SessionPageContent({
     </svg>
   );
 
-  const RepoIcon = () => (
-    <svg
-      width="20"
-      height="20"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-      <line x1="9" y1="13" x2="15" y2="13" />
-    </svg>
-  );
-
-  const loadFailure =
-    error ??
-    (!loading && !session
-      ? new Error("Session data could not be loaded")
-      : null);
-
-  if (loadFailure) {
-    return (
-      <div className="error session-load-error">
-        <div>
-          {t("sessionErrorPrefix")} {loadFailure.message}
-        </div>
-        <button type="button" onClick={retryInitialLoad}>
-          {t("sessionRetry")}
-        </button>
-      </div>
-    );
-  }
-
   return (
-    <FileTabOpenerContext.Provider value={{ openFileTab: openOrFocusFileTab }}>
+    <div
+      className={
+        isWideScreen
+          ? "main-content-wrapper session-main-wrapper"
+          : "main-content-mobile"
+      }
+    >
       <div
         className={
           isWideScreen
-            ? "main-content-wrapper session-main-wrapper"
-            : "main-content-mobile"
+            ? "main-content-constrained"
+            : "main-content-mobile-inner"
         }
       >
-        <div
-          className={
-            isWideScreen
-              ? "main-content-constrained"
-              : "main-content-mobile-inner"
-          }
-        >
-          <header className="session-header">
-            <div className="session-header-inner">
-              <div className="session-header-left">
-                {/* Sidebar toggle - on mobile: opens sidebar, on desktop: collapses/expands */}
-                {/* Hide on desktop when collapsed (sidebar has its own toggle) */}
-                {!(isWideScreen && isSidebarCollapsed) && (
-                  <button
-                    type="button"
-                    className="sidebar-toggle"
-                    onClick={isWideScreen ? toggleSidebar : openSidebar}
-                    title={
-                      isWideScreen
-                        ? t("sessionToggleSidebar")
-                        : t("sessionOpenSidebar")
-                    }
-                    aria-label={
-                      isWideScreen
-                        ? t("sessionToggleSidebar")
-                        : t("sessionOpenSidebar")
-                    }
+        <header className="session-header">
+          <div className="session-header-inner">
+            <div className="session-header-left">
+              {/* Desktop sidebar controls live in the sidebar itself. */}
+              {!isWideScreen && (
+                <button
+                  type="button"
+                  className="sidebar-toggle"
+                  onClick={openSidebar}
+                  title={t("sessionOpenSidebar")}
+                  aria-label={t("sessionOpenSidebar")}
+                >
+                  <SidebarIcon />
+                </button>
+              )}
+              {/* Project breadcrumb */}
+              {project?.name && (
+                <Link
+                  to={`${basePath}/sessions?project=${projectId}`}
+                  className="project-breadcrumb"
+                  title={project.name}
+                >
+                  <RemoteProjectIcon
+                    isRemoteProject={project.isRemoteProject}
+                  />
+                  {project.name.length > 12
+                    ? `${project.name.slice(0, 12)}...`
+                    : project.name}
+                </Link>
+              )}
+              <div className="session-title-row">
+                {isPinned && (
+                  <span
+                    className="pin-indicator-inline"
+                    role="img"
+                    aria-label={t("sessionPinnedLabel")}
+                    title={t("sessionPinnedLabel")}
                   >
-                    <SidebarIcon />
-                  </button>
+                    <PinIcon size={12} />
+                  </span>
                 )}
-                {/* Project breadcrumb */}
-                {project?.name && (
-                  <Link
-                    to={`${basePath}/sessions?project=${projectId}`}
-                    className="project-breadcrumb"
-                    title={project.name}
-                  >
-                    {project.name.length > 12
-                      ? `${project.name.slice(0, 12)}...`
-                      : project.name}
-                  </Link>
-                )}
-                <div className="session-title-row">
-                  {isStarred && (
-                    <svg
-                      className="star-indicator-inline"
-                      width="12"
-                      height="12"
-                      viewBox="0 0 24 24"
-                      fill="currentColor"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      role="img"
-                      aria-label={t("sessionStarredLabel")}
-                    >
-                      <title>{t("sessionStarredLabel")}</title>
-                      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
-                    </svg>
-                  )}
-                  {loading ? (
-                    <span className="session-title-skeleton" />
-                  ) : isEditingTitle ? (
-                    <input
-                      ref={renameInputRef}
-                      type="text"
-                      className="session-title-input"
-                      value={renameValue}
-                      onChange={(e) => setRenameValue(e.target.value)}
-                      onKeyDown={handleTitleKeyDown}
-                      onBlur={handleTitleBlur}
-                      disabled={isRenaming}
+                {loading ? (
+                  <span className="session-title-skeleton" />
+                ) : isEditingTitle ? (
+                  <input
+                    ref={renameInputRef}
+                    type="text"
+                    className="session-title-input"
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onKeyDown={handleTitleKeyDown}
+                    onBlur={handleTitleBlur}
+                    disabled={isRenaming}
+                  />
+                ) : (
+                  <>
+                    <ExpandableSessionTitle
+                      title={displayTitle}
+                      fullTitle={session?.fullTitle}
                     />
-                  ) : (
-                    <>
-                      <button
-                        ref={titleButtonRef}
-                        type="button"
-                        className="session-title session-title-dropdown-trigger"
-                        onClick={() =>
-                          setShowRecentSessions(!showRecentSessions)
-                        }
-                        title={session?.fullTitle ?? displayTitle}
-                      >
-                        <span className="session-title-text">
-                          {displayTitle}
-                        </span>
-                        <svg
-                          className="session-title-chevron"
-                          width="12"
-                          height="12"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          aria-hidden="true"
-                        >
-                          <polyline points="6 9 12 15 18 9" />
-                        </svg>
-                      </button>
-                      <RecentSessionsDropdown
-                        currentSessionId={sessionId}
-                        isOpen={showRecentSessions}
-                        onClose={() => setShowRecentSessions(false)}
-                        onNavigate={() => setShowRecentSessions(false)}
-                        triggerRef={titleButtonRef}
-                        basePath={basePath}
-                      />
-                    </>
-                  )}
-                  {!loading && isArchived && (
-                    <span className="archived-badge">
-                      {t("sessionArchivedBadge")}
-                    </span>
-                  )}
-                  {!loading && (
-                    <SessionMenu
-                      sessionId={sessionId}
-                      projectId={projectId}
-                      isStarred={isStarred}
-                      isArchived={isArchived}
-                      hasUnread={hasUnread}
-                      provider={session?.provider}
-                      processId={
-                        status.owner === "self" ? status.processId : undefined
-                      }
-                      canArchive={canArchive}
-                      archiveBlockReason={archiveBlockReason}
-                      onToggleStar={handleToggleStar}
-                      onToggleArchive={handleToggleArchive}
-                      onToggleRead={handleToggleRead}
-                      onRename={handleStartEditingTitle}
-                      onClone={(newSessionId) => {
-                        navigate(
-                          `${basePath}/projects/${projectId}/sessions/${newSessionId}`,
-                        );
-                      }}
-                      onTerminate={handleTerminate}
-                      sharingConfigured={sharingConfigured}
-                      onShare={handleShare}
-                      useFixedPositioning
-                      useEllipsisIcon
-                    />
-                  )}
-                </div>
-              </div>
-              <div className="session-header-right">
-                {!isWideScreen && (
-                  <button
-                    type="button"
-                    className="session-inspector-toggle"
-                    onClick={() => setInspectorOpen(true)}
-                    title={t("sessionInspectorOpen")}
-                    aria-label={t("sessionInspectorOpen")}
-                  >
-                    <SessionOutlineIcon />
-                  </button>
+                    {isGeneratingTitle && <SessionTitleGenerationStatus />}
+                  </>
                 )}
-                {!loading && session && (
-                  <button
-                    type="button"
-                    className="session-info-button"
-                    onClick={() => setShowProcessInfoModal(true)}
-                    title={t("sessionViewInfo")}
-                    aria-label={t("sessionViewInfo")}
-                  >
-                    <SessionInfoIcon />
-                  </button>
+                {!loading && isArchived && (
+                  <span className="archived-badge">
+                    {t("sessionArchivedBadge")}
+                  </span>
+                )}
+                {!loading && (
+                  <SessionMenu
+                    sessionId={sessionId}
+                    projectId={projectId}
+                    title={displayTitle}
+                    isPinned={isPinned}
+                    isArchived={isArchived}
+                    hasUnread={hasUnread}
+                    provider={session?.provider}
+                    processId={
+                      status.owner === "self" ? status.processId : undefined
+                    }
+                    canArchive={canArchive}
+                    archiveBlockReason={archiveBlockReason}
+                    onTogglePin={handleTogglePin}
+                    onToggleArchive={handleToggleArchive}
+                    onToggleRead={handleToggleRead}
+                    onRename={handleStartEditingTitle}
+                    onTitleGenerated={(generatedTitle) => {
+                      setLocalCustomTitle(generatedTitle);
+                    }}
+                    onTitleGenerationStateChange={setIsGeneratingTitle}
+                    onClone={(newSessionId) => {
+                      navigate(
+                        `${basePath}/projects/${projectId}/sessions/${newSessionId}`,
+                      );
+                    }}
+                    onTerminate={handleTerminate}
+                    onCompact={
+                      (session?.provider === "zcode" ||
+                        session?.provider === "codex") &&
+                      status.owner === "self" &&
+                      status.processId
+                        ? handleCompact
+                        : undefined
+                    }
+                    onGoal={
+                      (session?.provider === "zcode" ||
+                        session?.provider === "codex") &&
+                      status.owner === "self" &&
+                      status.processId
+                        ? () => setShowGoalModal(true)
+                        : undefined
+                    }
+                    sharingConfigured={sharingConfigured}
+                    onShare={handleShare}
+                    useFixedPositioning
+                    useEllipsisIcon
+                  />
                 )}
               </div>
             </div>
-          </header>
+            <div className="session-header-right">
+              <button
+                type="button"
+                className={`session-search-button${
+                  isSessionSearchOpen ? " active" : ""
+                }`}
+                onClick={() =>
+                  isSessionSearchOpen
+                    ? handleCloseSessionSearch()
+                    : handleOpenSessionSearch()
+                }
+                title={t("sessionSearchTitle")}
+                aria-label={t("sessionSearchTitle")}
+                aria-expanded={isSessionSearchOpen}
+                aria-controls={
+                  isSessionSearchOpen ? "session-search-panel" : undefined
+                }
+                aria-keyshortcuts="Control+F Meta+F"
+              >
+                <SessionSearchIcon />
+              </button>
+              {(!isWideScreen || !isInspectorExpanded) && (
+                <button
+                  type="button"
+                  className="session-inspector-toggle"
+                  onClick={() => {
+                    if (isWideScreen) {
+                      setInspectorExpanded(true);
+                    } else {
+                      setInspectorDrawerOpen(true);
+                    }
+                  }}
+                  title={
+                    isWideScreen
+                      ? t("sessionInspectorExpand")
+                      : t("sessionInspectorOpen")
+                  }
+                  aria-label={
+                    isWideScreen
+                      ? t("sessionInspectorExpand")
+                      : t("sessionInspectorOpen")
+                  }
+                  aria-controls="session-inspector-panel"
+                  aria-expanded={
+                    isWideScreen ? isInspectorExpanded : isInspectorDrawerOpen
+                  }
+                >
+                  <SessionOutlineIcon />
+                </button>
+              )}
+              {!loading && session && (
+                <button
+                  type="button"
+                  className="session-info-button"
+                  onClick={() => setShowProcessInfoModal(true)}
+                  title={t("sessionViewInfo")}
+                  aria-label={t("sessionViewInfo")}
+                >
+                  <SessionInfoIcon />
+                </button>
+              )}
+            </div>
+          </div>
+        </header>
 
-          {/* Process Info Modal */}
-          {showProcessInfoModal && session && (
-            <ProcessInfoModal
-              sessionId={actualSessionId}
-              provider={session.provider}
-              model={session.model}
-              status={status}
-              processState={processState}
-              contextUsage={session.contextUsage}
-              originator={session.originator}
-              cliVersion={session.cliVersion}
-              sessionSource={session.source}
-              approvalPolicy={session.approvalPolicy}
-              sandboxPolicy={session.sandboxPolicy}
-              createdAt={session.createdAt}
-              sessionStreamConnected={sessionUpdatesConnected}
-              lastSessionEventAt={lastStreamActivityAt}
-              onClose={() => setShowProcessInfoModal(false)}
+        <SessionSearchBar
+          isOpen={isSessionSearchOpen}
+          projectId={projectId}
+          sessionId={sessionId}
+          onOpen={handleOpenSessionSearch}
+          onClose={handleCloseSessionSearch}
+          onSelectMessage={handleSelectMessage}
+        />
+
+        {session?.parentSessionId && (
+          <Link
+            className="subagent-parent-banner"
+            to={`${basePath}/projects/${projectId}/sessions/${session.parentSessionId}`}
+          >
+            <span className="subagent-parent-banner-icon" aria-hidden="true">
+              ↖
+            </span>
+            <span className="subagent-parent-banner-text">
+              {t("sessionSubagentBanner")}
+            </span>
+            <span className="subagent-parent-banner-link">
+              {t("sessionSubagentBannerLink")}
+            </span>
+          </Link>
+        )}
+
+        {/* Process Info Modal */}
+        {showProcessInfoModal && session && (
+          <ProcessInfoModal
+            sessionId={actualSessionId}
+            provider={session.provider}
+            model={session.model}
+            status={status}
+            processState={processState}
+            contextUsage={session.contextUsage}
+            originator={session.originator}
+            cliVersion={session.cliVersion}
+            sessionSource={session.source}
+            approvalPolicy={session.approvalPolicy}
+            sandboxPolicy={session.sandboxPolicy}
+            createdAt={session.createdAt}
+            sessionStreamConnected={sessionUpdatesConnected}
+            lastSessionEventAt={lastStreamActivityAt}
+            onClose={() => setShowProcessInfoModal(false)}
+          />
+        )}
+
+        {/* Model Switch Modal */}
+        {showModelSwitchModal &&
+          status.owner === "self" &&
+          status.processId && (
+            <ModelSwitchModal
+              processId={status.processId}
+              currentModel={session?.model}
+              currentReasoningEffort={session?.reasoningEffort}
+              onModelChanged={handleModelChanged}
+              onClose={() => setShowModelSwitchModal(false)}
             />
           )}
 
-          {/* Model Switch Modal */}
-          {showModelSwitchModal &&
-            status.owner === "self" &&
-            status.processId && (
-              <ModelSwitchModal
-                processId={status.processId}
-                currentModel={session?.model}
-                onModelChanged={handleModelChanged}
-                onClose={() => setShowModelSwitchModal(false)}
-              />
-            )}
-
-          {status.owner === "external" && (
-            <div className="external-session-warning">
-              {t("sessionExternalWarning")}
-            </div>
-          )}
-
-          {hasPendingToolCalls && (
-            <div className="external-session-warning pending-tool-warning">
-              {t("sessionPendingElsewhereWarning")}
-            </div>
-          )}
-
-          <div
-            className="editor-tabbar"
-            role="tablist"
-            aria-label={t("editorTabs" as never)}
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === "chat"}
-              className={`editor-tab${activeTab === "chat" ? " is-active" : ""}`}
-              onClick={() => setActiveTab("chat")}
-            >
-              <span className="editor-tab-label">
-                {t("editorTabChat" as never)}
-              </span>
-            </button>
-            {openFileTabs.map((p) => (
-              <div
-                key={p}
-                role="tab"
-                aria-selected={activeTab === p}
-                tabIndex={0}
-                className={`editor-tab editor-tab--file${activeTab === p ? " is-active" : ""}${dirtyTabs.has(p) ? " is-dirty" : ""}`}
-              >
-                <button
-                  type="button"
-                  className="editor-tab-main"
-                  onClick={() => setActiveTab(p)}
-                  title={p}
-                >
-                  <TabFileIcon />
-                  <span className="editor-tab-label">{p.split("/").pop()}</span>
-                  {dirtyTabs.has(p) && (
-                    <span className="editor-tab-dot" aria-hidden="true">
-                      ●
-                    </span>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  className="editor-tab-close"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    requestCloseTab(p);
-                  }}
-                  aria-label={t("editorClose" as never)}
-                  title={t("editorClose" as never)}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-          </div>
-          <div className="session-workbench-body">
-            <div
-              className={`chat-panel${activeTab === "chat" ? " is-active" : ""}`}
-            >
-              <main className="session-messages">
-                {loading ? (
-                  <SessionMessagesSkeleton />
-                ) : (
-                  <SessionMetadataProvider
-                    projectId={projectId}
-                    projectPath={project?.path ?? null}
-                    sessionId={sessionId}
-                  >
-                    <AgentContentProvider
-                      agentContent={agentContent}
-                      setAgentContent={setAgentContent}
-                      toolUseToAgent={toolUseToAgent}
-                      projectId={projectId}
-                      sessionId={sessionId}
-                    >
-                      <MessageList
-                        messages={messages}
-                        preprocessedItems={renderItems}
-                        provider={session?.provider}
-                        isProcessing={
-                          status.owner === "self" && processState === "in-turn"
-                        }
-                        isCompacting={isCompacting}
-                        scrollTrigger={scrollTrigger}
-                        pendingMessages={pendingMessages}
-                        deferredMessages={deferredMessages}
-                        onCancelDeferred={(tempId) =>
-                          api.cancelDeferredMessage(sessionId, tempId)
-                        }
-                        markdownAugments={markdownAugments}
-                        activeToolApproval={activeToolApproval}
-                        hasOlderMessages={pagination?.hasOlderMessages}
-                        hasNewerMessages={pagination?.hasNewerMessages}
-                        loadingOlder={loadingOlder}
-                        loadingNewer={loadingNewer}
-                        loadingTargetMessage={loadingTargetMessage}
-                        onLoadOlderMessages={loadOlderMessages}
-                        onLoadNewerMessages={loadNewerMessages}
-                        onLoadTargetMessage={loadTargetMessageWindow}
-                        onEditUserPrompt={
-                          !isViewingHistoricalBranch &&
-                          (session?.provider === "claude" ||
-                            session?.provider === "codex" ||
-                            !session?.provider)
-                            ? handleEditUserPrompt
-                            : undefined
-                        }
-                        onSelectBranch={handleSelectBranch}
-                        focusBranchId={pendingBranchFocusId}
-                        onBranchFocused={handleBranchFocused}
-                        targetMessageId={targetMessageId}
-                        onTargetFocused={handleTargetFocused}
-                      />
-                    </AgentContentProvider>
-                  </SessionMetadataProvider>
-                )}
-              </main>
-
-              <footer className="session-input">
-                <div
-                  className={`session-connection-bar session-connection-${sessionConnectionStatus}`}
-                />
-                <div className="session-input-inner">
-                  {/* User question panel */}
-                  {pendingInputRequest &&
-                    pendingInputRequest.sessionId === actualSessionId &&
-                    isAskUserQuestion && (
-                      <QuestionAnswerPanel
-                        request={pendingInputRequest}
-                        sessionId={actualSessionId}
-                        onSubmit={handleQuestionSubmit}
-                        onDeny={handleDeny}
-                        readOnly={isPersistedInputRequest}
-                      />
-                    )}
-
-                  {/* Tool approval: show panel + always-visible toolbar */}
-                  {pendingInputRequest &&
-                    pendingInputRequest.sessionId === actualSessionId &&
-                    !isAskUserQuestion && (
-                      <>
-                        <ToolApprovalPanel
-                          request={pendingInputRequest}
-                          sessionId={actualSessionId}
-                          agentName={approvalAgentName}
-                          onApprove={handleApprove}
-                          onDeny={handleDeny}
-                          onApproveAcceptEdits={handleApproveAcceptEdits}
-                          onApproveForSession={handleApproveForSession}
-                          onApproveAlways={handleApproveAlways}
-                          onDenyWithFeedback={handleDenyWithFeedback}
-                          collapsed={approvalCollapsed}
-                          onCollapsedChange={setApprovalCollapsed}
-                        />
-                        <MessageInputToolbar
-                          mode={permissionMode}
-                          onModeChange={setPermissionMode}
-                          isHeld={holdModeEnabled ? isHeld : undefined}
-                          onHoldChange={holdModeEnabled ? setHold : undefined}
-                          supportsPermissionMode={supportsPermissionMode}
-                          supportsThinkingToggle={supportsThinkingToggle}
-                          contextUsage={session?.contextUsage}
-                          projectId={projectId}
-                          sessionId={actualSessionId}
-                          isRunning={status.owner === "self"}
-                          isThinking={processState === "in-turn"}
-                          onStop={handleAbort}
-                          pendingApproval={
-                            approvalCollapsed
-                              ? {
-                                  type: "tool-approval",
-                                  onExpand: () => setApprovalCollapsed(false),
-                                }
-                              : undefined
-                          }
-                        />
-                      </>
-                    )}
-
-                  {/* Edit/rewind banner: shown while editing a past message */}
-                  {editRewind && (
-                    <div
-                      className="edit-rewind-banner"
-                      data-testid="edit-rewind-banner"
-                    >
-                      <span className="edit-rewind-banner-text">
-                        {t("sessionEditingFromHere")}
-                      </span>
-                      <button
-                        type="button"
-                        className="edit-rewind-banner-cancel"
-                        onClick={handleCancelEdit}
-                      >
-                        {t("actionCancel")}
-                      </button>
-                    </div>
-                  )}
-
-                  {/* No pending approval: show full message input */}
-                  {!(
-                    pendingInputRequest &&
-                    pendingInputRequest.sessionId === actualSessionId &&
-                    !isAskUserQuestion
-                  ) && (
-                    <MessageInput
-                      onSend={handleSend}
-                      onQueue={
-                        isSessionReady &&
-                        status.owner !== "none" &&
-                        processState !== "idle"
-                          ? handleQueue
-                          : undefined
-                      }
-                      disabled={!isSessionReady}
-                      placeholder={
-                        status.owner === "external"
-                          ? t("sessionPlaceholderExternal")
-                          : processState === "idle"
-                            ? t("sessionPlaceholderResume")
-                            : t("sessionPlaceholderQueue")
-                      }
-                      mode={permissionMode}
-                      onModeChange={setPermissionMode}
-                      isHeld={holdModeEnabled ? isHeld : undefined}
-                      onHoldChange={holdModeEnabled ? setHold : undefined}
-                      supportsPermissionMode={supportsPermissionMode}
-                      supportsThinkingToggle={supportsThinkingToggle}
-                      isRunning={status.owner === "self"}
-                      isThinking={processState === "in-turn"}
-                      onStop={handleAbort}
-                      draftKey={`draft-message-${sessionId}`}
-                      onDraftControlsReady={handleDraftControlsReady}
-                      collapsed={
-                        !!(
-                          pendingInputRequest &&
-                          pendingInputRequest.sessionId === actualSessionId
-                        )
-                      }
-                      contextUsage={session?.contextUsage}
-                      projectId={projectId}
-                      sessionId={sessionId}
-                      attachments={attachments}
-                      onAttach={handleAttach}
-                      onRemoveAttachment={handleRemoveAttachment}
-                      uploadProgress={uploadProgress}
-                      commandPrefix={commandPrefix}
-                      commandLabel={commandLabel}
-                      commands={activeCommands}
-                      showCommandButton={showCommandButton}
-                      commandButtons={commandButtons}
-                      onCustomCommand={handleCustomCommand}
-                    />
-                  )}
-                </div>
-              </footer>
-            </div>
-            {openFileTabs.map((p) => (
-              <div
-                key={p}
-                className={`file-panel${activeTab === p ? " is-active" : ""}`}
-              >
-                <FileEditor
-                  projectId={projectId}
-                  filePath={p}
-                  onClose={() => requestCloseTab(p)}
-                  onDirtyChange={(d) => handleTabDirty(p, d)}
-                  onSaveRef={(fn) => updateSaveHandler(p, fn)}
-                />
-              </div>
-            ))}
-          </div>
-          {pendingCloseTab && (
-            <Modal
-              title={t("editorUnsavedConfirmTitle" as never)}
-              onClose={() => setPendingCloseTab(null)}
-            >
-              <div className="unsaved-confirm">
-                <p>
-                  {t("editorUnsavedConfirmBody" as never, {
-                    name: pendingCloseTab.split("/").pop() || pendingCloseTab,
-                  })}
-                </p>
-                <div className="unsaved-confirm-actions">
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    onClick={() => confirmCloseTab(true)}
-                  >
-                    {t("editorSaveAndClose" as never)}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-secondary"
-                    onClick={() => confirmCloseTab(false)}
-                  >
-                    {t("editorCloseWithoutSave" as never)}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-ghost"
-                    onClick={() => setPendingCloseTab(null)}
-                  >
-                    {t("editorCancel" as never)}
-                  </button>
-                </div>
-              </div>
-            </Modal>
-          )}
-        </div>
-        {isWideScreen ? (
-          <SessionInspector
-            presentation="sidebar"
-            inspectorWidth={inspector.width}
-            onResizeStart={() => inspector.setIsResizing(true)}
-            onResize={inspector.setWidth}
-            onResizeEnd={() => inspector.setIsResizing(false)}
-            messages={messages}
-            userQuestions={session?.userQuestions}
-            markdownAugments={markdownAugments}
-            activeToolApproval={activeToolApproval}
-            projectId={projectId}
-            sessionId={actualSessionId}
-            provider={session?.provider}
-            model={session?.model}
-            reasoningEffort={session?.reasoningEffort}
-            serviceTier={session?.serviceTier}
-            basePath={basePath}
-            status={status}
-            processState={processState}
-            onSelectMessage={handleInspectorSelectMessage}
-            onOpenFile={(path) => openOrFocusFileTab(path)}
-            processId={status.owner === "self" ? status.processId : undefined}
-            providers={providers}
-          />
-        ) : (
-          <SessionInspector
-            presentation="drawer"
-            isOpen={isInspectorOpen}
-            onClose={() => setInspectorOpen(false)}
-            messages={messages}
-            userQuestions={session?.userQuestions}
-            markdownAugments={markdownAugments}
-            activeToolApproval={activeToolApproval}
-            projectId={projectId}
-            sessionId={actualSessionId}
-            provider={session?.provider}
-            model={session?.model}
-            reasoningEffort={session?.reasoningEffort}
-            serviceTier={session?.serviceTier}
-            basePath={basePath}
-            status={status}
-            processState={processState}
-            onSelectMessage={handleInspectorSelectMessage}
-            onOpenFile={(path) => openOrFocusFileTab(path)}
-            processId={status.owner === "self" ? status.processId : undefined}
-            providers={providers}
+        {/* Provider-native Goal lifecycle dialog (ZCode or Codex). */}
+        {showGoalModal && status.owner === "self" && status.processId && (
+          <GoalModal
+            processId={status.processId}
+            onClose={() => setShowGoalModal(false)}
           />
         )}
-      </div>
-    </FileTabOpenerContext.Provider>
-  );
-}
 
-function TabFileIcon() {
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M14 3v5h5" />
-      <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-    </svg>
+        {status.owner === "external" && (
+          <div className="external-session-warning">
+            {t("sessionExternalWarning")}
+          </div>
+        )}
+
+        {hasPendingToolCalls && (
+          <div className="external-session-warning pending-tool-warning">
+            {t("sessionPendingElsewhereWarning")}
+          </div>
+        )}
+
+        <main className="session-messages">
+          {loading ? (
+            <SessionMessagesSkeleton />
+          ) : (
+            <SessionMetadataProvider
+              projectId={projectId}
+              projectPath={project?.path ?? null}
+              sessionId={sessionId}
+            >
+              <AgentContentProvider
+                agentContent={agentContent}
+                setAgentContent={setAgentContent}
+                toolUseToAgent={toolUseToAgent}
+                toolUseToAgentIds={toolUseToAgentIds}
+                projectId={projectId}
+                sessionId={sessionId}
+              >
+                <MessageList
+                  messages={messages}
+                  preprocessedItems={renderItems}
+                  provider={session?.provider}
+                  isProcessing={
+                    status.owner === "self" && processState === "in-turn"
+                  }
+                  lastActivityAt={lastStreamActivityAt}
+                  isCompacting={isCompacting}
+                  scrollTrigger={scrollTrigger + activeWindowTrimRevision}
+                  pendingMessages={pendingMessages}
+                  deferredMessages={deferredMessages}
+                  onCancelDeferred={(tempId) =>
+                    api.cancelDeferredMessage(sessionId, tempId)
+                  }
+                  markdownAugments={markdownAugments}
+                  activeToolApproval={activeToolApproval}
+                  hasOlderMessages={
+                    displayPage
+                      ? Boolean(displayPage.nextCursor)
+                      : pagination?.hasOlderMessages
+                  }
+                  hasNewerMessages={pagination?.hasNewerMessages}
+                  loadingOlder={loadingOlder}
+                  loadingNewer={loadingNewer}
+                  loadingTargetMessage={loadingTargetMessage}
+                  onLoadOlderMessages={loadOlderMessages}
+                  onLoadNewerMessages={loadNewerMessages}
+                  onLoadTargetMessage={loadTargetMessageWindow}
+                  onFollowingBottomChange={updateActiveWindowFollowingBottom}
+                  onEditUserPrompt={
+                    !isViewingHistoricalBranch &&
+                    supportsHistoricalMessageEditing(session?.provider)
+                      ? handleEditUserPrompt
+                      : undefined
+                  }
+                  onSelectBranch={handleSelectBranch}
+                  focusBranchId={pendingBranchFocusId}
+                  onBranchFocused={handleBranchFocused}
+                  targetMessageId={targetMessageId}
+                  onTargetFocused={handleTargetFocused}
+                  transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
+                />
+              </AgentContentProvider>
+            </SessionMetadataProvider>
+          )}
+        </main>
+
+        <footer className="session-input">
+          <div
+            className={`session-connection-bar session-connection-${sessionConnectionStatus}`}
+          />
+          <div className="session-input-inner">
+            {/* User question panel */}
+            {pendingInputRequest &&
+              pendingInputRequest.sessionId === actualSessionId &&
+              isAskUserQuestion && (
+                <QuestionAnswerPanel
+                  key={pendingInputRequest.id}
+                  request={pendingInputRequest}
+                  sessionId={actualSessionId}
+                  onSubmit={handleQuestionSubmit}
+                  onDeny={handleDeny}
+                  readOnly={isPersistedInputRequest}
+                />
+              )}
+
+            {/* Tool approval: show panel + always-visible toolbar */}
+            {pendingInputRequest &&
+              pendingInputRequest.sessionId === actualSessionId &&
+              !isAskUserQuestion && (
+                <>
+                  <ToolApprovalPanel
+                    request={pendingInputRequest}
+                    sessionId={actualSessionId}
+                    agentName={approvalAgentName}
+                    onApprove={handleApprove}
+                    onDeny={handleDeny}
+                    onApproveAcceptEdits={handleApproveAcceptEdits}
+                    onApproveForSession={handleApproveForSession}
+                    onApproveStrictAutoReview={handleApproveStrictAutoReview}
+                    onApproveAlways={handleApproveAlways}
+                    onDenyWithFeedback={handleDenyWithFeedback}
+                    preserveModeOnPlanApproval={effectiveProvider === "kimi"}
+                    collapsed={approvalCollapsed}
+                    onCollapsedChange={setApprovalCollapsed}
+                  />
+                  <MessageInputToolbar
+                    mode={permissionMode}
+                    onModeChange={setPermissionMode}
+                    isHeld={holdModeEnabled ? isHeld : undefined}
+                    onHoldChange={holdModeEnabled ? setHold : undefined}
+                    supportsPermissionMode={supportsPermissionMode}
+                    provider={effectiveProvider}
+                    permissionModes={permissionModes}
+                    supportsThinkingToggle={supportsThinkingToggle}
+                    contextUsage={session?.contextUsage}
+                    projectId={projectId}
+                    sessionId={actualSessionId}
+                    isRunning={status.owner === "self"}
+                    isThinking={processState === "in-turn"}
+                    onStop={handleAbort}
+                    pendingApproval={
+                      approvalCollapsed
+                        ? {
+                            type: "tool-approval",
+                            onExpand: () => setApprovalCollapsed(false),
+                          }
+                        : undefined
+                    }
+                  />
+                </>
+              )}
+
+            {/* Bridge-reported turn health: retry backoff / failed turn */}
+            {turnHealth?.retryStatus && processState === "in-turn" && (
+              <div
+                className="turn-health-banner turn-health-banner-retry"
+                data-testid="turn-health-retry"
+              >
+                <span className="turn-health-banner-text">
+                  {typeof turnHealth.retryStatus.attempt === "number" &&
+                  turnHealth.retryStatus.attempt > 0
+                    ? t("statusBadgeRetryingAttempt", {
+                        attempt: String(turnHealth.retryStatus.attempt),
+                      })
+                    : t("statusBadgeRetrying")}
+                  {turnHealth.retryStatus.message
+                    ? ` — ${turnHealth.retryStatus.message}`
+                    : ""}
+                </span>
+                {retryActionLink && (
+                  <a
+                    className="turn-health-banner-action"
+                    href={retryActionLink}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {turnHealth.retryStatus.actionLabel ?? retryActionLink}
+                  </a>
+                )}
+              </div>
+            )}
+            {turnHealth?.lastErrorMessage &&
+              turnHealth.lastTurnStatus === "failed" &&
+              processState === "idle" && (
+                <div
+                  className="turn-health-banner turn-health-banner-error"
+                  data-testid="turn-health-error"
+                >
+                  <span className="turn-health-banner-text">
+                    {t("statusBadgeFailed")}: {turnHealth.lastErrorMessage}
+                  </span>
+                </div>
+              )}
+
+            {/* Edit/rewind banner: shown while editing a past message */}
+            {editRewind && (
+              <div
+                className="edit-rewind-banner"
+                data-testid="edit-rewind-banner"
+              >
+                <span className="edit-rewind-banner-text">
+                  {t("sessionEditingFromHere")}
+                </span>
+                <button
+                  type="button"
+                  className="edit-rewind-banner-cancel"
+                  onClick={handleCancelEdit}
+                >
+                  {t("actionCancel")}
+                </button>
+              </div>
+            )}
+
+            {/* Codex edit: waiting for the rewritten branch snapshot to land */}
+            {historyRewritePending && !editRewind && (
+              <div
+                className="session-branch-sync-banner"
+                data-testid="branch-sync-banner"
+                role="status"
+                aria-live="polite"
+              >
+                <span
+                  className="session-branch-sync-spinner"
+                  aria-hidden="true"
+                />
+                <span className="session-branch-sync-text">
+                  {t("sessionSyncingBranch")}
+                </span>
+              </div>
+            )}
+
+            {/* No pending approval: show full message input */}
+            {!(
+              pendingInputRequest &&
+              pendingInputRequest.sessionId === actualSessionId &&
+              !isAskUserQuestion
+            ) && (
+              <MessageInput
+                onSend={handleSend}
+                onQueue={
+                  status.owner !== "none" && processState !== "idle"
+                    ? handleQueue
+                    : undefined
+                }
+                placeholder={
+                  status.owner === "external"
+                    ? t("sessionPlaceholderExternal")
+                    : processState === "idle"
+                      ? t("sessionPlaceholderResume")
+                      : t("sessionPlaceholderQueue")
+                }
+                mode={permissionMode}
+                onModeChange={setPermissionMode}
+                isHeld={holdModeEnabled ? isHeld : undefined}
+                onHoldChange={holdModeEnabled ? setHold : undefined}
+                supportsPermissionMode={supportsPermissionMode}
+                provider={effectiveProvider}
+                permissionModes={permissionModes}
+                supportsThinkingToggle={supportsThinkingToggle}
+                isRunning={status.owner === "self"}
+                isThinking={processState === "in-turn"}
+                onStop={handleAbort}
+                draftKey={`draft-message-${sessionId}`}
+                onDraftControlsReady={handleDraftControlsReady}
+                collapsed={
+                  !!(
+                    pendingInputRequest &&
+                    pendingInputRequest.sessionId === actualSessionId
+                  )
+                }
+                contextUsage={session?.contextUsage}
+                projectId={projectId}
+                sessionId={sessionId}
+                attachments={attachments}
+                onAttach={handleAttach}
+                onRemoveAttachment={handleRemoveAttachment}
+                uploadProgress={uploadProgress}
+                commandPrefix={commandPrefix}
+                commandLabel={commandLabel}
+                commands={activeCommands}
+                showCommandButton={showCommandButton}
+                commandButtons={commandButtons}
+                onCustomCommand={handleCustomCommand}
+              />
+            )}
+          </div>
+        </footer>
+      </div>
+      {isWideScreen ? (
+        isInspectorExpanded ? (
+          <SessionInspector
+            presentation="sidebar"
+            onClose={() => setInspectorExpanded(false)}
+            messages={inspectorMessages}
+            userQuestions={
+              displayPage ? displayQuestions : session?.userQuestions
+            }
+            questionCoverage={
+              displayPage ? displayQuestionCoverage : "complete"
+            }
+            hasLegacyDetails={!displayPage || legacyInspectorMessages !== null}
+            legacyDetailsLoading={legacyInspectorLoading}
+            legacyDetailsError={legacyInspectorError}
+            onLoadLegacyDetails={() => loadLegacyInspectorHistory()}
+            markdownAugments={markdownAugments}
+            activeToolApproval={activeToolApproval}
+            projectId={projectId}
+            sessionId={actualSessionId}
+            provider={session?.provider}
+            model={session?.model}
+            reasoningEffort={session?.reasoningEffort}
+            serviceTier={session?.serviceTier}
+            basePath={basePath}
+            status={status}
+            processState={processState}
+            onSelectMessage={handleSelectMessage}
+          />
+        ) : null
+      ) : (
+        <SessionInspector
+          presentation="drawer"
+          isOpen={isInspectorDrawerOpen}
+          onClose={() => setInspectorDrawerOpen(false)}
+          messages={inspectorMessages}
+          userQuestions={
+            displayPage ? displayQuestions : session?.userQuestions
+          }
+          questionCoverage={displayPage ? displayQuestionCoverage : "complete"}
+          hasLegacyDetails={!displayPage || legacyInspectorMessages !== null}
+          legacyDetailsLoading={legacyInspectorLoading}
+          legacyDetailsError={legacyInspectorError}
+          onLoadLegacyDetails={() => loadLegacyInspectorHistory()}
+          markdownAugments={markdownAugments}
+          activeToolApproval={activeToolApproval}
+          projectId={projectId}
+          sessionId={actualSessionId}
+          provider={session?.provider}
+          model={session?.model}
+          reasoningEffort={session?.reasoningEffort}
+          serviceTier={session?.serviceTier}
+          basePath={basePath}
+          status={status}
+          processState={processState}
+          onSelectMessage={handleSelectMessage}
+        />
+      )}
+    </div>
   );
 }

@@ -1,12 +1,21 @@
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
 import {
+  type AgentActivity,
+  type ContextCompactEvent,
+  type ContextCumulativeUsage,
   type DirProjectId,
   type UrlProjectId,
   asDirProjectId,
+  parsePiSessionHeader,
 } from "@yep-anywhere/shared";
+import { getCodexSubagentMetadata } from "../codex/subagent.js";
 import { decodeProjectId, encodeProjectId } from "../projects/paths.js";
 import type { ProjectScanner } from "../projects/scanner.js";
+import {
+  type PiSessionTailActivity,
+  readPiSessionTailActivity,
+} from "../sessions/pi-files.js";
 import { readFirstLine } from "../utils/jsonl.js";
 import { BatchProcessor } from "../watcher/BatchProcessor.js";
 import type {
@@ -39,13 +48,40 @@ interface ExternalSessionInfo {
   projectId?: UrlProjectId;
   /** Session provider */
   provider: FileChangeEvent["provider"];
+  /** Activity proven for this exact session, not inferred from project ownership. */
+  activity?: AgentActivity;
+  /**
+   * Session log path, kept for providers whose liveness can be read back out
+   * of the log when the process table has nothing to show (see
+   * {@link ExternalSessionTracker.getPiTailActivity}).
+   */
+  sessionFilePath?: string;
   timeoutId: ReturnType<typeof setTimeout>;
   validationTimeoutId: ReturnType<typeof setTimeout> | null;
+}
+
+/** Everything needed to decide whether one unowned session is externally active. */
+interface ExternalSessionCandidate {
+  provider: FileChangeEvent["provider"];
+  /** Activity proven for this exact session, not inferred from project ownership. */
+  activity?: AgentActivity;
+  dirProjectId?: DirProjectId;
+  projectId?: UrlProjectId;
+  sessionFilePath?: string;
+}
+
+interface CodexFileSessionMeta {
+  cwd: string;
+  timestamp: string;
+  model?: string;
+  isSubagent: boolean;
 }
 
 /** Default grace period after abort before external detection resumes (30 seconds) */
 const DEFAULT_ABORT_GRACE_MS = 30000;
 const MISSING_PROJECT_WARNING_INTERVAL_MS = 60_000;
+/** Match the managed-process stale-turn ceiling for log-only Pi hosts. */
+const DEFAULT_PI_IN_FLIGHT_STALE_MS = 5 * 60 * 1000;
 
 export interface ExternalSessionTrackerOptions {
   eventBus: EventBus;
@@ -57,6 +93,11 @@ export interface ExternalSessionTrackerOptions {
   abortGraceMs?: number;
   /** How often to re-check that an external provider process is still alive (default: 3000) */
   processValidationMs?: number;
+  /**
+   * Maximum time an unfinished Pi log tail can prove liveness without another
+   * file change (default: 5 minutes). Bounds stale ownership after a host dies.
+   */
+  piInFlightStaleMs?: number;
   /** Optional process probe override for tests/platform-specific integrations */
   externalProcessProbe?: ExternalProcessProbe;
   /** Optional callback to get session summary for new external sessions */
@@ -64,6 +105,10 @@ export interface ExternalSessionTrackerOptions {
     sessionId: string,
     projectId: UrlProjectId,
   ) => Promise<SessionSummary | null>;
+  /** Resolve ownership held by a standalone agent runtime. */
+  getRuntimeProcess?: (
+    sessionId: string,
+  ) => Promise<{ projectId: UrlProjectId } | null>;
 }
 
 /**
@@ -85,12 +130,15 @@ export class ExternalSessionTracker {
   private decayMs: number;
   private abortGraceMs: number;
   private processValidationMs: number;
+  private piInFlightStaleMs: number;
   private externalProcessProbe: ExternalProcessProbe;
   private unsubscribe: (() => void) | null = null;
   private getSessionSummary?: (
     sessionId: string,
     projectId: UrlProjectId,
   ) => Promise<SessionSummary | null>;
+  private getRuntimeProcess?: ExternalSessionTrackerOptions["getRuntimeProcess"];
+  private runtimeOwnedSessions = new Set<string>();
   /** Batches session parsing to prevent OOM from concurrent file reads */
   private sessionParser: BatchProcessor<SessionSummary | null>;
   /** Tracks sessions that have already emitted session-created */
@@ -103,9 +151,14 @@ export class ExternalSessionTracker {
       messageCount: number;
       projectId: UrlProjectId;
       contextUsage?: ContextUsage;
+      cumulativeUsage?: ContextCumulativeUsage;
+      compactCount?: number;
+      compactEvents?: ContextCompactEvent[];
       model?: string;
       reasoningEffort?: string;
       serviceTier?: string;
+      lastTurnStatus?: SessionSummary["lastTurnStatus"];
+      lastErrorMessage?: string;
     }
   > = new Map();
   private missingProjectWarningTimestamps: Map<string, number> = new Map();
@@ -117,9 +170,12 @@ export class ExternalSessionTracker {
     this.decayMs = options.decayMs ?? 30000;
     this.abortGraceMs = options.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS;
     this.processValidationMs = options.processValidationMs ?? 3000;
+    this.piInFlightStaleMs =
+      options.piInFlightStaleMs ?? DEFAULT_PI_IN_FLIGHT_STALE_MS;
     this.externalProcessProbe =
       options.externalProcessProbe ?? hasActiveExternalProviderProcess;
     this.getSessionSummary = options.getSessionSummary;
+    this.getRuntimeProcess = options.getRuntimeProcess;
 
     // Initialize batch processor for session parsing
     // Limits concurrent JSONL parsing to prevent OOM during bulk file operations
@@ -133,7 +189,9 @@ export class ExternalSessionTracker {
         const now = new Date().toISOString();
 
         // Check if supervisor owns this session
-        const isOwned = !!this.supervisor.getProcessForSession(sessionId);
+        const isOwned =
+          !!this.supervisor.getProcessForSession(sessionId) ||
+          this.runtimeOwnedSessions.has(sessionId);
         const isExternal = this.externalSessions.has(sessionId);
 
         // Clean up external tracking if owned
@@ -153,9 +211,14 @@ export class ExternalSessionTracker {
               messageCount: summary.messageCount,
               projectId,
               contextUsage: summary.contextUsage,
+              cumulativeUsage: summary.cumulativeUsage,
+              compactCount: summary.compactCount,
+              compactEvents: summary.compactEvents,
               model: summary.model,
               reasoningEffort: summary.reasoningEffort,
               serviceTier: summary.serviceTier,
+              lastTurnStatus: summary.lastTurnStatus,
+              lastErrorMessage: summary.lastErrorMessage,
             });
             this.createdSessions.add(sessionId);
 
@@ -175,9 +238,14 @@ export class ExternalSessionTracker {
                 messageCount: summary.messageCount,
                 updatedAt: summary.updatedAt,
                 contextUsage: summary.contextUsage,
+                cumulativeUsage: summary.cumulativeUsage,
+                compactCount: summary.compactCount,
+                compactEvents: summary.compactEvents,
                 model: summary.model,
                 reasoningEffort: summary.reasoningEffort,
                 serviceTier: summary.serviceTier,
+                lastTurnStatus: summary.lastTurnStatus ?? null,
+                lastErrorMessage: summary.lastErrorMessage ?? null,
                 timestamp: now,
               };
               this.eventBus.emit(event);
@@ -204,9 +272,14 @@ export class ExternalSessionTracker {
               messageCount: summary.messageCount,
               projectId,
               contextUsage: summary.contextUsage,
+              cumulativeUsage: summary.cumulativeUsage,
+              compactCount: summary.compactCount,
+              compactEvents: summary.compactEvents,
               model: summary.model,
               reasoningEffort: summary.reasoningEffort,
               serviceTier: summary.serviceTier,
+              lastTurnStatus: summary.lastTurnStatus,
+              lastErrorMessage: summary.lastErrorMessage,
             });
           }
         } else {
@@ -219,19 +292,44 @@ export class ExternalSessionTracker {
           const contextUsageChanged =
             cached?.contextUsage?.inputTokens !==
             summary.contextUsage?.inputTokens;
+          const cumulativeUsageChanged =
+            cached?.cumulativeUsage?.totalTokens !==
+              summary.cumulativeUsage?.totalTokens ||
+            cached?.cumulativeUsage?.inputTokens !==
+              summary.cumulativeUsage?.inputTokens ||
+            cached?.cumulativeUsage?.outputTokens !==
+              summary.cumulativeUsage?.outputTokens ||
+            cached?.cumulativeUsage?.cacheReadTokens !==
+              summary.cumulativeUsage?.cacheReadTokens ||
+            cached?.cumulativeUsage?.cacheCreationTokens !==
+              summary.cumulativeUsage?.cacheCreationTokens;
+          const compactCountChanged =
+            cached?.compactCount !== summary.compactCount;
+          const compactEventsChanged =
+            JSON.stringify(cached?.compactEvents ?? []) !==
+            JSON.stringify(summary.compactEvents ?? []);
           const modelChanged = cached?.model !== summary.model;
           const reasoningEffortChanged =
             cached?.reasoningEffort !== summary.reasoningEffort;
           const serviceTierChanged =
             cached?.serviceTier !== summary.serviceTier;
+          const lastTurnStatusChanged =
+            cached?.lastTurnStatus !== summary.lastTurnStatus;
+          const lastErrorMessageChanged =
+            cached?.lastErrorMessage !== summary.lastErrorMessage;
 
           if (
             titleChanged ||
             messageCountChanged ||
             contextUsageChanged ||
+            cumulativeUsageChanged ||
+            compactCountChanged ||
+            compactEventsChanged ||
             modelChanged ||
             reasoningEffortChanged ||
-            serviceTierChanged
+            serviceTierChanged ||
+            lastTurnStatusChanged ||
+            lastErrorMessageChanged
           ) {
             const event: SessionUpdatedEvent = {
               type: "session-updated",
@@ -241,9 +339,14 @@ export class ExternalSessionTracker {
               messageCount: summary.messageCount,
               updatedAt: summary.updatedAt,
               contextUsage: summary.contextUsage,
+              cumulativeUsage: summary.cumulativeUsage,
+              compactCount: summary.compactCount,
+              compactEvents: summary.compactEvents,
               model: summary.model,
               reasoningEffort: summary.reasoningEffort,
               serviceTier: summary.serviceTier,
+              lastTurnStatus: summary.lastTurnStatus ?? null,
+              lastErrorMessage: summary.lastErrorMessage ?? null,
               timestamp: now,
             };
             this.eventBus.emit(event);
@@ -254,9 +357,14 @@ export class ExternalSessionTracker {
               messageCount: summary.messageCount,
               projectId,
               contextUsage: summary.contextUsage,
+              cumulativeUsage: summary.cumulativeUsage,
+              compactCount: summary.compactCount,
+              compactEvents: summary.compactEvents,
               model: summary.model,
               reasoningEffort: summary.reasoningEffort,
               serviceTier: summary.serviceTier,
+              lastTurnStatus: summary.lastTurnStatus,
+              lastErrorMessage: summary.lastErrorMessage,
             });
           }
         }
@@ -289,6 +397,11 @@ export class ExternalSessionTracker {
    */
   isExternal(sessionId: string): boolean {
     return this.externalSessions.has(sessionId);
+  }
+
+  /** Activity that is proven for this exact external session. */
+  getExternalActivity(sessionId: string): AgentActivity | undefined {
+    return this.externalSessions.get(sessionId)?.activity;
   }
 
   /**
@@ -389,6 +502,7 @@ export class ExternalSessionTracker {
     }
     this.externalSessions.clear();
     this.recentlyAborted.clear();
+    this.runtimeOwnedSessions.clear();
     this.missingProjectWarningTimestamps.clear();
   }
 
@@ -403,6 +517,11 @@ export class ExternalSessionTracker {
       return;
     }
 
+    if (event.provider === "pi") {
+      await this.handlePiFileChange(event);
+      return;
+    }
+
     // Parse sessionId and projectId from path
     // Format: projects/<projectId>/<sessionId>.jsonl
     const parsed = this.parseSessionPath(event.relativePath);
@@ -412,13 +531,19 @@ export class ExternalSessionTracker {
 
     // Check if we own this session
     const process = this.supervisor.getProcessForSession(sessionId);
-    if (process) {
+    const runtimeProcess = process
+      ? null
+      : await this.getRuntimeProcess?.(sessionId);
+    if (runtimeProcess) this.runtimeOwnedSessions.add(sessionId);
+    else this.runtimeOwnedSessions.delete(sessionId);
+    if (process || runtimeProcess) {
       // We own it - remove from external tracking if present
       this.removeExternal(sessionId);
       // Still parse to detect title/messageCount changes for owned sessions
       if (this.getSessionSummary) {
         const getSessionSummary = this.getSessionSummary;
-        const projectId = process.projectId;
+        const projectId = process?.projectId ?? runtimeProcess?.projectId;
+        if (!projectId) return;
         this.sessionParser.enqueue(sessionId, async () => {
           return getSessionSummary(sessionId, projectId);
         });
@@ -434,11 +559,9 @@ export class ExternalSessionTracker {
 
     // We don't own it and it's not in grace period - decide whether it is
     // still actively controlled by an external provider process.
-    const project = await this.scanner.getProjectBySessionFile(event.path);
     await this.handleUnownedSessionActivity(sessionId, {
       provider: event.provider,
       dirProjectId,
-      projectId: project?.id as UrlProjectId | undefined,
     });
   }
 
@@ -494,17 +617,79 @@ export class ExternalSessionTracker {
     );
   }
 
+  private async handlePiFileChange(event: FileChangeEvent): Promise<void> {
+    const firstLine = await readFirstLine(event.path).catch(() => null);
+    if (!firstLine) return;
+
+    let header: ReturnType<typeof parsePiSessionHeader>;
+    try {
+      header = parsePiSessionHeader(JSON.parse(firstLine));
+    } catch {
+      return;
+    }
+    if (!header) return;
+
+    const sessionId = header.id;
+    const projectId = encodeProjectId(header.cwd);
+    const process = this.supervisor.getProcessForSession(sessionId);
+    const runtimeProcess = process
+      ? null
+      : await this.getRuntimeProcess?.(sessionId);
+    if (runtimeProcess) this.runtimeOwnedSessions.add(sessionId);
+    else this.runtimeOwnedSessions.delete(sessionId);
+
+    if (process || runtimeProcess) {
+      this.removeExternal(sessionId);
+      if (this.getSessionSummary) {
+        const getSessionSummary = this.getSessionSummary;
+        const ownedProjectId = process?.projectId ?? runtimeProcess?.projectId;
+        if (!ownedProjectId) return;
+        this.sessionParser.enqueue(sessionId, () =>
+          getSessionSummary(sessionId, ownedProjectId),
+        );
+      }
+      return;
+    }
+
+    if (this.isInAbortGracePeriod(sessionId)) return;
+
+    await this.handleUnownedSessionActivity(sessionId, {
+      provider: "pi",
+      projectId,
+      sessionFilePath: event.path,
+    });
+  }
+
   private async handleCodexFileChange(event: FileChangeEvent): Promise<void> {
     const sessionId = this.extractCodexSessionId(event.relativePath);
     if (!sessionId) return;
 
+    const meta = await this.readCodexSessionMeta(event.path);
+    if (!meta) return;
+
+    // Codex persists every collaboration worker as its own rollout file. Those
+    // files are child threads of the visible CLI session, not new sessions.
+    if (meta.isSubagent) {
+      this.removeExternal(sessionId);
+      this.runtimeOwnedSessions.delete(sessionId);
+      this.createdSessions.delete(sessionId);
+      this.sessionStateCache.delete(sessionId);
+      return;
+    }
+
     const process = this.supervisor.getProcessForSession(sessionId);
-    if (process) {
+    const runtimeProcess = process
+      ? null
+      : await this.getRuntimeProcess?.(sessionId);
+    if (runtimeProcess) this.runtimeOwnedSessions.add(sessionId);
+    else this.runtimeOwnedSessions.delete(sessionId);
+    if (process || runtimeProcess) {
       this.removeExternal(sessionId);
       // Still parse to detect title/messageCount changes for owned sessions
       if (this.getSessionSummary) {
         const getSessionSummary = this.getSessionSummary;
-        const projectId = process.projectId;
+        const projectId = process?.projectId ?? runtimeProcess?.projectId;
+        if (!projectId) return;
         this.sessionParser.enqueue(sessionId, async () => {
           return getSessionSummary(sessionId, projectId);
         });
@@ -516,14 +701,18 @@ export class ExternalSessionTracker {
       return;
     }
 
-    const projectId = await this.readCodexProjectIdFromFile(event.path);
-    if (!projectId) return;
+    const projectId = encodeProjectId(meta.cwd);
 
     await this.handleUnownedSessionActivity(sessionId, {
       provider: event.provider,
       projectId,
     });
-    await this.ensureCodexSessionCreated(sessionId, event.path, projectId);
+    await this.ensureCodexSessionCreated(
+      sessionId,
+      event.path,
+      projectId,
+      meta,
+    );
   }
 
   private extractCodexSessionId(relativePath: string): string | null {
@@ -534,37 +723,32 @@ export class ExternalSessionTracker {
     return match?.[1] ?? null;
   }
 
-  private async readCodexProjectIdFromFile(
-    filePath: string,
-  ): Promise<UrlProjectId | null> {
-    const meta = await this.readCodexSessionMeta(filePath);
-    if (!meta) return null;
-    return encodeProjectId(meta.cwd);
-  }
-
   private async readCodexSessionMeta(
     filePath: string,
-  ): Promise<{ cwd: string; timestamp: string; model?: string } | null> {
+  ): Promise<CodexFileSessionMeta | null> {
     try {
       const firstLine = await readFirstLine(filePath);
       if (!firstLine) return null;
 
       const parsed = JSON.parse(firstLine) as {
         type?: string;
-        payload?: { cwd?: string; timestamp?: string; model?: string };
+        payload?: Record<string, unknown>;
       };
       if (
         parsed.type !== "session_meta" ||
-        !parsed.payload?.cwd ||
-        !parsed.payload?.timestamp
+        typeof parsed.payload?.cwd !== "string" ||
+        typeof parsed.payload.timestamp !== "string"
       ) {
         return null;
       }
 
+      const model = parsed.payload.model;
+
       return {
         cwd: parsed.payload.cwd,
         timestamp: parsed.payload.timestamp,
-        model: parsed.payload.model,
+        model: typeof model === "string" ? model : undefined,
+        isSubagent: getCodexSubagentMetadata(parsed.payload).isSubagent,
       };
     } catch {
       return null;
@@ -575,11 +759,9 @@ export class ExternalSessionTracker {
     sessionId: string,
     filePath: string,
     projectId: UrlProjectId,
+    meta: CodexFileSessionMeta,
   ): Promise<void> {
     if (this.createdSessions.has(sessionId)) return;
-
-    const meta = await this.readCodexSessionMeta(filePath);
-    if (!meta) return;
 
     try {
       const stats = await stat(filePath);
@@ -612,15 +794,23 @@ export class ExternalSessionTracker {
 
   private async handleUnownedSessionActivity(
     sessionId: string,
-    info: {
-      provider: FileChangeEvent["provider"];
-      dirProjectId?: DirProjectId;
-      projectId?: UrlProjectId;
-    },
+    info: ExternalSessionCandidate,
   ): Promise<void> {
-    const activeExternalProcess = await this.checkExternalProcessForInfo(info);
+    const [activeExternalProcess, piTailActivity] = await Promise.all([
+      this.checkExternalProcessForInfo(info),
+      this.getPiTailActivity(info),
+    ]);
 
-    if (activeExternalProcess === false) {
+    // A Pi process can sit idle in the same cwd indefinitely, and the process
+    // probe cannot identify which native session it has open. A terminal Pi
+    // log tail is therefore the authoritative turn verdict for this session.
+    if (piTailActivity === "settled") {
+      this.removeExternal(sessionId);
+      this.enqueueSessionParse(sessionId, info);
+      return;
+    }
+
+    if (activeExternalProcess === false && piTailActivity !== "in-flight") {
       this.removeExternal(sessionId);
       this.enqueueSessionParse(sessionId, info);
       return;
@@ -628,16 +818,54 @@ export class ExternalSessionTracker {
 
     // If probing is unavailable (null), keep the previous behavior and treat
     // recent external file activity as active until the decay timeout expires.
-    this.markExternal(sessionId, info);
+    this.markExternal(
+      sessionId,
+      piTailActivity === "in-flight" ? { ...info, activity: "in-turn" } : info,
+    );
+  }
+
+  /**
+   * Whether the session log itself shows a turn still in flight.
+   *
+   * The process probe answers "is a provider CLI running in this project", and
+   * a definitive `false` normally retires an external session. That premise
+   * does not hold for a provider hosted in-process by an SDK embedder: Pi Web
+   * runs `AgentSession` inside its own Next.js server, so there is no `pi`
+   * process to find and the host's cwd is its install directory, not the
+   * project. Every session driven that way was therefore reported as inactive
+   * while it was streaming.
+   *
+   * The append-only log is the stronger evidence in that case, and it is
+   * evidence the probe cannot contradict: a log that just grew, ending in an
+   * unfinished turn, means something is driving this session right now.
+   * Periodic validation bounds how long that evidence remains authoritative
+   * without another file change, so a host that dies mid-turn is retired.
+   */
+  private async getPiTailActivity(
+    info: ExternalSessionCandidate,
+  ): Promise<PiSessionTailActivity> {
+    if (info.provider !== "pi" || !info.sessionFilePath) return "unknown";
+    return readPiSessionTailActivity(info.sessionFilePath);
+  }
+
+  /**
+   * Log-only liveness is provisional: a crashed host leaves the same unfinished
+   * tail behind forever. File changes refresh `lastActivity`; once they stop for
+   * the stale window, the tail can no longer keep ownership alive by itself.
+   */
+  private async hasRecentLiveTurnEvidence(
+    info: ExternalSessionInfo,
+    activity?: PiSessionTailActivity,
+  ): Promise<boolean> {
+    if (Date.now() - info.lastActivity.getTime() >= this.piInFlightStaleMs) {
+      return false;
+    }
+    return (activity ?? (await this.getPiTailActivity(info))) === "in-flight";
   }
 
   private enqueueSessionParse(
     sessionId: string,
-    info: {
-      provider: FileChangeEvent["provider"];
-      dirProjectId?: DirProjectId;
-      projectId?: UrlProjectId;
-    },
+    info: ExternalSessionCandidate,
   ): void {
     if (!this.getSessionSummary) return;
 
@@ -651,11 +879,7 @@ export class ExternalSessionTracker {
 
   private markExternal(
     sessionId: string,
-    info: {
-      provider: FileChangeEvent["provider"];
-      dirProjectId?: DirProjectId;
-      projectId?: UrlProjectId;
-    },
+    info: ExternalSessionCandidate,
   ): void {
     const now = new Date();
     const existing = this.externalSessions.get(sessionId);
@@ -667,6 +891,9 @@ export class ExternalSessionTracker {
         clearTimeout(existing.validationTimeoutId);
       }
       existing.lastActivity = now;
+      existing.sessionFilePath =
+        info.sessionFilePath ?? existing.sessionFilePath;
+      existing.activity = info.activity ?? existing.activity;
       existing.timeoutId = this.createDecayTimeout(sessionId);
       existing.validationTimeoutId =
         this.createProcessValidationTimeout(sessionId);
@@ -680,6 +907,8 @@ export class ExternalSessionTracker {
         dirProjectId: info.dirProjectId,
         projectId: info.projectId,
         provider: info.provider,
+        activity: info.activity,
+        sessionFilePath: info.sessionFilePath,
         timeoutId: this.createDecayTimeout(sessionId),
         validationTimeoutId: null,
       };
@@ -723,8 +952,20 @@ export class ExternalSessionTracker {
     const info = this.externalSessions.get(sessionId);
     if (!info) return;
 
-    const activeExternalProcess = await this.checkExternalProcessForInfo(info);
-    if (activeExternalProcess === true) {
+    const [activeExternalProcess, piTailActivity] = await Promise.all([
+      this.checkExternalProcessForInfo(info),
+      this.getPiTailActivity(info),
+    ]);
+    if (piTailActivity === "settled") {
+      this.removeExternal(sessionId);
+      return;
+    }
+    // A long thinking phase writes nothing to the log, so decay must also ask
+    // whether the last recorded turn ever finished before retiring a session.
+    if (
+      activeExternalProcess === true ||
+      (await this.hasRecentLiveTurnEvidence(info, piTailActivity))
+    ) {
       info.timeoutId = this.createDecayTimeout(sessionId);
       return;
     }
@@ -746,25 +987,32 @@ export class ExternalSessionTracker {
     const info = this.externalSessions.get(sessionId);
     if (!info) return;
 
-    const activeExternalProcess = await this.checkExternalProcessForInfo(info);
-    if (activeExternalProcess === false) {
+    const [activeExternalProcess, piTailActivity] = await Promise.all([
+      this.checkExternalProcessForInfo(info),
+      this.getPiTailActivity(info),
+    ]);
+    if (piTailActivity === "settled") {
+      this.removeExternal(sessionId);
+      return;
+    }
+    if (
+      activeExternalProcess === false &&
+      !(await this.hasRecentLiveTurnEvidence(info, piTailActivity))
+    ) {
       this.removeExternal(sessionId);
       return;
     }
 
-    if (
-      activeExternalProcess === true &&
-      this.externalSessions.has(sessionId)
-    ) {
+    // Re-arm while the session still looks active. A log-evidenced session must
+    // keep validating too, otherwise it would only ever be retired by decay.
+    if (this.externalSessions.has(sessionId)) {
       info.validationTimeoutId = this.createProcessValidationTimeout(sessionId);
     }
   }
 
-  private async checkExternalProcessForInfo(info: {
-    provider: FileChangeEvent["provider"];
-    dirProjectId?: DirProjectId;
-    projectId?: UrlProjectId;
-  }): Promise<boolean | null> {
+  private async checkExternalProcessForInfo(
+    info: ExternalSessionCandidate,
+  ): Promise<boolean | null> {
     const project = await this.resolveProjectForSession(info);
     if (!project?.path) return null;
 
@@ -791,6 +1039,9 @@ export class ExternalSessionTracker {
         sessionId,
         projectId: info.projectId,
         ownership,
+        ...(ownership.owner === "external" && info.activity
+          ? { activity: info.activity }
+          : {}),
         timestamp: new Date().toISOString(),
       };
       this.eventBus.emit(event);
@@ -816,6 +1067,9 @@ export class ExternalSessionTracker {
       sessionId,
       projectId: project.id,
       ownership,
+      ...(ownership.owner === "external" && info.activity
+        ? { activity: info.activity }
+        : {}),
       timestamp: new Date().toISOString(),
     };
 

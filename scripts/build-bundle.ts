@@ -1,9 +1,9 @@
 #!/usr/bin/env tsx
 
 /**
- * Build script for npm package distribution
+ * Build script for the self-contained Node.js distribution bundle
  *
- * This script prepares a single bundle for npm publishing by:
+ * This script prepares a single bundle for local deployment and GitHub Release by:
  * 1. Building the shared package (types)
  * 2. Building the client (React app)
  * 3. Building the server (Node.js app)
@@ -16,33 +16,104 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-  createRuntimeShrinkwrap,
-  getRuntimeAllowScripts,
-  getRuntimeDependencies,
-  resolveBundleOutputDir,
-} from "./runtime-package.js";
+  promoteStagedDirectory,
+  resolveBundleOutputDirectory,
+} from "./promote-staged-directory.js";
+import { createRuntimeShrinkwrap } from "./runtime-package.js";
 
 const ROOT_DIR = path.resolve(import.meta.dirname, "..");
 const CLIENT_DIST = path.join(ROOT_DIR, "packages/client/dist");
 const SERVER_PACKAGE = path.join(ROOT_DIR, "packages/server");
 const SERVER_DIST = path.join(SERVER_PACKAGE, "dist");
 const SHARED_DIST = path.join(ROOT_DIR, "packages/shared/dist");
+const PI_EXTENSION_SOURCE = path.join(
+  SERVER_PACKAGE,
+  "resources/pi-yep-extension.mjs",
+);
 
-// Staging directory for npm publishing (keeps workspace package.json intact)
-const STAGING_DIR = resolveBundleOutputDir();
+// Build into an unpublished sibling first. The currently running 8022 process
+// serves files directly from dist/npm-package/client-dist, so deleting or
+// mutating that directory during compilation creates real asset 404s.
+// YEP_BUNDLE_OUTPUT_DIR is primarily for isolated verification and packaging.
+const PUBLISHED_DIR = resolveBundleOutputDirectory(
+  ROOT_DIR,
+  process.env.YEP_BUNDLE_OUTPUT_DIR,
+);
+const STAGING_DIR = path.join(
+  path.dirname(PUBLISHED_DIR),
+  `.${path.basename(PUBLISHED_DIR)}.build-${process.pid}-${Date.now()}`,
+);
+let stagingPublished = false;
 
-// Version for npm package - set via NPM_VERSION env var (from git tag in CI) or fallback
-const NPM_VERSION = process.env.NPM_VERSION || "0.4.8";
+// A normal build failure must leave the published bundle intact and should not
+// leave a partially assembled staging tree behind.
+process.once("exit", () => {
+  if (!stagingPublished && fs.existsSync(STAGING_DIR)) {
+    fs.rmSync(STAGING_DIR, { recursive: true, force: true });
+  }
+});
+
+// Version for the bundle. Normally supplied via NPM_VERSION (release tag in CI,
+// root package.json in redeploy-server.sh). When absent we read the root
+// package.json rather than falling back to a hardcoded string: a stale constant
+// silently produces a bundle that misreports its own version, which then
+// defeats every downstream version check. Failing loudly is the point.
+function resolveBundleVersion(): string {
+  const fromEnv = process.env.NPM_VERSION?.trim();
+  if (fromEnv) return fromEnv;
+
+  const rootPackageJson = path.join(ROOT_DIR, "package.json");
+  let version: unknown;
+  try {
+    version = JSON.parse(fs.readFileSync(rootPackageJson, "utf-8")).version;
+  } catch (error) {
+    console.error(
+      `Failed to read a version from ${rootPackageJson}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    console.error(
+      "Set NPM_VERSION explicitly, or repair the root package.json.",
+    );
+    process.exit(1);
+  }
+
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+/.test(version)) {
+    console.error(
+      `Root package.json has no usable "version" (got: ${JSON.stringify(version)}).`,
+    );
+    console.error(
+      "Set NPM_VERSION explicitly, or repair the root package.json.",
+    );
+    process.exit(1);
+  }
+
+  return version;
+}
+
+const NPM_VERSION = resolveBundleVersion();
+
+// Which release line this bundle belongs to. This repository is the fork line,
+// so that is the default; YEP_RELEASE_CHANNEL exists for the rare case of
+// building an upstream-channel artifact. An unrecognised value is a typo that
+// would silently re-enable upstream update prompts, so reject it outright.
+const RELEASE_CHANNELS = ["upstream", "fork", "dev"];
+const RELEASE_CHANNEL = process.env.YEP_RELEASE_CHANNEL ?? "fork";
+if (!RELEASE_CHANNELS.includes(RELEASE_CHANNEL)) {
+  console.error(
+    `Unknown YEP_RELEASE_CHANNEL "${RELEASE_CHANNEL}" (expected: ${RELEASE_CHANNELS.join(" | ")}).`,
+  );
+  process.exit(1);
+}
 const BUILD_DATE = process.env.YEP_BUILD_DATE || new Date().toISOString();
 
 function commandOutput(command: string): string | null {
   try {
-    const output = execSync(command, {
+    return execSync(command, {
       cwd: ROOT_DIR,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "ignore"],
     }).trim();
-    return output.length > 0 ? output : null;
   } catch {
     return null;
   }
@@ -69,13 +140,13 @@ function createBuildInfo() {
     schemaVersion: 1,
     buildId: `${NPM_VERSION}-${shortCommit}-${compactDate}`,
     version: NPM_VERSION,
+    releaseChannel: RELEASE_CHANNEL,
     gitDescribe: gitDescribe ?? null,
     gitCommit: gitCommit ?? null,
     gitBranch: gitBranch ?? null,
     gitDirty: gitStatus !== null ? gitStatus.length > 0 : null,
     builtAt: BUILD_DATE,
     buildProfile: process.env.YEP_BUILD_PROFILE ?? "production",
-    // 本地构建默认使用 "/" 以便本地访问，远程部署时通过 BASE_PATH 环境变量覆盖
     basePath: normalizeBasePath(process.env.BASE_PATH ?? "/"),
   };
 }
@@ -96,57 +167,6 @@ function log(message: string): void {
 
 function error(message: string): void {
   console.error(`[build-bundle] ERROR: ${message}`);
-}
-
-// If node_modules is out of sync with pnpm-lock.yaml (e.g. after a git pull that
-// added dependencies, or a partial/interrupted install), the client build fails
-// with cryptic TS2307 "Cannot find module" errors for mermaid/tiptap/lowlight/
-// tiptap-markdown. Detect the most common missing packages up front and
-// self-heal with `pnpm install`, so a rebuild never dies on a missing
-// dependency. This runs identically on Windows (deploy.ps1) and macOS
-// (deploy.sh) because both delegate the build to `pnpm build:bundle`.
-function ensureWorkspaceDependencies(): void {
-  // Each entry is a list of candidate paths; a sentinel passes if ANY candidate
-  // exists. This lets `vite` be satisfied from packages/client/node_modules/.bin
-  // (where pnpm links it, since it is a client-only dependency) or from the
-  // repo-root .bin (in case of shamefully-hoist).
-  const sentinelGroups: string[][] = [
-    // Client heavy optional deps that frequently go missing after an
-    // interrupted install.
-    ["packages/client/node_modules/mermaid"],
-    ["packages/client/node_modules/@tiptap/react"],
-    ["packages/client/node_modules/lowlight"],
-    ["packages/client/node_modules/tiptap-markdown"],
-    // Dev toolchain binaries required by lint/typecheck/build.
-    ["node_modules/.bin/biome"],
-    ["node_modules/.bin/tsc"],
-    ["node_modules/.bin/vite", "packages/client/node_modules/.bin/vite"],
-    ["node_modules/.bin/tsx"],
-  ];
-
-  const missing = sentinelGroups
-    .filter(
-      (group) => !group.some((p) => fs.existsSync(path.join(ROOT_DIR, p))),
-    )
-    .map((group) => group[0]);
-
-  if (missing.length === 0) return;
-
-  log(
-    `Workspace dependencies look out of sync (${missing.length} sentinel package(s)/tool(s) missing from node_modules, e.g. ${path.basename(missing[0])}). Restoring with \`pnpm install --force\` before building...`,
-  );
-  try {
-    // --force re-links everything even when pnpm's .modules.yaml state claims
-    // node_modules is up to date (the classic stale-state left by an
-    // interrupted install where symlinks are gone but pnpm thinks they exist).
-    execStep("pnpm install --force");
-  } catch (err) {
-    error(
-      "Automatic `pnpm install --force` failed. Run `pnpm install --force` manually " +
-        "in a normal terminal (the environment may block file operations), then retry the build.",
-    );
-    throw err;
-  }
 }
 
 function execStep(
@@ -178,14 +198,13 @@ function step(name: string, fn: () => void): void {
   }
 }
 
-// Make sure workspace dependencies are installed before compiling anything.
-ensureWorkspaceDependencies();
-
 // Clean previous build artifacts
 step("Clean previous builds", () => {
   log("Removing old dist directories...");
 
-  const dirsToClean = [SHARED_DIST, CLIENT_DIST, SERVER_DIST];
+  // Never clean PUBLISHED_DIR here. It is still serving the current UI while
+  // shared/client/server compilation runs.
+  const dirsToClean = [SHARED_DIST, CLIENT_DIST, SERVER_DIST, STAGING_DIR];
 
   for (const dir of dirsToClean) {
     if (fs.existsSync(dir)) {
@@ -193,50 +212,22 @@ step("Clean previous builds", () => {
       log(`  Removed: ${path.relative(ROOT_DIR, dir)}`);
     }
   }
-
-  // STAGING_DIR (dist/npm-package) intentionally keeps its `node_modules`.
-  // That node_modules is (re)generated by the server's `npm ci` on startup
-  // (see run-yepanywhere.ps1 -> Ensure-RuntimeDependencies), and a recursive
-  // `fs.rmSync` over npm-ci's Windows junction/symlink tree can hang for many
-  // minutes. So instead of deleting the whole staging dir we only purge the
-  // build artifacts this script overwrites, leaving node_modules intact.
-  if (fs.existsSync(STAGING_DIR)) {
-    const stagingArtifacts = [
-      "client-dist",
-      "dist",
-      "bundled",
-      "build-info.json",
-      "package.json",
-      "README.md",
-      "npm-shrinkwrap.json",
-    ];
-    for (const entry of stagingArtifacts) {
-      const p = path.join(STAGING_DIR, entry);
-      if (fs.existsSync(p)) {
-        fs.rmSync(p, { recursive: true, force: true });
-      }
-    }
-    log(
-      `  Purged build artifacts in: ${path.relative(ROOT_DIR, STAGING_DIR)} (kept node_modules)`,
-    );
-  }
 });
 
 // Build shared package (types/schemas)
 step("Build shared package", () => {
   log("Building @yep-anywhere/shared (TypeScript compilation)...");
-  execStep("pnpm --filter @yep-anywhere/shared build");
+  execStep("corepack pnpm --filter @yep-anywhere/shared build");
 });
 
 // Build client
 step("Build client", () => {
-  // Vite's `base` is baked into asset URLs at build time. Must match BUILD_INFO.basePath
-  // 本地构建默认使用 "/" 以便本地访问，远程部署时通过 BASE_PATH 环境变量覆盖为 "/yep"
+  // Vite's `base` must match the service's BASE_PATH.
   const clientBasePath = process.env.BASE_PATH ?? "/";
   log(
-    `Building @yep-anywhere/client (Vite production build, BASE_PATH=${clientBasePath})...`,
+    `Building @yep-anywhere/client (Vite production build, BASE_PATH=${clientBasePath || "/"})...`,
   );
-  execStep("pnpm --filter @yep-anywhere/client build", undefined, {
+  execStep("corepack pnpm --filter @yep-anywhere/client build", undefined, {
     BASE_PATH: clientBasePath,
     YEP_BUILD_ID: BUILD_INFO.buildId,
     YEP_BUILD_VERSION: BUILD_INFO.version,
@@ -271,7 +262,7 @@ step("Build client", () => {
 // Build server
 step("Build server", () => {
   log("Building @yep-anywhere/server (TypeScript compilation)...");
-  execStep("pnpm --filter @yep-anywhere/server build");
+  execStep("corepack pnpm --filter @yep-anywhere/server build");
 
   // Verify server dist exists
   const serverDist = path.join(SERVER_PACKAGE, "dist");
@@ -300,7 +291,7 @@ step("Write build metadata", () => {
   );
   log(`  Build id: ${BUILD_INFO.buildId}`);
   log(
-    `  Written to: ${path.relative(ROOT_DIR, path.join(STAGING_DIR, "build-info.json"))}`,
+    `  Staged at: ${path.relative(ROOT_DIR, path.join(STAGING_DIR, "build-info.json"))}`,
   );
 });
 
@@ -333,8 +324,6 @@ step("Rewrite @yep-anywhere/shared imports", () => {
         if (!content.includes("@yep-anywhere/shared")) continue;
 
         let relPath = path.relative(path.dirname(fullPath), sharedEntry);
-        // Use forward slashes so the rewritten ESM import resolves on Windows too
-        // (Node's ESM loader treats backslashes as literal characters, not separators).
         relPath = relPath.split(path.sep).join("/");
         // Ensure it starts with ./ for Node.js ESM resolution
         if (!relPath.startsWith(".")) relPath = `./${relPath}`;
@@ -411,13 +400,39 @@ step("Bundle client into staging", () => {
   log("  Client assets bundled into staging");
 });
 
-// Generate package.json for publishing (in staging, not modifying original)
-step("Generate package.json for npm", () => {
-  log("Generating package.json for npm publishing...");
+// Pi loads this extension explicitly for every Yep-owned RPC process. It is
+// bundled as data (not installed into ~/.pi), keeping user configuration
+// untouched while making packaged and source runs behave identically.
+step("Bundle Pi RPC extension", () => {
+  const extensionDest = path.join(
+    STAGING_DIR,
+    "resources/pi-yep-extension.mjs",
+  );
+  if (!fs.existsSync(PI_EXTENSION_SOURCE)) {
+    throw new Error(`Pi extension not found at ${PI_EXTENSION_SOURCE}`);
+  }
+  fs.mkdirSync(path.dirname(extensionDest), { recursive: true });
+  fs.copyFileSync(PI_EXTENSION_SOURCE, extensionDest);
+  log("  Pi RPC extension bundled into staging");
+});
 
-  // Create a new package.json for publishing
+// Generate the bundle package.json in staging without modifying the workspace.
+step("Generate bundle package.json", () => {
+  log("Generating bundle package.json...");
+
+  const sourcePackageJsonPath = path.join(SERVER_PACKAGE, "package.json");
+  const sourcePackageJson = JSON.parse(
+    fs.readFileSync(sourcePackageJsonPath, "utf-8"),
+  );
+
+  // Create a package.json for the self-contained bundle. This repository does
+  // not publish the bundle to a package registry.
+  // The bare `yepanywhere` name belongs to the upstream release line, which we
+  // have no publish rights to and do not want to shadow. Scoping the name adds
+  // a second defense against registry mistakes. The bin names are deliberately
+  // unchanged — redeploy-server.sh invokes `yepanywhere --codex-bridge-only`.
   const npmPackageJson: Record<string, unknown> = {
-    name: "yepanywhere",
+    name: "@hustc5622/yepanywhere",
     version: NPM_VERSION,
     description: "A mobile-first supervisor for Claude Code agents",
     type: "module",
@@ -426,9 +441,6 @@ step("Generate package.json for npm", () => {
       yc: "./dist/cli.js",
     },
     scripts: {
-      // Cross-platform postinstall: on non-Windows, ensure node-pty's
-      // spawn-helper is executable (Unix needs +x). On Windows no chmod is
-      // needed, so this is a safe no-op there.
       postinstall:
         "node -e \"if(process.platform!=='win32'){const fs=require('fs'),path=require('path');const fix=(d)=>{if(!fs.existsSync(d))return;for(const a of fs.readdirSync(d)){const p=path.join(d,a,'spawn-helper');if(fs.existsSync(p))fs.chmodSync(p,0o755);}};fix('node_modules/node-pty/prebuilds');const pd='node_modules/.pnpm';if(fs.existsSync(pd))for(const e of fs.readdirSync(pd)){if(e.indexOf('node-pty@')===0)fix(path.join(pd,e,'node_modules/node-pty/prebuilds'));}}\"",
     },
@@ -436,27 +448,25 @@ step("Generate package.json for npm", () => {
     exports: {
       ".": "./dist/index.js",
     },
-    files: [
-      "dist",
-      "client-dist",
-      "bundled",
-      "README.md",
-      "npm-shrinkwrap.json",
-    ],
-    dependencies: getRuntimeDependencies(),
-    allowScripts: getRuntimeAllowScripts(),
+    files: ["dist", "client-dist", "bundled", "resources", "README.md"],
+    // Copy dependencies from source, excluding workspace deps
+    dependencies: Object.fromEntries(
+      Object.entries(sourcePackageJson.dependencies || {}).filter(
+        ([name]) => !name.startsWith("@yep-anywhere/"),
+      ),
+    ),
     repository: {
       type: "git",
-      url: "git+https://github.com/kzahel/yepanywhere.git",
+      url: "git+https://github.com/hustc5622/yepanywhere.git",
     },
-    homepage: "https://github.com/kzahel/yepanywhere#readme",
+    homepage: "https://github.com/hustc5622/yepanywhere#readme",
     bugs: {
-      url: "https://github.com/kzahel/yepanywhere/issues",
+      url: "https://github.com/hustc5622/yepanywhere/issues",
     },
     keywords: ["claude", "ai", "agent", "supervisor", "mobile"],
     license: "MIT",
     engines: {
-      node: ">=20",
+      node: ">=22.13.0",
     },
   };
 
@@ -467,10 +477,11 @@ step("Generate package.json for npm", () => {
     `${JSON.stringify(npmPackageJson, null, 2)}\n`,
   );
 
-  log("  Package name: yepanywhere");
+  log(`  Package name: ${npmPackageJson.name}`);
   log(`  Version: ${NPM_VERSION}`);
+  log(`  Release channel: ${RELEASE_CHANNEL}`);
   log(
-    `  Written to: ${path.relative(ROOT_DIR, path.join(STAGING_DIR, "package.json"))}`,
+    `  Staged at: ${path.relative(ROOT_DIR, path.join(STAGING_DIR, "package.json"))}`,
   );
   log("  (Original packages/server/package.json unchanged)");
 });
@@ -480,9 +491,6 @@ step("Copy reproducible runtime lock", () => {
   fs.writeFileSync(
     path.join(STAGING_DIR, "npm-shrinkwrap.json"),
     `${JSON.stringify(shrinkwrap, null, 2)}\n`,
-  );
-  log(
-    `  Written to: ${path.relative(ROOT_DIR, path.join(STAGING_DIR, "npm-shrinkwrap.json"))}`,
   );
 });
 
@@ -502,8 +510,10 @@ A mobile-first supervisor for Claude Code agents.
 
 ## Installation
 
+This build is not published to a registry. Install it from a checkout:
+
 \`\`\`bash
-npm install -g yepanywhere
+npm install -g ./dist/npm-package
 \`\`\`
 
 ## Usage
@@ -528,6 +538,117 @@ MIT
     fs.writeFileSync(readmeDest, basicReadme);
     log("  Created basic README.md (no repo README found)");
   }
+});
+
+// Validate everything that the running service needs before the stable path is
+// changed. In particular, this catches a client build that omitted favicon
+// files or failed to add a fresh favicon URL.
+step("Validate staged bundle", () => {
+  const requiredFiles = [
+    "build-info.json",
+    "package.json",
+    "dist/cli.js",
+    "client-dist/index.html",
+    "client-dist/build-info.json",
+    "client-dist/favicon.ico",
+    "client-dist/icon-192.png",
+  ];
+
+  for (const relativePath of requiredFiles) {
+    const absolutePath = path.join(STAGING_DIR, relativePath);
+    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+      throw new Error(`Required staged file is missing: ${relativePath}`);
+    }
+    if (fs.statSync(absolutePath).size === 0) {
+      throw new Error(`Required staged file is empty: ${relativePath}`);
+    }
+  }
+
+  for (const relativePath of [
+    "build-info.json",
+    "client-dist/build-info.json",
+  ]) {
+    const buildInfo = JSON.parse(
+      fs.readFileSync(path.join(STAGING_DIR, relativePath), "utf8"),
+    ) as { buildId?: unknown };
+    if (buildInfo.buildId !== BUILD_INFO.buildId) {
+      throw new Error(
+        `${relativePath} has build id ${String(buildInfo.buildId)}, expected ${BUILD_INFO.buildId}`,
+      );
+    }
+  }
+
+  const stagedClientDir = path.join(STAGING_DIR, "client-dist");
+  const indexHtml = fs.readFileSync(
+    path.join(stagedClientDir, "index.html"),
+    "utf8",
+  );
+  const linkTags = indexHtml.match(/<link\b[^>]*>/gi) ?? [];
+  let localIconCount = 0;
+
+  for (const tag of linkTags) {
+    const rel = tag.match(/\brel\s*=\s*(["'])([^"']*)\1/i)?.[2];
+    const href = tag.match(/\bhref\s*=\s*(["'])([^"']*)\1/i)?.[2];
+    const isIcon = rel
+      ?.toLowerCase()
+      .split(/\s+/)
+      .some((token) => token === "icon" || token.endsWith("-icon"));
+    if (!isIcon || !href || /^(?:data:|https?:|\/\/)/i.test(href)) continue;
+
+    localIconCount += 1;
+    const iconUrl = new URL(href, "http://bundle.invalid");
+    if (iconUrl.searchParams.get("v") !== BUILD_INFO.buildId) {
+      throw new Error(
+        `Icon URL is not versioned with build id ${BUILD_INFO.buildId}: ${href}`,
+      );
+    }
+  }
+
+  if (localIconCount === 0) {
+    throw new Error("No local favicon links were found in staged index.html");
+  }
+
+  for (const match of indexHtml.matchAll(
+    /\b(?:src|href)\s*=\s*(["'])([^"']+)\1/gi,
+  )) {
+    const reference = match[2];
+    if (!reference || /^(?:data:|https?:|\/\/)/i.test(reference)) continue;
+
+    const assetUrl = new URL(reference, "http://bundle.invalid");
+    if (!assetUrl.pathname.includes("/assets/")) continue;
+
+    const basePrefix =
+      BUILD_INFO.basePath === "/" ? "/" : `${BUILD_INFO.basePath}/`;
+    if (!assetUrl.pathname.startsWith(basePrefix)) {
+      throw new Error(
+        `Client asset URL does not use configured base path ${BUILD_INFO.basePath}: ${reference}`,
+      );
+    }
+
+    const relativeAssetPath = assetUrl.pathname.slice(basePrefix.length);
+    const stagedAssetPath = path.join(stagedClientDir, relativeAssetPath);
+    if (!fs.existsSync(stagedAssetPath)) {
+      throw new Error(`Referenced client asset is missing: ${reference}`);
+    }
+  }
+
+  log(`  Validated ${requiredFiles.length} required files`);
+  log(`  Validated ${localIconCount} build-versioned icon links`);
+});
+
+// Only after every build and validation step succeeds do we expose the new
+// directory at the stable path. A failed rename restores the previous bundle.
+step("Publish staged bundle", () => {
+  // Re-check immediately before the destructive cutover. A long build gives
+  // another process time to create or redirect the configured output path.
+  resolveBundleOutputDirectory(ROOT_DIR, PUBLISHED_DIR);
+  promoteStagedDirectory({
+    stagedDir: STAGING_DIR,
+    publishedDir: PUBLISHED_DIR,
+    onWarning: (message) => log(`WARNING: ${message}`),
+  });
+  stagingPublished = true;
+  log(`  Published at: ${path.relative(ROOT_DIR, PUBLISHED_DIR)}`);
 });
 
 // Helper: Recursive copy
@@ -560,12 +681,13 @@ for (const result of results) {
 const allSuccess = results.every((r) => r.success);
 if (allSuccess) {
   log("\n✓ All build steps completed successfully!");
-  log("\nThe npm package is ready for publishing:");
-  log(`  Location: ${path.relative(ROOT_DIR, STAGING_DIR)}`);
-  log("\nNext steps:");
-  log(`  1. cd ${path.relative(ROOT_DIR, STAGING_DIR)}`);
-  log("  2. Test: npm pack");
-  log("  3. Publish: npm publish");
+  log("\nThe self-contained bundle is ready:");
+  log(`  Location: ${path.relative(ROOT_DIR, PUBLISHED_DIR)}`);
+  log("\nDistribution policy:");
+  log(
+    "  Attach the bundle to a ya-v* GitHub Release or use an authorized local deploy.",
+  );
+  log("  Do not publish this bundle to a package registry.");
   log("\nNote: packages/server/package.json is unchanged (workspace intact)");
 } else {
   error("\n✗ Build failed. See errors above.");

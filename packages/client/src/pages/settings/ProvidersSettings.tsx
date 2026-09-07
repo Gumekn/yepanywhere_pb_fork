@@ -1,177 +1,167 @@
 import { useCallback, useEffect, useState } from "react";
+import { type OhMyRouterThroughputStatus, api } from "../../api/client";
 import { useProviders } from "../../hooks/useProviders";
-import { useServerSettings } from "../../hooks/useServerSettings";
 import { useI18n } from "../../i18n";
 import { getAllProviders } from "../../providers/registry";
 
-const DEFAULT_OLLAMA_SYSTEM_PROMPT =
-  "You are a helpful coding assistant. You help users with software engineering tasks. You have access to tools for reading files, editing files, running shell commands, and searching code. Use tools when needed to answer questions or make changes. Be concise and direct.";
+function formatMilliseconds(value: number | undefined): string {
+  if (value === undefined) return "—";
+  return `${Math.round(value).toLocaleString()} ms`;
+}
 
-function OllamaUrlInput() {
+function OhMyRouterThroughputBenchmark() {
   const { t } = useI18n();
-  const { settings, updateSetting } = useServerSettings();
-  const [url, setUrl] = useState("");
-  const [isSaving, setIsSaving] = useState(false);
-  const [hasChanges, setHasChanges] = useState(false);
+  const [status, setStatus] = useState<OhMyRouterThroughputStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const serverValue = settings?.ollamaUrl ?? "";
+  const refresh = useCallback(async () => {
+    try {
+      const next = await api.getOhMyRouterThroughputBenchmark();
+      setStatus(next);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    if (settings) {
-      setUrl(settings.ollamaUrl ?? "");
-    }
-  }, [settings]);
-
-  const handleSave = useCallback(async () => {
-    setIsSaving(true);
-    try {
-      await updateSetting("ollamaUrl", url.trim() || undefined);
-      setHasChanges(false);
-    } catch {
-      // Error handled by useServerSettings
-    } finally {
-      setIsSaving(false);
-    }
-  }, [url, updateSetting]);
-
-  return (
-    <div style={{ marginTop: "var(--space-2)", width: "100%" }}>
-      <div
-        style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}
-      >
-        <input
-          type="text"
-          className="settings-input"
-          value={url}
-          onChange={(e) => {
-            setUrl(e.target.value);
-            setHasChanges(e.target.value !== serverValue);
-          }}
-          placeholder="http://localhost:11434"
-          style={{ flex: 1 }}
-        />
-        <button
-          type="button"
-          className="settings-button"
-          disabled={!hasChanges || isSaving}
-          onClick={handleSave}
-        >
-          {isSaving ? t("providersSaving") : t("providersSave")}
-        </button>
-      </div>
-      <span className="settings-hint">{t("providersOllamaUrlHint")}</span>
-    </div>
-  );
-}
-
-function OllamaUseFullSystemPrompt() {
-  const { t } = useI18n();
-  const { settings, updateSetting } = useServerSettings();
-  const enabled = settings?.ollamaUseFullSystemPrompt ?? false;
-
-  return (
-    <label
-      style={{
-        display: "flex",
-        gap: "var(--space-2)",
-        alignItems: "center",
-        marginTop: "var(--space-2)",
-        cursor: "pointer",
-      }}
-    >
-      <input
-        type="checkbox"
-        checked={enabled}
-        onChange={(e) =>
-          updateSetting("ollamaUseFullSystemPrompt", e.target.checked)
-        }
-      />
-      <span>{t("providersUseFullPrompt")}</span>
-      <span className="settings-hint" style={{ marginLeft: "auto" }}>
-        {t("providersUseFullPromptHint")}
-      </span>
-    </label>
-  );
-}
-
-function OllamaSystemPromptInput() {
-  const { t } = useI18n();
-  const { settings, updateSetting } = useServerSettings();
-  const [prompt, setPrompt] = useState("");
-  const [isSaving, setIsSaving] = useState(false);
-  const [hasChanges, setHasChanges] = useState(false);
-
-  const serverValue = settings?.ollamaSystemPrompt ?? "";
+    void refresh();
+  }, [refresh]);
 
   useEffect(() => {
-    if (settings) {
-      setPrompt(settings.ollamaSystemPrompt ?? "");
-    }
-  }, [settings]);
+    if (status?.benchmark?.status !== "running") return;
+    const timer = window.setInterval(() => void refresh(), 2_000);
+    return () => window.clearInterval(timer);
+  }, [refresh, status?.benchmark?.status]);
 
-  const handleSave = useCallback(async () => {
-    setIsSaving(true);
+  const start = async () => {
+    setStarting(true);
     try {
-      await updateSetting("ollamaSystemPrompt", prompt.trim() || undefined);
-      setHasChanges(false);
-    } catch {
-      // Error handled by useServerSettings
+      const response = await api.startOhMyRouterThroughputBenchmark();
+      setStatus((current) => ({
+        available: current?.available ?? true,
+        unavailableReason: current?.unavailableReason,
+        benchmark: response.benchmark,
+      }));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setIsSaving(false);
+      setStarting(false);
     }
-  }, [prompt, updateSetting]);
+  };
+
+  const benchmark = status?.benchmark;
+  const isRunning = benchmark?.status === "running";
+  const buttonLabel = benchmark
+    ? t("ohmyrouterBenchmarkRetest")
+    : t("ohmyrouterBenchmarkStart");
 
   return (
-    <div style={{ marginTop: "var(--space-2)", width: "100%" }}>
-      <textarea
-        className="settings-textarea"
-        value={prompt}
-        onChange={(e) => {
-          setPrompt(e.target.value);
-          setHasChanges(e.target.value !== serverValue);
-        }}
-        placeholder={DEFAULT_OLLAMA_SYSTEM_PROMPT}
-        rows={4}
-      />
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginTop: "var(--space-2)",
-        }}
-      >
-        <span className="settings-hint">{t("providersOllamaPromptHint")}</span>
-        <button
-          type="button"
-          className="settings-button"
-          disabled={!hasChanges || isSaving}
-          onClick={handleSave}
-        >
-          {isSaving ? t("providersSaving") : t("providersSave")}
-        </button>
-      </div>
-    </div>
-  );
-}
+    <section className="settings-section">
+      <h2>{t("ohmyrouterBenchmarkTitle")}</h2>
+      <p className="settings-section-description">
+        {t("ohmyrouterBenchmarkDescription")}
+      </p>
 
-function OllamaSettings() {
-  const { settings } = useServerSettings();
-  const useFullPrompt = settings?.ollamaUseFullSystemPrompt ?? false;
+      {loading ? (
+        <p className="settings-hint">{t("ohmyrouterBenchmarkLoading")}</p>
+      ) : !status?.available ? (
+        <p className="settings-hint">
+          {t("ohmyrouterBenchmarkUnavailable", {
+            reason: status?.unavailableReason ?? "",
+          })}
+        </p>
+      ) : (
+        <div className="settings-group">
+          <div className="settings-item settings-item-stacked">
+            <div className="settings-item-row">
+              <div className="settings-item-info">
+                <strong>
+                  {isRunning
+                    ? t("ohmyrouterBenchmarkRunning", {
+                        completed: benchmark.completedModels,
+                        total: benchmark.totalModels,
+                      })
+                    : benchmark?.status === "completed"
+                      ? t("ohmyrouterBenchmarkCompleted")
+                      : benchmark?.status === "interrupted"
+                        ? t("ohmyrouterBenchmarkInterrupted")
+                        : benchmark?.status === "failed"
+                          ? t("ohmyrouterBenchmarkFailed")
+                          : t("ohmyrouterBenchmarkReady")}
+                </strong>
+                {benchmark?.completedAt && (
+                  <p>
+                    {t("ohmyrouterBenchmarkTestedAt", {
+                      date: new Date(benchmark.completedAt).toLocaleString(),
+                    })}
+                  </p>
+                )}
+                {benchmark?.error && (
+                  <p className="form-error">{benchmark.error}</p>
+                )}
+              </div>
+              <button
+                type="button"
+                className="settings-button"
+                disabled={starting || isRunning}
+                onClick={() => void start()}
+              >
+                {starting ? t("ohmyrouterBenchmarkStarting") : buttonLabel}
+              </button>
+            </div>
 
-  return (
-    <>
-      <OllamaUrlInput />
-      <OllamaUseFullSystemPrompt />
-      {!useFullPrompt && <OllamaSystemPromptInput />}
-    </>
+            {benchmark && benchmark.results.length > 0 && (
+              <div className="throughput-benchmark-results">
+                {benchmark.results.map((result) => (
+                  <div
+                    key={`${benchmark.id}-${result.modelId}`}
+                    className="throughput-benchmark-result"
+                  >
+                    <div>
+                      <strong>{result.modelName}</strong>
+                      <code>{result.modelId}</code>
+                    </div>
+                    {result.error ? (
+                      <span className="throughput-benchmark-error">
+                        {t("ohmyrouterBenchmarkModelFailed", {
+                          error: result.error,
+                        })}
+                      </span>
+                    ) : (
+                      <span className="throughput-benchmark-metrics">
+                        {t("ohmyrouterBenchmarkMetrics", {
+                          rate: result.tokensPerSecond?.toFixed(1) ?? "—",
+                          tokens: result.outputTokens?.toLocaleString() ?? "—",
+                          ttft: formatMilliseconds(result.timeToFirstTokenMs),
+                        })}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {benchmark && benchmark.results.length === 0 && !isRunning && (
+              <p className="settings-hint">
+                {t("ohmyrouterBenchmarkNoResults")}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+      {error && <p className="form-error">{error}</p>}
+    </section>
   );
 }
 
 export function ProvidersSettings() {
   const { t } = useI18n();
-  const { providers: serverProviders, loading: providersLoading } =
-    useProviders();
+  const { providers: serverProviders } = useProviders();
 
   // Merge server detection status with client-side metadata
   const registeredProviders = getAllProviders();
@@ -187,50 +177,52 @@ export function ProvidersSettings() {
   });
 
   return (
-    <section className="settings-section">
-      <h2>{t("providersSectionTitle")}</h2>
-      <p className="settings-section-description">
-        {t("providersSectionDescription")}
-      </p>
-      <div className="settings-group">
-        {providerDisplayList.map((provider) => (
-          <div key={provider.id} className="settings-item">
-            <div className="settings-item-info">
-              <div className="settings-item-header">
-                <strong>{provider.displayName}</strong>
-                {provider.installed ? (
-                  <span className="settings-status-badge settings-status-detected">
-                    {t("providersDetected")}
-                  </span>
-                ) : (
-                  <span className="settings-status-badge settings-status-not-detected">
-                    {t("providersNotDetected")}
-                  </span>
+    <>
+      <section className="settings-section">
+        <h2>{t("providersSectionTitle")}</h2>
+        <p className="settings-section-description">
+          {t("providersSectionDescription")}
+        </p>
+        <div className="settings-group">
+          {providerDisplayList.map((provider) => (
+            <div key={provider.id} className="settings-item">
+              <div className="settings-item-info">
+                <div className="settings-item-header">
+                  <strong>{provider.displayName}</strong>
+                  {provider.installed ? (
+                    <span className="settings-status-badge settings-status-detected">
+                      {t("providersDetected")}
+                    </span>
+                  ) : (
+                    <span className="settings-status-badge settings-status-not-detected">
+                      {t("providersNotDetected")}
+                    </span>
+                  )}
+                </div>
+                <p>{provider.metadata.description}</p>
+                {provider.metadata.limitations.length > 0 && (
+                  <ul className="settings-limitations">
+                    {provider.metadata.limitations.map((limitation) => (
+                      <li key={limitation}>{limitation}</li>
+                    ))}
+                  </ul>
                 )}
               </div>
-              <p>{provider.metadata.description}</p>
-              {provider.metadata.limitations.length > 0 && (
-                <ul className="settings-limitations">
-                  {provider.metadata.limitations.map((limitation) => (
-                    <li key={limitation}>{limitation}</li>
-                  ))}
-                </ul>
+              {provider.metadata.website && (
+                <a
+                  href={provider.metadata.website}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="settings-link"
+                >
+                  {t("providersWebsite")}
+                </a>
               )}
-              {provider.id === "claude-ollama" && <OllamaSettings />}
             </div>
-            {provider.metadata.website && (
-              <a
-                href={provider.metadata.website}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="settings-link"
-              >
-                {t("providersWebsite")}
-              </a>
-            )}
-          </div>
-        ))}
-      </div>
-    </section>
+          ))}
+        </div>
+      </section>
+      <OhMyRouterThroughputBenchmark />
+    </>
   );
 }

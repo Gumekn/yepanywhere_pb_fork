@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 
@@ -11,6 +17,7 @@ export interface FilterOption<T extends string> {
   description?: string; // Optional description shown below label
   count?: number;
   color?: string; // For provider colors (colored dot)
+  group?: string; // Optional group label; options sharing a group render together under a header
 }
 
 export interface FilterDropdownProps<T extends string> {
@@ -21,6 +28,9 @@ export interface FilterDropdownProps<T extends string> {
   multiSelect?: boolean; // default true
   placeholder?: string; // shown when nothing selected
   align?: "left" | "right"; // dropdown alignment, default left
+  selectedDescription?: string; // optional secondary text shown inside the trigger
+  /** Optional accent used by selected states, including the mobile portal. */
+  accentColor?: string;
 }
 
 /**
@@ -36,6 +46,8 @@ export function FilterDropdown<T extends string>({
   multiSelect = true,
   placeholder,
   align = "left",
+  selectedDescription,
+  accentColor,
 }: FilterDropdownProps<T>) {
   const { t } = useI18n();
   const [isOpen, setIsOpen] = useState(false);
@@ -44,6 +56,12 @@ export function FilterDropdown<T extends string>({
   );
   const buttonRef = useRef<HTMLButtonElement>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
+  const accentStyle = accentColor
+    ? ({
+        "--filter-dropdown-accent": accentColor,
+        "--filter-dropdown-selected-background": `color-mix(in srgb, ${accentColor} 10%, transparent)`,
+      } as CSSProperties)
+    : undefined;
 
   const handleButtonClick = () => {
     buttonRef.current?.blur();
@@ -148,6 +166,88 @@ export function FilterDropdown<T extends string>({
     return `${label} (${selected.length})`;
   })();
 
+  const renderOption = (option: FilterOption<T>) => {
+    const isSelected = selected.includes(option.value);
+    return (
+      <button
+        key={option.value}
+        type="button"
+        className={`filter-dropdown-option ${isSelected ? "selected" : ""} ${!multiSelect ? "single-select" : ""}`}
+        onClick={() => handleOptionClick(option.value)}
+        aria-pressed={isSelected}
+      >
+        {multiSelect && (
+          <span
+            className={`filter-dropdown-checkbox ${isSelected ? "checked" : ""}`}
+            aria-hidden="true"
+          >
+            {isSelected && (
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="3"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            )}
+          </span>
+        )}
+
+        {option.color && (
+          <span
+            className="filter-dropdown-color-dot"
+            style={{ backgroundColor: option.color }}
+            aria-hidden="true"
+          />
+        )}
+
+        <span className="filter-dropdown-label-wrapper">
+          <span className="filter-dropdown-label">{option.label}</span>
+          {option.description && (
+            <span className="filter-dropdown-description">
+              {option.description}
+            </span>
+          )}
+        </span>
+
+        {option.count !== undefined && (
+          <span className="filter-dropdown-count">{option.count}</span>
+        )}
+      </button>
+    );
+  };
+
+  // Group options by their optional `group` field, preserving first-seen
+  // order. Ungrouped options render first without a header. When no option
+  // declares a group the output is a flat list identical to the legacy
+  // behavior.
+  const groupedOptions = (() => {
+    if (!options.some((option) => option.group)) return null;
+    const order: string[] = [];
+    const byGroup = new Map<string, FilterOption<T>[]>();
+    const ungrouped: FilterOption<T>[] = [];
+    for (const option of options) {
+      if (!option.group) {
+        ungrouped.push(option);
+        continue;
+      }
+      const existing = byGroup.get(option.group);
+      if (existing) {
+        existing.push(option);
+      } else {
+        byGroup.set(option.group, [option]);
+        order.push(option.group);
+      }
+    }
+    return { order, byGroup, ungrouped };
+  })();
+
   const optionsContent = (
     <>
       {multiSelect && selected.length > 0 && (
@@ -163,62 +263,24 @@ export function FilterDropdown<T extends string>({
         </>
       )}
 
-      {options.map((option) => {
-        const isSelected = selected.includes(option.value);
-        return (
-          <button
-            key={option.value}
-            type="button"
-            className={`filter-dropdown-option ${isSelected ? "selected" : ""} ${!multiSelect ? "single-select" : ""}`}
-            onClick={() => handleOptionClick(option.value)}
-            aria-pressed={isSelected}
-          >
-            {multiSelect && (
-              <span
-                className={`filter-dropdown-checkbox ${isSelected ? "checked" : ""}`}
-                aria-hidden="true"
-              >
-                {isSelected && (
-                  <svg
-                    width="12"
-                    height="12"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="3"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <polyline points="20 6 9 17 4 12" />
-                  </svg>
-                )}
-              </span>
-            )}
-
-            {option.color && (
-              <span
-                className="filter-dropdown-color-dot"
-                style={{ backgroundColor: option.color }}
-                aria-hidden="true"
-              />
-            )}
-
-            <span className="filter-dropdown-label-wrapper">
-              <span className="filter-dropdown-label">{option.label}</span>
-              {option.description && (
-                <span className="filter-dropdown-description">
-                  {option.description}
-                </span>
-              )}
-            </span>
-
-            {option.count !== undefined && (
-              <span className="filter-dropdown-count">{option.count}</span>
-            )}
-          </button>
-        );
-      })}
+      {groupedOptions ? (
+        <>
+          {groupedOptions.ungrouped.map(renderOption)}
+          {groupedOptions.order.map((groupName) => (
+            <div
+              key={`group-${groupName}`}
+              className="filter-dropdown-group"
+              role="group"
+              aria-label={groupName}
+            >
+              <div className="filter-dropdown-group-header">{groupName}</div>
+              {(groupedOptions.byGroup.get(groupName) ?? []).map(renderOption)}
+            </div>
+          ))}
+        </>
+      ) : (
+        options.map(renderOption)
+      )}
     </>
   );
 
@@ -234,6 +296,7 @@ export function FilterDropdown<T extends string>({
             <div
               ref={sheetRef}
               className="filter-dropdown-sheet"
+              style={accentStyle}
               tabIndex={-1}
               aria-label={t("filterByLabel", { label })}
             >
@@ -252,6 +315,7 @@ export function FilterDropdown<T extends string>({
       <div
         ref={sheetRef}
         className={`filter-dropdown-dropdown ${align === "right" ? "align-right" : ""}`}
+        style={accentStyle}
         tabIndex={-1}
         aria-label={t("filterByLabel", { label })}
       >
@@ -260,7 +324,7 @@ export function FilterDropdown<T extends string>({
     ) : null;
 
   return (
-    <div className="filter-dropdown-container">
+    <div className="filter-dropdown-container" style={accentStyle}>
       <button
         ref={buttonRef}
         type="button"
@@ -270,7 +334,16 @@ export function FilterDropdown<T extends string>({
         aria-haspopup="listbox"
         aria-expanded={isOpen}
       >
-        <span className="filter-dropdown-button-label">{displayText}</span>
+        {selected.length > 0 && selectedDescription ? (
+          <span className="filter-dropdown-button-content">
+            <span className="filter-dropdown-button-label">{displayText}</span>
+            <span className="filter-dropdown-button-description">
+              {selectedDescription}
+            </span>
+          </span>
+        ) : (
+          <span className="filter-dropdown-button-label">{displayText}</span>
+        )}
         <svg
           className="filter-dropdown-chevron"
           width="12"

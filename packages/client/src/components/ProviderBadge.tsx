@@ -1,17 +1,20 @@
-import type { ProviderName } from "@yep-anywhere/shared";
-import { MODEL_OPTIONS } from "../hooks/useModelSettings";
+import type { LiveProviderName, ProviderName } from "@yep-anywhere/shared";
+import { resolveModelDisplayLabel } from "@yep-anywhere/shared";
+import { useOptionalI18n } from "../i18n";
 
-const PROVIDER_COLORS: Record<ProviderName, string> = {
+const PROVIDER_COLORS: Record<LiveProviderName, string> = {
   claude: "var(--provider-claude)", // Claude orange
   "claude-ollama": "var(--provider-claude)", // Same as Claude (uses Claude SDK)
   codex: "var(--provider-codex)", // OpenAI green
   "codex-oss": "var(--provider-codex)", // OpenAI green (same as codex)
   gemini: "var(--provider-gemini)", // Google blue
   "gemini-acp": "var(--provider-gemini)", // Google blue (same as gemini)
-  opencode: "var(--provider-opencode)", // OpenCode purple
+  pi: "var(--provider-pi)", // Pi cyan
+  kimi: "var(--provider-kimi, #1783ff)", // Kimi KMBlue
+  zcode: "var(--provider-zcode)", // ZCode
 };
 
-const PROVIDER_LABELS: Record<ProviderName, string> = {
+const PROVIDER_LABELS: Record<LiveProviderName, string> = {
   claude: "Claude",
   // Same product brand as `claude` (both use the Claude SDK + Anthropic agent
   // loop). The model name is what distinguishes them — e.g. "Sonnet 4" vs a
@@ -22,7 +25,9 @@ const PROVIDER_LABELS: Record<ProviderName, string> = {
   "codex-oss": "CodexOSS",
   gemini: "Gemini",
   "gemini-acp": "Gemini ACP",
-  opencode: "OpenCode",
+  pi: "Pi",
+  kimi: "Kimi",
+  zcode: "ZCode",
 };
 
 interface ProviderBadgeProps {
@@ -31,7 +36,7 @@ interface ProviderBadgeProps {
   compact?: boolean;
   /** Model name to display alongside provider (e.g., "opus", "sonnet") */
   model?: string;
-  /** Provider-specific reasoning effort (e.g., "xhigh") */
+  /** Provider-specific reasoning effort (e.g., Codex "xhigh", Claude "max") */
   reasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g., "fast") */
   serviceTier?: string;
@@ -53,41 +58,15 @@ export function ProviderBadge({
   isThinking = false,
   className = "",
 }: ProviderBadgeProps) {
-  const color = PROVIDER_COLORS[provider];
-  const label = PROVIDER_LABELS[provider];
+  const i18n = useOptionalI18n();
+  const color = PROVIDER_COLORS[provider as LiveProviderName] ?? "currentColor";
+  const label = PROVIDER_LABELS[provider as LiveProviderName] ?? provider;
 
   // Format model name for display
   const getModelLabel = (modelName: string | undefined): string | null => {
     if (!modelName) return null;
     if (modelName === "default") return null;
-    const isExtendedContext = modelName.includes("[1m]");
-
-    // Check if it's a known short model option (e.g., "opus", "sonnet")
-    const knownModel = MODEL_OPTIONS.find((o) => o.value === modelName);
-    if (knownModel && knownModel.value !== "default") {
-      return knownModel.label;
-    }
-
-    // Parse full model IDs like "claude-opus-4-5-20251101" or "claude-sonnet-4-20250514"
-    // Extract the model family (opus, sonnet, haiku) from the full ID
-    const claudeMatch = modelName.match(/claude-(\w+)-/);
-    if (claudeMatch?.[1]) {
-      const family = claudeMatch[1];
-      // Check if the extracted family is a known model
-      const familyModel = MODEL_OPTIONS.find((o) => o.value === family);
-      if (familyModel) {
-        return isExtendedContext
-          ? `${familyModel.label} 1M`
-          : familyModel.label;
-      }
-      // Capitalize unknown family
-      const capitalized = family.charAt(0).toUpperCase() + family.slice(1);
-      return isExtendedContext ? `${capitalized} 1M` : capitalized;
-    }
-
-    // For other models, capitalize first letter
-    const capitalized = modelName.charAt(0).toUpperCase() + modelName.slice(1);
-    return isExtendedContext ? `${capitalized} 1M` : capitalized;
+    return resolveModelDisplayLabel(modelName);
   };
 
   const normalizeConfigLabel = (value: string | undefined): string | null => {
@@ -99,7 +78,32 @@ export function ProviderBadge({
     effort: string | undefined,
   ): string | null => {
     const normalized = normalizeConfigLabel(effort);
-    if (!normalized || normalized === "none") return null;
+    if (
+      !normalized ||
+      normalized === "none" ||
+      (provider === "pi" && normalized === "default")
+    ) {
+      return null;
+    }
+    if (
+      (provider === "codex" || provider === "codex-oss") &&
+      normalized === "max"
+    ) {
+      return "xhigh";
+    }
+    return normalized;
+  };
+
+  const getServiceTierLabel = (): string | null => {
+    const normalized = normalizeConfigLabel(serviceTier);
+    if (provider === "codex" || provider === "codex-oss") {
+      if (normalized === "priority" || normalized === "fast") {
+        return i18n?.t("codexFastModeLabel") ?? "Fast (priority)";
+      }
+      if (normalized === "default") {
+        return i18n?.t("codexStandardModeLabel") ?? "Standard";
+      }
+    }
     return normalized;
   };
 
@@ -107,7 +111,7 @@ export function ProviderBadge({
   const configLabel = [
     modelLabel,
     getReasoningEffortLabel(reasoningEffort),
-    normalizeConfigLabel(serviceTier),
+    getServiceTierLabel(),
   ]
     .filter((value): value is string => Boolean(value))
     .join(" · ");

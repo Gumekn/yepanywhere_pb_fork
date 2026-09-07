@@ -5,6 +5,11 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Hono } from "hono";
 import { type RuntimeBuildInfo, getRuntimeBuildInfo } from "../build-info.js";
+import {
+  type CodexEventDiagnostics,
+  getCodexEventDiagnostics,
+} from "../codex-events/diagnostics.js";
+import { CODEX_PROVIDER_RUNTIME_IDENTITY } from "../codex-events/runtime.js";
 import { isNewerSemver } from "../utils/semver.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -49,20 +54,19 @@ async function getCurrentVersion(): Promise<string> {
   }
 }
 
-// GitHub repository for version checking (can be overridden via env)
-const GITHUB_REPO =
-  process.env.YEP_UPDATE_GITHUB_REPO || "Gumekn/yepanywhere_pb_fork";
+const UPDATE_SERVER_URL = "https://updates.yepanywhere.com/version";
 
 // Cache for update server check (24 hour TTL for routine app traffic)
 let cachedLatestVersion: { version: string; timestamp: number } | null = null;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
- * Fetch the latest version from GitHub Releases API.
- * Falls back to null if no releases are found or on error.
+ * Fetch the latest version from the update server.
+ * Sends current version and install ID for analytics.
  */
 async function getLatestVersion(
   currentVersion: string,
+  installId?: string,
   options?: { forceRefresh?: boolean },
 ): Promise<string | null> {
   // Return cached value if fresh
@@ -79,42 +83,33 @@ async function getLatestVersion(
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
     const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "yepanywhere-version-check",
+      Accept: "application/json",
     };
+    if (installId) {
+      headers["X-CFU-ID"] = installId;
+    }
 
-    // Fetch latest release from GitHub
-    const response = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`,
-      {
-        signal: controller.signal,
-        headers,
-      },
-    );
+    const response = await fetch(`${UPDATE_SERVER_URL}/${currentVersion}`, {
+      signal: controller.signal,
+      headers,
+    });
 
     clearTimeout(timeoutId);
 
+    // 204 = no update available (current version is latest)
+    if (response.status === 204) {
+      cachedLatestVersion = { version: currentVersion, timestamp: Date.now() };
+      return currentVersion;
+    }
+
     if (!response.ok) {
-      // 404 means no releases published yet
-      if (response.status === 404) {
-        cachedLatestVersion = {
-          version: currentVersion,
-          timestamp: Date.now(),
-        };
-        return currentVersion;
-      }
       return null;
     }
 
-    const data = (await response.json()) as {
-      tag_name?: string;
-      name?: string;
-    };
+    const data = (await response.json()) as { version?: string };
+    const version = data.version || null;
 
-    // Extract version from tag_name (e.g., "v0.1.11" -> "0.1.11")
-    let version = data.tag_name || data.name || null;
     if (version) {
-      version = version.replace(/^v/, ""); // Remove leading 'v' if present
       cachedLatestVersion = { version, timestamp: Date.now() };
     }
 
@@ -135,6 +130,19 @@ export interface VersionInfo {
   resumeProtocolVersion: number;
   /** Feature capabilities supported by this server. Used by clients to show/hide UI. */
   capabilities: string[];
+  /** Generated Codex protocol baseline and bounded compatibility diagnostics. */
+  codexProtocol: {
+    version: string;
+    schemaHash: string;
+    profile: "stable" | "experimental";
+    experimentalApi: boolean;
+    /** Process-lifetime compatibility metric; payloads are never exposed. */
+    unknownNotificationsTotal: number;
+    /** Process-lifetime compatibility metric for newer server requests. */
+    unknownServerRequestsTotal: number;
+    /** Bounded, fingerprint-only compatibility diagnostics. */
+    diagnostics: CodexEventDiagnostics;
+  };
   /** Device bridge availability and update state. */
   deviceBridgeState?: DeviceBridgeState;
   /** Installed managed bridge binary version when known. */
@@ -258,11 +266,21 @@ export function createVersionRoutes(options?: VersionRouteOptions): Hono {
     // For dev versions like "v0.1.7-3-g050bfd2", extract base version "v0.1.7"
     // to compare against the update server.
     const baseVersion = current.split("-")[0] || current;
-    const latest = await getLatestVersion(baseVersion, {
-      forceRefresh: fresh,
-    });
+
+    // The public update service only knows the upstream release line. Asking it
+    // about a fork build gets back upstream's newest version, which is usually
+    // numerically higher and would prompt the user to "update" by installing
+    // upstream over their fork. isNewerSemver drops pre-release/build suffixes,
+    // so no version-string trick can express this — the channel has to gate it.
+    const isUpstreamChannel = build.releaseChannel === "upstream";
+    const latest = isUpstreamChannel
+      ? await getLatestVersion(baseVersion, options?.installId, {
+          forceRefresh: fresh,
+        })
+      : null;
     const updateAvailable = latest ? isNewerSemver(baseVersion, latest) : false;
 
+    const codexDiagnostics = getCodexEventDiagnostics();
     const info: VersionInfo = {
       current,
       latest,
@@ -270,6 +288,15 @@ export function createVersionRoutes(options?: VersionRouteOptions): Hono {
       build,
       resumeProtocolVersion: RESUME_PROTOCOL_VERSION,
       capabilities,
+      codexProtocol: {
+        version: CODEX_PROVIDER_RUNTIME_IDENTITY.codexVersion,
+        schemaHash: CODEX_PROVIDER_RUNTIME_IDENTITY.schemaHash,
+        profile: CODEX_PROVIDER_RUNTIME_IDENTITY.profile,
+        experimentalApi: CODEX_PROVIDER_RUNTIME_IDENTITY.experimentalApi,
+        unknownNotificationsTotal: codexDiagnostics.unknownNotificationsTotal,
+        unknownServerRequestsTotal: codexDiagnostics.unknownServerRequestsTotal,
+        diagnostics: codexDiagnostics,
+      },
       deviceBridgeState: deviceBridgeStatus.state,
       deviceBridgeVersion: deviceBridgeStatus.installedVersion ?? null,
       latestDeviceBridgeVersion: deviceBridgeStatus.latestVersion ?? null,

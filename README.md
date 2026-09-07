@@ -14,22 +14,7 @@
   <a href="https://yepanywhere.com">yepanywhere.com</a>
 </p>
 
-Yep Anywhere 是 Claude Code 和 Codex 的远程操作界面。它自托管、无需云账号，让智能体继续在你的开发机上运行，你可以从手机上查看进度、处理审批并继续对话。
-
-## 本分支新增与修复
-
-> 本仓库基于原作者 [kzahel/yepanywhere](https://github.com/kzahel/yepanywhere) 继续开发；以下为当前分支的新增功能、改进与修复，不代表上游原项目的全部能力。
-
-- **前端更新**：在“设置 → 关于”中可检查版本、重构建本地最新代码，或拉取 GitHub 最新代码后重构建并重启。
-- **服务管理**：`pnpm yep` 提供开发与生产服务的中文交互式管理，并支持后台静默运行和登录自启动。
-- **密码管理**：管理员密码用于本机恢复和管理普通登录密码，普通密码只允许在服务器本机修改。
-- **仓库浏览**：会话检查器可浏览项目仓库、打开文件并在文件变动时刷新目录树。
-- **会话参数**：会话检查器支持模型选择和按提供商原生档位设置思考程度，停止的会话也可预设下次启动模型。
-- **文件工作区**：文件可在会话内以多个标签页同时打开、编辑、保存或在新浏览器标签页查看。
-- **增强预览**：Markdown 支持目录、标题层级、表格和常见文本结构，DOCX、PDF、CSV/TSV 与 XLS/XLSX 可直接预览。
-- **稳定性修复**：修复 Windows 更新假成功与文件锁失败、更新检测不准确、会话页空数据崩溃、Codex 默认提供商兼容和发送后长期停留在 Pondering 等问题。
-
-完整的功能与修复清单见 [本分支新增与修复说明](docs/本分支新增与修复.md)。
+Yep Anywhere 是 Claude Code、Codex、Gemini、Pi、Kimi 和 ZCode 的远程操作界面。它自托管、无需云账号，让智能体继续在你的开发机上运行，你可以从手机上查看进度、处理审批并继续对话。
 
 ## 功能
 
@@ -42,10 +27,6 @@ Yep Anywhere 是 Claude Code 和 Codex 的远程操作界面。它自托管、�
 - **全局活动流**：跨会话查看所有智能体当前在做什么
 - **远程设备控制**：通过 WebRTC 把 Android 模拟器和设备串流到手机，支持触控、导航按钮和自适应画质
 - **服务端托管进程**：客户端断开不会中断正在运行的任务
-- **仓库文件工作区**：在会话侧栏浏览仓库文件，并以 VS Code 风格标签页预览或编辑多个文件
-- **多格式文件预览**：直接渲染 Markdown、PDF、DOCX、CSV/TSV 和 XLS/XLSX，无法预览的二进制文件可下载
-- **会话参数控制**：在新建会话和会话检查器中选择提供商模型，并使用提供商原生的思考程度档位
-- **本地更新与服务管理**：从设置页更新本地或 GitHub 代码，并用统一命令管理开发、生产和自启动服务
 - **语音输入**：通过浏览器语音 API 直接和智能体对话
 - **移动端性能优化**：语法高亮和 Markdown 渲染在服务端完成
 
@@ -57,9 +38,10 @@ Yep Anywhere 是 Claude Code 和 Codex 的远程操作界面。它自托管、�
 |--------|------|------|----------|------|
 | Claude Code | 完整支持 | 支持 | 支持 | 主要提供商，功能支持最完整 |
 | Codex | 完整支持 | 支持 | 支持 | 支持 diff 和审批 |
-| Codex-OSS | 视模型能力而定 | 支持 | 支持 | 通过 Codex CLI 使用本地模型 |
-| Gemini / Gemini ACP | 视提供商能力而定 | 支持 | 支持 | 通过 Gemini CLI 接入 |
-| Claude + Ollama / OpenCode | 视提供商能力而定 | 视提供商能力而定 | 支持 | 可选的本地或多提供商接入 |
+| Gemini | 支持 | 依 provider 模式 | 支持 | 支持 CLI 与 ACP 接入 |
+| Pi | 完整支持 | 支持 | 支持 | 通过原生 RPC 与中性 LLM gateway 接入 |
+| Kimi | 完整支持 | 支持 | 支持 | 通过 ACP 接入 |
+| ZCode | 完整支持 | 支持 | 支持 | 通过 app-server 接入 |
 
 ## 截图
 
@@ -84,67 +66,35 @@ Yep Anywhere 是 Claude Code 和 Codex 的远程操作界面。它自托管、�
 
 ## 快速开始
 
-本分支建议从源码运行；需要 Node.js 20+，并按需安装 Claude Code、Codex 或其他已支持的 CLI 提供商。
+如果你已经能安装任一受支持的 coding agent，就能安装 Yep Anywhere。项目不发布 npm 包；可以从本仓库的 GitHub Release 获取 bundle，或从源码运行：
 
 ```bash
-git clone https://github.com/Gumekn/yepanywhere_pb_fork.git
-cd yepanywhere_pb_fork
+git clone https://github.com/hustc5622/yepanywhere.git
+cd yepanywhere
 pnpm install
-pnpm dev
+pnpm build
+pnpm start
 ```
 
-在浏览器打开 http://localhost:3400；`pnpm dev` 直接运行开发服务，修改源码后会自动重载。
+在浏览器打开 http://localhost:3400。应用会自动检测已安装的 CLI 智能体。
 
-如需构建并运行生产服务：
+### Windows 登录自启动
 
-```bash
-pnpm yep rebuild
-pnpm yep start-prod
-```
-
-生产服务默认监听 http://localhost:8022；`pnpm start` 仅用于 workspace 编译产物调试，不是本分支推荐的生产部署入口。
-
-## 本地服务管理
-
-macOS 和 Windows 使用同一个入口管理开发与生产服务：
+本地分支保留 Windows 计划任务自启动支持：
 
 ```bash
-pnpm yep
-```
-
-入口会自动识别 Windows 或 macOS，并显示中文菜单。也可以直接执行统一命令：
-
-```bash
-pnpm yep start-dev
-pnpm yep start-dev --fg
-pnpm yep stop-dev
-pnpm yep restart-dev
-pnpm yep start-prod
-pnpm yep stop-prod
-pnpm yep restart-prod
-pnpm yep stop
-pnpm yep status
 pnpm yep rebuild
 pnpm yep enable-autostart
-pnpm yep disable-autostart
-pnpm yep setup-admin-password
+pnpm yep status
 ```
 
-`start-dev` 默认在后台以 `dev` Profile 运行，关闭原终端不会停止；只有 `start-dev --fg` 使用前台模式。生产服务默认沿用未命名 Profile 和端口 8022，也可通过环境变量显式指定 Profile 或数据目录：Windows 由当前用户的计划任务 `YepAnywhereServer` 管理，macOS 由一个带 `RunAtLoad`/`KeepAlive` 的 LaunchAgent 管理。macOS 也可直接运行 `bash yep.sh <命令>`。
-
-开发运行、生产运行和登录自启动是三个独立状态。`stop-prod` 只停止当前生产实例并保留自启动配置；`disable-autostart` 只删除下次登录自启动并保留当前实例；`stop` 停止开发与生产实例，但不改变自启动开关。`status` 会分别显示安装、加载、运行、自启动、PID、Profile、端口、日志和配置异常。
-
-`rebuild` 先在同一 `dist` 文件系统内创建唯一暂存目录，完成 Bundle 构建、`npm ci --omit=dev` 和运行时校验后，才停止并交换生产 Bundle、通过同一服务定义重启并核对 `buildId`。暂存阶段失败不会停止当前生产服务或触碰生产 Bundle。
-
-默认日志位于 `~/.yep-anywhere/logs/`：开发后台控制台使用 `dev-console.log`（Windows 分为 `.out.log` / `.err.log`）；macOS 生产服务使用 `server-launchd.out.log` / `server-launchd.err.log`，Windows 生产监督器使用 `server.out.log` / `server.err.log`。Windows 需要系统自带的 Windows PowerShell 和 Node.js 20+。
-
-完整部署可使用 `pnpm run deploy -- --server-only`；不要使用 `pnpm deploy`，它是 pnpm 的 workspace 内置命令，不会调用本项目脚本。
+如需关闭下次登录自启动，运行 `pnpm yep disable-autostart`；它不会停止当前实例。
 
 ## 远程访问
 
 服务器运行在你的机器上，客户端会直接连接服务器的 WebSocket。你可以从手机通过自己的网络访问它，例如 Tailscale、局域网 IP，或者带 SSL 终止的反向代理/隧道（如 Caddy）。
 
-如需密码保护，先在服务器项目目录运行 `pnpm yep setup-admin-password`，为当前系统用户设置所有 Profile 共用的管理员密码；再从服务器本机的 loopback 页面，在现有“设置 → 本地访问”中启用或修改普通登录密码。远程用户只能使用普通登录密码，运行时没有认证绕过开关。更多细节见 [远程访问文档](docs/project/remote-access.md)。
+如需密码保护，可在设置中启用基于 cookie 的认证；无头环境也可以运行 `yepanywhere --setup-auth "<password>"`。更多细节见 [远程访问文档](docs/project/remote-access.md)。
 
 ## 为什么不用手机终端？
 
@@ -156,7 +106,7 @@ pnpm yep setup-admin-password
 
 ## 开发
 
-构建、端口、Profile 和环境变量说明见 [部署模式说明](docs/DEPLOYMENT_MODES.md) 与 [项目开发说明](CLAUDE.md)。
+构建说明、配置项和更多开发信息见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
 ## TOS 合规
 

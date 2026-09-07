@@ -6,10 +6,9 @@
 
 import type { SDKMessage } from "../../types.js";
 import type { ProviderName } from "../types.js";
-import { MockClaudeOllamaProvider, MockClaudeProvider } from "./claude.js";
 import { MockCodexOSSProvider, MockCodexProvider } from "./codex.js";
 import { MockGeminiProvider } from "./gemini.js";
-import { MockOpenCodeProvider } from "./opencode.js";
+import { MockPiProvider } from "./pi.js";
 import type {
   MockAgentProvider,
   MockProviderConfig,
@@ -24,18 +23,14 @@ export function createMockProvider(
   config: MockProviderConfig = {},
 ): MockAgentProvider {
   switch (type) {
-    case "claude":
-      return new MockClaudeProvider(config);
-    case "claude-ollama":
-      return new MockClaudeOllamaProvider(config);
     case "codex":
       return new MockCodexProvider(config);
     case "codex-oss":
       return new MockCodexOSSProvider(config);
     case "gemini":
       return new MockGeminiProvider(config);
-    case "opencode":
-      return new MockOpenCodeProvider(config);
+    case "pi":
+      return new MockPiProvider(config);
     default:
       throw new Error(`Unknown provider type: ${type}`);
   }
@@ -48,12 +43,10 @@ export function createAllMockProviders(
   config: MockProviderConfig = {},
 ): Map<ProviderName, MockAgentProvider> {
   const providers = new Map<ProviderName, MockAgentProvider>();
-  providers.set("claude", new MockClaudeProvider(config));
-  providers.set("claude-ollama", new MockClaudeOllamaProvider(config));
   providers.set("codex", new MockCodexProvider(config));
   providers.set("codex-oss", new MockCodexOSSProvider(config));
   providers.set("gemini", new MockGeminiProvider(config));
-  providers.set("opencode", new MockOpenCodeProvider(config));
+  providers.set("pi", new MockPiProvider(config));
   return providers;
 }
 
@@ -71,12 +64,10 @@ export function createMockProviderWithScenarios(
  * Provider types available for parameterized testing.
  */
 export const MOCK_PROVIDER_TYPES: ProviderName[] = [
-  "claude",
-  "claude-ollama",
   "codex",
   "codex-oss",
   "gemini",
-  "opencode",
+  "pi",
 ];
 
 /**

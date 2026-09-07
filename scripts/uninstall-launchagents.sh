@@ -5,7 +5,6 @@ set -euo pipefail
 
 SERVER_LABEL="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
 BRIDGE_LABEL="${YEP_LAUNCHD_BRIDGE_LABEL:-com.yueyuan.yepanywhere.codex-bridge}"
-CLAUDE_BRIDGE_LABEL="${YEP_LAUNCHD_CLAUDE_BRIDGE_LABEL:-com.yueyuan.yepanywhere.claude-bridge}"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 USER_DOMAIN="gui/$(id -u)"
 STOP_NOW=true
@@ -96,11 +95,7 @@ uninstall_agent() {
   dim "removed $plist"
 }
 
-log "Removing Yep Anywhere persistent LaunchAgent definitions ..."
-$REMOVE_SERVER && uninstall_agent "$SERVER_LABEL"
-$REMOVE_CODEX_BRIDGE && uninstall_agent "$BRIDGE_LABEL"
-$REMOVE_CLAUDE_BRIDGE && uninstall_agent "$CLAUDE_BRIDGE_LABEL"
-if ! $STOP_NOW; then
-  dim "currently loaded instances were left unchanged"
-fi
-log "Persistent LaunchAgent definitions removed."
+log "Uninstalling Yep Anywhere LaunchAgents ..."
+uninstall_agent "$SERVER_LABEL"
+uninstall_agent "$BRIDGE_LABEL"
+log "Uninstalled LaunchAgents."

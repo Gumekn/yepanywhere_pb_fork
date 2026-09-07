@@ -1,23 +1,33 @@
-import type {
-  EnrichedRecentEntry,
-  ProviderName,
-  UrlProjectId,
+import {
+  type EnrichedRecentEntry,
+  type ProviderName,
+  type UrlProjectId,
+  getSessionDisplayTitle,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
 import type { ISessionIndexService } from "../indexes/types.js";
+import type { SessionMetadataService } from "../metadata/index.js";
+import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
+import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import { decodeProjectId, getProjectName } from "../projects/paths.js";
+import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
+import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { findSessionSummaryAcrossProviders } from "../sessions/provider-resolution.js";
 import type { ISessionReader } from "../sessions/types.js";
+import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { Project } from "../supervisor/types.js";
 
 export interface RecentsDeps {
   recentsService: RecentsService;
+  notificationService?: NotificationService;
+  sessionMetadataService?: SessionMetadataService;
   scanner: ProjectScanner;
   readerFactory: (project: Project) => ISessionReader;
   sessionIndexService?: ISessionIndexService;
@@ -27,6 +37,14 @@ export interface RecentsDeps {
   geminiScanner?: GeminiSessionScanner;
   geminiSessionsDir?: string;
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
+  piScanner?: PiSessionScanner;
+  zcodeDbPath?: string;
+  piSessionsDir?: string;
+  piReaderFactory?: (projectPath: string) => PiSessionReader;
+  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
+  kimiScanner?: KimiSessionScanner;
+  kimiSessionsDir?: string;
+  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
 }
 
 export function createRecentsRoutes(deps: RecentsDeps): Hono {
@@ -67,25 +85,41 @@ export function createRecentsRoutes(deps: RecentsDeps): Hono {
         projectId,
         {
           readerFactory: deps.readerFactory,
+          sessionMetadataService: deps.sessionMetadataService,
           sessionIndexService: deps.sessionIndexService,
           codexSessionsDir: deps.codexSessionsDir,
           codexReaderFactory: deps.codexReaderFactory,
           geminiSessionsDir: deps.geminiSessionsDir,
           geminiReaderFactory: deps.geminiReaderFactory,
           geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
+          piSessionsDir: deps.piSessionsDir,
+          piReaderFactory: deps.piReaderFactory,
+          kimiSessionsDir: deps.kimiSessionsDir,
+          kimiReaderFactory: deps.kimiReaderFactory,
         },
       );
       if (!resolved) {
         continue;
       }
 
+      const metadata = deps.sessionMetadataService?.getMetadata(
+        entry.sessionId,
+      );
+
       enriched.push({
         sessionId: entry.sessionId,
         projectId: entry.projectId,
         visitedAt: entry.visitedAt,
-        title: resolved.summary.title,
+        title: getSessionDisplayTitle({
+          customTitle: metadata?.customTitle ?? resolved.summary.customTitle,
+          aiTitle: metadata?.aiTitle ?? resolved.summary.aiTitle,
+          title: resolved.summary.title,
+        }),
         projectName,
         provider: resolved.summary.provider as ProviderName,
+        cumulativeUsage: resolved.summary.cumulativeUsage,
+        compactCount: resolved.summary.compactCount,
+        compactEvents: resolved.summary.compactEvents,
       });
     }
 
@@ -113,6 +147,7 @@ export function createRecentsRoutes(deps: RecentsDeps): Hono {
     }
 
     await deps.recentsService.recordVisit(body.sessionId, body.projectId);
+    await deps.notificationService?.markSeen(body.sessionId);
     return c.json({ recorded: true });
   });
 

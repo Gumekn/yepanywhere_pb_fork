@@ -1,3 +1,7 @@
+import {
+  getToolApprovalPersistence,
+  supportsToolApprovalFeedback,
+} from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useToolApprovalFeedbackDraft } from "../hooks/useDrafts";
 import { useI18n } from "../i18n";
@@ -36,34 +40,46 @@ function getMcpApprovalScopes(request: InputRequest): string[] {
   return getStringArray(input.persistScopes);
 }
 
+function getApprovalKind(request: InputRequest): string | undefined {
+  return getString(asRecord(request.toolInput)?.approvalKind);
+}
+
+/**
+ * A subagent (child session) permission request is routed into the parent
+ * session but carries the origin child's identity so the panel can explain
+ * which subagent is asking. Prefer a human title, then the agent type.
+ */
+function getSubagentOriginTitle(request: InputRequest): string | undefined {
+  const input = asRecord(request.toolInput);
+  if (!input) return undefined;
+  if (!getString(input.originSessionId)) return undefined;
+  return (
+    getString(input.originSessionTitle) ??
+    getString(input.originAgent) ??
+    undefined
+  );
+}
+
 function getApprovalPrompt(request: InputRequest): string | undefined {
   return getString(asRecord(request.toolInput)?.approvalPrompt);
 }
 
-function requestSupportsPersistentApproval(request: InputRequest): boolean {
+function getApprovalAction(
+  request: InputRequest,
+): { url: string; label: string } | null {
   const input = asRecord(request.toolInput);
-  if (!input) return false;
-
-  const availableDecisions = Array.isArray(input.availableDecisions)
-    ? input.availableDecisions
-    : [];
-  if (
-    availableDecisions.some((decision) => {
-      if (decision === "acceptForSession") return true;
-      const decisionRecord = asRecord(decision);
-      return (
-        !!decisionRecord?.acceptWithExecpolicyAmendment ||
-        !!decisionRecord?.applyNetworkPolicyAmendment
-      );
-    })
-  ) {
-    return true;
+  const rawUrl = getString(input?.actionUrl);
+  if (!rawUrl) return null;
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    return {
+      url: url.toString(),
+      label: getString(input?.actionLabel) ?? "Open link",
+    };
+  } catch {
+    return null;
   }
-
-  return (
-    input.proposedExecpolicyAmendment !== undefined ||
-    input.proposedNetworkPolicyAmendments !== undefined
-  );
 }
 
 interface Props {
@@ -74,8 +90,11 @@ interface Props {
   onDeny: () => Promise<void>;
   onApproveAcceptEdits?: () => Promise<void>;
   onApproveForSession?: () => Promise<void>;
+  onApproveStrictAutoReview?: () => Promise<void>;
   onApproveAlways?: () => Promise<void>;
   onDenyWithFeedback?: (feedback: string) => Promise<void>;
+  /** Approve ExitPlanMode without changing the session permission mode. */
+  preserveModeOnPlanApproval?: boolean;
   /** Whether the panel is collapsed (controlled externally) */
   collapsed?: boolean;
   /** Callback when collapse state changes */
@@ -93,8 +112,10 @@ export function ToolApprovalPanel({
   onDeny,
   onApproveAcceptEdits,
   onApproveForSession,
+  onApproveStrictAutoReview,
   onApproveAlways,
   onDenyWithFeedback,
+  preserveModeOnPlanApproval = false,
   collapsed = false,
   onCollapsedChange,
 }: Props) {
@@ -117,13 +138,23 @@ export function ToolApprovalPanel({
   }, [request.id]);
 
   const isEditTool = request.toolName && EDIT_TOOLS.includes(request.toolName);
+  const approvalKind = getApprovalKind(request);
+  const subagentOriginTitle = getSubagentOriginTitle(request);
   const mcpApprovalScopes = getMcpApprovalScopes(request);
   const isScopedMcpApproval = mcpApprovalScopes.length > 0;
+  const isPermissionsApproval = approvalKind === "permissions";
+  const usesProviderPersistentApproval =
+    approvalKind === "command_execution" || approvalKind === "file_change";
+  const approvalPersistence = getToolApprovalPersistence(request.toolInput);
   const canApproveMcpForSession = mcpApprovalScopes.includes("session");
   const canApproveMcpAlways = mcpApprovalScopes.includes("always");
   const canApprovePersistently =
     !isScopedMcpApproval &&
-    (isEditTool || requestSupportsPersistentApproval(request));
+    !isPermissionsApproval &&
+    (isEditTool || approvalPersistence !== undefined);
+  const canDenyWithFeedback =
+    Boolean(onDenyWithFeedback) &&
+    supportsToolApprovalFeedback(request.toolInput, request.source);
 
   const handleApprove = useCallback(async () => {
     setSubmitting(true);
@@ -164,6 +195,16 @@ export function ToolApprovalPanel({
     }
   }, [onApproveAlways]);
 
+  const handleApproveStrictAutoReview = useCallback(async () => {
+    if (!onApproveStrictAutoReview) return;
+    setSubmitting(true);
+    try {
+      await onApproveStrictAutoReview();
+    } finally {
+      setSubmitting(false);
+    }
+  }, [onApproveStrictAutoReview]);
+
   const handleDeny = useCallback(async () => {
     setSubmitting(true);
     try {
@@ -185,6 +226,17 @@ export function ToolApprovalPanel({
       setSubmitting(false);
     }
   }, [onDenyWithFeedback, feedback, clearFeedback]);
+
+  const handlePersistentApproval = usesProviderPersistentApproval
+    ? approvalPersistence?.response === "approve_always"
+      ? handleApproveAlways
+      : handleApproveForSession
+    : handleApproveAcceptEdits;
+  const hasPersistentApprovalHandler = usesProviderPersistentApproval
+    ? approvalPersistence?.response === "approve_always"
+      ? Boolean(onApproveAlways)
+      : Boolean(onApproveForSession)
+    : Boolean(onApproveAcceptEdits);
 
   // Focus feedback input when shown
   useEffect(() => {
@@ -213,7 +265,24 @@ export function ToolApprovalPanel({
 
       const isPlanMode = isExitPlanMode(request.toolName);
 
-      if (isScopedMcpApproval) {
+      if (isPermissionsApproval) {
+        if (e.key === "1") {
+          e.preventDefault();
+          handleApprove();
+        } else if (e.key === "2" && onApproveStrictAutoReview) {
+          e.preventDefault();
+          handleApproveStrictAutoReview();
+        } else if (e.key === "3" && onApproveForSession) {
+          e.preventDefault();
+          handleApproveForSession();
+        } else if (e.key === "4" || e.key === "Escape") {
+          e.preventDefault();
+          handleDeny();
+        } else if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          handleApprove();
+        }
+      } else if (isScopedMcpApproval) {
         if (e.key === "1") {
           e.preventDefault();
           handleApprove();
@@ -235,6 +304,16 @@ export function ToolApprovalPanel({
           handleApprove();
         }
       } else if (isPlanMode) {
+        if (preserveModeOnPlanApproval) {
+          if (e.key === "1" || (e.key === "Enter" && !e.shiftKey)) {
+            e.preventDefault();
+            handleApprove();
+          } else if (e.key === "2" || e.key === "Escape") {
+            e.preventDefault();
+            handleDeny();
+          }
+          return;
+        }
         // ExitPlanMode: 1=auto-accept, 2=manual, 3=deny
         if (e.key === "1" && onApproveAcceptEdits) {
           e.preventDefault();
@@ -260,13 +339,14 @@ export function ToolApprovalPanel({
         } else if (
           e.key === "2" &&
           canApprovePersistently &&
-          onApproveAcceptEdits
+          hasPersistentApprovalHandler
         ) {
           e.preventDefault();
-          handleApproveAcceptEdits();
+          handlePersistentApproval();
         } else if (
           e.key === "3" ||
-          (e.key === "2" && (!canApprovePersistently || !onApproveAcceptEdits))
+          (e.key === "2" &&
+            (!canApprovePersistently || !hasPersistentApprovalHandler))
         ) {
           e.preventDefault();
           handleDeny();
@@ -287,6 +367,8 @@ export function ToolApprovalPanel({
     handleApproveAcceptEdits,
     handleApproveAlways,
     handleApproveForSession,
+    handleApproveStrictAutoReview,
+    handlePersistentApproval,
     handleDeny,
     handleDenyWithFeedback,
     submitting,
@@ -297,17 +379,23 @@ export function ToolApprovalPanel({
     canApprovePersistently,
     canApproveMcpAlways,
     canApproveMcpForSession,
+    hasPersistentApprovalHandler,
+    isPermissionsApproval,
     isScopedMcpApproval,
     onApproveAlways,
     onApproveAcceptEdits,
     onApproveForSession,
+    onApproveStrictAutoReview,
+    preserveModeOnPlanApproval,
     request.toolName,
   ]);
 
+  const displayToolName = request.toolName;
   const summary = request.toolName
     ? getToolSummary(request.toolName, request.toolInput, undefined, "pending")
     : request.prompt;
   const approvalPrompt = getApprovalPrompt(request);
+  const approvalAction = getApprovalAction(request);
 
   const [showPreviewModal, setShowPreviewModal] = useState(false);
 
@@ -315,7 +403,7 @@ export function ToolApprovalPanel({
   // long to display inline. The full tool details (diffs, etc.) are already
   // visible in the session stream above.
   const summaryText =
-    approvalPrompt ?? `Allow ${request.toolName ?? ""} ${summary ?? ""}?`;
+    approvalPrompt ?? `Allow ${displayToolName ?? ""} ${summary ?? ""}?`;
   const showViewDetails = summaryText.length > 120;
 
   const renderContext: RenderContext = useMemo(
@@ -358,6 +446,11 @@ export function ToolApprovalPanel({
       {!collapsed && (
         <div className="tool-approval-panel">
           <div className="tool-approval-header">
+            {subagentOriginTitle && (
+              <span className="tool-approval-subagent-origin">
+                {t("subagentApprovalOrigin", { title: subagentOriginTitle })}
+              </span>
+            )}
             {isExitPlanMode(request.toolName) ? (
               <>
                 <span className="tool-approval-title">
@@ -373,7 +466,7 @@ export function ToolApprovalPanel({
                   <span className="tool-approval-question">
                     {approvalPrompt ??
                       t("toolApprovalAllow", {
-                        tool: request.toolName ?? "",
+                        tool: displayToolName ?? "",
                         summary: summary ?? "",
                       })}
                   </span>
@@ -387,6 +480,16 @@ export function ToolApprovalPanel({
                     </button>
                   )}
                 </div>
+                {approvalAction && (
+                  <a
+                    className="tool-approval-action-link"
+                    href={approvalAction.url}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                  >
+                    {approvalAction.label}
+                  </a>
+                )}
                 {showPreviewModal && request.toolName && (
                   <Modal
                     title={t("toolApprovalDetailsTitle", {
@@ -408,7 +511,49 @@ export function ToolApprovalPanel({
           </div>
 
           <div className="tool-approval-options">
-            {isScopedMcpApproval ? (
+            {isPermissionsApproval ? (
+              <>
+                <button
+                  type="button"
+                  className="tool-approval-option primary"
+                  onClick={handleApprove}
+                  disabled={!armed || submitting}
+                >
+                  <kbd>1</kbd>
+                  <span>{t("toolApprovalGrantForTurn")}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="tool-approval-option"
+                  onClick={handleApproveStrictAutoReview}
+                  disabled={!armed || submitting || !onApproveStrictAutoReview}
+                >
+                  <kbd>2</kbd>
+                  <span>{t("toolApprovalGrantWithReview")}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="tool-approval-option"
+                  onClick={handleApproveForSession}
+                  disabled={!armed || submitting || !onApproveForSession}
+                >
+                  <kbd>3</kbd>
+                  <span>{t("toolApprovalGrantForSession")}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="tool-approval-option"
+                  onClick={handleDeny}
+                  disabled={!armed || submitting}
+                >
+                  <kbd>4</kbd>
+                  <span>{t("toolApprovalContinueWithoutPermissions")}</span>
+                </button>
+              </>
+            ) : isScopedMcpApproval ? (
               <>
                 <button
                   type="button"
@@ -454,6 +599,28 @@ export function ToolApprovalPanel({
                   <span>{t("toolApprovalCancel")}</span>
                 </button>
               </>
+            ) : isExitPlanMode(request.toolName) &&
+              preserveModeOnPlanApproval ? (
+              <>
+                <button
+                  type="button"
+                  className="tool-approval-option primary"
+                  onClick={handleApprove}
+                  disabled={!armed || submitting}
+                >
+                  <kbd>1</kbd>
+                  <span>{t("toolApprovalApproveKeepMode")}</span>
+                </button>
+                <button
+                  type="button"
+                  className="tool-approval-option"
+                  onClick={handleDeny}
+                  disabled={!armed || submitting}
+                >
+                  <kbd>2</kbd>
+                  <span>{t("toolApprovalNoKeepPlanning")}</span>
+                </button>
+              </>
             ) : isExitPlanMode(request.toolName) ? (
               <>
                 <button
@@ -496,15 +663,23 @@ export function ToolApprovalPanel({
                   <span>{t("toolApprovalYes")}</span>
                 </button>
 
-                {canApprovePersistently && onApproveAcceptEdits && (
+                {canApprovePersistently && hasPersistentApprovalHandler && (
                   <button
                     type="button"
                     className="tool-approval-option"
-                    onClick={handleApproveAcceptEdits}
+                    onClick={handlePersistentApproval}
                     disabled={!armed || submitting}
                   >
                     <kbd>2</kbd>
-                    <span>{t("toolApprovalYesDontAsk")}</span>
+                    <span>
+                      {usesProviderPersistentApproval
+                        ? approvalPersistence?.kind === "command-policy"
+                          ? t("toolApprovalApplyCommandPolicy")
+                          : approvalPersistence?.kind === "network-policy"
+                            ? t("toolApprovalApplyNetworkPolicy")
+                            : t("toolApprovalAllowForSession")
+                        : t("toolApprovalYesDontAsk")}
+                    </span>
                   </button>
                 )}
 
@@ -515,14 +690,16 @@ export function ToolApprovalPanel({
                   disabled={!armed || submitting}
                 >
                   <kbd>
-                    {canApprovePersistently && onApproveAcceptEdits ? "3" : "2"}
+                    {canApprovePersistently && hasPersistentApprovalHandler
+                      ? "3"
+                      : "2"}
                   </kbd>
                   <span>{t("toolApprovalNo")}</span>
                 </button>
               </>
             )}
 
-            {onDenyWithFeedback && !isScopedMcpApproval && !showFeedback && (
+            {canDenyWithFeedback && !showFeedback && (
               <button
                 type="button"
                 className="tool-approval-option feedback-toggle"
@@ -535,7 +712,7 @@ export function ToolApprovalPanel({
               </button>
             )}
 
-            {onDenyWithFeedback && !isScopedMcpApproval && showFeedback && (
+            {canDenyWithFeedback && showFeedback && (
               <div className="tool-approval-feedback">
                 <input
                   ref={feedbackInputRef}

@@ -1,6 +1,16 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  CODEX_CLEAR_MCP_APP_SERVER_ARGS,
+  CODEX_FULL_MCP_APP_SERVER_ARGS,
+  CODEX_STANDARD_MCP_APP_SERVER_ARGS,
+  type CodexMcpConfigEntry,
+  getCodexMcpAppServerArgs,
+  getCodexMcpConfigEntries,
+  getCodexMcpThreadConfig,
+  resolveCodexMcpThreadProfile,
+} from "../src/codex/mcp-profile.js";
 
 describe("loadConfig codex paths", () => {
   afterEach(() => {
@@ -39,6 +49,7 @@ describe("loadConfig codex paths", () => {
   it("always allows the managed uploads directory for local-image", async () => {
     vi.stubEnv("CODEX_HOME", "/tmp/codex-home");
     vi.stubEnv("YEP_ANYWHERE_DATA_DIR", "/tmp/yep-data");
+    vi.stubEnv("KIMI_SESSIONS_DIR", "/tmp/kimi-home/sessions");
     vi.stubEnv("ALLOWED_IMAGE_PATHS", "");
 
     const { loadConfig } = await import("../src/config.js");
@@ -47,12 +58,14 @@ describe("loadConfig codex paths", () => {
     expect(config.allowedImagePaths).toEqual([
       "/tmp/yep-data/uploads",
       "/tmp/codex-home/generated_images",
+      "/tmp/kimi-home/sessions",
     ]);
   });
 
   it("merges managed uploads with configured local-image paths", async () => {
     vi.stubEnv("CODEX_HOME", "/tmp/codex-home");
     vi.stubEnv("YEP_ANYWHERE_DATA_DIR", "/tmp/yep-data");
+    vi.stubEnv("KIMI_SESSIONS_DIR", "/tmp/kimi-home/sessions");
     vi.stubEnv("ALLOWED_IMAGE_PATHS", "/tmp, /var/tmp, /tmp");
 
     const { loadConfig } = await import("../src/config.js");
@@ -61,9 +74,29 @@ describe("loadConfig codex paths", () => {
     expect(config.allowedImagePaths).toEqual([
       "/tmp/yep-data/uploads",
       "/tmp/codex-home/generated_images",
+      "/tmp/kimi-home/sessions",
       "/tmp",
       "/var/tmp",
     ]);
+  });
+
+  it("does not allow an empty Kimi sessions path to become an image prefix", async () => {
+    vi.stubEnv("CODEX_HOME", "/tmp/codex-home");
+    vi.stubEnv("YEP_ANYWHERE_DATA_DIR", "/tmp/yep-data");
+    vi.stubEnv("KIMI_CODE_HOME", "/tmp/kimi-home");
+    vi.stubEnv("KIMI_SESSIONS_DIR", "");
+    vi.stubEnv("ALLOWED_IMAGE_PATHS", "");
+
+    const { loadConfig } = await import("../src/config.js");
+    const config = loadConfig();
+
+    expect(config.kimiSessionsDir).toBe("/tmp/kimi-home/sessions");
+    expect(config.allowedImagePaths).toEqual([
+      "/tmp/yep-data/uploads",
+      "/tmp/codex-home/generated_images",
+      "/tmp/kimi-home/sessions",
+    ]);
+    expect(config.allowedImagePaths).not.toContain("");
   });
 
   it("allows Codex home and configured roots for local text files", async () => {
@@ -79,7 +112,7 @@ describe("loadConfig codex paths", () => {
     ]);
   });
 
-  it("uses light and clear Codex bridge upstream args by default and keeps full profile unrestricted", async () => {
+  it("uses the standard, clear, and full Codex bridge profiles by default", async () => {
     vi.stubEnv("YEP_CODEX_BRIDGE_LIGHT_UPSTREAM_ARGS", undefined);
     vi.stubEnv("YEP_CODEX_BRIDGE_CLEAR_UPSTREAM_ARGS", undefined);
     vi.stubEnv("YEP_CODEX_BRIDGE_FULL_UPSTREAM_ARGS", undefined);
@@ -89,19 +122,176 @@ describe("loadConfig codex paths", () => {
     const { loadConfig } = await import("../src/config.js");
     const config = loadConfig();
 
-    expect(config.codexBridgeLightUpstreamArgs).toEqual([
-      "--disable",
-      "apps",
-      "--disable",
-      "plugins",
+    expect(config.codexBridgeLightUpstreamArgs).toEqual(
+      CODEX_STANDARD_MCP_APP_SERVER_ARGS,
+    );
+    expect(config.codexBridgeClearUpstreamArgs).toEqual(
+      CODEX_CLEAR_MCP_APP_SERVER_ARGS,
+    );
+    expect(config.codexBridgeFullUpstreamArgs).toEqual(
+      CODEX_FULL_MCP_APP_SERVER_ARGS,
+    );
+  });
+
+  it("defaults the Codex bridge journal to lifecycle and accepts explicit fallbacks", async () => {
+    vi.stubEnv("YEP_CODEX_BRIDGE_JOURNAL_MODE", undefined);
+    let { loadConfig } = await import("../src/config.js");
+    expect(loadConfig().codexBridgeJournalMode).toBe("lifecycle");
+
+    for (const mode of [
+      "off",
+      "lifecycle",
+      "full",
+      "legacy-blocking",
+    ] as const) {
+      vi.stubEnv("YEP_CODEX_BRIDGE_JOURNAL_MODE", mode);
+      vi.resetModules();
+      ({ loadConfig } = await import("../src/config.js"));
+      expect(loadConfig().codexBridgeJournalMode).toBe(mode);
+    }
+
+    vi.stubEnv("YEP_CODEX_BRIDGE_JOURNAL_MODE", "not-a-mode");
+    vi.resetModules();
+    ({ loadConfig } = await import("../src/config.js"));
+    expect(loadConfig().codexBridgeJournalMode).toBe("lifecycle");
+  });
+
+  it("applies MCP enablement only to discovered servers", () => {
+    const configuredServerIds = [
+      "node_repl",
+      "lark",
+      "feishu-mcp",
+      "chrome-devtools",
+      "custom.server",
+    ];
+    const entries: CodexMcpConfigEntry[] = configuredServerIds.map((name) => ({
+      name,
+      transport: {
+        type: "stdio",
+        command: "fake-mcp",
+      },
+    }));
+
+    const standard = getCodexMcpThreadConfig("standard", entries).mcp_servers;
+    const clear = getCodexMcpThreadConfig("clear", entries).mcp_servers;
+    const full = getCodexMcpThreadConfig("full", entries).mcp_servers;
+
+    expect(
+      Object.fromEntries(
+        Object.entries(standard).map(([name, config]) => [
+          name,
+          config.enabled,
+        ]),
+      ),
+    ).toEqual({
+      node_repl: true,
+      lark: true,
+      "feishu-mcp": true,
+      "chrome-devtools": false,
+      "custom.server": false,
+    });
+    expect(
+      Object.values(clear).every((config) => config.enabled === false),
+    ).toBe(true);
+    expect(Object.values(full).every((config) => config.enabled === true)).toBe(
+      true,
+    );
+    expect(standard["chrome-devtools"]).toMatchObject({
+      command: "fake-mcp",
+      enabled: false,
+    });
+    expect(standard["chrome-devtools"]).not.toHaveProperty("args");
+    expect(standard.web).toBeUndefined();
+  });
+
+  it("extracts only MCP transports from effective Codex config", () => {
+    expect(
+      getCodexMcpConfigEntries({
+        mcp_servers: {
+          local: {
+            command: "npx",
+            args: ["-y", "local-mcp"],
+            env: { SECRET: "do-not-copy" },
+          },
+          remote: {
+            url: "https://mcp.example.test",
+            http_headers: { Authorization: "do-not-copy" },
+          },
+        },
+      }),
+    ).toEqual([
+      { name: "local", transport: { type: "stdio", command: "npx" } },
+      {
+        name: "remote",
+        transport: {
+          type: "streamable_http",
+          url: "https://mcp.example.test",
+        },
+      },
     ]);
-    expect(config.codexBridgeClearUpstreamArgs).toEqual([
-      "--disable",
-      "apps",
-      "--disable",
-      "plugins",
+  });
+
+  it("merges client MCP fields while keeping the selected profile authoritative", () => {
+    const resolved = resolveCodexMcpThreadProfile(
+      "standard",
+      {
+        mcp_servers: {
+          node_repl: { command: "/base/node-repl", args: ["--base"] },
+          "project.custom": { url: "https://base.example.test" },
+        },
+      },
+      {
+        mcp_servers: {
+          node_repl: { args: ["--client"], enabled: false },
+          client_only: {
+            command: "/client/mcp",
+            env: { CLIENT_VALUE: "kept" },
+            enabled: true,
+          },
+        },
+      },
+    );
+
+    expect(resolved.configuredServerIds).toEqual([
+      "client_only",
+      "node_repl",
+      "project.custom",
     ]);
-    expect(config.codexBridgeFullUpstreamArgs).toEqual([]);
+    expect(resolved.clientExpectedDisabledServerIds).toEqual([
+      "client_only",
+      "project.custom",
+    ]);
+    expect(resolved.threadConfig.mcp_servers).toEqual({
+      client_only: {
+        command: "/client/mcp",
+        env: { CLIENT_VALUE: "kept" },
+        enabled: false,
+      },
+      node_repl: {
+        command: "/base/node-repl",
+        args: ["--client"],
+        enabled: true,
+      },
+      "project.custom": {
+        url: "https://base.example.test",
+        enabled: false,
+      },
+    });
+  });
+
+  it("removes stale MCP enablement from custom bridge args", () => {
+    expect(
+      getCodexMcpAppServerArgs("clear", [
+        "--disable",
+        "apps",
+        "-c",
+        "mcp_servers.missing.enabled=false",
+        "--config",
+        "mcp_servers.also-missing.enabled=true",
+        "-c",
+        'model_provider="openai"',
+      ]),
+    ).toEqual(["--disable", "apps", "-c", 'model_provider="openai"']);
   });
 
   it("parses profile-specific Codex bridge upstream args from env", async () => {
@@ -144,45 +334,45 @@ describe("loadConfig codex paths", () => {
     const config = loadConfig();
 
     expect(config.codexBridgeLightUpstreamArgs).toEqual(["--disable", "apps"]);
-    expect(config.codexBridgeClearUpstreamArgs).toEqual([
-      "--disable",
-      "apps",
-      "--disable",
-      "plugins",
-    ]);
-    expect(config.codexBridgeFullUpstreamArgs).toEqual([]);
+    expect(config.codexBridgeClearUpstreamArgs).toEqual(
+      CODEX_CLEAR_MCP_APP_SERVER_ARGS,
+    );
+    expect(config.codexBridgeFullUpstreamArgs).toEqual(
+      CODEX_FULL_MCP_APP_SERVER_ARGS,
+    );
   });
 
-  it("uses safe Claude bridge defaults", async () => {
-    vi.stubEnv("PORT", undefined);
-    vi.stubEnv("YEP_CLAUDE_BRIDGE_HOST", undefined);
-    vi.stubEnv("YEP_CLAUDE_BRIDGE_PORT", undefined);
-    vi.stubEnv("YEP_CLAUDE_BRIDGE_CONTROL_URL", undefined);
-    vi.stubEnv("YEP_SERVER_URL", undefined);
-    vi.stubEnv("YEP_ANYWHERE_SERVER_URL", undefined);
+  it("keeps the agent runtime embedded by default", async () => {
+    vi.stubEnv("PORT", "8022");
+    vi.stubEnv("YEP_RUNTIME_MODE", undefined);
+    vi.stubEnv("YEP_RUNTIME_PORT", undefined);
+    vi.stubEnv("YEP_RUNTIME_CONTROL_URL", undefined);
+    vi.stubEnv("YEP_ANYWHERE_DATA_DIR", "/tmp/yep-runtime-config");
 
     const { loadConfig } = await import("../src/config.js");
     const config = loadConfig();
 
-    expect(config.claudeBridgeHost).toBe("127.0.0.1");
-    expect(config.claudeBridgePort).toBe(4520);
-    expect(config.claudeBridgeControlUrl).toBe("http://127.0.0.1:4520");
-    expect(config.claudeBridgeServerUrl).toBe("http://127.0.0.1:3400");
+    expect(config.runtimeMode).toBe("embedded");
+    expect(config.runtimePort).toBe(8025);
+    expect(config.runtimeControlUrl).toBe("http://127.0.0.1:8025");
+    expect(config.runtimeTokenFile).toBe(
+      "/tmp/yep-runtime-config/runtime/token",
+    );
   });
 
-  it("parses Claude bridge env overrides", async () => {
-    vi.stubEnv("YEP_CLAUDE_BRIDGE_HOST", "localhost");
-    vi.stubEnv("YEP_CLAUDE_BRIDGE_PORT", "4620");
-    vi.stubEnv("YEP_CLAUDE_BRIDGE_CONTROL_URL", "http://localhost:4621");
-    vi.stubEnv("YEP_SERVER_URL", "http://127.0.0.1:8022/yep");
+  it("parses external agent runtime overrides", async () => {
+    vi.stubEnv("YEP_RUNTIME_MODE", "external");
+    vi.stubEnv("YEP_RUNTIME_PORT", "9025");
+    vi.stubEnv("YEP_RUNTIME_CONTROL_URL", "http://localhost:9026");
+    vi.stubEnv("YEP_RUNTIME_TOKEN_FILE", "/tmp/runtime-token");
 
     const { loadConfig } = await import("../src/config.js");
     const config = loadConfig();
 
-    expect(config.claudeBridgeHost).toBe("localhost");
-    expect(config.claudeBridgePort).toBe(4620);
-    expect(config.claudeBridgeControlUrl).toBe("http://localhost:4621");
-    expect(config.claudeBridgeServerUrl).toBe("http://127.0.0.1:8022/yep");
+    expect(config.runtimeMode).toBe("external");
+    expect(config.runtimePort).toBe(9025);
+    expect(config.runtimeControlUrl).toBe("http://localhost:9026");
+    expect(config.runtimeTokenFile).toBe("/tmp/runtime-token");
   });
 
   it("defaults session title submodule for ohmyrouter", async () => {
@@ -196,7 +386,12 @@ describe("loadConfig codex paths", () => {
     expect(config.sessionTitleGeneration.subModule).toBe(
       "claude-code-internal",
     );
-    expect(config.sessionTitleGeneration.model).toBe("deepseek-v4-pro");
+    expect(config.sessionTitleGeneration.model).toBe("deepseek-v4-flash");
+    expect(config.sessionTitleGeneration).toMatchObject({
+      retryMaxAttempts: 3,
+      retryBaseDelayMs: 5000,
+      retryMaxDelayMs: 60000,
+    });
   });
 
   it("allows session title submodule override", async () => {

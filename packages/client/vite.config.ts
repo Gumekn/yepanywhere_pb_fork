@@ -2,6 +2,8 @@ import { execSync } from "node:child_process";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 import { cspPlugin } from "./vite-plugin-csp";
+import { faviconVersionPlugin } from "./vite-plugin-favicon-version";
+import { precompressPlugin } from "./vite-plugin-precompress";
 import { reloadNotify } from "./vite-plugin-reload-notify";
 
 // NO_FRONTEND_RELOAD: Disable HMR and use manual reload notifications instead
@@ -52,28 +54,17 @@ function getDevBuildId(): string {
   }
 }
 
+const buildId = process.env.YEP_BUILD_ID ?? getDevBuildId();
+
 export default defineConfig({
   clearScreen: false,
   base: basePath,
   build: {
-    // Mermaid and document previews are lazy-loaded, but a few of their
-    // minified chunks legitimately exceed Vite's generic 500 kB default.
-    // Keep warning if an on-demand chunk grows beyond the current ceiling.
-    chunkSizeWarningLimit: 750,
     rollupOptions: {
       output: {
         manualChunks(id) {
           if (!id.includes("node_modules")) return;
           if (id.includes("/@xterm/")) return "vendor-xterm";
-          // CRITICAL: react, react-dom AND scheduler MUST live in the same
-          // chunk. react-dom imports `scheduler`; `scheduler` (and other React
-          // ecosystem libs like lucide-react) then re-import React, forming a
-          // cross-chunk ESM cycle. Under that cycle, `vendor-react`'s React
-          // export is not yet assigned when lucide's top-level
-          // `createContext({})` runs, throwing
-          // "Cannot read properties of undefined (reading 'createContext')"
-          // and leaving the app blank. Keeping them together removes the
-          // back-edge and the cycle.
           if (
             id.includes("/react/") ||
             id.includes("/react-dom/") ||
@@ -88,25 +79,13 @@ export default defineConfig({
             return "vendor-router";
           }
           if (id.includes("/zod/")) return "vendor-zod";
-          // Heavy, on-demand-only preview libraries: keep them out of the
-          // eager vendor chunk so they load lazily when a file is opened.
-          if (
-            id.includes("/xlsx/") ||
-            id.includes("/docx-preview/") ||
-            id.includes("/papaparse/")
-          ) {
-            return "preview-libs";
-          }
-          // Let Rollup place remaining dependencies according to their import
-          // graph. Forcing every React consumer into a generic vendor chunk
-          // creates a vendor -> vendor-react -> vendor cycle.
-          return;
+          return "vendor";
         },
       },
     },
   },
   define: {
-    __BUILD_ID__: JSON.stringify(process.env.YEP_BUILD_ID ?? getDevBuildId()),
+    __BUILD_ID__: JSON.stringify(buildId),
     __APP_VERSION__: JSON.stringify(
       process.env.YEP_BUILD_VERSION ??
         process.env.YEP_BUILD_GIT_DESCRIBE ??
@@ -122,14 +101,22 @@ export default defineConfig({
     react(),
     // When HMR is disabled, use reload-notify plugin to tell backend about changes
     reloadNotify({ enabled: noFrontendReload }),
+    // A browser can remember a failed favicon download for the lifetime of the
+    // process. A build-specific URL guarantees that a successful deploy retries.
+    faviconVersionPlugin(buildId),
     // Content Security Policy (stricter in production, permissive in dev for HMR)
     cspPlugin({ isRemote: false }),
+    // Emit .gz/.br siblings so the server can serve precompressed bytes with
+    // zero runtime CPU. First-load payload drops ~1.65 MB -> ~0.4 MB, which is
+    // the single largest win on tunnelled/remote access.
+    precompressPlugin({ enabled: process.env.YEP_SKIP_PRECOMPRESS !== "true" }),
   ],
   resolve: {
     conditions: ["source"],
   },
   server: {
     port: vitePort,
+    strictPort: true,
     host: viteHost,
     allowedHosts: ["localhost", ".yepanywhere.com"],
     // HMR configuration for reverse proxy setup

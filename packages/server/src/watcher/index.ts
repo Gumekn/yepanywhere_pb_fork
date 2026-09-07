@@ -5,6 +5,7 @@ export type {
   WatchProvider,
   SessionStatusEvent,
   SessionCreatedEvent,
+  SessionIdChangedEvent,
   SourceChangeEvent,
   ProcessStateEvent,
   ProcessTerminatedEvent,
@@ -24,10 +25,3 @@ export type {
   FocusedSessionWatchEvent,
   FocusedSessionWatchManagerOptions,
 } from "./FocusedSessionWatchManager.js";
-export { ProjectFileWatchManager } from "./ProjectFileWatchManager.js";
-export type {
-  ProjectFileChangeEvent,
-  ProjectFileChangeDetail,
-  ProjectFileWatchManagerOptions,
-  ProjectFileChangeSource,
-} from "./ProjectFileWatchManager.js";

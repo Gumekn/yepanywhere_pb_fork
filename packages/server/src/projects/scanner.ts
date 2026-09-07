@@ -4,13 +4,23 @@ import { basename, join } from "node:path";
 import {
   DEFAULT_PROVIDER,
   type ProviderName,
+  type RemoteExecutorConfig,
   type UrlProjectId,
 } from "@yep-anywhere/shared";
 import type { ProjectMetadataService } from "../metadata/index.js";
+import { isRetiredProviderName } from "../sdk/providers/policy.js";
+import {
+  isLocalPathWithin,
+  tryMapLocalPathToRemote,
+  tryMapRemotePathToLocal,
+} from "../sdk/remote-path-mapping.js";
+import { PI_SESSIONS_DIR } from "../sessions/pi-files.js";
+import { ZCODE_DB_PATH } from "../sessions/zcode-db.js";
 import type { Project } from "../supervisor/types.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
 import { CODEX_SESSIONS_DIR, CodexSessionScanner } from "./codex-scanner.js";
 import { GEMINI_TMP_DIR, GeminiSessionScanner } from "./gemini-scanner.js";
+import { KIMI_SESSIONS_DIR, KimiSessionScanner } from "./kimi-scanner.js";
 import {
   CLAUDE_PROJECTS_DIR,
   canonicalizeProjectPath,
@@ -20,16 +30,28 @@ import {
   normalizeProjectPathForDedup,
   readCwdFromSessionFile,
 } from "./paths.js";
+import { PiSessionScanner } from "./pi-scanner.js";
+import { ZCodeSessionScanner } from "./zcode-scanner.js";
 
 export interface ScannerOptions {
   projectsDir?: string; // override for testing
   codexSessionsDir?: string; // override for testing
   geminiSessionsDir?: string; // override for testing
+  kimiSessionsDir?: string; // override for testing
+  piSessionsDir?: string; // override for testing
   codexScanner?: CodexSessionScanner | null; // shared provider scanner
   geminiScanner?: GeminiSessionScanner | null; // shared provider scanner
+  kimiScanner?: KimiSessionScanner | null; // shared provider scanner
+  piScanner?: PiSessionScanner | null; // shared provider scanner
+  zcodeScanner?: ZCodeSessionScanner | null; // shared provider scanner
   enableCodex?: boolean; // whether to include Codex projects (default: true)
   enableGemini?: boolean; // whether to include Gemini projects (default: true)
+  enableKimi?: boolean; // whether to include Kimi projects (default: true)
+  enablePi?: boolean; // whether to include Pi projects (default: true)
+  enableZCode?: boolean; // whether to include ZCode projects (default: true)
   projectMetadataService?: ProjectMetadataService; // for persisting added projects
+  /** Remote Claude executors whose shared stores should also be scanned. */
+  remoteExecutors?: RemoteExecutorConfig[];
   /** Optional EventBus for watcher-driven cache invalidation */
   eventBus?: EventBus;
   /** Project snapshot TTL in milliseconds (default: 5000) */
@@ -43,29 +65,41 @@ interface ProjectSnapshot {
   timestamp: number;
 }
 
-interface ProjectDirInfo {
-  projectPath: string;
-  sessionCount: number;
-  lastActivity: string | null;
+interface ClaudeSessionSource {
+  projectsDir: string;
+  executor?: RemoteExecutorConfig;
 }
 
 export class ProjectScanner {
   private projectsDir: string;
+  private remoteExecutors: RemoteExecutorConfig[];
   private codexScanner: CodexSessionScanner | null;
   private geminiScanner: GeminiSessionScanner | null;
+  private kimiScanner: KimiSessionScanner | null;
+  private piScanner: PiSessionScanner | null;
+  private zcodeScanner: ZCodeSessionScanner | null;
   private enableCodex: boolean;
   private enableGemini: boolean;
+  private enableKimi: boolean;
+  private enablePi: boolean;
+  private enableZCode: boolean;
   private projectMetadataService: ProjectMetadataService | null;
   private cacheTtlMs: number;
   private cacheDirty = true;
+  private cacheGeneration = 0;
   private snapshot: ProjectSnapshot | null = null;
   private inFlightScan: Promise<ProjectSnapshot> | null = null;
+  private inFlightScanGeneration: number | null = null;
   private unsubscribeEventBus: (() => void) | null = null;
 
   constructor(options: ScannerOptions = {}) {
     this.projectsDir = options.projectsDir ?? CLAUDE_PROJECTS_DIR;
+    this.remoteExecutors = [...(options.remoteExecutors ?? [])];
     this.enableCodex = options.enableCodex ?? true;
     this.enableGemini = options.enableGemini ?? true;
+    this.enableKimi = options.enableKimi ?? true;
+    this.enablePi = options.enablePi ?? true;
+    this.enableZCode = options.enableZCode ?? true;
     this.codexScanner = this.enableCodex
       ? (options.codexScanner ??
         new CodexSessionScanner({
@@ -78,13 +112,40 @@ export class ProjectScanner {
           sessionsDir: options.geminiSessionsDir ?? GEMINI_TMP_DIR,
         }))
       : null;
+    this.kimiScanner = this.enableKimi
+      ? (options.kimiScanner ??
+        new KimiSessionScanner({
+          sessionsDir: options.kimiSessionsDir ?? KIMI_SESSIONS_DIR,
+        }))
+      : null;
+    this.piScanner = this.enablePi
+      ? (options.piScanner ??
+        new PiSessionScanner({
+          sessionsDir: options.piSessionsDir ?? PI_SESSIONS_DIR,
+        }))
+      : null;
+    this.zcodeScanner = this.enableZCode
+      ? (options.zcodeScanner ?? new ZCodeSessionScanner())
+      : null;
     this.projectMetadataService = options.projectMetadataService ?? null;
     this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? 5000);
 
     if (options.eventBus) {
       this.unsubscribeEventBus = options.eventBus.subscribe((event) => {
-        if (event.type !== "file-change") return;
-        this.handleFileChange(event);
+        if (event.type === "file-change") {
+          this.handleFileChange(event);
+          return;
+        }
+        if (
+          event.type === "session-updated" &&
+          event.trigger === "zcode-db-reconcile"
+        ) {
+          // A reconcile event may be the first evidence of a project created
+          // by an external CLI, so invalidate both cache layers before
+          // title/event consumers resolve the encoded project ID.
+          this.invalidateCache();
+          this.zcodeScanner?.invalidateCache();
+        }
       });
     }
   }
@@ -97,6 +158,83 @@ export class ProjectScanner {
     this.invalidateCache();
   }
 
+  setRemoteExecutors(executors: RemoteExecutorConfig[]): void {
+    this.remoteExecutors = executors.map((executor) => ({
+      ...executor,
+      sessionStorage: executor.sessionStorage
+        ? { ...executor.sessionStorage }
+        : undefined,
+    }));
+    this.invalidateCache();
+  }
+
+  private getClaudeSessionSources(): ClaudeSessionSource[] {
+    const sources: ClaudeSessionSource[] = [];
+    const seen = new Set<string>();
+
+    // Prefer authoritative shared stores over a stale compatibility replica
+    // when both still contain the same session.
+    for (const executor of this.remoteExecutors) {
+      const projectsDir = executor.sessionStorage?.localProjectsDir;
+      if (executor.sessionStorage?.mode !== "shared" || !projectsDir) continue;
+      if (seen.has(projectsDir)) continue;
+      seen.add(projectsDir);
+      sources.push({ projectsDir, executor });
+    }
+
+    if (!seen.has(this.projectsDir)) {
+      sources.push({ projectsDir: this.projectsDir });
+    } else {
+      // If the environment override points at the same shared store, retain
+      // its executor mapping instead of adding an un-mapped duplicate source.
+      const source = sources.find(
+        (candidate) => candidate.projectsDir === this.projectsDir,
+      );
+      if (!source) sources.push({ projectsDir: this.projectsDir });
+    }
+    return sources;
+  }
+
+  /** Map a semantic cwd according to the physical session source that owns it. */
+  mapSessionCwdToLocal(cwd: string, sessionDir: string): string {
+    const sources = this.getClaudeSessionSources()
+      .filter((source) => isLocalPathWithin(sessionDir, source.projectsDir))
+      .sort((a, b) => b.projectsDir.length - a.projectsDir.length);
+    const executor = sources[0]?.executor;
+    return executor ? (tryMapRemotePathToLocal(cwd, executor) ?? cwd) : cwd;
+  }
+
+  private getClaudeSessionDirForProject(projectPath: string): string {
+    const candidates = this.remoteExecutors
+      .filter(
+        (executor) =>
+          executor.sessionStorage?.mode === "shared" &&
+          executor.sessionStorage.localProjectsDir,
+      )
+      .map((executor) => ({
+        executor,
+        remoteCwd: tryMapLocalPathToRemote(projectPath, executor),
+      }))
+      .filter(
+        (
+          candidate,
+        ): candidate is {
+          executor: RemoteExecutorConfig;
+          remoteCwd: string;
+        } => Boolean(candidate.remoteCwd),
+      )
+      .sort(
+        (a, b) => b.executor.localRoot.length - a.executor.localRoot.length,
+      );
+
+    const selected = candidates[0];
+    const projectsDir = selected?.executor.sessionStorage?.localProjectsDir;
+    if (selected && projectsDir) {
+      return join(projectsDir, selected.remoteCwd.replace(/[/\\:]/g, "-"));
+    }
+    return join(this.projectsDir, projectPath.replace(/[/\\:]/g, "-"));
+  }
+
   async listProjects(): Promise<Project[]> {
     const snapshot = await this.getSnapshot();
     return snapshot.projects.map((project) => this.cloneProject(project));
@@ -107,6 +245,7 @@ export class ProjectScanner {
    */
   invalidateCache(): void {
     this.cacheDirty = true;
+    this.cacheGeneration += 1;
   }
 
   private async getSnapshot(forceRefresh = false): Promise<ProjectSnapshot> {
@@ -121,23 +260,33 @@ export class ProjectScanner {
     }
 
     if (this.inFlightScan) {
-      return this.inFlightScan;
+      if (this.inFlightScanGeneration === this.cacheGeneration) {
+        return this.inFlightScan;
+      }
+      // The active scan started before the latest watcher event. Wait for it
+      // to settle, then perform a fresh scan instead of letting a stale result
+      // clear the dirty flag or leak to the caller.
+      await this.inFlightScan;
+      return this.getSnapshot(forceRefresh);
     }
 
+    const scanGeneration = this.cacheGeneration;
     const scanPromise = this.scanProjects()
       .then((projects) => {
         const snapshot = this.buildSnapshot(projects);
         this.snapshot = snapshot;
-        this.cacheDirty = false;
+        this.cacheDirty = this.cacheGeneration !== scanGeneration;
         return snapshot;
       })
       .finally(() => {
         if (this.inFlightScan === scanPromise) {
           this.inFlightScan = null;
+          this.inFlightScanGeneration = null;
         }
       });
 
     this.inFlightScan = scanPromise;
+    this.inFlightScanGeneration = scanGeneration;
     return scanPromise;
   }
 
@@ -174,9 +323,15 @@ export class ProjectScanner {
   }
 
   private sessionDirToSuffix(sessionDir: string): string {
-    // Claude session dirs live under projectsDir; codex/gemini do not.
-    const relative = sessionDir.startsWith(this.projectsDir)
-      ? sessionDir.slice(this.projectsDir.length)
+    // Claude session dirs can live under the default replica or a configured
+    // shared projects root. Codex/Gemini paths are left untouched.
+    const source = this.getClaudeSessionSources()
+      .filter((candidate) =>
+        isLocalPathWithin(sessionDir, candidate.projectsDir),
+      )
+      .sort((a, b) => b.projectsDir.length - a.projectsDir.length)[0];
+    const relative = source
+      ? sessionDir.slice(source.projectsDir.length)
       : sessionDir;
     return relative.replace(/^[\\/]+/, "");
   }
@@ -188,12 +343,25 @@ export class ProjectScanner {
   private cloneProject(project: Project): Project {
     return {
       ...project,
+      isRemoteProject: this.isRemoteProjectPath(project.path),
       mergedSessionDirs: project.mergedSessionDirs
         ? [...project.mergedSessionDirs]
         : undefined,
       hasCodexSessions: project.hasCodexSessions,
       hasGeminiSessions: project.hasGeminiSessions,
+      hasPiSessions: project.hasPiSessions,
     };
+  }
+
+  /**
+   * Remote Claude projects are working copies kept in the conventional
+   * `projects` directory below a configured executor's shared local root.
+   * Derive this from settings so the UI never needs a machine-specific path.
+   */
+  private isRemoteProjectPath(projectPath: string): boolean {
+    return this.remoteExecutors.some((executor) =>
+      isLocalPathWithin(projectPath, join(executor.localRoot, "projects")),
+    );
   }
 
   private handleFileChange(event: FileChangeEvent): void {
@@ -207,6 +375,12 @@ export class ProjectScanner {
       this.codexScanner?.invalidateCache();
     } else if (event.provider === "gemini") {
       this.geminiScanner?.invalidateCache();
+    } else if (event.provider === "kimi") {
+      this.kimiScanner?.invalidateCache();
+    } else if (event.provider === "pi") {
+      this.piScanner?.invalidateCache();
+    } else if (event.provider === "zcode") {
+      this.zcodeScanner?.invalidateCache();
     }
   }
 
@@ -215,19 +389,6 @@ export class ProjectScanner {
     const seenPaths = new Set<string>();
     // Map from normalized path to project index for cross-machine dedup
     const normalizedIndex = new Map<string, number>();
-
-    // ~/.claude/projects/ can have two structures:
-    // 1. Projects directly as -home-user-project/
-    // 2. Projects under hostname/ as hostname/-home-user-project/
-    let dirs: string[] = [];
-    try {
-      await access(this.projectsDir);
-      const entries = await readdir(this.projectsDir, { withFileTypes: true });
-      dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
-    } catch {
-      // Directory doesn't exist or unreadable — skip Claude project scanning
-      // but continue to Codex/Gemini/metadata merge below
-    }
 
     // Helper to add a Claude project, merging cross-machine duplicates
     const addOrMerge = (
@@ -287,6 +448,7 @@ export class ProjectScanner {
           sessionDir,
           hasCodexSessions: false,
           hasGeminiSessions: false,
+          hasPiSessions: false,
           activeOwnedCount: 0, // populated by route
           activeExternalCount: 0, // populated by route
           lastActivity,
@@ -295,41 +457,54 @@ export class ProjectScanner {
       }
     };
 
-    for (const dir of dirs) {
-      const dirPath = join(this.projectsDir, dir);
-
-      // Check if this is a project directory
-      // On Unix/macOS: /home/user/project → -home-user-project (starts with -)
-      // On Windows: C:\Users\kaa\project → c--Users-kaa-project (drive letter + --)
-      if (dir.startsWith("-") || /^[a-zA-Z]--/.test(dir)) {
-        const infos = await this.getProjectDirInfos(dirPath);
-        for (const info of infos) {
-          addOrMerge(
-            info.projectPath,
-            dirPath,
-            info.sessionCount,
-            info.lastActivity,
-          );
-        }
-        continue;
-      }
-
-      // Otherwise, treat as hostname directory
-      // Format: ~/.claude/projects/hostname/-project-path/
-      let projectDirs: string[];
+    for (const source of this.getClaudeSessionSources()) {
+      // Claude projects roots can have two structures:
+      // 1. Projects directly as -home-user-project/
+      // 2. Projects under hostname/ as hostname/-home-user-project/
+      let dirs: string[] = [];
       try {
-        const subEntries = await readdir(dirPath, { withFileTypes: true });
-        projectDirs = subEntries
-          .filter((e) => e.isDirectory())
-          .map((e) => e.name);
+        await access(source.projectsDir);
+        const entries = await readdir(source.projectsDir, {
+          withFileTypes: true,
+        });
+        dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
       } catch {
         continue;
       }
 
-      for (const projectDir of projectDirs) {
-        const projectDirPath = join(dirPath, projectDir);
-        const infos = await this.getProjectDirInfos(projectDirPath);
-        for (const info of infos) {
+      for (const dir of dirs) {
+        const dirPath = join(source.projectsDir, dir);
+
+        // On Unix/macOS: /home/user/project → -home-user-project.
+        // On Windows: C:\Users\name\project → c--Users-name-project.
+        if (dir.startsWith("-") || /^[a-zA-Z]--/.test(dir)) {
+          const info = await this.getProjectDirInfo(dirPath, source);
+          if (info) {
+            addOrMerge(
+              info.projectPath,
+              dirPath,
+              info.sessionCount,
+              info.lastActivity,
+            );
+          }
+          continue;
+        }
+
+        // Otherwise, treat it as a hostname directory.
+        let projectDirs: string[];
+        try {
+          const subEntries = await readdir(dirPath, { withFileTypes: true });
+          projectDirs = subEntries
+            .filter((e) => e.isDirectory())
+            .map((e) => e.name);
+        } catch {
+          continue;
+        }
+
+        for (const projectDir of projectDirs) {
+          const projectDirPath = join(dirPath, projectDir);
+          const info = await this.getProjectDirInfo(projectDirPath, source);
+          if (!info) continue;
           addOrMerge(
             info.projectPath,
             projectDirPath,
@@ -368,6 +543,7 @@ export class ProjectScanner {
           name: basename(projectPath),
           hasCodexSessions: true,
           hasGeminiSessions: false,
+          hasPiSessions: false,
         });
       }
     }
@@ -403,6 +579,110 @@ export class ProjectScanner {
           name: basename(projectPath),
           hasCodexSessions: false,
           hasGeminiSessions: true,
+          hasPiSessions: false,
+        });
+      }
+    }
+
+    // Merge Pi projects if enabled. Pi records the canonical cwd directly in
+    // each native JSONL session header.
+    if (this.piScanner) {
+      const piProjects = await this.piScanner.listProjects();
+      for (const piProject of piProjects) {
+        const projectPath = canonicalizeProjectPath(piProject.path);
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasPiSessions = true;
+          existing.sessionCount += piProject.sessionCount;
+          if (
+            piProject.lastActivity &&
+            (!existing.lastActivity ||
+              piProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = piProject.lastActivity;
+          }
+          continue;
+        }
+        seenPaths.add(projectPath);
+        projects.push({
+          ...piProject,
+          id: encodeProjectId(projectPath),
+          path: projectPath,
+          name: basename(projectPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
+          hasPiSessions: true,
+        });
+      }
+    }
+
+    // Merge Kimi projects if enabled
+    if (this.kimiScanner) {
+      const kimiProjects = await this.kimiScanner.listProjects();
+      for (const kimiProject of kimiProjects) {
+        const projectPath = canonicalizeProjectPath(kimiProject.path);
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasKimiSessions = true;
+          existing.sessionCount += kimiProject.sessionCount;
+          if (
+            kimiProject.lastActivity &&
+            (!existing.lastActivity ||
+              kimiProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = kimiProject.lastActivity;
+          }
+          continue;
+        }
+        seenPaths.add(projectPath);
+        projects.push({
+          ...kimiProject,
+          id: encodeProjectId(projectPath),
+          path: projectPath,
+          name: basename(projectPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
+          hasPiSessions: false,
+          hasKimiSessions: true,
+        });
+      }
+    }
+
+    // Merge ZCode projects if enabled
+    if (this.zcodeScanner) {
+      const zcodeProjects = await this.zcodeScanner.listProjects();
+      for (const zcodeProject of zcodeProjects) {
+        const projectPath = canonicalizeProjectPath(zcodeProject.path);
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasZCodeSessions = true;
+          existing.sessionCount += zcodeProject.sessionCount;
+          if (
+            zcodeProject.lastActivity &&
+            (!existing.lastActivity ||
+              zcodeProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = zcodeProject.lastActivity;
+          }
+          continue;
+        }
+        seenPaths.add(projectPath);
+        projects.push({
+          ...zcodeProject,
+          id: encodeProjectId(projectPath),
+          path: projectPath,
+          name: basename(projectPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
+          hasPiSessions: false,
+          hasKimiSessions: false,
+          hasZCodeSessions: true,
         });
       }
     }
@@ -425,15 +705,15 @@ export class ProjectScanner {
         }
 
         seenPaths.add(projectPath);
-        const encodedPath = projectPath.replace(/[/\\:]/g, "-");
         projects.push({
           id: encodeProjectId(projectPath),
           path: projectPath,
           name: basename(projectPath),
           sessionCount: 0,
-          sessionDir: join(this.projectsDir, encodedPath),
+          sessionDir: this.getClaudeSessionDirForProject(projectPath),
           hasCodexSessions: false,
           hasGeminiSessions: false,
+          hasPiSessions: false,
           activeOwnedCount: 0,
           activeExternalCount: 0,
           lastActivity: metadata.addedAt,
@@ -446,13 +726,15 @@ export class ProjectScanner {
     // home directory so sessions can always be created even if detection is broken
     if (projects.length === 0) {
       const home = homedir();
-      const encodedPath = home.replace(/[/\\:]/g, "-");
       projects.push({
         id: encodeProjectId(home),
         path: home,
         name: basename(home) || "Home",
         sessionCount: 0,
-        sessionDir: join(this.projectsDir, encodedPath),
+        sessionDir: this.getClaudeSessionDirForProject(home),
+        hasCodexSessions: false,
+        hasGeminiSessions: false,
+        hasPiSessions: false,
         activeOwnedCount: 0,
         activeExternalCount: 0,
         lastActivity: null,
@@ -477,22 +759,13 @@ export class ProjectScanner {
    */
   async getOrCreateProject(
     projectId: string,
-    preferredProvider?: "claude" | "codex" | "gemini",
+    preferredProvider?: ProviderName | string,
   ): Promise<Project | null> {
     let resolvedProjectId = projectId;
 
     // First check if project already exists
     const existing = await this.getProject(resolvedProjectId);
-    if (existing) {
-      try {
-        const stats = await stat(existing.path);
-        if (stats.isDirectory()) return existing;
-      } catch {
-        // 保留 sessionDir 供调用方恢复 cwd，但不再把失效项目留在新快照中。
-      }
-      this.invalidateCache();
-      return existing;
-    }
+    if (existing) return existing;
 
     // Decode the projectId to get the path
     let projectPath: string;
@@ -507,13 +780,6 @@ export class ProjectScanner {
       const canonicalId = encodeProjectId(canonicalProjectPath);
       const canonicalProject = await this.getProject(canonicalId);
       if (canonicalProject) {
-        try {
-          const stats = await stat(canonicalProject.path);
-          if (stats.isDirectory()) return canonicalProject;
-        } catch {
-          // 与上面的缓存命中一致，保留恢复所需的 sessionDir。
-        }
-        this.invalidateCache();
         return canonicalProject;
       }
       projectPath = canonicalProjectPath;
@@ -535,9 +801,12 @@ export class ProjectScanner {
       return null;
     }
 
-    // Determine provider: use preferred if specified, otherwise check for Codex/Gemini sessions
-    let provider: ProviderName = preferredProvider ?? DEFAULT_PROVIDER;
-    if (!preferredProvider) {
+    // Determine provider from the caller preference or discovered session trees.
+    const livePreferredProvider = isRetiredProviderName(preferredProvider)
+      ? undefined
+      : (preferredProvider as ProviderName | undefined);
+    let provider: ProviderName = livePreferredProvider ?? DEFAULT_PROVIDER;
+    if (!livePreferredProvider) {
       // Check if Codex sessions exist for this path
       if (this.codexScanner) {
         const codexSessions =
@@ -555,33 +824,69 @@ export class ProjectScanner {
           provider = "gemini";
         }
       }
+
+      // Check if Pi sessions exist (only if no earlier provider sessions)
+      if (provider === "claude" && this.piScanner) {
+        const piSessions =
+          await this.piScanner.getSessionsForProject(projectPath);
+        if (piSessions.length > 0) {
+          provider = "pi";
+        }
+      }
+
+      // Check if Kimi sessions exist (only if no earlier provider sessions)
+      if (provider === "claude" && this.kimiScanner) {
+        const kimiSessions =
+          await this.kimiScanner.getSessionsForProject(projectPath);
+        if (kimiSessions.length > 0) {
+          provider = "kimi";
+        }
+      }
+
+      // Check if ZCode sessions exist (only if no earlier provider sessions)
+      if (provider === "claude" && this.zcodeScanner) {
+        const zcodeSessions =
+          await this.zcodeScanner.getSessionsForProject(projectPath);
+        if (zcodeSessions.length > 0) {
+          provider = "zcode";
+        }
+      }
     }
 
     // Create a virtual project entry
     // The session directory will be created by the SDK when the first session starts
-    const encodedPath = projectPath.replace(/[/\\:]/g, "-");
-
     // Determine the session directory based on provider
     let sessionDir: string;
     if (provider === "codex") {
       sessionDir = CODEX_SESSIONS_DIR;
     } else if (provider === "gemini") {
       sessionDir = GEMINI_TMP_DIR;
+    } else if (provider === "pi") {
+      sessionDir = PI_SESSIONS_DIR;
+    } else if (provider === "kimi") {
+      sessionDir = KIMI_SESSIONS_DIR;
+    } else if (provider === "zcode") {
+      sessionDir = ZCODE_DB_PATH;
     } else {
-      sessionDir = join(this.projectsDir, encodedPath);
+      sessionDir = this.getClaudeSessionDirForProject(projectPath);
     }
 
-    return {
+    return this.cloneProject({
       id: resolvedProjectId as UrlProjectId,
       path: projectPath,
       name: basename(projectPath),
       sessionCount: 0,
       sessionDir,
+      hasCodexSessions: provider === "codex",
+      hasGeminiSessions: provider === "gemini",
+      hasPiSessions: provider === "pi",
+      hasKimiSessions: provider === "kimi",
+      hasZCodeSessions: provider === "zcode",
       activeOwnedCount: 0,
       activeExternalCount: 0,
       lastActivity: null,
       provider,
-    };
+    });
   }
 
   /**
@@ -600,56 +905,40 @@ export class ProjectScanner {
     return project ? this.cloneProject(project) : null;
   }
 
-  /**
-   * Find the project for one concrete Claude session file.
-   *
-   * A single physical Claude session directory can contain jsonls from more
-   * than one cwd. Directory suffixes are therefore only a fallback; the jsonl
-   * cwd is the source of truth when it is available.
-   */
-  async getProjectBySessionFile(
-    sessionFilePath: string,
-  ): Promise<Project | null> {
-    const cwd = await readCwdFromSessionFile(sessionFilePath);
-    if (!cwd) return null;
-
-    const snapshot = await this.getSnapshot();
-    const project = snapshot.byId.get(
-      encodeProjectId(canonicalizeProjectPath(cwd)),
-    );
-    return project ? this.cloneProject(project) : null;
-  }
-
   dispose(): void {
     this.unsubscribeEventBus?.();
     this.unsubscribeEventBus = null;
   }
 
   /**
-   * Get project infos from a session directory in a single readdir pass.
-   *
-   * Claude normally stores one cwd per physical session directory, but moved
-   * projects, rsync workflows, and manual file moves can leave multiple cwd
-   * values in the same directory. Group by the cwd written inside each jsonl
-   * so project ownership is correct at the scanner source.
-   *
-   * Uses each jsonl file's mtime for lastActivity so each cwd group gets its
-   * own activity timestamp.
+   * Get project info from a session directory in a single readdir pass.
+   * Uses directory mtime as a cheap proxy for lastActivity (one stat
+   * on the dir itself instead of stat-ing every session file).
    */
-  private async getProjectDirInfos(
+  private async getProjectDirInfo(
     projectDirPath: string,
-  ): Promise<ProjectDirInfo[]> {
+    source: ClaudeSessionSource,
+  ): Promise<{
+    projectPath: string;
+    sessionCount: number;
+    lastActivity: string | null;
+  } | null> {
     try {
       const files = await readdir(projectDirPath);
       const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
 
-      if (jsonlFiles.length === 0) return [];
+      if (jsonlFiles.length === 0) return null;
+
+      // Count non-agent sessions
+      const sessionCount = jsonlFiles.filter(
+        (f) => !f.startsWith("agent-"),
+      ).length;
 
       // Sort jsonl files by mtime descending. The newest file carries the
       // most recent `cwd` the SDK wrote — older jsonls may still record the
       // project's original location from before the user moved it on disk.
-      // Within each cwd group this keeps the group's lastActivity accurate.
-      // Stat-ing N files is cheap (≈50µs each).
+      // Reading any older one would let a stale path leak into the project
+      // snapshot's id/path fields. Stat-ing N files is cheap (≈50µs each).
       const withMtime: Array<{ file: string; mtime: number }> = [];
       for (const file of jsonlFiles) {
         try {
@@ -660,45 +949,24 @@ export class ProjectScanner {
         }
       }
       withMtime.sort((a, b) => b.mtime - a.mtime);
-      const byProjectPath = new Map<string, ProjectDirInfo>();
+      const lastActivity = withMtime[0]
+        ? new Date(withMtime[0].mtime).toISOString()
+        : null;
 
-      for (const { file, mtime } of withMtime) {
+      for (const { file } of withMtime) {
         const filePath = join(projectDirPath, file);
         const cwd = await readCwdFromSessionFile(filePath);
-        if (!cwd) continue;
-
-        const projectPath = canonicalizeProjectPath(cwd);
-        const existing = byProjectPath.get(projectPath);
-        if (existing) {
-          if (!file.startsWith("agent-")) {
-            existing.sessionCount += 1;
-          }
-          continue;
+        if (cwd) {
+          const projectPath = source.executor
+            ? (tryMapRemotePathToLocal(cwd, source.executor) ?? cwd)
+            : cwd;
+          return { projectPath, sessionCount, lastActivity };
         }
-
-        byProjectPath.set(projectPath, {
-          projectPath,
-          sessionCount: file.startsWith("agent-") ? 0 : 1,
-          lastActivity: new Date(mtime).toISOString(),
-        });
       }
 
-      const infos = Array.from(byProjectPath.values());
-      const encodedDirName = basename(projectDirPath);
-      const matchingDirInfos = infos.filter(
-        (info) =>
-          this.encodeClaudeProjectDirName(info.projectPath) === encodedDirName,
-      );
-      return matchingDirInfos.length > 0 ? matchingDirInfos : infos;
+      return null;
     } catch {
-      return [];
+      return null;
     }
   }
-
-  private encodeClaudeProjectDirName(projectPath: string): string {
-    return projectPath.replace(/[/\\:]/g, "-");
-  }
 }
-
-// Singleton for convenience
-export const projectScanner = new ProjectScanner();

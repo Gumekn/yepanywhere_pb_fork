@@ -1,7 +1,9 @@
 import { SLASH_COMMAND_SESSION_KIND } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { api } from "../api/client";
 import type { GlobalSessionItem } from "../api/client";
+import { useToastContext } from "../contexts/ToastContext";
 import { useDrafts } from "../hooks/useDrafts";
 import { useGlobalSessions } from "../hooks/useGlobalSessions";
 import { resolvePreferredProjectId } from "../hooks/useRecentProject";
@@ -10,6 +12,9 @@ import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
 import { activityBus } from "../lib/activityBus";
 import { formatSmartTime } from "../lib/datetime";
+import { compareSessionsByPinAndUpdatedAt } from "../lib/sessionOrdering";
+import { ProjectGitStatusButton } from "./ProjectGitStatusButton";
+import { RemoteProjectIcon } from "./RemoteProjectIcon";
 import { SessionListItem } from "./SessionListItem";
 import {
   SidebarIcons,
@@ -24,16 +29,14 @@ const SWIPE_THRESHOLD = 50; // Minimum distance to trigger close
 const SWIPE_ENGAGE_THRESHOLD = 15; // Minimum horizontal distance before swipe engages
 const RECENT_SESSIONS_INITIAL = 12; // Initial number of recent sessions to show
 const RECENT_SESSIONS_INCREMENT = 10; // How many more to show on each expand
+/**
+ * Any project touched within this window keeps at least one session in the
+ * sidebar, even when busier projects fill up the global session limit.
+ */
+const PROJECT_COVERAGE_DAYS = 7;
 
 const getSessionListTitle = (session: GlobalSessionItem): string | null =>
   session.customTitle ?? session.aiTitle ?? session.title ?? null;
-
-const sortSessionsByUpdatedAtDesc = (
-  sessions: GlobalSessionItem[],
-): GlobalSessionItem[] =>
-  [...sessions].sort(
-    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-  );
 
 interface SessionProjectGroup {
   key: string;
@@ -47,6 +50,28 @@ interface SessionProjectGroup {
 
 function isRunningSession(session: GlobalSessionItem): boolean {
   return session.activity === "in-turn";
+}
+
+function canArchiveSession(session: GlobalSessionItem): boolean {
+  return !session.isArchived && session.runtime?.canArchive !== false;
+}
+
+/** Max number of busy session names to spell out before summarizing the rest. */
+const MAX_BUSY_NAMES = 3;
+
+/** Build a readable "A, B, C +N more" list of busy session titles for a toast. */
+function formatBusyNames(
+  busy: GlobalSessionItem[],
+  t: ReturnType<typeof useI18n>["t"],
+): string {
+  const names = busy
+    .slice(0, MAX_BUSY_NAMES)
+    .map((s) => getSessionListTitle(s) ?? t("sessionUntitled"));
+  let label = names.join(", ");
+  if (busy.length > MAX_BUSY_NAMES) {
+    label += ` ${t("bulkArchiveMore", { count: busy.length - MAX_BUSY_NAMES })}`;
+  }
+  return label;
 }
 
 function groupSessionsByProject(
@@ -83,7 +108,16 @@ function groupSessionsByProject(
     });
   }
 
-  return Array.from(groupsByProject.values());
+  const groups = Array.from(groupsByProject.values());
+
+  // Keep pins first, then sort each project's sessions by activity. Group order
+  // itself stays in hook (insertion) order so an active session's project does
+  // not jump under the pointer during high-frequency live updates.
+  for (const group of groups) {
+    group.sessions.sort(compareSessionsByPinAndUpdatedAt);
+  }
+
+  return groups;
 }
 
 interface SidebarProps {
@@ -125,11 +159,13 @@ export function Sidebar({
   onResizeEnd,
 }: SidebarProps) {
   const { t, locale } = useI18n();
+  const { showToast } = useToastContext();
   // Base path for navigation links (empty — app is served at its own root).
   const basePath = useRemoteBasePath();
   const shouldLoadSessionLists = isDesktop ? !isCollapsed : isOpen;
 
-  // Fetch global sessions for sidebar (non-starred only for recent/older sections)
+  // One combined list powers the project groups. `includePinned` asks the
+  // server to append old pins that fall outside the ordinary top-N window.
   const {
     sessions: globalSessions,
     loading: globalLoading,
@@ -138,34 +174,29 @@ export function Sidebar({
     limit: 50,
     includeStats: false,
     excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
+    projectCoverageDays: PROJECT_COVERAGE_DAYS,
+    includePinned: true,
     enabled: shouldLoadSessionLists,
     liveUpdates: true,
     metadataLiveUpdates: true,
   });
 
-  // Fetch starred sessions separately to ensure we get ALL starred sessions
+  const sessionsLoading = globalLoading;
+
   const {
-    sessions: starredSessions,
-    loading: starredLoading,
-    refetch: refetchStarredSessions,
-  } = useGlobalSessions({
-    starred: true,
-    limit: 100,
-    includeStats: false,
-    excludeSessionKind: SLASH_COMMAND_SESSION_KIND,
-    enabled: shouldLoadSessionLists,
-    liveUpdates: true,
-    metadataLiveUpdates: true,
-  });
-
-  const sessionsLoading = globalLoading || starredLoading;
-
-  const { recentProjects, projects } = useRecentProjects({
+    recentProjects,
+    projects,
+    refetch: refetchProjects,
+  } = useRecentProjects({
     enabled: shouldLoadSessionLists,
   });
   const newSessionProjectId = resolvePreferredProjectId(
     projects,
     recentProjects[0]?.id,
+  );
+  const projectsById = useMemo(
+    () => new Map(projects.map((project) => [project.id, project])),
+    [projects],
   );
 
   const sidebarRef = useRef<HTMLElement>(null);
@@ -182,19 +213,21 @@ export function Sidebar({
   const [olderProjectGroupsLimit, setOlderProjectGroupsLimit] = useState(
     RECENT_SESSIONS_INITIAL,
   );
-  const [starredSessionsLimit, setStarredSessionsLimit] = useState(
-    RECENT_SESSIONS_INITIAL,
-  );
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false);
   const [expandedProjectGroups, setExpandedProjectGroups] = useState<
     Set<string>
   >(() => new Set());
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [isBulkArchivePending, setIsBulkArchivePending] = useState(false);
 
   const refetchSessionLists = useCallback(async () => {
     if (!shouldLoadSessionLists) return;
 
-    await Promise.all([refetchGlobalSessions(), refetchStarredSessions()]);
-  }, [refetchGlobalSessions, refetchStarredSessions, shouldLoadSessionLists]);
+    await Promise.all([refetchGlobalSessions(), refetchProjects()]);
+  }, [refetchGlobalSessions, refetchProjects, shouldLoadSessionLists]);
 
   const handleRefreshRecentSessions = useCallback(async () => {
     if (isRefreshingSessions) return;
@@ -213,7 +246,11 @@ export function Sidebar({
     const unsubscribeMetadata = activityBus.on(
       "session-metadata-changed",
       (event) => {
-        if (event.archived !== undefined || event.starred !== undefined) {
+        if (
+          event.archived !== undefined ||
+          event.pinned !== undefined ||
+          event.starred !== undefined
+        ) {
           void refetchSessionLists();
         }
       },
@@ -321,48 +358,164 @@ export function Sidebar({
     };
   }, [isResizing, onResize, onResizeEnd]);
 
-  // Starred sessions come from dedicated fetch (filtered by server)
-  // Filter out archived just in case
-  const filteredStarredSessions = useMemo(() => {
-    return starredSessions.filter((s) => !s.isArchived);
-  }, [starredSessions]);
-
-  // Sessions updated in the last 24 hours (non-starred, non-archived)
-  const recentDaySessions = useMemo(() => {
+  // Sessions updated in the last 24 hours, plus every pinned session. An old
+  // pin is elevated into its project's recent card instead of living in a
+  // second, independently maintained collection.
+  // Keep the hook-provided order stable so high-frequency live updates don't
+  // move an active session back under the user's pointer while browsing.
+  const recentSessions = useMemo(() => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const isWithinLastDay = (date: Date) => date.getTime() >= oneDayAgo;
 
-    return sortSessionsByUpdatedAtDesc(
-      globalSessions.filter(
-        (s) =>
-          !s.isStarred &&
-          !s.isArchived &&
-          isWithinLastDay(new Date(s.updatedAt)),
-      ),
+    return globalSessions.filter(
+      (s) =>
+        !s.isArchived &&
+        (s.isStarred || isWithinLastDay(new Date(s.updatedAt))),
     );
   }, [globalSessions]);
 
-  // Older sessions (non-starred, non-archived, NOT in last 24 hours)
+  // Older sessions (unpinned, non-archived, NOT in last 24 hours).
+  // Preserve stable ordering here for the same reason as recentSessions.
   const olderSessions = useMemo(() => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const isOlderThanOneDay = (date: Date) => date.getTime() < oneDayAgo;
 
-    return sortSessionsByUpdatedAtDesc(
-      globalSessions.filter(
-        (s) =>
-          !s.isStarred &&
-          !s.isArchived &&
-          isOlderThanOneDay(new Date(s.updatedAt)),
-      ),
+    return globalSessions.filter(
+      (s) =>
+        !s.isStarred &&
+        !s.isArchived &&
+        isOlderThanOneDay(new Date(s.updatedAt)),
     );
   }, [globalSessions]);
+
+  const sidebarSessions = useMemo(
+    () => [...recentSessions, ...olderSessions],
+    [olderSessions, recentSessions],
+  );
+
+  const sidebarSessionsById = useMemo(
+    () => new Map(sidebarSessions.map((session) => [session.id, session])),
+    [sidebarSessions],
+  );
+
+  const selectedSessions = useMemo(
+    () =>
+      Array.from(selectedSessionIds)
+        .map((id) => sidebarSessionsById.get(id))
+        .filter((session): session is GlobalSessionItem => Boolean(session)),
+    [selectedSessionIds, sidebarSessionsById],
+  );
+
+  useEffect(() => {
+    setSelectedSessionIds((current) => {
+      let changed = false;
+      const next = new Set<string>();
+
+      for (const id of current) {
+        if (sidebarSessionsById.has(id)) {
+          next.add(id);
+        } else {
+          changed = true;
+        }
+      }
+
+      return changed ? next : current;
+    });
+  }, [sidebarSessionsById]);
+
+  const handleSelectSession = useCallback(
+    (sessionId: string, selected: boolean) => {
+      setSelectedSessionIds((current) => {
+        const next = new Set(current);
+        if (selected) {
+          next.add(sessionId);
+        } else {
+          next.delete(sessionId);
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const handleClearSelection = useCallback(() => {
+    setSelectedSessionIds(new Set());
+    setIsSelectionMode(false);
+  }, []);
+
+  const handleBulkArchiveSelected = useCallback(async () => {
+    if (isBulkArchivePending || selectedSessions.length === 0) return;
+
+    const archivableSessions = selectedSessions.filter(canArchiveSession);
+    const busySessions = selectedSessions.filter(
+      (s) => !s.isArchived && !canArchiveSession(s),
+    );
+    if (archivableSessions.length === 0) {
+      showToast(
+        busySessions.length > 0
+          ? t("bulkArchiveSkippedNames", {
+              names: formatBusyNames(busySessions, t),
+            })
+          : (selectedSessions[0]?.runtime?.archiveBlockReason ??
+              t("sessionArchiveFailed")),
+        "error",
+      );
+      return;
+    }
+
+    setIsBulkArchivePending(true);
+    try {
+      const results = await Promise.allSettled(
+        archivableSessions.map((session) =>
+          api.updateSessionMetadata(session.id, { archived: true }),
+        ),
+      );
+      const succeeded = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - succeeded;
+
+      const parts: string[] = [];
+      if (succeeded > 0) {
+        parts.push(t("sidebarArchivedSelected", { count: succeeded }));
+      }
+      if (busySessions.length > 0) {
+        parts.push(
+          t("bulkArchiveSkippedNames", {
+            names: formatBusyNames(busySessions, t),
+          }),
+        );
+      }
+      if (failed > 0) {
+        parts.push(t("bulkArchiveFailed", { count: failed }));
+      }
+      if (parts.length > 0) {
+        showToast(parts.join(" · "), failed > 0 ? "error" : "success");
+      }
+      handleClearSelection();
+      await refetchSessionLists();
+    } catch (err) {
+      console.error("Failed to archive selected sidebar sessions:", err);
+      showToast(
+        err instanceof Error ? err.message : t("sessionArchiveFailed"),
+        "error",
+      );
+    } finally {
+      setIsBulkArchivePending(false);
+    }
+  }, [
+    handleClearSelection,
+    isBulkArchivePending,
+    refetchSessionLists,
+    selectedSessions,
+    showToast,
+    t,
+  ]);
 
   // Track which sessions have unsent drafts in localStorage
   const drafts = useDrafts();
 
   const allRecentProjectGroups = useMemo(
-    () => groupSessionsByProject("recent", recentDaySessions),
-    [recentDaySessions],
+    () => groupSessionsByProject("recent", recentSessions),
+    [recentSessions],
   );
 
   const recentProjectGroups = useMemo(
@@ -380,8 +533,13 @@ export function Sidebar({
     [allOlderProjectGroups, olderProjectGroupsLimit],
   );
 
+  const autoExpandedSessionIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!currentSessionId) return;
+    if (!currentSessionId) {
+      autoExpandedSessionIdRef.current = null;
+      return;
+    }
+    if (autoExpandedSessionIdRef.current === currentSessionId) return;
 
     const currentGroupKeys = [
       ...allRecentProjectGroups,
@@ -394,6 +552,7 @@ export function Sidebar({
 
     if (currentGroupKeys.length === 0) return;
 
+    autoExpandedSessionIdRef.current = currentSessionId;
     setExpandedProjectGroups((current) => {
       let changed = false;
       const next = new Set(current);
@@ -444,17 +603,36 @@ export function Sidebar({
       pendingInputType={session.pendingInputType}
       hasUnread={session.hasUnread}
       interrupted={session.interrupted}
-      isStarred={session.isStarred}
+      lastTurnStatus={session.lastTurnStatus}
+      lastErrorMessage={session.lastErrorMessage}
+      retryStatus={session.retryStatus}
+      isPinned={session.isStarred}
       isArchived={session.isArchived}
       mode="compact"
       isCurrent={session.id === currentSessionId}
       activity={session.activity}
-      onNavigate={onNavigate}
       showProjectName={showProjectName}
       projectName={session.projectName}
       basePath={basePath}
       messageCount={session.messageCount}
+      cumulativeUsage={session.cumulativeUsage}
+      compactCount={session.compactCount}
+      compactEvents={session.compactEvents}
       hasDraft={drafts.has(session.id)}
+      isSelected={selectedSessionIds.has(session.id)}
+      isSelectionMode={isSelectionMode}
+      onSelect={isSelectionMode ? handleSelectSession : undefined}
+      onSelectForArchive={() => {
+        setIsSelectionMode(true);
+        handleSelectSession(session.id, true);
+      }}
+      onNavigate={() => {
+        if (isSelectionMode) {
+          handleSelectSession(session.id, !selectedSessionIds.has(session.id));
+          return;
+        }
+        onNavigate();
+      }}
     />
   );
 
@@ -467,6 +645,8 @@ export function Sidebar({
         );
         const runningLabel = t("agentsRunning");
         const unreadLabel = t("globalSessionsStatusUnread");
+        const project = projectsById.get(group.projectId);
+        const gitStatus = project?.gitStatus;
 
         return (
           <div
@@ -492,6 +672,9 @@ export function Sidebar({
                     <span className="sidebar-project-name">
                       {group.projectName}
                     </span>
+                    <RemoteProjectIcon
+                      isRemoteProject={project?.isRemoteProject}
+                    />
                     {group.runningCount > 0 && (
                       <span
                         className="sidebar-project-status sidebar-project-status--running"
@@ -531,6 +714,10 @@ export function Sidebar({
                   </span>
                 </span>
               </button>
+              <ProjectGitStatusButton
+                status={gitStatus}
+                projectName={group.projectName}
+              />
               <Link
                 to={`${basePath}/new-session?projectId=${encodeURIComponent(group.projectId)}`}
                 className="sidebar-project-new-session"
@@ -614,22 +801,32 @@ export function Sidebar({
         }
       >
         <div className="sidebar-header">
-          {isDesktop && isCollapsed ? (
-            /* Desktop collapsed mode: show toggle button to expand */
-            <button
-              type="button"
-              className="sidebar-toggle"
-              onClick={onToggleExpanded}
-              title={t("actionExpandSidebar")}
-              aria-label={t("actionExpandSidebar")}
-            >
-              <SidebarToggleIcon />
-            </button>
-          ) : isDesktop ? (
-            /* Desktop expanded mode: show brand (toggle is in toolbar) */
-            <span className="sidebar-brand">
-              <YepAnywhereLogo />
-            </span>
+          {isDesktop ? (
+            <>
+              {!isCollapsed && (
+                <span className="sidebar-brand">
+                  <YepAnywhereLogo />
+                </span>
+              )}
+              <button
+                type="button"
+                className="sidebar-toggle"
+                onClick={onToggleExpanded}
+                title={
+                  isCollapsed
+                    ? t("actionExpandSidebar")
+                    : t("actionCollapseSidebar")
+                }
+                aria-label={
+                  isCollapsed
+                    ? t("actionExpandSidebar")
+                    : t("actionCollapseSidebar")
+                }
+                aria-expanded={!isCollapsed}
+              >
+                <SidebarToggleIcon />
+              </button>
+            </>
           ) : (
             /* Mobile mode: brand text + close button */
             <>
@@ -722,39 +919,72 @@ export function Sidebar({
             />
           </SidebarNavSection>
 
-          {/* Global sessions list */}
-          {filteredStarredSessions.length > 0 && (
-            <div className="sidebar-section">
-              <h3 className="sidebar-section-title">
-                {t("sidebarSectionStarred")}
-              </h3>
-              <ul className="sidebar-session-list">
-                {filteredStarredSessions
-                  .slice(0, starredSessionsLimit)
-                  .map((session) => renderSessionListItem(session, true))}
-              </ul>
-              {filteredStarredSessions.length > starredSessionsLimit && (
+          {isSelectionMode && (
+            <div className="sidebar-bulk-toolbar is-active">
+              <span className="sidebar-bulk-toolbar__count">
+                {t("bulkSelectedCount", {
+                  count: selectedSessionIds.size,
+                })}
+              </span>
+              <div className="sidebar-bulk-toolbar__actions">
                 <button
                   type="button"
-                  className="sidebar-show-more"
-                  onClick={() =>
-                    setStarredSessionsLimit(
-                      (prev) => prev + RECENT_SESSIONS_INCREMENT,
+                  className="sidebar-bulk-toolbar__button sidebar-bulk-toolbar__button--primary"
+                  onClick={() => void handleBulkArchiveSelected()}
+                  disabled={
+                    isBulkArchivePending ||
+                    selectedSessions.every(
+                      (session) => !canArchiveSession(session),
                     )
                   }
+                  title={t("bulkArchiveSelected")}
                 >
-                  {t("actionShowMore", {
-                    count: Math.min(
-                      RECENT_SESSIONS_INCREMENT,
-                      filteredStarredSessions.length - starredSessionsLimit,
-                    ),
-                  })}
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <polyline points="21 8 21 21 3 21 3 8" />
+                    <rect x="1" y="3" width="22" height="5" />
+                    <line x1="10" y1="12" x2="14" y2="12" />
+                  </svg>
+                  {t("bulkArchive")}
                 </button>
-              )}
+                <button
+                  type="button"
+                  className="sidebar-bulk-toolbar__icon-button"
+                  onClick={handleClearSelection}
+                  disabled={isBulkArchivePending}
+                  aria-label={t("sidebarCancelArchiveSelection")}
+                  title={t("sidebarCancelArchiveSelection")}
+                >
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <line x1="18" y1="6" x2="6" y2="18" />
+                    <line x1="6" y1="6" x2="18" y2="18" />
+                  </svg>
+                </button>
+              </div>
             </div>
           )}
 
-          {recentDaySessions.length > 0 && (
+          {/* Global sessions list */}
+          {recentSessions.length > 0 && (
             <div className="sidebar-section">
               <div className="sidebar-section-heading">
                 <h3 className="sidebar-section-title">
@@ -836,8 +1066,7 @@ export function Sidebar({
             </div>
           )}
 
-          {filteredStarredSessions.length === 0 &&
-            recentDaySessions.length === 0 &&
+          {recentSessions.length === 0 &&
             olderSessions.length === 0 &&
             (sessionsLoading ? (
               <div className="sidebar-loading">

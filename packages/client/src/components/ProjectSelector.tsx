@@ -5,6 +5,7 @@ import { useProjects } from "../hooks/useProjects";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
 import type { Project } from "../types";
+import { RemoteProjectIcon } from "./RemoteProjectIcon";
 
 const DESKTOP_BREAKPOINT = 769;
 
@@ -15,6 +16,10 @@ interface ProjectSelectorProps {
   currentProjectName?: string;
   /** Called when a new project is selected */
   onProjectChange?: (project: Project) => void;
+  /** Reuse a project list already loaded by the parent. */
+  projects?: Project[];
+  /** Loading state for a parent-provided project list. */
+  projectsLoading?: boolean;
 }
 
 /**
@@ -25,6 +30,8 @@ export function ProjectSelector({
   currentProjectId,
   currentProjectName,
   onProjectChange,
+  projects: providedProjects,
+  projectsLoading: providedProjectsLoading,
 }: ProjectSelectorProps) {
   const { t } = useI18n();
   const [isOpen, setIsOpen] = useState(false);
@@ -36,7 +43,13 @@ export function ProjectSelector({
   const navigate = useNavigate();
   const basePath = useRemoteBasePath();
 
-  const { projects, loading } = useProjects();
+  const shouldFetchProjects = providedProjects === undefined;
+  const { projects: fetchedProjects, loading: fetchedProjectsLoading } =
+    useProjects({ enabled: shouldFetchProjects });
+  const projects = providedProjects ?? fetchedProjects;
+  const loading = shouldFetchProjects
+    ? fetchedProjectsLoading
+    : (providedProjectsLoading ?? false);
 
   // Find current project name
   const currentProject = projects.find((p) => p.id === currentProjectId);
@@ -134,7 +147,12 @@ export function ProjectSelector({
 
   // Don't show selector if only one project
   if (!loading && projects.length <= 1) {
-    return <span className="session-title">{displayName}</span>;
+    return (
+      <span className="session-title project-selector-static-title">
+        <RemoteProjectIcon isRemoteProject={currentProject?.isRemoteProject} />
+        {displayName}
+      </span>
+    );
   }
 
   const optionsContent = (
@@ -148,7 +166,10 @@ export function ProjectSelector({
             className={`project-selector-option ${isSelected ? "selected" : ""}`}
             onClick={() => handleProjectSelect(project)}
           >
-            <span className="project-selector-name">{project.name}</span>
+            <span className="project-selector-name-row">
+              <RemoteProjectIcon isRemoteProject={project.isRemoteProject} />
+              <span className="project-selector-name">{project.name}</span>
+            </span>
             <span className="project-selector-meta">
               {t("projectSelectorSessionsCount", {
                 count: project.sessionCount,
@@ -210,6 +231,7 @@ export function ProjectSelector({
         aria-haspopup="listbox"
         aria-expanded={isOpen}
       >
+        <RemoteProjectIcon isRemoteProject={currentProject?.isRemoteProject} />
         <span className="project-selector-text">{displayName}</span>
         <svg
           className="project-selector-chevron"

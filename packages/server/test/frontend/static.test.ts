@@ -1,8 +1,19 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
+import { brotliCompress, gunzipSync, gzip } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createStaticRoutes } from "../../src/frontend/static.js";
+import {
+  createStaticRoutes,
+  negotiateEncoding,
+} from "../../src/frontend/static.js";
+
+const gzipAsync = promisify(gzip);
+const brotliCompressAsync = promisify(brotliCompress);
+
+/** Large enough to clear the 1 KB compression threshold. */
+const BIG_JS = `console.log(${JSON.stringify("x".repeat(4096))});`;
 
 describe("static frontend routes", () => {
   let tempDir: string;
@@ -69,9 +80,7 @@ describe("static frontend routes", () => {
       basePath: "/yep",
     });
 
-    const response = await routes.request("/yep/sessions", {
-      headers: { Accept: "text/html" },
-    });
+    const response = await routes.request("/yep/sessions");
 
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-cache");
@@ -80,61 +89,172 @@ describe("static frontend routes", () => {
     );
   });
 
-  it("returns 404 for missing explicit assets and API routes", async () => {
-    const routes = createStaticRoutes({
-      distPath: tempDir,
-      basePath: "/yep",
+  describe("content coding negotiation", () => {
+    it("prefers brotli, falls back to gzip, and honours q=0", () => {
+      expect(negotiateEncoding("gzip, deflate, br")).toBe("br");
+      expect(negotiateEncoding("gzip, deflate")).toBe("gzip");
+      expect(negotiateEncoding("br;q=0, gzip")).toBe("gzip");
+      expect(negotiateEncoding("gzip;q=0")).toBe("identity");
+      expect(negotiateEncoding("*")).toBe("br");
+      expect(negotiateEncoding("")).toBe("identity");
+      expect(negotiateEncoding("identity")).toBe("identity");
     });
 
-    const missingAsset = await routes.request(
-      "/yep/assets/missing-deadbeef.js",
-      {
-        headers: { Accept: "text/html,application/xhtml+xml" },
-      },
-    );
-    expect(missingAsset.status).toBe(404);
-    expect(missingAsset.headers.get("content-type")).toContain("text/plain");
-    expect(missingAsset.headers.get("cache-control")).toBe("no-store");
+    it("compresses assets on demand and keeps the payload decodable", async () => {
+      await writeFile(path.join(tempDir, "assets", "app-CREDb_As.js"), BIG_JS);
 
-    const missingApi = await routes.request("/yep/api/missing", {
-      headers: { Accept: "text/html" },
+      const routes = createStaticRoutes({ distPath: tempDir });
+      const response = await routes.request("/assets/app-CREDb_As.js", {
+        headers: { "Accept-Encoding": "gzip" },
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-encoding")).toBe("gzip");
+      expect(response.headers.get("vary")).toBe("Accept-Encoding");
+
+      const body = Buffer.from(await response.arrayBuffer());
+      expect(body.byteLength).toBeLessThan(BIG_JS.length);
+      expect(gunzipSync(body).toString("utf-8")).toBe(BIG_JS);
     });
-    expect(missingApi.status).toBe(404);
-    expect(missingApi.headers.get("cache-control")).toBe("no-store");
+
+    it("leaves the payload alone when the client accepts nothing", async () => {
+      await writeFile(path.join(tempDir, "assets", "app-CREDb_As.js"), BIG_JS);
+
+      const routes = createStaticRoutes({ distPath: tempDir });
+      const response = await routes.request("/assets/app-CREDb_As.js");
+
+      expect(response.status).toBe(200);
+      expect(response.headers.has("content-encoding")).toBe(false);
+      expect(await response.text()).toBe(BIG_JS);
+    });
+
+    it("does not compress already-compressed media", async () => {
+      const png = Buffer.alloc(2048, 7);
+      await writeFile(path.join(tempDir, "assets", "pic-CREDb_As.png"), png);
+
+      const routes = createStaticRoutes({ distPath: tempDir });
+      const response = await routes.request("/assets/pic-CREDb_As.png", {
+        headers: { "Accept-Encoding": "br, gzip" },
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.headers.has("content-encoding")).toBe(false);
+      expect(response.headers.get("content-type")).toBe("image/png");
+    });
+
+    it("skips payloads below the compression threshold", async () => {
+      await writeFile(path.join(tempDir, "assets", "tiny-CREDb_As.js"), "x=1;");
+
+      const routes = createStaticRoutes({ distPath: tempDir });
+      const response = await routes.request("/assets/tiny-CREDb_As.js", {
+        headers: { "Accept-Encoding": "br, gzip" },
+      });
+
+      expect(response.headers.has("content-encoding")).toBe(false);
+    });
+
+    it("serves build-time precompressed siblings when present", async () => {
+      const source = path.join(tempDir, "assets", "pre-CREDb_As.js");
+      await writeFile(source, BIG_JS);
+      // A distinguishable payload proves the sibling was used rather than a
+      // fresh on-demand compression of the source.
+      const marker = `${BIG_JS}//precompressed`;
+      await writeFile(`${source}.gz`, await gzipAsync(Buffer.from(marker)));
+      await writeFile(
+        `${source}.br`,
+        await brotliCompressAsync(Buffer.from(marker)),
+      );
+
+      const routes = createStaticRoutes({ distPath: tempDir });
+      const response = await routes.request("/assets/pre-CREDb_As.js", {
+        headers: { "Accept-Encoding": "gzip" },
+      });
+
+      expect(response.headers.get("content-encoding")).toBe("gzip");
+      const body = Buffer.from(await response.arrayBuffer());
+      expect(gunzipSync(body).toString("utf-8")).toBe(marker);
+    });
   });
 
-  it.each(["styles.css", "font.woff2", "manifest.json"])(
-    "returns 404 for a missing %s request",
-    async (filename) => {
+  describe("conditional requests", () => {
+    it("answers 304 for a matching asset validator", async () => {
+      await writeFile(path.join(tempDir, "assets", "app-CREDb_As.js"), BIG_JS);
+
+      const routes = createStaticRoutes({ distPath: tempDir });
+      const first = await routes.request("/assets/app-CREDb_As.js", {
+        headers: { "Accept-Encoding": "gzip" },
+      });
+      const etag = first.headers.get("etag");
+      expect(etag).toBeTruthy();
+
+      const second = await routes.request("/assets/app-CREDb_As.js", {
+        headers: { "Accept-Encoding": "gzip", "If-None-Match": etag as string },
+      });
+
+      expect(second.status).toBe(304);
+      expect(await second.text()).toBe("");
+      // A 304 must not claim a coding for a body it does not send.
+      expect(second.headers.has("content-encoding")).toBe(false);
+    });
+
+    it("keeps validators distinct per content coding", async () => {
+      await writeFile(path.join(tempDir, "assets", "app-CREDb_As.js"), BIG_JS);
+
+      const routes = createStaticRoutes({ distPath: tempDir });
+      const gzipped = await routes.request("/assets/app-CREDb_As.js", {
+        headers: { "Accept-Encoding": "gzip" },
+      });
+      const identity = await routes.request("/assets/app-CREDb_As.js");
+
+      expect(gzipped.headers.get("etag")).not.toBe(
+        identity.headers.get("etag"),
+      );
+
+      // A gzip validator must not satisfy an identity request, otherwise a
+      // client that cannot decode gzip would be told its copy is current.
+      const crossed = await routes.request("/assets/app-CREDb_As.js", {
+        headers: { "If-None-Match": gzipped.headers.get("etag") as string },
+      });
+      expect(crossed.status).toBe(200);
+    });
+
+    it("answers 304 for the SPA shell so navigations skip the body", async () => {
       const routes = createStaticRoutes({
         distPath: tempDir,
         basePath: "/yep",
       });
 
-      const response = await routes.request(`/yep/${filename}`, {
-        headers: { Accept: "text/html" },
+      const first = await routes.request("/yep/sessions");
+      const etag = first.headers.get("etag");
+      expect(etag).toBeTruthy();
+
+      const second = await routes.request("/yep/sessions", {
+        headers: { "If-None-Match": etag as string },
       });
+      expect(second.status).toBe(304);
+      expect(await second.text()).toBe("");
 
-      expect(response.status).toBe(404);
-      expect(response.headers.get("cache-control")).toBe("no-store");
-    },
-  );
-
-  it("only falls back to the SPA shell for HTML navigations", async () => {
-    const routes = createStaticRoutes({
-      distPath: tempDir,
-      basePath: "/yep",
+      // A rebuilt shell must invalidate the cached copy.
+      await writeFile(path.join(tempDir, "index.html"), "<div>rebuilt</div>");
+      const third = await routes.request("/yep/sessions", {
+        headers: { "If-None-Match": etag as string },
+      });
+      expect(third.status).toBe(200);
+      expect(await third.text()).toContain("rebuilt");
     });
+  });
 
-    const navigation = await routes.request("/yep/projects/project-1", {
-      headers: { Accept: "text/html,application/xhtml+xml" },
-    });
-    expect(navigation.status).toBe(200);
-    expect(await navigation.text()).toContain("<div>app</div>");
+  it("types the PWA manifest so it is parseable and compressible", async () => {
+    await writeFile(
+      path.join(tempDir, "site.webmanifest"),
+      JSON.stringify({ name: "yep" }),
+    );
 
-    const nonHtmlNavigation = await routes.request("/yep/projects/project-1", {
-      headers: { Accept: "application/json" },
-    });
-    expect(nonHtmlNavigation.status).toBe(404);
+    const routes = createStaticRoutes({ distPath: tempDir });
+    const response = await routes.request("/site.webmanifest");
+
+    expect(response.headers.get("content-type")).toBe(
+      "application/manifest+json",
+    );
   });
 });

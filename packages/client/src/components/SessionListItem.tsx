@@ -5,20 +5,28 @@ import { useToastContext } from "../contexts/ToastContext";
 import type { AgentActivity } from "../hooks/useFileActivity";
 import { useI18n } from "../i18n";
 import { formatSmartTime } from "../lib/datetime";
-import { formatTokenCount } from "../lib/tokens";
+import { formatTokenCount, getEffectiveTokenTotal } from "../lib/tokens";
 import type {
+  ContextCompactEvent,
+  ContextCumulativeUsage,
   ContextUsage,
   PendingInputType,
   ProviderName,
   SessionCreatedBy,
+  SessionLastTurnStatus,
+  SessionRetryStatus,
   SessionRuntime,
   SessionStatus,
 } from "../types";
+import { CompactCountBadge } from "./CompactCountBadge";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
+import { PinIcon } from "./PinIcon";
 import { ProviderBadge } from "./ProviderBadge";
 import { SessionMenu } from "./SessionMenu";
+import { SessionTitleGenerationStatus } from "./SessionTitleGenerationStatus";
 import { SessionStatusBadge } from "./StatusBadge";
 import { ThinkingIndicator } from "./ThinkingIndicator";
+import { TokenUsageBadge } from "./TokenUsageBadge";
 
 interface SessionListItemProps {
   // Core (required)
@@ -35,6 +43,9 @@ interface SessionListItemProps {
   runtime?: SessionRuntime;
   pendingInputType?: PendingInputType;
   contextUsage?: ContextUsage;
+  cumulativeUsage?: ContextCumulativeUsage;
+  compactCount?: number;
+  compactEvents?: ContextCompactEvent[];
   status?: SessionStatus;
   provider?: ProviderName;
   /**
@@ -42,6 +53,12 @@ interface SessionListItemProps {
    * restart) and it can be resumed. Only set for owner==="none" sessions.
    */
   interrupted?: boolean;
+  /** Terminal status of the most recent turn (bridge-reported). */
+  lastTurnStatus?: SessionLastTurnStatus;
+  /** Most recent provider error message, if the last turn failed. */
+  lastErrorMessage?: string;
+  /** Present while the provider is retrying a failed request. */
+  retryStatus?: SessionRetryStatus;
   /** SSH host for remote execution (undefined = local) */
   executor?: string;
   /** Explicit creation owner recorded by Yep metadata. */
@@ -63,14 +80,16 @@ interface SessionListItemProps {
   customBadges?: Array<{ label: string; className: string; title?: string }>;
 
   // Actions (menu hidden when all undefined)
-  isStarred?: boolean;
+  isPinned?: boolean;
   isArchived?: boolean;
-  onToggleStar?: () => void;
+  onTogglePin?: () => void;
   onToggleArchive?: () => void;
+  /** Let the sidebar enter archive selection instead of archiving immediately. */
+  onSelectForArchive?: () => void;
   onToggleRead?: () => void;
   onRename?: () => void;
 
-  // Selection (for All Sessions page)
+  // Selection (for session lists and the sidebar)
   isCurrent?: boolean;
   isSelected?: boolean;
   isSelectionMode?: boolean;
@@ -93,17 +112,17 @@ interface SessionListItemProps {
   /** Provider-specific service tier / speed label for provider badge display. */
   serviceTier?: string;
 
-  /** When true (and `mode === "card"`), the card shows a "12 条 · 12.3K
-   *  tokens" line below the timestamp. Used on the All Sessions page so users
-   *  can see at a glance how big each session is. Off by default so other
-   *  callers (Inbox, sidebar) aren't disturbed. */
+  /** When true (and `mode === "card"`), the card shows a "12 条 · 12.3K"
+   *  line below the timestamp. Used on the All Sessions page so users can see
+   *  at a glance how big each session is. Off by default so other callers
+   *  (Inbox, sidebar) aren't disturbed. */
   showSizeMeta?: boolean;
 }
 
 type SessionCreationIndicatorKind = "yep" | "terminal" | "unknown";
 
-function normalizeCreationValue(value: unknown): string {
-  return typeof value === "string" ? value.trim().toLowerCase() : "";
+function normalizeCreationValue(value: string | undefined): string {
+  return value?.trim().toLowerCase() ?? "";
 }
 
 function getSessionCreationIndicator({
@@ -165,8 +184,8 @@ function getSessionCreationIndicator({
  * RecentsPage, and InboxContent.
  *
  * Features:
- * - Star indicator, title, draft badge
- * - SessionMenu (star, archive, rename actions) - hidden when no action handlers
+ * - Pin indicator, title, draft badge
+ * - SessionMenu (pin, archive, rename actions) - hidden when no action handlers
  * - Inline rename editing with optimistic updates
  * - Card mode: context usage indicator, full status badge, time display
  * - Compact mode: abbreviated badges (Appr/Q/Running)
@@ -187,9 +206,15 @@ export function SessionListItem({
   runtime,
   pendingInputType,
   contextUsage,
+  cumulativeUsage,
+  compactCount,
+  compactEvents,
   status,
   provider,
   interrupted,
+  lastTurnStatus,
+  lastErrorMessage,
+  retryStatus,
   executor,
   createdBy,
   originator,
@@ -204,10 +229,11 @@ export function SessionListItem({
   customBadge,
   customBadges,
   // Actions
-  isStarred: isStarredProp,
+  isPinned: isPinnedProp,
   isArchived: isArchivedProp,
-  onToggleStar,
+  onTogglePin,
   onToggleArchive,
+  onSelectForArchive,
   onToggleRead,
   onRename,
   // Selection
@@ -232,7 +258,7 @@ export function SessionListItem({
   const navigate = useNavigate();
 
   // Local state for optimistic updates (only used when action handlers are provided)
-  const [localIsStarred, setLocalIsStarred] = useState<boolean | undefined>(
+  const [localIsPinned, setLocalIsPinned] = useState<boolean | undefined>(
     undefined,
   );
   const [localIsArchived, setLocalIsArchived] = useState<boolean | undefined>(
@@ -241,12 +267,13 @@ export function SessionListItem({
   const [isEditing, setIsEditing] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+  const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
   const [localTitle, setLocalTitle] = useState<string | undefined>(undefined);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const isSavingRef = useRef(false);
 
   // Computed values with optimistic fallback
-  const isStarred = localIsStarred ?? isStarredProp;
+  const isPinned = localIsPinned ?? isPinnedProp;
   const isArchived = localIsArchived ?? isArchivedProp;
   const canArchive = isArchived || runtime?.canArchive !== false;
   const archiveBlockReason =
@@ -259,6 +286,11 @@ export function SessionListItem({
     (messageCount === 0 || (messageCount == null && activity === "in-turn"));
   const displayTitle =
     localTitle ?? title ?? (isNewSession ? "New session" : "Untitled session");
+  const effectiveTokenTotal = getEffectiveTokenTotal(cumulativeUsage);
+  const fallbackContextTokenTotal =
+    effectiveTokenTotal === null && contextUsage && contextUsage.inputTokens > 0
+      ? contextUsage.inputTokens
+      : null;
 
   // Focus input when entering edit mode
   useEffect(() => {
@@ -294,15 +326,16 @@ export function SessionListItem({
   );
 
   // Handlers for menu actions
-  const handleToggleStar = async () => {
-    const newStarred = !isStarred;
-    setLocalIsStarred(newStarred);
+  const handleTogglePin = async () => {
+    const newPinned = !isPinned;
+    setLocalIsPinned(newPinned);
     try {
-      await api.updateSessionMetadata(sessionId, { starred: newStarred });
-      onToggleStar?.();
+      await api.updateSessionMetadata(sessionId, { pinned: newPinned });
+      onTogglePin?.();
     } catch (err) {
-      console.error("Failed to update star status:", err);
-      setLocalIsStarred(undefined); // Revert on error
+      console.error("Failed to update pin status:", err);
+      showToast(t("sessionPinFailed"), "error");
+      setLocalIsPinned(undefined); // Revert on error
     }
   };
 
@@ -410,7 +443,19 @@ export function SessionListItem({
       );
     }
 
-    // Priority 2: In-turn (thinking)
+    // Priority 2: Retrying - still working, but surface the backoff
+    if (activity === "in-turn" && retryStatus) {
+      return (
+        <span
+          className="session-badge session-badge-continue"
+          title={retryStatus.message}
+        >
+          {t("statusBadgeRetryShort")}
+        </span>
+      );
+    }
+
+    // Priority 3: In-turn (thinking)
     if (activity === "in-turn") {
       return <ThinkingIndicator />;
     }
@@ -419,8 +464,20 @@ export function SessionListItem({
       return <span className="session-badge session-badge-external">Hold</span>;
     }
 
-    // Priority 3: Interrupted (e.g. by a server restart) - prompt to continue
-    if (interrupted) {
+    // Priority 4: The last turn failed - surface the provider error
+    if (lastTurnStatus === "failed" || lastErrorMessage) {
+      return (
+        <span
+          className="session-badge session-badge-failed"
+          title={lastErrorMessage}
+        >
+          {t("statusBadgeFailedShort")}
+        </span>
+      );
+    }
+
+    // Priority 5: Interrupted (e.g. by a server restart) - prompt to continue
+    if (interrupted || lastTurnStatus === "interrupted") {
       return (
         <span
           className="session-badge session-badge-continue"
@@ -442,28 +499,10 @@ export function SessionListItem({
     hasUnread && "unread",
     isSelected && "selected",
     isArchived && "archived",
+    isPinned && "pinned",
   ]
     .filter(Boolean)
     .join(" ");
-
-  // Star icon SVG
-  const StarIcon = ({
-    filled,
-    size = 10,
-  }: { filled: boolean; size?: number }) => (
-    <svg
-      className="session-star-icon"
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill={filled ? "currentColor" : "none"}
-      stroke="currentColor"
-      strokeWidth="2"
-      aria-hidden="true"
-    >
-      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
-    </svg>
-  );
 
   return (
     <li className={liClasses}>
@@ -506,9 +545,10 @@ export function SessionListItem({
             // Card mode: title on one line, meta on second line
             <>
               <strong className="session-list-item__title">
-                {isStarred && <StarIcon filled size={12} />}
+                {isPinned && <PinIcon size={12} className="session-pin-icon" />}
                 {isNewSession && <ThinkingIndicator />}
                 {displayTitle}
+                {isGeneratingTitle && <SessionTitleGenerationStatus />}
                 {hasDraft && <span className="session-draft-badge">Draft</span>}
                 {isArchived && (
                   <span className="session-archived-badge">Archived</span>
@@ -543,16 +583,29 @@ export function SessionListItem({
                     {t("cardMessageCount", { count: messageCount })}
                   </span>
                 )}
+                {showSizeMeta && effectiveTokenTotal !== null && (
+                  <TokenUsageBadge
+                    usage={cumulativeUsage}
+                    className="session-list-item__size-meta"
+                  />
+                )}
                 {showSizeMeta &&
-                  contextUsage &&
-                  contextUsage.inputTokens > 0 && (
+                  effectiveTokenTotal === null &&
+                  fallbackContextTokenTotal !== null && (
                     <span
                       className="session-list-item__size-meta"
-                      title={`${contextUsage.inputTokens.toLocaleString()} tokens`}
+                      title={`${fallbackContextTokenTotal.toLocaleString()} context tokens`}
                     >
-                      {formatTokenCount(contextUsage.inputTokens)}
+                      {formatTokenCount(fallbackContextTokenTotal)}
                     </span>
                   )}
+                {showSizeMeta && (
+                  <CompactCountBadge
+                    count={compactCount}
+                    events={compactEvents}
+                    className="session-list-item__size-meta"
+                  />
+                )}
                 {executor && (
                   <span
                     className="session-badge session-badge-executor"
@@ -580,6 +633,9 @@ export function SessionListItem({
                     hasUnread={hasUnread}
                     activity={activity}
                     interrupted={interrupted}
+                    lastTurnStatus={lastTurnStatus}
+                    lastErrorMessage={lastErrorMessage}
+                    retryStatus={retryStatus}
                   />
                 )}
               </span>
@@ -589,11 +645,11 @@ export function SessionListItem({
             <>
               <span className="session-list-item__compact-content">
                 <span className="session-list-item__title-row">
-                  {isStarred && <StarIcon filled />}
                   {isNewSession && <ThinkingIndicator />}
                   <span className="session-list-item__title-text">
                     {displayTitle}
                   </span>
+                  {isGeneratingTitle && <SessionTitleGenerationStatus />}
                 </span>
                 <span className="session-list-item__meta session-list-item__meta--compact">
                   {showProjectName && projectName && (
@@ -620,6 +676,15 @@ export function SessionListItem({
                       className="session-list-item__provider"
                     />
                   )}
+                  <TokenUsageBadge
+                    usage={cumulativeUsage}
+                    className="session-list-item__usage-meta"
+                  />
+                  <CompactCountBadge
+                    count={compactCount}
+                    events={compactEvents}
+                    className="session-list-item__usage-meta"
+                  />
                   {creationIndicatorEl}
                   {hasDraft && (
                     <span className="session-draft-badge">Draft</span>
@@ -636,23 +701,30 @@ export function SessionListItem({
       )}
 
       {/* Only show menu when provider is available (required for clone) */}
-      {provider && (
+      {provider && !(mode === "compact" && isSelectionMode) && (
         <SessionMenu
           sessionId={sessionId}
           projectId={projectId}
-          isStarred={isStarred ?? false}
+          title={displayTitle}
+          isPinned={isPinned ?? false}
           isArchived={isArchived ?? false}
           hasUnread={hasUnread ?? false}
           provider={provider}
           canArchive={canArchive}
           archiveBlockReason={archiveBlockReason}
-          onToggleStar={handleToggleStar}
+          onTogglePin={handleTogglePin}
           onToggleArchive={handleToggleArchive}
+          onSelectForArchive={onSelectForArchive}
           onToggleRead={handleToggleRead}
           onRename={() => {
             setRenameValue(displayTitle);
             setIsEditing(true);
           }}
+          onTitleGenerated={(generatedTitle) => {
+            setLocalTitle(generatedTitle);
+            onRename?.();
+          }}
+          onTitleGenerationStateChange={setIsGeneratingTitle}
           onClone={(newSessionId) => {
             navigate(
               `${basePath}/projects/${projectId}/sessions/${newSessionId}`,

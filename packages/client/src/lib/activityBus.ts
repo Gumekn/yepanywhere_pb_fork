@@ -1,7 +1,12 @@
 import type {
   AgentActivity,
+  ContextCompactEvent,
+  ContextCumulativeUsage,
   ContextUsage,
   PendingInputType,
+  ProviderName,
+  SessionLastTurnStatus,
+  SessionRetryStatus,
   UrlProjectId,
 } from "@yep-anywhere/shared";
 import type { SessionStatus, SessionSummary } from "../types";
@@ -26,7 +31,7 @@ export type FileType =
 
 export interface FileChangeEvent {
   type: "file-change";
-  provider: "claude" | "gemini" | "codex";
+  provider: ProviderName;
   path: string;
   relativePath: string;
   changeType: FileChangeType;
@@ -39,6 +44,8 @@ export interface SessionStatusEvent {
   sessionId: string;
   projectId: UrlProjectId;
   ownership: SessionStatus;
+  /** Session-specific activity when the tracker can prove it. */
+  activity?: AgentActivity;
   timestamp: string;
 }
 
@@ -62,6 +69,12 @@ export interface ProcessStateEvent {
   activity: AgentActivity;
   /** Type of pending input (only set when activity is "waiting-input") */
   pendingInputType?: PendingInputType;
+  /** Terminal status of the most recent turn (bridge-reported). */
+  lastTurnStatus?: SessionLastTurnStatus;
+  /** Most recent provider error message, if the last turn failed. */
+  lastErrorMessage?: string;
+  /** Present while the provider is retrying a failed request. */
+  retryStatus?: SessionRetryStatus;
   timestamp: string;
 }
 
@@ -73,9 +86,9 @@ export interface SessionMetadataChangedEvent {
   title?: string;
   aiTitle?: string;
   archived?: boolean;
+  pinned?: boolean;
+  /** @deprecated Compatibility alias sent by older servers. */
   starred?: boolean;
-  /** Preset model for next session start (set via inspector). */
-  model?: string;
   timestamp: string;
 }
 
@@ -88,6 +101,8 @@ export interface SessionUpdatedEvent {
   type: "session-updated";
   sessionId: string;
   projectId: UrlProjectId;
+  /** Optional producer identity for targeted refresh behavior. */
+  trigger?: "codex-plan-updated" | "zcode-db-reconcile";
   /** New title (derived from first user message) */
   title?: string | null;
   /** New message count */
@@ -96,12 +111,22 @@ export interface SessionUpdatedEvent {
   updatedAt?: string;
   /** Context window usage from the last assistant message */
   contextUsage?: ContextUsage;
+  /** Cumulative token spend across the whole session, when available. */
+  cumulativeUsage?: ContextCumulativeUsage;
+  /** Number of context compactions recorded in the active session history. */
+  compactCount?: number;
+  /** Best-effort details for each recorded context compaction. */
+  compactEvents?: ContextCompactEvent[];
   /** Resolved model name (e.g., "claude-sonnet-4-5-20250929") */
   model?: string;
-  /** Provider-specific reasoning effort (e.g. "xhigh") */
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
   reasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g. "fast") */
   serviceTier?: string;
+  /** Terminal/interrupted status derived from the newest persisted turn. */
+  lastTurnStatus?: SessionLastTurnStatus | null;
+  /** Provider error associated with the newest failed turn. */
+  lastErrorMessage?: string | null;
   timestamp: string;
 }
 
@@ -118,6 +143,8 @@ export interface WorkerActivityEvent {
   activeWorkers: number;
   queueLength: number;
   hasActiveWork: boolean;
+  /** External work survives a web/API shell reload. */
+  runtimeMode?: "embedded" | "external";
   timestamp: string;
 }
 
@@ -414,6 +441,11 @@ class ActivityBus {
     } finally {
       this._isDisconnecting = false;
     }
+  }
+
+  /** Ask mounted consumers to refresh after an intentional background pause. */
+  refreshConsumers(): void {
+    this.emit("refresh", undefined);
   }
 
   /**

@@ -26,6 +26,11 @@ const VIDEO_EXTENSIONS = new Set(["mp4", "webm", "mov", "avi", "mkv", "ogv"]);
 
 const MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
 
+export interface SafeMarkdownOptions {
+  /** Resolve a non-HTTP image reference in a trusted, caller-specific scope. */
+  resolveImageUrl?: (href: string) => string | null;
+}
+
 /**
  * Check if a string looks like an absolute local file path.
  * Must start with / (but not //) and contain a file extension.
@@ -133,34 +138,6 @@ function renderTextWithLocalMediaLinks(text: string): string {
     .join("");
 }
 
-/**
- * GitHub-style slugger state for heading ids. Reset per render so ids stay
- * stable within a single document but don't collide across documents.
- */
-const headingSlugs = new Map<string, number>();
-
-/**
- * Turn a heading's raw text into a stable, url-safe slug.
- * Keeps CJK characters and word characters, drops markdown/emphasis markers
- * and HTML tags, and collapses whitespace to dashes.
- */
-function slugify(text: string): string {
-  const cleaned = text
-    .replace(/[`*_~]/g, "")
-    .replace(/<[^>]+>/g, "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^\w一-鿿\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-  return cleaned || "section";
-}
-
-/** Match fenced ```mermaid code blocks produced by marked (after sanitize). */
-const MERMAID_BLOCK_RE =
-  /<pre><code class="language-mermaid(?:\s[^"]*)?">([\s\S]*?)<\/code><\/pre>/g;
-
 const MARKDOWN_SANITIZE_OPTIONS = {
   allowedTags: [
     "a",
@@ -168,6 +145,7 @@ const MARKDOWN_SANITIZE_OPTIONS = {
     "br",
     "code",
     "del",
+    "details",
     "div",
     "em",
     "h1",
@@ -185,6 +163,7 @@ const MARKDOWN_SANITIZE_OPTIONS = {
     "pre",
     "span",
     "strong",
+    "summary",
     "table",
     "tbody",
     "td",
@@ -204,17 +183,13 @@ const MARKDOWN_SANITIZE_OPTIONS = {
       "data-column",
     ],
     code: ["class"],
+    details: ["class", "open"],
     div: ["class"],
-    h1: ["id"],
-    h2: ["id"],
-    h3: ["id"],
-    h4: ["id"],
-    h5: ["id"],
-    h6: ["id"],
     img: ["src", "alt", "title"],
     input: ["type", "checked", "disabled"],
     ol: ["start"],
     span: ["class"],
+    summary: ["class"],
     td: ["align"],
     th: ["align"],
   },
@@ -228,82 +203,99 @@ const MARKDOWN_SANITIZE_OPTIONS = {
   disallowedTagsMode: "escape" as const,
 };
 
-const renderer: RendererObject<string, string> = {
-  html({ text }) {
-    // Disable raw HTML passthrough from markdown by escaping it.
-    return escapeHtml(text);
-  },
-  text({ text }: Tokens.Text | Tokens.Escape) {
-    return renderTextWithLocalMediaLinks(text);
-  },
-  link(
-    this: RendererThis<string, string>,
-    { href, title, tokens }: Tokens.Link,
+const DETAILS_PLACEHOLDER_PREFIX = "YEP_MARKDOWN_DETAILS_BLOCK_";
+const MAX_DETAILS_DEPTH = 8;
+
+function sanitizeResolvedImageUrl(url: string): string | null {
+  const trimmed = url.trim();
+  if (
+    !trimmed ||
+    /\p{C}/u.test(trimmed) ||
+    !trimmed.startsWith("/") ||
+    trimmed.startsWith("//")
   ) {
-    // Check for local file paths first — rewrite to clickable media placeholder
-    if (isLocalFilePath(href)) {
-      const ext = getExtension(href);
+    return null;
+  }
+  return trimmed;
+}
+
+function createRenderer(
+  options: SafeMarkdownOptions = {},
+): RendererObject<string, string> {
+  return {
+    html({ text }) {
+      // Disable raw HTML passthrough from markdown by escaping it.
+      return escapeHtml(text);
+    },
+    text({ text }: Tokens.Text | Tokens.Escape) {
+      return renderTextWithLocalMediaLinks(text);
+    },
+    link(
+      this: RendererThis<string, string>,
+      { href, title, tokens }: Tokens.Link,
+    ) {
+      // Check for local file paths first — rewrite to clickable media placeholder
+      if (isLocalFilePath(href)) {
+        const ext = getExtension(href);
+        const renderedText = this.parser.parseInline(tokens);
+
+        if (MEDIA_EXTENSIONS.has(ext)) {
+          return renderLocalMediaLink(href, renderedText, ext);
+        }
+        return renderLocalTextFileLink(href, renderedText, title);
+      }
+
+      const safeHref = sanitizeUrl(href);
       const renderedText = this.parser.parseInline(tokens);
 
-      if (MEDIA_EXTENSIONS.has(ext)) {
-        return renderLocalMediaLink(href, renderedText, ext);
+      if (!safeHref) {
+        // Keep readable text when URL protocol is unsafe.
+        return renderedText;
       }
-      return renderLocalTextFileLink(href, renderedText, title);
-    }
 
-    const safeHref = sanitizeUrl(href);
-    const renderedText = this.parser.parseInline(tokens);
+      const escapedHref = escapeHtml(safeHref);
+      const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+      return `<a href="${escapedHref}"${titleAttr}>${renderedText}</a>`;
+    },
+    image({ href, title, text }: Tokens.Image) {
+      // Check for local file paths first — rewrite to clickable media placeholder
+      if (isLocalFilePath(href)) {
+        const ext = getExtension(href);
 
-    if (!safeHref) {
-      // Keep readable text when URL protocol is unsafe.
-      return renderedText;
-    }
-
-    const escapedHref = escapeHtml(safeHref);
-    const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
-    return `<a href="${escapedHref}"${titleAttr}>${renderedText}</a>`;
-  },
-  image({ href, title, text }: Tokens.Image) {
-    // Check for local file paths first — rewrite to clickable media placeholder
-    if (isLocalFilePath(href)) {
-      const ext = getExtension(href);
-
-      if (MEDIA_EXTENSIONS.has(ext)) {
-        return renderLocalMediaLink(href, text, ext);
+        if (MEDIA_EXTENSIONS.has(ext)) {
+          return renderLocalMediaLink(href, text, ext);
+        }
+        // Unrecognized extension — just show text
+        return escapeHtml(text || getFileName(href));
       }
-      // Unrecognized extension — just show text
-      return escapeHtml(text || getFileName(href));
-    }
 
-    const safeSrc = sanitizeUrl(href, ALLOWED_IMAGE_PROTOCOLS);
-    if (!safeSrc) {
-      return escapeHtml(text);
-    }
+      const safeSrc =
+        sanitizeUrl(href, ALLOWED_IMAGE_PROTOCOLS) ??
+        (options.resolveImageUrl
+          ? sanitizeResolvedImageUrl(options.resolveImageUrl(href) ?? "")
+          : null);
+      if (!safeSrc) {
+        return escapeHtml(text);
+      }
 
-    const escapedSrc = escapeHtml(safeSrc);
-    const altAttr = text ? ` alt="${escapeHtml(text)}"` : ' alt=""';
-    const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
-    return `<img src="${escapedSrc}"${altAttr}${titleAttr}>`;
-  },
-  heading(
-    this: RendererThis<string, string>,
-    { tokens, depth, text }: Tokens.Heading,
-  ) {
-    const inner = this.parser.parseInline(tokens);
-    const base = slugify(text);
-    const count = headingSlugs.get(base) ?? 0;
-    const id = count === 0 ? base : `${base}-${count + 1}`;
-    headingSlugs.set(base, count + 1);
-    return `<h${depth} id="${escapeHtml(id)}" class="md-heading">${inner}<a class="md-heading-anchor" href="#${escapeHtml(id)}" aria-hidden="true" tabindex="-1">#</a></h${depth}>\n`;
-  },
-};
+      const escapedSrc = escapeHtml(safeSrc);
+      const altAttr = text ? ` alt="${escapeHtml(text)}"` : ' alt=""';
+      const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+      return `<img src="${escapedSrc}"${altAttr}${titleAttr}>`;
+    },
+  };
+}
 
-const markdownRenderer = new Marked({
-  async: false,
-  gfm: true,
-});
+function createMarkdownRenderer(options: SafeMarkdownOptions = {}): Marked {
+  const instance = new Marked({
+    async: false,
+    gfm: true,
+  });
+  instance.use({ renderer: createRenderer(options) });
+  return instance;
+}
 
-markdownRenderer.use({ renderer });
+const markdownRenderer = createMarkdownRenderer();
 
 /**
  * Return a safe absolute URL for markdown links, or null for unsupported schemes.
@@ -337,18 +329,205 @@ export function sanitizeUrl(
 /**
  * Render markdown to sanitized HTML with raw HTML disabled.
  */
-export function renderSafeMarkdown(markdown: string): string {
-  // Reset per-document slug state so heading ids are unique within a file.
-  headingSlugs.clear();
-  const rendered = markdownRenderer.parse(markdown, { async: false });
+export function renderSafeMarkdown(
+  markdown: string,
+  options: SafeMarkdownOptions = {},
+): string {
+  const renderer = options.resolveImageUrl
+    ? createMarkdownRenderer(options)
+    : markdownRenderer;
+  const { markdown: markdownWithPlaceholders, replacements } =
+    extractDetailsBlocks(markdown, 0, options);
+  const rendered = renderer.parse(markdownWithPlaceholders, {
+    async: false,
+  });
   const html = typeof rendered === "string" ? rendered : "";
   const sanitized = sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS);
-  // Promote ```mermaid fenced blocks to <div class="mermaid"> for client rendering.
-  const withMermaid = sanitized.replace(
-    MERMAID_BLOCK_RE,
-    (_match, code: string) => `<div class="mermaid">${code}</div>`,
-  );
-  return withMermaid.trim();
+  return restoreDetailsBlocks(sanitized, replacements).trim();
+}
+
+function renderSafeMarkdownNested(
+  markdown: string,
+  depth: number,
+  options: SafeMarkdownOptions,
+): string {
+  if (depth > MAX_DETAILS_DEPTH) {
+    return renderSafeMarkdownWithoutDetails(markdown, options);
+  }
+
+  const renderer = options.resolveImageUrl
+    ? createMarkdownRenderer(options)
+    : markdownRenderer;
+  const { markdown: markdownWithPlaceholders, replacements } =
+    extractDetailsBlocks(markdown, depth, options);
+  const rendered = renderer.parse(markdownWithPlaceholders, {
+    async: false,
+  });
+  const html = typeof rendered === "string" ? rendered : "";
+  const sanitized = sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS);
+  return restoreDetailsBlocks(sanitized, replacements).trim();
+}
+
+function renderSafeMarkdownWithoutDetails(
+  markdown: string,
+  options: SafeMarkdownOptions,
+): string {
+  const renderer = options.resolveImageUrl
+    ? createMarkdownRenderer(options)
+    : markdownRenderer;
+  const rendered = renderer.parse(markdown, { async: false });
+  const html = typeof rendered === "string" ? rendered : "";
+  return sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS).trim();
+}
+
+function renderSafeInlineMarkdown(markdown: string): string {
+  const rendered = markdownRenderer.parseInline(markdown, { async: false });
+  const html = typeof rendered === "string" ? rendered : "";
+  return sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS).trim();
+}
+
+function extractDetailsBlocks(
+  markdown: string,
+  depth = 0,
+  options: SafeMarkdownOptions = {},
+): {
+  markdown: string;
+  replacements: Map<string, string>;
+} {
+  if (!/<details[\s>]/i.test(markdown)) {
+    return { markdown, replacements: new Map() };
+  }
+
+  const replacements = new Map<string, string>();
+  let result = "";
+  let lastIndex = 0;
+  let pos = 0;
+  let fence: { char: "`" | "~"; length: number } | null = null;
+
+  while (pos < markdown.length) {
+    const lineStart = pos;
+    const newlineIdx = markdown.indexOf("\n", pos);
+    const lineEnd = newlineIdx === -1 ? markdown.length : newlineIdx + 1;
+    const line = markdown.slice(lineStart, lineEnd);
+    const lineWithoutNewline = line.replace(/\n$/, "");
+
+    if (fence) {
+      if (isClosingFenceLine(lineWithoutNewline, fence)) {
+        fence = null;
+      }
+      pos = lineEnd;
+      continue;
+    }
+
+    const openingFence = getOpeningFence(lineWithoutNewline);
+    if (openingFence) {
+      fence = openingFence;
+      pos = lineEnd;
+      continue;
+    }
+
+    if (/^\s*<details(?:\s[^>]*)?>/i.test(lineWithoutNewline)) {
+      const rest = markdown.slice(lineStart);
+      const closeMatch = /<\/details\s*>/i.exec(rest);
+      if (closeMatch) {
+        const blockStart = lineStart;
+        const blockEnd = lineStart + closeMatch.index + closeMatch[0].length;
+        const block = markdown.slice(blockStart, blockEnd);
+        const renderedDetails = renderDetailsBlock(block, depth, options);
+        if (renderedDetails) {
+          const placeholder = `${DETAILS_PLACEHOLDER_PREFIX}${replacements.size}__`;
+          result += markdown.slice(lastIndex, blockStart);
+          result += `\n\n${placeholder}\n\n`;
+          replacements.set(placeholder, renderedDetails);
+          lastIndex = blockEnd;
+          pos = blockEnd;
+          continue;
+        }
+      }
+    }
+
+    pos = lineEnd;
+  }
+
+  if (replacements.size === 0) {
+    return { markdown, replacements };
+  }
+
+  result += markdown.slice(lastIndex);
+  return { markdown: result, replacements };
+}
+
+function renderDetailsBlock(
+  block: string,
+  depth: number,
+  options: SafeMarkdownOptions,
+): string | null {
+  const match = /^\s*<details([^>]*)>([\s\S]*?)<\/details\s*>\s*$/i.exec(block);
+  if (!match) return null;
+
+  const attrs = match[1] ?? "";
+  const inner = match[2] ?? "";
+  const summaryMatch =
+    /^\s*<summary(?:\s[^>]*)?>([\s\S]*?)<\/summary\s*>/i.exec(inner);
+
+  const summaryMarkdown = summaryMatch?.[1]?.trim() || "Details";
+  const bodyMarkdown = summaryMatch
+    ? inner.slice(summaryMatch[0].length).trim()
+    : inner.trim();
+  const summaryHtml = renderSafeInlineMarkdown(summaryMarkdown);
+  const bodyHtml = bodyMarkdown
+    ? renderSafeMarkdownNested(bodyMarkdown, depth + 1, options)
+    : "";
+  const openAttr = /\sopen(?:\s*=\s*(?:"open"|'open'|open))?(?=\s|$)/i.test(
+    attrs,
+  )
+    ? " open"
+    : "";
+
+  return `<details class="markdown-details"${openAttr}><summary class="markdown-details__summary">${summaryHtml}</summary><div class="markdown-details__content">${bodyHtml}</div></details>`;
+}
+
+function restoreDetailsBlocks(
+  html: string,
+  replacements: ReadonlyMap<string, string>,
+): string {
+  let restored = html;
+  for (const [placeholder, detailsHtml] of replacements) {
+    const escaped = escapeRegExp(placeholder);
+    restored = restored.replace(
+      new RegExp(`<p>\\s*${escaped}\\s*</p>`, "g"),
+      detailsHtml,
+    );
+    restored = restored.replace(new RegExp(escaped, "g"), detailsHtml);
+  }
+  return restored;
+}
+
+function getOpeningFence(
+  line: string,
+): { char: "`" | "~"; length: number } | null {
+  const match = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+  if (!match?.[1]) return null;
+  return {
+    char: match[1][0] as "`" | "~",
+    length: match[1].length,
+  };
+}
+
+function isClosingFenceLine(
+  line: string,
+  fence: { char: "`" | "~"; length: number },
+): boolean {
+  const trimmed = line.trim();
+  const pattern =
+    fence.char === "`"
+      ? new RegExp(`^\`{${fence.length},}$`)
+      : new RegExp(`^~{${fence.length},}$`);
+  return pattern.test(trimmed);
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function escapeHtml(text: string): string {

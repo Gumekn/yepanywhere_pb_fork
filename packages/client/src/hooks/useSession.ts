@@ -1,25 +1,146 @@
 import {
   type AgentActivity,
-  DEFAULT_PERMISSION_MODE,
   type MarkdownAugment,
   type ProviderName,
   getModelContextWindow,
 } from "@yep-anywhere/shared";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 import { getMessageId } from "../lib/mergeMessages";
-import { findPendingTasks } from "../lib/pendingTasks";
+import { type AgentTask, findAgentTasks } from "../lib/pendingTasks";
+import { normalizeProviderPermissionMode } from "../lib/providerPermissionModes";
 import { extractSessionIdFromFileEvent } from "../lib/sessionFile";
 import { generateUUID } from "../lib/uuid";
 import type {
   InputRequest,
   Message,
   PermissionMode,
+  Session,
+  SessionLastTurnStatus,
+  SessionRetryStatus,
   SessionStatus,
 } from "../types";
+import { usePendingMessages } from "./usePendingMessages";
+import { useSessionPermissionMode } from "./useSessionPermissionMode";
+
+// Re-exported for backward compatibility with existing consumers/tests that
+// import these from useSession; the implementation now lives in
+// usePendingMessages.
+export {
+  type PendingMessage,
+  reconcilePendingMessagesWithConfirmedMessages,
+} from "./usePendingMessages";
+
+/** Bridge-reported health of the most recent turn (retry/failure surface). */
+export interface SessionTurnHealth {
+  lastTurnStatus?: SessionLastTurnStatus;
+  lastErrorMessage?: string;
+  retryStatus?: SessionRetryStatus;
+}
+
+/**
+ * Merge a subagent's already-known messages with a freshly loaded transcript,
+ * deduping by message id (uuid preferred). The loaded transcript is canonical;
+ * messages only present in the existing set (e.g. arrived via stream after the
+ * read) are appended.
+ */
+function mergeAgentMessages(existing: Message[], loaded: Message[]): Message[] {
+  const byId = new Map<string, Message>();
+  for (const m of loaded) byId.set(getMessageId(m), m);
+  for (const m of existing) {
+    const id = getMessageId(m);
+    if (!byId.has(id)) byId.set(id, m);
+  }
+  return Array.from(byId.values());
+}
+
+export interface AgentMappingLoadPlan {
+  loadKey: string;
+  tasks: AgentTask[];
+}
+
+/**
+ * Select the tool calls whose agent mappings can be restored from disk.
+ *
+ * Most providers expose mappings while a Task is still pending, so completed
+ * calls drop out and pending calls drive the key. Kimi's authoritative child
+ * ids live in tool.result (completed calls must stay eligible and the key
+ * must advance when another result lands), but the reader also assigns
+ * provisional ids from on-disk agent directories, so pending Kimi calls are
+ * eligible too.
+ */
+export function buildAgentMappingLoadPlan(
+  messages: Message[],
+  provider: Session["provider"] | undefined,
+  sessionId: string,
+): AgentMappingLoadPlan | null {
+  const tasks = findAgentTasks(messages).filter((task) =>
+    provider === "kimi" ? true : task.resultCount === 0,
+  );
+  if (tasks.length === 0) return null;
+
+  return {
+    loadKey: [
+      sessionId,
+      provider ?? "unknown",
+      ...tasks.map(
+        (task) =>
+          `${task.toolUseId}:${task.resultCount}:${task.expectedAgentCount ?? "?"}`,
+      ),
+    ].join("\u0000"),
+    tasks,
+  };
+}
+
+/** Whether a pending Kimi spawn still has child directories left to discover. */
+export function hasUnresolvedKimiAgentMappings(
+  tasks: AgentTask[],
+  idsByToolUse: ReadonlyMap<string, readonly string[]>,
+): boolean {
+  return tasks.some((task) => {
+    if (task.resultCount > 0) return false;
+    const mappedCount = idsByToolUse.get(task.toolUseId)?.length ?? 0;
+    return task.expectedAgentCount === undefined
+      ? mappedCount === 0
+      : mappedCount < task.expectedAgentCount;
+  });
+}
+
+/** Extract a Kimi child id from an agents/<id>/wire.jsonl activity event. */
+export function extractKimiAgentIdFromFileEvent(
+  event: Pick<FileChangeEvent, "provider" | "relativePath">,
+): string | null {
+  if (event.provider !== "kimi") return null;
+  const parts = event.relativePath.split(/[\\/]/);
+  const agentsIndex = parts.lastIndexOf("agents");
+  const agentId = agentsIndex >= 0 ? parts[agentsIndex + 1] : undefined;
+  return agentId && /^agent-\d+$/.test(agentId) ? agentId : null;
+}
+
+/** Initial stream updates need a REST fallback until the session GET lands. */
+export function shouldFetchSessionMetadataForUpdate(
+  session: Session | null,
+): boolean {
+  return session === null;
+}
+
+export function sessionTurnHealthFromSession(
+  session: Pick<Session, "lastTurnStatus" | "lastErrorMessage" | "retryStatus">,
+): SessionTurnHealth | null {
+  return session.lastTurnStatus ||
+    session.lastErrorMessage ||
+    session.retryStatus
+    ? {
+        lastTurnStatus: session.lastTurnStatus,
+        lastErrorMessage: session.lastErrorMessage,
+        retryStatus: session.retryStatus,
+      }
+    : null;
+}
 import {
   type FileChangeEvent,
   type ProcessStateEvent,
+  type SessionMetadataChangedEvent,
   type SessionStatusEvent,
   type SessionUpdatedEvent,
   useFileActivity,
@@ -55,28 +176,335 @@ function processStateFromActivity(
   return undefined;
 }
 
+export function processStateFromProcessEvent(
+  event: Pick<ProcessStateEvent, "activity" | "pendingInputType">,
+): ProcessState | undefined {
+  // pendingInputType is the direct signal that a prompt exists. In
+  // particular, bridge snapshots can briefly pair it with the provider's
+  // underlying in-turn/busy activity while the tool call is blocked.
+  if (event.pendingInputType) return "waiting-input";
+  return processStateFromActivity(event.activity);
+}
+
+function keepPersistedPendingInputForSession(
+  request: InputRequest | null,
+  sessionId: string,
+): InputRequest | null {
+  return request?.source === "persisted" && request.sessionId === sessionId
+    ? request
+    : null;
+}
+
 // Re-export types from useSessionMessages
 export type { AgentContent, AgentContentMap } from "./useSessionMessages";
 
 const THROTTLE_MS = 500;
+const HISTORY_REWRITE_RETRY_DELAYS_MS = [
+  120, 300, 600, 1_000, 1_500, 2_500, 4_000,
+] as const;
+const KIMI_SNAPSHOT_RETRY_DELAYS_MS = [120, 300, 600, 1_200, 2_500] as const;
+// Cap the conditional backoff so a dropped rollback/turn event can't leave the
+// edit spinner spinning indefinitely. Once elapsed crosses this budget we do a
+// single unconditional refresh and clear the pending state.
+const HISTORY_REWRITE_MAX_WAIT_MS = 12_000;
+
+export interface HistoryRewriteSyncTarget {
+  expectedPrompt: string;
+  previousActiveBranchId: string | null;
+}
+
+interface HistoryRewriteSyncRequest extends HistoryRewriteSyncTarget {
+  id: number;
+  startedAt: number;
+}
+
+export function isCodexHistoryRewriteSnapshotReady(
+  session: Session,
+  target: HistoryRewriteSyncTarget,
+): boolean {
+  const branchState = session.codexBranchState ?? session.branchState;
+  const activeBranchId = branchState?.activeBranchId;
+  if (
+    !branchState ||
+    !activeBranchId ||
+    activeBranchId === target.previousActiveBranchId
+  ) {
+    return false;
+  }
+
+  const activeBranch = branchState.branches.find(
+    (branch) => branch.id === activeBranchId,
+  );
+  if (!activeBranch || activeBranch.siblingCount < 2) return false;
+
+  const expectedPrompt = target.expectedPrompt.trim();
+  const persistedPrompt = activeBranch.prompt.trim();
+  return (
+    persistedPrompt === expectedPrompt ||
+    persistedPrompt.startsWith(`${expectedPrompt}\n`)
+  );
+}
 
 // Re-export StreamingMarkdownCallbacks for consumers
 export type { StreamingMarkdownCallbacks } from "./useStreamingContent";
-
-/** Pending message waiting for server confirmation */
-export interface PendingMessage {
-  tempId: string;
-  content: string;
-  timestamp: string;
-  /** Display status text (e.g. "Uploading...", "Sending..."). Defaults to "Sending..." */
-  status?: string;
-}
 
 /** Deferred message queued server-side, waiting for agent's turn to end */
 export interface DeferredMessage {
   tempId?: string;
   content: string;
   timestamp: string;
+}
+
+function normalizeMetadataTitle(title: string): string | undefined {
+  const normalized = title.trim();
+  return normalized || undefined;
+}
+
+export function mergeSessionMetadataChange(
+  session: Session | null,
+  event: SessionMetadataChangedEvent,
+  expectedSessionId: string,
+): Session | null {
+  if (
+    !session ||
+    event.sessionId !== expectedSessionId ||
+    (event.title === undefined && event.aiTitle === undefined)
+  ) {
+    return session;
+  }
+
+  return {
+    ...session,
+    ...(event.title !== undefined && {
+      customTitle: normalizeMetadataTitle(event.title),
+    }),
+    ...(event.aiTitle !== undefined && {
+      aiTitle: normalizeMetadataTitle(event.aiTitle),
+    }),
+  };
+}
+
+export function shouldRefreshSettledAuthoritativeSnapshot(
+  provider: Session["provider"] | undefined,
+  owner: SessionStatus["owner"],
+  processState: ProcessState,
+  eventSessionId: string,
+  expectedSessionId: string,
+): boolean {
+  return (
+    (provider === "pi" || provider === "kimi") &&
+    owner === "self" &&
+    processState === "idle" &&
+    eventSessionId === expectedSessionId
+  );
+}
+
+/**
+ * Providers whose persisted entry ids never match their live stream UUIDs.
+ * They can only converge by replacing the whole visible snapshot.
+ */
+function hasUncorrelatedPersistedIds(
+  provider: Session["provider"] | undefined,
+): boolean {
+  return provider === "pi" || provider === "kimi";
+}
+
+/**
+ * Whether a settled persisted refresh must be forced past the display-mode
+ * "owned sessions stay on their stream" guard.
+ *
+ * `refreshLightweightDisplay` drops any refresh for an owned session unless it
+ * is forced. For Pi/Kimi that guard is fatal: their live stream replay only
+ * covers the last ~30s of process history, so anything written to JSONL while
+ * the client was disconnected (mobile shell suspends its subscriptions while
+ * hidden) can never reach the transcript, and the session appears frozen until
+ * it is reopened. Callers must only force once the turn has settled, because a
+ * forced display refresh discards the not-yet-persisted live tail.
+ */
+export function shouldForceOwnedPersistedDisplayRefresh(
+  provider: Session["provider"] | undefined,
+  owner: SessionStatus["owner"],
+  hasDisplayPage: boolean,
+): boolean {
+  return (
+    hasUncorrelatedPersistedIds(provider) && owner === "self" && hasDisplayPage
+  );
+}
+
+/**
+ * Whether an owned session still needs the focused file watch.
+ *
+ * Owned sessions normally rely on their live stream, but Pi/Kimi cannot replay
+ * a missed tail, so the targeted watch is their only durable convergence
+ * signal when activity-bus events are lost (e.g. a suspended mobile shell).
+ */
+export function shouldWatchOwnedSessionFile(
+  provider: Session["provider"] | undefined,
+): boolean {
+  return hasUncorrelatedPersistedIds(provider);
+}
+
+/**
+ * Pi and Kimi persist different message ids from the UUIDs used by their live
+ * streams. Do not merge or replace an owned live tail with a potentially
+ * lagging full snapshot until the turn has settled.
+ */
+export function shouldDeferUncorrelatedPersistedSync(
+  provider: Session["provider"] | undefined,
+  owner: SessionStatus["owner"],
+  processState: ProcessState | undefined,
+): boolean {
+  return (
+    (provider === "pi" || provider === "kimi") &&
+    owner === "self" &&
+    processState !== "idle"
+  );
+}
+
+function normalizeKimiSnapshotText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function kimiMessageText(
+  message: Message,
+  includeToolResults: boolean,
+): string {
+  const content = message.message?.content ?? message.content;
+  if (typeof content === "string") {
+    return normalizeKimiSnapshotText(content);
+  }
+  if (!Array.isArray(content)) return "";
+
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+      continue;
+    }
+    if (block.type === "thinking" && typeof block.thinking === "string") {
+      parts.push(block.thinking);
+      continue;
+    }
+    if (
+      includeToolResults &&
+      block.type === "tool_result" &&
+      typeof block.content === "string"
+    ) {
+      parts.push(block.content);
+    }
+  }
+  return normalizeKimiSnapshotText(parts.join("\n"));
+}
+
+function kimiHumanPromptText(message: Message): string | null {
+  const role = message.type ?? message.role ?? message.message?.role;
+  if (role !== "user") return null;
+
+  const content = message.message?.content ?? message.content;
+  if (
+    Array.isArray(content) &&
+    content.length > 0 &&
+    content.every((block) => block.type === "tool_result")
+  ) {
+    return null;
+  }
+
+  const text = kimiMessageText(message, false);
+  return text || null;
+}
+
+/**
+ * Kimi emits ACP chunks without stable message ids, while its persisted reader
+ * synthesizes ids from the full wire log. A turn-ended event does not await the
+ * wire persistence queue, so only replace live messages after the disk snapshot
+ * contains both the latest prompt and the latest textual output from that turn.
+ */
+export function isKimiAuthoritativeSnapshotReady(
+  currentMessages: Message[],
+  persistedMessages: Message[],
+): boolean {
+  let currentPromptIndex = -1;
+  let currentPrompt = "";
+  for (let index = currentMessages.length - 1; index >= 0; index -= 1) {
+    const message = currentMessages[index];
+    if (!message) continue;
+    const prompt = kimiHumanPromptText(message);
+    if (prompt !== null) {
+      currentPromptIndex = index;
+      currentPrompt = prompt;
+      break;
+    }
+  }
+  if (currentPromptIndex < 0) return true;
+
+  let persistedPromptIndex = -1;
+  for (let index = persistedMessages.length - 1; index >= 0; index -= 1) {
+    const message = persistedMessages[index];
+    if (message && kimiHumanPromptText(message) === currentPrompt) {
+      persistedPromptIndex = index;
+      break;
+    }
+  }
+  if (persistedPromptIndex < 0) return false;
+
+  let currentTailAnchor = "";
+  for (
+    let index = currentMessages.length - 1;
+    index > currentPromptIndex;
+    index -= 1
+  ) {
+    const message = currentMessages[index];
+    if (!message) continue;
+    const text = kimiMessageText(message, true);
+    if (text) {
+      currentTailAnchor = text;
+      break;
+    }
+  }
+  if (!currentTailAnchor) return true;
+
+  const persistedTail = normalizeKimiSnapshotText(
+    persistedMessages
+      .slice(persistedPromptIndex + 1)
+      .map((message) => kimiMessageText(message, true))
+      .filter(Boolean)
+      .join("\n"),
+  );
+  return persistedTail.includes(currentTailAnchor);
+}
+
+export function shouldRefreshFullPersistedSession(
+  provider: Session["provider"] | undefined,
+): boolean {
+  return (
+    provider === "codex" ||
+    provider === "codex-oss" ||
+    provider === "pi" ||
+    provider === "kimi"
+  );
+}
+
+/**
+ * A "tool_use-only" assistant message carries no streamed text/thinking of its
+ * own — its content is exclusively tool_use blocks. Such messages must not
+ * clear active streaming placeholders: a provider can emit a tool call before
+ * flushing the reasoning/text that preceded it, and clearing here would make
+ * that streamed text vanish until a later message re-emits it. Text-bearing
+ * assistant messages still clear placeholders as before, and the `complete`
+ * event force-clears any leftovers.
+ */
+export function isToolUseOnlyAssistantMessage(
+  sdkMessage: Record<string, unknown>,
+): boolean {
+  const message = sdkMessage.message as { content?: unknown } | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content) || content.length === 0) return false;
+  return content.every(
+    (block) =>
+      typeof block === "object" &&
+      block !== null &&
+      (block as { type?: unknown }).type === "tool_use",
+  );
 }
 
 function extractUserMessageText(
@@ -111,9 +539,10 @@ function extractUserMessageText(
 export function useSession(
   projectId: string,
   sessionId: string,
-  initialStatus?: { owner: "self"; processId: string },
+  initialStatus?: Extract<SessionStatus, { owner: "self" }>,
   streamingMarkdownCallbacks?: StreamingMarkdownCallbacks,
   branchId?: string,
+  preferDisplayHistory = true,
 ) {
   // Use initial status if provided (from navigation state) to connect stream immediately
   const [status, setStatus] = useState<SessionStatus>(
@@ -125,7 +554,39 @@ export function useSession(
   );
   const [pendingInputRequest, setPendingInputRequest] =
     useState<InputRequest | null>(null);
+  const [turnHealth, setTurnHealth] = useState<SessionTurnHealth | null>(null);
   const [error, setError] = useState<Error | null>(null);
+  const [historyRewriteRequest, setHistoryRewriteRequest] =
+    useState<HistoryRewriteSyncRequest | null>(null);
+  const [historyRewriteSignal, setHistoryRewriteSignal] = useState(0);
+  const historyRewriteSequenceRef = useRef(0);
+  const historyRewriteAttemptRef = useRef(0);
+  const historyRewriteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const handledHistoryRewriteSignalRef = useRef(0);
+
+  const signalHistoryRewriteSync = useCallback(() => {
+    setHistoryRewriteSignal((value) => value + 1);
+  }, []);
+
+  const beginHistoryRewriteSync = useCallback(
+    (target: HistoryRewriteSyncTarget) => {
+      historyRewriteSequenceRef.current += 1;
+      historyRewriteAttemptRef.current = 0;
+      handledHistoryRewriteSignalRef.current = historyRewriteSignal;
+      if (historyRewriteTimerRef.current) {
+        clearTimeout(historyRewriteTimerRef.current);
+        historyRewriteTimerRef.current = null;
+      }
+      setHistoryRewriteRequest({
+        ...target,
+        id: historyRewriteSequenceRef.current,
+        startedAt: Date.now(),
+      });
+    },
+    [historyRewriteSignal],
+  );
 
   // Actual session ID from server (may differ from URL sessionId during temp→real ID transition)
   // This happens when createSession returns before the SDK sends the real session ID
@@ -138,10 +599,6 @@ export function useSession(
   const [lastStreamActivityAt, setLastStreamActivityAt] = useState<
     string | null
   >(null);
-
-  // Pending messages queue - messages waiting for server confirmation
-  // These are displayed separately from the main message list
-  const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
 
   // Deferred messages queue - messages queued server-side waiting for agent's turn to end
   const [deferredMessages, setDeferredMessages] = useState<DeferredMessage[]>(
@@ -156,14 +613,18 @@ export function useSession(
     Record<string, MarkdownAugment>
   >({});
 
-  // Permission mode state: localMode is UI-selected, serverMode is confirmed by server
-  const [localMode, setLocalMode] = useState<PermissionMode>(
-    DEFAULT_PERMISSION_MODE,
+  // Permission mode (UI-selected + server-confirmed) is owned by a dedicated hook.
+  const {
+    permissionMode,
+    modeVersion,
+    applyServerModeUpdate,
+    setPermissionMode,
+  } = useSessionPermissionMode(
+    sessionId,
+    status.owner,
+    initialStatus?.permissionMode,
+    initialStatus?.modeVersion,
   );
-  const [serverMode, setServerMode] = useState<PermissionMode>(
-    DEFAULT_PERMISSION_MODE,
-  );
-  const [modeVersion, setModeVersion] = useState<number>(0);
   // Track whether we've already processed a stream "connected" event in this mount.
   // For Codex providers, the first connected-event catch-up fetch can duplicate
   // freshly streamed messages because JSONL and stream IDs are not yet aligned.
@@ -173,6 +634,13 @@ export function useSession(
   // biome-ignore lint/correctness/useExhaustiveDependencies: effect intentionally runs on session switches
   useEffect(() => {
     hasHandledConnectedEventRef.current = false;
+    setLastStreamActivityAt(null);
+    setTurnHealth(null);
+    setHistoryRewriteRequest(null);
+    if (historyRewriteTimerRef.current) {
+      clearTimeout(historyRewriteTimerRef.current);
+      historyRewriteTimerRef.current = null;
+    }
   }, [sessionId]);
 
   // Slash commands available for this session (from init message)
@@ -181,26 +649,17 @@ export function useSession(
   const [sessionTools, setSessionTools] = useState<string[]>([]);
   // MCP servers available for this session (from init message)
   const [mcpServers, setMcpServers] = useState<string[]>([]);
-  const lastKnownModeVersionRef = useRef<number>(0);
-
-  // Apply server mode update only if version is >= our last known version
-  // This syncs both local and server mode to the confirmed value
-  const applyServerModeUpdate = useCallback(
-    (mode: PermissionMode, version: number) => {
-      if (version >= lastKnownModeVersionRef.current) {
-        lastKnownModeVersionRef.current = version;
-        setServerMode(mode);
-        setLocalMode(mode); // Sync local to server-confirmed mode
-        setModeVersion(version);
-      }
-    },
-    [],
-  );
 
   // Handle initial load completion from useSessionMessages
   const handleLoadComplete = useCallback(
     (result: SessionLoadResult) => {
-      setError(null);
+      // A durable provider ID may arrive while the client was disconnected.
+      // Let REST canonicalization repair the URL even when the live ID-change
+      // event was missed.
+      if (result.session.id && result.session.id !== sessionId) {
+        setActualSessionId(result.session.id);
+      }
+
       // Only update status from REST if we don't already have an owned status from navigation.
       // This prevents a race condition where:
       // 1. Session created with initialStatus = {owner: "self"}
@@ -216,17 +675,22 @@ export function useSession(
         return result.status;
       });
 
-      // Sync permission mode from server if owned
-      if (
-        result.status.owner === "self" &&
-        result.status.permissionMode &&
-        result.status.modeVersion !== undefined
-      ) {
-        applyServerModeUpdate(
-          result.status.permissionMode,
-          result.status.modeVersion,
-        );
-      }
+      // Restore the live process mode when owned, otherwise the durable
+      // per-session mode. Older servers do not return the top-level fields,
+      // so use the provider's native default as a compatibility fallback.
+      const restoredPermissionMode =
+        result.permissionMode ??
+        (result.status.owner === "self"
+          ? result.status.permissionMode
+          : undefined) ??
+        normalizeProviderPermissionMode(result.session.provider, undefined);
+      const restoredModeVersion =
+        result.modeVersion ??
+        (result.status.owner === "self"
+          ? result.status.modeVersion
+          : undefined) ??
+        0;
+      applyServerModeUpdate(restoredPermissionMode, restoredModeVersion);
       // Set pending input request from API response immediately. This also
       // clears stale prompts after another client already approved/denied them.
       setPendingInputRequest(
@@ -242,13 +706,14 @@ export function useSession(
       } else if (result.status.owner === "none") {
         setProcessState("idle");
       }
+      setTurnHealth(sessionTurnHealthFromSession(result.session));
       // Set slash commands from API response so the "/" button appears reliably
       // (the SSE init message that normally carries these is discarded after ~30s)
       if (result.slashCommands?.length) {
         setSlashCommands(result.slashCommands.map((c) => c.name));
       }
     },
-    [applyServerModeUpdate],
+    [applyServerModeUpdate, sessionId],
   );
 
   // Handle initial load error
@@ -259,8 +724,13 @@ export function useSession(
   // Use the session messages hook for message state and stream buffering
   const {
     messages,
+    displayPage,
+    displayQuestions,
+    displayQuestionCoverage,
+    hydratedLiveTailDetailRef,
     agentContent,
     toolUseToAgent,
+    toolUseToAgentIds,
     loading,
     session,
     setSession,
@@ -271,6 +741,7 @@ export function useSession(
     registerToolUseAgent,
     setAgentContent,
     setToolUseToAgent,
+    setToolUseToAgentIds,
     setMessages,
     truncateMessagesBefore,
     fetchNewMessages,
@@ -283,48 +754,229 @@ export function useSession(
     loadOlderMessages,
     loadNewerMessages,
     loadTargetMessageWindow,
-    retryInitialLoad: retryMessagesInitialLoad,
+    updateActiveWindowFollowingBottom,
+    activeWindowTrimRevision,
   } = useSessionMessages({
     projectId,
     sessionId,
     branchId,
+    preferDisplayHistory,
+    displayHistoryEligible: status.owner === "none" && processState === "idle",
+    displayHistoryLiveOwned: status.owner === "self",
     onLoadComplete: handleLoadComplete,
     onLoadError: handleLoadError,
   });
 
-  const retryInitialLoad = useCallback(() => {
-    setError(null);
-    retryMessagesInitialLoad();
-  }, [retryMessagesInitialLoad]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: clear stale load errors whenever the session key changes
+  const lastPrunedActiveWindowRevisionRef = useRef(0);
   useEffect(() => {
-    setError(null);
-  }, [projectId, sessionId]);
-
-  // Update local mode (UI selection) and sync to server if process is active
-  const setPermissionMode = useCallback(
-    async (mode: PermissionMode) => {
-      setLocalMode(mode);
-
-      // If there's an active process, immediately sync to server
-      if (status.owner === "self" || status.owner === "external") {
-        try {
-          const result = await api.setPermissionMode(sessionId, mode);
-          // Update server-confirmed mode
-          if (result.modeVersion >= lastKnownModeVersionRef.current) {
-            lastKnownModeVersionRef.current = result.modeVersion;
-            setServerMode(result.permissionMode);
-            setModeVersion(result.modeVersion);
-          }
-        } catch (err) {
-          // If API fails (e.g., no active process), mode will be sent on next message
-          console.warn("Failed to sync permission mode:", err);
+    if (
+      activeWindowTrimRevision === 0 ||
+      activeWindowTrimRevision === lastPrunedActiveWindowRevisionRef.current
+    ) {
+      return;
+    }
+    lastPrunedActiveWindowRevisionRef.current = activeWindowTrimRevision;
+    const retainedMessageIds = new Set(
+      messages.map((message) => getMessageId(message)).filter(Boolean),
+    );
+    setMarkdownAugments((previous) => {
+      let changed = false;
+      const retained: Record<string, MarkdownAugment> = {};
+      for (const [messageId, augment] of Object.entries(previous)) {
+        if (retainedMessageIds.has(messageId)) {
+          retained[messageId] = augment;
+        } else {
+          changed = true;
         }
       }
-    },
-    [sessionId, status.owner],
-  );
+      return changed ? retained : previous;
+    });
+  }, [activeWindowTrimRevision, messages]);
+
+  useEffect(() => {
+    if (!historyRewriteRequest) return;
+
+    let cancelled = false;
+    const requestId = historyRewriteRequest.id;
+    const attemptRefresh = async () => {
+      historyRewriteTimerRef.current = null;
+      const refreshed = await refreshSessionMessages({
+        branchId: null,
+        replaceMessages: true,
+        acceptSnapshot: ({ session: snapshotSession }) =>
+          isCodexHistoryRewriteSnapshotReady(
+            snapshotSession,
+            historyRewriteRequest,
+          ),
+      });
+      if (cancelled) return;
+
+      if (refreshed) {
+        setHistoryRewriteRequest((current) =>
+          current?.id === requestId ? null : current,
+        );
+        return;
+      }
+
+      if (
+        Date.now() - historyRewriteRequest.startedAt >=
+        HISTORY_REWRITE_MAX_WAIT_MS
+      ) {
+        await refreshSessionMessages({
+          branchId: null,
+          replaceMessages: true,
+        });
+        if (!cancelled) {
+          setHistoryRewriteRequest((current) =>
+            current?.id === requestId ? null : current,
+          );
+        }
+        return;
+      }
+
+      const attempt = historyRewriteAttemptRef.current;
+      historyRewriteAttemptRef.current = attempt + 1;
+      const baseDelay =
+        HISTORY_REWRITE_RETRY_DELAYS_MS[
+          Math.min(attempt, HISTORY_REWRITE_RETRY_DELAYS_MS.length - 1)
+        ] ?? 4_000;
+      // Never schedule past the wait budget: clamp so the final attempt fires
+      // right at the cap and takes the unconditional-refresh branch above.
+      const remaining =
+        HISTORY_REWRITE_MAX_WAIT_MS -
+        (Date.now() - historyRewriteRequest.startedAt);
+      const delay = Math.max(0, Math.min(baseDelay, remaining));
+      historyRewriteTimerRef.current = setTimeout(attemptRefresh, delay);
+    };
+
+    const hasFreshSignal =
+      historyRewriteSignal !== handledHistoryRewriteSignalRef.current;
+    handledHistoryRewriteSignalRef.current = historyRewriteSignal;
+    historyRewriteTimerRef.current = setTimeout(
+      attemptRefresh,
+      hasFreshSignal ? 25 : HISTORY_REWRITE_RETRY_DELAYS_MS[0],
+    );
+
+    return () => {
+      cancelled = true;
+      if (historyRewriteTimerRef.current) {
+        clearTimeout(historyRewriteTimerRef.current);
+        historyRewriteTimerRef.current = null;
+      }
+    };
+  }, [historyRewriteRequest, historyRewriteSignal, refreshSessionMessages]);
+
+  // Optimistic pending-message queue, reconciled against `messages` inside the hook.
+  const {
+    pendingMessages,
+    setPendingMessages,
+    addPendingMessage,
+    removePendingMessage,
+    updatePendingMessage,
+  } = usePendingMessages(messages);
+
+  const messagesRef = useRef(messages);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  const processStateRef = useRef(processState);
+  useEffect(() => {
+    processStateRef.current = processState;
+  }, [processState]);
+
+  // Pi and Kimi use different identities for live and persisted
+  // messages. Once a turn settles, replace the whole visible snapshot so a
+  // full persisted response cannot be appended as duplicate historical turns.
+  const authoritativeSnapshotRefreshTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  const authoritativeSnapshotRefreshGenerationRef = useRef(0);
+  const scheduleAuthoritativeSnapshotRefresh = useCallback(() => {
+    const provider = session?.provider;
+    if (provider !== "pi" && provider !== "kimi") {
+      return;
+    }
+
+    const generation = ++authoritativeSnapshotRefreshGenerationRef.current;
+    if (authoritativeSnapshotRefreshTimerRef.current) {
+      clearTimeout(authoritativeSnapshotRefreshTimerRef.current);
+    }
+
+    const refresh = async (attempt: number) => {
+      if (generation !== authoritativeSnapshotRefreshGenerationRef.current) {
+        return;
+      }
+      authoritativeSnapshotRefreshTimerRef.current = null;
+      // A forced display refresh drops the not-yet-persisted live tail, so it
+      // must never land on a turn that restarted while it was pending.
+      if (displayPage && processStateRef.current !== "idle") {
+        return;
+      }
+      // Display mode keeps its own snapshot and refuses unforced refreshes for
+      // owned sessions. Every caller of this scheduler fires only once the turn
+      // has settled, so forcing here is what lets a Pi/Kimi transcript converge
+      // without reopening the session. The `acceptSnapshot` gate is dropped in
+      // display mode because the lightweight path reports no messages, which
+      // would make the Kimi readiness check reject every refresh.
+      const refreshed = await refreshSessionMessages(
+        displayPage
+          ? { replaceMessages: true }
+          : provider === "kimi"
+            ? {
+                replaceMessages: true,
+                acceptSnapshot: ({ messages: persistedMessages }) =>
+                  isKimiAuthoritativeSnapshotReady(
+                    messagesRef.current,
+                    persistedMessages,
+                  ),
+              }
+            : undefined,
+      );
+      if (
+        (!displayPage && provider !== "kimi") ||
+        refreshed ||
+        generation !== authoritativeSnapshotRefreshGenerationRef.current
+      ) {
+        return;
+      }
+
+      // A forced display refresh can lose the race with persistence (metadata
+      // or the display projection may not have caught up yet). Retry within a
+      // bounded window instead of leaving the transcript short a turn.
+      const nextDelay = KIMI_SNAPSHOT_RETRY_DELAYS_MS[attempt + 1];
+      if (nextDelay === undefined) return;
+      authoritativeSnapshotRefreshTimerRef.current = setTimeout(() => {
+        void refresh(attempt + 1);
+      }, nextDelay);
+    };
+
+    const initialDelay =
+      provider === "kimi" ? KIMI_SNAPSHOT_RETRY_DELAYS_MS[0] : 120;
+    authoritativeSnapshotRefreshTimerRef.current = setTimeout(() => {
+      void refresh(0);
+    }, initialDelay);
+  }, [displayPage, refreshSessionMessages, session?.provider]);
+
+  useEffect(() => {
+    return () => {
+      authoritativeSnapshotRefreshGenerationRef.current += 1;
+      if (authoritativeSnapshotRefreshTimerRef.current) {
+        clearTimeout(authoritativeSnapshotRefreshTimerRef.current);
+      }
+    };
+  }, []);
+
+  // A new turn invalidates any pending forced display refresh: replacing the
+  // snapshot now would erase the prompt and tail the stream is producing. The
+  // next settle schedules a fresh one.
+  useEffect(() => {
+    if (!displayPage || processState === "idle") return;
+    if (!authoritativeSnapshotRefreshTimerRef.current) return;
+    authoritativeSnapshotRefreshGenerationRef.current += 1;
+    clearTimeout(authoritativeSnapshotRefreshTimerRef.current);
+    authoritativeSnapshotRefreshTimerRef.current = null;
+  }, [displayPage, processState]);
 
   // Set hold state (soft pause) for the session
   const setHold = useCallback(
@@ -357,74 +1009,123 @@ export function useSession(
     pending: boolean;
   }>({ timer: null, pending: false });
 
-  // Add a message to the pending queue
-  // Generates a tempId that will be sent to the server and echoed back in stream
-  const addPendingMessage = useCallback((content: string): string => {
-    const tempId = `temp-${generateUUID()}`;
-    setPendingMessages((prev) => [
-      ...prev,
-      { tempId, content, timestamp: new Date().toISOString() },
-    ]);
-    return tempId;
-  }, []);
+  // Track the exact set of Task results used for the most recent mapping load.
+  // Kimi's key advances when a new call appears, when a result lands, and
+  // again if another result for the same tool call lands.
+  const agentMappingsLoadKeyRef = useRef<string | null>(null);
+  const knownKimiAgentIdsRef = useRef<Set<string>>(new Set());
+  const [agentMappingsRevision, setAgentMappingsRevision] = useState(0);
 
-  // Remove a pending message by tempId (used when server confirms or send fails)
-  const removePendingMessage = useCallback((tempId: string) => {
-    setPendingMessages((prev) => prev.filter((p) => p.tempId !== tempId));
-  }, []);
-
-  // Update a pending message's fields (e.g. status text)
-  const updatePendingMessage = useCallback(
-    (tempId: string, updates: Partial<PendingMessage>) => {
-      setPendingMessages((prev) =>
-        prev.map((p) => (p.tempId === tempId ? { ...p, ...updates } : p)),
-      );
-    },
-    [],
-  );
-
-  // Track if we've loaded pending agents for this session
-  const pendingAgentsLoadedRef = useRef<string | null>(null);
-
-  // Load pending agent content on session load
-  // This handles page reload while Tasks are running: loads agent content-so-far
   useEffect(() => {
-    // Only run once per session after initial load
-    if (loading || pendingAgentsLoadedRef.current === sessionId) return;
-    if (messages.length === 0) return;
+    knownKimiAgentIdsRef.current = new Set(
+      Array.from(toolUseToAgentIds.values()).flat(),
+    );
+  }, [toolUseToAgentIds]);
 
-    const loadPendingAgents = async () => {
-      // Mark as loaded to prevent re-running
-      pendingAgentsLoadedRef.current = sessionId;
+  // Restore agent mappings and content from persisted provider transcripts.
+  // Other providers load pending Tasks from their streaming transcripts; Kimi's
+  // ids come from the disk reader (authoritative tool.result ids, plus
+  // provisional ids for still-running children from the agents/ directory).
+  useEffect(() => {
+    if (loading || messages.length === 0) return;
 
-      // Find pending Tasks (tool_use without matching tool_result)
-      const pendingTasks = findPendingTasks(messages);
-      if (pendingTasks.length === 0) return;
+    const loadPlan = buildAgentMappingLoadPlan(
+      messages,
+      session?.provider,
+      sessionId,
+    );
+    const loadKey = loadPlan
+      ? `${loadPlan.loadKey}\u0000${agentMappingsRevision}`
+      : null;
+    if (!loadPlan || agentMappingsLoadKeyRef.current === loadKey) {
+      return;
+    }
 
+    // Claim this plan before starting the request so unrelated rerenders do not
+    // launch duplicate mapping/content reads.
+    agentMappingsLoadKeyRef.current = loadKey;
+
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const loadMappedAgents = async (attempt: number): Promise<void> => {
       try {
-        // Get agent mappings (toolUseId → agentId)
+        // Get agent mappings (toolUseId → agentId). An AgentSwarm call fans
+        // out to N children sharing one toolUseId, so group them.
         const { mappings } = await api.getAgentMappings(projectId, sessionId);
-        const mappingsMap = new Map(
-          mappings.map((m) => [m.toolUseId, m.agentId]),
-        );
+        if (cancelled) return;
+        const firstAgentByToolUse = new Map<string, string>();
+        const idsByToolUse = new Map<string, string[]>();
+        for (const m of mappings) {
+          if (!firstAgentByToolUse.has(m.toolUseId)) {
+            firstAgentByToolUse.set(m.toolUseId, m.agentId);
+          }
+          const existing = idsByToolUse.get(m.toolUseId);
+          if (existing) {
+            if (!existing.includes(m.agentId)) existing.push(m.agentId);
+          } else {
+            idsByToolUse.set(m.toolUseId, [m.agentId]);
+          }
+        }
+        if (session?.provider === "kimi") {
+          for (const ids of idsByToolUse.values()) {
+            for (const agentId of ids) {
+              knownKimiAgentIdsRef.current.add(agentId);
+            }
+          }
+        }
 
         // Update the toolUseToAgent state with loaded mappings
         // This allows TaskRenderer to access agentContent even after page reload
         setToolUseToAgent((prev) => {
           const next = new Map(prev);
-          for (const [toolUseId, agentId] of mappingsMap) {
-            if (!next.has(toolUseId)) {
+          for (const [toolUseId, agentId] of firstAgentByToolUse) {
+            // Kimi mappings are authoritative: let a later result-backed id
+            // replace an earlier provisional (directory-scan) one.
+            if (
+              !next.has(toolUseId) ||
+              (session?.provider === "kimi" && next.get(toolUseId) !== agentId)
+            ) {
               next.set(toolUseId, agentId);
             }
           }
           return next;
         });
+        setToolUseToAgentIds((prev) => {
+          const next = new Map(prev);
+          for (const [toolUseId, ids] of idsByToolUse) {
+            if (session?.provider === "kimi") {
+              // The reader returns the session's full mapping set, so a fresh
+              // response replaces (rather than merges with) stale provisional
+              // fan-outs.
+              const existing = next.get(toolUseId) ?? [];
+              const unchanged =
+                existing.length === ids.length &&
+                existing.every((id) => ids.includes(id));
+              if (!unchanged) next.set(toolUseId, [...ids]);
+            } else {
+              const existing = next.get(toolUseId) ?? [];
+              const merged = [...existing];
+              for (const id of ids) {
+                if (!merged.includes(id)) merged.push(id);
+              }
+              next.set(toolUseId, merged);
+            }
+          }
+          return next;
+        });
 
-        // Load content for each pending task that has an agent file
-        for (const task of pendingTasks) {
-          const agentId = mappingsMap.get(task.toolUseId);
-          if (!agentId) continue;
-
+        // Load every mapped child selected by the plan. For a completed Kimi
+        // AgentSwarm this supplies all member statuses and aggregate metrics,
+        // rather than leaving the renderer with result.agentId's first child.
+        const mappedAgentIds = new Set<string>();
+        for (const task of loadPlan.tasks) {
+          for (const id of idsByToolUse.get(task.toolUseId) ?? []) {
+            mappedAgentIds.add(id);
+          }
+        }
+        for (const agentId of mappedAgentIds) {
+          if (cancelled) return;
           try {
             const agentData = await api.getAgentSession(
               projectId,
@@ -432,60 +1133,127 @@ export function useSession(
               agentId,
             );
 
+            if (cancelled) return;
             // Merge into agentContent state, deduping by message ID
             // Use getMessageId to prefer uuid over id
             setAgentContent((prev) => {
               const existing = prev[agentId];
-              if (existing && existing.messages.length > 0) {
-                // Already have content (maybe from stream), merge without duplicates
-                const existingIds = new Set(
-                  existing.messages.map((m) => getMessageId(m)),
-                );
-                const newMessages = agentData.messages.filter(
-                  (m) => !existingIds.has(getMessageId(m)),
-                );
-                return {
-                  ...prev,
-                  [agentId]: {
-                    messages: [...existing.messages, ...newMessages],
-                    status: agentData.status,
-                  },
-                };
-              }
-              // No existing content, use loaded data
+              const merged =
+                existing && existing.messages.length > 0
+                  ? mergeAgentMessages(existing.messages, agentData.messages)
+                  : agentData.messages;
               return {
                 ...prev,
-                [agentId]: agentData,
+                [agentId]: {
+                  messages: merged,
+                  status: agentData.status,
+                  ...(agentData.agentType
+                    ? { agentType: agentData.agentType }
+                    : {}),
+                  ...(agentData.metrics ? { metrics: agentData.metrics } : {}),
+                  ...(agentData.descriptor
+                    ? { descriptor: agentData.descriptor }
+                    : {}),
+                },
               };
             });
           } catch {
             // Skip agents that can't be loaded
           }
         }
+
+        // A pending Kimi call resolves only after the reader spots its
+        // agents/<id> directory, which can appear a moment after the tool
+        // call surfaces. Retry a few times so late directory creation is
+        // picked up without waiting for the tool result.
+        if (cancelled || session?.provider !== "kimi") return;
+        const hasUnresolvedPending = hasUnresolvedKimiAgentMappings(
+          loadPlan.tasks,
+          idsByToolUse,
+        );
+        if (hasUnresolvedPending && attempt < 5) {
+          retryTimer = setTimeout(
+            () => void loadMappedAgents(attempt + 1),
+            3000,
+          );
+        }
       } catch {
         // Silent fail for agent mappings - not critical
       }
     };
 
-    loadPendingAgents();
+    void loadMappedAgents(0);
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
   }, [
+    agentMappingsRevision,
     loading,
     messages,
     projectId,
+    session?.provider,
     sessionId,
     setAgentContent,
     setToolUseToAgent,
+    setToolUseToAgentIds,
   ]);
 
   const fetchPersistedSessionChanges = useCallback(() => {
     const provider = session?.provider;
-    if (provider === "codex" || provider === "codex-oss") {
-      void refreshSessionMessages();
+    // Owned Pi/Kimi turns are already supplied by the live stream. Their
+    // persisted ids cannot be correlated with live UUIDs, so wait until idle
+    // rather than replacing an in-flight tail with a lagging full snapshot.
+    if (
+      shouldDeferUncorrelatedPersistedSync(provider, status.owner, processState)
+    ) {
       return;
     }
 
+    // The defer guard above means an owned Pi/Kimi session has settled by now.
+    // Display mode still drops unforced refreshes for owned sessions, so force
+    // it; otherwise a tail written while this client was disconnected would
+    // stay invisible until the session is reopened.
+    const forceOwnedDisplayRefresh = shouldForceOwnedPersistedDisplayRefresh(
+      provider,
+      status.owner,
+      Boolean(displayPage),
+    );
+
+    // Kimi cannot incrementally slice its synthesized ids. Even while idle,
+    // reject a disk snapshot that has not caught up with the current live tail.
+    if (provider === "kimi") {
+      void refreshSessionMessages(
+        forceOwnedDisplayRefresh
+          ? { replaceMessages: true }
+          : {
+              replaceMessages: true,
+              acceptSnapshot: ({ messages: persistedMessages }) =>
+                isKimiAuthoritativeSnapshotReady(
+                  messagesRef.current,
+                  persistedMessages,
+                ),
+            },
+      );
+      return;
+    }
+
+    // Providers can rewrite recent transcript entries and tool parts in place.
+    if (shouldRefreshFullPersistedSession(provider)) {
+      void refreshSessionMessages(
+        forceOwnedDisplayRefresh ? { replaceMessages: true } : undefined,
+      );
+      return;
+    }
     void fetchNewMessages();
-  }, [fetchNewMessages, refreshSessionMessages, session?.provider]);
+  }, [
+    displayPage,
+    fetchNewMessages,
+    processState,
+    refreshSessionMessages,
+    session?.provider,
+    status.owner,
+  ]);
 
   // Leading + trailing edge throttle:
   // - Leading: fires immediately on first call
@@ -527,16 +1295,45 @@ export function useSession(
         return;
       }
 
-      // For owned sessions: messages come via stream stream, metadata via session-updated event
-      // No API call needed - skip file change processing entirely
+      // Kimi swarm members can create their directories seconds apart. A new
+      // child file is a durable signal to re-read the mapping even after the
+      // bounded timer retries have ended.
+      const kimiAgentId = extractKimiAgentIdFromFileEvent(event);
+      if (kimiAgentId && !knownKimiAgentIdsRef.current.has(kimiAgentId)) {
+        knownKimiAgentIdsRef.current.add(kimiAgentId);
+        agentMappingsLoadKeyRef.current = null;
+        setAgentMappingsRevision((revision) => revision + 1);
+      }
+
+      // Owned sessions normally stay on their stream. Pi/Kimi need one
+      // authoritative replacement after idle because live and persisted ids do
+      // not correlate; a later file event is an additional convergence signal.
       if (status.owner === "self") {
+        if (historyRewriteRequest) {
+          signalHistoryRewriteSync();
+        }
+        if (
+          (session?.provider === "pi" || session?.provider === "kimi") &&
+          processState === "idle"
+        ) {
+          scheduleAuthoritativeSnapshotRefresh();
+        }
         return;
       }
 
       // For external/idle sessions: fetch both messages and metadata via API
       throttledFetch();
     },
-    [sessionId, status.owner, throttledFetch],
+    [
+      historyRewriteRequest,
+      processState,
+      scheduleAuthoritativeSnapshotRefresh,
+      session?.provider,
+      sessionId,
+      signalHistoryRewriteSync,
+      status.owner,
+      throttledFetch,
+    ],
   );
 
   // Handle session content updates via stream (title, messageCount, updatedAt, contextUsage)
@@ -566,8 +1363,82 @@ export function useSession(
           ...(event.serviceTier !== undefined && {
             serviceTier: event.serviceTier,
           }),
+          ...(event.lastTurnStatus !== undefined && {
+            lastTurnStatus: event.lastTurnStatus ?? undefined,
+          }),
+          ...(event.lastErrorMessage !== undefined && {
+            lastErrorMessage: event.lastErrorMessage ?? undefined,
+          }),
         };
       });
+      if (
+        event.lastTurnStatus !== undefined ||
+        event.lastErrorMessage !== undefined
+      ) {
+        const lastTurnStatus = event.lastTurnStatus ?? undefined;
+        const lastErrorMessage = event.lastErrorMessage ?? undefined;
+        setTurnHealth((current) =>
+          lastTurnStatus || lastErrorMessage || current?.retryStatus
+            ? {
+                lastTurnStatus,
+                lastErrorMessage,
+                retryStatus: current?.retryStatus,
+              }
+            : null,
+        );
+      }
+
+      // The initial GET can still be in flight when a stream event arrives
+      // (e.g. the +1s/+3s reconcile events for a new session). Fetch metadata
+      // instead of dropping the event so title/contextUsage land promptly.
+      if (shouldFetchSessionMetadataForUpdate(session)) {
+        void fetchSessionMetadata();
+      }
+
+      if (
+        historyRewriteRequest &&
+        (session?.provider === "codex" || session?.provider === "codex-oss")
+      ) {
+        signalHistoryRewriteSync();
+      }
+
+      if (
+        status.owner === "external" &&
+        event.trigger === "codex-plan-updated"
+      ) {
+        throttledFetch();
+      }
+
+      if (
+        shouldRefreshSettledAuthoritativeSnapshot(
+          session?.provider,
+          status.owner,
+          processState,
+          event.sessionId,
+          sessionId,
+        )
+      ) {
+        scheduleAuthoritativeSnapshotRefresh();
+      }
+    },
+    [
+      processState,
+      fetchSessionMetadata,
+      historyRewriteRequest,
+      scheduleAuthoritativeSnapshotRefresh,
+      session,
+      session?.provider,
+      sessionId,
+      setSession,
+      signalHistoryRewriteSync,
+      status.owner,
+      throttledFetch,
+    ],
+  );
+
+  const handleSessionMetadataChange = useCallback(
+    (event: SessionMetadataChangedEvent) => {
+      setSession((prev) => mergeSessionMetadataChange(prev, event, sessionId));
     },
     [sessionId, setSession],
   );
@@ -577,6 +1448,12 @@ export function useSession(
     (event: SessionStatusEvent) => {
       if (event.sessionId === sessionId) {
         setStatus(event.ownership);
+        const nextProcessState = processStateFromActivity(event.activity);
+        if (nextProcessState) {
+          setProcessState(nextProcessState);
+        } else if (event.ownership.owner === "none") {
+          setProcessState("idle");
+        }
       }
     },
     [sessionId],
@@ -590,28 +1467,65 @@ export function useSession(
       if (event.sessionId !== sessionId) return;
 
       // Update process state from activity bus
-      const nextProcessState = processStateFromActivity(event.activity);
+      const nextProcessState = processStateFromProcessEvent(event);
       if (nextProcessState) {
         setProcessState(nextProcessState);
       }
+      if (historyRewriteRequest) {
+        signalHistoryRewriteSync();
+      }
+      // Mirror bridge-reported turn health (retry/failure). Events always
+      // carry the server's latest truth, so absence clears stale state.
+      setTurnHealth(
+        event.lastTurnStatus || event.lastErrorMessage || event.retryStatus
+          ? {
+              lastTurnStatus: event.lastTurnStatus,
+              lastErrorMessage: event.lastErrorMessage,
+              retryStatus: event.retryStatus,
+            }
+          : null,
+      );
+      if (
+        shouldRefreshSettledAuthoritativeSnapshot(
+          session?.provider,
+          status.owner,
+          nextProcessState ?? processState,
+          event.sessionId,
+          sessionId,
+        )
+      ) {
+        scheduleAuthoritativeSnapshotRefresh();
+      }
 
-      // Always refresh the current request on waiting-input. Codex can emit
-      // multiple approvals in one turn, and the latest event may represent a
-      // different queued request than the one currently shown.
-      if (event.activity === "waiting-input" && event.pendingInputType) {
+      // Always refresh the current request when the event advertises pending
+      // input. Providers can emit multiple approvals in one turn while their
+      // runtime still reports in-turn.
+      // Use the dedicated endpoint so the focused page only refreshes the
+      // prompt instead of reloading all session metadata.
+      if (event.pendingInputType) {
         api
-          .getSessionMetadata(projectId, sessionId)
+          .getPendingInputRequest(sessionId)
           .then((result) => {
-            setPendingInputRequest(result.pendingInputRequest ?? null);
+            setPendingInputRequest(result.request ?? null);
           })
           .catch(() => {
             // Non-critical. A later activity event or reconnect will refresh it.
           });
-      } else if (event.activity !== "waiting-input") {
-        setPendingInputRequest(null);
+      } else {
+        setPendingInputRequest((prev) =>
+          keepPersistedPendingInputForSession(prev, sessionId),
+        );
       }
     },
-    [projectId, sessionId],
+    [
+      processState,
+      historyRewriteRequest,
+      scheduleAuthoritativeSnapshotRefresh,
+      session?.provider,
+      sessionId,
+      signalHistoryRewriteSync,
+      status.owner,
+    ],
   );
 
   // Handle activity bus reconnection (e.g., after phone screen wake).
@@ -620,11 +1534,16 @@ export function useSession(
   // data because the session stream unsubscribes when ownership becomes "none" and
   // nobody triggers a persisted-session refresh.
   const handleActivityReconnect = useCallback(async () => {
-    fetchPersistedSessionChanges();
+    if (historyRewriteRequest) {
+      signalHistoryRewriteSync();
+    } else {
+      fetchPersistedSessionChanges();
+    }
     try {
       const data = await api.getSessionMetadata(projectId, sessionId);
       setStatus(data.ownership);
       setPendingInputRequest(data.pendingInputRequest ?? null);
+      setTurnHealth(sessionTurnHealthFromSession(data.session));
       const nextProcessState = processStateFromActivity(
         data.session.runtime?.activity ?? data.session.activity,
       );
@@ -636,11 +1555,18 @@ export function useSession(
     } catch {
       // Silent fail - non-critical
     }
-  }, [projectId, sessionId, fetchPersistedSessionChanges]);
+  }, [
+    projectId,
+    sessionId,
+    fetchPersistedSessionChanges,
+    historyRewriteRequest,
+    signalHistoryRewriteSync,
+  ]);
 
   useFileActivity({
     onSessionStatusChange: handleSessionStatusChange,
     onFileChange: handleFileChange,
+    onSessionMetadataChange: handleSessionMetadataChange,
     onSessionUpdated: handleSessionUpdated,
     onProcessStateChange: handleProcessStateChange,
     onReconnect: handleActivityReconnect,
@@ -650,18 +1576,51 @@ export function useSession(
   // This is a targeted server-side watch of the currently viewed session file,
   // independent from broad global activity-tree watch behavior.
   const handleSessionWatchChange = useCallback(() => {
-    if (status.owner === "self") return;
+    if (status.owner === "self") {
+      if (historyRewriteRequest) signalHistoryRewriteSync();
+      // Owned Pi/Kimi sessions cannot replay a missed tail, so treat a settled
+      // file write as the signal to pull the authoritative snapshot.
+      if (
+        shouldWatchOwnedSessionFile(session?.provider) &&
+        processState === "idle"
+      ) {
+        scheduleAuthoritativeSnapshotRefresh();
+      }
+      return;
+    }
     throttledFetch();
-  }, [status.owner, throttledFetch]);
+  }, [
+    historyRewriteRequest,
+    processState,
+    scheduleAuthoritativeSnapshotRefresh,
+    session?.provider,
+    signalHistoryRewriteSync,
+    status.owner,
+    throttledFetch,
+  ]);
+
+  const sessionWatchTarget = useMemo(
+    () =>
+      status.owner === "self" &&
+      !historyRewriteRequest &&
+      !shouldWatchOwnedSessionFile(session?.provider)
+        ? null
+        : {
+            sessionId,
+            projectId,
+            provider: session?.provider,
+          },
+    [
+      historyRewriteRequest,
+      projectId,
+      session?.provider,
+      sessionId,
+      status.owner,
+    ],
+  );
 
   const { connected: sessionWatchConnected } = useSessionWatchStream(
-    status.owner !== "self"
-      ? {
-          sessionId,
-          projectId,
-          provider: session?.provider,
-        }
-      : null,
+    sessionWatchTarget,
     {
       onChange: handleSessionWatchChange,
     },
@@ -778,6 +1737,16 @@ export function useSession(
           typeof sdkMessage.type === "string" ? sdkMessage.type : undefined;
         const msgRole = sdkMessage.role as Message["role"] | undefined;
 
+        if (
+          msgType === "system" &&
+          (sdkMessage.subtype === "history_fork_complete" ||
+            // Older servers emitted the same sync signal under this subtype.
+            sdkMessage.subtype === "history_rewrite_complete")
+        ) {
+          signalHistoryRewriteSync();
+          return;
+        }
+
         // Handle stream_event messages (partial content from streaming API)
         // Delegate to useStreamingContent hook
         if (msgType === "stream_event") {
@@ -787,7 +1756,13 @@ export function useSession(
         }
 
         // For assistant messages, clear the matching streaming placeholder.
-        if (msgType === "assistant") {
+        // Skip pure tool_use messages: they don't represent the final form of
+        // any streamed text/thinking, so clearing here would erase still-shown
+        // streamed content before its real message arrives.
+        if (
+          msgType === "assistant" &&
+          !isToolUseOnlyAssistantMessage(sdkMessage)
+        ) {
           // Check if this is a subagent message
           // Use parentToolUseId as the routing key (it's the Task tool_use id)
           const isSubagentMsg =
@@ -903,6 +1878,12 @@ export function useSession(
         ) {
           setProcessState(statusData.state as ProcessState);
         }
+        if (historyRewriteRequest) {
+          signalHistoryRewriteSync();
+        }
+        if (statusData.state === "idle") {
+          scheduleAuthoritativeSnapshotRefresh();
+        }
         // Capture pending input request when waiting for user input
         if (statusData.state === "waiting-input" && statusData.request) {
           setPendingInputRequest(statusData.request);
@@ -917,7 +1898,9 @@ export function useSession(
           }
         } else {
           // Clear pending request when state changes away from waiting-input
-          setPendingInputRequest(null);
+          setPendingInputRequest((prev) =>
+            keepPersistedPendingInputForSession(prev, sessionId),
+          );
         }
       } else if (data.eventType === "deferred-queue") {
         const deferredData = data as {
@@ -931,6 +1914,7 @@ export function useSession(
         setStatus({ owner: "none" });
         setPendingInputRequest(null);
         setDeferredMessages([]);
+        scheduleAuthoritativeSnapshotRefresh();
       } else if (data.eventType === "error") {
         clearStreamingPlaceholders({ main: true, allAgents: true });
       } else if (data.eventType === "connected") {
@@ -973,7 +1957,9 @@ export function useSession(
         if (connectedData.state === "waiting-input" && connectedData.request) {
           setPendingInputRequest(connectedData.request);
         } else {
-          setPendingInputRequest(null);
+          setPendingInputRequest((prev) =>
+            keepPersistedPendingInputForSession(prev, sessionId),
+          );
         }
         if (
           connectedData.permissionMode &&
@@ -1012,17 +1998,37 @@ export function useSession(
         // Sync deferred messages from connected event
         setDeferredMessages(connectedData.deferredMessages ?? []);
 
-        // Fetch messages from JSONL since last known message.
-        // For Codex providers, skip the very first connected-event fetch because
-        // it can duplicate fresh stream messages (ID mismatch between stream and
-        // early JSONL normalization). Reconnects still fetch as normal.
+        // Fetch messages from JSONL since the last known message. Pi/Kimi
+        // cannot provide a correlated incremental slice, so an active turn
+        // stays on the stream and replaces itself only after idle.
+        // Codex keeps its existing first-connect guard for early normalization.
         const connectedProvider = connectedData.provider ?? session?.provider;
         const isCodexProvider =
           connectedProvider === "codex" || connectedProvider === "codex-oss";
         const isFirstConnectedEvent = !hasHandledConnectedEventRef.current;
         hasHandledConnectedEventRef.current = true;
+        const connectedProcessState =
+          connectedData.state === "idle" ||
+          connectedData.state === "in-turn" ||
+          connectedData.state === "waiting-input" ||
+          connectedData.state === "hold"
+            ? (connectedData.state as ProcessState)
+            : undefined;
 
-        if (!(isFirstConnectedEvent && isCodexProvider)) {
+        if (historyRewriteRequest) {
+          signalHistoryRewriteSync();
+        } else if (
+          shouldDeferUncorrelatedPersistedSync(
+            connectedProvider,
+            "self",
+            connectedProcessState,
+          )
+        ) {
+          // The stream will carry the active turn; idle/complete schedules the
+          // authoritative replacement and retries until wire.jsonl catches up.
+        } else if (connectedProvider === "pi" || connectedProvider === "kimi") {
+          scheduleAuthoritativeSnapshotRefresh();
+        } else if (!(isFirstConnectedEvent && isCodexProvider)) {
           fetchNewMessages();
         }
       } else if (data.eventType === "mode-change") {
@@ -1106,10 +2112,14 @@ export function useSession(
       handleStreamEvent,
       clearStreamingPlaceholders,
       removePendingMessage,
+      setPendingMessages,
       streamingMarkdownCallbacks,
       handleStreamMessageEvent,
       handleStreamSubagentMessage,
       registerToolUseAgent,
+      scheduleAuthoritativeSnapshotRefresh,
+      historyRewriteRequest,
+      signalHistoryRewriteSync,
       setSession,
       fetchNewMessages,
       session?.provider,
@@ -1138,59 +2148,6 @@ export function useSession(
     }
   }, [projectId, sessionId]);
 
-  // ── In-turn timeout safety valve ──────────────────────────────────────
-  //
-  // When processState is "in-turn" but no stream activity has arrived for
-  // a while, the agent may have hung / crashed / been OOM-killed without the
-  // WebSocket closing cleanly. Without this guard the UI stays stuck on
-  // "Pondering..." forever.
-  //
-  // The timer fires every IN_TURN_CHECK_INTERVAL_MS. If we're in "in-turn"
-  // and lastStreamActivityAt is older than IN_TURN_STUCK_THRESHOLD_MS, we
-  // probe the server metadata to recover the real state. This is the same
-  // fallback handleStreamError uses on stream error/close.
-  const IN_TURN_STUCK_THRESHOLD_MS = 5 * 60 * 1000; // 5 min
-  const IN_TURN_CHECK_INTERVAL_MS = 30 * 1000; // check every 30 s
-
-  const inTurnCheckTimerRef = useRef<ReturnType<typeof setInterval> | null>(
-    null,
-  );
-
-  useEffect(() => {
-    if (processState !== "in-turn") {
-      if (inTurnCheckTimerRef.current) {
-        clearInterval(inTurnCheckTimerRef.current);
-        inTurnCheckTimerRef.current = null;
-      }
-      return;
-    }
-
-    // Already running
-    if (inTurnCheckTimerRef.current) return;
-
-    inTurnCheckTimerRef.current = setInterval(() => {
-      if (!lastStreamActivityAt) {
-        // No activity recorded at all — check immediately
-        void handleStreamError();
-        return;
-      }
-
-      const elapsed = Date.now() - new Date(lastStreamActivityAt).getTime();
-      if (elapsed > IN_TURN_STUCK_THRESHOLD_MS) {
-        void handleStreamError();
-      }
-    }, IN_TURN_CHECK_INTERVAL_MS);
-
-    return () => {
-      if (inTurnCheckTimerRef.current) {
-        clearInterval(inTurnCheckTimerRef.current);
-        inTurnCheckTimerRef.current = null;
-      }
-    };
-  }, [processState, lastStreamActivityAt, handleStreamError]);
-
-  // ── End in-turn timeout safety valve ────────────────────────────────
-
   // Only connect to session stream when we own the session
   // External sessions are tracked via the activity stream instead
   const { connected, reconnect: reconnectStream } = useSessionStream(
@@ -1204,7 +2161,15 @@ export function useSession(
       setProcessState((current) =>
         current === "waiting-input" ? nextState : current,
       );
-      fetchNewMessages();
+      if (
+        !shouldDeferUncorrelatedPersistedSync(
+          session?.provider,
+          status.owner,
+          nextState,
+        )
+      ) {
+        fetchNewMessages();
+      }
       api
         .getSessionMetadata(projectId, sessionId)
         .then((data) => {
@@ -1223,7 +2188,7 @@ export function useSession(
           // Non-critical. Stream/activity events will continue to update state.
         });
     },
-    [projectId, sessionId, fetchNewMessages],
+    [projectId, sessionId, fetchNewMessages, session?.provider, status.owner],
   );
 
   const sessionUpdatesConnected =
@@ -1235,8 +2200,16 @@ export function useSession(
 
   // Allow external model update (e.g., after /model command switches mid-session)
   const setSessionModel = useCallback(
-    (model: string) => {
-      setSession((prev) => (prev ? { ...prev, model } : prev));
+    (model: string, reasoningEffort?: string) => {
+      setSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              model,
+              ...(reasoningEffort !== undefined && { reasoningEffort }),
+            }
+          : prev,
+      );
     },
     [setSession],
   );
@@ -1245,21 +2218,26 @@ export function useSession(
     session,
     setSessionModel,
     messages,
+    displayPage,
+    displayQuestions,
+    displayQuestionCoverage,
+    hydratedLiveTailDetailRef,
     agentContent, // Subagent messages keyed by agentId (for Task tool)
     setAgentContent, // Setter for merging lazy-loaded agent content
     toolUseToAgent, // Mapping from Task tool_use_id → agentId (for rendering during streaming)
+    toolUseToAgentIds, // Mapping from Task tool_use_id → all subagent ids (AgentSwarm fan-out)
     markdownAugments, // Pre-rendered markdown HTML from REST response (keyed by blockId)
     status,
     processState,
+    turnHealth, // Bridge-reported retry/failure state of the latest turn
     isCompacting, // True when context is being compressed
     isHeld: processState === "hold", // Derived from process state
     pendingInputRequest,
     actualSessionId, // Real session ID from server (may differ from URL during temp→real transition)
-    permissionMode: localMode, // UI-selected mode (sent with next message)
+    permissionMode, // UI-selected mode (sent with next message)
     modeVersion,
     loading,
     error,
-    retryInitialLoad,
     connected,
     sessionWatchConnected,
     sessionUpdatesConnected,
@@ -1283,9 +2261,13 @@ export function useSession(
     loadOlderMessages, // Load next chunk of older messages
     loadNewerMessages, // Load next chunk of newer messages
     loadTargetMessageWindow, // Load a bounded window around a target message
+    updateActiveWindowFollowingBottom, // Allow safe active-tail memory trimming
+    activeWindowTrimRevision, // Force bottom restoration after an accepted trim
     reconnectStream, // Force session stream reconnection (e.g., after process restart)
     truncateMessagesBefore, // Rewind/edit: drop a uuid and everything after it
     refreshSessionMessages, // Reload authoritative JSONL/session snapshot
+    beginHistoryRewriteSync, // Codex edit: wait for the rewritten active branch before applying REST
+    historyRewritePending: historyRewriteRequest !== null,
     markPendingInputResolved, // Clear a resolved approval/question immediately
   };
 }

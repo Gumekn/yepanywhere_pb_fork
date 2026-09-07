@@ -1,18 +1,26 @@
 import { stat } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import type { HttpBindings } from "@hono/node-server";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
+import type { RemoteExecutorConfig } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import { compress } from "hono/compress";
 import {
   ArchiveError,
   type ArchiveProvider,
   type ArchivedSessionRecord,
   type SessionArchiveService,
 } from "./archive/index.js";
-import type { AdminPasswordService } from "./auth/AdminPasswordService.js";
 import type { AuthService } from "./auth/AuthService.js";
 import { createAuthRoutes } from "./auth/routes.js";
+import type { FeishuBindingStore } from "./channels/feishu/binding-store.js";
+import type { FeishuDurableInbox } from "./channels/feishu/inbox.js";
+import type { FeishuOperationStore } from "./channels/feishu/operation-store.js";
+import type { FeishuChannelService } from "./channels/feishu/service.js";
 import type { CodexBridgeController } from "./codex-bridge/types.js";
+import { CodexAppServerHistoryReader } from "./codex-history/CodexAppServerHistoryReader.js";
+import { getCodexHistoryClient } from "./codex-history/CodexHistoryClient.js";
+import { CodexSessionCatalog } from "./codex-history/CodexSessionCatalog.js";
 import type { SessionTitleGenerationConfig } from "./config.js";
 import type { DeviceBridgeService } from "./device/DeviceBridgeService.js";
 import type { FrontendProxy } from "./frontend/index.js";
@@ -20,6 +28,8 @@ import type {
   SessionContentIndexService,
   SessionIndexService,
 } from "./indexes/index.js";
+import type { InteractionBroker } from "./interactions/InteractionBroker.js";
+import { SessionInteractionService } from "./interactions/SessionInteractionService.js";
 import { getLogger } from "./logging/logger.js";
 import type {
   ProjectMetadataService,
@@ -42,8 +52,14 @@ import {
   GEMINI_TMP_DIR,
   GeminiSessionScanner,
 } from "./projects/gemini-scanner.js";
+import {
+  KIMI_SESSIONS_DIR,
+  KimiSessionScanner,
+} from "./projects/kimi-scanner.js";
 import { CLAUDE_PROJECTS_DIR } from "./projects/paths.js";
+import { PiSessionScanner } from "./projects/pi-scanner.js";
 import { ProjectScanner } from "./projects/scanner.js";
+import { ZCodeSessionScanner } from "./projects/zcode-scanner.js";
 import {
   type NativePushService,
   PushNotifier,
@@ -55,6 +71,11 @@ import { createActivityRoutes } from "./routes/activity.js";
 import { createBrowserProfilesRoutes } from "./routes/browser-profiles.js";
 import { createClientLogsRoutes } from "./routes/client-logs.js";
 import { createCodexBridgeRoutes } from "./routes/codex-bridge.js";
+import {
+  type CodexTranscriptStoreSource,
+  createCodexTranscriptRoutes,
+  createDefaultCodexTranscriptStoreSources,
+} from "./routes/codex-transcript.js";
 import { createConnectionsRoutes } from "./routes/connections.js";
 import { createDebugStreamingRoutes } from "./routes/debug-streaming.js";
 import {
@@ -63,12 +84,14 @@ import {
 } from "./routes/deploy.js";
 import { createDevRoutes } from "./routes/dev.js";
 import { createDeviceRoutes } from "./routes/devices.js";
+import { createFeishuChannelRoutes } from "./routes/feishu-channel.js";
 import { createFilesRoutes } from "./routes/files.js";
-import { createFsBrowseRoutes } from "./routes/fs-browse.js";
 import { createGitStatusRoutes } from "./routes/git-status.js";
 import { createGlobalSessionsRoutes } from "./routes/global-sessions.js";
 import { health } from "./routes/health.js";
 import { createInboxRoutes } from "./routes/inbox.js";
+import { createLocalFileRoutes } from "./routes/local-file.js";
+import { createLocalImageRoutes } from "./routes/local-image.js";
 import { createNetworkBindingRoutes } from "./routes/network-binding.js";
 import { createOnboardingRoutes } from "./routes/onboarding.js";
 import { createProcessesRoutes } from "./routes/processes.js";
@@ -83,45 +106,55 @@ import { createServerInfoRoutes } from "./routes/server-info.js";
 import { createSessionsRoutes } from "./routes/sessions.js";
 import { createSettingsRoutes } from "./routes/settings.js";
 import { createSharingRoutes } from "./routes/sharing.js";
-import { ClaudeOllamaProvider } from "./sdk/providers/claude-ollama.js";
-
-import { createLocalFileRoutes } from "./routes/local-file.js";
-import { createLocalImageRoutes } from "./routes/local-image.js";
 import { type UploadDeps, createUploadRoutes } from "./routes/upload.js";
 import { createVersionRoutes } from "./routes/version.js";
-import type {
-  ClaudeSDK,
-  PermissionMode,
-  RealClaudeSDKInterface,
-} from "./sdk/types.js";
+import { createZCodeBridgeRoutes } from "./routes/zcode-bridge.js";
+import { EmbeddedRuntimeController } from "./runtime/EmbeddedRuntimeController.js";
+import { RuntimeEventStore } from "./runtime/RuntimeEventStore.js";
+import type { RuntimeController } from "./runtime/types.js";
+import {
+  configureClaudeRemoteExecutors,
+  configureClaudeSessionFileObserver,
+  getProvider,
+} from "./sdk/providers/index.js";
+import { isProviderEnabled } from "./sdk/providers/policy.js";
+import type { ClaudeSDK, PermissionMode } from "./sdk/types.js";
 import type { BrowserProfileService } from "./services/BrowserProfileService.js";
 import type { ConnectedBrowsersService } from "./services/ConnectedBrowsersService.js";
 import type { ModelInfoService } from "./services/ModelInfoService.js";
 import type { NetworkBindingService } from "./services/NetworkBindingService.js";
+import type { OhMyRouterBenchmarkService } from "./services/OhMyRouterBenchmarkService.js";
 import type { ServerSettingsService } from "./services/ServerSettingsService.js";
+import { SessionCommandService } from "./services/SessionCommandService.js";
 import { SessionTitleService } from "./services/SessionTitleService.js";
 import type { SharingService } from "./services/SharingService.js";
 import { CodexSessionReader } from "./sessions/codex-reader.js";
+import { invalidateCodexSessionManifest } from "./sessions/codex-session-manifest.js";
 import { GeminiSessionReader } from "./sessions/gemini-reader.js";
+import { KimiSessionReader } from "./sessions/kimi-reader.js";
 import { normalizeSession } from "./sessions/normalization.js";
-import { OpenCodeSessionReader } from "./sessions/opencode-reader.js";
+import { PI_SESSIONS_DIR } from "./sessions/pi-files.js";
+import { PiSessionReader } from "./sessions/pi-reader.js";
+import { normalizeProviderGroup } from "./sessions/provider-groups.js";
 import {
   findSessionSummaryAcrossProviders,
+  listSessionsAcrossProviders,
   resolveSessionSources,
 } from "./sessions/provider-resolution.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
 import type { ISessionReader } from "./sessions/types.js";
+import { ZCODE_DB_PATH } from "./sessions/zcode-db.js";
+import { ZCodeSessionReader } from "./sessions/zcode-reader.js";
 import { ExternalSessionTracker } from "./supervisor/ExternalSessionTracker.js";
 import { Supervisor } from "./supervisor/Supervisor.js";
 import type { Project, SessionSummary } from "./supervisor/types.js";
 import type { EventBus } from "./watcher/index.js";
 import { LifecycleWebhookService } from "./webhooks/LifecycleWebhookService.js";
+import { ZCodeBridgeService } from "./zcode-bridge/ZCodeBridgeService.js";
 
 export interface AppOptions {
   /** Legacy SDK interface for mock SDK (for testing) */
   sdk?: ClaudeSDK;
-  /** Real SDK interface with full features */
-  realSdk?: RealClaudeSDKInterface;
   projectsDir?: string; // override for testing
   idleTimeoutMs?: number;
   defaultPermissionMode?: PermissionMode;
@@ -161,8 +194,8 @@ export interface AppOptions {
   maxQueueSize?: number;
   /** AuthService for cookie-based auth (optional) */
   authService?: AuthService;
-  /** System-user-wide administrator credential service. */
-  adminPasswordService?: AdminPasswordService;
+  /** Whether auth is disabled by env var (--auth-disable). Bypasses all auth. */
+  authDisabled?: boolean;
   /** Desktop auth token for Tauri app. Requests with matching X-Desktop-Token header bypass auth. */
   desktopAuthToken?: string;
   /** Server host (for server-info endpoint) */
@@ -193,6 +226,12 @@ export interface AppOptions {
   browserProfileService?: BrowserProfileService;
   /** ServerSettingsService for server-wide settings */
   serverSettingsService?: ServerSettingsService;
+  /** Keep filesystem watchers in sync with shared Claude session sources. */
+  onRemoteExecutorsChanged?: (
+    executors: RemoteExecutorConfig[],
+  ) => void | Promise<void>;
+  /** Runs OhMyRouter model throughput benchmarks from the settings API. */
+  ohmyrouterBenchmarkService?: OhMyRouterBenchmarkService;
   /** ModelInfoService for cached model metadata (context windows, etc.) */
   modelInfoService?: ModelInfoService;
   /** SharingService for session sharing */
@@ -201,7 +240,19 @@ export interface AppOptions {
   deviceBridgeService?: DeviceBridgeService;
   /** Codex bridge for externally launched `codex --remote` TUI sessions. */
   codexBridgeService?: CodexBridgeController;
-  /** AI title generation settings. */
+  /** Canonical Codex transcript sources. Primarily injectable for tests/embedders. */
+  codexTranscriptStoreSources?: readonly CodexTranscriptStoreSource[];
+  /** Self-hosted Feishu/Lark channel configuration and lifecycle. */
+  feishuChannelService?: FeishuChannelService;
+  /** Protected Feishu scope-to-session bindings exposed to authenticated admins. */
+  feishuBindingStore?: FeishuBindingStore;
+  /** Durable Feishu event identities used for recovery and opaque deep links. */
+  feishuInbox?: FeishuDurableInbox;
+  /** Broker-owned interaction projections used for aggregate diagnostics. */
+  feishuOperationStore?: FeishuOperationStore;
+  /** Adapter-wide readiness, including persistence and recovery. */
+  feishuChannelReady?: () => boolean;
+  /** User-triggered AI title generation settings. */
   sessionTitleGeneration?: SessionTitleGenerationConfig;
   /** If non-empty, only these provider names are exposed via the API. */
   enabledProviders?: string[];
@@ -218,12 +269,24 @@ export interface AppOptions {
    * https://host/yep/...). Empty string / omitted = serve at root.
    */
   basePath?: string;
+  /** Runtime facade for live agent operations. Defaults to embedded Supervisor mode. */
+  runtimeController?: RuntimeController;
+  /** Durable authority shared by every interaction channel. */
+  interactionBroker?: InteractionBroker;
 }
 
 export interface AppResult {
   app: Hono<{ Bindings: HttpBindings }>;
   /** Supervisor instance for debug API access */
   supervisor: Supervisor;
+  /** Runtime facade used by live session routes */
+  runtimeController: RuntimeController;
+  /** Provider-neutral pending-input application authority. */
+  sessionInteractionService: SessionInteractionService;
+  /** Provider-neutral application boundary for session commands. */
+  sessionCommandService: SessionCommandService;
+  /** Durable CAS authority used by every interaction channel. */
+  interactionBroker: InteractionBroker;
   /** Project scanner for debug API access */
   scanner: ProjectScanner;
   /** Session reader factory for debug API access */
@@ -233,12 +296,20 @@ export interface AppResult {
 const AUTO_ARCHIVE_AGE_DAYS = 7;
 const AUTO_ARCHIVE_AGE_MS = AUTO_ARCHIVE_AGE_DAYS * 24 * 60 * 60 * 1000;
 
+/**
+ * Smallest response worth compressing.
+ *
+ * Below roughly a packet's worth of payload the CPU and header cost outweigh the
+ * saving, and most small responses here are status probes on the hot path.
+ */
+const COMPRESSION_THRESHOLD_BYTES = 1024;
+
 function normalizeArchiveProviderName(
   provider: string | undefined,
 ): ArchiveProvider | null {
-  if (provider === "claude" || provider === "claude-ollama") return "claude";
-  if (provider === "codex" || provider === "codex-oss") return "codex";
-  return null;
+  const group = normalizeProviderGroup(provider);
+  // Auto-archive only sweeps claude/codex session files.
+  return group === "claude" || group === "codex" ? group : null;
 }
 
 async function findSessionFileForArchive(
@@ -298,14 +369,46 @@ function emitArchiveFileChange(
   }
 }
 
-export function shouldSkipAutoArchiveForStarredSession(
+export function shouldSkipAutoArchiveForPinnedSession(
   session: Pick<SessionSummary, "isStarred">,
   metadata: Pick<SessionMetadata, "isStarred"> | undefined,
 ): boolean {
+  // `isStarred` is the legacy persisted key now interpreted as the session's
+  // pin. Keeping the same bit preserves existing favorites and their retention
+  // protection without a second source of truth.
   return metadata?.isStarred ?? session.isStarred ?? false;
 }
 
+/**
+ * Durable event journal for the embedded runtime.
+ *
+ * Without it `subscribeSession` can only replay `Process.getMessageHistory()`,
+ * which keeps roughly the last 15–30 seconds. A shell that is disconnected for
+ * longer — the mobile shell drops its subscriptions whenever the document is
+ * hidden — therefore loses every message produced in the meantime and can only
+ * recover by reloading the persisted transcript. Journaling to disk (the same
+ * store the standalone runtime worker uses) lets a reconnect resume from the
+ * client's last message id instead.
+ *
+ * Disabled without a data directory (route tests, embedded fixtures) or when
+ * `YEP_RUNTIME_EVENT_JOURNAL=0`.
+ */
+export function createEmbeddedRuntimeEventStore(
+  dataDir: string | undefined,
+): RuntimeEventStore | undefined {
+  if (!dataDir || process.env.YEP_RUNTIME_EVENT_JOURNAL === "0") {
+    return undefined;
+  }
+  return new RuntimeEventStore({
+    eventsDir: join(dataDir, "runtime", "events"),
+  });
+}
+
 export function createApp(options: AppOptions): AppResult {
+  configureClaudeRemoteExecutors(
+    options.serverSettingsService?.getSetting("remoteExecutors") ?? [],
+  );
+
   // When running behind a reverse proxy that adds a path prefix (Caddy
   // exposes us at /yep/), wrap the Hono instance so every subsequent
   // .use/.route/.get call matches the prefixed URL automatically — we
@@ -315,6 +418,23 @@ export function createApp(options: AppOptions): AppResult {
   const root = new Hono<{ Bindings: HttpBindings }>();
   const app = basePath ? root.basePath(basePath) : root;
 
+  // Response compression, registered before the security middleware so it wraps
+  // every `/api/*` response including error bodies.
+  //
+  // Session payloads are dominated by server-rendered augment output — on a
+  // measured 1.72 MB pi session response, `_highlightedContentHtml` alone was
+  // 1.49 MB (73%) — and that HTML is highly redundant: gzip took the whole body
+  // to 0.238 MB, a 7.2:1 ratio. Uncompressed that response needed roughly two
+  // minutes over a throttled remote tunnel.
+  //
+  // Hono's middleware is safe to apply broadly here: it skips responses that
+  // already carry `Content-Encoding` or `Transfer-Encoding` (so `streamSSE`
+  // output is untouched, and `text/event-stream` is excluded from its
+  // compressible-type list as well), skips non-compressible content types (the
+  // APK and image downloads served through `stream()`), honours
+  // `Cache-Control: no-transform`, and leaves bodies under the threshold alone.
+  app.use("/api/*", compress({ threshold: COMPRESSION_THRESHOLD_BYTES }));
+
   // Security middleware: host validation, CORS, custom header requirement
   app.use("/api/*", hostCheckMiddleware);
   app.use("/api/*", corsMiddleware);
@@ -322,11 +442,12 @@ export function createApp(options: AppOptions): AppResult {
 
   // Auth middleware (if authService is provided)
   // The middleware checks authService.isEnabled() dynamically
-  if (options.authService && options.adminPasswordService) {
+  if (options.authService) {
     app.use(
       "/api/*",
       createAuthMiddleware({
         authService: options.authService,
+        authDisabled: options.authDisabled,
         desktopAuthToken: options.desktopAuthToken,
       }),
     );
@@ -334,30 +455,86 @@ export function createApp(options: AppOptions): AppResult {
 
   // Auth routes (always mounted if authService is provided)
   // This allows checking auth status and enabling/disabling from settings
-  if (options.authService && options.adminPasswordService) {
+  if (options.authService) {
     app.route(
       "/api/auth",
       createAuthRoutes({
         authService: options.authService,
-        adminPasswordService: options.adminPasswordService,
+        authDisabled: options.authDisabled,
         desktopAuthToken: options.desktopAuthToken,
       }),
     );
   }
 
   // Create dependencies
-  const codexScanner = new CodexSessionScanner();
-  const geminiScanner = new GeminiSessionScanner();
+  const providerEnabled = (name: string): boolean =>
+    isProviderEnabled(name, options.enabledProviders);
+  const codexEnabled = providerEnabled("codex") || providerEnabled("codex-oss");
+  const geminiEnabled =
+    providerEnabled("gemini") || providerEnabled("gemini-acp");
+  const codexScanner = codexEnabled ? new CodexSessionScanner() : undefined;
+  const geminiScanner = geminiEnabled ? new GeminiSessionScanner() : undefined;
+  const kimiScanner = providerEnabled("kimi")
+    ? new KimiSessionScanner()
+    : undefined;
+  const piScanner = providerEnabled("pi")
+    ? new PiSessionScanner({ sessionsDir: PI_SESSIONS_DIR })
+    : undefined;
+  const zcodeScanner = providerEnabled("zcode")
+    ? new ZCodeSessionScanner()
+    : undefined;
   const scanner = new ProjectScanner({
     projectsDir: options.projectsDir,
+    remoteExecutors:
+      options.serverSettingsService?.getSetting("remoteExecutors") ?? [],
     codexScanner,
     geminiScanner,
+    kimiScanner,
+    piScanner,
+    zcodeScanner,
+    enableCodex: codexEnabled,
+    enableGemini: geminiEnabled,
+    enableKimi: Boolean(kimiScanner),
+    enablePi: Boolean(piScanner),
+    enableZCode: Boolean(zcodeScanner),
     projectMetadataService: options.projectMetadataService,
     eventBus: options.eventBus,
     cacheTtlMs: options.projectScanCacheTtlMs,
   });
+  configureClaudeSessionFileObserver((update) => {
+    scanner.invalidateCache();
+    options.eventBus?.emit({
+      type: "file-change",
+      provider: "claude",
+      path: update.localPath,
+      relativePath: relative(update.projectsDir, update.localPath),
+      changeType: "modify",
+      timestamp: new Date().toISOString(),
+      fileType: "session",
+    });
+  });
   const readerCache = new Map<string, ISessionReader>();
   const maxReaderCacheSize = 500;
+
+  // Kimi and Pi readers cache their shared-tree directory scans briefly. Pi's
+  // parsed-session cache is much larger, so invalidate only the file that
+  // changed instead of making every project reparse its whole history.
+  options.eventBus?.subscribe((event) => {
+    if (
+      event.type !== "file-change" ||
+      (event.provider !== "kimi" && event.provider !== "pi")
+    ) {
+      return;
+    }
+    for (const reader of readerCache.values()) {
+      if (event.provider === "kimi" && reader instanceof KimiSessionReader) {
+        reader.invalidateCache();
+      }
+      if (event.provider === "pi" && reader instanceof PiSessionReader) {
+        reader.invalidateFile(event.path);
+      }
+    }
+  });
 
   const getOrCreateReader = <T extends ISessionReader>(
     key: string,
@@ -407,7 +584,7 @@ export function createApp(options: AppOptions): AppResult {
             new GeminiSessionReader({
               sessionsDir: GEMINI_TMP_DIR,
               projectPath: project.path,
-              hashToCwd: geminiScanner.getHashToCwd(),
+              hashToCwd: geminiScanner?.getHashToCwd(),
             }),
         );
       case "claude":
@@ -426,14 +603,65 @@ export function createApp(options: AppOptions): AppResult {
             }),
         );
       }
-      case "opencode":
+      case "pi": {
+        const mis = options.modelInfoService;
         return getOrCreateReader(
-          `opencode::${project.path}`,
+          `pi::${PI_SESSIONS_DIR}::${project.path}`,
           () =>
-            new OpenCodeSessionReader({
+            new PiSessionReader({
+              sessionsDir: PI_SESSIONS_DIR,
+              projectPath: project.path,
+              getContextWindow: mis
+                ? (model, provider, sessionId) =>
+                    mis.getCachedContextWindow(model, provider, sessionId)
+                : undefined,
+            }),
+        );
+      }
+      case "kimi":
+        return getOrCreateReader(
+          `kimi::${KIMI_SESSIONS_DIR}::${project.path}`,
+          () =>
+            new KimiSessionReader({
+              sessionsDir: KIMI_SESSIONS_DIR,
               projectPath: project.path,
             }),
         );
+      case "zcode": {
+        const mis = options.modelInfoService;
+        return getOrCreateReader(
+          `zcode::${project.path}`,
+          () =>
+            new ZCodeSessionReader({
+              projectPath: project.path,
+              getContextWindow: mis
+                ? (model, provider, sessionId) =>
+                    mis.getContextWindow(model, provider, sessionId)
+                : undefined,
+              getForkParentSessionId: (sessionId) =>
+                options.sessionMetadataService?.getForkParentSessionId?.(
+                  sessionId,
+                ),
+            }),
+        );
+      }
+      // Fallback keeps the switch exhaustive over ProviderName; unknown
+      // providers read as Claude (matches the client's GenericProvider).
+      default: {
+        const mis = options.modelInfoService;
+        return getOrCreateReader(
+          `claude::${project.sessionDir}${mergedKey}`,
+          () =>
+            new ClaudeSessionReader({
+              sessionDir: project.sessionDir,
+              additionalDirs: project.mergedSessionDirs,
+              getContextWindow: mis
+                ? (model, provider, sessionId) =>
+                    mis.getContextWindow(model, provider, sessionId)
+                : undefined,
+            }),
+        );
+      }
     }
   };
   const codexReaderFactory = (projectPath: string): CodexSessionReader =>
@@ -445,6 +673,33 @@ export function createApp(options: AppOptions): AppResult {
           projectPath,
         }),
     );
+  const codexHistoryClient =
+    codexEnabled && !options.sdk ? getCodexHistoryClient() : undefined;
+  const codexAppServerHistoryReader = codexHistoryClient
+    ? new CodexAppServerHistoryReader({ client: codexHistoryClient })
+    : undefined;
+  const codexSessionCatalog = codexHistoryClient
+    ? new CodexSessionCatalog({
+        client: codexHistoryClient,
+        sessionsDir: CODEX_SESSIONS_DIR,
+      })
+    : undefined;
+  codexScanner?.setSessionCatalog(codexSessionCatalog);
+  options.eventBus?.subscribe((event) => {
+    if (event.type !== "file-change" || event.provider !== "codex") return;
+    invalidateCodexSessionManifest(CODEX_SESSIONS_DIR);
+    const match = basename(event.path).match(
+      /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(?:\.zst)?$/i,
+    );
+    if (match?.[1] && event.changeType === "delete") {
+      codexSessionCatalog?.invalidateSession(match[1]);
+    } else {
+      // Create/modify must not evict a manifest-confirmed row while the state
+      // DB is still catching up. Expire the snapshot and let reconciliation
+      // refresh it in place; only a confirmed delete removes the overlay.
+      codexSessionCatalog?.invalidate();
+    }
+  });
   const geminiReaderFactory = (projectPath: string): GeminiSessionReader =>
     getOrCreateReader(
       `gemini-extra::${GEMINI_TMP_DIR}::${projectPath}`,
@@ -452,9 +707,44 @@ export function createApp(options: AppOptions): AppResult {
         new GeminiSessionReader({
           sessionsDir: GEMINI_TMP_DIR,
           projectPath,
-          hashToCwd: geminiScanner.getHashToCwd(),
+          hashToCwd: geminiScanner?.getHashToCwd(),
         }),
     );
+  const piReaderFactory = (projectPath: string): PiSessionReader =>
+    getOrCreateReader(`pi::${PI_SESSIONS_DIR}::${projectPath}`, () => {
+      const mis = options.modelInfoService;
+      return new PiSessionReader({
+        sessionsDir: PI_SESSIONS_DIR,
+        projectPath,
+        getContextWindow: mis
+          ? (model, provider, sessionId) =>
+              mis.getCachedContextWindow(model, provider, sessionId)
+          : undefined,
+      });
+    });
+  const kimiReaderFactory = (projectPath: string): KimiSessionReader =>
+    getOrCreateReader(
+      `kimi-extra::${KIMI_SESSIONS_DIR}::${projectPath}`,
+      () =>
+        new KimiSessionReader({
+          sessionsDir: KIMI_SESSIONS_DIR,
+          projectPath,
+        }),
+    );
+  const zcodeReaderFactory = (projectPath: string): ZCodeSessionReader =>
+    getOrCreateReader(`zcode-extra::${ZCODE_DB_PATH}::${projectPath}`, () => {
+      const mis = options.modelInfoService;
+      return new ZCodeSessionReader({
+        dbPath: ZCODE_DB_PATH,
+        projectPath,
+        getContextWindow: mis
+          ? (model, provider, sessionId) =>
+              mis.getCachedContextWindow(model, provider, sessionId)
+          : undefined,
+        getForkParentSessionId: (sessionId) =>
+          options.sessionMetadataService?.getForkParentSessionId?.(sessionId),
+      });
+    });
   const getSessionSummary = async (sessionId: string, projectId: string) => {
     const project = await scanner.getProject(projectId);
     if (!project) return null;
@@ -464,33 +754,104 @@ export function createApp(options: AppOptions): AppResult {
       project.id,
       {
         readerFactory,
+        sessionMetadataService: options.sessionMetadataService,
         codexSessionsDir: CODEX_SESSIONS_DIR,
         codexReaderFactory,
         geminiSessionsDir: GEMINI_TMP_DIR,
         geminiReaderFactory,
-        geminiHashToCwd: geminiScanner.getHashToCwd(),
+        geminiHashToCwd: geminiScanner?.getHashToCwd(),
+        piSessionsDir: PI_SESSIONS_DIR,
+        zcodeDbPath: ZCODE_DB_PATH,
+        piReaderFactory,
+        zcodeReaderFactory,
+        kimiSessionsDir: KIMI_SESSIONS_DIR,
+        kimiReaderFactory,
       },
       options.sessionMetadataService?.getProvider(sessionId),
     );
     return resolved?.summary ?? null;
   };
   const supervisor = new Supervisor({
+    // Claude Code used to be the implicit provider. Codex is the supported
+    // default now; tests can still supply the legacy mock SDK explicitly.
+    provider: options.sdk ? undefined : (getProvider("codex") ?? undefined),
     sdk: options.sdk,
-    realSdk: options.realSdk,
     idleTimeoutMs: options.idleTimeoutMs,
     defaultPermissionMode: options.defaultPermissionMode,
     eventBus: options.eventBus,
     maxWorkers: options.maxWorkers,
     idlePreemptThresholdMs: options.idlePreemptThresholdMs,
     maxQueueSize: options.maxQueueSize,
+    enabledProviders: options.enabledProviders,
     // Save executor for remote sessions to support resume
     onSessionExecutor: options.sessionMetadataService
       ? (sessionId, executor) =>
           options.sessionMetadataService?.setExecutor(sessionId, executor) ??
           Promise.resolve()
       : undefined,
+    onSessionIdChanged: options.sessionMetadataService
+      ? async (oldSessionId, newSessionId, projectId) => {
+          await options.sessionMetadataService?.remapSessionId(
+            oldSessionId,
+            newSessionId,
+          );
+          options.eventBus?.emit({
+            type: "session-metadata-changed",
+            sessionId: newSessionId,
+            projectId,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      : undefined,
     onSessionSummary: getSessionSummary,
   });
+  const runtimeController =
+    options.runtimeController ??
+    new EmbeddedRuntimeController(
+      supervisor,
+      options.eventBus,
+      createEmbeddedRuntimeEventStore(options.dataDir),
+    );
+  const sessionInteractionService = new SessionInteractionService({
+    runtimeController,
+    codexBridgeService: options.codexBridgeService,
+    sessionMetadataService: options.sessionMetadataService,
+    eventBus: options.eventBus,
+    interactionBroker: options.interactionBroker,
+  });
+  const interactionBroker = sessionInteractionService.getInteractionBroker();
+  const sessionCommandService = new SessionCommandService({
+    runtimeController,
+    scanner,
+    readerFactory,
+    sessionInteractionService,
+    sessionMetadataService: options.sessionMetadataService,
+    eventBus: options.eventBus,
+    serverSettingsService: options.serverSettingsService,
+    modelInfoService: options.modelInfoService,
+    recentsService: options.recentsService,
+    codexSessionsDir: CODEX_SESSIONS_DIR,
+    codexReaderFactory,
+    geminiScanner,
+    geminiSessionsDir: GEMINI_TMP_DIR,
+    geminiReaderFactory,
+    zcodeDbPath: ZCODE_DB_PATH,
+    piSessionsDir: PI_SESSIONS_DIR,
+    piReaderFactory,
+    zcodeReaderFactory,
+    kimiSessionsDir: KIMI_SESSIONS_DIR,
+    kimiReaderFactory,
+    enabledProviders: options.enabledProviders,
+  });
+
+  // Bridge clients observe the shared Codex upstream and
+  // replay lifecycle changes onto the EventBus. Teach them which sessions the
+  // Supervisor owns so they stay silent about ownership for owned sessions;
+  // otherwise a bridge poll racing the Supervisor's own ownership event flips
+  // the client into a transient "external session" banner during resume.
+  const bridgeOwnershipResolver = (sessionId: string): boolean =>
+    Boolean(supervisor.getProcessForSession(sessionId));
+  options.codexBridgeService?.setOwnershipResolver?.(bridgeOwnershipResolver);
 
   // Create external session tracker if eventBus is available
   const externalTracker = options.eventBus
@@ -502,15 +863,18 @@ export function createApp(options: AppOptions): AppResult {
         // Callback to get session summary for new external sessions
         // projectId is now UrlProjectId (base64url) - ExternalSessionTracker converts it
         getSessionSummary,
+        getRuntimeProcess: (sessionId) =>
+          runtimeController.getProcessForSession(sessionId),
       })
     : undefined;
 
+  let sessionTitleService: SessionTitleService | undefined;
   if (
     options.eventBus &&
     options.sessionMetadataService &&
     options.sessionTitleGeneration?.enabled
   ) {
-    const sessionTitleService = new SessionTitleService({
+    sessionTitleService = new SessionTitleService({
       eventBus: options.eventBus,
       metadataService: options.sessionMetadataService,
       ...options.sessionTitleGeneration,
@@ -523,11 +887,18 @@ export function createApp(options: AppOptions): AppResult {
           project.id,
           {
             readerFactory,
+            sessionMetadataService: options.sessionMetadataService,
             codexSessionsDir: CODEX_SESSIONS_DIR,
             codexReaderFactory,
             geminiSessionsDir: GEMINI_TMP_DIR,
             geminiReaderFactory,
-            geminiHashToCwd: geminiScanner.getHashToCwd(),
+            geminiHashToCwd: geminiScanner?.getHashToCwd(),
+            piSessionsDir: PI_SESSIONS_DIR,
+            zcodeDbPath: ZCODE_DB_PATH,
+            piReaderFactory,
+            zcodeReaderFactory,
+            kimiSessionsDir: KIMI_SESSIONS_DIR,
+            kimiReaderFactory,
           },
           options.sessionMetadataService?.getProvider(sessionId),
         );
@@ -548,14 +919,17 @@ export function createApp(options: AppOptions): AppResult {
         };
       },
     });
-    sessionTitleService.start();
+    // Do not call SessionTitleService.start(): that legacy hook subscribes to
+    // lifecycle events and performs automatic/backfill generation. The product
+    // path is intentionally manual-only through the POST route below.
     getLogger().info(
       {
         model: options.sessionTitleGeneration.model,
         apiBase: options.sessionTitleGeneration.apiBase,
         subModule: options.sessionTitleGeneration.subModule,
+        retryMaxAttempts: options.sessionTitleGeneration.retryMaxAttempts,
       },
-      "[SessionTitleService] Enabled",
+      "[SessionTitleService] Manual title generation enabled",
     );
   }
 
@@ -568,6 +942,8 @@ export function createApp(options: AppOptions): AppResult {
         projects,
         codexScanner,
         geminiScanner,
+        piScanner,
+        kimiScanner,
       });
       const roots = {
         claudeProjectsDir: options.projectsDir ?? CLAUDE_PROJECTS_DIR,
@@ -579,7 +955,13 @@ export function createApp(options: AppOptions): AppResult {
         codexReaderFactory,
         geminiSessionsDir: GEMINI_TMP_DIR,
         geminiReaderFactory,
-        geminiHashToCwd: geminiScanner.getHashToCwd(),
+        geminiHashToCwd: geminiScanner?.getHashToCwd(),
+        piSessionsDir: PI_SESSIONS_DIR,
+        zcodeDbPath: ZCODE_DB_PATH,
+        piReaderFactory,
+        zcodeReaderFactory,
+        kimiSessionsDir: KIMI_SESSIONS_DIR,
+        kimiReaderFactory,
       };
       const seenSessionIds = new Set<string>();
       let archivedCount = 0;
@@ -636,12 +1018,12 @@ export function createApp(options: AppOptions): AppResult {
             const metadata = options.sessionMetadataService?.getMetadata(
               session.id,
             );
-            if (shouldSkipAutoArchiveForStarredSession(session, metadata)) {
+            if (shouldSkipAutoArchiveForPinnedSession(session, metadata)) {
               skippedCount++;
               continue;
             }
             if (
-              supervisor.getProcessForSession(session.id) ||
+              (await runtimeController.getProcessForSession(session.id)) ||
               externalTracker?.isExternal(session.id)
             ) {
               skippedCount++;
@@ -702,7 +1084,7 @@ export function createApp(options: AppOptions): AppResult {
 
       if (archivedCount > 0) {
         scanner.invalidateCache();
-        codexScanner.invalidateCache();
+        codexScanner?.invalidateCache();
       }
       getLogger().info(
         `[SessionArchiveService] Auto-archive scan finished archived=${archivedCount} skipped=${skippedCount} failed=${failedCount}`,
@@ -718,7 +1100,10 @@ export function createApp(options: AppOptions): AppResult {
       pushService: options.pushService,
       nativePushService: options.nativePushService,
       notificationService: options.notificationService,
+      sessionMetadataService: options.sessionMetadataService,
+      runtimeController,
       supervisor,
+      bridgeControllers: [options.codexBridgeService],
       connectedBrowsers: options.connectedBrowsers,
     });
   }
@@ -726,6 +1111,7 @@ export function createApp(options: AppOptions): AppResult {
   if (options.eventBus && options.serverSettingsService) {
     new LifecycleWebhookService({
       eventBus: options.eventBus,
+      runtimeController,
       supervisor,
       serverSettingsService: options.serverSettingsService,
     });
@@ -779,6 +1165,7 @@ export function createApp(options: AppOptions): AppResult {
     "/api/server",
     createServerAdminRoutes({
       supervisor,
+      runtimeController,
       notificationService: options.notificationService,
       dataDir: options.dataDir,
     }),
@@ -847,6 +1234,16 @@ export function createApp(options: AppOptions): AppResult {
     );
   }
 
+  const codexTranscriptStoreSources =
+    options.codexTranscriptStoreSources ??
+    (options.dataDir
+      ? createDefaultCodexTranscriptStoreSources({
+          dataDir: options.dataDir,
+          providerEventStorePath:
+            process.env.YEP_CODEX_EVENT_STORE_PATH?.trim(),
+        })
+      : []);
+
   // Mount API routes
   app.route(
     "/api/projects",
@@ -854,6 +1251,7 @@ export function createApp(options: AppOptions): AppResult {
       scanner,
       readerFactory,
       supervisor,
+      runtimeController,
       externalTracker,
       notificationService: options.notificationService,
       sessionMetadataService: options.sessionMetadataService,
@@ -862,31 +1260,58 @@ export function createApp(options: AppOptions): AppResult {
       codexScanner,
       codexSessionsDir: CODEX_SESSIONS_DIR,
       codexReaderFactory,
+      codexSessionCatalog,
       geminiScanner,
       geminiSessionsDir: GEMINI_TMP_DIR,
       geminiReaderFactory,
+      piScanner,
+      kimiScanner,
+      piSessionsDir: PI_SESSIONS_DIR,
+      zcodeDbPath: ZCODE_DB_PATH,
+      piReaderFactory,
+      zcodeReaderFactory,
+      kimiSessionsDir: KIMI_SESSIONS_DIR,
+      kimiReaderFactory,
+      codexBridgeService: options.codexBridgeService,
     }),
   );
   app.route(
     "/api",
     createSessionsRoutes({
+      runtimeController,
       supervisor,
       scanner,
       readerFactory,
+      feishuInbox: options.feishuInbox,
       externalTracker,
       notificationService: options.notificationService,
       sessionMetadataService: options.sessionMetadataService,
+      sessionTitleService,
       eventBus: options.eventBus,
       codexScanner,
       codexSessionsDir: CODEX_SESSIONS_DIR,
       codexReaderFactory,
+      codexAppServerHistoryReader,
+      codexSessionCatalog,
+      sessionIndexService: options.sessionIndexService,
       geminiScanner,
       geminiSessionsDir: GEMINI_TMP_DIR,
       geminiReaderFactory,
+      piScanner,
+      kimiScanner,
+      piSessionsDir: PI_SESSIONS_DIR,
+      zcodeDbPath: ZCODE_DB_PATH,
+      piReaderFactory,
+      zcodeReaderFactory,
+      kimiSessionsDir: KIMI_SESSIONS_DIR,
+      kimiReaderFactory,
       serverSettingsService: options.serverSettingsService,
       modelInfoService: options.modelInfoService,
       recentsService: options.recentsService,
       codexBridgeService: options.codexBridgeService,
+      codexEventStoreSources: codexTranscriptStoreSources,
+      sessionInteractionService,
+      sessionCommandService,
       sessionArchiveService: options.sessionArchiveService,
       claudeProjectsDir: options.projectsDir ?? CLAUDE_PROJECTS_DIR,
     }),
@@ -894,6 +1319,7 @@ export function createApp(options: AppOptions): AppResult {
   app.route(
     "/api/processes",
     createProcessesRoutes({
+      runtimeController,
       supervisor,
       scanner,
       readerFactory,
@@ -916,6 +1342,21 @@ export function createApp(options: AppOptions): AppResult {
               reader: geminiReaderFactory(project.path),
               sessionDir: GEMINI_TMP_DIR,
             };
+          case "pi":
+            return {
+              reader: piReaderFactory(project.path),
+              sessionDir: PI_SESSIONS_DIR,
+            };
+          case "kimi":
+            return {
+              reader: kimiReaderFactory(project.path),
+              sessionDir: KIMI_SESSIONS_DIR,
+            };
+          case "zcode":
+            return {
+              reader: zcodeReaderFactory(project.path),
+              sessionDir: ZCODE_DB_PATH,
+            };
           default:
             return {
               reader: readerFactory(project),
@@ -935,6 +1376,7 @@ export function createApp(options: AppOptions): AppResult {
       scanner,
       readerFactory,
       supervisor,
+      runtimeController,
       notificationService: options.notificationService,
       sessionIndexService: options.sessionIndexService,
       sessionMetadataService: options.sessionMetadataService,
@@ -944,6 +1386,14 @@ export function createApp(options: AppOptions): AppResult {
       geminiScanner,
       geminiSessionsDir: GEMINI_TMP_DIR,
       geminiReaderFactory,
+      piScanner,
+      kimiScanner,
+      piSessionsDir: PI_SESSIONS_DIR,
+      zcodeDbPath: ZCODE_DB_PATH,
+      piReaderFactory,
+      zcodeReaderFactory,
+      kimiSessionsDir: KIMI_SESSIONS_DIR,
+      kimiReaderFactory,
       codexBridgeService: options.codexBridgeService,
     }),
   );
@@ -955,6 +1405,7 @@ export function createApp(options: AppOptions): AppResult {
       scanner,
       readerFactory,
       supervisor,
+      runtimeController,
       externalTracker,
       notificationService: options.notificationService,
       sessionIndexService: options.sessionIndexService,
@@ -962,12 +1413,26 @@ export function createApp(options: AppOptions): AppResult {
       codexScanner,
       codexSessionsDir: CODEX_SESSIONS_DIR,
       codexReaderFactory,
+      codexSessionCatalog,
       geminiScanner,
       geminiSessionsDir: GEMINI_TMP_DIR,
       geminiReaderFactory,
+      piScanner,
+      kimiScanner,
+      piSessionsDir: PI_SESSIONS_DIR,
+      zcodeDbPath: ZCODE_DB_PATH,
+      piReaderFactory,
+      zcodeReaderFactory,
+      kimiSessionsDir: KIMI_SESSIONS_DIR,
+      kimiReaderFactory,
       eventBus: options.eventBus,
       codexBridgeService: options.codexBridgeService,
     }),
+  );
+
+  app.route(
+    "/api/sessions",
+    createCodexTranscriptRoutes({ sources: codexTranscriptStoreSources }),
   );
 
   // Search routes (full-text content search across sessions)
@@ -985,20 +1450,20 @@ export function createApp(options: AppOptions): AppResult {
         geminiScanner,
         geminiSessionsDir: GEMINI_TMP_DIR,
         geminiReaderFactory,
+        piScanner,
+        kimiScanner,
+        piSessionsDir: PI_SESSIONS_DIR,
+        zcodeDbPath: ZCODE_DB_PATH,
+        piReaderFactory,
+        zcodeReaderFactory,
+        kimiSessionsDir: KIMI_SESSIONS_DIR,
+        kimiReaderFactory,
       }),
     );
   }
 
   // Files routes (file browser)
-  app.route(
-    "/api/projects",
-    createFilesRoutes({
-      scanner,
-    }),
-  );
-
-  // Server-side filesystem browser (folder picker for remote / mobile web)
-  app.route("/api/filesystem", createFsBrowseRoutes());
+  app.route("/api/projects", createFilesRoutes({ scanner }));
 
   // Git status routes
   app.route("/api/projects", createGitStatusRoutes({ scanner }));
@@ -1009,6 +1474,8 @@ export function createApp(options: AppOptions): AppResult {
       "/api/recents",
       createRecentsRoutes({
         recentsService: options.recentsService,
+        notificationService: options.notificationService,
+        sessionMetadataService: options.sessionMetadataService,
         scanner,
         readerFactory,
         sessionIndexService: options.sessionIndexService,
@@ -1018,6 +1485,14 @@ export function createApp(options: AppOptions): AppResult {
         geminiScanner,
         geminiSessionsDir: GEMINI_TMP_DIR,
         geminiReaderFactory,
+        piScanner,
+        kimiScanner,
+        piSessionsDir: PI_SESSIONS_DIR,
+        zcodeDbPath: ZCODE_DB_PATH,
+        piReaderFactory,
+        zcodeReaderFactory,
+        kimiSessionsDir: KIMI_SESSIONS_DIR,
+        kimiReaderFactory,
       }),
     );
   }
@@ -1027,6 +1502,8 @@ export function createApp(options: AppOptions): AppResult {
     "/api/reports",
     createReportsRoutes({
       reportsDir: options.reportsDir,
+      dataDir: options.dataDir,
+      basePath: options.basePath,
       maxUploadSizeBytes: options.maxUploadSizeBytes,
     }),
   );
@@ -1040,6 +1517,13 @@ export function createApp(options: AppOptions): AppResult {
     }),
   );
 
+  // ZCode bridge routes (external `zcode tui` session observation and
+  // tool-approval forwarding from the hook plugin)
+  app.route(
+    "/api/zcode-bridge",
+    createZCodeBridgeRoutes({ bridge: new ZCodeBridgeService() }),
+  );
+
   // Server settings routes
   if (options.serverSettingsService) {
     app.route(
@@ -1047,15 +1531,28 @@ export function createApp(options: AppOptions): AppResult {
       createSettingsRoutes({
         serverSettingsService: options.serverSettingsService,
         onAllowedHostsChanged: updateAllowedHosts,
-        onOllamaUrlChanged: (url) => {
-          ClaudeOllamaProvider.setOllamaUrl(url);
+        onRemoteExecutorsChanged: async (executors) => {
+          configureClaudeRemoteExecutors(executors);
+          scanner.setRemoteExecutors(executors);
+          await options.onRemoteExecutorsChanged?.(executors);
+          await runtimeController.updateProviderSettings({
+            claudeRemoteExecutors: executors,
+          });
         },
-        onOllamaSystemPromptChanged: (prompt) => {
-          ClaudeOllamaProvider.setSystemPrompt(prompt);
-        },
-        onOllamaUseFullSystemPromptChanged: (enabled) => {
-          ClaudeOllamaProvider.setUseFullSystemPrompt(enabled);
-        },
+        ohmyrouterBenchmarkService: options.ohmyrouterBenchmarkService,
+      }),
+    );
+  }
+
+  if (options.feishuChannelService) {
+    app.route(
+      "/api/channels/feishu",
+      createFeishuChannelRoutes({
+        feishuChannelService: options.feishuChannelService,
+        bindingStore: options.feishuBindingStore,
+        inbox: options.feishuInbox,
+        operationStore: options.feishuOperationStore,
+        isChannelReady: options.feishuChannelReady,
       }),
     );
   }
@@ -1161,10 +1658,19 @@ export function createApp(options: AppOptions): AppResult {
     // Dev routes (manual reload workflow) - mounted when manual reload is enabled
     const isDevMode =
       process.env.NO_BACKEND_RELOAD === "true" ||
-      process.env.NO_FRONTEND_RELOAD === "true";
+      process.env.NO_FRONTEND_RELOAD === "true" ||
+      (process.env.NODE_ENV !== "production" &&
+        runtimeController.mode === "external");
     if (isDevMode) {
       console.log("[Dev] Mounting dev routes at /api/dev");
-      app.route("/api/dev", createDevRoutes({ eventBus: options.eventBus }));
+      app.route(
+        "/api/dev",
+        createDevRoutes({
+          eventBus: options.eventBus,
+          dataDir: options.dataDir,
+          runtimeMode: runtimeController.mode,
+        }),
+      );
     }
   }
 
@@ -1184,7 +1690,16 @@ export function createApp(options: AppOptions): AppResult {
     });
   }
 
-  return { app, supervisor, scanner, readerFactory };
+  return {
+    app,
+    supervisor,
+    runtimeController,
+    sessionInteractionService,
+    sessionCommandService,
+    interactionBroker,
+    scanner,
+    readerFactory,
+  };
 }
 
 // Default app for backwards compatibility (health check only)

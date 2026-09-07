@@ -7,14 +7,16 @@ import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { createNodeWebSocket } from "@hono/node-ws";
+import type { RemoteExecutorConfig } from "@yep-anywhere/shared";
 import { createApp } from "./app.js";
 import { SessionArchiveService } from "./archive/index.js";
-import { AdminPasswordService } from "./auth/AdminPasswordService.js";
 import { AuthService } from "./auth/AuthService.js";
 import { getRuntimeBuildInfo } from "./build-info.js";
+import { FeishuChannelRuntime } from "./channels/feishu/channel-runtime.js";
 import { CodexBridgeHttpClient } from "./codex-bridge/CodexBridgeHttpClient.js";
 import { CodexBridgeService } from "./codex-bridge/CodexBridgeService.js";
 import type { CodexBridgeController } from "./codex-bridge/types.js";
+import { shutdownCodexHistoryClient } from "./codex-history/CodexHistoryClient.js";
 import {
   closeCodexCorrelationDebugLogger,
   initCodexCorrelationDebugLogger,
@@ -32,6 +34,13 @@ import {
   SessionContentIndexService,
   SessionIndexService,
 } from "./indexes/index.js";
+import { InteractionBroker } from "./interactions/InteractionBroker.js";
+import type { SessionInteractionService } from "./interactions/SessionInteractionService.js";
+import {
+  LLM_GATEWAYS_ENV,
+  resolveLlmGatewayChannelsDetailed,
+  resolveLlmGatewayOverlayPath,
+} from "./llm-gateways/index.js";
 import {
   getLogFilePath,
   initLogger,
@@ -49,7 +58,9 @@ import { updateAllowedHosts } from "./middleware/allowed-hosts.js";
 import { NotificationService } from "./notifications/index.js";
 import { CodexSessionScanner } from "./projects/codex-scanner.js";
 import { GeminiSessionScanner } from "./projects/gemini-scanner.js";
+import { PiSessionScanner } from "./projects/pi-scanner.js";
 import { ProjectScanner } from "./projects/scanner.js";
+import { ZCodeSessionScanner } from "./projects/zcode-scanner.js";
 import {
   NativePushService,
   PushService,
@@ -58,53 +69,94 @@ import {
 import { RecentsService } from "./recents/index.js";
 import { createUploadRoutes } from "./routes/upload.js";
 import { createWsRoutes } from "./routes/ws.js";
-import { detectClaudeCli, detectCodexCli } from "./sdk/cli-detection.js";
+import { HttpRuntimeController } from "./runtime/HttpRuntimeController.js";
+import type { RuntimeController } from "./runtime/types.js";
+import { detectCodexCli } from "./sdk/cli-detection.js";
 import { initMessageLogger } from "./sdk/messageLogger.js";
-import { ClaudeOllamaProvider } from "./sdk/providers/claude-ollama.js";
-import { RealClaudeSDK } from "./sdk/real.js";
+import { codexProvider } from "./sdk/providers/index.js";
+import { isProviderEnabled } from "./sdk/providers/policy.js";
 import {
   BrowserProfileService,
   ConnectedBrowsersService,
   InstallService,
   ModelInfoService,
   NetworkBindingService,
+  OhMyRouterBenchmarkService,
   ServerSettingsService,
   SharingService,
+  ZCodeSessionChangeMonitor,
 } from "./services/index.js";
+import { PI_SESSIONS_DIR } from "./sessions/pi-files.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
+import { ZCODE_DB_PATH } from "./sessions/zcode-db.js";
 import { TerminalService } from "./terminal/TerminalService.js";
 import { UploadManager } from "./uploads/manager.js";
 import {
+  type BusEvent,
   EventBus,
   FileWatcher,
   FocusedSessionWatchManager,
-  ProjectFileWatchManager,
   SourceWatcher,
 } from "./watcher/index.js";
 
-// Allow many concurrent Claude sessions without listener warnings.
-// Each SDK session registers an exit handler; default limit is 10.
+// Several provider sessions can attach process-level listeners concurrently.
 process.setMaxListeners(50);
 
-// Prevent unhandled promise rejections from crashing the server.
-// The Claude Agent SDK can throw "ProcessTransport is not ready for writing"
-// from its internal streamInput() in a detached async context when a CLI
-// process dies. This isn't catchable from our Process.processMessages() loop.
+/**
+ * Idle keep-alive window for HTTP connections.
+ *
+ * Node's default is 5 s, which is fine on loopback but expensive behind a
+ * tunnel. Establishing a connection through frp costs roughly two round trips
+ * (visitor -> frps, then frps -> frpc `StartWorkConn` and the work connection
+ * back), measured at ~40-70 ms against our frps hosts. With a 5 s window a user
+ * who reads one screen and then taps a session pays that again, and HTTP/1.1
+ * opens up to six connections for the first paint. A window longer than typical
+ * think time keeps those connections warm instead.
+ */
+const HTTP_KEEP_ALIVE_TIMEOUT_MS = 70_000;
+
+/**
+ * `headersTimeout` must exceed `keepAliveTimeout`, otherwise Node can tear down
+ * a socket that is legitimately idle between keep-alive requests.
+ */
+const HTTP_HEADERS_TIMEOUT_MS = 75_000;
+
+function applyKeepAliveTuning(server: ReturnType<typeof serve>): void {
+  // `ServerType` also covers HTTP/2 servers, which do not expose these knobs.
+  const tunable = server as {
+    keepAliveTimeout?: number;
+    headersTimeout?: number;
+  };
+  if (typeof tunable.keepAliveTimeout === "number") {
+    tunable.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
+  }
+  if (typeof tunable.headersTimeout === "number") {
+    tunable.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
+  }
+}
+
+function isRecoverablePipeError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const value = error as { code?: unknown; message?: unknown };
+  return (
+    value.code === "EPIPE" ||
+    (typeof value.message === "string" &&
+      (value.message.includes("write EPIPE") ||
+        value.message.includes("not ready for writing")))
+  );
+}
+
+// A provider child may close its stdin while an asynchronous write is pending.
+// A broken child pipe is recoverable; an unrelated uncaught exception is not.
+// The latter exits non-zero so launchd can perform a throttled restart.
 process.on("unhandledRejection", (reason) => {
   const message =
     reason instanceof Error ? reason.message : String(reason ?? "unknown");
   const stack = reason instanceof Error ? reason.stack : undefined;
 
-  // Known SDK transport errors — these are already handled by Process via
-  // isProcessTerminationError when they surface through the iterator, but
-  // streamInput failures arrive as unhandled rejections.
-  const isTransportError =
-    message.includes("ProcessTransport is not ready") ||
-    message.includes("not ready for writing");
-
-  if (isTransportError) {
+  if (isRecoverablePipeError(reason)) {
     console.warn(
-      `[unhandledRejection] SDK transport error (session process likely died): ${message}`,
+      `[unhandledRejection] Recoverable provider pipe error: ${message}`,
     );
   } else {
     console.error(`[unhandledRejection] ${message}`);
@@ -115,22 +167,33 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const config = loadConfig();
+codexProvider.configureBridgeExecution({
+  mode: config.codexBridgeMode,
+  controlUrl: config.codexBridgeControlUrl,
+  authToken: config.desktopAuthToken,
+  authTokenFile: config.runtimeTokenFile,
+});
 
 // Track services for graceful shutdown (set after createApp)
-let supervisorForShutdown:
-  | Awaited<ReturnType<typeof createApp>>["supervisor"]
-  | null = null;
+let runtimeControllerForShutdown: RuntimeController | null = null;
 let deviceBridgeForShutdown: DeviceBridgeService | null = null;
 let codexBridgeForShutdown: CodexBridgeController | null = null;
+let feishuChannelRuntimeForShutdown: FeishuChannelRuntime | null = null;
+let zcodeSessionChangeMonitorForShutdown: ZCodeSessionChangeMonitor | null =
+  null;
 let terminalServiceForShutdown: TerminalService | null = null;
 let sessionArchiveServiceForShutdown: SessionArchiveService | null = null;
+let sessionInteractionServiceForShutdown: SessionInteractionService | null =
+  null;
+let interactionBrokerForShutdown: InteractionBroker | null = null;
 let isShuttingDown = false;
 
 /**
  * Graceful shutdown handler.
- * Aborts all running Claude processes before exiting to prevent orphaned child processes.
+ * Embedded mode owns and aborts agent children. External mode only detaches
+ * the shell subscriptions so a web/API replacement cannot interrupt work.
  */
-async function gracefulShutdown(signal: string): Promise<void> {
+async function gracefulShutdown(signal: string, exitCode = 0): Promise<void> {
   if (isShuttingDown) {
     console.log(`[Shutdown] Already shutting down, ignoring ${signal}`);
     return;
@@ -139,25 +202,26 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   console.log(`[Shutdown] Received ${signal}, cleaning up...`);
 
-  if (supervisorForShutdown) {
-    const processes = supervisorForShutdown.getAllProcesses();
-    if (processes.length > 0) {
+  if (feishuChannelRuntimeForShutdown) {
+    try {
+      await feishuChannelRuntimeForShutdown.shutdown();
+      console.log("[Shutdown] Feishu channel runtime shut down");
+    } catch {
+      console.error("[Shutdown] Error shutting down Feishu channel runtime");
+    }
+  }
+
+  if (runtimeControllerForShutdown) {
+    const abortActive = runtimeControllerForShutdown.mode === "embedded";
+    try {
+      await runtimeControllerForShutdown.shutdown({ abortActive });
       console.log(
-        `[Shutdown] Aborting ${processes.length} active session(s)...`,
+        abortActive
+          ? "[Shutdown] Embedded agent runtime shut down"
+          : "[Shutdown] Detached from external agent runtime",
       );
-      await Promise.all(
-        processes.map(async (p) => {
-          try {
-            await p.abort();
-            console.log(`[Shutdown] Aborted session ${p.sessionId}`);
-          } catch (error) {
-            console.error(
-              `[Shutdown] Error aborting session ${p.sessionId}:`,
-              error,
-            );
-          }
-        }),
-      );
+    } catch (error) {
+      console.error("[Shutdown] Error shutting down runtime facade:", error);
     }
   }
 
@@ -177,6 +241,25 @@ async function gracefulShutdown(signal: string): Promise<void> {
       console.log("[Shutdown] Codex bridge shut down");
     } catch (error) {
       console.error("[Shutdown] Error shutting down Codex bridge:", error);
+    }
+  }
+
+  shutdownCodexHistoryClient();
+
+  sessionInteractionServiceForShutdown?.dispose();
+  sessionInteractionServiceForShutdown = null;
+  interactionBrokerForShutdown?.shutdown();
+  interactionBrokerForShutdown = null;
+
+  if (zcodeSessionChangeMonitorForShutdown) {
+    try {
+      await zcodeSessionChangeMonitorForShutdown.stop();
+      console.log("[Shutdown] ZCode session change monitor stopped");
+    } catch (error) {
+      console.error(
+        "[Shutdown] Error stopping ZCode session change monitor:",
+        error,
+      );
     }
   }
 
@@ -203,12 +286,23 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   closeCodexCorrelationDebugLogger();
   console.log("[Shutdown] Cleanup complete, exiting");
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 // Register shutdown handlers early
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("uncaughtException", (error) => {
+  if (isRecoverablePipeError(error)) {
+    console.warn(
+      `[uncaughtException] Recoverable provider pipe error: ${error.message}`,
+    );
+    return;
+  }
+
+  console.error("[uncaughtException] Fatal server error:", error);
+  void gracefulShutdown("uncaughtException", 1).catch(() => process.exit(1));
+});
 
 // Initialize logging early to capture all output
 initLogger({
@@ -235,53 +329,10 @@ console.log(
   `[Build] id=${runtimeBuildInfo.buildId} version=${runtimeBuildInfo.version} git=${runtimeBuildInfo.gitCommit?.slice(0, 12) ?? "unknown"} dirty=${String(runtimeBuildInfo.gitDirty)} source=${runtimeBuildInfo.source} builtAt=${runtimeBuildInfo.builtAt}`,
 );
 
-// Check for Claude CLI (optional - warn if not found)
-const cliInfo = detectClaudeCli();
-if (cliInfo.found) {
-  console.log(`Claude CLI found: ${cliInfo.path} (${cliInfo.version})`);
-} else {
-  console.warn("Warning: Claude CLI not found.");
-  console.warn("Claude Code sessions will not be available.");
-  console.warn(
-    process.platform === "win32"
-      ? "Install: irm https://claude.ai/install.ps1 | iex"
-      : "Install: curl -fsSL https://claude.ai/install.sh | bash",
-  );
-}
-
-interface CodexSemver {
-  major: number;
-  minor: number;
-  patch: number;
-}
-
-function parseCodexSemver(raw: string | undefined): CodexSemver | null {
+function parseCodexVersion(raw: string | undefined): string | null {
   if (!raw) return null;
-  const match = raw.match(/(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?/);
-  if (!match) return null;
-  return {
-    major: Number.parseInt(match[1] ?? "0", 10),
-    minor: Number.parseInt(match[2] ?? "0", 10),
-    patch: Number.parseInt(match[3] ?? "0", 10),
-  };
-}
-
-function formatCodexSemver(v: CodexSemver): string {
-  return `${v.major}.${v.minor}.${v.patch}`;
-}
-
-/**
- * Whether a running Codex CLI version should trigger the startup warning.
- *
- * Patch-level drift (0.142.1 -> 0.142.2) is tolerated: patch releases are
- * expected to stay backward compatible. We warn on major/minor drift because
- * that is where the app-server protocol can change incompatibly.
- */
-function isCodexVersionWorthWarning(
-  expected: CodexSemver,
-  actual: CodexSemver,
-): boolean {
-  return expected.major !== actual.major || expected.minor !== actual.minor;
+  const match = raw.match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/);
+  return match ? match[0] : null;
 }
 
 function readExpectedCodexVersionFromPackageJson(): string | null {
@@ -327,43 +378,66 @@ async function warnIfCodexVersionMismatch(): Promise<void> {
     return;
   }
 
-  const expected = parseCodexSemver(expectedRaw);
-  if (!expected) {
-    return;
-  }
-
+  const expected = parseCodexVersion(expectedRaw) ?? expectedRaw;
   const codexInfo = await detectCodexCli();
   if (!codexInfo.found || !codexInfo.version) {
     return;
   }
 
-  const actual = parseCodexSemver(codexInfo.version);
-  if (!actual) {
-    return;
-  }
-
-  if (!isCodexVersionWorthWarning(expected, actual)) {
-    // Patch-level drift is tolerated; nothing to warn about.
+  const actual = parseCodexVersion(codexInfo.version) ?? codexInfo.version;
+  if (actual === expected) {
     return;
   }
 
   console.warn(
-    `[Codex] CLI version differs from the pinned value: expected ${formatCodexSemver(expected)} (package.json yepAnywhere.codexCli.expectedVersion), running ${formatCodexSemver(actual)}. The Codex app-server protocol may have changed; run \`pnpm codex:protocol:update\` to refresh the vendored protocol types and the version pin.`,
+    `[Codex] Version mismatch: expected ${expected} (package.json yepAnywhere.codexCli.expectedVersion), detected ${actual}. Codex behavior may be unpredictable until versions align.`,
   );
 }
 
-// Only meaningful when the Codex bridge is actually in use; skip the spawn
-// (and the noise) when the bridge is disabled.
-if (config.codexBridgeMode !== "disabled") {
-  await warnIfCodexVersionMismatch();
+await warnIfCodexVersionMismatch();
+
+/**
+ * Report rejected gateway entries once at startup.
+ *
+ * Extra gateway channels are resolved lazily by their consumers, and an
+ * invalid entry is skipped there so one typo cannot take the working default
+ * gateway down. Without this warning that skip would be silent, and the only
+ * symptom would be a model that never appears in the picker.
+ */
+function warnAboutLlmGatewayConfig(): void {
+  const { channels, problems } = resolveLlmGatewayChannelsDetailed(process.env);
+  for (const problem of problems) {
+    console.warn(
+      `[LLM gateways] Ignoring ${LLM_GATEWAYS_ENV}/overlay entry "${problem.entry}": ${problem.reason}`,
+    );
+  }
+  if (channels.length === 0) return;
+  // A retired credential answers `/models` exactly like a live one, so the
+  // first visible symptom of a stale key is a failed turn inside a provider
+  // process. Print the configured key so "which key is this server actually
+  // using" is answerable without restarting it.
+  console.log(
+    `[LLM gateways] Active channels: ${channels
+      .map(
+        (channel) => `${channel.id}(${channel.apiBase}, key ${channel.apiKey})`,
+      )
+      .join(", ")}`,
+  );
+  const overlayPath = resolveLlmGatewayOverlayPath(process.env);
+  if (overlayPath) {
+    console.log(
+      `[LLM gateways] Credentials overlay (re-read while running): ${overlayPath}`,
+    );
+  }
 }
 
-// Create the real SDK
-const realSdk = new RealClaudeSDK();
+warnAboutLlmGatewayConfig();
 
 // Create EventBus and FileWatchers for all provider directories
 const eventBus = new EventBus();
 const fileWatchers: FileWatcher[] = [];
+const fileWatcherByKey = new Map<string, FileWatcher>();
+const persistentWatcherKeys = new Set<string>();
 const codexBridgeService: CodexBridgeController | undefined =
   config.codexBridgeMode === "disabled"
     ? undefined
@@ -371,6 +445,8 @@ const codexBridgeService: CodexBridgeController | undefined =
       ? new CodexBridgeHttpClient({
           baseUrl: config.codexBridgeControlUrl,
           eventBus,
+          authToken: config.desktopAuthToken,
+          authTokenFile: config.runtimeTokenFile,
         })
       : new CodexBridgeService({
           enabled: config.codexBridgeEnabled,
@@ -381,24 +457,47 @@ const codexBridgeService: CodexBridgeController | undefined =
           lightUpstreamArgs: config.codexBridgeLightUpstreamArgs,
           clearUpstreamArgs: config.codexBridgeClearUpstreamArgs,
           fullUpstreamArgs: config.codexBridgeFullUpstreamArgs,
+          journalMode: config.codexBridgeJournalMode,
           eventBus,
+          authToken: config.desktopAuthToken,
+          authTokenFile: config.runtimeTokenFile,
+          statePath: path.join(config.dataDir, "codex-bridge", "sessions.json"),
         });
 console.log(
   `[CodexBridge] mode=${config.codexBridgeMode}${
     config.codexBridgeMode === "external"
       ? ` control=${config.codexBridgeControlUrl}`
       : ""
-  }`,
+  } journal=${config.codexBridgeJournalMode}`,
 );
-
 // Helper to create watcher if directory exists
 function createWatcherIfExists(
   watchDir: string,
-  provider: "claude" | "gemini" | "codex",
+  provider: "claude" | "gemini" | "codex" | "pi" | "kimi",
+  ensureDirectory = false,
+  persistent = false,
+  periodicRescanOverrideMs?: number,
 ): void {
+  const key = `${provider}:${path.resolve(watchDir)}`;
+  if (fileWatcherByKey.has(key)) {
+    if (persistent) persistentWatcherKeys.add(key);
+    return;
+  }
+  if (ensureDirectory) {
+    try {
+      fs.mkdirSync(watchDir, { recursive: true });
+    } catch (error) {
+      console.warn(
+        `[FileWatcher] Unable to create ${provider} replica directory (${watchDir}):`,
+        error,
+      );
+      return;
+    }
+  }
   if (fs.existsSync(watchDir)) {
     const periodicRescanMs =
-      provider === "codex" ? config.codexWatchPeriodicRescanMs : 0;
+      periodicRescanOverrideMs ??
+      (provider === "codex" ? config.codexWatchPeriodicRescanMs : 0);
 
     const watcher = new FileWatcher({
       watchDir,
@@ -409,16 +508,53 @@ function createWatcherIfExists(
     });
     watcher.start();
     fileWatchers.push(watcher);
+    fileWatcherByKey.set(key, watcher);
+    if (persistent) persistentWatcherKeys.add(key);
   } else {
     console.log(`[FileWatcher] Skipping ${provider} (${watchDir} not found)`);
   }
 }
 
+function syncClaudeSharedSessionWatchers(
+  executors: RemoteExecutorConfig[],
+): void {
+  const desired = new Set(
+    executors.flatMap((executor) => {
+      const projectsDir = executor.sessionStorage?.localProjectsDir;
+      return executor.sessionStorage?.mode === "shared" && projectsDir
+        ? [`claude:${path.resolve(projectsDir)}`]
+        : [];
+    }),
+  );
+
+  for (const [key, watcher] of fileWatcherByKey.entries()) {
+    if (
+      !key.startsWith("claude:") ||
+      persistentWatcherKeys.has(key) ||
+      desired.has(key)
+    ) {
+      continue;
+    }
+    watcher.stop();
+    fileWatcherByKey.delete(key);
+  }
+
+  for (const executor of executors) {
+    const projectsDir = executor.sessionStorage?.localProjectsDir;
+    if (executor.sessionStorage?.mode === "shared" && projectsDir) {
+      createWatcherIfExists(projectsDir, "claude", false, false, 5_000);
+    }
+  }
+}
+
 // Create watchers for session directories only (not full provider dirs)
 // This reduces inotify pressure and memory usage
-createWatcherIfExists(config.claudeSessionsDir, "claude");
-createWatcherIfExists(config.geminiSessionsDir, "gemini");
-createWatcherIfExists(config.codexSessionsDir, "codex");
+// Claude's directory stores local replicas of the authoritative VM JSONL files.
+createWatcherIfExists(config.claudeSessionsDir, "claude", true, true);
+createWatcherIfExists(config.geminiSessionsDir, "gemini", false, true);
+createWatcherIfExists(config.codexSessionsDir, "codex", false, true);
+createWatcherIfExists(config.kimiSessionsDir, "kimi", false, true);
+createWatcherIfExists(PI_SESSIONS_DIR, "pi", true, true);
 
 // When running without tsx watch (NO_BACKEND_RELOAD=true), start source watcher
 // to notify the UI when server code changes and needs manual reload
@@ -442,6 +578,8 @@ const sessionIndexService = new SessionIndexService({
   projectsDir: config.claudeProjectsDir,
   dataDir: path.join(config.dataDir, "indexes"),
   fullValidationIntervalMs: config.sessionIndexFullValidationMs,
+  fullValidationMinIntervalMs: config.sessionIndexFullValidationMinMs,
+  maxConcurrentFullValidations: config.sessionIndexMaxConcurrentFullValidations,
   writeLockTimeoutMs: config.sessionIndexWriteLockTimeoutMs,
   writeLockStaleMs: config.sessionIndexWriteLockStaleMs,
   eventBus,
@@ -464,7 +602,6 @@ const authService = new AuthService({
   sessionTtlMs: config.authSessionTtlMs,
   cookieSecret: config.authCookieSecret,
 });
-const adminPasswordService = new AdminPasswordService();
 const installService = new InstallService({
   dataDir: config.dataDir,
 });
@@ -472,14 +609,14 @@ const networkBindingService = new NetworkBindingService({
   dataDir: config.dataDir,
   cliPortOverride: config.cliPortOverride ? config.port : undefined,
   cliHostOverride: config.cliHostOverride ? config.host : undefined,
-  // Default port based on NODE_ENV:
-  // - Development: 3400 (source code, hot reload)
-  // - Production: 8022 (bundled package)
-  defaultPort: process.env.NODE_ENV === "production" ? 8022 : 3400,
+  defaultPort: 3400,
 });
 const connectedBrowsersService = new ConnectedBrowsersService(eventBus);
 const serverSettingsService = new ServerSettingsService({
   dataDir: config.dataDir,
+});
+const ohmyrouterBenchmarkService = new OhMyRouterBenchmarkService({
+  serverSettingsService,
 });
 const sharingService = new SharingService({
   dataDir: config.dataDir,
@@ -488,6 +625,35 @@ const modelInfoService = new ModelInfoService({ dataDir: config.dataDir });
 const sessionArchiveService = new SessionArchiveService({
   dataDir: config.dataDir,
 });
+const interactionBroker = new InteractionBroker({ dataDir: config.dataDir });
+const explicitPublicServerUrl =
+  process.env.YEP_SERVER_URL?.trim() ||
+  process.env.YEP_ANYWHERE_SERVER_URL?.trim() ||
+  undefined;
+const feishuChannelRuntime = new FeishuChannelRuntime({
+  dataDir: config.dataDir,
+  maxUploadSizeBytes: config.maxUploadSizeBytes,
+  ...(codexBridgeService?.getUsage
+    ? {
+        readCodexUsage: async () => {
+          const response = await codexBridgeService.getUsage?.({ fresh: true });
+          if (!response?.usage) {
+            throw new Error(
+              response?.error ?? "Codex usage snapshot is unavailable",
+            );
+          }
+          return response.usage;
+        },
+      }
+    : {}),
+  ...(explicitPublicServerUrl
+    ? { publicBaseUrl: explicitPublicServerUrl }
+    : {}),
+  onDiagnostic: (code) => {
+    console.warn(`[Feishu] Channel runtime diagnostic: ${code}`);
+  },
+});
+feishuChannelRuntimeForShutdown = feishuChannelRuntime;
 
 async function startServer() {
   let tlsOptions: { key: Buffer; cert: Buffer } | undefined;
@@ -515,12 +681,28 @@ async function startServer() {
   await sessionIndexService.initialize();
   await sessionContentIndexService.initialize();
   await sessionArchiveService.initialize();
+  await interactionBroker.initialize();
+  interactionBrokerForShutdown = interactionBroker;
+  await feishuChannelRuntime.prepare(eventBus);
   await pushService.initialize();
   await nativePushService.initialize();
   await browserProfileService.initialize();
   await recentsService.initialize();
+  const importedRecentReadMarkers =
+    await notificationService.importLastSeenFromRecents(
+      recentsService.getRecents(),
+    );
+  if (importedRecentReadMarkers > 0) {
+    console.log(
+      `[NotificationService] Imported ${importedRecentReadMarkers} read marker(s) from recents`,
+    );
+  }
   await authService.initialize();
   await serverSettingsService.initialize();
+  syncClaudeSharedSessionWatchers(
+    serverSettingsService.getSetting("remoteExecutors") ?? [],
+  );
+  await ohmyrouterBenchmarkService.initialize();
   await sharingService.initialize();
   await modelInfoService.initialize();
   await networkBindingService.initialize();
@@ -529,23 +711,10 @@ async function startServer() {
   // Seed allowed hosts middleware from persisted settings
   updateAllowedHosts(serverSettingsService.getSetting("allowedHosts"));
 
-  // Seed Ollama settings from persisted settings
-  const savedOllamaUrl = serverSettingsService.getSetting("ollamaUrl");
-  if (savedOllamaUrl) {
-    ClaudeOllamaProvider.setOllamaUrl(savedOllamaUrl);
-  }
-  ClaudeOllamaProvider.setSystemPrompt(
-    serverSettingsService.getSetting("ollamaSystemPrompt"),
-  );
-  ClaudeOllamaProvider.setUseFullSystemPrompt(
-    serverSettingsService.getSetting("ollamaUseFullSystemPrompt") ?? false,
-  );
-
-  // Warm model info cache (non-blocking, best-effort)
-  modelInfoService.warmProvider("claude-ollama").catch(() => {});
-
   // Log auth status
-  if (authService.isEnabled()) {
+  if (config.authDisabled) {
+    console.log("[Auth] Cookie auth disabled by --auth-disable flag");
+  } else if (authService.isEnabled()) {
     console.log("[Auth] Cookie auth enabled (configured in settings)");
   } else {
     console.log("[Auth] Cookie auth not enabled (enable in Settings)");
@@ -615,8 +784,112 @@ async function startServer() {
 
   // Create the app first (without WebSocket support initially)
   // We'll add WebSocket routes after setting up WebSocket support
-  const { app, supervisor, scanner } = createApp({
-    realSdk,
+  const configuredRuntimeController =
+    config.runtimeMode === "external"
+      ? new HttpRuntimeController({
+          baseUrl: config.runtimeControlUrl,
+          tokenFile: config.runtimeTokenFile,
+        })
+      : undefined;
+  if (configuredRuntimeController) {
+    const applyRuntimeEvent = async (event: BusEvent): Promise<void> => {
+      if (event.type === "session-id-changed") {
+        await sessionMetadataService.remapSessionId(
+          event.oldSessionId,
+          event.newSessionId,
+        );
+        if (event.executor) {
+          await sessionMetadataService.setExecutor(
+            event.newSessionId,
+            event.executor,
+          );
+        }
+        eventBus.emit(event);
+        eventBus.emit({
+          type: "session-metadata-changed",
+          sessionId: event.newSessionId,
+          projectId: event.projectId,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      eventBus.emit(
+        event.type === "worker-activity-changed"
+          ? { ...event, runtimeMode: "external" }
+          : event,
+      );
+    };
+    let runtimeEventChain = Promise.resolve();
+    const enqueueRuntimeEvent = (event: BusEvent): Promise<void> => {
+      const work = runtimeEventChain
+        .catch(() => {})
+        .then(() => applyRuntimeEvent(event));
+      runtimeEventChain = work;
+      return work;
+    };
+
+    await configuredRuntimeController.start();
+    await configuredRuntimeController.updateProviderSettings({
+      claudeRemoteExecutors:
+        serverSettingsService.getSetting("remoteExecutors") ?? [],
+    });
+    const activitySubscription =
+      await configuredRuntimeController.subscribeActivity((event) => {
+        void enqueueRuntimeEvent(event).catch((error) => {
+          console.error("[AgentRuntime] Failed to apply runtime event:", error);
+        });
+      });
+    if (!activitySubscription) {
+      throw new Error("External agent runtime activity stream is unavailable");
+    }
+
+    // Delayed provider IDs can arrive while the web shell is being replaced.
+    // Replay those idempotent remaps before serving requests so metadata has a
+    // single durable owner in this process.
+    const replay = await configuredRuntimeController.replay({});
+    for (const record of replay) {
+      if (record.type !== "session-id-changed") continue;
+      const data = record.data as {
+        oldSessionId?: unknown;
+        newSessionId?: unknown;
+        projectId?: unknown;
+        executor?: unknown;
+      };
+      if (
+        typeof data.oldSessionId !== "string" ||
+        typeof data.newSessionId !== "string" ||
+        typeof data.projectId !== "string"
+      ) {
+        continue;
+      }
+      await enqueueRuntimeEvent({
+        type: "session-id-changed",
+        oldSessionId: data.oldSessionId,
+        newSessionId: data.newSessionId,
+        projectId: data.projectId as Extract<
+          BusEvent,
+          { type: "session-id-changed" }
+        >["projectId"],
+        executor: typeof data.executor === "string" ? data.executor : undefined,
+        timestamp: record.timestamp,
+      });
+    }
+    console.log(
+      `[AgentRuntime] mode=external control=${config.runtimeControlUrl}`,
+    );
+  } else {
+    console.log("[AgentRuntime] mode=embedded");
+  }
+
+  const {
+    app,
+    supervisor,
+    runtimeController,
+    sessionInteractionService,
+    sessionCommandService,
+    scanner,
+  } = createApp({
     projectsDir: config.claudeProjectsDir,
     idleTimeoutMs: config.idleTimeoutMs,
     defaultPermissionMode: config.defaultPermissionMode,
@@ -635,7 +908,7 @@ async function startServer() {
     nativePushService,
     recentsService,
     authService,
-    adminPasswordService,
+    authDisabled: config.authDisabled,
     desktopAuthToken: config.desktopAuthToken,
     // Note: frontendProxy not passed - will be added below
     serverHost: "127.0.0.1", // Always report localhost as main binding
@@ -647,9 +920,16 @@ async function startServer() {
     connectedBrowsers: connectedBrowsersService,
     browserProfileService,
     serverSettingsService,
+    onRemoteExecutorsChanged: syncClaudeSharedSessionWatchers,
+    ohmyrouterBenchmarkService,
     sharingService,
     deviceBridgeService,
     codexBridgeService,
+    feishuChannelService: feishuChannelRuntime.service,
+    feishuBindingStore: feishuChannelRuntime.bindingStore,
+    feishuInbox: feishuChannelRuntime.inbox,
+    feishuOperationStore: feishuChannelRuntime.operationStore,
+    feishuChannelReady: () => feishuChannelRuntime.isOperational(),
     sessionTitleGeneration: config.sessionTitleGeneration,
     modelInfoService,
     enabledProviders: config.enabledProviders,
@@ -658,25 +938,124 @@ async function startServer() {
     allowedImagePaths: config.allowedImagePaths,
     allowedLocalFilePaths: config.allowedLocalFilePaths,
     basePath: config.basePath,
+    runtimeController: configuredRuntimeController,
+    interactionBroker,
   });
 
+  await feishuChannelRuntime.start({ eventBus, sessionCommandService });
+
+  const zcodeProviderEnabled = isProviderEnabled(
+    "zcode",
+    config.enabledProviders,
+  );
+  const zcodeMonitorDisabled = ["false", "0", "off", "disabled"].includes(
+    (process.env.ZCODE_SESSION_CHANGE_MONITOR ?? "").trim().toLowerCase(),
+  );
+  if (
+    config.sessionTitleGeneration.enabled &&
+    zcodeProviderEnabled &&
+    !zcodeMonitorDisabled
+  ) {
+    const zcodeChangeScanner = new ZCodeSessionScanner();
+    const zcodeSessionChangeMonitor = new ZCodeSessionChangeMonitor({
+      dbPath: zcodeChangeScanner.databasePath,
+      scanner: zcodeChangeScanner,
+      eventBus,
+    });
+    // createApp starts SessionTitleService before returning, so no database
+    // reconciliation event can race ahead of its EventBus subscription.
+    zcodeSessionChangeMonitor.start();
+    zcodeSessionChangeMonitorForShutdown = zcodeSessionChangeMonitor;
+  }
+  if (configuredRuntimeController) {
+    const [activity, processes] = await Promise.all([
+      runtimeController.getWorkerActivity(),
+      runtimeController.listProcessSnapshots(),
+    ]);
+    eventBus.emit({
+      type: "worker-activity-changed",
+      ...activity,
+      runtimeMode: "external",
+      timestamp: new Date().toISOString(),
+    });
+    for (const process of processes) {
+      eventBus.emit({
+        type: "session-status-changed",
+        sessionId: process.sessionId,
+        projectId: process.projectId,
+        ownership: {
+          owner: "self",
+          processId: process.id,
+          permissionMode: process.permissionMode,
+          modeVersion: process.modeVersion,
+        },
+        timestamp: new Date().toISOString(),
+      });
+      eventBus.emit({
+        type: "process-state-changed",
+        sessionId: process.sessionId,
+        projectId: process.projectId,
+        activity: process.state,
+        pendingInputType: process.pendingInputRequest
+          ? process.pendingInputRequest.type === "tool-approval"
+            ? "tool-approval"
+            : "user-question"
+          : undefined,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  const focusedPiScanner = isProviderEnabled("pi", config.enabledProviders)
+    ? new PiSessionScanner({ sessionsDir: PI_SESSIONS_DIR })
+    : undefined;
+  if (focusedPiScanner) {
+    eventBus.subscribe((event) => {
+      if (event.type === "file-change" && event.provider === "pi") {
+        focusedPiScanner.invalidateCache();
+      }
+    });
+  }
+  const emptyFocusedScanner = {
+    getSessionsForProject: async () => [],
+  };
   const focusedSessionWatchManager = new FocusedSessionWatchManager({
     scanner,
-    codexScanner: new CodexSessionScanner({
-      sessionsDir: config.codexSessionsDir,
-    }),
-    geminiScanner: new GeminiSessionScanner({
-      sessionsDir: config.geminiSessionsDir,
-    }),
+    codexScanner:
+      isProviderEnabled("codex", config.enabledProviders) ||
+      isProviderEnabled("codex-oss", config.enabledProviders)
+        ? new CodexSessionScanner({ sessionsDir: config.codexSessionsDir })
+        : emptyFocusedScanner,
+    geminiScanner:
+      isProviderEnabled("gemini", config.enabledProviders) ||
+      isProviderEnabled("gemini-acp", config.enabledProviders)
+        ? new GeminiSessionScanner({ sessionsDir: config.geminiSessionsDir })
+        : emptyFocusedScanner,
+    piScanner: focusedPiScanner,
+    zcodeScanner: zcodeProviderEnabled ? new ZCodeSessionScanner() : undefined,
   });
 
-  const projectFileWatchManager = new ProjectFileWatchManager({ scanner });
-
   // Set service references for graceful shutdown
-  supervisorForShutdown = supervisor;
+  runtimeControllerForShutdown = runtimeController;
+  sessionInteractionServiceForShutdown = sessionInteractionService;
   deviceBridgeForShutdown = deviceBridgeService ?? null;
   codexBridgeForShutdown = codexBridgeService ?? null;
   sessionArchiveServiceForShutdown = sessionArchiveService;
+
+  // The external runtime controller was already started above. The embedded one
+  // is created inside createApp(), so open its durable event journal here.
+  // Journaling is best effort: losing it costs reconnect replay depth, not the
+  // ability to run sessions.
+  if (!configuredRuntimeController) {
+    try {
+      await runtimeController.start();
+    } catch (error) {
+      console.error(
+        "[AgentRuntime] Failed to start embedded runtime journal:",
+        error,
+      );
+    }
+  }
 
   // Set up debug context for maintenance server
   setDebugContext({
@@ -700,6 +1079,11 @@ async function startServer() {
   // These must be added BEFORE the frontend proxy catch-all
   const uploadScanner = new ProjectScanner({
     projectsDir: config.claudeProjectsDir,
+    enableCodex: false,
+    enableGemini: false,
+    enableKimi: false,
+    enablePi: false,
+    enableZCode: false,
   });
   const uploadRoutes = createUploadRoutes({
     scanner: uploadScanner,
@@ -721,13 +1105,12 @@ async function startServer() {
     app,
     baseUrl,
     basePath: config.basePath,
-    supervisor,
+    runtimeController,
     eventBus,
     uploadManager: wsUploadManager,
     connectedBrowsers: connectedBrowsersService,
     browserProfileService,
     focusedSessionWatchManager,
-    projectFileWatchManager,
     deviceBridgeService,
     terminalService,
   });
@@ -808,6 +1191,8 @@ async function startServer() {
           onReady,
         )
       : serve({ fetch: app.fetch, port, hostname }, onReady);
+
+    applyKeepAliveTuning(server);
 
     server.on("error", (error: unknown) => {
       const err = error as NodeJS.ErrnoException;

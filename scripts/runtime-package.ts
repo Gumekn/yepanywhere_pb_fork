@@ -42,34 +42,20 @@ function readJson<T>(filePath: string): T {
 
 export function getRuntimeDependencies(): Dependencies {
   const sourcePackage = readJson<PackageJson>(SERVER_PACKAGE_JSON);
-  const dependencies = Object.fromEntries(
+  return Object.fromEntries(
     Object.entries(sourcePackage.dependencies ?? {}).filter(
       ([name]) => !name.startsWith("@yep-anywhere/"),
     ),
   );
-
-  const nonExact = Object.entries(dependencies).filter(
-    ([, version]) =>
-      !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version),
-  );
-  if (nonExact.length > 0) {
-    throw new Error(
-      `Bundle 运行时依赖必须使用精确版本: ${nonExact
-        .map(([name, version]) => `${name}@${version}`)
-        .join(", ")}`,
-    );
-  }
-
-  return dependencies;
 }
 
 export function getRuntimeAllowScripts(): Record<string, boolean> {
-  const dependencies = getRuntimeDependencies();
+  const lock = getRuntimeLock();
   return Object.fromEntries(
     ["bcrypt", "node-pty"].map((name) => {
-      const version = dependencies[name];
+      const version = lock.packages?.[`node_modules/${name}`]?.version;
       if (!version) {
-        throw new Error(`Missing approved runtime dependency: ${name}`);
+        throw new Error(`Missing locked runtime dependency: ${name}`);
       }
       return [`${name}@${version}`, true];
     }),

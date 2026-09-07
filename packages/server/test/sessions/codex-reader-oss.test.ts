@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,8 +8,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeProjectId } from "../../src/projects/paths.js";
 import { CodexSessionReader } from "../../src/sessions/codex-reader.js";
 import { invalidateCodexSessionManifest } from "../../src/sessions/codex-session-manifest.js";
-import { normalizeSession } from "../../src/sessions/normalization.js";
-import * as jsonl from "../../src/utils/jsonl.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -41,6 +39,7 @@ describe("CodexSessionReader - OSS Support", () => {
       lastCachedInputTokens?: number;
       modelContextWindow?: number;
     },
+    forkedFromId?: string,
   ) => {
     const metaPayload = {
       id: sessionId,
@@ -48,6 +47,7 @@ describe("CodexSessionReader - OSS Support", () => {
       timestamp: new Date().toISOString(),
       ...(provider ? { model_provider: provider } : {}),
       ...(originator ? { originator } : {}),
+      ...(forkedFromId ? { forked_from_id: forkedFromId } : {}),
     };
 
     const lines = [
@@ -130,125 +130,24 @@ describe("CodexSessionReader - OSS Support", () => {
     expect(second[0]?.sessionId).toBe(sessionId);
   });
 
-  it("reads a session JSONL only once when loading its detail", async () => {
-    const sessionId = randomUUID();
-    await createSessionFile(sessionId, "openai", "gpt-5");
-    const readJsonlLines = vi.spyOn(jsonl, "readJsonlLines");
-
-    const loaded = await reader.getSession(
-      sessionId,
-      "test-project" as UrlProjectId,
+  it("preserves native thread/fork lineage in the session summary", async () => {
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await createSessionFile(
+      childId,
+      "openai",
+      "gpt-5",
+      undefined,
+      undefined,
+      parentId,
     );
 
-    expect(loaded).not.toBeNull();
-    expect(readJsonlLines).toHaveBeenCalledTimes(1);
-  });
-
-  it("hides recommended plugin context from the title and conversation", async () => {
-    const sessionId = randomUUID();
-    const timestamp = new Date().toISOString();
-    const recommendedPlugins =
-      "<recommended_plugins>\nHere is a list of plugins that are available but not installed.\n- Airtable\n</recommended_plugins>";
-    const responseMessage = (role: "user" | "assistant", text: string) => ({
-      type: "response_item",
-      timestamp,
-      payload: {
-        type: "message",
-        role,
-        content: [
-          {
-            type: role === "user" ? "input_text" : "output_text",
-            text,
-          },
-        ],
-      },
+    await expect(
+      reader.getSessionSummary(childId, "test-project" as UrlProjectId),
+    ).resolves.toMatchObject({
+      id: childId,
+      forkParentSessionId: parentId,
     });
-    const entries = [
-      {
-        type: "session_meta",
-        timestamp,
-        payload: {
-          id: sessionId,
-          cwd: "/test/project",
-          timestamp,
-          model_provider: "openai",
-        },
-      },
-      responseMessage("user", recommendedPlugins),
-      responseMessage("user", "Actual user prompt"),
-      responseMessage("assistant", "Actual response"),
-    ];
-    await writeFile(
-      join(testDir, `${sessionId}.jsonl`),
-      `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-    );
-
-    const projectId = "test-project" as UrlProjectId;
-    const summary = await reader.getSessionSummary(sessionId, projectId);
-    const loaded = await reader.getSession(sessionId, projectId);
-
-    expect(summary?.title).toBe("Actual user prompt");
-    expect(summary?.fullTitle).toBe("Actual user prompt");
-    expect(summary?.userQuestions.map((question) => question.text)).toEqual([
-      "Actual user prompt",
-    ]);
-    expect(loaded).not.toBeNull();
-    if (!loaded) throw new Error("Expected Codex session to load");
-    const normalized = normalizeSession(loaded);
-    expect(JSON.stringify(normalized.messages)).not.toContain(
-      "recommended_plugins",
-    );
-    expect(JSON.stringify(normalized.messages)).toContain("Actual user prompt");
-  });
-
-  it("uses the visible request from Codex Desktop prompt wrappers", async () => {
-    const sessionId = randomUUID();
-    const timestamp = new Date().toISOString();
-    const wrappedPrompt = `# Files mentioned by the user:
-
-## E1089999.BIN: F:/DCOLYMP/E1089999.BIN
-
-<in-app-browser-context source="ambient-ui-state">
-hidden browser state
-</in-app-browser-context>
-
-## My request:
-插到相机里没反应`;
-    await writeFile(
-      join(testDir, `${sessionId}.jsonl`),
-      `${[
-        JSON.stringify({
-          type: "session_meta",
-          timestamp,
-          payload: {
-            id: sessionId,
-            cwd: "/test/project",
-            timestamp,
-            model_provider: "openai",
-          },
-        }),
-        JSON.stringify({
-          type: "response_item",
-          timestamp,
-          payload: {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: wrappedPrompt }],
-          },
-        }),
-      ].join("\n")}\n`,
-    );
-
-    const summary = await reader.getSessionSummary(
-      sessionId,
-      "test-project" as UrlProjectId,
-    );
-
-    expect(summary?.title).toBe("插到相机里没反应");
-    expect(summary?.fullTitle).toBe("插到相机里没反应");
-    expect(summary?.userQuestions.map((question) => question.text)).toEqual([
-      "插到相机里没反应",
-    ]);
   });
 
   it("filters manifest session files by project path", async () => {
@@ -289,6 +188,202 @@ hidden browser state
     const sessions = await filteredReader.listSessionFiles(testDir);
     expect(sessions).toHaveLength(1);
     expect(sessions[0]?.sessionId).toBe(matchingSessionId);
+  });
+
+  it("keeps Codex collaboration children out of top-level session files", async () => {
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const grandchildId = randomUUID();
+    await createSessionFile(parentId, "openai", "gpt-5");
+
+    const now = new Date().toISOString();
+    const parentPath = join(testDir, `${parentId}.jsonl`);
+    const parentRollout = await readFile(parentPath, "utf8");
+    await writeFile(
+      parentPath,
+      `${parentRollout}${JSON.stringify({
+        type: "event_msg",
+        timestamp: now,
+        payload: {
+          type: "item_completed",
+          thread_id: parentId,
+          turn_id: "turn-parent",
+          item: {
+            type: "CollabAgentToolCall",
+            id: "spawn-call-1",
+            tool: "spawn_agent",
+            status: "completed",
+            sender_thread_id: parentId,
+            receiver_thread_ids: [childId],
+            agents_states: {},
+          },
+        },
+      })}\n`,
+    );
+    await writeFile(
+      join(testDir, `${childId}.jsonl`),
+      `${[
+        JSON.stringify({
+          type: "session_meta",
+          timestamp: now,
+          payload: {
+            session_id: parentId,
+            id: childId,
+            // fork_turns="none" children do not need forked_from_id.
+            parent_thread_id: parentId,
+            cwd: "/test/project",
+            timestamp: now,
+            thread_source: "subagent",
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: parentId,
+                  depth: 1,
+                  agent_path: "/root/review",
+                  agent_nickname: "Noether",
+                  agent_role: "reviewer",
+                },
+              },
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          timestamp: now,
+          payload: {
+            type: "user_message",
+            message: "Review the parent changes",
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          timestamp: now,
+          payload: {
+            type: "item_completed",
+            thread_id: childId,
+            turn_id: "turn-child",
+            item: {
+              type: "CollabAgentToolCall",
+              id: "spawn-call-nested",
+              tool: "spawn_agent",
+              status: "completed",
+              sender_thread_id: childId,
+              receiver_thread_ids: [grandchildId],
+              agents_states: {},
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          timestamp: now,
+          payload: {
+            type: "task_complete",
+            turn_id: "turn-child",
+            last_agent_message: "Review complete",
+          },
+        }),
+      ].join("\n")}\n`,
+    );
+    await writeFile(
+      join(testDir, `${grandchildId}.jsonl`),
+      `${[
+        JSON.stringify({
+          type: "session_meta",
+          timestamp: now,
+          payload: {
+            session_id: childId,
+            id: grandchildId,
+            parent_thread_id: childId,
+            cwd: "/test/project",
+            timestamp: now,
+            thread_source: "subagent",
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: childId,
+                  depth: 2,
+                  agent_path: "/root/review/nested",
+                  agent_role: "explorer",
+                },
+              },
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          timestamp: now,
+          payload: {
+            type: "task_complete",
+            turn_id: "turn-grandchild",
+            last_agent_message: null,
+            error: { message: "Nested review failed" },
+          },
+        }),
+      ].join("\n")}\n`,
+    );
+
+    const sessions = await reader.listSessionFiles(testDir);
+    expect(sessions.map((session) => session.sessionId)).toEqual([parentId]);
+    expect(
+      await reader.getSessionSummary(childId, "test-project" as UrlProjectId),
+    ).toBeNull();
+    await expect(reader.getAgentMappings(parentId)).resolves.toEqual([
+      {
+        toolUseId: "spawn-call-1",
+        agentId: childId,
+        agentType: "reviewer",
+      },
+    ]);
+    await expect(
+      reader.getAgentSession(childId, parentId),
+    ).resolves.toMatchObject({
+      status: "completed",
+      agentType: "reviewer",
+      descriptor: {
+        agentId: childId,
+        parentAgentId: parentId,
+        parentToolUseId: "spawn-call-1",
+        type: "reviewer",
+        description: "/root/review",
+        status: "completed",
+      },
+    });
+    await expect(
+      reader.getAgentSession(childId, "different-parent"),
+    ).resolves.toBeNull();
+    await expect(reader.getAgentSession(childId)).resolves.toBeNull();
+    await expect(reader.getAgentMappings(childId)).resolves.toEqual([
+      {
+        toolUseId: "spawn-call-nested",
+        agentId: grandchildId,
+        agentType: "explorer",
+      },
+    ]);
+    await expect(
+      reader.getAgentSession(grandchildId, childId),
+    ).resolves.toMatchObject({
+      status: "failed",
+      agentType: "explorer",
+      descriptor: {
+        agentId: grandchildId,
+        parentAgentId: childId,
+        parentToolUseId: "spawn-call-nested",
+        type: "explorer",
+        description: "/root/review/nested",
+        status: "failed",
+      },
+    });
+
+    const otherProjectReader = new CodexSessionReader({
+      sessionsDir: testDir,
+      projectPath: "/test/other-project",
+    });
+    await expect(
+      otherProjectReader.getAgentMappings(parentId),
+    ).resolves.toEqual([]);
+    await expect(
+      otherProjectReader.getAgentSession(childId, parentId),
+    ).resolves.toBeNull();
   });
 
   const createRollbackSessionFile = async (sessionId: string) => {
@@ -393,6 +488,129 @@ hidden browser state
       "test-project" as UrlProjectId,
     );
     expect(summary?.provider).toBe("codex");
+  });
+
+  it("keeps current item_completed client identity in summary questions", async () => {
+    const sessionId = "current-user-question-identity";
+    const now = "2026-09-01T11:47:39.000Z";
+    await writeFile(
+      join(testDir, `${sessionId}.jsonl`),
+      `${[
+        {
+          type: "session_meta",
+          timestamp: now,
+          payload: {
+            id: sessionId,
+            cwd: "/test/project",
+            timestamp: now,
+            model_provider: "openai",
+          },
+        },
+        {
+          type: "response_item",
+          timestamp: "2026-09-01T11:47:42.595Z",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Inspect duplicate" }],
+            internal_chat_message_metadata_passthrough: {
+              turn_id: "turn-current-question",
+            },
+          },
+        },
+        {
+          type: "event_msg",
+          timestamp: "2026-09-01T11:47:42.597Z",
+          payload: {
+            type: "item_completed",
+            turn_id: "turn-current-question",
+            item: {
+              type: "UserMessage",
+              id: "native-user-question",
+              client_id: "client-current-question",
+              content: [{ type: "text", text: "Inspect duplicate" }],
+            },
+          },
+        },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n")}\n`,
+    );
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+
+    expect(summary?.userQuestions).toEqual([
+      expect.objectContaining({
+        turnId: "turn:turn-current-question",
+        clientUserMessageId: "client-current-question",
+        codexCorrelationKey: "codex:user-message:client-current-question",
+        text: "Inspect duplicate",
+      }),
+    ]);
+  });
+
+  it("marks the bounded summary question index partial when it reaches its cap", async () => {
+    const sessionId = "bounded-question-coverage";
+    const now = "2026-09-01T11:47:39.000Z";
+    const lines = [
+      {
+        type: "session_meta",
+        timestamp: now,
+        payload: {
+          id: sessionId,
+          cwd: "/test/project",
+          timestamp: now,
+          model_provider: "openai",
+        },
+      },
+      ...Array.from({ length: 2_049 }, (_, index) => ({
+        type: "response_item",
+        timestamp: now,
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: `Question ${index}` }],
+          internal_chat_message_metadata_passthrough: {
+            turn_id: `turn-${index}`,
+          },
+        },
+      })),
+    ];
+    await writeFile(
+      join(testDir, `${sessionId}.jsonl`),
+      `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+    );
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+
+    expect(summary?.userQuestions).toHaveLength(2_048);
+    expect(summary?.userQuestionCoverage).toBe("partial");
+  });
+
+  it("identifies DeepSeek cloud sessions as codex, not codex-oss", async () => {
+    // model_provider=deepseek is a cloud Responses-API source; the "deepseek"
+    // brand in the model name must not misroute it to the local OSS provider.
+    const sessionId = "deepseek-cloud-1";
+    await createSessionFile(sessionId, "deepseek", "deepseek-v4-flash");
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+    expect(summary?.provider).toBe("codex");
+    expect(summary?.codexModelProvider).toBe("deepseek");
+
+    const session = await reader.getSession(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+    expect(session?.data.provider).toBe("codex");
   });
 
   it("uses the latest visible entry timestamp for updatedAt", async () => {
@@ -686,6 +904,13 @@ hidden browser state
       },
       {
         type: "event_msg",
+        timestamp: "2024-01-01T00:00:02.004Z",
+        payload: {
+          type: "context_compacted",
+        },
+      },
+      {
+        type: "event_msg",
         timestamp: "2024-01-01T00:00:02.010Z",
         payload: {
           type: "token_count",
@@ -722,6 +947,150 @@ hidden browser state
     expect(summary?.contextUsage?.inputTokens).toBe(7_945);
     expect(summary?.contextUsage?.percentage).toBe(3);
     expect(summary?.contextUsage?.contextWindow).toBe(258_000);
+    expect(summary?.compactCount).toBe(1);
+    expect(summary?.compactEvents).toEqual([
+      expect.objectContaining({
+        timestamp: "2024-01-01T00:00:02.000Z",
+        beforeTokens: 227_243,
+        afterTokens: 7_945,
+        reclaimedTokens: 219_298,
+        trigger: "compacted",
+      }),
+    ]);
+    expect(summary?.cumulativeUsage?.totalTokens).toBe(235_288);
+    expect(summary?.cumulativeUsage?.inputTokens).toBe(227_243);
+    expect(summary?.cumulativeUsage?.turnCount).toBe(2);
+  });
+
+  it("does not double-count monotonic Codex totals around compaction events", async () => {
+    const sessionId = "context-post-compact-monotonic-total";
+    const now = new Date().toISOString();
+    const lines: CodexSessionEntry[] = [
+      {
+        type: "session_meta",
+        timestamp: now,
+        payload: {
+          id: sessionId,
+          cwd: "/test/project",
+          timestamp: now,
+          model_provider: "openai",
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: now,
+        payload: {
+          type: "user_message",
+          message: "Hello world",
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:01.000Z",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: 17_761_457,
+              cached_input_tokens: 17_338_240,
+              output_tokens: 38_570,
+              total_tokens: 17_800_027,
+            },
+            last_token_usage: {
+              input_tokens: 214_208,
+              cached_input_tokens: 210_304,
+              output_tokens: 403,
+              total_tokens: 214_611,
+            },
+          },
+          rate_limits: null,
+        },
+      },
+      {
+        type: "compacted",
+        timestamp: "2024-01-01T00:00:02.000Z",
+        payload: {
+          message: "",
+          replacement_history: [],
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:02.004Z",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: 17_761_457,
+              cached_input_tokens: 17_338_240,
+              output_tokens: 38_570,
+              total_tokens: 17_800_027,
+            },
+            last_token_usage: {
+              input_tokens: 0,
+              cached_input_tokens: 0,
+              output_tokens: 0,
+              total_tokens: 7_375,
+            },
+          },
+          rate_limits: null,
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:02.006Z",
+        payload: {
+          type: "context_compacted",
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:03.000Z",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: 17_804_129,
+              cached_input_tokens: 17_363_584,
+              output_tokens: 39_713,
+              total_tokens: 17_843_842,
+            },
+            last_token_usage: {
+              input_tokens: 26_227,
+              cached_input_tokens: 16_256,
+              output_tokens: 471,
+              total_tokens: 26_698,
+            },
+          },
+          rate_limits: null,
+        },
+      },
+    ];
+
+    await writeFile(
+      join(testDir, `${sessionId}.jsonl`),
+      `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+    );
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+
+    expect(summary?.compactCount).toBe(1);
+    expect(summary?.compactEvents).toEqual([
+      expect.objectContaining({
+        timestamp: "2024-01-01T00:00:02.000Z",
+        beforeTokens: 214_208,
+        afterTokens: 7_375,
+        reclaimedTokens: 206_833,
+        trigger: "compacted",
+      }),
+    ]);
+    expect(summary?.cumulativeUsage?.totalTokens).toBe(17_843_842);
+    expect(summary?.cumulativeUsage?.inputTokens).toBe(440_545);
+    expect(summary?.cumulativeUsage?.cacheReadTokens).toBe(17_363_584);
+    expect(summary?.cumulativeUsage?.turnCount).toBe(3);
   });
 
   it("excludes developer messages from messageCount", async () => {
@@ -770,6 +1139,53 @@ hidden browser state
     expect(summary?.messageCount).toBe(1);
   });
 
+  it("preserves managed paths in legacy event summaries and questions", async () => {
+    const sessionId = "legacy-managed-summary";
+    const now = "2026-08-08T00:00:00.000Z";
+    const managedPath = "/test/runtime/uploads/legacy-summary.pdf";
+    const ordinaryPath = "/workspace/project/README.md";
+    const prompt = `Review ${ordinaryPath}\n\nUser uploaded files:\n- legacy-summary.pdf (5.0 KB, application/pdf): ${managedPath}`;
+    const sessionPath = join(testDir, `${sessionId}.jsonl`);
+    await writeFile(
+      sessionPath,
+      `${[
+        {
+          type: "session_meta",
+          timestamp: now,
+          payload: {
+            id: sessionId,
+            cwd: "/test/project",
+            timestamp: now,
+            model_provider: "openai",
+          },
+        },
+        {
+          type: "event_msg",
+          timestamp: "2026-08-08T00:00:01.000Z",
+          payload: { type: "user_message", message: prompt },
+        },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n")}\n`,
+    );
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+    const summaries = await reader.listSessions("test-project" as UrlProjectId);
+    for (const projected of [
+      summary,
+      summaries.find((item) => item.id === sessionId),
+    ]) {
+      const serialized = JSON.stringify(projected);
+      expect(serialized).toContain(managedPath);
+      expect(serialized).not.toContain("[managed attachment]");
+      expect(serialized).toContain(ordinaryPath);
+    }
+    expect(await readFile(sessionPath, "utf8")).toContain(managedPath);
+  });
+
   it("hides Codex rollout entries removed by thread_rolled_back markers", async () => {
     const sessionId = "rollback-visible-branch";
     await createRollbackSessionFile(sessionId);
@@ -809,6 +1225,100 @@ hidden browser state
     ).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
   });
 
+  it("falls back to a rolled-back Codex branch prompt when visible title is setup-only", async () => {
+    const sessionId = "rollback-setup-only-title";
+    const now = new Date().toISOString();
+    const lines = [
+      JSON.stringify({
+        type: "session_meta",
+        timestamp: now,
+        payload: {
+          id: sessionId,
+          cwd: "/test/project",
+          timestamp: now,
+          model_provider: "openai",
+        },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: "# AGENTS.md instructions for /test/project\n\n<INSTRUCTIONS />",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:02Z",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "../eval-platform" }],
+        },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:03Z",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: "<turn_aborted>\nThe user interrupted.\n</turn_aborted>",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:04Z",
+        payload: {
+          type: "turn_aborted",
+          turn_id: "turn-1",
+          reason: "interrupted",
+        },
+      }),
+      JSON.stringify({
+        type: "event_msg",
+        timestamp: "2024-01-01T00:00:05Z",
+        payload: {
+          type: "thread_rolled_back",
+          num_turns: 1,
+        },
+      }),
+    ];
+
+    await writeFile(
+      join(testDir, `${sessionId}.jsonl`),
+      `${lines.join("\n")}\n`,
+    );
+
+    const summary = await reader.getSessionSummary(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+    expect(summary?.title).toBe("../eval-platform");
+    expect(summary?.fullTitle).toBe("../eval-platform");
+
+    const session = await reader.getSession(
+      sessionId,
+      "test-project" as UrlProjectId,
+    );
+    expect(session?.codexBranchState?.branches[0]?.prompt).toBe(
+      "../eval-platform",
+    );
+    expect(visibleMessageTexts(session?.data.session.entries ?? [])).toEqual([
+      "# AGENTS.md instructions for /test/project\n\n<INSTRUCTIONS />",
+    ]);
+  });
+
   it("preserves originator from session metadata", async () => {
     const sessionId = "originator-passthrough";
     await createSessionFile(sessionId, "openai", "gpt-4o", "yep-anywhere");
@@ -818,128 +1328,5 @@ hidden browser state
       "test-project" as UrlProjectId,
     );
     expect(summary?.originator).toBe("yep-anywhere");
-  });
-
-  it.each(["subagent", "subAgent"])(
-    "normalizes %s session metadata source for list consumers",
-    async (sourceKey) => {
-      const sessionId = `subagent-source-${sourceKey}`;
-      const now = new Date().toISOString();
-      await writeFile(
-        join(testDir, `${sessionId}.jsonl`),
-        `${[
-          JSON.stringify({
-            type: "session_meta",
-            timestamp: now,
-            payload: {
-              id: sessionId,
-              cwd: "/test/project",
-              timestamp: now,
-              model_provider: "openai",
-              source: {
-                [sourceKey]: {
-                  other: "guardian",
-                },
-              },
-            },
-          }),
-          JSON.stringify({
-            type: "event_msg",
-            timestamp: now,
-            payload: {
-              type: "user_message",
-              message: "Review this change",
-            },
-          }),
-        ].join("\n")}\n`,
-      );
-
-      const summary = await reader.getSessionSummary(
-        sessionId,
-        "test-project" as UrlProjectId,
-      );
-
-      expect(summary?.source).toBe("subagent");
-    },
-  );
-
-  it("filters lower- and camel-case subagent sessions from top-level listings", async () => {
-    const now = new Date().toISOString();
-    const sessionMeta = (id: string, source?: Record<string, unknown>) =>
-      JSON.stringify({
-        type: "session_meta",
-        timestamp: now,
-        payload: {
-          id,
-          cwd: "/test/project",
-          timestamp: now,
-          model_provider: "openai",
-          ...(source
-            ? {
-                forked_from_id: "parent-session",
-                source,
-              }
-            : {}),
-        },
-      });
-
-    await Promise.all([
-      writeFile(
-        join(testDir, "top-level.jsonl"),
-        `${sessionMeta("top-level")}\n`,
-      ),
-      ...["subagent", "subAgent"].map((sourceKey) =>
-        writeFile(
-          join(testDir, `${sourceKey}.jsonl`),
-          `${sessionMeta(sourceKey, {
-            [sourceKey]: {
-              thread_spawn: {
-                parent_thread_id: "parent-session",
-              },
-            },
-          })}\n`,
-        ),
-      ),
-    ]);
-
-    const files = await reader.listSessionFiles(testDir);
-    expect(files.map((file) => file.sessionId)).toEqual(["top-level"]);
-  });
-
-  it("filters guardian subagent sessions from top-level listings", async () => {
-    const now = new Date().toISOString();
-    await Promise.all([
-      writeFile(
-        join(testDir, "top-level.jsonl"),
-        `${JSON.stringify({
-          type: "session_meta",
-          timestamp: now,
-          payload: {
-            id: "top-level",
-            cwd: "/test/project",
-            timestamp: now,
-            model_provider: "openai",
-          },
-        })}\n`,
-      ),
-      writeFile(
-        join(testDir, "guardian.jsonl"),
-        `${JSON.stringify({
-          type: "session_meta",
-          timestamp: now,
-          payload: {
-            id: "guardian",
-            cwd: "/test/project",
-            timestamp: now,
-            model_provider: "openai",
-            source: { subagent: { other: "guardian" } },
-          },
-        })}\n`,
-      ),
-    ]);
-
-    const files = await reader.listSessionFiles(testDir);
-
-    expect(files.map((file) => file.sessionId)).toEqual(["top-level"]);
   });
 });

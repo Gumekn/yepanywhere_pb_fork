@@ -3,23 +3,11 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { UrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../src/app.js";
-import type {
-  CodexBridgeController,
-  CodexBridgeSessionView,
-} from "../../src/codex-bridge/types.js";
-import { getLogger } from "../../src/logging/logger.js";
 import type { SessionMetadataService } from "../../src/metadata/index.js";
 import { MockClaudeSDK, createMockScenario } from "../../src/sdk/mock.js";
-import type { SDKMessage } from "../../src/sdk/types.js";
-import type { LoadedSession } from "../../src/sessions/types.js";
-import type { Process } from "../../src/supervisor/Process.js";
-import {
-  type ProcessInfo,
-  encodeProjectId,
-} from "../../src/supervisor/types.js";
+import { encodeProjectId } from "../../src/supervisor/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "fixtures", "agents");
@@ -40,18 +28,14 @@ describe("Sessions API", () => {
     const projectPath = join(testDir, "myproject");
     await mkdir(projectPath, { recursive: true });
     projectId = encodeProjectId(projectPath);
-    const encodedPath = projectPath.replace(/[/\\:]/g, "-");
+    const encodedPath = projectPath.replaceAll("/", "-");
     sessionDir = join(testDir, "localhost", encodedPath);
 
     await mkdir(sessionDir, { recursive: true });
     // Session file must include cwd field for project path discovery
     await writeFile(
       join(sessionDir, "sess-existing.jsonl"),
-      `${JSON.stringify({
-        type: "user",
-        cwd: projectPath,
-        message: { content: "Hello" },
-      })}\n`,
+      `{"type":"user","cwd":"${projectPath}","message":{"content":"Hello"}}\n`,
     );
   });
 
@@ -150,6 +134,39 @@ describe("Sessions API", () => {
       expect(json.processId).toBeDefined();
     });
 
+    it("starts the displayed Claude default with an explicit Sonnet model", async () => {
+      mockSdk.addScenario(createMockScenario("new-session", "Hello!"));
+      const { app, supervisor } = createApp({
+        sdk: mockSdk,
+        projectsDir: testDir,
+      });
+      const startSession = vi.spyOn(supervisor, "startSession");
+
+      const res = await app.request(`/api/projects/${projectId}/sessions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Yep-Anywhere": "true",
+        },
+        body: JSON.stringify({
+          message: "hello",
+          provider: "claude",
+          model: "default",
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(startSession).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ text: "hello" }),
+        undefined,
+        expect.objectContaining({
+          model: "sonnet",
+          providerName: "claude",
+        }),
+      );
+    });
+
     it("accepts permission mode parameter", async () => {
       mockSdk.addScenario(createMockScenario("new-session", "Hello!"));
       const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
@@ -209,274 +226,6 @@ describe("Sessions API", () => {
   });
 
   describe("GET /api/projects/:projectId/sessions/:sessionId", () => {
-    it("returns one projected message list for a persisted session", async () => {
-      const dataUrl = `data:image/png;base64,${Buffer.from("persisted-image").toString("base64")}`;
-      await writeFile(
-        join(sessionDir, "sess-projected.jsonl"),
-        `${JSON.stringify({
-          type: "user",
-          uuid: "persisted-tool-result",
-          parentUuid: null,
-          message: {
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: "tool-persisted",
-                content: JSON.stringify({
-                  output: [{ type: "input_image", image_url: dataUrl }],
-                }),
-              },
-            ],
-          },
-          toolUseResult: {
-            output: [{ type: "input_image", image_url: dataUrl }],
-          },
-        })}\n`,
-      );
-      const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
-
-      const response = await app.request(
-        `/api/projects/${projectId}/sessions/sess-projected`,
-      );
-
-      expect(response.status).toBe(200);
-      const json = await response.json();
-      expect(json.session).not.toHaveProperty("messages");
-      expect(Array.isArray(json.messages)).toBe(true);
-      expect(JSON.stringify(json.messages)).not.toContain(
-        "data:image/png;base64",
-      );
-    });
-
-    it("returns one projected message list for a process-memory session", async () => {
-      const dataUrl = `data:image/png;base64,${Buffer.from("process-image").toString("base64")}`;
-      const sdkMessages: SDKMessage[] = [
-        {
-          type: "user",
-          uuid: "process-tool-result",
-          timestamp: "2026-08-17T01:02:03.000Z",
-          message: {
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: "tool-process",
-                content: JSON.stringify({
-                  output: [{ type: "input_image", image_url: dataUrl }],
-                }),
-              },
-            ],
-          },
-        },
-      ];
-      const { app, readerFactory, scanner, supervisor } = createApp({
-        sdk: mockSdk,
-        projectsDir: testDir,
-      });
-      const project = await scanner.getOrCreateProject(projectId);
-      if (!project) throw new Error("Expected test project to exist");
-      vi.spyOn(readerFactory(project), "getSession").mockResolvedValue(null);
-      vi.spyOn(supervisor, "getProcessForSession").mockReturnValue({
-        id: "process-memory",
-        sessionId: "sess-process-memory",
-        projectId,
-        state: { type: "idle", since: new Date("2026-08-17T01:02:04.000Z") },
-        permissionMode: "default",
-        modeVersion: 0,
-        provider: "claude",
-        resolvedModel: "claude-test",
-        resolvedReasoningEffort: undefined,
-        serviceTier: undefined,
-        contextWindow: undefined,
-        supportsDynamicCommands: false,
-        getMessageHistory: () => sdkMessages,
-      } as unknown as Process);
-
-      const response = await app.request(
-        `/api/projects/${projectId}/sessions/sess-process-memory`,
-      );
-
-      expect(response.status).toBe(200);
-      const json = await response.json();
-      expect(json.session).not.toHaveProperty("messages");
-      expect(Array.isArray(json.messages)).toBe(true);
-      expect(JSON.stringify(json.messages)).not.toContain(
-        "data:image/png;base64",
-      );
-    });
-
-    it("returns message-free metadata for a bridge-only session", async () => {
-      const sessionId = "sess-bridge-only";
-      const bridgeView: CodexBridgeSessionView = {
-        session: {
-          id: sessionId,
-          projectId: projectId as UrlProjectId,
-          title: "Bridge-only session",
-          fullTitle: "Bridge-only session",
-          createdAt: "2026-08-17T01:02:03.000Z",
-          updatedAt: "2026-08-17T01:02:04.000Z",
-          messageCount: 0,
-          ownership: { owner: "external" },
-          provider: "codex",
-        },
-        projectName: "myproject",
-        activity: "idle",
-      };
-      const codexBridgeService = {
-        getSessionView: vi.fn(async (requestedSessionId: string) =>
-          requestedSessionId === sessionId ? bridgeView : null,
-        ),
-        isSessionActive: vi.fn(async () => true),
-        getPendingInputRequest: vi.fn(async () => null),
-      } as unknown as CodexBridgeController;
-      const { app, readerFactory, scanner, supervisor } = createApp({
-        sdk: mockSdk,
-        projectsDir: testDir,
-        codexBridgeService,
-      });
-      const project = await scanner.getOrCreateProject(projectId);
-      if (!project) throw new Error("Expected test project to exist");
-      vi.spyOn(readerFactory(project), "getSession").mockResolvedValue(null);
-      vi.spyOn(supervisor, "getProcessForSession").mockReturnValue(undefined);
-
-      const response = await app.request(
-        `/api/projects/${projectId}/sessions/${sessionId}`,
-      );
-
-      expect(response.status).toBe(200);
-      const json = await response.json();
-      expect(json.session).not.toHaveProperty("messages");
-      expect(Array.isArray(json.messages)).toBe(true);
-      expect(JSON.stringify(json.messages)).not.toContain(
-        "data:image/png;base64",
-      );
-      expect(json.messages).toEqual([]);
-    });
-
-    it("negotiates gzip only when requested for a large JSON response", async () => {
-      await writeFile(
-        join(sessionDir, "sess-compression.jsonl"),
-        `${JSON.stringify({
-          type: "assistant",
-          uuid: "large-visible-message",
-          parentUuid: null,
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "visible response ".repeat(200) }],
-          },
-        })}\n`,
-      );
-      const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
-      const sessionUrl = `/api/projects/${projectId}/sessions/sess-compression`;
-
-      const compressed = await app.request(sessionUrl, {
-        headers: {
-          "X-Yep-Anywhere": "true",
-          "Accept-Encoding": "gzip",
-        },
-      });
-      expect(compressed.headers.get("content-encoding")).toBe("gzip");
-
-      const identity = await app.request(sessionUrl, {
-        headers: {
-          "X-Yep-Anywhere": "true",
-          "Accept-Encoding": "identity",
-        },
-      });
-      expect(identity.headers.has("content-encoding")).toBe(false);
-    });
-
-    it("does not compress a below-threshold Session JSON response", async () => {
-      const sessionId = "sess-small";
-      const smallSession: LoadedSession = {
-        summary: {
-          id: sessionId,
-          projectId: projectId as UrlProjectId,
-          title: null,
-          fullTitle: null,
-          createdAt: "2026-08-17T01:02:03.000Z",
-          updatedAt: "2026-08-17T01:02:04.000Z",
-          messageCount: 0,
-          ownership: { owner: "none" },
-          provider: "claude",
-        },
-        data: {
-          provider: "claude",
-          session: { messages: [] },
-        },
-      };
-      const { app, readerFactory, scanner } = createApp({
-        sdk: mockSdk,
-        projectsDir: testDir,
-      });
-      const project = await scanner.getOrCreateProject(projectId);
-      if (!project) throw new Error("Expected test project to exist");
-      vi.spyOn(readerFactory(project), "getSession").mockResolvedValue(
-        smallSession,
-      );
-      const sessionUrl = `/api/projects/${projectId}/sessions/${sessionId}`;
-      const identity = await app.request(sessionUrl, {
-        headers: {
-          "X-Yep-Anywhere": "true",
-          "Accept-Encoding": "identity",
-        },
-      });
-
-      expect(identity.status).toBe(200);
-      const body = await identity.text();
-      expect(Buffer.byteLength(body, "utf8")).toBeLessThan(1024);
-
-      const gzip = await app.request(sessionUrl, {
-        headers: {
-          "X-Yep-Anywhere": "true",
-          "Accept-Encoding": "gzip",
-        },
-      });
-      expect(gzip.status).toBe(200);
-      expect(gzip.headers.has("content-encoding")).toBe(false);
-    });
-
-    it("does not compress unrelated JSON routes registered after Session routes", async () => {
-      const { app, supervisor } = createApp({
-        sdk: mockSdk,
-        projectsDir: testDir,
-      });
-      const processInfo: ProcessInfo = {
-        id: "unrelated-process",
-        sessionId: "unrelated-session",
-        projectId: projectId as UrlProjectId,
-        projectPath: testDir,
-        projectName: "myproject",
-        sessionTitle: "unrelated response ".repeat(150),
-        state: "idle",
-        startedAt: "2026-08-17T01:02:03.000Z",
-        queueDepth: 0,
-        provider: "claude",
-      };
-      vi.spyOn(supervisor, "getProcessInfoList").mockReturnValue([processInfo]);
-
-      const identity = await app.request("/api/processes", {
-        headers: {
-          "X-Yep-Anywhere": "true",
-          "Accept-Encoding": "identity",
-        },
-      });
-      expect(identity.status).toBe(200);
-      expect(Buffer.byteLength(await identity.text(), "utf8")).toBeGreaterThan(
-        1024,
-      );
-
-      const gzip = await app.request("/api/processes", {
-        headers: {
-          "X-Yep-Anywhere": "true",
-          "Accept-Encoding": "gzip",
-        },
-      });
-      expect(gzip.status).toBe(200);
-      expect(gzip.headers.has("content-encoding")).toBe(false);
-    });
-
     it("returns pendingInputRequest for a persisted Claude AskUserQuestion", async () => {
       await writeFile(
         join(sessionDir, "sess-question.jsonl"),
@@ -624,10 +373,15 @@ describe("Sessions API", () => {
       expect(json.processId).toBeDefined();
     });
 
-    it("passes Codex rollbackNumTurns when resuming an edited Codex prompt", async () => {
+    it("forks edited Codex prompts immediately and persists child lineage", async () => {
       const sessionMetadataService = {
         getProvider: vi.fn(() => "codex"),
         getExecutor: vi.fn(() => undefined),
+        getMetadata: vi.fn(() => undefined),
+        setEditForkMetadata: vi.fn(async () => undefined),
+        setProvider: vi.fn(async () => undefined),
+        setCreatedBy: vi.fn(async () => undefined),
+        setProjectLocation: vi.fn(async () => undefined),
       };
       const { app, supervisor } = createApp({
         sdk: mockSdk,
@@ -639,6 +393,7 @@ describe("Sessions API", () => {
         .spyOn(supervisor, "resumeSession")
         .mockResolvedValue({
           id: "process-codex",
+          sessionId: "thread-codex-child",
           permissionMode: "default",
           modeVersion: 0,
         } as unknown as Awaited<ReturnType<typeof supervisor.resumeSession>>);
@@ -654,11 +409,20 @@ describe("Sessions API", () => {
           body: JSON.stringify({
             message: "q2-1",
             rollbackNumTurns: 2,
+            rollbackTarget: {
+              messageId: "user-q2-turn-q2",
+              text: "q2",
+            },
           }),
         },
       );
 
       expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toMatchObject({
+        sessionId: "thread-codex-child",
+        forkParentSessionId: "sess-existing",
+        processId: "process-codex",
+      });
       expect(resumeSpy).toHaveBeenCalledWith(
         "sess-existing",
         expect.any(String),
@@ -668,6 +432,14 @@ describe("Sessions API", () => {
           providerName: "codex",
           rollbackNumTurns: 2,
           resumeSessionAt: undefined,
+        }),
+        { requireImmediate: true },
+      );
+      expect(sessionMetadataService.setEditForkMetadata).toHaveBeenCalledWith(
+        "thread-codex-child",
+        expect.objectContaining({
+          forkParentSessionId: "sess-existing",
+          forkTargetMessageId: "user-q2-turn-q2",
         }),
       );
     });
@@ -719,6 +491,110 @@ describe("Sessions API", () => {
           resumeSessionAt: "parent-uuid",
         }),
       );
+    });
+
+    it("returns 410 when persisted metadata names the retired provider", async () => {
+      const sessionMetadataService = {
+        getPersistedProvider: vi.fn(() => "opencode"),
+        getProvider: vi.fn(() => undefined),
+      };
+      const { app, supervisor } = createApp({
+        sdk: mockSdk,
+        projectsDir: testDir,
+        sessionMetadataService:
+          sessionMetadataService as unknown as SessionMetadataService,
+      });
+      const resumeSpy = vi
+        .spyOn(supervisor, "resumeSession")
+        .mockRejectedValue(new Error("must not start"));
+
+      const res = await app.request(
+        `/api/projects/${projectId}/sessions/sess-existing/resume`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Yep-Anywhere": "true",
+          },
+          body: JSON.stringify({
+            message: "continue legacy session",
+          }),
+        },
+      );
+
+      expect(res.status).toBe(410);
+      await expect(res.json()).resolves.toMatchObject({
+        error: "OpenCode provider has been retired",
+        code: "provider_retired",
+      });
+      expect(resumeSpy).not.toHaveBeenCalled();
+    });
+
+    it("returns the ZCode fork id and records edit-fork lineage", async () => {
+      const sessionMetadataService = {
+        getProvider: vi.fn(() => "zcode"),
+        getExecutor: vi.fn(() => undefined),
+        setProvider: vi.fn(async () => undefined),
+        setForkParentSessionId: vi.fn(async () => undefined),
+        setCreatedBy: vi.fn(async () => undefined),
+        setProjectLocation: vi.fn(async () => undefined),
+      };
+      const { app, supervisor } = createApp({
+        sdk: mockSdk,
+        projectsDir: testDir,
+        sessionMetadataService:
+          sessionMetadataService as unknown as SessionMetadataService,
+      });
+      const resumeSpy = vi
+        .spyOn(supervisor, "resumeSession")
+        .mockResolvedValue({
+          id: "process-zcode-fork",
+          sessionId: "ses_zcode_fork",
+          permissionMode: "acceptEdits",
+          modeVersion: 3,
+        } as unknown as Awaited<ReturnType<typeof supervisor.resumeSession>>);
+
+      const res = await app.request(
+        `/api/projects/${projectId}/sessions/sess-existing/resume`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Yep-Anywhere": "true",
+          },
+          body: JSON.stringify({
+            message: "edited ZCode prompt",
+            mode: "acceptEdits",
+            resumeSessionAt: "msg_zcode_user",
+          }),
+        },
+      );
+
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toMatchObject({
+        sessionId: "ses_zcode_fork",
+        forkParentSessionId: "sess-existing",
+        processId: "process-zcode-fork",
+      });
+      expect(resumeSpy).toHaveBeenCalledWith(
+        "sess-existing",
+        expect.any(String),
+        expect.objectContaining({ text: "edited ZCode prompt" }),
+        "acceptEdits",
+        expect.objectContaining({
+          providerName: "zcode",
+          resumeSessionAt: "msg_zcode_user",
+          rollbackNumTurns: undefined,
+        }),
+        { requireImmediate: true },
+      );
+      expect(sessionMetadataService.setProvider).toHaveBeenCalledWith(
+        "ses_zcode_fork",
+        "zcode",
+      );
+      expect(
+        sessionMetadataService.setForkParentSessionId,
+      ).toHaveBeenCalledWith("ses_zcode_fork", "sess-existing");
     });
 
     it("returns 400 for non-integer rollbackNumTurns", async () => {
@@ -792,237 +668,21 @@ describe("Sessions API", () => {
   });
 
   describe("POST /api/sessions/:sessionId/messages", () => {
-    const requestHeaders = {
-      "Content-Type": "application/json",
-      "X-Yep-Anywhere": "true",
-    };
-
-    function createQueueProcess(
-      overrides: Record<string, unknown> = {},
-    ): Process {
-      return {
-        id: "process-active",
-        sessionId: "sess-active",
-        projectPath: testDir,
-        state: { type: "in-turn" },
-        isTerminated: false,
-        provider: "claude",
-        deferMessage: vi.fn(),
-        ...overrides,
-      } as unknown as Process;
-    }
-
-    function expectPrivateQueueLogs(
-      info: ReturnType<typeof vi.spyOn>,
-      warn: ReturnType<typeof vi.spyOn>,
-    ): void {
-      const payloads = [...info.mock.calls, ...warn.mock.calls].map(
-        ([payload]) => JSON.stringify(payload),
-      );
-      expect(payloads.join("\n")).not.toContain("secret body");
-    }
-
-    afterEach(() => {
-      vi.restoreAllMocks();
-    });
-
-    it("logs a rejected outcome when no active process exists", async () => {
-      const warn = vi.spyOn(getLogger(), "warn").mockImplementation(() => {});
+    it("returns 404 if no active process", async () => {
       const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
 
       const res = await app.request("/api/sessions/unknown/messages", {
         method: "POST",
-        headers: requestHeaders,
-        body: JSON.stringify({ message: "secret body" }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-Yep-Anywhere": "true",
+        },
+        body: JSON.stringify({ message: "hello" }),
       });
 
       expect(res.status).toBe(404);
       const json = await res.json();
       expect(json.error).toBe("No active process for session");
-      expect(warn).toHaveBeenCalledWith(
-        {
-          event: "session_queue_rejected",
-          sessionId: "unknown",
-          reason: "no_active_process",
-        },
-        expect.any(String),
-      );
-      expect(JSON.stringify(warn.mock.calls)).not.toContain("secret body");
-    });
-
-    it("logs requested and rejected outcomes for a terminated process", async () => {
-      const info = vi.spyOn(getLogger(), "info").mockImplementation(() => {});
-      const warn = vi.spyOn(getLogger(), "warn").mockImplementation(() => {});
-      const { app, supervisor } = createApp({
-        sdk: mockSdk,
-        projectsDir: testDir,
-      });
-      const process = createQueueProcess({
-        state: { type: "terminated", reason: "test termination" },
-        isTerminated: true,
-        terminationReason: "test termination",
-      });
-      vi.spyOn(supervisor, "getProcessForSession").mockReturnValue(process);
-
-      const res = await app.request("/api/sessions/sess-active/messages", {
-        method: "POST",
-        headers: requestHeaders,
-        body: JSON.stringify({
-          message: "secret body",
-          tempId: "temp-terminated",
-        }),
-      });
-
-      expect(res.status).toBe(410);
-      expect(info).toHaveBeenCalledWith(
-        expect.objectContaining({
-          event: "session_queue_requested",
-          sessionId: "sess-active",
-          tempId: "temp-terminated",
-          messageLength: 11,
-          processState: "terminated",
-        }),
-        expect.any(String),
-      );
-      expect(warn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          event: "session_queue_rejected",
-          sessionId: "sess-active",
-          reason: "process_terminated",
-        }),
-        expect.any(String),
-      );
-      expectPrivateQueueLogs(info, warn);
-    });
-
-    it("logs requested and accepted outcomes for a deferred message", async () => {
-      const info = vi.spyOn(getLogger(), "info").mockImplementation(() => {});
-      const warn = vi.spyOn(getLogger(), "warn").mockImplementation(() => {});
-      const { app, supervisor } = createApp({
-        sdk: mockSdk,
-        projectsDir: testDir,
-      });
-      const process = createQueueProcess();
-      vi.spyOn(supervisor, "getProcessForSession").mockReturnValue(process);
-
-      const res = await app.request("/api/sessions/sess-active/messages", {
-        method: "POST",
-        headers: requestHeaders,
-        body: JSON.stringify({
-          message: "secret body",
-          tempId: "temp-deferred",
-          deferred: true,
-        }),
-      });
-
-      expect(res.status).toBe(200);
-      expect(info).toHaveBeenCalledWith(
-        expect.objectContaining({
-          event: "session_queue_requested",
-          sessionId: "sess-active",
-          tempId: "temp-deferred",
-          messageLength: 11,
-          processState: "in-turn",
-        }),
-        expect.any(String),
-      );
-      expect(info).toHaveBeenCalledWith(
-        expect.objectContaining({
-          event: "session_queue_accepted",
-          sessionId: "sess-active",
-          tempId: "temp-deferred",
-          messageLength: 11,
-          processState: "in-turn",
-        }),
-        expect.any(String),
-      );
-      expectPrivateQueueLogs(info, warn);
-    });
-
-    it("logs requested and rejected outcomes when queueing fails", async () => {
-      const info = vi.spyOn(getLogger(), "info").mockImplementation(() => {});
-      const warn = vi.spyOn(getLogger(), "warn").mockImplementation(() => {});
-      const { app, supervisor } = createApp({
-        sdk: mockSdk,
-        projectsDir: testDir,
-      });
-      const process = createQueueProcess();
-      vi.spyOn(supervisor, "getProcessForSession").mockReturnValue(process);
-      vi.spyOn(supervisor, "queueMessageToSession").mockResolvedValue({
-        success: false,
-        error: "Process transport failed",
-      });
-
-      const res = await app.request("/api/sessions/sess-active/messages", {
-        method: "POST",
-        headers: requestHeaders,
-        body: JSON.stringify({
-          message: "secret body",
-          tempId: "temp-failed",
-        }),
-      });
-
-      expect(res.status).toBe(410);
-      expect(warn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          event: "session_queue_rejected",
-          sessionId: "sess-active",
-          tempId: "temp-failed",
-          messageLength: 11,
-          processState: "in-turn",
-          reason: "queue_failed",
-        }),
-        expect.any(String),
-      );
-      expectPrivateQueueLogs(info, warn);
-    });
-
-    it("logs requested and accepted outcomes when queueing succeeds", async () => {
-      const info = vi.spyOn(getLogger(), "info").mockImplementation(() => {});
-      const warn = vi.spyOn(getLogger(), "warn").mockImplementation(() => {});
-      const { app, supervisor } = createApp({
-        sdk: mockSdk,
-        projectsDir: testDir,
-      });
-      const process = createQueueProcess();
-      vi.spyOn(supervisor, "getProcessForSession").mockReturnValue(process);
-      vi.spyOn(supervisor, "queueMessageToSession").mockResolvedValue({
-        success: true,
-        process,
-        restarted: false,
-      });
-
-      const res = await app.request("/api/sessions/sess-active/messages", {
-        method: "POST",
-        headers: requestHeaders,
-        body: JSON.stringify({
-          message: "secret body",
-          tempId: "temp-1",
-        }),
-      });
-
-      expect(res.status).toBe(200);
-      expect(info).toHaveBeenCalledWith(
-        expect.objectContaining({
-          event: "session_queue_requested",
-          sessionId: "sess-active",
-          tempId: "temp-1",
-          messageLength: 11,
-          processState: "in-turn",
-        }),
-        expect.any(String),
-      );
-      expect(info).toHaveBeenCalledWith(
-        expect.objectContaining({
-          event: "session_queue_accepted",
-          sessionId: "sess-active",
-          tempId: "temp-1",
-          messageLength: 11,
-          processState: "in-turn",
-        }),
-        expect.any(String),
-      );
-      expectPrivateQueueLogs(info, warn);
     });
   });
 
@@ -1197,6 +857,59 @@ describe("Sessions API", () => {
       expect(json.error).toBe("Invalid request ID or no pending request");
     });
 
+    it("rejects an unanswered question without consuming the pending request", async () => {
+      const requestId = `question-${Date.now()}`;
+      mockSdk.addScenario({
+        messages: [
+          { type: "system", subtype: "init", session_id: "sess-question" },
+          {
+            type: "system",
+            subtype: "input_request",
+            input_request: {
+              id: requestId,
+              type: "question",
+              prompt: "Choose an option",
+            },
+          },
+        ],
+        delayMs: 5,
+      });
+      const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
+      const startRes = await app.request(
+        `/api/projects/${projectId}/sessions`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Yep-Anywhere": "true",
+          },
+          body: JSON.stringify({ message: "hello" }),
+        },
+      );
+      const { sessionId } = await startRes.json();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const unanswered = await app.request(`/api/sessions/${sessionId}/input`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Yep-Anywhere": "true",
+        },
+        body: JSON.stringify({ requestId, response: "approve" }),
+      });
+      expect(unanswered.status).toBe(400);
+      await expect(unanswered.json()).resolves.toEqual({
+        error: "Question response is missing 1 required answer",
+      });
+
+      const pending = await app.request(
+        `/api/sessions/${sessionId}/pending-input`,
+      );
+      await expect(pending.json()).resolves.toMatchObject({
+        request: { id: requestId, type: "question" },
+      });
+    });
+
     it("accepts approve response with correct requestId", async () => {
       const requestId = `req-${Date.now()}`;
       // Create a session with tool approval
@@ -1337,6 +1050,94 @@ describe("Sessions API", () => {
       expect(Array.isArray(json.messages)).toBe(true);
       expect(json.messages.length).toBeGreaterThan(0);
       expect(json.status).toBe("completed");
+    });
+
+    it("augments Edit renderer data in a persisted agent transcript", async () => {
+      const { app } = createApp({ sdk: mockSdk, projectsDir: testDir });
+      const records = [
+        {
+          type: "user",
+          uuid: "agent-user",
+          parentUuid: null,
+          message: { role: "user", content: "Edit the file" },
+        },
+        {
+          type: "assistant",
+          uuid: "agent-edit",
+          parentUuid: "agent-user",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "agent-edit-tool",
+                name: "Edit",
+                input: {
+                  file_path: "src/agent.ts",
+                  changes: [
+                    {
+                      path: "src/agent.ts",
+                      kind: "update",
+                      diff: "@@ -1 +1 @@\n-before\n+after",
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+        {
+          type: "user",
+          uuid: "agent-edit-result",
+          parentUuid: "agent-edit",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "agent-edit-tool",
+                content: "ok",
+              },
+            ],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "agent-final",
+          parentUuid: "agent-edit-result",
+          message: { role: "assistant", content: "Done" },
+        },
+        {
+          type: "result",
+          uuid: "agent-result",
+          parentUuid: "agent-final",
+          result: { type: "result" },
+        },
+      ];
+      await writeFile(
+        join(sessionDir, "agent-edit-agent.jsonl"),
+        `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+      );
+
+      const res = await app.request(
+        `/api/projects/${projectId}/sessions/sess-existing/agents/edit-agent`,
+      );
+      const json = await res.json();
+      const edit = json.messages
+        .flatMap((message: { message?: { content?: unknown } }) =>
+          Array.isArray(message.message?.content)
+            ? message.message.content
+            : [],
+        )
+        .find(
+          (block: { type?: string; name?: string }) =>
+            block.type === "tool_use" && block.name === "Edit",
+        );
+
+      expect(res.status).toBe(200);
+      expect(edit.input._rawPatch).toContain("-before");
+      expect(edit.input._structuredPatch).toHaveLength(1);
+      expect(edit.input._diffHtml).toContain('class="line line-deleted"');
     });
 
     it("returns 200 with empty messages for unknown agent", async () => {

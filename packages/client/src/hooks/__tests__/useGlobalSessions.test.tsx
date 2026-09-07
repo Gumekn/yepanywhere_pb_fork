@@ -68,6 +68,7 @@ const baseSessionSummary = {
   ...baseSession,
   projectId,
   fullTitle: null,
+  messageCount: baseSession.messageCount ?? 0,
 };
 
 function response(sessions: GlobalSessionItem[]) {
@@ -296,6 +297,60 @@ describe("useGlobalSessions", () => {
     );
     expect(mockGetGlobalSessionStats).toHaveBeenCalledTimes(1);
     expect(result.current.stats).toEqual(globalStats);
+  });
+
+  it("requests pinned-session coverage in the same list fetch", async () => {
+    renderHook(() => useGlobalSessions({ includePinned: true, limit: 50 }));
+    await flushPromises();
+
+    expect(mockGetGlobalSessions).toHaveBeenCalledWith(
+      expect.objectContaining({ includePinned: true }),
+    );
+  });
+
+  it("paginates from the ordinary page boundary before appended pins", async () => {
+    const recentSession = {
+      ...baseSession,
+      id: "recent-session",
+      updatedAt: "2026-06-22T08:00:00.000Z",
+    };
+    const oldPinnedSession = {
+      ...baseSession,
+      id: "old-pinned-session",
+      updatedAt: "2026-05-01T08:00:00.000Z",
+      isStarred: true,
+    };
+    const nextSession = {
+      ...baseSession,
+      id: "next-session",
+      updatedAt: "2026-06-21T08:00:00.000Z",
+    };
+    mockGetGlobalSessions
+      .mockResolvedValueOnce({
+        ...response([recentSession, oldPinnedSession]),
+        hasMore: true,
+        nextCursor: recentSession.updatedAt,
+      })
+      .mockResolvedValueOnce(response([nextSession]));
+
+    const { result } = renderHook(() =>
+      useGlobalSessions({ includePinned: true, limit: 1 }),
+    );
+    await flushPromises();
+
+    await act(async () => {
+      await result.current.loadMore();
+    });
+
+    expect(mockGetGlobalSessions).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ after: recentSession.updatedAt }),
+    );
+    expect(result.current.sessions.map((session) => session.id)).toEqual([
+      "recent-session",
+      "old-pinned-session",
+      "next-session",
+    ]);
   });
 
   it("does not fetch global stats for a project-scoped list", async () => {

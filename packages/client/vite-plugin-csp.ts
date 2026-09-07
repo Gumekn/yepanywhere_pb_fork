@@ -17,15 +17,6 @@ function computeScriptHash(content: string): string {
 }
 
 /**
- * Normalize newline sequences to match browser behavior.
- * Browsers canonicalize CRLF to LF before computing CSP script hashes,
- * so we must do the same or Windows-built bundles get mismatched hashes.
- */
-function normalizeScriptContent(content: string): string {
-  return content.replace(/\r\n/g, "\n");
-}
-
-/**
  * Extract inline script content from HTML.
  * Returns the content between <script>...</script> tags (non-module scripts only).
  */
@@ -37,7 +28,7 @@ function extractInlineScripts(html: string): string[] {
   for (const match of html.matchAll(scriptRegex)) {
     const content = match[1];
     if (content.trim()) {
-      scripts.push(normalizeScriptContent(content));
+      scripts.push(content);
     }
   }
   return scripts;

@@ -7,8 +7,8 @@
 # Usage:
 #   scripts/deploy.sh                         # interactive wizard
 #   scripts/deploy.sh --server-only           # non-interactive server deploy
+#   scripts/deploy.sh --dev-server            # replace 8022 with dev hot reload
 #   scripts/deploy.sh --codex-bridge-only     # non-interactive 4510 bridge deploy
-#   scripts/deploy.sh --claude-bridge-only    # non-interactive 4520 bridge deploy
 #   scripts/deploy.sh --apk-only --debug
 #   scripts/deploy.sh --restart-only --no-apk
 #   scripts/deploy.sh --skip-checks --no-install
@@ -35,59 +35,17 @@ warn() { echo -e "${C_YELLOW}!!${C_RESET}  $*" >&2; }
 err()  { echo -e "${C_RED}xx${C_RESET}  $*" >&2; }
 dim()  { echo -e "${C_DIM}    $*${C_RESET}"; }
 
+# shellcheck source=scripts/lib/node.sh
+source "$SCRIPT_DIR/lib/node.sh"
+# shellcheck source=scripts/lib/pnpm.sh
+source "$SCRIPT_DIR/lib/pnpm.sh"
+# shellcheck source=scripts/lib/deploy-env.sh
+source "$SCRIPT_DIR/lib/deploy-env.sh"
+# shellcheck source=scripts/lib/deploy-lock.sh
+source "$SCRIPT_DIR/lib/deploy-lock.sh"
+
 LOADED_DEPLOY_ENV_FILE=""
 DISCOVERED_FCM_SERVICE_ACCOUNT_FILE=""
-
-trim_whitespace() {
-  local value="$1"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s' "$value"
-}
-
-load_deploy_env_file() {
-  local env_file="${YEP_DEPLOY_ENV_FILE:-$REPO_ROOT/.env.deploy.local}"
-
-  if [[ ! -f "$env_file" ]]; then
-    if [[ -n "${YEP_DEPLOY_ENV_FILE:-}" ]]; then
-      err "YEP_DEPLOY_ENV_FILE was set, but the file does not exist: $env_file"
-      exit 1
-    fi
-    return
-  fi
-
-  local raw_line line key value
-  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-    line="$(trim_whitespace "$raw_line")"
-    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
-    if [[ "$line" == export[[:space:]]* ]]; then
-      line="$(trim_whitespace "${line#export}")"
-    fi
-    if [[ "$line" != *=* ]]; then
-      warn "Skipping invalid deploy env line in $env_file: $raw_line"
-      continue
-    fi
-
-    key="$(trim_whitespace "${line%%=*}")"
-    value="$(trim_whitespace "${line#*=}")"
-    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-      warn "Skipping invalid deploy env key in $env_file: $key"
-      continue
-    fi
-    if [[ -n "${!key+x}" ]]; then
-      continue
-    fi
-
-    if [[ ${#value} -ge 2 && "$value" == \"*\" && "$value" == *\" ]]; then
-      value="${value:1:$((${#value} - 2))}"
-    elif [[ ${#value} -ge 2 && "$value" == \'* && "$value" == *\' ]]; then
-      value="${value:1:$((${#value} - 2))}"
-    fi
-    export "$key=$value"
-  done <"$env_file"
-
-  LOADED_DEPLOY_ENV_FILE="$env_file"
-}
 
 resolve_local_path() {
   local value="$1"
@@ -129,9 +87,10 @@ usage() {
 
 Options:
   --server-only       Deploy only the server bundle
+  --dev-server        Replace 8022 with dev hot reload after active turns become idle
+  --allow-yep-session-interrupt
+                      Allow an 8022 restart/dev cutover to interrupt active Yep-managed work
   --codex-bridge-only Deploy only the 4510 Codex bridge sidecar
-  --claude-bridge-only
-                      Deploy only the 4520 Claude terminal bridge sidecar
   --apk-only          Build/install only the APK
   --no-server         Skip server deploy
   --no-apk            Skip APK build/install
@@ -141,8 +100,6 @@ Options:
                       Keep the Codex bridge sidecar alive while restarting the web server (default)
   --restart-codex-bridge
                       Restart the Codex bridge sidecar too; disconnects active cf sessions
-  --restart-claude-bridge
-                      Restart the Claude terminal bridge sidecar too
   --embedded-codex-bridge
                       Legacy mode: run the Codex bridge inside the web server
   --skip-checks       Skip pnpm lint/typecheck preflight
@@ -152,8 +109,11 @@ APK options passed through:
 
 Native push deploy config:
   YEP_DEPLOY_ENV_FILE              Env file to load (default: .env.deploy.local)
+  YEP_REPORTS_DIR                  Absolute or repository-relative Reports directory
+                                   (default: sibling research_tasks directory)
   ALLOWED_IMAGE_PATHS              Extra local media paths for /api/local-image
                                    (default: /tmp,$HOME/Downloads)
+  ALLOWED_HOSTS                    Comma-separated public hostnames/IPs accepted by the server
   YEP_ANDROID_GOOGLE_SERVICES_JSON Source path copied to Android app google-services.json
   YEP_FCM_SERVICE_ACCOUNT_FILE     Firebase service account JSON path for server FCM
   YEP_FCM_SERVICE_ACCOUNT_JSON     Raw Firebase service account JSON for server FCM
@@ -164,13 +124,19 @@ Native push deploy config:
 
 AI session title deploy config:
   SESSION_TITLE_LLM_API_KEY        OpenAI-compatible API key for title generation
-  LLM_API_KEY                      Fallback API key for title generation
+  LLM_API_KEY                      Shared fallback API key for titles and Pi gateway
   SESSION_TITLE_LLM_API_BASE       OpenAI-compatible API base for title generation
-  LLM_API_BASE                     Fallback API base for title generation
+  LLM_API_BASE                     Shared fallback API base for titles and Pi gateway
   SESSION_TITLE_SUB_MODULE         X-Sub-Module header for title generation
-  LLM_SUB_MODULE                   Fallback X-Sub-Module header for title generation
-  SESSION_TITLE_MODEL              Title model (default: deepseek-v4-pro)
-  SESSION_TITLE_GENERATION=false   Disable title generation
+  LLM_SUB_MODULE                   Shared fallback X-Sub-Module header for titles and Pi gateway
+  YEP_LLM_GATEWAY_API_KEY          API key for the default Pi LLM gateway
+  YEP_LLM_GATEWAY_API_BASE         API base for the default Pi LLM gateway
+  YEP_LLM_GATEWAY_SUB_MODULE       X-Sub-Module header for the default Pi LLM gateway
+  YEP_LLM_GATEWAYS                 Extra Pi LLM gateway channels; referenced key variables
+                                   are copied into the server LaunchAgent
+  YEP_LLM_GATEWAY_MODELS           Comma-separated Pi picker model prefixes; empty shows all
+  SESSION_TITLE_MODEL              Title model (default: deepseek-v4-flash)
+  SESSION_TITLE_GENERATION=false   Disable manual title generation
   SESSION_TITLE_TIMEOUT_MS         Title request timeout in milliseconds
   YEP_SYNC_SESSION_TITLE_LAUNCHAGENT=false
                                     Disable automatic server LaunchAgent title env sync
@@ -180,6 +146,13 @@ EOF
 }
 
 load_deploy_env_file
+if [[ -z "${YEP_REPORTS_DIR:-}" && -n "${RESEARCH_TASKS_DIR:-}" ]]; then
+  export YEP_REPORTS_DIR="$RESEARCH_TASKS_DIR"
+fi
+if [[ -z "${YEP_REPORTS_DIR:-}" ]]; then
+  export YEP_REPORTS_DIR="$(dirname "$REPO_ROOT")/research_tasks"
+fi
+normalize_path_env_var "YEP_REPORTS_DIR"
 normalize_path_env_var "YEP_ANDROID_GOOGLE_SERVICES_JSON"
 normalize_path_env_var "YEP_ANDROID_GOOGLE_SERVICES_TARGET"
 normalize_path_env_var "YEP_FCM_SERVICE_ACCOUNT_FILE"
@@ -187,8 +160,9 @@ normalize_path_env_var "GOOGLE_APPLICATION_CREDENTIALS"
 discover_fcm_service_account_file
 
 DO_SERVER=true
+DO_DEV_SERVER=false
+ALLOW_YEP_SESSION_INTERRUPT=false
 DO_CODEX_BRIDGE=false
-DO_CLAUDE_BRIDGE=false
 DO_APK=true
 RUN_CHECKS=true
 SERVER_ARGS=()
@@ -200,6 +174,7 @@ SYNC_NATIVE_PUSH_LAUNCHAGENT="${YEP_SYNC_NATIVE_PUSH_LAUNCHAGENT:-true}"
 REQUIRE_SESSION_TITLE_GENERATION="${YEP_REQUIRE_SESSION_TITLE_GENERATION:-false}"
 SYNC_SESSION_TITLE_LAUNCHAGENT="${YEP_SYNC_SESSION_TITLE_LAUNCHAGENT:-true}"
 SERVER_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
+SERVER_REPORTS_DIR="$YEP_REPORTS_DIR"
 NEED_SERVER_LAUNCHAGENT_SYNC=false
 SERVER_LAUNCHAGENT_SYNC_REASONS=()
 
@@ -314,7 +289,6 @@ choose_apk_build_type() {
 configure_interactive() {
   DO_SERVER=false
   DO_CODEX_BRIDGE=false
-  DO_CLAUDE_BRIDGE=false
   DO_APK=false
   RUN_CHECKS=false
   SERVER_ARGS=()
@@ -342,17 +316,6 @@ configure_interactive() {
     DO_CODEX_BRIDGE=true
     RUN_CHECKS=true
     SERVER_ARGS+=(--restart-codex-bridge)
-  fi
-
-  echo
-  log "4520 Claude bridge"
-  dim "4520 is the local HTTP bridge used by yepanywhere claude terminal sessions."
-  dim "Choosing no leaves the existing 4520 process untouched."
-  dim "Choosing yes restarts 4520; active terminal wrapper sessions may disconnect."
-  if ask_yes_no "Redeploy 4520 Claude bridge service?" "no"; then
-    DO_CLAUDE_BRIDGE=true
-    RUN_CHECKS=true
-    SERVER_ARGS+=(--restart-claude-bridge)
   fi
 
   echo
@@ -558,7 +521,7 @@ check_session_title_preflight() {
         elif ! is_truthy "$SYNC_SESSION_TITLE_LAUNCHAGENT"; then
           dim "YEP_SYNC_SESSION_TITLE_LAUNCHAGENT is disabled"
         else
-          dim "persist it with: SESSION_TITLE_LLM_API_KEY=<redacted> scripts/install-launchagents.sh --server-only"
+          dim "persist it with: SESSION_TITLE_LLM_API_KEY=<your-api-key> scripts/install-launchagents.sh --server-only"
         fi
       else
         dim "set SESSION_TITLE_LLM_API_KEY or LLM_API_KEY in .env.deploy.local or the deploying shell"
@@ -631,6 +594,53 @@ check_local_media_preflight() {
   fi
 }
 
+check_reports_preflight() {
+  $DO_SERVER || return 0
+
+  local server_label="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
+  local expected="$SERVER_REPORTS_DIR"
+  local launchd_state=""
+  local plist="$HOME/Library/LaunchAgents/$server_label.plist"
+  local plist_content=""
+
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1; then
+    local user_domain="gui/$(id -u)"
+    launchd_state="$(launchctl print "$user_domain/$server_label" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$launchd_state" ]]; then
+    if [[ "$launchd_state" == *"YEP_REPORTS_DIR"* && "$launchd_state" == *"$expected"* ]]; then
+      dim "reports config: LaunchAgent $server_label uses $expected"
+      return 0
+    fi
+
+    if server_deploy_restarts; then
+      mark_server_launchagent_sync_needed "reports directory"
+      dim "reports config: LaunchAgent $server_label will be updated with YEP_REPORTS_DIR=$expected"
+    else
+      warn "reports config in loaded LaunchAgent $server_label does not include YEP_REPORTS_DIR=$expected."
+      dim "server deploy is build-only, so LaunchAgent env was not auto-synced"
+    fi
+    return 0
+  fi
+
+  if [[ -f "$plist" ]]; then
+    plist_content="$(cat "$plist")"
+    if [[ "$plist_content" == *"<key>YEP_REPORTS_DIR</key>"* && "$plist_content" == *"$expected"* ]]; then
+      dim "reports config: LaunchAgent plist uses $expected"
+      return 0
+    fi
+
+    if server_deploy_restarts; then
+      mark_server_launchagent_sync_needed "reports directory"
+      dim "reports config: LaunchAgent plist will be updated with YEP_REPORTS_DIR=$expected"
+    else
+      warn "reports config in $plist does not include YEP_REPORTS_DIR=$expected."
+      dim "server deploy is build-only, so LaunchAgent env was not auto-synced"
+    fi
+  fi
+}
+
 ensure_server_bundle_for_launchagent_sync() {
   local cli_js="$REPO_ROOT/dist/npm-package/dist/cli.js"
 
@@ -656,73 +666,130 @@ sync_server_launchagent_env_if_needed() {
   if [[ ${#SERVER_LAUNCHAGENT_SYNC_REASONS[@]} -gt 0 ]]; then
     dim "reasons: ${SERVER_LAUNCHAGENT_SYNC_REASONS[*]}"
   fi
-  dim "4510 Codex bridge and 4520 Claude bridge are not touched"
-  scripts/install-launchagents.sh --server-only
+  dim "4510 Codex bridge is not touched"
+  # The following server deploy reloads this plist and performs the one
+  # intentional start after it has stopped the old process and arranged the
+  # bridge sidecars. Starting here as well creates a start → immediate stop →
+  # start race, and can leave launchd reporting a running job before the server
+  # is actually ready.
+  scripts/install-launchagents.sh --server-only --no-start
 }
 
-# Verify the dev toolchain and the client's heavy optional deps are linked.
-ensure_dependencies() {
-  local bins=(biome tsc tsx)
-  local b found
-  for b in "${bins[@]}"; do
-    found=false
-    for ext in "" ".cmd" ".ps1"; do
-      if [[ -e "$REPO_ROOT/node_modules/.bin/$b$ext" ]]; then found=true; break; fi
-    done
-    if ! $found; then return 1; fi
-  done
-  # `vite` is a dependency of packages/client, so its binary is linked into
-  # that workspace package's .bin, not the repo-root .bin (pnpm does not hoist
-  # a non-root dependency's binary unless shamefully-hoist is enabled). Accept
-  # it from either location so the check matches how node_modules is actually laid out.
-  local vite_ok=false
-  for ext in "" ".cmd" ".ps1"; do
-    if [[ -e "$REPO_ROOT/node_modules/.bin/vite$ext" || -e "$REPO_ROOT/packages/client/node_modules/.bin/vite$ext" ]]; then
-      vite_ok=true; break
-    fi
-  done
-  $vite_ok || return 1
-  local client_nm="$REPO_ROOT/packages/client/node_modules"
-  local d
-  for d in mermaid "@tiptap/react" lowlight tiptap-markdown; do
-    [[ -e "$client_nm/$d" ]] || return 1
-  done
-  return 0
-}
+start_dev_server() {
+  local server_port="${YEP_DEPLOY_PORT:-8022}"
+  local raw_base_path="${YEP_DEPLOY_BASE_PATH:-/yep}"
+  local server_base_path
+  local server_base_url
+  local dev_log="${YEP_DEV_8022_LOG:-/tmp/yep-dev-8022.log}"
 
-# Self-heal a broken/out-of-sync node_modules before lint or build. If pnpm
-# cannot complete the install (interrupted, or the environment blocks file
-# operations), fail loudly with actionable guidance instead of a downstream
-# "command not found" error.
-ensure_deps_or_install() {
-  if ensure_dependencies; then return 0; fi
-  warn "node_modules is incomplete or out of sync with pnpm-lock.yaml."
-  warn "Restoring dependencies with 'pnpm install --force' (re-links everything) ..."
-  # --force makes pnpm re-link ALL packages even when its state file
-  # (.modules.yaml) claims node_modules is already up to date. That stale
-  # state is exactly what an interrupted install leaves behind: the symlinks
-  # are gone but pnpm still thinks they exist, so a plain `pnpm install`
-  # prints "Already up to date" and links nothing.
-  if pnpm install --force; then
-    :
+  if [[ "$raw_base_path" == "/" ]]; then
+    server_base_path=""
   else
-    warn "'pnpm install --force' failed; retrying with 'pnpm install' ..."
-    if ! pnpm install; then
-      err "Dependency restore failed. pnpm could not finish installation"
-      err "(commonly because the install was interrupted, or the environment"
-      err "blocks file operations). Please restore manually in a normal"
-      err "terminal, then re-run this deploy/rebuild:"
-      err "    pnpm install --force"
-      exit 1
+    server_base_path="/${raw_base_path#/}"
+    server_base_path="${server_base_path%/}"
+  fi
+  server_base_url="http://127.0.0.1:${server_port}${server_base_path}"
+
+  log "Starting 8022 dev hot reload ..."
+  dim "server: ${server_base_url}"
+  dim "log:    ${dev_log}"
+  dim "mode:   pnpm dev:8022 --replace --wait-for-yep-sessions"
+
+  local dev_args=(dev:8022 --replace --wait-for-yep-sessions)
+  if $ALLOW_YEP_SESSION_INTERRUPT; then
+    dev_args+=(--allow-yep-session-interrupt)
+  fi
+
+  : >"$dev_log"
+  env -u YEP_DEPLOY_LOCK_HELD -u YEP_DEPLOY_LOCK_OWNED \
+    PORT="$server_port" \
+    BASE_PATH="${server_base_path:-/}" \
+    ALLOWED_IMAGE_PATHS="$SERVER_ALLOWED_IMAGE_PATHS" \
+    nohup pnpm "${dev_args[@]}" >"$dev_log" 2>&1 &
+  local dev_pid=$!
+  disown "$dev_pid" 2>/dev/null || true
+
+  log "Waiting for ${server_base_url}/api/version ..."
+  local waiting_announced=false
+  local startup_checks=0
+  local preflight_checks=0
+  while true; do
+    if grep -Fq "Starting hot reload on " "$dev_log" &&
+      dev_server_ready \
+      "${server_base_url}/api/version" \
+      "${server_base_url}/api/status/workers" &&
+      dev_frontend_ready "${server_base_url}/" "${server_base_path:-/}"; then
+      log "8022 dev hot reload is running."
+      echo "Deploy complete."
+      return 0
     fi
+    if grep -Fq "Starting hot reload on " "$dev_log"; then
+      startup_checks=$((startup_checks + 1))
+      if [[ "$startup_checks" -ge 120 ]]; then
+        err "Dev hot reload started but did not become healthy within 30s."
+        tail -80 "$dev_log" >&2 || true
+        return 1
+      fi
+    elif grep -Fq "YEP_DEV_8022_WAITING_FOR_IDLE" "$dev_log"; then
+      if ! $waiting_announced; then
+        log "8022 dev hot reload cutover is queued."
+        dim "active embedded-runtime turns will finish before 8022 is replaced"
+        dim "follow progress: tail -f $dev_log"
+        waiting_announced=true
+      fi
+      # Keep this deploy process and its shared lock alive until the queued
+      # cutover is actually ready, so another deploy cannot race it.
+    else
+      preflight_checks=$((preflight_checks + 1))
+      if [[ "$preflight_checks" -ge 120 ]]; then
+        err "Dev hot reload preflight did not complete within 30s."
+        tail -80 "$dev_log" >&2 || true
+        return 1
+      fi
+    fi
+    if ! kill -0 "$dev_pid" 2>/dev/null; then
+      err "Dev hot reload process exited before ${server_base_url}/api/version became ready."
+      tail -80 "$dev_log" >&2 || true
+      return 1
+    fi
+    sleep 0.25
+  done
+}
+
+dev_frontend_ready() {
+  local frontend_url="$1"
+  local expected_base_path="${2:-/yep}"
+  local body
+  local vite_client_path
+  body="$(curl -fsS "$frontend_url" 2>/dev/null)" || return 1
+  if [[ "$expected_base_path" == "/" || -z "$expected_base_path" ]]; then
+    vite_client_path="/@vite/client"
+  else
+    vite_client_path="${expected_base_path%/}/@vite/client"
   fi
-  if ! ensure_dependencies; then
-    err "Dependencies are still missing after 'pnpm install --force'."
-    err "Run the following manually in a normal terminal, then retry:"
-    err "    pnpm install --force"
-    exit 1
-  fi
-  log "Dependencies restored."
+  [[ "$body" == *"$vite_client_path"* ]]
+}
+
+dev_server_ready() {
+  local version_url="$1"
+  local workers_url="$2"
+  local body
+  local workers
+  body="$(curl -fsS "$version_url" 2>/dev/null)" || return 1
+  workers="$(curl -fsS "$workers_url" 2>/dev/null)" || return 1
+  YEP_VERSION_JSON="$body" YEP_WORKERS_JSON="$workers" node -e '
+const info = JSON.parse(process.env.YEP_VERSION_JSON || "{}");
+const workers = JSON.parse(process.env.YEP_WORKERS_JSON || "{}");
+const build = info && info.build;
+process.exit(
+  build &&
+  build.source === "dev" &&
+  build.nodeEnv === "development" &&
+  workers.runtimeMode === "external"
+    ? 0
+    : 1,
+);
+' >/dev/null 2>&1
 }
 
 if [[ $# -eq 0 ]]; then
@@ -738,31 +805,33 @@ else
     case "$1" in
       --server-only)
         DO_SERVER=true
+        DO_DEV_SERVER=false
         DO_CODEX_BRIDGE=false
-        DO_CLAUDE_BRIDGE=false
         DO_APK=false
+        shift
+        ;;
+      --dev-server)
+        DO_SERVER=true
+        DO_DEV_SERVER=true
+        DO_CODEX_BRIDGE=false
+        DO_APK=false
+        RUN_CHECKS=false
+        shift
+        ;;
+      --allow-yep-session-interrupt)
+        ALLOW_YEP_SESSION_INTERRUPT=true
         shift
         ;;
       --codex-bridge-only)
         DO_SERVER=false
         DO_CODEX_BRIDGE=true
-        DO_CLAUDE_BRIDGE=false
         DO_APK=false
         SERVER_ARGS+=(--restart-codex-bridge)
-        shift
-        ;;
-      --claude-bridge-only)
-        DO_SERVER=false
-        DO_CODEX_BRIDGE=false
-        DO_CLAUDE_BRIDGE=true
-        DO_APK=false
-        SERVER_ARGS+=(--restart-claude-bridge)
         shift
         ;;
       --apk-only)
         DO_SERVER=false
         DO_CODEX_BRIDGE=false
-        DO_CLAUDE_BRIDGE=false
         DO_APK=true
         RUN_CHECKS=false
         shift
@@ -791,11 +860,6 @@ else
       --restart-codex-bridge)
         DO_CODEX_BRIDGE=true
         SERVER_ARGS+=(--restart-codex-bridge)
-        shift
-        ;;
-      --restart-claude-bridge)
-        DO_CLAUDE_BRIDGE=true
-        SERVER_ARGS+=(--restart-claude-bridge)
         shift
         ;;
       --embedded-codex-bridge|--no-preserve-codex-bridge)
@@ -831,15 +895,19 @@ else
   done
 fi
 
-if ! $DO_SERVER && ! $DO_CODEX_BRIDGE && ! $DO_CLAUDE_BRIDGE && ! $DO_APK; then
-  err "Nothing to deploy: 8022 server, 4510 bridge, 4520 bridge, and APK are all disabled."
+if ! $DO_SERVER && ! $DO_CODEX_BRIDGE && ! $DO_APK; then
+  err "Nothing to deploy: 8022 server, 4510 bridge, and APK are all disabled."
   exit 2
 fi
 
+acquire_deploy_lock
+ensure_project_node
+
 log "Deploy plan"
 dim "8022 web/API:        $DO_SERVER"
+dim "8022 dev hot reload: $DO_DEV_SERVER"
+dim "allow session interrupt: $ALLOW_YEP_SESSION_INTERRUPT"
 dim "4510 Codex bridge:   $DO_CODEX_BRIDGE"
-dim "4520 Claude bridge:  $DO_CLAUDE_BRIDGE"
 dim "server args:         ${SERVER_ARGS[*]:-}"
 dim "apk:                 $DO_APK ${APK_ARGS[*]:-}"
 dim "checks:              $RUN_CHECKS"
@@ -855,27 +923,40 @@ elif [[ -n "${SESSION_TITLE_GENERATION+x}" ]] && is_falsey "$SESSION_TITLE_GENER
   dim "session titles:    disabled by deploy env"
 fi
 
-log "Checking native push deploy prerequisites ..."
-sync_android_google_services
-check_native_push_preflight
-log "Checking session title deploy prerequisites ..."
-check_session_title_preflight
-log "Checking local media deploy prerequisites ..."
-check_local_media_preflight
+if ! $DO_DEV_SERVER; then
+  log "Checking native push deploy prerequisites ..."
+  sync_android_google_services
+  check_native_push_preflight
+  log "Checking session title deploy prerequisites ..."
+  check_session_title_preflight
+  log "Checking reports deploy configuration ..."
+  check_reports_preflight
+  log "Checking local media deploy prerequisites ..."
+  check_local_media_preflight
+fi
 
-if $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE || $DO_CLAUDE_BRIDGE; }; then
-  ensure_deps_or_install
+if $DO_DEV_SERVER || { $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE; }; }; then
+  ensure_pnpm
+fi
+
+if $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE; }; then
   log "Running preflight checks ..."
   pnpm lint
   pnpm typecheck
 fi
 
-sync_server_launchagent_env_if_needed
+if ! $DO_DEV_SERVER; then
+  sync_server_launchagent_env_if_needed
+fi
 
-if $DO_SERVER || $DO_CODEX_BRIDGE || $DO_CLAUDE_BRIDGE; then
+if $DO_DEV_SERVER; then
+  start_dev_server
+elif $DO_SERVER || $DO_CODEX_BRIDGE; then
   log "Deploying server services ..."
   if ! $DO_SERVER; then
     SERVER_ARGS+=(--no-restart)
+  elif $ALLOW_YEP_SESSION_INTERRUPT && ! server_args_contain "--allow-yep-session-interrupt"; then
+    SERVER_ARGS+=(--allow-yep-session-interrupt)
   fi
   if [[ ${#SERVER_ARGS[@]} -gt 0 ]]; then
     scripts/redeploy-server.sh "${SERVER_ARGS[@]}"

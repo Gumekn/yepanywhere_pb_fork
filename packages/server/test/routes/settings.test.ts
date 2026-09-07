@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createSettingsRoutes } from "../../src/routes/settings.js";
+import type { OhMyRouterBenchmarkService } from "../../src/services/OhMyRouterBenchmarkService.js";
 import type {
   ServerSettings,
   ServerSettingsService,
@@ -17,6 +18,7 @@ describe("Settings Routes", () => {
 
     mockServerSettingsService = {
       getSettings: vi.fn(() => settings),
+      getSetting: vi.fn((key: keyof ServerSettings) => settings[key]),
       updateSettings: vi.fn(async (updates: Partial<ServerSettings>) => {
         settings = { ...settings, ...updates };
         return settings;
@@ -24,49 +26,266 @@ describe("Settings Routes", () => {
     } as unknown as ServerSettingsService;
   });
 
-  describe("PUT /remote-executors", () => {
-    it("rejects invalid host aliases", async () => {
+  describe("remote executors", () => {
+    it("persists a normalized shared-root mapping and applies it at runtime", async () => {
+      const onRemoteExecutorsChanged = vi.fn();
       const routes = createSettingsRoutes({
         serverSettingsService: mockServerSettingsService,
+        onRemoteExecutorsChanged,
       });
 
       const response = await routes.request("/remote-executors", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          executors: ["devbox", "-oProxyCommand=touch_/tmp/pwned"],
-        }),
-      });
-
-      expect(response.status).toBe(400);
-      const json = await response.json();
-      expect(json.error).toContain("Invalid remote executor host alias");
-      expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
-    });
-
-    it("accepts and normalizes valid aliases", async () => {
-      const routes = createSettingsRoutes({
-        serverSettingsService: mockServerSettingsService,
-      });
-
-      const response = await routes.request("/remote-executors", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          executors: ["  devbox  ", "gpu-server", "", "  "],
+          executors: [
+            {
+              host: " 192.168.64.4 ",
+              user: " yueyuan ",
+              localRoot: "/Users/yueyuan/Desktop/file/UTM/",
+              remoteRoot: "/mnt/utm/",
+              claudePath: "/home/yueyuan/.local/bin/claude",
+            },
+          ],
         }),
       });
 
       expect(response.status).toBe(200);
-      const json = await response.json();
-      expect(json.executors).toEqual(["devbox", "gpu-server"]);
+      const expected = [
+        {
+          host: "192.168.64.4",
+          user: "yueyuan",
+          localRoot: "/Users/yueyuan/Desktop/file/UTM",
+          remoteRoot: "/mnt/utm",
+          claudePath: "/home/yueyuan/.local/bin/claude",
+        },
+      ];
+      await expect(response.json()).resolves.toEqual({ executors: expected });
       expect(mockServerSettingsService.updateSettings).toHaveBeenCalledWith({
-        remoteExecutors: ["devbox", "gpu-server"],
+        remoteExecutors: expected,
       });
+      expect(onRemoteExecutorsChanged).toHaveBeenCalledWith(expected);
+    });
+
+    it("rejects an option-like SSH host", async () => {
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+
+      const response = await routes.request("/remote-executors", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          executors: [
+            {
+              host: "-oProxyCommand=bad",
+              localRoot: "/local",
+              remoteRoot: "/remote",
+            },
+          ],
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
+    });
+
+    it("round-trips a validated shared Claude projects directory", async () => {
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+      const executor = {
+        host: "utm",
+        localRoot: "/Users/me/UTM",
+        remoteRoot: "/mnt/utm",
+        sessionStorage: {
+          mode: "shared",
+          localProjectsDir: "/Users/me/UTM/claude/projects",
+          remoteProjectsDir: "/mnt/utm/claude/projects",
+        },
+      };
+
+      const response = await routes.request("/remote-executors", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ executors: [executor] }),
+      });
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ executors: [executor] });
     });
   });
 
   describe("PUT /", () => {
+    it.each(["priority", "default"])(
+      "persists Codex service tier %s",
+      async (serviceTier) => {
+        const routes = createSettingsRoutes({
+          serverSettingsService: mockServerSettingsService,
+        });
+        const response = await routes.request("/", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            newSessionDefaults: { provider: "codex", serviceTier },
+          }),
+        });
+        expect(response.status).toBe(200);
+        expect(settings.newSessionDefaults).toMatchObject({
+          provider: "codex",
+          serviceTier,
+          byProvider: { codex: { serviceTier } },
+        });
+      },
+    );
+
+    it.each([
+      { provider: "codex", serviceTier: "fast" },
+      { provider: "codex", serviceTier: true },
+      { provider: "pi", serviceTier: "priority" },
+      { provider: "pi", byProvider: { pi: { serviceTier: "priority" } } },
+    ])(
+      "rejects invalid service tier defaults %j",
+      async (newSessionDefaults) => {
+        const routes = createSettingsRoutes({
+          serverSettingsService: mockServerSettingsService,
+        });
+        const response = await routes.request("/", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ newSessionDefaults }),
+        });
+        expect(response.status).toBe(400);
+        expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
+      },
+    );
+
+    it("accepts Claude as the default provider", async () => {
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+
+      const response = await routes.request("/", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newSessionDefaults: {
+            provider: "claude",
+            model: "sonnet",
+          },
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(mockServerSettingsService.updateSettings).toHaveBeenCalledWith({
+        newSessionDefaults: {
+          provider: "claude",
+          model: "sonnet",
+          byProvider: {
+            claude: {
+              model: "sonnet",
+            },
+          },
+        },
+      });
+    });
+
+    it("rejects the retired provider as a new-session default", async () => {
+      settings = {
+        ...settings,
+        newSessionDefaults: {
+          provider: "codex",
+          model: "gpt-5.6-sol",
+          permissionMode: "bypassPermissions",
+          codexMcpMode: "clear",
+          byProvider: {
+            codex: {
+              model: "gpt-5.6-sol",
+              permissionMode: "bypassPermissions",
+              codexMcpMode: "clear",
+            },
+          },
+        },
+      };
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+      const response = await routes.request("/", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newSessionDefaults: {
+            provider: "opencode",
+            permissionMode: "acceptEdits",
+          },
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
+    });
+
+    it("accepts the shared gateway model configuration for Pi defaults", async () => {
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+      const llmGatewayConfig = {
+        model: "claude-opus-4-8",
+        requestProtocol: "anthropic" as const,
+      };
+
+      const response = await routes.request("/", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newSessionDefaults: {
+            provider: "pi",
+            permissionMode: "acceptEdits",
+            llmGatewayConfig,
+            byProvider: {
+              pi: { permissionMode: "acceptEdits", llmGatewayConfig },
+            },
+          },
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(mockServerSettingsService.updateSettings).toHaveBeenCalledWith({
+        newSessionDefaults: {
+          provider: "pi",
+          permissionMode: "acceptEdits",
+          llmGatewayConfig,
+          byProvider: {
+            pi: { permissionMode: "acceptEdits", llmGatewayConfig },
+          },
+        },
+      });
+    });
+
+    it("rejects provider-specific options stored under the wrong provider", async () => {
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+
+      const response = await routes.request("/", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newSessionDefaults: {
+            provider: "claude",
+            byProvider: {
+              claude: {
+                codexMcpMode: "full",
+              },
+            },
+          },
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
+    });
+
     it("accepts clearing globalInstructions with null", async () => {
       settings = {
         ...settings,
@@ -91,25 +310,6 @@ describe("Settings Routes", () => {
       expect(mockServerSettingsService.updateSettings).toHaveBeenCalledWith({
         globalInstructions: undefined,
       });
-    });
-
-    it("rejects invalid aliases in remoteExecutors setting", async () => {
-      const routes = createSettingsRoutes({
-        serverSettingsService: mockServerSettingsService,
-      });
-
-      const response = await routes.request("/", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          remoteExecutors: ["devbox", "-oProxyCommand=touch_/tmp/pwned"],
-        }),
-      });
-
-      expect(response.status).toBe(400);
-      const json = await response.json();
-      expect(json.error).toContain("Invalid remote executor host alias");
-      expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
     });
 
     it("accepts and normalizes valid aliases in chromeOsHosts setting", async () => {
@@ -178,23 +378,47 @@ describe("Settings Routes", () => {
     });
   });
 
-  describe("POST /remote-executors/:host/test", () => {
-    it("rejects invalid host path parameters", async () => {
+  describe("OhMyRouter throughput benchmark", () => {
+    it("returns the persisted benchmark status", async () => {
+      const ohmyrouterBenchmarkService = {
+        getStatus: vi.fn(() => ({
+          available: true,
+          benchmark: { id: "run-1", status: "completed" },
+        })),
+      } as unknown as OhMyRouterBenchmarkService;
       const routes = createSettingsRoutes({
         serverSettingsService: mockServerSettingsService,
+        ohmyrouterBenchmarkService,
       });
-      const invalidHost = encodeURIComponent("-oProxyCommand=touch_/tmp/pwned");
 
-      const response = await routes.request(
-        `/remote-executors/${invalidHost}/test`,
-        {
-          method: "POST",
-        },
-      );
+      const response = await routes.request("/ohmyrouter-throughput");
 
-      expect(response.status).toBe(400);
-      const json = await response.json();
-      expect(json.error).toBe("host must be a valid SSH host alias");
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        available: true,
+        benchmark: { id: "run-1" },
+      });
+    });
+
+    it("starts a new benchmark run", async () => {
+      const ohmyrouterBenchmarkService = {
+        start: vi.fn(async () => ({ id: "run-2", status: "running" })),
+        getStatus: vi.fn(),
+      } as unknown as OhMyRouterBenchmarkService;
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+        ohmyrouterBenchmarkService,
+      });
+
+      const response = await routes.request("/ohmyrouter-throughput", {
+        method: "POST",
+      });
+
+      expect(response.status).toBe(202);
+      await expect(response.json()).resolves.toMatchObject({
+        benchmark: { id: "run-2", status: "running" },
+      });
+      expect(ohmyrouterBenchmarkService.start).toHaveBeenCalledOnce();
     });
   });
 });

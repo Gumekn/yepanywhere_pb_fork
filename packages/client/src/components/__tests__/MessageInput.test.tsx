@@ -49,7 +49,7 @@ function typeInTextarea(textarea: HTMLTextAreaElement, value: string) {
   fireEvent.keyUp(textarea);
 }
 
-describe("MessageInput command completion", () => {
+describe("MessageInput", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.stubGlobal("matchMedia", () => ({
@@ -67,6 +67,110 @@ describe("MessageInput command completion", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+  });
+
+  it.each(["Queue", "Insert now"])(
+    "routes the %s button to its own submission callback",
+    (choice) => {
+      const onQueue = vi.fn();
+      const onStop = vi.fn();
+      const { textarea, onSend } = renderMessageInput({
+        isRunning: true,
+        isThinking: true,
+        onQueue,
+        onStop,
+      });
+      const queueButton = screen.getByRole("button", {
+        name: "Queue",
+      }) as HTMLButtonElement;
+      const insertButton = screen.getByRole("button", {
+        name: "Insert now",
+      }) as HTMLButtonElement;
+      expect(queueButton.disabled).toBe(true);
+      expect(insertButton.disabled).toBe(true);
+
+      typeInTextarea(textarea, "Follow up");
+      expect(queueButton.disabled).toBe(false);
+      expect(insertButton.disabled).toBe(false);
+      expect(screen.getByRole("button", { name: "Stop" })).toBeDefined();
+      fireEvent.click(screen.getByRole("button", { name: choice }));
+      expect(choice === "Queue" ? onQueue : onSend).toHaveBeenCalledWith(
+        "Follow up",
+      );
+      expect(choice === "Queue" ? onSend : onQueue).not.toHaveBeenCalled();
+      expect(onStop).not.toHaveBeenCalled();
+      expect(textarea.value).toBe("");
+      expect(queueButton.disabled).toBe(true);
+      expect(insertButton.disabled).toBe(true);
+    },
+  );
+
+  it("keeps Enter for direct insertion and Ctrl+Enter for the deferred queue", () => {
+    const onQueue = vi.fn();
+    const { textarea, onSend } = renderMessageInput({
+      isRunning: true,
+      isThinking: true,
+      onQueue,
+    });
+    typeInTextarea(textarea, "Next turn");
+    fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
+    expect(onQueue).toHaveBeenCalledWith("Next turn");
+    expect(onSend).not.toHaveBeenCalled();
+
+    typeInTextarea(textarea, "Current turn");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("Current turn");
+    expect(onQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])(
+    "honors disabled=%s for attachment-only submissions",
+    (disabled) => {
+      const onQueue = vi.fn();
+      const { onSend } = renderMessageInput({
+        isRunning: true,
+        isThinking: true,
+        onQueue,
+        disabled,
+        attachments: [
+          {
+            id: "attachment-1",
+            name: "attachment-1_image.png",
+            originalName: "image.png",
+            mimeType: "image/png",
+            size: 1024,
+            path: "/tmp/image.png",
+          },
+        ],
+      });
+      for (const name of ["Queue", "Insert now"]) {
+        const button = screen.getByRole("button", {
+          name,
+        }) as HTMLButtonElement;
+        expect(button.disabled).toBe(disabled);
+        fireEvent.click(button);
+      }
+      expect(onQueue).toHaveBeenCalledTimes(disabled ? 0 : 1);
+      expect(onSend).toHaveBeenCalledTimes(disabled ? 0 : 1);
+    },
+  );
+
+  it("keeps ordinary Send when the session has no active turn", () => {
+    renderMessageInput();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Queue" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Insert now" })).toBeNull();
+  });
+
+  it("offers both send choices with visible Chinese labels", async () => {
+    localStorage.setItem("yep-anywhere-locale", "zh-CN");
+    renderMessageInput({ isRunning: true, isThinking: true, onQueue: vi.fn() });
+    expect(
+      (await screen.findByRole("button", { name: "排队" })).textContent,
+    ).toBe("排队");
+    expect(
+      (await screen.findByRole("button", { name: "直接插入" })).textContent,
+    ).toContain("直接插入");
   });
 
   it("shows and inserts Claude slash commands only for '/' tokens", () => {
@@ -92,32 +196,49 @@ describe("MessageInput command completion", () => {
     ).toBeNull();
   });
 
-  it("shows and inserts Codex dollar commands only for '$' tokens", () => {
+  it("completes Codex slash commands and skills in separate namespaces", () => {
     const { textarea } = renderMessageInput({
-      commandPrefix: "$",
+      commandPrefix: "/",
       commandLabel: "Codex commands",
-      commands: ["model", "review"],
+      commands: ["compact", "model"],
+      commandButtons: [
+        {
+          prefix: "/",
+          label: "Codex commands",
+          showButton: true,
+          commands: ["compact", "model"],
+        },
+        {
+          prefix: "$",
+          label: "Skills",
+          showButton: true,
+          commands: ["openai-docs"],
+        },
+      ],
     });
 
-    typeInTextarea(textarea, "$mo");
+    typeInTextarea(textarea, "$op");
 
-    const listbox = screen.getByRole("listbox", { name: "Codex commands" });
+    const listbox = screen.getByRole("listbox", { name: "Skills" });
     expect(
-      within(listbox).getByRole("option", { name: "$model" }),
+      within(listbox).getByRole("option", { name: "$openai-docs" }),
     ).toBeDefined();
 
     fireEvent.keyDown(textarea, { key: "Tab" });
-    expect(textarea.value).toBe("$model ");
+    expect(textarea.value).toBe("$openai-docs ");
 
-    typeInTextarea(textarea, "/mo");
+    typeInTextarea(textarea, "/co");
     expect(
-      screen.queryByRole("listbox", { name: "Codex commands" }),
-    ).toBeNull();
+      within(screen.getByRole("listbox", { name: "Codex commands" })).getByRole(
+        "option",
+        { name: "/compact" },
+      ),
+    ).toBeDefined();
   });
 
   it("uses the active provider prefix in the toolbar command menu", () => {
     const { textarea } = renderMessageInput({
-      commandPrefix: "$",
+      commandPrefix: "/",
       commandLabel: "Codex commands",
       commands: ["model", "review"],
     });
@@ -127,43 +248,41 @@ describe("MessageInput command completion", () => {
     );
 
     const menu = screen.getByRole("menu", { name: "Codex commands" });
-    fireEvent.click(within(menu).getByRole("menuitem", { name: "$model" }));
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "/model" }));
 
-    expect(textarea.value).toBe("$model ");
+    expect(textarea.value).toBe("/model ");
   });
 
-  it("renders static dollar and slash command toolbar buttons", () => {
+  it("renders separate slash-command and skill toolbar buttons", () => {
     const { textarea } = renderMessageInput({
       commandPrefix: "$",
       commandLabel: "Codex commands",
       commands: ["model"],
       commandButtons: [
         {
-          prefix: "$",
+          prefix: "/",
           label: "Codex commands",
           showButton: true,
           commands: ["model"],
         },
         {
-          prefix: "/",
-          label: "Slash commands",
+          prefix: "$",
+          label: "Skills",
           showButton: true,
-          commands: ["help"],
+          commands: ["openai-docs"],
         },
       ],
     });
 
+    fireEvent.click(screen.getByRole("button", { name: "Show skills" }));
     fireEvent.click(
-      screen.getByRole("button", { name: "Show slash commands" }),
-    );
-    fireEvent.click(
-      within(screen.getByRole("menu", { name: "Slash commands" })).getByRole(
+      within(screen.getByRole("menu", { name: "Skills" })).getByRole(
         "menuitem",
-        { name: "/help" },
+        { name: "$openai-docs" },
       ),
     );
 
-    expect(textarea.value).toBe("/help ");
+    expect(textarea.value).toBe("$openai-docs ");
   });
 
   it("keeps the toolbar command button stable while commands are loading", () => {
@@ -200,16 +319,16 @@ describe("MessageInput command completion", () => {
     const onCustomCommand = vi.fn(() => true);
     const { textarea } = renderMessageInput({
       commandPrefix: "$",
-      commandLabel: "Codex commands",
-      commands: ["model"],
+      commandLabel: "Skills",
+      commands: ["openai-docs"],
       onCustomCommand,
     });
 
-    typeInTextarea(textarea, "$mo");
+    typeInTextarea(textarea, "$op");
     fireEvent.keyDown(textarea, { key: "Tab" });
 
     expect(onCustomCommand).not.toHaveBeenCalled();
-    expect(textarea.value).toBe("$model ");
+    expect(textarea.value).toBe("$openai-docs ");
   });
 
   it("still routes custom slash commands through the slash handler", () => {
@@ -240,5 +359,40 @@ describe("MessageInput command completion", () => {
 
     expect(onSend).toHaveBeenCalledWith("/deep-research");
     expect(textarea.value).toBe("");
+  });
+
+  it("pastes a copied user input as text plus all image attachments", () => {
+    const onAttach = vi.fn();
+    const { textarea } = renderMessageInput({
+      projectId: "project",
+      sessionId: "session",
+      onAttach,
+    });
+    typeInTextarea(textarea, "prefix suffix");
+    textarea.setSelectionRange(7, 7);
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [],
+        getData: (type: string) => {
+          if (type === "text/plain") return "review both ";
+          if (type === "text/html") {
+            return `<div data-yep-anywhere-user-input="1">
+              <img src="data:image/png;base64,Zmlyc3Q=" data-yep-anywhere-attachment-name="first.png">
+              <img src="data:image/png;base64,c2Vjb25k" data-yep-anywhere-attachment-name="second.png">
+            </div>`;
+          }
+          return "";
+        },
+      },
+    });
+
+    expect(textarea.value).toBe("prefix review both suffix");
+    expect(onAttach).toHaveBeenCalledTimes(1);
+    const attached = onAttach.mock.calls[0]?.[0] as File[];
+    expect(attached.map((file) => file.name)).toEqual([
+      "first.png",
+      "second.png",
+    ]);
   });
 });

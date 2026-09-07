@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NotificationService } from "../../src/notifications/NotificationService.js";
 import { PushNotifier } from "../../src/push/PushNotifier.js";
 import type { PushService } from "../../src/push/PushService.js";
+import type { RuntimeController } from "../../src/runtime/types.js";
 import type { Supervisor } from "../../src/supervisor/Supervisor.js";
 import type { InputRequest, ProcessState } from "../../src/supervisor/types.js";
 import type {
@@ -89,6 +90,52 @@ describe("PushNotifier", () => {
   });
 
   describe("handling process state changes", () => {
+    it("reads pending input from an external runtime snapshot", async () => {
+      const request: InputRequest = {
+        id: "req-external",
+        sessionId: "session-external",
+        type: "tool-approval",
+        prompt: "Allow Edit?",
+        toolName: "Edit",
+        toolInput: { file_path: "/home/user/test-project/src/index.ts" },
+        timestamp: new Date().toISOString(),
+      };
+      const runtimeController = {
+        getProcessSnapshotForSession: vi.fn(async () => ({
+          id: "proc-external",
+          state: "waiting-input",
+          pendingInputRequest: request,
+          messageHistory: [],
+        })),
+      } as unknown as Pick<RuntimeController, "getProcessSnapshotForSession">;
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        runtimeController,
+      });
+
+      eventHandler?.({
+        type: "process-state-changed",
+        sessionId: "session-external",
+        projectId: testProjectId,
+        activity: "waiting-input",
+        timestamp: new Date().toISOString(),
+      });
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "pending-input",
+            sessionId: "session-external",
+            requestId: "req-external",
+          }),
+          expect.any(Object),
+        );
+      });
+    });
+
     it("should send push notification when entering waiting-input state", async () => {
       const mockProcess = {
         state: {
@@ -142,6 +189,67 @@ describe("PushNotifier", () => {
       expect(payload.inputType).toBe("tool-approval");
       expect(payload.summary).toBe("Edit: index.ts");
       expect(payload.requestId).toBe("req-1");
+    });
+
+    it("pushes once per request id across repeated waiting-input events", async () => {
+      // The bridge transport re-emits process-state-changed while a session
+      // stays in waiting-input (turn status / retry status changes), which used
+      // to re-buzz the user for an approval already delivered.
+      const request: InputRequest = {
+        id: "req-repeat",
+        sessionId: "session-repeat",
+        type: "tool-approval",
+        prompt: "Allow Edit?",
+        toolName: "Edit",
+        toolInput: { file_path: "/home/user/test-project/src/index.ts" },
+        timestamp: new Date().toISOString(),
+      } as InputRequest;
+      const mockProcess = {
+        state: { type: "waiting-input", request } as ProcessState,
+      };
+      vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(
+        mockProcess as unknown as ReturnType<
+          Supervisor["getProcessForSession"]
+        >,
+      );
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        supervisor: mockSupervisor,
+      });
+
+      const event: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-repeat",
+        projectId: testProjectId,
+        activity: "waiting-input",
+        timestamp: new Date().toISOString(),
+      };
+
+      eventHandler?.(event);
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+      });
+
+      eventHandler?.({ ...event, timestamp: new Date().toISOString() });
+      eventHandler?.({ ...event, timestamp: new Date().toISOString() });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+
+      // A genuinely different approval still notifies.
+      mockProcess.state = {
+        type: "waiting-input",
+        request: { ...request, id: "req-next" },
+      } as ProcessState;
+      eventHandler?.({ ...event, timestamp: new Date().toISOString() });
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(2);
+      });
+      expect(
+        vi.mocked(mockPushService.sendToAll).mock.calls[1]?.[0],
+      ).toMatchObject({ requestId: "req-next" });
     });
 
     it("should not send push when activity is in-turn", async () => {
@@ -216,6 +324,489 @@ describe("PushNotifier", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
 
       expect(mockPushService.sendToAll).not.toHaveBeenCalled();
+    });
+
+    it("falls back to bridge pending input when no process owns the session", async () => {
+      const request: InputRequest = {
+        id: "req-bridge",
+        sessionId: "thread-bridge",
+        type: "tool-approval",
+        prompt: "Allow bash?",
+        toolName: "Bash",
+        toolInput: { command: "ls" },
+        timestamp: new Date().toISOString(),
+        source: "codex-bridge",
+      };
+      vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(undefined);
+      const bridgeController = {
+        getPendingInputRequest: vi.fn(async (sessionId: string) =>
+          sessionId === "thread-bridge" ? request : null,
+        ),
+      };
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        supervisor: mockSupervisor,
+        bridgeControllers: [bridgeController as never],
+      });
+
+      eventHandler?.({
+        type: "process-state-changed",
+        sessionId: "thread-bridge",
+        projectId: testProjectId,
+        activity: "waiting-input",
+        pendingInputType: "tool-approval",
+        timestamp: new Date().toISOString(),
+      });
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "pending-input",
+            sessionId: "thread-bridge",
+            requestId: "req-bridge",
+            inputType: "tool-approval",
+          }),
+          expect.any(Object),
+        );
+      });
+    });
+
+    it("skips absent bridge controllers and reads the next one", async () => {
+      const request: InputRequest = {
+        id: "req-next",
+        sessionId: "ses_next",
+        type: "question",
+        prompt: "Pick one",
+        toolName: "AskUserQuestion",
+        toolInput: {},
+        timestamp: new Date().toISOString(),
+        source: "codex-bridge",
+      };
+      vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(undefined);
+      const emptyController = {
+        getPendingInputRequest: vi.fn(async () => null),
+      };
+      const nextController = {
+        getPendingInputRequest: vi.fn(async () => request),
+      };
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        supervisor: mockSupervisor,
+        bridgeControllers: [
+          undefined,
+          emptyController as never,
+          nextController as never,
+        ],
+      });
+
+      eventHandler?.({
+        type: "process-state-changed",
+        sessionId: "ses_next",
+        projectId: testProjectId,
+        activity: "waiting-input",
+        pendingInputType: "user-question",
+        timestamp: new Date().toISOString(),
+      });
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "pending-input",
+            sessionId: "ses_next",
+            requestId: undefined,
+            inputType: "user-question",
+            summary: "Question waiting — open Yep to answer",
+          }),
+          expect.any(Object),
+        );
+      });
+    });
+
+    describe("concurrent delivery dedupe", () => {
+      it("dedupes repeated waiting-input events while the first send is still pending", async () => {
+        // EventBus fans out `void handleProcessStateChange()` so multiple
+        // handlers can race the first delivery. The request id is only
+        // written after `await sendPromise` today, so a repeat that arrives
+        // before the first send resolves slips through the dedupe check and
+        // buzzes the user again. This test reproduces that regression.
+        const request: InputRequest = {
+          id: "req-concurrent",
+          sessionId: "session-concurrent",
+          type: "tool-approval",
+          prompt: "Allow Edit?",
+          toolName: "Edit",
+          toolInput: { file_path: "/home/user/test-project/src/index.ts" },
+          timestamp: new Date().toISOString(),
+        } as InputRequest;
+        const mockProcess = {
+          state: { type: "waiting-input", request } as ProcessState,
+        };
+        vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(
+          mockProcess as unknown as ReturnType<
+            Supervisor["getProcessForSession"]
+          >,
+        );
+
+        let resolveFirst:
+          | ((
+              value: Array<{ browserProfileId: string; success: boolean }>,
+            ) => void)
+          | undefined;
+        // First call stays pending until we resolve it; subsequent repeats
+        // must be deduped while it is in-flight.
+        vi.mocked(mockPushService.sendToAll).mockImplementation(() => {
+          return new Promise((resolve) => {
+            resolveFirst = resolve;
+          });
+        });
+
+        new PushNotifier({
+          eventBus: mockEventBus,
+          pushService: mockPushService,
+          notificationService: mockNotificationService,
+          supervisor: mockSupervisor,
+        });
+
+        const event: ProcessStateEvent = {
+          type: "process-state-changed",
+          sessionId: "session-concurrent",
+          projectId: testProjectId,
+          activity: "waiting-input",
+          timestamp: new Date().toISOString(),
+        };
+
+        // Fire the same waiting-input event three times rapidly.
+        eventHandler?.(event);
+        eventHandler?.({ ...event, timestamp: new Date().toISOString() });
+        eventHandler?.({ ...event, timestamp: new Date().toISOString() });
+
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        // Only the first invocation reached sendToAll.
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+
+        // Complete the first delivery; repeats must still not fire.
+        resolveFirst?.([{ browserProfileId: "profile-1", success: true }]);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+      });
+
+      it("allows retrying the same request after a failed send", async () => {
+        const request: InputRequest = {
+          id: "req-fail-retry",
+          sessionId: "session-fail-retry",
+          type: "tool-approval",
+          prompt: "Allow Edit?",
+          toolName: "Edit",
+          toolInput: { file_path: "/home/user/test-project/src/index.ts" },
+          timestamp: new Date().toISOString(),
+        } as InputRequest;
+        const mockProcess = {
+          state: { type: "waiting-input", request } as ProcessState,
+        };
+        vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(
+          mockProcess as unknown as ReturnType<
+            Supervisor["getProcessForSession"]
+          >,
+        );
+
+        vi.mocked(mockPushService.sendToAll)
+          .mockResolvedValueOnce([
+            {
+              browserProfileId: "profile-1",
+              success: false,
+              error: "Network error",
+            },
+          ])
+          .mockResolvedValueOnce([
+            { browserProfileId: "profile-1", success: true },
+          ]);
+
+        const consoleSpy = vi
+          .spyOn(console, "log")
+          .mockImplementation(() => {});
+
+        new PushNotifier({
+          eventBus: mockEventBus,
+          pushService: mockPushService,
+          notificationService: mockNotificationService,
+          supervisor: mockSupervisor,
+        });
+
+        const event: ProcessStateEvent = {
+          type: "process-state-changed",
+          sessionId: "session-fail-retry",
+          projectId: testProjectId,
+          activity: "waiting-input",
+          timestamp: new Date().toISOString(),
+        };
+
+        // First send fails.
+        eventHandler?.(event);
+        await vi.waitFor(() => {
+          expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+        });
+
+        // The same request id can still be retried because the failed state
+        // was cleared on failure.
+        eventHandler?.({ ...event, timestamp: new Date().toISOString() });
+        await vi.waitFor(() => {
+          expect(mockPushService.sendToAll).toHaveBeenCalledTimes(2);
+        });
+        expect(
+          vi.mocked(mockPushService.sendToAll).mock.calls[1]?.[0],
+        ).toMatchObject({ requestId: "req-fail-retry" });
+
+        consoleSpy.mockRestore();
+      });
+
+      it("does not let an old async completion overwrite or delete a newer request's state", async () => {
+        const firstRequest: InputRequest = {
+          id: "req-old",
+          sessionId: "session-stale",
+          type: "tool-approval",
+          prompt: "Allow Edit?",
+          toolName: "Edit",
+          toolInput: { file_path: "/home/user/test-project/src/old.ts" },
+          timestamp: new Date().toISOString(),
+        } as InputRequest;
+        const secondRequest: InputRequest = {
+          id: "req-new",
+          sessionId: "session-stale",
+          type: "tool-approval",
+          prompt: "Allow Bash?",
+          toolName: "Bash",
+          toolInput: { command: "ls" },
+          timestamp: new Date().toISOString(),
+        } as InputRequest;
+
+        const mockProcess = {
+          state: {
+            type: "waiting-input",
+            request: firstRequest,
+          } as ProcessState,
+        };
+        let currentRequest = firstRequest;
+        vi.mocked(mockSupervisor.getProcessForSession).mockImplementation(
+          () =>
+            ({
+              state: { type: "waiting-input", request: currentRequest },
+            }) as unknown as ReturnType<Supervisor["getProcessForSession"]>,
+        );
+
+        let resolveFirst:
+          | ((
+              value: Array<{ browserProfileId: string; success: boolean }>,
+            ) => void)
+          | undefined;
+        vi.mocked(mockPushService.sendToAll).mockImplementation(() => {
+          // Only the very first call stays pending; later calls resolve
+          // immediately so we can observe ordering.
+          if (!resolveFirst) {
+            return new Promise((resolve) => {
+              resolveFirst = resolve;
+            });
+          }
+          return Promise.resolve([
+            { browserProfileId: "profile-1", success: true },
+          ]);
+        });
+
+        new PushNotifier({
+          eventBus: mockEventBus,
+          pushService: mockPushService,
+          notificationService: mockNotificationService,
+          supervisor: mockSupervisor,
+        });
+
+        const event: ProcessStateEvent = {
+          type: "process-state-changed",
+          sessionId: "session-stale",
+          projectId: testProjectId,
+          activity: "waiting-input",
+          timestamp: new Date().toISOString(),
+        };
+
+        // Kick off the first send (stays pending).
+        eventHandler?.(event);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+
+        // A new request arrives while the first send is still pending.
+        currentRequest = secondRequest;
+        eventHandler?.({ ...event, timestamp: new Date().toISOString() });
+        await vi.waitFor(() => {
+          expect(mockPushService.sendToAll).toHaveBeenCalledTimes(2);
+        });
+        expect(
+          vi.mocked(mockPushService.sendToAll).mock.calls[1]?.[0],
+        ).toMatchObject({ requestId: "req-new" });
+
+        // Now the first send finally resolves. Its completion must NOT delete
+        // the newer request's state, so the newer request id is still
+        // considered delivered/known and a repeat of req-new is skipped.
+        resolveFirst?.([{ browserProfileId: "profile-1", success: true }]);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // A repeat of the new request id is deduped (delivered state kept).
+        eventHandler?.({ ...event, timestamp: new Date().toISOString() });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(2);
+      });
+
+      it("does not leave or revive dedupe state when leaving waiting-input while a send is in-flight", async () => {
+        const request: InputRequest = {
+          id: "req-leave",
+          sessionId: "session-leave",
+          type: "tool-approval",
+          prompt: "Allow Edit?",
+          toolName: "Edit",
+          toolInput: { file_path: "/home/user/test-project/src/index.ts" },
+          timestamp: new Date().toISOString(),
+        } as InputRequest;
+        const waitingProcess = {
+          state: { type: "waiting-input", request } as ProcessState,
+        };
+        const inTurnProcess = {
+          state: { type: "in-turn" } as ProcessState,
+        };
+        vi.mocked(mockSupervisor.getProcessForSession)
+          .mockReturnValueOnce(
+            waitingProcess as unknown as ReturnType<
+              Supervisor["getProcessForSession"]
+            >,
+          )
+          .mockReturnValue(
+            inTurnProcess as unknown as ReturnType<
+              Supervisor["getProcessForSession"]
+            >,
+          );
+
+        let resolveFirst:
+          | ((
+              value: Array<{ browserProfileId: string; success: boolean }>,
+            ) => void)
+          | undefined;
+        vi.mocked(mockPushService.sendToAll).mockImplementation(() => {
+          return new Promise((resolve) => {
+            resolveFirst = resolve;
+          });
+        });
+
+        const consoleSpy = vi
+          .spyOn(console, "log")
+          .mockImplementation(() => {});
+
+        new PushNotifier({
+          eventBus: mockEventBus,
+          pushService: mockPushService,
+          notificationService: mockNotificationService,
+          supervisor: mockSupervisor,
+        });
+
+        const event: ProcessStateEvent = {
+          type: "process-state-changed",
+          sessionId: "session-leave",
+          projectId: testProjectId,
+          activity: "waiting-input",
+          timestamp: new Date().toISOString(),
+        };
+
+        // Enter waiting-input, send stays pending.
+        eventHandler?.(event);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+
+        // Leave waiting-input while the send is still in-flight. The dedupe
+        // state must be cleared synchronously so the stale async completion
+        // cannot revive it.
+        eventHandler?.({ ...event, activity: "in-turn" });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+
+        // Now the pending send resolves. It must not write back any state.
+        resolveFirst?.([{ browserProfileId: "profile-1", success: true }]);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // Re-entering waiting-input with the same request id must produce a
+        // new push because the previous state was cleared on leave.
+        vi.mocked(mockSupervisor.getProcessForSession).mockReturnValueOnce(
+          waitingProcess as unknown as ReturnType<
+            Supervisor["getProcessForSession"]
+          >,
+        );
+        vi.mocked(mockPushService.sendToAll).mockResolvedValue([
+          { browserProfileId: "profile-1", success: true },
+        ]);
+        eventHandler?.(event);
+        await vi.waitFor(() => {
+          expect(mockPushService.sendToAll).toHaveBeenCalledTimes(2);
+        });
+
+        consoleSpy.mockRestore();
+      });
+    });
+
+    describe("bridge fallback on owned process", () => {
+      it("queries the bridge when the owned process is in-turn with no pending request", async () => {
+        // The process stream may miss an approval while the bridge still holds
+        // it. The fallback must still send the push.
+        const bridgeRequest: InputRequest = {
+          id: "req-bridge-owned",
+          sessionId: "session-owned",
+          type: "tool-approval",
+          prompt: "Allow bash?",
+          toolName: "Bash",
+          toolInput: { command: "ls" },
+          timestamp: new Date().toISOString(),
+          source: "codex-bridge",
+        };
+
+        const runtimeController = {
+          getProcessSnapshotForSession: vi.fn(async () => ({
+            id: "proc-owned",
+            state: "in-turn",
+            pendingInputRequest: null,
+            messageHistory: [],
+          })),
+        } as unknown as Pick<RuntimeController, "getProcessSnapshotForSession">;
+        const bridgeController = {
+          getPendingInputRequest: vi.fn(async (sessionId: string) =>
+            sessionId === "session-owned" ? bridgeRequest : null,
+          ),
+        };
+
+        new PushNotifier({
+          eventBus: mockEventBus,
+          pushService: mockPushService,
+          notificationService: mockNotificationService,
+          runtimeController,
+          bridgeControllers: [bridgeController as never],
+        });
+
+        eventHandler?.({
+          type: "process-state-changed",
+          sessionId: "session-owned",
+          projectId: testProjectId,
+          activity: "waiting-input",
+          timestamp: new Date().toISOString(),
+        });
+
+        await vi.waitFor(() => {
+          expect(mockPushService.sendToAll).toHaveBeenCalledWith(
+            expect.objectContaining({
+              type: "pending-input",
+              sessionId: "session-owned",
+              requestId: "req-bridge-owned",
+              inputType: "tool-approval",
+            }),
+            expect.any(Object),
+          );
+        });
+      });
     });
   });
 
@@ -315,7 +906,62 @@ describe("PushNotifier", () => {
       expect(payload.summary).toBe("Run: Bash");
     });
 
-    it("should truncate long question prompts", async () => {
+    it("names the subagent for a file permission routed from a child session", async () => {
+      const mockProcess = {
+        state: {
+          type: "waiting-input",
+          request: {
+            id: "per_child",
+            sessionId: "session-parent",
+            type: "tool-approval",
+            prompt: "Allow file edit?",
+            toolName: "Edit",
+            toolInput: {
+              file_path: "/tmp/outside/file.txt",
+              originSessionId: "ses_child",
+              parentSessionId: "session-parent",
+              originSessionTitle: "Explore open_platform_api_case project",
+            },
+            timestamp: new Date().toISOString(),
+          } as InputRequest,
+        } as ProcessState,
+      };
+
+      vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(
+        mockProcess as unknown as ReturnType<
+          Supervisor["getProcessForSession"]
+        >,
+      );
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        supervisor: mockSupervisor,
+      });
+
+      const event: ProcessStateEvent = {
+        type: "process-state-changed",
+        sessionId: "session-parent",
+        projectId: testProjectId,
+        activity: "waiting-input",
+        timestamp: new Date().toISOString(),
+      };
+
+      eventHandler?.(event);
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalled();
+      });
+
+      const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
+      // Push targets the parent session but names the requesting subagent.
+      expect(payload.sessionId).toBe("session-parent");
+      expect(payload.summary).toBe(
+        "Subagent Explore open_platform_api_case project — Edit: file.txt",
+      );
+    });
+
+    it("uses a generic summary for long question prompts", async () => {
       const longPrompt =
         "This is a very long question that exceeds the maximum length we want to show in a push notification summary";
 
@@ -359,12 +1005,12 @@ describe("PushNotifier", () => {
       });
 
       const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
-      expect(payload.summary.length).toBeLessThanOrEqual(60);
-      expect(payload.summary.endsWith("...")).toBe(true);
+      expect(payload.summary).toBe("Question waiting — open Yep to answer");
       expect(payload.inputType).toBe("user-question");
+      expect(payload.requestId).toBeUndefined();
     });
 
-    it("should not truncate short prompts", async () => {
+    it("does not expose short question prompts", async () => {
       const shortPrompt = "What database should we use?";
 
       const mockProcess = {
@@ -407,7 +1053,8 @@ describe("PushNotifier", () => {
       });
 
       const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
-      expect(payload.summary).toBe(shortPrompt);
+      expect(payload.summary).toBe("Question waiting — open Yep to answer");
+      expect(payload.requestId).toBeUndefined();
     });
   });
 
@@ -814,6 +1461,46 @@ describe("PushNotifier", () => {
       const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
       expect(payload.type).toBe("session-halted");
       expect(payload.sessionTitle).toBe("Existing bridge session");
+    });
+
+    it("does not let a provider update replace a cached Yep AI title", async () => {
+      vi.mocked(mockSupervisor.getProcessForSession).mockReturnValue(undefined);
+
+      new PushNotifier({
+        eventBus: mockEventBus,
+        pushService: mockPushService,
+        notificationService: mockNotificationService,
+        supervisor: mockSupervisor,
+      });
+
+      eventHandler?.({
+        type: "session-metadata-changed",
+        sessionId: "session-1",
+        aiTitle: "Yep AI title",
+        timestamp: new Date().toISOString(),
+      });
+      eventHandler?.({
+        type: "session-updated",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        title: "Provider fallback title",
+        timestamp: new Date().toISOString(),
+      });
+      eventHandler?.({
+        type: "process-state-changed",
+        sessionId: "session-1",
+        projectId: testProjectId,
+        activity: "idle",
+        timestamp: new Date().toISOString(),
+      });
+
+      await vi.waitFor(() => {
+        expect(mockPushService.sendToAll).toHaveBeenCalledTimes(1);
+      });
+
+      const payload = vi.mocked(mockPushService.sendToAll).mock.calls[0][0];
+      expect(payload.type).toBe("session-halted");
+      expect(payload.sessionTitle).toBe("Yep AI title");
     });
 
     it("should still mark session-halted badge state without push subscriptions", async () => {

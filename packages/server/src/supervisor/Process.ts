@@ -10,16 +10,32 @@ import type {
   SlashCommand,
   ThinkingConfig,
   UrlProjectId,
+  UserQuestionAnswers,
 } from "@yep-anywhere/shared";
+import { codexUserMessageIdentity } from "../codex/user-message-identity.js";
 import { getLogger } from "../logging/logger.js";
-import type { MessageQueue } from "../sdk/messageQueue.js";
+import { sanitizeSDKMessageForPublic } from "../sdk/messageLogger.js";
+import {
+  type MessageQueue,
+  buildUserPromptProjection,
+} from "../sdk/messageQueue.js";
+import {
+  type CodexNativeCapabilities,
+  type CodexNativeControlRequest,
+  type CodexNativeControlResult,
+  type CodexSessionControls,
+  codexControlFailure,
+} from "../sdk/providers/codex-controls.js";
+import type { AgentSteerResult } from "../sdk/providers/types.js";
 import type {
   PermissionMode,
+  ProviderApprovalDecision,
   SDKMessage,
   TimestampedSDKMessage,
   ToolApprovalResult,
   UserMessage,
 } from "../sdk/types.js";
+import { validateQuestionAnswers } from "../sessions/question-answers.js";
 import type {
   AgentActivity,
   InputRequest,
@@ -27,12 +43,22 @@ import type {
   ProcessInfo,
   ProcessOptions,
   ProcessState,
+  SessionRetryStatus,
 } from "./types.js";
 import { DEFAULT_IDLE_TIMEOUT_MS } from "./types.js";
 
 type Listener = (event: ProcessEvent) => void;
 
-const DEFAULT_PROVIDER_INITIALIZATION_TIMEOUT_MS = 15_000;
+export interface ProcessQueueMessageResult {
+  success: boolean;
+  position?: number;
+  error?: string;
+}
+
+export interface ProcessQueueMessageOptions {
+  /** False preserves one queued provider turn for one external reply surface. */
+  allowSteer?: boolean;
+}
 
 /**
  * IMPORTANT: Never filter out messages by type before emitting to SSE!
@@ -53,6 +79,33 @@ export function shouldEmitMessage(_message: SDKMessage): boolean {
   return true;
 }
 
+/** Structural comparison so an unchanged retry state does not re-broadcast. */
+function retryStatusEquals(
+  a: SessionRetryStatus | undefined,
+  b: SessionRetryStatus | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.attempt === b.attempt &&
+    a.message === b.message &&
+    a.next === b.next &&
+    a.actionLabel === b.actionLabel &&
+    a.actionLink === b.actionLink
+  );
+}
+
+function normalizeSteerResult(result: AgentSteerResult): {
+  accepted: boolean;
+  turnId?: string;
+} {
+  if (typeof result === "boolean") return { accepted: result };
+  return {
+    accepted: result.accepted,
+    ...(result.turnId ? { turnId: result.turnId } : {}),
+  };
+}
+
 /**
  * Pending tool approval request.
  * The SDK's canUseTool callback creates this and waits for respondToInput.
@@ -62,7 +115,20 @@ interface PendingToolApproval {
   resolve: (result: ToolApprovalResult) => void;
 }
 
+interface SessionIdWaiter {
+  resolve: (id: string) => void;
+  reject: (error: Error) => void;
+  strict: boolean;
+  timeout: ReturnType<typeof setTimeout> | null;
+}
+
 export interface ProcessConstructorOptions extends ProcessOptions {
+  /** Correlates the request, provider transport, and first-output logs. */
+  startupId?: string;
+  /** Wall-clock start of the provider request, before preflight work. */
+  startupStartedAtMs?: number;
+  /** Created without an initial turn and therefore not materialized yet. */
+  unmaterializedSession?: boolean;
   /** MessageQueue for real SDK, undefined for mock SDK */
   queue?: MessageQueue;
   /** Abort function from real SDK */
@@ -77,13 +143,28 @@ export interface ProcessConstructorOptions extends ProcessOptions {
    * Function to steer an active turn with additional user input.
    * Returns false when steering is unavailable and caller should enqueue.
    */
-  steerFn?: (message: UserMessage) => Promise<boolean>;
+  steerFn?: (message: UserMessage) => Promise<AgentSteerResult>;
+  /** Capability-gated Codex app-server controls for this session. */
+  codexControls?: CodexSessionControls;
   /** Function to get supported models (SDK 0.2.7+) */
   supportedModelsFn?: () => Promise<ModelInfo[]>;
   /** Function to get supported slash commands (SDK 0.2.7+) */
   supportedCommandsFn?: () => Promise<SlashCommand[]>;
   /** Function to change model mid-session (SDK 0.2.7+) */
   setModelFn?: (model?: string) => Promise<void>;
+  /** Function to change the provider-native permission/session mode */
+  setPermissionModeFn?: (mode: PermissionMode) => Promise<void>;
+  /** Function to trigger a provider-native context compaction mid-session */
+  compactFn?: () => Promise<void>;
+  /** Function to change the provider-native reasoning effort mid-session */
+  setReasoningEffortFn?: (effort: string) => Promise<void>;
+  /** Function to read the provider-native session goal status */
+  getGoalFn?: () => Promise<import("@yep-anywhere/shared").ProviderGoalState>;
+  /** Function to run a provider-native goal lifecycle action */
+  goalActionFn?: (
+    action: import("@yep-anywhere/shared").ProviderGoalAction,
+    objective?: string,
+  ) => Promise<import("@yep-anywhere/shared").ProviderGoalState>;
   /**
    * Function returning a structured breakdown of current context-window usage
    * (system prompt, tools, skills, MCP servers, memory files...). SDK 0.2.7+.
@@ -100,23 +181,32 @@ export interface ProcessConstructorOptions extends ProcessOptions {
 
 export class Process {
   readonly id: string;
+  readonly startupId: string | undefined;
   private _sessionId: string;
   readonly projectPath: string;
   readonly projectId: UrlProjectId;
   readonly startedAt: Date;
   readonly provider: ProviderName;
   readonly model: string | undefined;
+  /** Exact provider reasoning effort requested when the process started. */
+  readonly requestedReasoningEffort: string | undefined;
   /** SSH host for remote execution (undefined = local) */
   readonly executor: string | undefined;
+  private readonly startupStartedAtMs: number;
+  private firstProviderMessageLogged = false;
+  private firstProviderOutputLogged = false;
+  private _unmaterializedSession: boolean;
 
   private legacyQueue: UserMessage[] = [];
   private messageQueue: MessageQueue | null;
   private abortFn: (() => void) | null;
   private _state: ProcessState = { type: "in-turn" };
+  private _retryStatus: SessionRetryStatus | undefined;
   private listeners: Set<Listener> = new Set();
   private idleTimer: NodeJS.Timeout | null = null;
   private idleTimeoutMs: number;
   private iteratorDone = false;
+  private acceptingMessages = true;
 
   /** Set synchronously when transport/spawn fails to prevent race with queueMessage */
   private transportFailed = false;
@@ -128,6 +218,9 @@ export class Process {
    */
   private currentBucket: SDKMessage[] = [];
   private previousBucket: SDKMessage[] = [];
+  /** UUID-keyed public prompts used to replace provider echoes losslessly. */
+  private publicUserPrompts = new Map<string, string>();
+  private static readonly MAX_PUBLIC_USER_PROMPTS = 256;
   private bucketSwapTimer: ReturnType<typeof setInterval> | null = null;
   private static readonly BUCKET_SWAP_INTERVAL_MS = 15_000;
 
@@ -163,7 +256,8 @@ export class Process {
   /** Function to interrupt current turn gracefully (SDK 0.2.7+) */
   private interruptFn: (() => Promise<void>) | null;
   /** Function to steer an active turn (provider-specific, currently Codex app-server) */
-  private steerFn: ((message: UserMessage) => Promise<boolean>) | null;
+  private steerFn: ((message: UserMessage) => Promise<AgentSteerResult>) | null;
+  private codexControls: CodexSessionControls | null;
 
   /** Function to get supported models (SDK 0.2.7+) */
   private supportedModelsFn: (() => Promise<ModelInfo[]>) | null;
@@ -173,6 +267,20 @@ export class Process {
 
   /** Function to change model mid-session (SDK 0.2.7+) */
   private setModelFn: ((model?: string) => Promise<void>) | null;
+  private compactFn: (() => Promise<void>) | null;
+  private setReasoningEffortFn: ((effort: string) => Promise<void>) | null;
+  private getGoalFn:
+    | (() => Promise<import("@yep-anywhere/shared").ProviderGoalState>)
+    | null;
+  private goalActionFn:
+    | ((
+        action: import("@yep-anywhere/shared").ProviderGoalAction,
+        objective?: string,
+      ) => Promise<import("@yep-anywhere/shared").ProviderGoalState>)
+    | null;
+
+  /** Function to change the provider-native permission/session mode */
+  private setPermissionModeFn: ((mode: PermissionMode) => Promise<void>) | null;
 
   /** Function returning structured live context-window breakdown (SDK 0.2.7+) */
   private getContextUsageFn:
@@ -189,15 +297,10 @@ export class Process {
   /** Set after the first time we successfully probe initializationResult() */
   private _initializationResultProbed = false;
 
-  /** Resolvers waiting for the real session ID */
-  private sessionIdResolvers: Array<(id: string) => void> = [];
+  /** Waiters for the real session ID emitted by the provider init message. */
+  private sessionIdWaiters: SessionIdWaiter[] = [];
   private sessionIdResolved = false;
-  private initializationResolved = false;
-  private initializationError: Error | null = null;
-  private initializationWaiters: Array<{
-    resolve: () => void;
-    reject: (error: Error) => void;
-  }> = [];
+  private sessionIdInitializationError: Error | null = null;
 
   /** Timestamp of last SDK message received (for staleness detection) */
   private _lastMessageTime: Date;
@@ -236,10 +339,14 @@ export class Process {
     options: ProcessConstructorOptions,
   ) {
     this.id = randomUUID();
+    this.startupId = options.startupId;
     this._sessionId = options.sessionId;
     this.projectPath = options.projectPath;
     this.projectId = options.projectId;
     this.startedAt = new Date();
+    this.startupStartedAtMs =
+      options.startupStartedAtMs ?? this.startedAt.getTime();
+    this._unmaterializedSession = options.unmaterializedSession === true;
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
 
     // Real SDK provides these, mock SDK doesn't
@@ -249,16 +356,23 @@ export class Process {
     this._permissions = options.permissions;
     this.provider = options.provider;
     this.model = options.model;
+    this.requestedReasoningEffort = options.reasoningEffort;
     this.executor = options.executor;
     this._thinking = options.thinking;
     this._effort = options.effort;
     this.setMaxThinkingTokensFn = options.setMaxThinkingTokensFn ?? null;
     this.interruptFn = options.interruptFn ?? null;
     this.steerFn = options.steerFn ?? null;
+    this.codexControls = options.codexControls ?? null;
     this.supportedModelsFn = options.supportedModelsFn ?? null;
     this.supportedCommandsFn = options.supportedCommandsFn ?? null;
     this._pidResolver = options.pid;
     this.setModelFn = options.setModelFn ?? null;
+    this.compactFn = options.compactFn ?? null;
+    this.setReasoningEffortFn = options.setReasoningEffortFn ?? null;
+    this.getGoalFn = options.getGoalFn ?? null;
+    this.goalActionFn = options.goalActionFn ?? null;
+    this.setPermissionModeFn = options.setPermissionModeFn ?? null;
     this.getContextUsageFn = options.getContextUsageFn ?? null;
     this.initializationResultFn = options.initializationResultFn ?? null;
     this._isProcessAlive = options.isProcessAlive ?? null;
@@ -301,6 +415,11 @@ export class Process {
     return this._sessionId;
   }
 
+  /** Whether a create-only process has not yet accepted its first user turn. */
+  get isUnmaterializedSession(): boolean {
+    return this._unmaterializedSession;
+  }
+
   /**
    * The actual model used by the API, extracted from the first assistant message.
    * Falls back to the requested model if no assistant message has been received yet.
@@ -310,7 +429,11 @@ export class Process {
   }
 
   get resolvedReasoningEffort(): string | undefined {
-    return this._resolvedReasoningEffort ?? this._effort;
+    return (
+      this._resolvedReasoningEffort ??
+      this.requestedReasoningEffort ??
+      this._effort
+    );
   }
 
   get serviceTier(): string | undefined {
@@ -324,6 +447,24 @@ export class Process {
 
   get state(): ProcessState {
     return this._state;
+  }
+
+  /** Provider retry/backoff state while the current turn is being retried. */
+  get retryStatus(): SessionRetryStatus | undefined {
+    return this._retryStatus;
+  }
+
+  /**
+   * Record provider retry/backoff state reported through
+   * `StartSessionOptions.onRetryStatus`.
+   *
+   * Kept off the message stream: the stream is replayed into the transcript,
+   * and a retry is transient status rather than conversation.
+   */
+  setRetryStatus(retryStatus: SessionRetryStatus | undefined): void {
+    if (retryStatusEquals(this._retryStatus, retryStatus)) return;
+    this._retryStatus = retryStatus;
+    this.emit({ type: "retry-status", retryStatus });
   }
 
   /** When the last SDK message was received (for staleness detection) */
@@ -483,6 +624,23 @@ export class Process {
     return this.setModelFn !== null;
   }
 
+  get codexNativeCapabilities(): CodexNativeCapabilities | undefined {
+    return this.codexControls?.capabilities;
+  }
+
+  async executeCodexControl(
+    request: CodexNativeControlRequest,
+  ): Promise<CodexNativeControlResult> {
+    if (!this.codexControls) {
+      return codexControlFailure(
+        request.control,
+        "unsupported_provider",
+        `Provider ${this.provider} does not expose Codex native controls`,
+      );
+    }
+    return this.codexControls.invoke(request);
+  }
+
   /**
    * Get the list of available models from the SDK.
    * Only supported by Claude SDK 0.2.7+.
@@ -541,6 +699,91 @@ export class Process {
     return true;
   }
 
+  get supportsCompact(): boolean {
+    return this.compactFn !== null;
+  }
+
+  /**
+   * Trigger a provider-native context compaction. Returns false when the
+   * provider does not support it, so the route can surface a 4xx.
+   */
+  async compact(): Promise<boolean> {
+    if (!this.compactFn) return false;
+    getLogger().info(
+      {
+        event: "session_compact",
+        sessionId: this._sessionId,
+        processId: this.id,
+      },
+      "Compacting session context",
+    );
+    await this.compactFn();
+    return true;
+  }
+
+  get supportsReasoningEffortChange(): boolean {
+    return this.setReasoningEffortFn !== null;
+  }
+
+  /**
+   * Change the provider-native reasoning effort mid-session. Returns false
+   * when unsupported; provider failures (e.g. a level the model does not
+   * advertise) propagate so the route can surface them.
+   */
+  async setReasoningEffort(effort: string): Promise<boolean> {
+    if (!this.setReasoningEffortFn) return false;
+    getLogger().info(
+      {
+        event: "reasoning_effort_change",
+        sessionId: this._sessionId,
+        processId: this.id,
+        previousEffort: this.resolvedReasoningEffort ?? null,
+        newEffort: effort,
+      },
+      "Changing provider reasoning effort",
+    );
+    await this.setReasoningEffortFn(effort);
+    this._resolvedReasoningEffort = effort;
+    return true;
+  }
+
+  get supportsGoal(): boolean {
+    return this.getGoalFn !== null && this.goalActionFn !== null;
+  }
+
+  /**
+   * Read the provider-native session goal. Returns null when unsupported.
+   */
+  async getGoal(): Promise<
+    import("@yep-anywhere/shared").ProviderGoalState | null
+  > {
+    if (!this.getGoalFn) return null;
+    return this.getGoalFn();
+  }
+
+  /**
+   * Run a provider-native goal lifecycle action. Returns null when
+   * unsupported; provider failures propagate so the route can surface them.
+   */
+  async goalAction(
+    action: import("@yep-anywhere/shared").ProviderGoalAction,
+    objective?: string,
+  ): Promise<import("@yep-anywhere/shared").ProviderGoalState | null> {
+    if (!this.goalActionFn) return null;
+    getLogger().info(
+      {
+        event: "session_goal_action",
+        sessionId: this._sessionId,
+        processId: this.id,
+        action,
+        // Never log the objective text — it is user content.
+        hasObjective: objective !== undefined,
+      },
+      "Session goal action",
+    );
+    return this.goalActionFn(action, objective);
+  }
+
   /**
    * Live, structured context-window breakdown from the SDK
    * (Query.getContextUsage()). Returns null if the provider does not
@@ -577,6 +820,12 @@ export class Process {
    */
   get isTerminated(): boolean {
     return this._state.type === "terminated";
+  }
+
+  /** Mark a message-free provider startup as ready to accept native controls. */
+  markReadyWithoutTurn(): void {
+    if (this.isTerminated || this._state.type === "waiting-input") return;
+    this.transitionToIdle();
   }
 
   /**
@@ -682,6 +931,15 @@ export class Process {
   }
 
   /**
+   * Apply a mode to the provider first, then publish the confirmed local state.
+   * Providers without a native mode API keep the existing Yep-only behavior.
+   */
+  async syncPermissionMode(mode: PermissionMode): Promise<void> {
+    await this.setPermissionModeFn?.(mode);
+    this.setPermissionMode(mode);
+  }
+
+  /**
    * Mark the process as terminated due to an error or external termination.
    * Emits a terminated event and cleans up resources.
    */
@@ -712,17 +970,8 @@ export class Process {
 
     this.clearIdleTimer();
     this.stopBucketSwapTimer();
+    this.closeMessageQueue("process_terminated");
     this.iteratorDone = true;
-
-    if (!this.initializationResolved) {
-      this.initializationError =
-        error ??
-        new Error(`Provider session terminated before startup: ${reason}`);
-      for (const waiter of this.initializationWaiters) {
-        waiter.reject(this.initializationError);
-      }
-      this.initializationWaiters = [];
-    }
 
     // Wake up hold wait if held (so processMessages loop can exit)
     if (this._holdResolve) {
@@ -757,52 +1006,85 @@ export class Process {
    * Wait for the real session ID from the SDK's init message.
    * Returns immediately if already received, or waits with a timeout.
    */
-  waitForSessionId(timeoutMs = 5000): Promise<string> {
+  waitForSessionId(
+    timeoutMs = 5000,
+    options?: { strict?: boolean },
+  ): Promise<string> {
     if (this.sessionIdResolved) {
       return Promise.resolve(this._sessionId);
     }
 
-    return new Promise((resolve) => {
-      this.sessionIdResolvers.push(resolve);
+    const strict = options?.strict === true;
+    const existingError = strict
+      ? (this.sessionIdInitializationError ??
+        this.getProviderInitializationError())
+      : null;
+    if (existingError) return Promise.reject(existingError);
 
-      // Timeout fallback - resolve with current ID even if not updated
-      setTimeout(() => {
-        const index = this.sessionIdResolvers.indexOf(resolve);
+    return new Promise((resolve, reject) => {
+      const waiter: SessionIdWaiter = {
+        resolve,
+        reject,
+        strict,
+        timeout: null,
+      };
+      this.sessionIdWaiters.push(waiter);
+
+      const boundedTimeoutMs = Number.isFinite(timeoutMs)
+        ? Math.max(0, timeoutMs)
+        : 5000;
+      waiter.timeout = setTimeout(() => {
+        const index = this.sessionIdWaiters.indexOf(waiter);
         if (index >= 0) {
-          this.sessionIdResolvers.splice(index, 1);
-          resolve(this._sessionId);
+          this.sessionIdWaiters.splice(index, 1);
+          waiter.timeout = null;
+          if (strict) {
+            reject(
+              new Error(
+                `Provider initialization timed out after ${boundedTimeoutMs}ms before returning a session ID`,
+              ),
+            );
+          } else {
+            // Backwards-compatible fallback for providers that can report
+            // their durable ID after the initial request has returned.
+            resolve(this._sessionId);
+          }
         }
-      }, timeoutMs);
+      }, boundedTimeoutMs);
     });
   }
 
-  /** 等待 provider 发出 init；若启动阶段退出则立即失败。 */
-  waitForInitialization(
-    timeoutMs = DEFAULT_PROVIDER_INITIALIZATION_TIMEOUT_MS,
-  ): Promise<void> {
-    if (this.initializationResolved) return Promise.resolve();
-    if (this.initializationError)
-      return Promise.reject(this.initializationError);
+  private getProviderInitializationError(): Error | null {
+    const history = this.getMessageHistory();
+    let providerError: SDKMessage | undefined;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const message = history[index];
+      if (message?.type === "error") {
+        providerError = message;
+        break;
+      }
+    }
+    if (!providerError) return null;
+    const detail =
+      typeof providerError.error === "string"
+        ? providerError.error
+        : "Provider failed before returning a session ID";
+    return new Error(detail);
+  }
 
-    return new Promise((resolve, reject) => {
-      const waiter = { resolve, reject };
-      this.initializationWaiters.push(waiter);
-      const timeout = setTimeout(() => {
-        const index = this.initializationWaiters.indexOf(waiter);
-        if (index >= 0) this.initializationWaiters.splice(index, 1);
-        reject(
-          new Error("Provider session startup timed out before initialization"),
-        );
-      }, timeoutMs);
-      waiter.resolve = () => {
-        clearTimeout(timeout);
-        resolve();
-      };
-      waiter.reject = (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      };
-    });
+  private rejectSessionIdWaiters(error: Error): void {
+    this.sessionIdInitializationError ??= error;
+    const remaining: SessionIdWaiter[] = [];
+    for (const waiter of this.sessionIdWaiters) {
+      if (waiter.strict) {
+        if (waiter.timeout) clearTimeout(waiter.timeout);
+        waiter.timeout = null;
+        waiter.reject(error);
+      } else {
+        remaining.push(waiter);
+      }
+    }
+    this.sessionIdWaiters = remaining;
   }
 
   getInfo(): ProcessInfo {
@@ -832,7 +1114,9 @@ export class Process {
       provider: this.provider,
       model: this._resolvedModel ?? this.model,
       reasoningEffort: this.resolvedReasoningEffort,
+      requestedReasoningEffort: this.requestedReasoningEffort,
       serviceTier: this._serviceTier,
+      retryStatus: this._retryStatus,
       thinking: this._thinking,
       effort: this._effort,
       executor: this.executor,
@@ -915,55 +1199,62 @@ export class Process {
     } as TimestampedSDKMessage<T>;
   }
 
+  private rememberPublicUserPrompt(uuid: string, publicPrompt: string): void {
+    this.publicUserPrompts.delete(uuid);
+    this.publicUserPrompts.set(uuid, publicPrompt);
+    while (this.publicUserPrompts.size > Process.MAX_PUBLIC_USER_PROMPTS) {
+      const oldest = this.publicUserPrompts.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.publicUserPrompts.delete(oldest);
+    }
+  }
+
+  private projectProviderMessageForPublic(message: SDKMessage): SDKMessage {
+    const safeMessage = sanitizeSDKMessageForPublic(message) as SDKMessage;
+    if (safeMessage.type !== "user" || !safeMessage.uuid) return safeMessage;
+    const publicPrompt = this.publicUserPrompts.get(safeMessage.uuid);
+    if (!publicPrompt) return safeMessage;
+    return {
+      ...safeMessage,
+      message: {
+        ...safeMessage.message,
+        role: safeMessage.message?.role ?? "user",
+        content: publicPrompt,
+      },
+    };
+  }
+
   /**
    * Add initial user message to history without queuing to SDK.
    * Used for real SDK sessions where the initial message is passed directly
    * to the SDK but needs to be in history for SSE replay to late-joining clients.
    *
-   * @param text - The message text
+   * @param message - Structured input used to construct the public view
    * @param uuid - The UUID to use (should match what was passed to SDK)
    * @param tempId - Optional client temp ID for optimistic UI tracking
    */
-  addInitialUserMessage(text: string, uuid: string, tempId?: string): void {
+  addInitialUserMessage(
+    message: UserMessage | string,
+    uuid: string,
+    tempId?: string,
+  ): void {
+    this._unmaterializedSession = false;
+    const publicPrompt = buildUserPromptProjection(
+      typeof message === "string" ? { text: message } : message,
+    ).publicPrompt;
+    this.rememberPublicUserPrompt(uuid, publicPrompt);
     const sdkMessage = this.withTimestamp({
       type: "user",
       uuid,
       tempId,
-      message: { role: "user", content: text },
+      clientUserMessageId: uuid,
+      ...(this.provider === "codex" ? codexUserMessageIdentity(uuid) : {}),
+      isOptimistic: true,
+      message: { role: "user", content: publicPrompt },
     } as SDKMessage);
 
     this.currentBucket.push(sdkMessage);
     this.emit({ type: "message", message: sdkMessage });
-  }
-
-  /**
-   * Format file size for display.
-   */
-  private formatSize(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024)
-      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  }
-
-  /**
-   * Build user message content that matches what MessageQueue sends to the SDK.
-   * This ensures SSE/history messages can be deduplicated against JSONL.
-   */
-  private buildUserMessageContent(message: UserMessage): string {
-    let text = message.text;
-
-    // Append attachment paths (same format as MessageQueue.toSDKMessage)
-    if (message.attachments?.length) {
-      const lines = message.attachments.map(
-        (f) =>
-          `- ${f.originalName} (${this.formatSize(f.size)}, ${f.mimeType}): ${f.path}`,
-      );
-      text += `\n\nUser uploaded files:\n${lines.join("\n")}`;
-    }
-
-    return text;
   }
 
   /**
@@ -973,11 +1264,10 @@ export class Process {
    *
    * @returns Object with success status and queue position or error
    */
-  queueMessage(message: UserMessage): {
-    success: boolean;
-    position?: number;
-    error?: string;
-  } {
+  async queueMessage(
+    message: UserMessage,
+    options: ProcessQueueMessageOptions = {},
+  ): Promise<ProcessQueueMessageResult> {
     // Check if process is terminated or transport failed
     if (this._state.type === "terminated") {
       return {
@@ -994,97 +1284,137 @@ export class Process {
         error: "Process transport failed",
       };
     }
+    if (
+      this.messageQueue &&
+      (!this.acceptingMessages ||
+        this.iteratorDone ||
+        this.messageQueue.isClosed)
+    ) {
+      return {
+        success: false,
+        error: "Process provider is no longer accepting messages",
+      };
+    }
 
     // Create user message with UUID - this UUID will be used by both SSE and SDK
     const uuid = randomUUID();
-    const messageWithUuid: UserMessage = { ...message, uuid };
-
-    // Build content that matches what the SDK will write to JSONL.
-    // This ensures SSE/history messages can be deduplicated against JSONL.
-    const content = this.buildUserMessageContent(message);
-
-    const sdkMessage = this.withTimestamp({
-      type: "user",
+    const messageWithUuid = { ...message, uuid };
+    // A provider can emit its adoption event before the steer RPC resolves.
+    // Register the public projection first so that early echo keeps attachments
+    // and never exposes provider-only prompt expansion.
+    this.rememberPublicUserPrompt(
       uuid,
-      tempId: message.tempId,
-      message: { role: "user", content },
-    } as SDKMessage);
-
-    // Add to history for SSE replay to late-joining clients.
-    // The client-side deduplication (mergeSSEMessage, mergeJSONLMessages) handles
-    // any duplicates when JSONL is later fetched. This is especially important
-    // for the two-phase flow (createSession + queueMessage) where the client
-    // may connect before the JSONL is written.
-    if (shouldEmitMessage(sdkMessage)) {
-      // Check for duplicates in both buckets before adding
-      // This prevents duplicates if the provider echoes the message back with the same UUID
-      const isDuplicate =
-        this.currentBucket.some((m) => m.uuid && m.uuid === sdkMessage.uuid) ||
-        this.previousBucket.some((m) => m.uuid && m.uuid === sdkMessage.uuid);
-      if (!isDuplicate) {
-        this.currentBucket.push(sdkMessage);
-      }
-    }
-
-    // Emit to current SSE subscribers so other clients see it immediately
-    // Include the session ID so client can associate it correctly
-    // The provider will echo this message back, but if we ensure UUIDs match,
-    // the client will merge them.
-    if (shouldEmitMessage(sdkMessage)) {
-      this.emit({
-        type: "message",
-        message: { ...sdkMessage, session_id: this._sessionId },
-      });
-    }
+      buildUserPromptProjection(messageWithUuid).publicPrompt,
+    );
 
     if (this.messageQueue) {
       // If provider supports in-turn steering, prefer that over queue-after-turn behavior.
-      if (this._state.type === "in-turn" && this.steerFn) {
-        const steerMessage: UserMessage = {
-          ...messageWithUuid,
-          // Mirror MessageQueue's attachment expansion for steer payloads.
-          text: content,
-          attachments: undefined,
-        };
-        void this.steerFn(steerMessage)
-          .then((steered) => {
-            if (!steered) {
-              this.messageQueue?.push(messageWithUuid);
-            }
-          })
-          .catch((error) => {
-            const log = getLogger();
-            log.warn(
-              {
-                event: "process_steer_failed",
-                sessionId: this._sessionId,
-                processId: this.id,
-                provider: this.provider,
-                error: error instanceof Error ? error.message : String(error),
-              },
-              "Steer failed; falling back to queued message",
-            );
-            this.messageQueue?.push(messageWithUuid);
-          });
-        return { success: true, position: 0 };
+      if (
+        options.allowSteer !== false &&
+        this._state.type === "in-turn" &&
+        this.steerFn
+      ) {
+        let steerResult: AgentSteerResult = false;
+        try {
+          steerResult = await this.steerFn(messageWithUuid);
+        } catch (error) {
+          getLogger().warn(
+            {
+              event: "process_steer_failed",
+              sessionId: this._sessionId,
+              processId: this.id,
+              provider: this.provider,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "Steer failed; falling back to queued message",
+          );
+        }
+        const admission = normalizeSteerResult(steerResult);
+        if (admission.accepted) {
+          this._unmaterializedSession = false;
+          this.publishOptimisticUserMessage(messageWithUuid, admission.turnId);
+          return { success: true, position: 0 };
+        }
       }
 
-      // Transition to running if we were idle
+      // Steering may have completed after the provider exited. Re-check the
+      // resident queue before acknowledging or publishing an optimistic echo.
+      if (
+        !this.acceptingMessages ||
+        this.iteratorDone ||
+        this.messageQueue.isClosed
+      ) {
+        return {
+          success: false,
+          error: "Process provider is no longer accepting messages",
+        };
+      }
+      const position = this.messageQueue.push(messageWithUuid);
+      if (position === -1) {
+        return {
+          success: false,
+          error: "Process provider is no longer accepting messages",
+        };
+      }
+
+      // Transition to running only after the resident queue accepted the input.
       if (this._state.type === "idle") {
         this.clearIdleTimer();
         this.setState({ type: "in-turn" });
       }
-      // Pass message with UUID so SDK uses the same UUID we emitted via SSE
-      const position = this.messageQueue.push(messageWithUuid);
+      this._unmaterializedSession = false;
+      this.publishOptimisticUserMessage(messageWithUuid);
       return { success: true, position };
     }
 
     // Legacy behavior for mock SDK
-    this.legacyQueue.push(message);
+    this.legacyQueue.push(messageWithUuid);
+    this._unmaterializedSession = false;
+    this.publishOptimisticUserMessage(messageWithUuid);
     if (this._state.type === "idle") {
       this.processNextInQueue();
     }
     return { success: true, position: this.legacyQueue.length };
+  }
+
+  private publishOptimisticUserMessage(
+    message: UserMessage & { uuid: string },
+    turnId?: string,
+  ): void {
+    const existing =
+      this.currentBucket.find((item) => item.uuid === message.uuid) ??
+      this.previousBucket.find((item) => item.uuid === message.uuid);
+    if (existing && existing.isOptimistic !== true) return;
+
+    const content = buildUserPromptProjection(message).publicPrompt;
+    this.rememberPublicUserPrompt(message.uuid, content);
+    const sdkMessage = this.withTimestamp({
+      type: "user",
+      uuid: message.uuid,
+      tempId: message.tempId,
+      clientUserMessageId: message.uuid,
+      ...(this.provider === "codex"
+        ? codexUserMessageIdentity(message.uuid)
+        : {}),
+      isOptimistic: true,
+      ...(turnId ? { turnId, codexTurnId: turnId } : {}),
+      message: { role: "user", content },
+    } as SDKMessage);
+
+    if (!shouldEmitMessage(sdkMessage)) return;
+
+    // Add to history for SSE replay to late-joining clients. The provider echo
+    // uses the same UUID and is deduplicated when JSONL is merged later.
+    const isDuplicate =
+      this.currentBucket.some((item) => item.uuid === sdkMessage.uuid) ||
+      this.previousBucket.some((item) => item.uuid === sdkMessage.uuid);
+    if (!isDuplicate) {
+      this.currentBucket.push(sdkMessage);
+    }
+    this.emit({
+      type: "message",
+      message: { ...sdkMessage, session_id: this._sessionId },
+    });
   }
 
   /**
@@ -1230,7 +1560,12 @@ export class Process {
   async handleToolApproval(
     toolName: string,
     input: unknown,
-    options: { signal: AbortSignal },
+    options: {
+      signal: AbortSignal;
+      requestId?: string;
+      requestMethod?: string;
+      respectProviderDecision?: boolean;
+    },
   ): Promise<ToolApprovalResult> {
     console.log(
       `[handleToolApproval] toolName=${toolName}, permissionMode=${this._permissionMode}`,
@@ -1251,8 +1586,14 @@ export class Process {
       return permissionResult;
     }
 
-    // Handle based on permission mode
-    switch (this._permissionMode) {
+    // Skip Yep's mode policy when the provider already applied its native
+    // policy and explicitly decided this request still needs a human.
+    const localPermissionMode = options.respectProviderDecision
+      ? undefined
+      : this._permissionMode;
+    switch (localPermissionMode) {
+      case undefined:
+        break;
       case "bypassPermissions": {
         // Always prompt for user questions and plan approval, even in bypass mode
         // These are inherently interactive and shouldn't be auto-answered
@@ -1280,8 +1621,11 @@ export class Process {
           return { behavior: "allow" };
         }
 
-        // Allow Write to .claude/plans/ directory for saving plans
-        if (toolName === "Write") {
+        // Claude plan mode writes its generated plan into .claude/plans/.
+        // Pi has no native plan prompt or plan lifecycle, so its plan mode is
+        // intentionally a strict approval gate and must not inherit this
+        // provider-specific write exception.
+        if (this.provider !== "pi" && toolName === "Write") {
           const filePath = (input as { file_path?: string })?.file_path ?? "";
           if (filePath.includes(".claude/plans/")) {
             return { behavior: "allow" };
@@ -1350,11 +1694,29 @@ export class Process {
     }
 
     // Default behavior: ask user for approval
+    const isQuestion = toolName === "AskUserQuestion";
+    const questionInput =
+      isQuestion && input && typeof input === "object"
+        ? (input as { questions?: Array<{ question?: unknown }> })
+        : undefined;
+    const firstQuestion = questionInput?.questions?.find(
+      (question) => typeof question?.question === "string",
+    )?.question;
+    const providerRequestId = options.requestId?.trim() || undefined;
     const request: InputRequest = {
-      id: randomUUID(),
+      // Preserve a provider-native id when available so notification actions
+      // address the same request observed by the provider.
+      id: providerRequestId || randomUUID(),
+      providerRequestId,
+      providerRequestMethod: options.requestMethod,
       sessionId: this._sessionId,
-      type: "tool-approval",
-      prompt: `Allow ${toolName}?`,
+      type: isQuestion ? "question" : "tool-approval",
+      prompt:
+        typeof firstQuestion === "string" && firstQuestion.trim()
+          ? firstQuestion
+          : isQuestion
+            ? "Question requires your answer"
+            : `Allow ${toolName}?`,
       toolName,
       toolInput: input,
       timestamp: new Date().toISOString(),
@@ -1423,8 +1785,8 @@ export class Process {
    */
   respondToInput(
     requestId: string,
-    response: "approve" | "deny",
-    answers?: Record<string, string>,
+    response: ProviderApprovalDecision,
+    answers?: UserQuestionAnswers,
     feedback?: string,
   ): boolean {
     const pending = this.pendingToolApprovals.get(requestId);
@@ -1442,6 +1804,22 @@ export class Process {
       return false;
     }
 
+    const approved = response !== "deny";
+    if (approved) {
+      const validation = validateQuestionAnswers(pending.request, answers);
+      if (!validation.valid) {
+        getLogger().warn(
+          {
+            sessionId: this._sessionId,
+            requestId,
+            missingAnswerCount: validation.missingAnswerCount,
+          },
+          "Question approval rejected because required answers were missing",
+        );
+        return false;
+      }
+    }
+
     // Build the result with optional updated input for AskUserQuestion.
     // If deny has feedback, use that as the message.
     const trimmedFeedback = feedback?.trim();
@@ -1450,13 +1828,20 @@ export class Process {
     // If user provided feedback, set interrupt: false so Claude can incorporate the guidance.
     const shouldInterrupt = response === "deny" && !trimmedFeedback;
     const result: ToolApprovalResult = {
-      behavior: response === "approve" ? "allow" : "deny",
-      message: response === "deny" ? denyMessage : undefined,
-      interrupt: response === "deny" ? shouldInterrupt : undefined,
+      behavior: approved ? "allow" : "deny",
+      message: !approved ? denyMessage : undefined,
+      interrupt: !approved ? shouldInterrupt : undefined,
+      // Providers with persistent grants honor this; others treat the
+      // approval as one-shot.
+      approvalScope:
+        response === "approve_always" || response === "approve_for_session"
+          ? "always"
+          : undefined,
+      providerDecision: response,
     };
 
     // If answers provided (AskUserQuestion), pass them as updatedInput
-    if (answers && response === "approve") {
+    if (answers && approved) {
       const originalInput = pending.request.toolInput as {
         questions?: unknown[];
       };
@@ -1467,15 +1852,12 @@ export class Process {
     }
 
     // If EnterPlanMode is approved, switch to plan mode
-    if (
-      response === "approve" &&
-      pending.request.toolName === "EnterPlanMode"
-    ) {
+    if (approved && pending.request.toolName === "EnterPlanMode") {
       this.setPermissionMode("plan");
     }
 
     // If ExitPlanMode is approved, switch back to the app's default mode.
-    if (response === "approve" && pending.request.toolName === "ExitPlanMode") {
+    if (approved && pending.request.toolName === "ExitPlanMode") {
       this.setPermissionMode(DEFAULT_PERMISSION_MODE);
     }
 
@@ -1489,19 +1871,30 @@ export class Process {
     // Codex app-server decline decisions do not currently include a rejection
     // reason in-protocol. Queue the feedback as a follow-up user message.
     if (response === "deny" && trimmedFeedback && this.provider === "codex") {
-      const queued = this.queueMessage({
+      void this.queueMessage({
         text: `I denied that request. Instead: ${trimmedFeedback}`,
-      });
-      if (!queued.success) {
-        getLogger().warn(
-          {
-            sessionId: this._sessionId,
-            processId: this.id,
-            error: queued.error,
-          },
-          "Failed to queue Codex deny feedback follow-up message",
-        );
-      }
+      })
+        .then((queued) => {
+          if (queued.success) return;
+          getLogger().warn(
+            {
+              sessionId: this._sessionId,
+              processId: this.id,
+              error: queued.error,
+            },
+            "Failed to queue Codex deny feedback follow-up message",
+          );
+        })
+        .catch((error) => {
+          getLogger().warn(
+            {
+              sessionId: this._sessionId,
+              processId: this.id,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "Codex deny feedback follow-up admission rejected unexpectedly",
+          );
+        });
     }
 
     // Emit the next pending approval, or transition to running if none left
@@ -1552,6 +1945,7 @@ export class Process {
   async abort(): Promise<void> {
     this.clearIdleTimer();
     this.stopBucketSwapTimer();
+    this.closeMessageQueue("process_aborted");
 
     // Call the SDK's abort function if available
     if (this.abortFn) {
@@ -1571,6 +1965,22 @@ export class Process {
   }
 
   private async processMessages(): Promise<void> {
+    if (this.startupId) {
+      getLogger().info(
+        {
+          event: "provider_first_message_wait_started",
+          startupId: this.startupId,
+          sessionId: this._sessionId,
+          processId: this.id,
+          projectId: this.projectId,
+          provider: this.provider,
+          executor: this.executor,
+          requestElapsedMs: Date.now() - this.startupStartedAtMs,
+        },
+        "Waiting for first provider message",
+      );
+    }
+
     try {
       while (!this.iteratorDone) {
         // Check if held - pause before calling iterator.next()
@@ -1586,21 +1996,104 @@ export class Process {
 
         if (result.done) {
           this.iteratorDone = true;
-          if (this.messageQueue) {
-            this.transportFailed = true;
-            this.markTerminated(
-              this.initializationResolved
-                ? "provider session ended"
-                : "provider session ended before initialization",
+          this.closeMessageQueue("provider_iterator_done");
+          if (this.startupId && !this.firstProviderMessageLogged) {
+            getLogger().warn(
+              {
+                event: "provider_ended_before_first_message",
+                startupId: this.startupId,
+                sessionId: this._sessionId,
+                processId: this.id,
+                projectId: this.projectId,
+                provider: this.provider,
+                executor: this.executor,
+                requestElapsedMs: Date.now() - this.startupStartedAtMs,
+              },
+              "Provider ended before emitting its first message",
             );
-          } else if (this._state.type !== "waiting-input") {
+          }
+          if (!this.sessionIdResolved) {
+            this.rejectSessionIdWaiters(
+              new Error("Provider ended before returning a session ID"),
+            );
+          }
+          // Don't transition to idle if we're waiting for input
+          if (this._state.type !== "waiting-input") {
             this.transitionToIdle();
           }
           break;
         }
 
-        const message = this.withTimestamp(result.value);
+        const message = this.projectProviderMessageForPublic(
+          this.withTimestamp(result.value),
+        ) as TimestampedSDKMessage;
         this._lastMessageTime = new Date();
+
+        const isProviderOutput =
+          message.type === "assistant" || message.type === "stream_event";
+        if (
+          !this.firstProviderMessageLogged ||
+          (!this.firstProviderOutputLogged && isProviderOutput)
+        ) {
+          const messageRecord = message as unknown as Record<string, unknown>;
+          const streamEvent =
+            messageRecord.event && typeof messageRecord.event === "object"
+              ? (messageRecord.event as Record<string, unknown>)
+              : undefined;
+          const milestoneFields = {
+            startupId: this.startupId,
+            sessionId: this._sessionId,
+            processId: this.id,
+            projectId: this.projectId,
+            provider: this.provider,
+            executor: this.executor,
+            messageType: message.type,
+            messageSubtype:
+              typeof messageRecord.subtype === "string"
+                ? messageRecord.subtype
+                : undefined,
+            streamEventType:
+              typeof streamEvent?.type === "string"
+                ? streamEvent.type
+                : undefined,
+            requestElapsedMs: Date.now() - this.startupStartedAtMs,
+            processElapsedMs: Date.now() - this.startedAt.getTime(),
+          };
+
+          if (!this.firstProviderMessageLogged) {
+            this.firstProviderMessageLogged = true;
+            if (this.startupId) {
+              getLogger().info(
+                {
+                  event: "provider_first_message_received",
+                  ...milestoneFields,
+                },
+                "Received first provider message",
+              );
+            }
+          }
+
+          if (!this.firstProviderOutputLogged && isProviderOutput) {
+            this.firstProviderOutputLogged = true;
+            if (this.startupId) {
+              getLogger().info(
+                {
+                  event: "provider_first_output_received",
+                  ...milestoneFields,
+                },
+                "Received first provider output",
+              );
+            }
+          }
+        }
+
+        if (!this.sessionIdResolved && message.type === "error") {
+          const detail =
+            typeof message.error === "string"
+              ? message.error
+              : "Provider failed before returning a session ID";
+          this.rejectSessionIdWaiters(new Error(detail));
+        }
 
         // Store message in history for replay to late-joining clients.
         // Exclude stream_event messages - they're transient streaming deltas that
@@ -1609,14 +2102,42 @@ export class Process {
         if (shouldEmitMessage(message) && message.type !== "stream_event") {
           // Check for duplicates before adding to history
           // This handles the case where queueMessage added the optimistic message
-          // and now the provider is echoing it back with the same UUID
-          const isDuplicate =
+          // and now the provider is echoing it back with the same UUID, or (Pi)
+          // under the persisted entry id while naming the optimistic row it
+          // supersedes.
+          const matchesHistoryRow = (existing: SDKMessage): boolean =>
+            existing.uuid === message.uuid ||
+            (typeof message.supersedesMessageId === "string" &&
+              existing.uuid === message.supersedesMessageId);
+          const duplicateBucket =
             message.type === "user" &&
             message.uuid &&
-            (this.currentBucket.some((m) => m.uuid === message.uuid) ||
-              this.previousBucket.some((m) => m.uuid === message.uuid));
+            (this.currentBucket.some(matchesHistoryRow)
+              ? this.currentBucket
+              : this.previousBucket.some(matchesHistoryRow)
+                ? this.previousBucket
+                : undefined);
 
-          if (!isDuplicate) {
+          if (duplicateBucket) {
+            const duplicateIndex = duplicateBucket.findIndex(matchesHistoryRow);
+            const optimistic = duplicateBucket[duplicateIndex];
+            if (optimistic) {
+              // Keep one public-history row, but enrich the optimistic entry
+              // with the provider's authoritative turn correlation.
+              duplicateBucket[duplicateIndex] = {
+                ...optimistic,
+                ...message,
+                tempId: message.tempId ?? optimistic.tempId,
+                clientUserMessageId:
+                  message.clientUserMessageId ?? optimistic.clientUserMessageId,
+                message: message.message ?? optimistic.message,
+                isOptimistic:
+                  optimistic.isOptimistic === false
+                    ? false
+                    : (message.isOptimistic ?? false),
+              } as TimestampedSDKMessage;
+            }
+          } else {
             this.currentBucket.push(message);
           }
         }
@@ -1631,9 +2152,6 @@ export class Process {
           const oldSessionId = this._sessionId;
           this._sessionId = message.session_id;
           this.sessionIdResolved = true;
-          this.initializationResolved = true;
-          for (const waiter of this.initializationWaiters) waiter.resolve();
-          this.initializationWaiters = [];
           if (typeof message.model === "string" && message.model) {
             this._resolvedModel = message.model;
           }
@@ -1654,6 +2172,12 @@ export class Process {
               previousTempId: oldSessionId,
               processId: this.id,
               projectId: this.projectId,
+              startupId: this.startupId,
+              requestToInitializationDurationMs:
+                this.startupId === undefined
+                  ? undefined
+                  : Date.now() - this.startupStartedAtMs,
+              initializationDurationMs: Date.now() - this.startedAt.getTime(),
             },
             `Session ID received from SDK: ${this._sessionId}`,
           );
@@ -1669,10 +2193,12 @@ export class Process {
           }
 
           // Resolve any waiters
-          for (const resolve of this.sessionIdResolvers) {
-            resolve(this._sessionId);
+          for (const waiter of this.sessionIdWaiters) {
+            if (waiter.timeout) clearTimeout(waiter.timeout);
+            waiter.timeout = null;
+            waiter.resolve(this._sessionId);
           }
-          this.sessionIdResolvers = [];
+          this.sessionIdWaiters = [];
         }
 
         // Capture resolved model from first assistant message
@@ -1691,7 +2217,11 @@ export class Process {
           this.emit({ type: "message", message });
         }
 
-        if (message.type === "system" && message.subtype === "turn_complete") {
+        if (
+          message.type === "system" &&
+          (message.subtype === "turn_usage" ||
+            message.subtype === "turn_complete")
+        ) {
           const usage = message.usage as
             | { model_context_window?: unknown }
             | undefined;
@@ -1707,16 +2237,6 @@ export class Process {
         }
 
         // Handle special message types
-        if (message.type === "error" && !this.initializationResolved) {
-          const startupError = new Error(
-            typeof message.error === "string"
-              ? message.error
-              : "Provider session failed before initialization",
-          );
-          this.transportFailed = true;
-          this.markTerminated("provider startup failed", startupError);
-          break;
-        }
         if (message.type === "system" && message.subtype === "input_request") {
           // Legacy mock SDK behavior - handle input_request message
           this.handleInputRequest(message);
@@ -1738,27 +2258,37 @@ export class Process {
               }
             }
           }
-          this.transitionToIdle();
+          this.transitionToIdle({ continueQueuedTurn: true });
         }
       }
     } catch (error) {
       const err = error as Error;
       const log = getLogger();
+      this.iteratorDone = true;
+      this.closeMessageQueue("provider_iterator_error");
 
       log.error(
         {
           event: "process_error",
+          startupId: this.startupId,
           sessionId: this._sessionId,
           processId: this.id,
           projectId: this.projectId,
           errorMessage: err.message,
           errorStack: err.stack,
           currentState: this._state.type,
+          requestElapsedMs:
+            this.startupId === undefined
+              ? undefined
+              : Date.now() - this.startupStartedAtMs,
         },
         `Process error: ${this._sessionId} - ${err.message}`,
       );
 
       this.emit({ type: "error", error: err });
+      if (!this.sessionIdResolved) {
+        this.rejectSessionIdWaiters(err);
+      }
 
       // Detect process termination errors - set flag synchronously BEFORE markTerminated
       // to prevent race where queueMessage is called before state changes to terminated
@@ -1819,18 +2349,82 @@ export class Process {
     this.setState({ type: "waiting-input", request });
   }
 
-  private transitionToIdle(): void {
+  private transitionToIdle(
+    options: { continueQueuedTurn?: boolean } = {},
+  ): void {
     this.clearIdleTimer();
     // Feed next deferred message before transitioning to idle
     const next = this.deferredQueue.shift();
     if (next) {
       this.emitDeferredQueueChange();
-      this.queueMessage(next.message); // stays in-turn, SDK picks it up
+      void this.queueMessage(next.message)
+        .then((result) => {
+          if (result.success || this._state.type === "terminated") return;
+          getLogger().warn(
+            {
+              sessionId: this._sessionId,
+              processId: this.id,
+              error: result.error,
+            },
+            "Failed to queue deferred message after turn completion",
+          );
+          this.setState({ type: "idle", since: new Date() });
+          this.startIdleTimer();
+        })
+        .catch((error) => {
+          if (this._state.type === "terminated") return;
+          getLogger().warn(
+            {
+              sessionId: this._sessionId,
+              processId: this.id,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "Deferred message admission rejected unexpectedly",
+          );
+          this.setState({ type: "idle", since: new Date() });
+          this.startIdleTimer();
+        });
       return;
     }
+
+    // Resident providers such as Kimi yield the completed turn's result before
+    // advancing their MessageQueue generator. If another prompt arrived while
+    // that turn was finishing, it is already queued here and will be consumed
+    // by the very next iterator.next(). Keep the process busy across that
+    // boundary instead of briefly (and then permanently) publishing idle.
+    if (
+      options.continueQueuedTurn &&
+      this.messageQueue &&
+      this.messageQueue.depth > 0
+    ) {
+      if (this._state.type !== "in-turn") {
+        this.setState({ type: "in-turn" });
+      }
+      return;
+    }
+
     this.setState({ type: "idle", since: new Date() });
     this.startIdleTimer();
     this.processNextInQueue();
+  }
+
+  private closeMessageQueue(reason: string): void {
+    if (!this.messageQueue) return;
+    this.acceptingMessages = false;
+    const discarded = this.messageQueue.close();
+    if (discarded === 0) return;
+    getLogger().warn(
+      {
+        event: "process_message_queue_discarded",
+        sessionId: this._sessionId,
+        processId: this.id,
+        projectId: this.projectId,
+        provider: this.provider,
+        reason,
+        discardedCount: discarded,
+      },
+      "Discarded messages after the resident provider queue closed",
+    );
   }
 
   /**

@@ -22,6 +22,7 @@ packages/mobile/src-tauri/gen/android/app/google-services.json
 .idea/
 .vscode/
 .claude/
+.zcode/
 *.swp
 *.swo
 *~
@@ -34,7 +35,6 @@ Thumbs.db
 *.log
 npm-debug.log*
 pnpm-debug.log*
-.verify-logs/
 
 # Test coverage
 coverage/
@@ -61,14 +61,14 @@ packages/server/generated/codex-app-server/
 # Text files in repo root
 /*.txt
 
+# Local tool config
+/config.json
+
 packages/client/dist-remote
 packages/client/dist-stable
 packages/server/client-dist/
 packages/server/bundled/
 
-# Reference repos (cloned for source reading)
+# Reference repos cloned for source reading, e.g. references/opencode/ and references/codex/
 references/
 start.sh
-
-# AI agent workspace memory (project-local, not source)
-.workbuddy/

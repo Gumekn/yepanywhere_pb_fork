@@ -9,11 +9,18 @@
 
 import { basename } from "node:path";
 import {
+  type ProviderName,
   type UrlProjectId,
   getSessionDisplayTitle,
 } from "@yep-anywhere/shared";
+import {
+  type BridgeControllers,
+  getAnyBridgePendingInputRequest,
+} from "../bridge-common/multi.js";
+import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { NotificationService } from "../notifications/NotificationService.js";
 import { decodeProjectId } from "../projects/paths.js";
+import type { RuntimeController } from "../runtime/types.js";
 import type { ConnectedBrowsersService } from "../services/ConnectedBrowsersService.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
 import type { InputRequest } from "../supervisor/types.js";
@@ -39,9 +46,42 @@ export interface PushNotifierOptions {
   nativePushService?: NativePushService;
   /** Tracks notification-backed badge state. */
   notificationService?: NotificationService;
-  supervisor: Supervisor;
+  /** Durable Yep titles used to keep notification titles provider-agnostic. */
+  sessionMetadataService?: Pick<SessionMetadataService, "getMetadata">;
+  /** Live process source. RuntimeController is required for external mode. */
+  runtimeController?: Pick<RuntimeController, "getProcessSnapshotForSession">;
+  /** Backwards-compatible embedded/test process source. */
+  supervisor?: Supervisor;
+  /** Bridge sessions have no managed process, so pending input comes from here. */
+  bridgeControllers?: BridgeControllers;
   /** Optional: skip push for connected browser profiles */
   connectedBrowsers?: ConnectedBrowsersService;
+}
+
+interface NotificationProcessView {
+  id: string;
+  state: string | { type: string; request?: InputRequest };
+  pendingInputRequest?: InputRequest | null;
+  messageHistory?: Array<{
+    type?: string;
+    message?: { role?: string; content?: unknown };
+  }>;
+  getMessageHistory?: () => Array<{
+    type?: string;
+    message?: { role?: string; content?: unknown };
+  }>;
+  startedAt?: string | Date;
+  provider?: ProviderName;
+  model?: string;
+  resolvedModel?: string;
+  executor?: string;
+  permissionMode?: string;
+}
+
+interface CachedSessionTitles {
+  providerTitle?: string;
+  aiTitle?: string;
+  customTitle?: string;
 }
 
 export class PushNotifier {
@@ -49,7 +89,10 @@ export class PushNotifier {
   private pushService: PushService;
   private nativePushService?: NativePushService;
   private notificationService?: NotificationService;
-  private supervisor: Supervisor;
+  private sessionMetadataService?: PushNotifierOptions["sessionMetadataService"];
+  private runtimeController?: PushNotifierOptions["runtimeController"];
+  private supervisor?: Supervisor;
+  private bridgeControllers?: BridgeControllers;
   private connectedBrowsers?: ConnectedBrowsersService;
   private unsubscribe: (() => void) | null = null;
   /**
@@ -58,15 +101,38 @@ export class PushNotifier {
    * delivery before deciding whether a dismiss is needed.
    */
   private sessionsWithNotification = new Map<string, true | Promise<boolean>>();
+  /**
+   * Session-scoped dedupe state for pending-input pushes.
+   *
+   * `process-state-changed` re-fires while a session stays in waiting-input
+   * (the bridge transport re-emits on turn-status/retry changes), and
+   * EventBus fans these out via `void handleProcessStateChange()` — so
+   * multiple concurrent handlers can race the first delivery. The state is
+   * registered atomically BEFORE awaiting the send result, so a repeat of
+   * the same request id is skipped whether the first send is still pending
+   * or already delivered.
+   *
+   * On send failure the state is only cleared when the map still holds the
+   * same request id AND the same promise object, so a newer request cannot
+   * be wiped out by an older async completion.
+   */
+  private sessionInputState = new Map<
+    string,
+    | { kind: "in-flight"; requestId: string; promise: Promise<boolean> }
+    | { kind: "delivered"; requestId: string }
+  >();
   private sessionsWithHaltedNotification = new Set<string>();
-  private sessionTitleBySessionId = new Map<string, string>();
+  private sessionTitlesBySessionId = new Map<string, CachedSessionTitles>();
 
   constructor(options: PushNotifierOptions) {
     this.eventBus = options.eventBus;
     this.pushService = options.pushService;
     this.nativePushService = options.nativePushService;
     this.notificationService = options.notificationService;
+    this.sessionMetadataService = options.sessionMetadataService;
+    this.runtimeController = options.runtimeController;
     this.supervisor = options.supervisor;
+    this.bridgeControllers = options.bridgeControllers;
     this.connectedBrowsers = options.connectedBrowsers;
 
     // Subscribe to EventBus for process state changes
@@ -80,16 +146,31 @@ export class PushNotifier {
       } else if (event.type === "session-created") {
         this.cacheSessionTitle(
           event.session.id,
-          getSessionDisplayTitle({
-            customTitle: event.session.customTitle,
-            aiTitle: event.session.aiTitle,
-            title: event.session.title,
-          }),
+          "providerTitle",
+          event.session.title,
+        );
+        this.cacheSessionTitle(
+          event.session.id,
+          "aiTitle",
+          event.session.aiTitle,
+        );
+        this.cacheSessionTitle(
+          event.session.id,
+          "customTitle",
+          event.session.customTitle,
         );
       } else if (event.type === "session-updated") {
-        this.cacheSessionTitle(event.sessionId, event.title);
+        this.cacheSessionTitle(event.sessionId, "providerTitle", event.title, {
+          preserveOnEmpty: true,
+        });
       } else if (event.type === "session-metadata-changed") {
-        this.cacheSessionTitle(event.sessionId, event.title ?? event.aiTitle);
+        if (event.title !== undefined) {
+          this.cacheSessionTitle(event.sessionId, "customTitle", event.title);
+        }
+        if (event.aiTitle !== undefined) {
+          this.cacheSessionTitle(event.sessionId, "aiTitle", event.aiTitle);
+        }
+        this.syncMetadataTitles(event.sessionId);
       }
     });
   }
@@ -102,11 +183,14 @@ export class PushNotifier {
   private async handleProcessStateChange(
     event: ProcessStateEvent,
   ): Promise<void> {
-    const process = this.supervisor.getProcessForSession(event.sessionId);
+    const process = await this.getProcess(event.sessionId);
     this.cacheProcessSessionTitle(event.sessionId, process);
 
     // Send dismiss when leaving waiting-input (if we sent a notification for it)
     if (event.activity !== "waiting-input") {
+      // Clear the dedupe state so a stale async completion cannot revive it
+      // or overwrite a newer request's state.
+      this.sessionInputState.delete(event.sessionId);
       const notificationState = this.sessionsWithNotification.get(
         event.sessionId,
       );
@@ -144,12 +228,48 @@ export class PushNotifier {
       return;
     }
 
-    // Get the process to access the InputRequest details
-    if (!process || process.state.type !== "waiting-input") {
+    // Resolve the pending input request, preferring the owned runtime process
+    // when it actually carries one, and falling back to the bridge sidecar
+    // otherwise. The bridge is consulted even when a process owns the
+    // session, because the process can be `in-turn` (no pending request of
+    // its own) while the bridge's long connection still holds a tool
+    // approval that Yep must surface. Without this fallback, mobile push
+    // was never sent for bridge-held approvals on owned sessions.
+    let request: InputRequest | null = null;
+    if (process) {
+      // Only short-circuit when the owned process is itself waiting for
+      // input AND carries a request. An in-turn process with no pending
+      // request must still fall through to the bridge.
+      if (this.getProcessActivity(process) === "waiting-input") {
+        request = this.getPendingInputRequest(process);
+      }
+    }
+    // When the owned process has no pending request, consult the bridge
+    // sidecar too. The bridge is consulted even when a process owns the
+    // session, because the process can be `in-turn` (no pending request of
+    // its own) while the bridge's long connection still holds a tool
+    // approval that Yep must surface. Without this fallback, mobile push
+    // was never sent for bridge-held approvals on owned sessions.
+    // `request` is null at this point (checked above), so the bridge result
+    // does not collide with a process request id; when a process request
+    // existed, the branch above already set `request` and we skip the
+    // bridge.
+    if (!request && this.bridgeControllers) {
+      request = await getAnyBridgePendingInputRequest(
+        this.bridgeControllers,
+        event.sessionId,
+      );
+    }
+    if (!request) return;
+
+    // Dedupe by request id across concurrent handlers. The state is read
+    // and written synchronously below, so a repeat of the same request id
+    // that arrives while the first send is still in-flight is skipped
+    // before it can call sendToAll.
+    const existing = this.sessionInputState.get(event.sessionId);
+    if (existing && existing.requestId === request.id) {
       return;
     }
-
-    const request = process.state.request;
     const inputType =
       request.type === "tool-approval" ? "tool-approval" : "user-question";
 
@@ -168,10 +288,16 @@ export class PushNotifier {
       sessionId: event.sessionId,
       projectId: event.projectId,
       projectName,
-      sessionTitle: this.getSessionTitle(process),
+      sessionTitle: this.getPreferredSessionTitle(
+        event.sessionId,
+        process ? this.getSessionTitle(process) : undefined,
+      ),
       inputType,
       summary,
-      requestId: request.id,
+      // Question notifications must route into the session UI. Omitting the
+      // request id prevents old notification clients from treating them as a
+      // one-tap approval that would submit no answers.
+      requestId: inputType === "tool-approval" ? request.id : undefined,
       timestamp: event.timestamp,
     };
 
@@ -179,16 +305,47 @@ export class PushNotifier {
     const connectedIds =
       this.connectedBrowsers?.getConnectedBrowserProfileIds() ?? [];
     const sendPromise = this.sendPendingInput(payload, connectedIds);
+
+    // Atomically register the in-flight state BEFORE awaiting so concurrent
+    // repeats of the same request id are deduped while this send is pending.
+    const inFlightEntry = {
+      kind: "in-flight" as const,
+      requestId: request.id,
+      promise: sendPromise,
+    };
+    this.sessionInputState.set(event.sessionId, inFlightEntry);
     this.sessionsWithNotification.set(event.sessionId, sendPromise);
 
     const sent = await sendPromise;
+    const current = this.sessionInputState.get(event.sessionId);
     if (sent) {
+      // Only promote to delivered when the state still refers to this same
+      // request. A newer request could have replaced it in the meantime.
+      if (
+        current &&
+        current.kind === "in-flight" &&
+        current.requestId === request.id &&
+        current.promise === sendPromise
+      ) {
+        this.sessionInputState.set(event.sessionId, {
+          kind: "delivered",
+          requestId: request.id,
+        });
+      }
       this.sessionsWithNotification.set(event.sessionId, true);
     } else if (
-      this.sessionsWithNotification.get(event.sessionId) === sendPromise
+      current &&
+      current.kind === "in-flight" &&
+      current.requestId === request.id &&
+      current.promise === sendPromise
     ) {
-      this.sessionsWithNotification.delete(event.sessionId);
+      // Send failed and the state still points at this attempt: clear it so
+      // the same request can be retried. A newer request's state is left
+      // untouched.
+      this.sessionInputState.delete(event.sessionId);
     }
+    // When the state was replaced by a newer request, leave it as-is so the
+    // newer request's in-flight/delivered record survives this completion.
   }
 
   private async sendPendingInput(
@@ -266,8 +423,9 @@ export class PushNotifier {
     }
 
     this.sessionsWithNotification.delete(event.sessionId);
+    this.sessionInputState.delete(event.sessionId);
     this.sessionsWithHaltedNotification.delete(event.sessionId);
-    this.sessionTitleBySessionId.delete(event.sessionId);
+    this.sessionTitlesBySessionId.delete(event.sessionId);
     await this.sendDismiss(event.sessionId);
   }
 
@@ -285,11 +443,12 @@ export class PushNotifier {
       return;
     }
 
-    const process = this.supervisor.getProcessForSession(event.sessionId);
+    const process = await this.getProcess(event.sessionId);
     this.cacheProcessSessionTitle(event.sessionId, process);
-    const sessionTitle =
-      (process ? this.getSessionTitle(process) : undefined) ??
-      this.sessionTitleBySessionId.get(event.sessionId);
+    const sessionTitle = this.getPreferredSessionTitle(
+      event.sessionId,
+      process ? this.getSessionTitle(process) : undefined,
+    );
     const projectName = this.getProjectName(event.projectId);
     const payload: SessionHaltedPayload = {
       type: "session-halted",
@@ -299,7 +458,7 @@ export class PushNotifier {
       sessionTitle,
       reason,
       duration: process?.startedAt
-        ? Date.now() - process.startedAt.getTime()
+        ? Date.now() - new Date(process.startedAt).getTime()
         : 0,
       timestamp: event.timestamp,
     };
@@ -350,24 +509,56 @@ export class PushNotifier {
 
   private cacheProcessSessionTitle(
     sessionId: string,
-    process:
-      | NonNullable<ReturnType<Supervisor["getProcessForSession"]>>
-      | undefined,
+    process: NotificationProcessView | null | undefined,
   ): void {
     if (!process) return;
-    this.cacheSessionTitle(sessionId, this.getSessionTitle(process));
+    this.cacheSessionTitle(
+      sessionId,
+      "providerTitle",
+      this.getSessionTitle(process),
+      { preserveOnEmpty: true },
+    );
   }
 
   private cacheSessionTitle(
     sessionId: string,
+    field: keyof CachedSessionTitles,
     title: string | null | undefined,
+    options: { preserveOnEmpty?: boolean } = {},
   ): void {
-    const normalized = title?.replace(/\s+/g, " ").trim();
-    if (!normalized) return;
-    this.sessionTitleBySessionId.set(
-      sessionId,
-      normalized.length <= 120 ? normalized : `${normalized.slice(0, 117)}...`,
-    );
+    const normalized = normalizeSessionTitle(title);
+    if (!normalized && options.preserveOnEmpty) return;
+
+    const cached = this.sessionTitlesBySessionId.get(sessionId) ?? {};
+    if (normalized) cached[field] = normalized;
+    else delete cached[field];
+
+    if (cached.customTitle || cached.aiTitle || cached.providerTitle) {
+      this.sessionTitlesBySessionId.set(sessionId, cached);
+    } else {
+      this.sessionTitlesBySessionId.delete(sessionId);
+    }
+  }
+
+  private syncMetadataTitles(sessionId: string): void {
+    const metadata = this.sessionMetadataService?.getMetadata(sessionId);
+    if (!this.sessionMetadataService) return;
+    this.cacheSessionTitle(sessionId, "customTitle", metadata?.customTitle);
+    this.cacheSessionTitle(sessionId, "aiTitle", metadata?.aiTitle);
+  }
+
+  private getPreferredSessionTitle(
+    sessionId: string,
+    processTitle?: string,
+  ): string | undefined {
+    this.syncMetadataTitles(sessionId);
+    const cached = this.sessionTitlesBySessionId.get(sessionId);
+    const title = getSessionDisplayTitle({
+      customTitle: cached?.customTitle,
+      aiTitle: cached?.aiTitle,
+      title: cached?.providerTitle ?? processTitle,
+    });
+    return title === "Untitled" ? undefined : title;
   }
 
   /**
@@ -386,45 +577,52 @@ export class PushNotifier {
    * Build a human-readable summary from the InputRequest.
    */
   private buildSummary(request: InputRequest): string {
+    const subagentPrefix = this.subagentSummaryPrefix(request);
     if (request.type === "tool-approval") {
       const toolName = request.toolName ?? "Unknown tool";
 
-      // For file operations, try to extract the file path
       if (request.toolInput && typeof request.toolInput === "object") {
         const input = request.toolInput as Record<string, unknown>;
+
+        // For file operations, try to extract the file path
         const filePath = input.file_path ?? input.filePath ?? input.path;
         if (typeof filePath === "string") {
           // Extract just the filename from the path
           const fileName = basename(filePath);
-          return `${toolName}: ${fileName}`;
+          return `${subagentPrefix}${toolName}: ${fileName}`;
         }
       }
 
-      return `Run: ${toolName}`;
+      return `${subagentPrefix}Run: ${toolName}`;
     }
 
-    // For questions/choices, use the prompt text (truncated)
-    const prompt = request.prompt ?? "Waiting for input";
-    if (prompt.length > 60) {
-      return `${prompt.slice(0, 57)}...`;
-    }
-    return prompt;
+    // Questions require the full Yep UI. Keep the notification generic so it
+    // cannot be mistaken for an actionable approval or expose answer details.
+    return `${subagentPrefix}Question waiting — open Yep to answer`;
+  }
+
+  /**
+   * When a request was routed up from a subagent (child session), prefix the
+   * summary so the operator knows which subagent needs input. The request
+   * itself still targets the parent session for navigation.
+   */
+  private subagentSummaryPrefix(request: InputRequest): string {
+    if (!request.toolInput || typeof request.toolInput !== "object") return "";
+    const input = request.toolInput as Record<string, unknown>;
+    if (typeof input.originSessionId !== "string") return "";
+    const title =
+      typeof input.originSessionTitle === "string" && input.originSessionTitle
+        ? input.originSessionTitle
+        : typeof input.originAgent === "string" && input.originAgent
+          ? input.originAgent
+          : undefined;
+    return title ? `Subagent ${title} — ` : "Subagent — ";
   }
 
   private getSessionTitle(
-    process: NonNullable<ReturnType<Supervisor["getProcessForSession"]>>,
+    process: NotificationProcessView,
   ): string | undefined {
-    const historyReader = (
-      process as {
-        getMessageHistory?: () => Array<{
-          type?: string;
-          message?: { content?: unknown };
-        }>;
-      }
-    ).getMessageHistory;
-    if (typeof historyReader !== "function") return undefined;
-
-    const firstUser = historyReader.call(process).find((message) => {
+    const firstUser = this.getMessageHistory(process).find((message) => {
       return (
         message.type === "user" && typeof message.message?.content === "string"
       );
@@ -438,6 +636,39 @@ export class PushNotifier {
       : `${normalized.slice(0, 117)}...`;
   }
 
+  private async getProcess(
+    sessionId: string,
+  ): Promise<NotificationProcessView | null> {
+    if (this.runtimeController) {
+      return this.runtimeController.getProcessSnapshotForSession(sessionId);
+    }
+    return (
+      (this.supervisor?.getProcessForSession(sessionId) as
+        | NotificationProcessView
+        | undefined) ?? null
+    );
+  }
+
+  private getProcessActivity(process: NotificationProcessView): string {
+    return typeof process.state === "string"
+      ? process.state
+      : process.state.type;
+  }
+
+  private getPendingInputRequest(
+    process: NotificationProcessView,
+  ): InputRequest | null {
+    if (process.pendingInputRequest) return process.pendingInputRequest;
+    return typeof process.state === "object" &&
+      process.state.type === "waiting-input"
+      ? (process.state.request ?? null)
+      : null;
+  }
+
+  private getMessageHistory(process: NotificationProcessView) {
+    return process.messageHistory ?? process.getMessageHistory?.() ?? [];
+  }
+
   /**
    * Clean up EventBus subscription.
    */
@@ -447,4 +678,14 @@ export class PushNotifier {
       this.unsubscribe = null;
     }
   }
+}
+
+function normalizeSessionTitle(
+  title: string | null | undefined,
+): string | undefined {
+  const normalized = title?.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.length <= 120
+    ? normalized
+    : `${normalized.slice(0, 117)}...`;
 }

@@ -15,6 +15,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
@@ -81,9 +82,36 @@ class MainActivity : TauriActivity() {
     handleNotificationIntent(intent)
   }
 
+  private fun setSystemBarTheme(resolvedTheme: String) {
+    if (resolvedTheme != "light" && resolvedTheme != "dark") {
+      Log.w(TAG, "setSystemBarTheme: ignored invalid theme=$resolvedTheme")
+      return
+    }
+
+    val useDarkIcons = resolvedTheme == "light"
+    runOnUiThread {
+      WindowCompat.getInsetsController(window, window.decorView).apply {
+        isAppearanceLightStatusBars = useDarkIcons
+        isAppearanceLightNavigationBars = useDarkIcons
+      }
+      Log.d(
+        TAG,
+        "setSystemBarTheme: theme=$resolvedTheme darkIcons=$useDarkIcons"
+      )
+    }
+  }
+
   override fun onDestroy() {
     sessionWatcher?.stop()
     sessionWatcher = null
+    // Break the JavaScript-interface reference chain explicitly. WebView owns
+    // the bridge, while the bridge owns both this Activity and the WebView.
+    // Tauri/Wry still owns final WebView destruction in super.onDestroy().
+    mainWebView?.removeJavascriptInterface("YepNativePush")
+    nativePushBridge = null
+    mainWebView = null
+    pendingPermissionCallbackIds.clear()
+    pendingNotificationPath = null
     super.onDestroy()
   }
 
@@ -271,6 +299,9 @@ class MainActivity : TauriActivity() {
   }
 
   private fun configureSessionWatcher(origin: String) {
+    // Persist for YepApprovalActionReceiver: notification Approve/Deny must
+    // reach the server even when the app process was since killed.
+    YepApprovalActionReceiver.rememberServerOrigin(applicationContext, origin)
     runOnUiThread {
       val watcher = sessionWatcher ?: YepSessionWatcher(applicationContext).also {
         sessionWatcher = it
@@ -279,10 +310,64 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  private fun uploadNativeLogs(callbackId: String) {
+    val origin = YepApprovalActionReceiver.serverOrigin(applicationContext)
+    if (origin == null) {
+      YepLog.w("uploadLogs", "no stored server origin")
+      nativePushBridge?.respond(
+        callbackId,
+        false,
+        null,
+        "Server origin unknown; open a server first",
+      )
+      return
+    }
+
+    Thread {
+      try {
+        val count = YepLog.upload(applicationContext, origin)
+        YepLog.i("uploadLogs", "uploaded=$count origin=$origin")
+        nativePushBridge?.respond(
+          callbackId,
+          true,
+          JSONObject().put("uploaded", count),
+          null,
+        )
+      } catch (error: Throwable) {
+        YepLog.e("uploadLogs", "failed", error)
+        nativePushBridge?.respond(
+          callbackId,
+          false,
+          null,
+          error.message ?: "Log upload failed",
+        )
+      }
+    }.apply { isDaemon = true }.start()
+  }
+
   class NativePushBridge(
     private val activity: MainActivity,
     private val webView: WebView
   ) {
+    @JavascriptInterface
+    fun getShellDiagnostics(): String {
+      val webViewPackage =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+          WebView.getCurrentWebViewPackage()
+        } else {
+          null
+        }
+      return JSONObject()
+        .put("appVersion", BuildConfig.VERSION_NAME)
+        .put("versionCode", BuildConfig.VERSION_CODE)
+        .put("androidSdk", Build.VERSION.SDK_INT)
+        .put("device", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+        .put("webViewPackage", webViewPackage?.packageName ?: JSONObject.NULL)
+        .put("webViewVersion", webViewPackage?.versionName ?: JSONObject.NULL)
+        .put("nativeLogEntries", YepLog.entryCount())
+        .toString()
+    }
+
     @JavascriptInterface
     fun getStatus(callbackId: String) {
       val status = activity.nativePushStatusJson()
@@ -309,6 +394,17 @@ class MainActivity : TauriActivity() {
     fun configureSessionWatcher(origin: String) {
       Log.i(TAG, "bridge.configureSessionWatcher: origin=$origin")
       activity.configureSessionWatcher(origin)
+    }
+
+    @JavascriptInterface
+    fun setSystemBarTheme(resolvedTheme: String) {
+      activity.setSystemBarTheme(resolvedTheme)
+    }
+
+    @JavascriptInterface
+    fun uploadLogs(callbackId: String) {
+      Log.i(TAG, "bridge.uploadLogs: callbackId=$callbackId")
+      activity.uploadNativeLogs(callbackId)
     }
 
     @JavascriptInterface

@@ -1,13 +1,89 @@
+import { fromUrlProjectId, isUrlProjectId } from "@yep-anywhere/shared";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api/client";
+import { useToastContext } from "../contexts/ToastContext";
 import { useI18n } from "../i18n";
+import { appPath } from "../lib/apiPath";
+import { writeClipboardText } from "../lib/clipboard";
+import { parseUserPrompt } from "../lib/parseUserPrompt";
 import { getProvider } from "../providers/registry";
+import { PinIcon } from "./PinIcon";
+
+/**
+ * Decode a base64url project id back into its absolute path.
+ *
+ * Project ids are always built from a normalized absolute path, so anything
+ * that does not decode to one is treated as unknown and the caller omits the
+ * row rather than leaking mojibake.
+ */
+function decodeProjectPath(projectId: string): string | undefined {
+  if (!isUrlProjectId(projectId)) return undefined;
+  try {
+    const decoded = fromUrlProjectId(projectId);
+    // U+FFFD means the bytes were not valid UTF-8 to begin with.
+    if (!decoded.startsWith("/") || decoded.includes("\uFFFD"))
+      return undefined;
+    return decoded;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Text produced by "Copy session info".
+ *
+ * A bare session id is not resolvable to a project by any Yep API, client
+ * route or CLI — every read path is keyed by `projectId + sessionId`. So the
+ * copied block carries the project path and a deep link, which is what makes
+ * it useful when pasted into an agent running in some other directory.
+ */
+/**
+ * Reduce a session title to one clean line for the `Label: value` block.
+ *
+ * Untitled sessions fall back to a preview of the first prompt, which can be a
+ * truncated multi-line blob still carrying an "User uploaded files:" manifest.
+ * Pasting that verbatim broke the block's line-per-field shape and made the
+ * receiving agent's transcript re-parse the quoted marker as real metadata.
+ */
+function flattenSessionInfoTitle(value: string): string {
+  const markerIndex = value.search(/(?:^|\n)\s*User uploaded files:/);
+  const head = markerIndex >= 0 ? value.slice(0, markerIndex) : value;
+  const cleaned = parseUserPrompt(head).text || head;
+  return cleaned.replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
+export function buildSessionInfoText(input: {
+  sessionId: string;
+  projectId: string;
+  title?: string | null;
+  provider?: string;
+}): string {
+  const { sessionId, projectId, title, provider } = input;
+  const rows: Array<[string, string | undefined]> = [
+    ["Title", title ? flattenSessionInfoTitle(title) : undefined],
+    ["Session ID", sessionId],
+    ["Provider", provider],
+    ["Project", decodeProjectPath(projectId)],
+    [
+      "Link",
+      `${window.location.origin}${appPath(
+        `/projects/${projectId}/sessions/${sessionId}`,
+      )}`,
+    ],
+  ];
+
+  return rows
+    .filter(([, value]) => value && value.trim().length > 0)
+    .map(([label, value]) => `${label}: ${value}`)
+    .join("\n");
+}
 
 export interface SessionMenuProps {
   sessionId: string;
   projectId: string;
-  isStarred: boolean;
+  title?: string | null;
+  isPinned: boolean;
   isArchived: boolean;
   hasUnread?: boolean;
   /** Provider name - used for capability checks like cloning support */
@@ -16,14 +92,24 @@ export interface SessionMenuProps {
   processId?: string;
   canArchive?: boolean;
   archiveBlockReason?: string;
-  onToggleStar: () => void | Promise<void>;
+  onTogglePin: () => void | Promise<void>;
   onToggleArchive: () => void | Promise<void>;
+  /** Replace direct archiving with a parent-controlled selection flow. */
+  onSelectForArchive?: () => void;
   onToggleRead?: () => void | Promise<void>;
   onRename: () => void;
+  /** Called after an explicitly generated title has been persisted. */
+  onTitleGenerated?: (title: string) => void | Promise<void>;
+  /** Reports the lifetime of the explicit title-generation request. */
+  onTitleGenerationStateChange?: (isGenerating: boolean) => void;
   /** Called after successful clone with the new session ID */
   onClone?: (newSessionId: string) => void | Promise<void>;
   /** Called to terminate the session's process */
   onTerminate?: () => void | Promise<void>;
+  /** Called to trigger a provider-native context compaction (ZCode). */
+  onCompact?: () => void | Promise<void>;
+  /** Called to open the provider-native goal lifecycle dialog (ZCode). */
+  onGoal?: () => void;
   /** Use "..." icon instead of chevron */
   useEllipsisIcon?: boolean;
   /** Whether session sharing is configured */
@@ -39,19 +125,25 @@ export interface SessionMenuProps {
 export function SessionMenu({
   sessionId,
   projectId,
-  isStarred,
+  title,
+  isPinned,
   isArchived,
   hasUnread,
   provider,
   processId,
   canArchive,
   archiveBlockReason,
-  onToggleStar,
+  onTogglePin,
   onToggleArchive,
+  onSelectForArchive,
   onToggleRead,
   onRename,
+  onTitleGenerated,
+  onTitleGenerationStateChange,
   onClone,
   onTerminate,
+  onCompact,
+  onGoal,
   sharingConfigured,
   onShare,
   useEllipsisIcon = false,
@@ -59,10 +151,13 @@ export function SessionMenu({
   useFixedPositioning = false,
 }: SessionMenuProps) {
   const { t } = useI18n();
+  const { showToast } = useToastContext();
   const [isOpen, setIsOpen] = useState(false);
   const [isCloning, setIsCloning] = useState(false);
   const [isTerminating, setIsTerminating] = useState(false);
+  const [isCompacting, setIsCompacting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
+  const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
   const [dropdownPosition, setDropdownPosition] = useState<{
     top: number;
     left?: number;
@@ -117,8 +212,8 @@ export function SessionMenu({
       // Calculate position synchronously before opening to avoid flicker
       if (useFixedPositioning && triggerRef.current) {
         const rect = triggerRef.current.getBoundingClientRect();
-        const dropdownWidth = 140; // Approximate width of dropdown
-        const dropdownHeight = 180; // Approximate height of dropdown (varies by options)
+        const dropdownWidth = 190; // Approximate width of dropdown
+        const dropdownHeight = 260; // Approximate height of dropdown (varies by options)
         const rightPosition = window.innerWidth - rect.right;
         const margin = 8;
 
@@ -191,6 +286,74 @@ export function SessionMenu({
     }
   };
 
+  const handleCompact = async () => {
+    if (isCompacting || !onCompact) return;
+    setIsCompacting(true);
+    setIsOpen(false);
+    setDropdownPosition(null);
+    triggerRef.current?.blur();
+    try {
+      await onCompact();
+    } catch (error) {
+      console.error("Failed to compact session:", error);
+    } finally {
+      setIsCompacting(false);
+    }
+  };
+
+  const handleCopySessionInfo = async () => {
+    setIsOpen(false);
+    setDropdownPosition(null);
+    triggerRef.current?.blur();
+    try {
+      await writeClipboardText(
+        buildSessionInfoText({ sessionId, projectId, title, provider }),
+      );
+      showToast(t("sessionMenuInfoCopied"), "success");
+    } catch (error) {
+      console.error("Failed to copy session info:", error);
+      showToast(t("sessionMenuInfoCopyFailed"), "error");
+    }
+  };
+
+  const handleCopyTitle = async () => {
+    setIsOpen(false);
+    setDropdownPosition(null);
+    triggerRef.current?.blur();
+    try {
+      await writeClipboardText(title?.trim() || t("sessionUntitled"));
+      showToast(t("sessionMenuTitleCopied"), "success");
+    } catch (error) {
+      console.error("Failed to copy session title:", error);
+      showToast(t("sessionMenuTitleCopyFailed"), "error");
+    }
+  };
+
+  const handleGenerateTitle = async () => {
+    if (isGeneratingTitle) return;
+    setIsGeneratingTitle(true);
+    onTitleGenerationStateChange?.(true);
+    setIsOpen(false);
+    setDropdownPosition(null);
+    triggerRef.current?.blur();
+    try {
+      const result = await api.generateSessionTitle(projectId, sessionId);
+      await onTitleGenerated?.(result.title);
+      showToast(t("sessionTitleGenerated"), "success");
+    } catch (error) {
+      console.error("Failed to generate session title:", error);
+      showToast(
+        error instanceof Error
+          ? error.message
+          : t("sessionTitleGenerationFailed"),
+        "error",
+      );
+    } finally {
+      setIsGeneratingTitle(false);
+      onTitleGenerationStateChange?.(false);
+    }
+  };
+
   const handleShare = async () => {
     if (isSharing || !onShare) return;
     setIsSharing(true);
@@ -232,19 +395,39 @@ export function SessionMenu({
       className="session-menu-dropdown"
       style={dropdownStyle}
     >
-      <button type="button" onClick={() => handleAction(onToggleStar)}>
+      <button type="button" onClick={() => handleAction(onTogglePin)}>
+        <PinIcon />
+        {isPinned ? t("sessionMenuUnpin") : t("sessionMenuPin")}
+      </button>
+      <button type="button" onClick={handleCopyTitle}>
         <svg
           width="14"
           height="14"
           viewBox="0 0 24 24"
-          fill={isStarred ? "currentColor" : "none"}
+          fill="none"
           stroke="currentColor"
           strokeWidth="2"
           aria-hidden="true"
         >
-          <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
         </svg>
-        {isStarred ? t("sessionMenuUnstar") : t("sessionMenuStar")}
+        {t("sessionMenuCopyTitle")}
+      </button>
+      <button type="button" onClick={handleCopySessionInfo}>
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          aria-hidden="true"
+        >
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+        </svg>
+        {t("sessionMenuCopyInfo")}
       </button>
       <button type="button" onClick={() => handleAction(onRename)}>
         <svg
@@ -260,6 +443,28 @@ export function SessionMenu({
           <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
         </svg>
         {t("sessionMenuRename")}
+      </button>
+      <button
+        type="button"
+        onClick={handleGenerateTitle}
+        disabled={isGeneratingTitle}
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          aria-hidden="true"
+        >
+          <path d="M12 3l1.4 3.6L17 8l-3.6 1.4L12 13l-1.4-3.6L7 8l3.6-1.4L12 3z" />
+          <path d="M19 13l.9 2.1L22 16l-2.1.9L19 19l-.9-2.1L16 16l2.1-.9L19 13z" />
+          <path d="M5 14l1.1 2.9L9 18l-2.9 1.1L5 22l-1.1-2.9L1 18l2.9-1.1L5 14z" />
+        </svg>
+        {isGeneratingTitle
+          ? t("sessionMenuGeneratingTitle")
+          : t("sessionMenuGenerateTitle")}
       </button>
       {onClone && getProvider(provider).capabilities.supportsCloning && (
         <button type="button" onClick={handleClone} disabled={isCloning}>
@@ -296,9 +501,52 @@ export function SessionMenu({
           {isSharing ? t("sessionMenuSharing") : t("sessionMenuShare")}
         </button>
       )}
+      {onCompact && (
+        <button type="button" onClick={handleCompact} disabled={isCompacting}>
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            aria-hidden="true"
+          >
+            <path d="M4 14h6v6" />
+            <path d="M20 10h-6V4" />
+            <path d="M14 10l7-7" />
+            <path d="M3 21l7-7" />
+          </svg>
+          {isCompacting ? t("sessionMenuCompacting") : t("sessionMenuCompact")}
+        </button>
+      )}
+      {onGoal && (
+        <button type="button" onClick={() => handleAction(onGoal)}>
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="10" />
+            <circle cx="12" cy="12" r="6" />
+            <circle cx="12" cy="12" r="2" />
+          </svg>
+          {t("sessionMenuGoal")}
+        </button>
+      )}
       <button
         type="button"
-        onClick={() => handleAction(onToggleArchive)}
+        onClick={() =>
+          handleAction(
+            !isArchived && onSelectForArchive
+              ? onSelectForArchive
+              : onToggleArchive,
+          )
+        }
         disabled={!isArchived && canArchive === false}
         title={
           !isArchived && canArchive === false ? archiveBlockReason : undefined
@@ -317,7 +565,11 @@ export function SessionMenu({
           <rect x="1" y="3" width="22" height="5" />
           <line x1="10" y1="12" x2="14" y2="12" />
         </svg>
-        {isArchived ? t("sessionMenuUnarchive") : t("sessionMenuArchive")}
+        {isArchived
+          ? t("sessionMenuUnarchive")
+          : onSelectForArchive
+            ? t("sessionMenuSelectForArchive")
+            : t("sessionMenuArchive")}
       </button>
       {onToggleRead && (
         <button type="button" onClick={() => handleAction(onToggleRead)}>

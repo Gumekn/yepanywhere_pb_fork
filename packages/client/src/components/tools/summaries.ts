@@ -1,4 +1,5 @@
 import { getDisplayBashCommandFromInput } from "../../lib/bashCommand";
+import { getCodexWebRunOverview } from "../../lib/codexWebRun";
 import type { ToolResultData } from "../../types/renderItems";
 import { toolRegistry } from "../renderers/tools";
 
@@ -26,6 +27,7 @@ export function getToolSummary(
   input: unknown,
   result: ToolResultData | undefined,
   status: "pending" | "complete" | "error" | "aborted",
+  _options?: { provider?: string },
 ): string {
   const renderer = toolRegistry.get(toolName);
 
@@ -73,11 +75,31 @@ export function getToolSummary(
     return inputSummary;
   }
 
+  // Codex code mode's `exec` input is the useful context; its result is an
+  // orchestration envelope and otherwise collapses every row to just "done".
+  if (toolName === "CodexExec") {
+    if (status === "error" || result?.isError) {
+      return `${inputSummary} → failed`;
+    }
+    return getCodexWebRunOverview(input) && resultSummary
+      ? `${inputSummary} → ${resultSummary}`
+      : inputSummary;
+  }
+
   if (toolName === "WriteStdin") {
     if (inputSummary && inputSummary !== "waiting for output") {
       return `${inputSummary} → ${resultSummary}`;
     }
     return resultSummary;
+  }
+
+  if (
+    (toolName.toLowerCase() === "websearch" ||
+      toolName.toLowerCase() === "webfetch") &&
+    inputSummary &&
+    inputSummary !== "..."
+  ) {
+    return `${inputSummary} → ${resultSummary}`;
   }
 
   return resultSummary;

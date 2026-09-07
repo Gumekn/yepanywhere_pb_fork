@@ -3,7 +3,9 @@ import type {
   CodexBranchState,
   CodexSessionEntry,
 } from "@yep-anywhere/shared";
+import { codexEntryAnchor } from "./codex-entry-anchor.js";
 import { isCodexTurnAbortedNoticeText } from "./codex-turn-aborted.js";
+import { sanitizeCodexPublicUserPrompt } from "./public-user-prompt.js";
 import {
   isSessionSetupText,
   isSyntheticUserPromptText,
@@ -27,7 +29,9 @@ export interface CodexBranchView {
   branchState: CodexBranchState;
 }
 
-function hasResponseItemUserMessages(entries: CodexSessionEntry[]): boolean {
+function hasResponseItemUserMessages(
+  entries: readonly CodexSessionEntry[],
+): boolean {
   return entries.some(
     (entry) =>
       entry.type === "response_item" &&
@@ -223,7 +227,7 @@ function buildBranchState(args: {
  * latest branch by default or project an older sibling branch for review.
  */
 export function buildCodexBranchView(
-  entries: CodexSessionEntry[],
+  entries: readonly CodexSessionEntry[],
   sessionId: string,
   selectedBranchId?: string,
 ): CodexBranchView {
@@ -275,7 +279,9 @@ export function buildCodexBranchView(
         activePathIds.length > 0
           ? (activePathIds[activePathIds.length - 1] ?? null)
           : null;
-      const id = `codex-branch-${entryIndex}`;
+      // Branch ids round-trip to the client as `?branchId=`, so they must be
+      // anchored to the entry rather than to its position in this array.
+      const id = `codex-branch-${codexEntryAnchor(entry, String(entryIndex))}`;
       const parent = parentId ? nodesById.get(parentId) : undefined;
       const node: CodexBranchNode = {
         id,
@@ -359,4 +365,102 @@ export function applyCodexRollbackMarkers(
   entries: CodexSessionEntry[],
 ): CodexSessionEntry[] {
   return buildCodexBranchView(entries, "codex-session").entries;
+}
+
+export interface CodexRollbackTarget {
+  /** Entry timestamp of the edited user turn, when known. */
+  timestamp?: string;
+  /** Prompt text of the edited user turn. */
+  prompt: string;
+}
+
+function orderedActivePath(branchState: CodexBranchState): CodexBranchOption[] {
+  const byId = new Map(
+    branchState.branches.map((branch) => [branch.id, branch]),
+  );
+  const path: CodexBranchOption[] = [];
+  let cursor = branchState.activeBranchId;
+  const visited = new Set<string>();
+  while (cursor && !visited.has(cursor)) {
+    visited.add(cursor);
+    const node = byId.get(cursor);
+    if (!node) break;
+    path.push(node);
+    cursor = node.parentId;
+  }
+  return path.reverse();
+}
+
+/**
+ * Compute the authoritative legacy exclusion count for editing a user prompt.
+ * Stable Codex editing forks a new thread after the retained boundary, so this
+ * is the number of source user turns excluded from the child. The count must
+ * come from the persisted turn tree - not from however many prompts the client
+ * happened to render (setup folding, dedupe, and viewing an older branch all
+ * skew the client-side count).
+ *
+ * When the edited turn sits on a sibling branch, the child forks from the
+ * deepest common ancestor on the active path.
+ */
+export function computeCodexRollbackNumTurns(
+  branchState: CodexBranchState,
+  target: CodexRollbackTarget,
+): number | null {
+  const activePath = orderedActivePath(branchState);
+  if (activePath.length === 0) return null;
+
+  const targetPrompt = sanitizeCodexPublicUserPrompt(target.prompt).trim();
+  if (!targetPrompt) return null;
+
+  const promptMatches = branchState.branches.filter(
+    (branch) =>
+      sanitizeCodexPublicUserPrompt(branch.prompt).trim() === targetPrompt,
+  );
+
+  const timestampMatches = target.timestamp
+    ? branchState.branches.filter(
+        (branch) => branch.createdAt === target.timestamp,
+      )
+    : [];
+  const candidates =
+    timestampMatches.length === 1
+      ? timestampMatches
+      : timestampMatches.length > 1
+        ? timestampMatches.filter((branch) => promptMatches.includes(branch))
+        : promptMatches;
+  if (candidates.length === 0) return null;
+
+  // Prefer a candidate on the active path; otherwise take the most recent.
+  const activeIds = new Map(activePath.map((node, index) => [node.id, index]));
+  const onActive = candidates.filter((branch) => activeIds.has(branch.id));
+  const candidate =
+    onActive.length > 0
+      ? (onActive[onActive.length - 1] as CodexBranchOption)
+      : (candidates[candidates.length - 1] as CodexBranchOption);
+
+  const activeIndex = activeIds.get(candidate.id);
+  if (activeIndex !== undefined) {
+    const numTurns = activePath.length - activeIndex;
+    return numTurns > 0 ? numTurns : null;
+  }
+
+  // Edited turn is on a sibling branch: retain through the deepest ancestor
+  // shared with the active path (the new prompt becomes a fresh sibling).
+  const byId = new Map(
+    branchState.branches.map((branch) => [branch.id, branch]),
+  );
+  let cursor = candidate.parentId;
+  const visited = new Set<string>();
+  while (cursor && !visited.has(cursor)) {
+    visited.add(cursor);
+    const ancestorIndex = activeIds.get(cursor);
+    if (ancestorIndex !== undefined) {
+      const numTurns = activePath.length - (ancestorIndex + 1);
+      return numTurns > 0 ? numTurns : null;
+    }
+    cursor = byId.get(cursor)?.parentId ?? null;
+  }
+
+  // No shared ancestor: exclude the entire active path.
+  return activePath.length;
 }

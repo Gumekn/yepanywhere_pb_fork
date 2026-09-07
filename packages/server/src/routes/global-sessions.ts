@@ -6,50 +6,76 @@
  */
 
 import {
+  type ContextCompactEvent,
+  type ContextCumulativeUsage,
   type ContextUsage,
   type ProviderName,
   type SessionCreatedBy,
   type SessionKind,
+  type SessionOriginChannel,
   type SessionQuestion,
   type SessionRuntime,
   isSessionKind,
-  isUrlProjectId,
   sessionMatchesKind,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
-import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
+import { listAllBridgeSessionViews } from "../bridge-common/multi.js";
+import {
+  isActiveBridgeSessionView,
+  isLiveBridgeSessionView,
+} from "../bridge-common/session-state.js";
+import type { BridgeSessionView } from "../bridge-common/types.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
+import type { CodexSessionCatalog } from "../codex-history/CodexSessionCatalog.js";
 import type { SessionIndexService } from "../indexes/index.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
-import { decodeProjectId, getProjectName } from "../projects/paths.js";
+import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
+import type { RuntimeController } from "../runtime/types.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
+import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { listSessionsAcrossProviders } from "../sessions/provider-resolution.js";
 import {
+  type SessionRuntimeProcess,
   deriveSessionRuntime,
   pendingInputTypeFromProcess,
 } from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
+import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
 import type {
   AgentActivity,
   PendingInputType,
   Project,
+  SessionLastTurnStatus,
   SessionOwnership,
+  SessionRetryStatus,
   SessionSummary,
 } from "../supervisor/types.js";
 import type { BusEvent, EventBus } from "../watcher/index.js";
 import { buildProviderProjectCatalog } from "./provider-catalog.js";
+import { ServerTimingRecorder } from "./server-timing.js";
+
+const SESSION_LIST_TIMING_NAMES = [
+  "projectLookup",
+  "bridgeView",
+  "catalog",
+  "sessionScan",
+  "total",
+] as const;
 
 export interface GlobalSessionsDeps {
   scanner: ProjectScanner;
   readerFactory: (project: Project) => ISessionReader;
   supervisor?: Supervisor;
+  runtimeController?: RuntimeController;
   externalTracker?: ExternalSessionTracker;
   notificationService?: NotificationService;
   sessionIndexService?: SessionIndexService;
@@ -60,16 +86,43 @@ export interface GlobalSessionsDeps {
   codexSessionsDir?: string;
   /** Optional shared Codex reader factory for cross-provider session lookups */
   codexReaderFactory?: (projectPath: string) => CodexSessionReader;
+  codexSessionCatalog?: CodexSessionCatalog;
   /** Gemini scanner for checking if a project has Gemini sessions */
   geminiScanner?: GeminiSessionScanner;
   /** Gemini sessions directory (defaults to ~/.gemini/tmp) */
   geminiSessionsDir?: string;
   /** Optional shared Gemini reader factory for cross-provider session lookups */
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
+  /** Pi scanner for checking if a project has Pi sessions */
+  piScanner?: PiSessionScanner;
+  zcodeDbPath?: string;
+  piSessionsDir?: string;
+  piReaderFactory?: (projectPath: string) => PiSessionReader;
+  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
+  /** Kimi scanner for checking if a project has Kimi sessions */
+  kimiScanner?: KimiSessionScanner;
+  /** Kimi sessions directory */
+  kimiSessionsDir?: string;
+  /** Optional shared Kimi reader factory for cross-provider session lookups */
+  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
   /** Event bus for cache invalidation */
   eventBus?: EventBus;
   /** Codex bridge for externally launched `codex --remote` TUI sessions. */
   codexBridgeService?: CodexBridgeController;
+}
+
+type AnyBridgeSessionView = BridgeSessionView | null;
+
+async function listBridgeSessionViews(
+  deps: Pick<GlobalSessionsDeps, "codexBridgeService">,
+): Promise<BridgeSessionView[]> {
+  return listAllBridgeSessionViews([deps.codexBridgeService]);
+}
+
+function isLiveAnyBridgeSessionView(
+  view: NonNullable<AnyBridgeSessionView>,
+): boolean {
+  return isLiveBridgeSessionView(view);
 }
 
 export interface GlobalSessionItem {
@@ -78,7 +131,7 @@ export interface GlobalSessionItem {
   title: string | null;
   createdAt: string;
   updatedAt: string;
-  messageCount: number;
+  messageCount?: number;
   userQuestions?: SessionQuestion[];
   provider: ProviderName;
   // Project context
@@ -98,6 +151,8 @@ export interface GlobalSessionItem {
   executor?: string;
   /** Explicit creation owner recorded by Yep metadata. */
   createdBy?: SessionCreatedBy;
+  /** Non-identifying inbound channel recorded by Yep metadata. */
+  originChannel?: SessionOriginChannel;
   /** Launcher identifier from session metadata (e.g. "Codex Desktop", "yep-anywhere") */
   originator?: string;
   /** Session source from provider metadata (e.g. "appServer", "exec") */
@@ -106,9 +161,15 @@ export interface GlobalSessionItem {
    *  the All Sessions page can render the token count immediately on first
    *  paint, without waiting for a session-updated SSE event. */
   contextUsage?: ContextUsage;
+  /** Cumulative token spend across the whole session, when available. */
+  cumulativeUsage?: ContextCumulativeUsage;
+  /** Number of context compactions recorded in the active session history. */
+  compactCount?: number;
+  /** Best-effort details for each recorded context compaction. */
+  compactEvents?: ContextCompactEvent[];
   /** Model name from the session summary (matches contextUsage's scope). */
   model?: string;
-  /** Provider-specific reasoning effort (e.g. "xhigh") */
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
   reasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g. "fast") */
   serviceTier?: string;
@@ -119,6 +180,12 @@ export interface GlobalSessionItem {
    * ownership.owner === "none" and the session is not externally active.
    */
   interrupted?: boolean;
+  /** Terminal status of the most recent turn (bridge-reported). */
+  lastTurnStatus?: SessionLastTurnStatus;
+  /** Most recent provider error message, if the last turn failed. */
+  lastErrorMessage?: string;
+  /** Present while the provider is retrying a failed request. */
+  retryStatus?: SessionRetryStatus;
 }
 
 /** Stats about all sessions (computed during full scan) */
@@ -142,6 +209,8 @@ export interface ProjectOption {
 export interface GlobalSessionsResponse {
   sessions: GlobalSessionItem[];
   hasMore: boolean;
+  /** Cursor for the next ordinary recency page, before coverage extras. */
+  nextCursor?: string;
   /** Global stats computed from all sessions (not just paginated results) */
   stats: GlobalSessionStats;
   /** All projects for filter dropdown */
@@ -155,27 +224,12 @@ const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
 /** Stats cache TTL in milliseconds */
 const STATS_CACHE_TTL_MS = 5000;
-
-export function resolveSessionProjectName(
-  sessionProjectId: string,
-  scanningProject: Pick<Project, "name">,
-  projectById: ReadonlyMap<string, Pick<Project, "name">>,
-): string {
-  const actualProject = projectById.get(sessionProjectId);
-  if (actualProject) {
-    return actualProject.name;
-  }
-
-  if (isUrlProjectId(sessionProjectId)) {
-    try {
-      return getProjectName(decodeProjectId(sessionProjectId));
-    } catch {
-      return scanningProject.name;
-    }
-  }
-
-  return scanningProject.name;
-}
+/**
+ * Max number of extra "one session per project" entries appended when the
+ * caller asks for project coverage (`projectCoverageDays`). Keeps a machine
+ * with hundreds of projects from blowing up the sidebar payload.
+ */
+const MAX_PROJECT_COVERAGE_EXTRAS = 50;
 
 function createEmptyStats(): GlobalSessionStats {
   return {
@@ -349,12 +403,17 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       project,
       {
         readerFactory: deps.readerFactory,
+        sessionMetadataService: deps.sessionMetadataService,
         sessionIndexService: deps.sessionIndexService,
         codexSessionsDir: deps.codexSessionsDir,
         codexReaderFactory: deps.codexReaderFactory,
         geminiSessionsDir: deps.geminiSessionsDir,
         geminiReaderFactory: deps.geminiReaderFactory,
         geminiHashToCwd: providerCatalog.geminiHashToCwd,
+        piSessionsDir: deps.piSessionsDir,
+        piReaderFactory: deps.piReaderFactory,
+        kimiSessionsDir: deps.kimiSessionsDir,
+        kimiReaderFactory: deps.kimiReaderFactory,
         allowStaleSessionCache: true,
       },
       providerCatalog,
@@ -368,6 +427,9 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       projects,
       codexScanner: deps.codexScanner,
       geminiScanner: deps.geminiScanner,
+      piScanner: deps.piScanner,
+      kimiScanner: deps.kimiScanner,
+      codexSessionCatalog: deps.codexSessionCatalog,
     });
     const seenSessionIds = new Set<string>();
 
@@ -393,8 +455,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       }
     }
 
-    const statsBridgeSessionViews =
-      (await deps.codexBridgeService?.listSessionViews()) ?? [];
+    const statsBridgeSessionViews = await listBridgeSessionViews(deps);
     for (const item of statsBridgeSessionViews) {
       if (seenSessionIds.has(item.session.id)) continue;
       const metadata = deps.sessionMetadataService?.getMetadata(
@@ -463,6 +524,18 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
   // GET /api/sessions - Get all sessions with pagination
   routes.get("/", async (c) => {
+    const requestStartedAt = performance.now();
+    const serverTiming = new ServerTimingRecorder(SESSION_LIST_TIMING_NAMES);
+    const processBySessionId = new Map<string, SessionRuntimeProcess>();
+    if (deps.runtimeController) {
+      for (const process of await deps.runtimeController.listProcessSnapshots()) {
+        processBySessionId.set(process.sessionId, process);
+      }
+    } else {
+      for (const process of deps.supervisor?.getAllProcesses?.() ?? []) {
+        processBySessionId.set(process.sessionId, process);
+      }
+    }
     // Parse query params
     const filterProjectId = c.req.query("project");
     const searchQuery = c.req.query("q")?.toLowerCase();
@@ -474,8 +547,25 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       : undefined;
     const afterCursor = c.req.query("after");
     const includeArchived = c.req.query("includeArchived") === "true";
-    const starredOnly = c.req.query("starred") === "true";
+    const pinnedOnly =
+      c.req.query("pinned") === "true" || c.req.query("starred") === "true";
+    // Sidebar pin coverage: return ordinary top-N results and append every
+    // pinned session that would otherwise fall outside that page. The stored
+    // metadata key remains `isStarred` for backward compatibility.
+    const includePinned = c.req.query("includePinned") === "true";
     const includeStats = c.req.query("includeStats") === "true";
+    // When set, every project with at least one visible session inside the
+    // window keeps its newest session in the response, even if the global
+    // top-N cut it off. Used by the sidebar so an active working directory
+    // never disappears just because other projects are busier.
+    const coverageDaysParam = Number.parseInt(
+      c.req.query("projectCoverageDays") || "",
+      10,
+    );
+    const coverageSinceMs =
+      Number.isFinite(coverageDaysParam) && coverageDaysParam > 0
+        ? Date.now() - coverageDaysParam * 24 * 60 * 60 * 1000
+        : null;
     const limitParam = c.req.query("limit");
     const limit = Math.min(
       Math.max(1, Number.parseInt(limitParam || "", 10) || DEFAULT_LIMIT),
@@ -483,8 +573,9 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
     );
 
     // Get all projects
-    const allProjects = await deps.scanner.listProjects();
-    const projectById = new Map(allProjects.map((p) => [p.id, p]));
+    const allProjects = await serverTiming.measure("projectLookup", () =>
+      deps.scanner.listProjects(),
+    );
 
     // Filter to single project if projectId query param provided
     const projects = filterProjectId
@@ -495,8 +586,9 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
     const projectOptions: ProjectOption[] = allProjects
       .map((p) => ({ id: p.id, name: p.name }))
       .sort((a, b) => a.name.localeCompare(b.name));
-    const bridgeSessionViews =
-      (await deps.codexBridgeService?.listSessionViews()) ?? [];
+    const bridgeSessionViews = await serverTiming.measure("bridgeView", () =>
+      listBridgeSessionViews(deps),
+    );
     for (const item of bridgeSessionViews) {
       if (
         !projectOptions.some((project) => project.id === item.session.projectId)
@@ -518,19 +610,50 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
     const maxCandidates = limit + 1;
     const topSessions: GlobalSessionItem[] = [];
     const knownSessionIds = new Set<string>();
-    const providerCatalog = await buildProviderProjectCatalog({
-      projects: allProjects,
-      codexScanner: deps.codexScanner,
-      geminiScanner: deps.geminiScanner,
-    });
+    const pinnedSessionExtras = new Map<string, GlobalSessionItem>();
+    /** Newest in-window session per project, used for coverage backfill. */
+    const projectCoverage = new Map<string, GlobalSessionItem>();
 
-    const projectsForSessionScan = shouldCollectStats
-      ? projects
-      : [...projects].sort(compareProjectsByLastActivityDesc);
+    const isCoverageCandidate = (session: {
+      projectId: string;
+      updatedAt: string;
+    }): boolean => {
+      if (coverageSinceMs === null) return false;
+      const timestamp = new Date(session.updatedAt).getTime();
+      if (!Number.isFinite(timestamp) || timestamp < coverageSinceMs) {
+        return false;
+      }
+      const existing = projectCoverage.get(session.projectId);
+      return !existing || timestamp > updatedAtMs(existing);
+    };
+    const providerCatalog = await serverTiming.measure("catalog", () =>
+      buildProviderProjectCatalog({
+        projects: allProjects,
+        codexScanner: deps.codexScanner,
+        geminiScanner: deps.geminiScanner,
+        piScanner: deps.piScanner,
+        kimiScanner: deps.kimiScanner,
+        codexSessionCatalog: deps.codexSessionCatalog,
+      }),
+    );
 
+    const projectsForSessionScan =
+      shouldCollectStats || includePinned
+        ? projects
+        : [...projects].sort(compareProjectsByLastActivityDesc);
+
+    const sessionScanStartedAt = performance.now();
     for (const project of projectsForSessionScan) {
+      // Projects are sorted by lastActivity desc, so once a project falls out
+      // of the coverage window every remaining project does too.
+      const projectInCoverageWindow =
+        coverageSinceMs !== null &&
+        (timestampMs(project.lastActivity) ?? Number.NEGATIVE_INFINITY) >=
+          coverageSinceMs;
       if (
         !shouldCollectStats &&
+        !includePinned &&
+        !projectInCoverageWindow &&
         canStopBeforeProject(topSessions, project, maxCandidates)
       ) {
         break;
@@ -540,16 +663,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
       // Enrich each session
       for (const session of sessions) {
-        if (filterProjectId && session.projectId !== filterProjectId) {
-          continue;
-        }
-
         knownSessionIds.add(session.id);
-        const sessionProjectName = resolveSessionProjectName(
-          session.projectId,
-          project,
-          projectById,
-        );
 
         // Get session metadata
         const metadata = deps.sessionMetadataService?.getMetadata(session.id);
@@ -559,6 +673,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         const aiTitle = metadata?.aiTitle ?? session.aiTitle;
         const executor = metadata?.executor;
         const createdBy = metadata?.createdBy ?? session.createdBy;
+        const originChannel = metadata?.originChannel ?? session.originChannel;
 
         // Get unread status
         const hasUnread = deps.notificationService
@@ -577,8 +692,8 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         // Skip archived sessions unless explicitly requested
         if (isArchived && !includeArchived) continue;
 
-        // Skip non-starred sessions if starred filter is active
-        if (starredOnly && !isStarred) continue;
+        // `starred=true` remains a legacy alias for older API consumers.
+        if (pinnedOnly && !isStarred) continue;
 
         if (
           !matchesSessionKindFilters(
@@ -604,7 +719,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
             ?.toLowerCase()
             .includes(searchQuery);
           const aiTitleMatch = aiTitle?.toLowerCase().includes(searchQuery);
-          const projectNameMatch = sessionProjectName
+          const projectNameMatch = project.name
             .toLowerCase()
             .includes(searchQuery);
 
@@ -618,30 +733,38 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           }
         }
 
-        if (!canEnterTopSessions(topSessions, session, maxCandidates)) {
+        const entersTopSessions = canEnterTopSessions(
+          topSessions,
+          session,
+          maxCandidates,
+        );
+        const coversProject = isCoverageCandidate(session);
+        const coversPinnedSession = includePinned && isStarred;
+        if (!entersTopSessions && !coversProject && !coversPinnedSession) {
           continue;
         }
 
         // Compute status
-        const process = deps.supervisor?.getProcessForSession(session.id);
-        const bridgedSession =
-          bridgedSessionById.get(session.id) ??
-          (await deps.codexBridgeService?.getSessionView(session.id)) ??
-          null;
-        const isBridgeSessionActive = bridgedSession
-          ? ((await deps.codexBridgeService?.isSessionActive(session.id)) ??
-            false)
-          : false;
-        const isBridgeSessionLive =
-          bridgedSession !== null && isLiveBridgeSessionView(bridgedSession);
+        const process =
+          processBySessionId.get(session.id) ??
+          deps.supervisor?.getProcessForSession?.(session.id);
+        // The bulk `/session-views` snapshot is authoritative here: it already
+        // lists every displayable bridge session and ships the sidecar's own
+        // liveness verdict per entry. Falling back to `/sessions/:id/view` +
+        // `/sessions/:id/active` per candidate session turned one page of
+        // global sessions into two sidecar requests per session per bridge.
+        const bridgedSession = bridgedSessionById.get(session.id) ?? null;
         const isExternal =
           (deps.externalTracker?.isExternal(session.id) ?? false) ||
-          (isBridgeSessionLive && isBridgeSessionActive);
+          (bridgedSession !== null &&
+            isActiveBridgeSessionView(bridgedSession));
 
         const runtime = deriveSessionRuntime({
           process,
           externalActive: isExternal,
-          externalActivity: bridgedSession?.activity,
+          externalActivity:
+            bridgedSession?.activity ??
+            deps.externalTracker?.getExternalActivity?.(session.id),
           fallbackOwnership: session.ownership,
         });
         const ownership: SessionOwnership = runtime.ownership;
@@ -650,42 +773,68 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
           bridgedSession?.pendingInputType;
         const activity = runtime.activity;
 
-        addTopSession(
-          topSessions,
-          {
-            id: session.id,
-            title: session.title,
-            createdAt: session.createdAt,
-            updatedAt: session.updatedAt,
-            messageCount: session.messageCount,
-            userQuestions: session.userQuestions,
-            provider: session.provider,
-            projectId: session.projectId,
-            projectName: sessionProjectName,
-            ownership,
-            pendingInputType,
-            activity,
-            runtime,
-            hasUnread,
-            customTitle,
-            aiTitle,
-            isArchived,
-            isStarred,
-            executor,
-            createdBy,
-            originator: session.originator,
-            source: session.source,
-            contextUsage: session.contextUsage,
-            model: session.model,
-            reasoningEffort: session.reasoningEffort,
-            serviceTier: session.serviceTier,
-            interrupted:
-              ownership.owner === "none" ? session.interrupted : undefined,
-          },
-          maxCandidates,
-        );
+        const item: GlobalSessionItem = {
+          id: session.id,
+          title: session.title,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+          ...(bridgedSession
+            ? { messageCount: bridgedSession.session.messageCount }
+            : providerCatalog.codexUnknownMessageCountIds?.has(session.id)
+              ? {}
+              : { messageCount: session.messageCount }),
+          userQuestions: session.userQuestions,
+          provider: session.provider,
+          projectId: session.projectId,
+          projectName: project.name,
+          ownership,
+          pendingInputType,
+          activity,
+          runtime,
+          hasUnread,
+          customTitle,
+          aiTitle,
+          isArchived,
+          isStarred,
+          executor,
+          createdBy,
+          originChannel,
+          originator: session.originator,
+          source: session.source,
+          contextUsage: session.contextUsage,
+          cumulativeUsage: session.cumulativeUsage,
+          compactCount: session.compactCount,
+          compactEvents: session.compactEvents,
+          model: session.model,
+          reasoningEffort: session.reasoningEffort,
+          serviceTier: session.serviceTier,
+          interrupted:
+            ownership.owner === "none" ? session.interrupted : undefined,
+          lastTurnStatus: bridgedSession
+            ? bridgedSession.session.lastTurnStatus
+            : session.lastTurnStatus,
+          lastErrorMessage: bridgedSession
+            ? bridgedSession.session.lastErrorMessage
+            : session.lastErrorMessage,
+          retryStatus: process
+            ? process.retryStatus
+            : bridgedSession
+              ? bridgedSession.session.retryStatus
+              : session.retryStatus,
+        };
+
+        if (coversProject) {
+          projectCoverage.set(item.projectId, item);
+        }
+        if (coversPinnedSession) {
+          pinnedSessionExtras.set(item.id, item);
+        }
+        if (entersTopSessions) {
+          addTopSession(topSessions, item, maxCandidates);
+        }
       }
     }
+    serverTiming.set("sessionScan", performance.now() - sessionScanStartedAt);
 
     for (const item of bridgeSessionViews) {
       const session = item.session;
@@ -699,6 +848,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       const aiTitle = metadata?.aiTitle ?? session.aiTitle;
       const executor = metadata?.executor;
       const createdBy = metadata?.createdBy ?? session.createdBy;
+      const originChannel = metadata?.originChannel ?? session.originChannel;
 
       const hasUnread = deps.notificationService
         ? deps.notificationService.hasUnread(session.id, session.updatedAt)
@@ -714,7 +864,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       }
 
       if (isArchived && !includeArchived) continue;
-      if (starredOnly && !isStarred) continue;
+      if (pinnedOnly && !isStarred) continue;
       if (
         !matchesSessionKindFilters(
           { title: session.title, customTitle },
@@ -746,57 +896,105 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         }
       }
 
-      if (!canEnterTopSessions(topSessions, session, maxCandidates)) {
+      const entersTopSessions = canEnterTopSessions(
+        topSessions,
+        session,
+        maxCandidates,
+      );
+      const coversProject = isCoverageCandidate(session);
+      const coversPinnedSession = includePinned && isStarred;
+      if (!entersTopSessions && !coversProject && !coversPinnedSession) {
         continue;
       }
 
       const runtime = deriveSessionRuntime({
-        externalActive: isLiveBridgeSessionView(item),
+        externalActive: isLiveAnyBridgeSessionView(item),
         externalActivity: item.activity,
         fallbackOwnership: session.ownership,
       });
 
-      addTopSession(
-        topSessions,
-        {
-          id: session.id,
-          title: session.title,
-          createdAt: session.createdAt,
-          updatedAt: session.updatedAt,
-          messageCount: session.messageCount,
-          userQuestions: session.userQuestions,
-          provider: session.provider,
-          projectId: session.projectId,
-          projectName: item.projectName,
-          ownership: runtime.ownership,
-          pendingInputType: item.pendingInputType,
-          activity: runtime.activity,
-          runtime,
-          hasUnread,
-          customTitle,
-          aiTitle,
-          isArchived,
-          isStarred,
-          executor,
-          createdBy,
-          originator: session.originator,
-          source: session.source,
-          contextUsage: session.contextUsage,
-          model: session.model,
-          reasoningEffort: session.reasoningEffort,
-          serviceTier: session.serviceTier,
-          interrupted:
-            runtime.ownership.owner === "none"
-              ? session.interrupted
-              : undefined,
-        },
-        maxCandidates,
-      );
+      const bridgeItem: GlobalSessionItem = {
+        id: session.id,
+        title: session.title,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        messageCount: session.messageCount,
+        userQuestions: session.userQuestions,
+        provider: session.provider,
+        projectId: session.projectId,
+        projectName: item.projectName,
+        ownership: runtime.ownership,
+        pendingInputType: item.pendingInputType,
+        activity: runtime.activity,
+        runtime,
+        hasUnread,
+        customTitle,
+        aiTitle,
+        isArchived,
+        isStarred,
+        executor,
+        createdBy,
+        originChannel,
+        originator: session.originator,
+        source: session.source,
+        contextUsage: session.contextUsage,
+        cumulativeUsage: session.cumulativeUsage,
+        compactCount: session.compactCount,
+        compactEvents: session.compactEvents,
+        model: session.model,
+        reasoningEffort: session.reasoningEffort,
+        serviceTier: session.serviceTier,
+        lastTurnStatus: session.lastTurnStatus,
+        lastErrorMessage: session.lastErrorMessage,
+        retryStatus: session.retryStatus,
+        interrupted:
+          runtime.ownership.owner === "none" ? session.interrupted : undefined,
+      };
+
+      if (coversProject) {
+        projectCoverage.set(bridgeItem.projectId, bridgeItem);
+      }
+      if (coversPinnedSession) {
+        pinnedSessionExtras.set(bridgeItem.id, bridgeItem);
+      }
+      if (entersTopSessions) {
+        addTopSession(topSessions, bridgeItem, maxCandidates);
+      }
     }
 
     // Get one extra to determine hasMore
     const hasMore = topSessions.length > limit;
     const sessions = topSessions.slice(0, limit);
+    // Capture the ordinary page boundary before pinned/project coverage rows
+    // are appended. Their timestamps can be much older and are not cursors.
+    const nextCursor = hasMore ? sessions.at(-1)?.updatedAt : undefined;
+
+    // Pins share the ordinary response and are deduplicated against the top-N
+    // page. This replaces the sidebar's former second "starred sessions"
+    // request and its independent pagination/display state.
+    if (pinnedSessionExtras.size > 0) {
+      const includedSessionIds = new Set(sessions.map((session) => session.id));
+      const extras = Array.from(pinnedSessionExtras.values())
+        .filter((candidate) => !includedSessionIds.has(candidate.id))
+        .sort((a, b) => updatedAtMs(b) - updatedAtMs(a));
+      sessions.push(...extras);
+    }
+
+    // Backfill one session for every in-window project the top-N dropped, so
+    // the sidebar always lists recently used working directories.
+    if (projectCoverage.size > 0) {
+      const includedProjectIds = new Set(sessions.map((s) => s.projectId));
+      const includedSessionIds = new Set(sessions.map((s) => s.id));
+      const extras = Array.from(projectCoverage.values())
+        .filter(
+          (candidate) =>
+            !includedProjectIds.has(candidate.projectId) &&
+            !includedSessionIds.has(candidate.id),
+        )
+        .sort((a, b) => updatedAtMs(b) - updatedAtMs(a))
+        .slice(0, MAX_PROJECT_COVERAGE_EXTRAS);
+      sessions.push(...extras);
+    }
 
     if (shouldCollectStats) {
       cachedStats = { value: stats, timestamp: Date.now() };
@@ -806,10 +1004,13 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
     const response: GlobalSessionsResponse = {
       sessions,
       hasMore,
+      ...(nextCursor ? { nextCursor } : {}),
       stats,
       projects: projectOptions,
     };
 
+    serverTiming.set("total", performance.now() - requestStartedAt);
+    c.header("Server-Timing", serverTiming.headerValue());
     return c.json(response);
   });
 

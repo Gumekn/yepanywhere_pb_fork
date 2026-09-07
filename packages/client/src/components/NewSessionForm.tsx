@@ -1,12 +1,22 @@
 import {
   type CodexMcpMode,
+  type CodexServiceTier,
   DEFAULT_PERMISSION_MODE,
+  type LiveProviderName,
+  type LlmGatewayModelCapabilities,
+  type LlmGatewayModelLimits,
+  type LlmGatewayRequestProtocol,
+  type LlmGatewaySessionConfig,
   type ModelInfo,
+  type NewSessionProviderDefaults,
   type ProviderInfo,
-  type ProviderName,
+  type ProviderMcpServerStatus,
+  getLlmGatewayModelDefaultLimits,
+  getNewSessionProviderDefaults,
   resolveModel,
 } from "@yep-anywhere/shared";
 import {
+  type CSSProperties,
   type ChangeEvent,
   type ClipboardEvent,
   type KeyboardEvent,
@@ -30,18 +40,33 @@ import {
   getModelSetting,
   useModelSettings,
 } from "../hooks/useModelSettings";
+import { useProviderPermissionModeConfig } from "../hooks/useProviderPermissionModeConfig";
 import {
   getAvailableProviders,
   getDefaultProvider,
   useProviders,
 } from "../hooks/useProviders";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
-import { useRemoteExecutors } from "../hooks/useRemoteExecutors";
 import { useServerSettings } from "../hooks/useServerSettings";
 import { useI18n } from "../i18n";
-import { getStaticAgentCommandConfigs } from "../lib/agentCommands";
+import { getAgentCommandConfigs } from "../lib/agentCommands";
+import { readClipboardUserInput } from "../lib/clipboard";
+import {
+  getModelReasoningEfforts,
+  resolveModelReasoningEffort,
+} from "../lib/codexReasoning";
 import { hasCoarsePointer } from "../lib/deviceDetection";
-import type { PermissionMode } from "../types";
+import {
+  getProviderPermissionModes,
+  normalizeProviderPermissionMode,
+} from "../lib/providerPermissionModes";
+import {
+  HistoricalEditQueueError,
+  requireStartedHistoricalEdit,
+  shouldRestoreHistoricalEditAfterFailure,
+} from "../lib/sessionBranching";
+import type { PermissionMode, SessionNavigationState } from "../types";
+import { CodexUsageCard } from "./CodexUsageCard";
 import { FilterDropdown, type FilterOption } from "./FilterDropdown";
 import { clearFabPrefill, getFabPrefill } from "./FloatingActionButton";
 import { SlashCommandButton } from "./SlashCommandButton";
@@ -53,26 +78,41 @@ interface PendingFile {
   previewUrl?: string;
 }
 
-const MODE_ORDER: PermissionMode[] = [
-  "auto",
-  "default",
-  "acceptEdits",
-  "plan",
-  "bypassPermissions",
-];
 const CODEX_MCP_MODE_ORDER: CodexMcpMode[] = ["clear", "standard", "full"];
+const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+
+const NEW_SESSION_PROVIDER_ACCENTS = {
+  claude: "var(--provider-claude)",
+  "claude-ollama": "var(--provider-claude)",
+  codex: "var(--provider-codex)",
+  "codex-oss": "var(--provider-codex)",
+  gemini: "var(--provider-gemini)",
+  "gemini-acp": "var(--provider-gemini)",
+  pi: "var(--provider-pi)",
+  kimi: "var(--provider-kimi)",
+  zcode: "var(--provider-zcode)",
+} satisfies Record<LiveProviderName, string>;
+
+export function getNewSessionProviderAccent(
+  provider: LiveProviderName | null | undefined,
+): string {
+  return provider
+    ? NEW_SESSION_PROVIDER_ACCENTS[provider]
+    : "var(--app-yep-green)";
+}
 
 const EFFORT_LABEL_KEYS: Record<
   EffortLevel,
   | "newSessionEffortLow"
   | "newSessionEffortMedium"
   | "newSessionEffortHigh"
+  | "newSessionEffortXHigh"
   | "newSessionEffortMax"
 > = {
   low: "newSessionEffortLow",
   medium: "newSessionEffortMedium",
   high: "newSessionEffortHigh",
-  xhigh: "newSessionEffortMax",
+  xhigh: "newSessionEffortXHigh",
   max: "newSessionEffortMax",
 };
 
@@ -85,7 +125,7 @@ function getThinkingOption(
   return `on:${effort}`;
 }
 
-type ThinkingPreset = "off" | "auto" | `on:${EffortLevel}`;
+type ThinkingPreset = "off" | "auto" | `on:${string}`;
 
 const THINKING_PRESET_ORDER: readonly ThinkingPreset[] = [
   "off",
@@ -94,7 +134,23 @@ const THINKING_PRESET_ORDER: readonly ThinkingPreset[] = [
   "on:medium",
   "on:high",
   "on:xhigh",
+  "on:max",
 ];
+const DEFAULT_GATEWAY_CAPABILITIES: LlmGatewayModelCapabilities = {
+  attachment: false,
+  reasoning: false,
+  temperature: true,
+  toolCall: true,
+};
+
+function getDefaultGatewayCapabilities(
+  hasReasoningVariants = false,
+): LlmGatewayModelCapabilities {
+  return {
+    ...DEFAULT_GATEWAY_CAPABILITIES,
+    reasoning: hasReasoningVariants,
+  };
+}
 
 function isEffortLevel(value: string): value is EffortLevel {
   return EFFORT_LEVEL_OPTIONS.some((option) => option.value === value);
@@ -125,14 +181,28 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+function formatContextWindow(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const millions = tokens / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}M`;
+  }
+  return `${Math.round(tokens / 1_000)}K`;
+}
+
 function getPreferredModelId(
   models: ModelInfo[],
   preferredModelId?: string | null,
+  fallbackModelId?: string,
 ) {
   const configuredModelId = preferredModelId ?? resolveModel(getModelSetting());
 
   if (!configuredModelId) {
-    return models.find((m) => m.id === "default")?.id ?? null;
+    return (
+      models.find((m) => m.id === "default")?.id ??
+      models[0]?.id ??
+      models.find((m) => m.id === fallbackModelId)?.id ??
+      null
+    );
   }
 
   if (configuredModelId) {
@@ -140,9 +210,73 @@ function getPreferredModelId(
       (m) => m.id === configuredModelId,
     );
     if (matchingPreferredModel) return matchingPreferredModel.id;
+
+    const matchingResolvedModel = models.find(
+      (model) =>
+        model.id !== "default" && model.resolvedModel === configuredModelId,
+    );
+    if (matchingResolvedModel) return matchingResolvedModel.id;
+
+    const legacyClaudeModel = {
+      fable: "claude-fable-5[1m]",
+      "sonnet[1m]": "sonnet",
+      "opus[1m]": "opus",
+      best: "opus",
+    }[configuredModelId];
+    if (legacyClaudeModel) {
+      const matchingLegacyModel = models.find(
+        (model) => model.id === legacyClaudeModel,
+      );
+      if (matchingLegacyModel) return matchingLegacyModel.id;
+    }
+  }
+
+  return (
+    models.find((m) => m.id === fallbackModelId)?.id ?? models[0]?.id ?? null
+  );
+}
+
+function getPreferredGatewayModelId(
+  models: ModelInfo[],
+  preferredModelId?: string | null,
+): string | null {
+  const configuredModelId = preferredModelId ?? resolveModel(getModelSetting());
+
+  if (configuredModelId) {
+    const matchingPreferredModel = models.find(
+      (model) => model.id === configuredModelId,
+    );
+    if (matchingPreferredModel) return matchingPreferredModel.id;
   }
 
   return models[0]?.id ?? null;
+}
+
+/**
+ * Resolve a managed gateway model's context/output window.
+ *
+ * Prefers the real limits the model advertises (populated from
+ * the gateway `/v1/models` catalog, carried on ModelInfo. Only backfills
+ * per-field from the curated catalog when the live
+ * catalog omits a value. Returns limits only when both context and output are
+ * known, since the session config requires both.
+ */
+function resolveGatewayModelLimits(
+  model: ModelInfo | undefined,
+): LlmGatewayModelLimits | undefined {
+  if (!model) return undefined;
+  const curated = getLlmGatewayModelDefaultLimits(model.id);
+  const context = model.contextWindow ?? curated?.context;
+  const output = model.maxOutputTokens ?? curated?.output;
+  if (!context || !output) return undefined;
+  return { context, output };
+}
+
+function sameLlmGatewayConfig(
+  a: LlmGatewaySessionConfig | undefined,
+  b: LlmGatewaySessionConfig | undefined,
+): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 export interface NewSessionFormProps {
@@ -171,21 +305,84 @@ export function NewSessionForm({
     `draft-new-session-${projectId}`,
   );
   const [mode, setMode] = useState<PermissionMode>(DEFAULT_PERMISSION_MODE);
-  const [selectedProvider, setSelectedProvider] = useState<ProviderName | null>(
+  const [selectedProvider, setSelectedProvider] =
+    useState<LiveProviderName | null>(null);
+  const selectedProviderAccent = getNewSessionProviderAccent(selectedProvider);
+  const newSessionThemeStyle = {
+    "--new-session-accent": selectedProviderAccent,
+  } as CSSProperties;
+  const [codexFastMode, setCodexFastMode] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [codexReasoningEffort, setCodexReasoningEffort] = useState<
+    string | null
+  >(null);
+  const [kimiReasoningEffort, setKimiReasoningEffort] = useState<string | null>(
     null,
   );
-  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [selectedGatewayProtocol, setSelectedGatewayProtocol] =
+    useState<LlmGatewayRequestProtocol>("openai-compatible");
   const [selectedCodexMcpMode, setSelectedCodexMcpMode] =
     useState<CodexMcpMode>("standard");
-  // null = local, string = remote host
-  const [selectedExecutor, setSelectedExecutor] = useState<string | null>(null);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  const pendingFilesRef = useRef<PendingFile[]>(pendingFiles);
+  pendingFilesRef.current = pendingFiles;
   const [isStarting, setIsStarting] = useState(false);
+  const [startRetryBlockedMessage, setStartRetryBlockedMessage] = useState<
+    string | null
+  >(null);
   const [uploadProgress, setUploadProgress] = useState<
     Record<string, { uploaded: number; total: number }>
   >({});
   const [interimTranscript, setInterimTranscript] = useState("");
   const [isSavingDefaults, setIsSavingDefaults] = useState(false);
+
+  // ZCode MCP server status snapshot. Loaded once per provider selection
+  // (no polling) purely as informational context for new sessions.
+  const [zcodeMcpServers, setZcodeMcpServers] = useState<Record<
+    string,
+    ProviderMcpServerStatus
+  > | null>(null);
+  const [zcodeMcpLoading, setZcodeMcpLoading] = useState(false);
+  const [zcodeMcpError, setZcodeMcpError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (selectedProvider !== "zcode") return;
+    let cancelled = false;
+    setZcodeMcpServers(null);
+    setZcodeMcpError(null);
+    setZcodeMcpLoading(true);
+    api
+      .listZCodeMcpServers(projectId)
+      .then((response) => {
+        if (cancelled) return;
+        setZcodeMcpServers(response.servers);
+        setZcodeMcpLoading(false);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setZcodeMcpError(
+          error instanceof Error ? error.message : String(error),
+        );
+        setZcodeMcpLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProvider, projectId]);
+
+  // Object URLs keep their backing Blob alive for the lifetime of the page.
+  // Removal and successful submission revoke them below; this cleanup covers
+  // route changes, cancelled drafts, and failed starts that unmount the form.
+  useEffect(
+    () => () => {
+      for (const pendingFile of pendingFilesRef.current) {
+        if (pendingFile.previewUrl) {
+          URL.revokeObjectURL(pendingFile.previewUrl);
+        }
+      }
+    },
+    [],
+  );
   // Unavailable providers (not installed / not authed) are collapsed by default
   // so the selector grid stays tidy instead of showing tall, uneven cards.
   const [showUnavailableProviders, setShowUnavailableProviders] =
@@ -194,7 +391,6 @@ export function NewSessionForm({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceButtonRef = useRef<VoiceInputButtonRef>(null);
   const hasInitializedDefaultsRef = useRef(false);
-
   // Thinking toggle state
   const {
     thinkingMode,
@@ -217,26 +413,17 @@ export function NewSessionForm({
     isLoading: settingsLoading,
     updateSetting: updateServerSetting,
   } = useServerSettings();
-
-  // Fetch remote executors
-  const { executors: remoteExecutors, loading: executorsLoading } =
-    useRemoteExecutors();
   const availableProviders = getAvailableProviders(providers);
   const resolvedPlaceholder = placeholder ?? t("newSessionPlaceholder");
-  const modeLabels: Record<PermissionMode, string> = {
-    auto: t("modeAutoLabel"),
-    default: t("modeDefaultLabel"),
-    acceptEdits: t("modeAcceptEditsLabel"),
-    plan: t("modePlanLabel"),
-    bypassPermissions: t("modeBypassPermissionsLabel"),
-  };
-  const modeDescriptions: Record<PermissionMode, string> = {
-    auto: t("modeAutoDescription"),
-    default: t("modeDefaultDescription"),
-    acceptEdits: t("modeAcceptEditsDescription"),
-    plan: t("modePlanDescription"),
-    bypassPermissions: t("modeBypassPermissionsDescription"),
-  };
+  const selectedProviderInfo = providers.find(
+    (provider) => provider.name === selectedProvider,
+  );
+  const {
+    labels: modeLabels,
+    descriptions: modeDescriptions,
+    title: permissionModeTitle,
+    description: permissionModeDescription,
+  } = useProviderPermissionModeConfig(selectedProvider);
   const codexMcpModeLabels: Record<CodexMcpMode, string> = {
     clear: t("newSessionCodexMcpClearLabel"),
     standard: t("newSessionCodexMcpStandardLabel"),
@@ -247,15 +434,136 @@ export function NewSessionForm({
     standard: t("newSessionCodexMcpStandardDescription"),
     full: t("newSessionCodexMcpFullDescription"),
   };
+  // ZCode mcp/list lifecycle statuses (real CLI 0.16.1 enum).
+  const zcodeMcpStatusLabels: Record<string, string> = {
+    connecting: t("newSessionZcodeMcpStatusConnecting"),
+    connected: t("newSessionZcodeMcpStatusConnected"),
+    disabled: t("newSessionZcodeMcpStatusDisabled"),
+    disconnected: t("newSessionZcodeMcpStatusDisconnected"),
+    failed: t("newSessionZcodeMcpStatusFailed"),
+    untrusted: t("newSessionZcodeMcpStatusUntrusted"),
+  };
+  // Get models and capabilities for the currently selected provider.
+  const availableModels: ModelInfo[] = selectedProviderInfo?.models ?? [];
+  const selectedModelInfo = availableModels.find(
+    (model) => model.id === selectedModel,
+  );
+  const showCodexFastMode =
+    selectedProvider === "codex" &&
+    (!selectedModelInfo?.modelProvider ||
+      selectedModelInfo.modelProvider === "openai");
+  const supportsCodexFastMode = selectedModelInfo?.supportsFastMode === true;
+  const serviceTierForRequest: CodexServiceTier | undefined = showCodexFastMode
+    ? codexFastMode && supportsCodexFastMode
+      ? "priority"
+      : "default"
+    : undefined;
+  const selectedGatewayProtocols =
+    selectedProvider === "pi"
+      ? (selectedModelInfo?.supportedRequestProtocols ?? [])
+      : [];
+  const isManagedGatewayModel = selectedGatewayProtocols.length > 0;
+  const codexReasoningEfforts = useMemo(
+    () => getModelReasoningEfforts(selectedModelInfo),
+    [selectedModelInfo],
+  );
+  const claudeReasoningEfforts = useMemo(
+    () =>
+      selectedProvider === "claude"
+        ? getModelReasoningEfforts(selectedModelInfo)
+        : [],
+    [selectedModelInfo, selectedProvider],
+  );
+  const kimiReasoningEfforts = useMemo(
+    () =>
+      selectedProvider === "kimi"
+        ? getModelReasoningEfforts(selectedModelInfo)
+        : [],
+    [selectedModelInfo, selectedProvider],
+  );
+  const piReasoningEfforts = useMemo(
+    () =>
+      selectedProvider === "pi"
+        ? getModelReasoningEfforts(selectedModelInfo)
+        : [],
+    [selectedModelInfo, selectedProvider],
+  );
+  const effectiveCodexReasoningEffort =
+    selectedProvider === "codex"
+      ? resolveModelReasoningEffort(
+          selectedModelInfo,
+          codexReasoningEffort ??
+            (codexReasoningEfforts.length === 0
+              ? thinkingLevel === "max"
+                ? "xhigh"
+                : thinkingLevel
+              : undefined),
+        )
+      : undefined;
+  const effectiveKimiReasoningEffort =
+    selectedProvider === "kimi" && kimiReasoningEfforts.length > 0
+      ? resolveModelReasoningEffort(selectedModelInfo, kimiReasoningEffort)
+      : undefined;
+  const resolvedPiThinkingEffort =
+    selectedProvider === "pi"
+      ? resolveModelReasoningEffort(
+          selectedModelInfo,
+          thinkingMode === "on" ? thinkingLevel : null,
+        )
+      : undefined;
+  const selectedReasoningEffort =
+    selectedProvider === "codex" && thinkingMode === "on"
+      ? effectiveCodexReasoningEffort
+      : selectedProvider === "kimi"
+        ? effectiveKimiReasoningEffort
+        : selectedProvider === "pi" && thinkingMode !== "off"
+          ? resolvedPiThinkingEffort
+          : undefined;
   const getEffortLabel = useCallback(
-    (effort: EffortLevel): string => {
-      return t(EFFORT_LABEL_KEYS[effort]);
+    (effort: string): string => {
+      return isEffortLevel(effort) ? t(EFFORT_LABEL_KEYS[effort]) : effort;
     },
     [t],
   );
-  const selectedThinkingPreset = getThinkingPreset(thinkingMode, thinkingLevel);
+  const resolvedClaudeThinkingEffort =
+    selectedProvider === "claude"
+      ? resolveModelReasoningEffort(selectedModelInfo, thinkingLevel)
+      : undefined;
+  const effectiveThinkingEffort =
+    resolvedClaudeThinkingEffort && isEffortLevel(resolvedClaudeThinkingEffort)
+      ? resolvedClaudeThinkingEffort
+      : resolvedPiThinkingEffort && isEffortLevel(resolvedPiThinkingEffort)
+        ? resolvedPiThinkingEffort
+        : thinkingLevel;
+  const selectedThinkingPreset: ThinkingPreset =
+    selectedProvider === "codex" &&
+    thinkingMode === "on" &&
+    effectiveCodexReasoningEffort
+      ? `on:${effectiveCodexReasoningEffort}`
+      : getThinkingPreset(thinkingMode, effectiveThinkingEffort);
   const thinkingOptions = useMemo((): FilterOption<ThinkingPreset>[] => {
-    return THINKING_PRESET_ORDER.map((preset) => {
+    const presets: Array<{
+      value: ThinkingPreset;
+      description?: string;
+    }> = [
+      { value: "off" },
+      { value: "auto" },
+      ...((selectedProvider === "codex" && codexReasoningEfforts.length > 0) ||
+      (selectedProvider === "claude" && claudeReasoningEfforts.length > 0) ||
+      (selectedProvider === "pi" && piReasoningEfforts.length > 0)
+        ? (selectedProvider === "claude"
+            ? claudeReasoningEfforts
+            : selectedProvider === "pi"
+              ? piReasoningEfforts
+              : codexReasoningEfforts
+          ).map((option) => ({
+            value: `on:${option.reasoningEffort}` as ThinkingPreset,
+            description: option.description,
+          }))
+        : THINKING_PRESET_ORDER.slice(2).map((value) => ({ value }))),
+    ];
+
+    return presets.map(({ value: preset, description }) => {
       if (preset === "off") {
         return {
           value: preset,
@@ -268,15 +576,23 @@ export function NewSessionForm({
           label: t("newSessionThinkingAuto"),
         };
       }
-      const effort = preset.slice(3) as EffortLevel;
+      const effort = preset.slice(3);
       return {
         value: preset,
         label: t("newSessionThinkingOn", {
           level: getEffortLabel(effort),
         }),
+        description,
       };
     });
-  }, [getEffortLabel, t]);
+  }, [
+    claudeReasoningEfforts,
+    codexReasoningEfforts,
+    getEffortLabel,
+    piReasoningEfforts,
+    selectedProvider,
+    t,
+  ]);
   const applyThinkingPreset = useCallback(
     (preset: ThinkingPreset) => {
       if (preset === "off" || preset === "auto") {
@@ -284,11 +600,21 @@ export function NewSessionForm({
         return;
       }
       const effort = preset.slice(3);
+      if (
+        selectedProvider === "codex" &&
+        codexReasoningEfforts.some(
+          (option) => option.reasoningEffort === effort,
+        )
+      ) {
+        setCodexReasoningEffort(effort);
+        setThinkingMode("on");
+        return;
+      }
       if (!isEffortLevel(effort)) return;
       setEffortLevel(effort);
       setThinkingMode("on");
     },
-    [setEffortLevel, setThinkingMode],
+    [codexReasoningEfforts, selectedProvider, setEffortLevel, setThinkingMode],
   );
   const handleThinkingSelect = useCallback(
     (selected: ThinkingPreset[]) => {
@@ -296,18 +622,161 @@ export function NewSessionForm({
     },
     [applyThinkingPreset],
   );
+  const kimiReasoningOptions = useMemo((): FilterOption<string>[] => {
+    return kimiReasoningEfforts.map((option) => {
+      const effort = option.reasoningEffort;
+      const label =
+        effort === "off"
+          ? t("newSessionThinkingOff")
+          : t("newSessionThinkingOn", {
+              level:
+                effort === "on"
+                  ? t("processInfoDefaultModel")
+                  : getEffortLabel(effort),
+            });
+      return {
+        value: effort,
+        label,
+        description: option.description,
+      };
+    });
+  }, [getEffortLabel, kimiReasoningEfforts, t]);
+  const handleKimiReasoningSelect = useCallback((selected: string[]) => {
+    setKimiReasoningEffort(selected[0] ?? null);
+  }, []);
+  const showKimiReasoningSelector =
+    selectedProvider === "kimi" && kimiReasoningOptions.length > 0;
 
-  // Get models and capabilities for the currently selected provider
-  const selectedProviderInfo = providers.find(
-    (p) => p.name === selectedProvider,
-  );
-  const availableModels: ModelInfo[] = selectedProviderInfo?.models ?? [];
   // Default to true for backwards compatibility with providers that don't set these flags
+  const permissionModes = getProviderPermissionModes(
+    selectedProvider,
+    selectedProviderInfo?.permissionModes,
+  );
   const supportsPermissionMode =
-    selectedProviderInfo?.supportsPermissionMode ?? true;
-  const supportsThinkingToggle =
+    (selectedProviderInfo?.supportsPermissionMode ?? true) &&
+    permissionModes.length > 0;
+  const providerSupportsThinkingToggle =
     selectedProviderInfo?.supportsThinkingToggle ?? true;
-  const commandButtons = useMemo(() => getStaticAgentCommandConfigs(), []);
+  const supportsThinkingToggle =
+    providerSupportsThinkingToggle &&
+    (selectedProvider !== "claude" ||
+      !selectedModelInfo ||
+      selectedModelInfo.supportsAdaptiveThinking === true ||
+      selectedModelInfo.supportsEffort === true);
+  const commandButtons = useMemo(
+    () =>
+      getAgentCommandConfigs(
+        selectedProvider,
+        selectedProviderInfo?.supportsSlashCommands,
+        [],
+        [],
+        {
+          codexCommands: t("codexCommandsLabel"),
+          skills: t("codexSkillsLabel"),
+          slashCommands: t("slashCommandsLabel"),
+        },
+      ),
+    [selectedProvider, selectedProviderInfo?.supportsSlashCommands, t],
+  );
+
+  const applyProviderSelection = useCallback(
+    (provider: ProviderInfo, savedDefaults?: NewSessionProviderDefaults) => {
+      const providerName = provider.name;
+      const models = provider.models ?? [];
+      const savedGatewayConfig = savedDefaults?.llmGatewayConfig;
+      // Codex saved defaults store the bare model slug plus a separate model
+      // source; map them back to the composite picker id (e.g.
+      // "deepseek/deepseek-v4-flash") so the right grouped option preselects.
+      const codexPreferredModel =
+        providerName === "codex" &&
+        savedDefaults?.model &&
+        savedDefaults?.codexModelProvider
+          ? models.find(
+              (m) =>
+                m.modelProvider === savedDefaults.codexModelProvider &&
+                (m.providerModelId ?? m.id) === savedDefaults.model,
+            )?.id
+          : undefined;
+
+      const preferredModel =
+        providerName === "pi"
+          ? getPreferredGatewayModelId(
+              models,
+              savedGatewayConfig?.model ??
+                savedDefaults?.model ??
+                provider.currentModel,
+            )
+          : getPreferredModelId(
+              models,
+              codexPreferredModel ??
+                savedDefaults?.model ??
+                provider.currentModel,
+              providerName === "codex" ? DEFAULT_CODEX_MODEL : undefined,
+            );
+
+      setSelectedProvider(providerName);
+      setMode(
+        normalizeProviderPermissionMode(
+          providerName,
+          savedDefaults?.permissionMode,
+          provider.permissionModes,
+        ),
+      );
+      setCodexFastMode(
+        providerName === "codex" && savedDefaults?.serviceTier === "priority",
+      );
+      setSelectedCodexMcpMode(
+        providerName === "codex"
+          ? (savedDefaults?.codexMcpMode ?? "standard")
+          : "standard",
+      );
+      setKimiReasoningEffort(
+        providerName === "kimi"
+          ? (savedDefaults?.reasoningEffort ?? null)
+          : null,
+      );
+
+      if (providerName === "pi") {
+        const modelInfo = models.find((model) => model.id === preferredModel);
+        const supportedProtocols = modelInfo?.supportedRequestProtocols ?? [];
+        const savedProtocol = savedGatewayConfig?.requestProtocol;
+        const protocol =
+          savedProtocol && supportedProtocols.includes(savedProtocol)
+            ? savedProtocol
+            : (supportedProtocols[0] ?? "openai-compatible");
+        setSelectedGatewayProtocol(protocol);
+      }
+
+      setSelectedModel(preferredModel);
+
+      const savedThinkingPreset = normalizeThinkingOption(
+        savedDefaults?.thinking,
+      );
+      const savedCodexReasoningEffort =
+        providerName === "codex"
+          ? (savedDefaults?.reasoningEffort ??
+            (savedThinkingPreset?.startsWith("on:")
+              ? savedThinkingPreset.slice(3) === "max"
+                ? "xhigh"
+                : savedThinkingPreset.slice(3)
+              : null))
+          : null;
+      setCodexReasoningEffort(savedCodexReasoningEffort);
+
+      if (savedThinkingPreset === "off" || savedThinkingPreset === "auto") {
+        setThinkingMode(savedThinkingPreset);
+      } else if (savedThinkingPreset?.startsWith("on:")) {
+        const effort = savedThinkingPreset.slice(3);
+        if (isEffortLevel(effort)) setEffortLevel(effort);
+        setThinkingMode("on");
+      } else if (savedCodexReasoningEffort) {
+        setThinkingMode("on");
+      } else if (provider.currentEffortLevel) {
+        setEffortLevel(provider.currentEffortLevel);
+      }
+    },
+    [setEffortLevel, setThinkingMode],
+  );
 
   // Initialize provider/model/mode from saved defaults once settings and providers load.
   useEffect(() => {
@@ -338,76 +807,201 @@ export function NewSessionForm({
 
     if (!initialProvider) return;
 
-    setSelectedProvider(initialProvider.name);
-    setSelectedModel(
-      getPreferredModelId(
-        initialProvider.models ?? [],
-        savedDefaults?.model ?? initialProvider.currentModel,
-      ),
+    applyProviderSelection(
+      initialProvider,
+      getNewSessionProviderDefaults(savedDefaults, initialProvider.name),
     );
-    setSelectedCodexMcpMode(savedDefaults?.codexMcpMode ?? "standard");
-    setMode(savedDefaults?.permissionMode ?? DEFAULT_PERMISSION_MODE);
-    const savedThinkingPreset = normalizeThinkingOption(
-      savedDefaults?.thinking,
-    );
-    if (savedThinkingPreset) {
-      applyThinkingPreset(savedThinkingPreset);
-    } else if (initialProvider.currentEffortLevel) {
-      setEffortLevel(initialProvider.currentEffortLevel);
-    }
   }, [
-    applyThinkingPreset,
+    applyProviderSelection,
     availableProviders,
     providers,
     providersLoading,
-    setEffortLevel,
     settings,
     settingsLoading,
   ]);
 
-  // When provider changes, reset model based on user settings
-  const handleProviderSelect = (providerName: ProviderName) => {
-    setSelectedProvider(providerName);
+  // Restore each provider's own saved options when switching providers.
+  const handleProviderSelect = (providerName: LiveProviderName) => {
     const provider = providers.find((p) => p.name === providerName);
-    if (provider?.models && provider.models.length > 0) {
-      setSelectedModel(
-        getPreferredModelId(provider.models, provider.currentModel),
-      );
-    } else {
-      setSelectedModel(null);
-    }
-    if (provider?.currentEffortLevel) {
-      setEffortLevel(provider.currentEffortLevel);
-    }
+    if (!provider) return;
+    applyProviderSelection(
+      provider,
+      getNewSessionProviderDefaults(settings?.newSessionDefaults, providerName),
+    );
   };
 
   // Build model options for FilterDropdown
   const modelOptions = useMemo((): FilterOption<string>[] => {
-    return availableModels.map((model) => {
+    const options: FilterOption<string>[] = [];
+
+    // Derive a stable color per provider prefix so grouped models get a
+    // consistent colored dot in the dropdown.
+    const providerColor = (provider: string): string => {
+      let hash = 0;
+      for (let i = 0; i < provider.length; i += 1) {
+        hash = (hash * 31 + provider.charCodeAt(i)) >>> 0;
+      }
+      return `hsl(${hash % 360} 60% 55%)`;
+    };
+
+    for (const model of availableModels) {
       const label = model.size
         ? `${model.name} (${(model.size / (1024 * 1024 * 1024)).toFixed(1)} GB)`
         : model.name;
 
       let description = model.description;
-      if (!description) {
-        const parts: string[] = [];
-        if (model.parameterSize) parts.push(model.parameterSize);
-        if (model.contextWindow) {
-          parts.push(`${Math.round(model.contextWindow / 1024)}K ctx`);
-        }
-        if (model.parentModel) parts.push(model.parentModel);
-        if (model.quantizationLevel) parts.push(model.quantizationLevel);
-        if (parts.length > 0) description = parts.join(" · ");
+      const parts: string[] = description ? [description] : [];
+      if (model.parameterSize) parts.push(model.parameterSize);
+      // Prefer the model's advertised window; fall back to the curated
+      // catalog only when the live catalog omits one.
+      const effectiveContextWindow =
+        model.contextWindow ??
+        (selectedProvider === "pi"
+          ? getLlmGatewayModelDefaultLimits(model.id)?.context
+          : undefined);
+      if (effectiveContextWindow) {
+        parts.push(
+          t("newSessionModelContextWindow", {
+            size: formatContextWindow(effectiveContextWindow),
+          }),
+        );
+      }
+      const reasoningEfforts = getModelReasoningEfforts(model);
+      if (reasoningEfforts.length > 0) {
+        parts.push(
+          t("newSessionModelThinkingEfforts", {
+            levels: reasoningEfforts
+              .map((effort) => getEffortLabel(effort.reasoningEffort))
+              .join(" / "),
+          }),
+        );
+      }
+      if (model.parentModel) parts.push(model.parentModel);
+      if (model.quantizationLevel) parts.push(model.quantizationLevel);
+      if (model.supportedRequestProtocols?.length) {
+        parts.push(
+          model.supportedRequestProtocols
+            .map((protocol) =>
+              protocol === "anthropic" ? "Anthropic" : "OpenAI-compatible",
+            )
+            .join(" / "),
+        );
+      }
+      if (parts.length > 0) description = parts.join(" · ");
+
+      // Codex models carry an explicit model source (Codex `model_provider`);
+      // group by its friendly display name so users can tell which channel a
+      // model routes through. Gateway catalog ids can be `channel/model` and
+      // group by the slash prefix. The synthetic "default" entry (no slash,
+      // no source) stays ungrouped at the top.
+      let group: string | undefined;
+      if (model.modelProvider) {
+        const source = selectedProviderInfo?.codexModelSources?.find(
+          (candidate) => candidate.id === model.modelProvider,
+        );
+        group = source?.displayName ?? model.modelProvider;
+      } else {
+        const slashIndex = model.id.indexOf("/");
+        group = slashIndex > 0 ? model.id.slice(0, slashIndex) : undefined;
       }
 
-      return { value: model.id, label, description };
-    });
-  }, [availableModels]);
+      options.push({
+        value: model.id,
+        label,
+        description,
+        ...(group ? { group, color: providerColor(group) } : {}),
+      });
+    }
+
+    return options;
+  }, [
+    availableModels,
+    getEffortLabel,
+    selectedProvider,
+    selectedProviderInfo?.codexModelSources,
+    t,
+  ]);
+
+  // Codex model sources that exist but cannot be selected yet (e.g. the server
+  // is missing the source's API key). Shown as a setup hint under the picker.
+  const unavailableCodexSourceHints = useMemo(() => {
+    if (selectedProvider !== "codex") return [];
+    return (selectedProviderInfo?.codexModelSources ?? [])
+      .filter((source) => !source.available)
+      .map((source) =>
+        source.unavailableReason === "missing_api_key"
+          ? t("newSessionCodexSourceMissingKey", { source: source.displayName })
+          : t("newSessionCodexSourceUnavailable", {
+              source: source.displayName,
+            }),
+      );
+  }, [selectedProvider, selectedProviderInfo?.codexModelSources, t]);
+
+  const selectedModelCapabilitySummary = useMemo(() => {
+    if (selectedProvider === "pi") {
+      const limits = resolveGatewayModelLimits(selectedModelInfo);
+      if (!limits) return null;
+      return t("newSessionModelContextWindow", {
+        size: formatContextWindow(limits.context),
+      });
+    }
+    if (selectedProvider !== "claude" || !selectedModelInfo) return null;
+    const parts: string[] = [];
+    if (selectedModelInfo.contextWindow) {
+      parts.push(
+        t("newSessionModelContextWindow", {
+          size: formatContextWindow(selectedModelInfo.contextWindow),
+        }),
+      );
+    }
+    const efforts = getModelReasoningEfforts(selectedModelInfo);
+    if (efforts.length > 0) {
+      parts.push(
+        t("newSessionModelThinkingEfforts", {
+          levels: efforts
+            .map((effort) => getEffortLabel(effort.reasoningEffort))
+            .join(" / "),
+        }),
+      );
+    }
+    return parts.join(" · ") || null;
+  }, [getEffortLabel, selectedModelInfo, selectedProvider, t]);
+
+  const showGatewayEndpointSelector =
+    selectedProvider === "pi" &&
+    selectedModel !== null &&
+    isManagedGatewayModel;
 
   // Handle model selection from FilterDropdown
-  const handleModelSelect = useCallback((selected: string[]) => {
-    setSelectedModel(selected[0] ?? null);
-  }, []);
+  const handleModelSelect = useCallback(
+    (selected: string[]) => {
+      const nextModel = selected[0] ?? null;
+      if (selectedProvider === "pi") {
+        const nextInfo = availableModels.find(
+          (model) => model.id === nextModel,
+        );
+        const supportedProtocols = nextInfo?.supportedRequestProtocols ?? [];
+        const nextProtocol = supportedProtocols.includes(
+          selectedGatewayProtocol,
+        )
+          ? selectedGatewayProtocol
+          : (supportedProtocols[0] ?? "openai-compatible");
+        setSelectedGatewayProtocol(nextProtocol);
+        setSelectedModel(nextModel);
+        return;
+      }
+      setSelectedModel(nextModel);
+    },
+    [availableModels, selectedGatewayProtocol, selectedProvider],
+  );
+
+  const handleGatewayProtocolSelect = useCallback(
+    (protocol: LlmGatewayRequestProtocol) => {
+      if (!selectedGatewayProtocols.includes(protocol)) return;
+      setSelectedGatewayProtocol(protocol);
+    },
+    [selectedGatewayProtocols],
+  );
 
   // Combined display text: committed text + interim transcript
   const displayText = interimTranscript
@@ -488,18 +1082,105 @@ export function NewSessionForm({
     [setEffortLevel, setThinkingMode],
   );
 
+  const gatewayModelLimits = useMemo((): LlmGatewayModelLimits | undefined => {
+    if (selectedProvider !== "pi") return undefined;
+    return resolveGatewayModelLimits(selectedModelInfo);
+  }, [selectedProvider, selectedModelInfo]);
+  const hasGatewayConfigError =
+    selectedProvider === "pi" &&
+    isManagedGatewayModel &&
+    !selectedGatewayProtocols.includes(selectedGatewayProtocol);
+  const llmGatewayConfigForRequest = useMemo(():
+    | LlmGatewaySessionConfig
+    | undefined => {
+    if (
+      selectedProvider !== "pi" ||
+      !isManagedGatewayModel ||
+      !selectedModel ||
+      hasGatewayConfigError
+    ) {
+      return undefined;
+    }
+    const reasoningEfforts = getModelReasoningEfforts(
+      selectedModelInfo,
+      selectedGatewayProtocol,
+    );
+    return {
+      model: selectedModel,
+      requestProtocol: selectedGatewayProtocol,
+      ...(selectedModelInfo?.name && selectedModelInfo.name !== selectedModel
+        ? { name: selectedModelInfo.name }
+        : {}),
+      ...(gatewayModelLimits ? { limits: gatewayModelLimits } : {}),
+      capabilities: getDefaultGatewayCapabilities(reasoningEfforts.length > 0),
+    };
+  }, [
+    gatewayModelLimits,
+    hasGatewayConfigError,
+    isManagedGatewayModel,
+    selectedModel,
+    selectedModelInfo,
+    selectedGatewayProtocol,
+    selectedProvider,
+  ]);
+  const selectedModelForRequest =
+    selectedProvider === "pi" && isManagedGatewayModel
+      ? undefined
+      : (selectedModel ?? undefined);
+  // Codex picker ids may be composite `source/model`; the API takes the bare
+  // model slug plus a separate `codexModelProvider` (model source) field.
+  const codexModelProviderForRequest =
+    selectedProvider === "codex"
+      ? (selectedModelInfo?.modelProvider ?? undefined)
+      : undefined;
+  const modelForRequest =
+    selectedProvider === "codex"
+      ? (selectedModelInfo?.providerModelId ??
+        selectedModelForRequest ??
+        undefined)
+      : selectedModelForRequest;
+  const thinkingForRequest = supportsThinkingToggle
+    ? getThinkingOption(thinkingMode, effectiveThinkingEffort)
+    : undefined;
+  const currentProviderDefaults = useMemo(
+    (): NewSessionProviderDefaults => ({
+      model: modelForRequest,
+      thinking: thinkingForRequest,
+      reasoningEffort: selectedReasoningEffort,
+      serviceTier: serviceTierForRequest,
+      permissionMode: mode,
+      codexMcpMode:
+        selectedProvider === "codex" ? selectedCodexMcpMode : undefined,
+      codexModelProvider: codexModelProviderForRequest,
+      llmGatewayConfig: llmGatewayConfigForRequest,
+    }),
+    [
+      mode,
+      llmGatewayConfigForRequest,
+      selectedCodexMcpMode,
+      codexModelProviderForRequest,
+      modelForRequest,
+      selectedProvider,
+      selectedReasoningEffort,
+      serviceTierForRequest,
+      thinkingForRequest,
+    ],
+  );
+
   const handleSaveDefaults = useCallback(async () => {
+    if (!selectedProvider) return;
+
     setIsSavingDefaults(true);
     try {
+      const byProvider: Partial<
+        Record<LiveProviderName, NewSessionProviderDefaults>
+      > = {
+        [selectedProvider]: currentProviderDefaults,
+      };
       await updateServerSetting("newSessionDefaults", {
-        provider: selectedProvider ?? undefined,
-        model: selectedModel ?? undefined,
-        thinking: supportsThinkingToggle
-          ? getThinkingOption(thinkingMode, thinkingLevel)
-          : undefined,
-        permissionMode: mode,
-        codexMcpMode:
-          selectedProvider === "codex" ? selectedCodexMcpMode : undefined,
+        provider: selectedProvider,
+        ...currentProviderDefaults,
+        byProvider,
       });
       showToast(t("newSessionDefaultsSaved"), "success");
     } catch (err) {
@@ -512,15 +1193,10 @@ export function NewSessionForm({
       setIsSavingDefaults(false);
     }
   }, [
-    mode,
-    selectedCodexMcpMode,
-    selectedModel,
+    currentProviderDefaults,
     selectedProvider,
     showToast,
-    supportsThinkingToggle,
     t,
-    thinkingLevel,
-    thinkingMode,
     updateServerSetting,
   ]);
 
@@ -537,36 +1213,58 @@ export function NewSessionForm({
     }
 
     const hasContent = finalMessage.trim() || pendingFiles.length > 0;
-    if (!projectId || !hasContent || isStarting) return;
+    if (
+      !projectId ||
+      !hasContent ||
+      isStarting ||
+      startRetryBlockedMessage ||
+      hasGatewayConfigError
+    ) {
+      return;
+    }
 
     const trimmedMessage = finalMessage.trim();
 
     setInterimTranscript("");
     setIsStarting(true);
+    let sessionStartOutcomePending = false;
 
     try {
       let sessionId: string;
       let processId: string;
+      let initialPermissionMode = mode;
+      let initialModeVersion = 0;
       const uploadedFiles: UploadedFile[] = [];
 
       // Get model and thinking settings
-      const thinking = getThinkingOption(thinkingMode, thinkingLevel);
+      const thinking = thinkingForRequest;
       const sessionOptions = {
         mode,
-        model: selectedModel ?? undefined,
+        model: modelForRequest,
         thinking,
+        reasoningEffort: selectedReasoningEffort,
+        serviceTier: serviceTierForRequest,
         provider: selectedProvider ?? undefined,
         codexMcpMode:
           selectedProvider === "codex" ? selectedCodexMcpMode : undefined,
-        executor: selectedExecutor ?? undefined,
+        codexModelProvider: codexModelProviderForRequest,
+        llmGatewayConfig: llmGatewayConfigForRequest,
       };
 
       if (pendingFiles.length > 0) {
         // Two-phase flow: create session first, then upload to real session folder
         // Step 1: Create the session without sending a message
-        const createResult = await api.createSession(projectId, sessionOptions);
+        sessionStartOutcomePending = true;
+        const createResult = await requireStartedHistoricalEdit(
+          await api.createSession(projectId, sessionOptions),
+          api.cancelQueuedRequest,
+          "session start",
+        );
+        sessionStartOutcomePending = false;
         sessionId = createResult.sessionId;
         processId = createResult.processId;
+        initialPermissionMode = createResult.permissionMode;
+        initialModeVersion = createResult.modeVersion;
 
         // Step 2: Upload files to the real session folder
         for (const pendingFile of pendingFiles) {
@@ -608,16 +1306,21 @@ export function NewSessionForm({
           uploadedFiles.length > 0 ? uploadedFiles : undefined,
           undefined, // tempId
           thinking, // Pass the captured thinking setting to avoid process restart
+          sessionOptions.reasoningEffort,
         );
       } else {
         // No files - use single-step flow for efficiency
-        const result = await api.startSession(
-          projectId,
-          trimmedMessage,
-          sessionOptions,
+        sessionStartOutcomePending = true;
+        const result = await requireStartedHistoricalEdit(
+          await api.startSession(projectId, trimmedMessage, sessionOptions),
+          api.cancelQueuedRequest,
+          "session start",
         );
+        sessionStartOutcomePending = false;
         sessionId = result.sessionId;
         processId = result.processId;
+        initialPermissionMode = result.permissionMode;
+        initialModeVersion = result.modeVersion;
       }
 
       // Clean up preview URLs
@@ -632,16 +1335,30 @@ export function NewSessionForm({
       // without waiting for getSession to complete
       // Also pass initial message as optimistic title (session name = first message)
       // Pass provider so provider-specific controls can render immediately
-      navigate(`${basePath}/projects/${projectId}/sessions/${sessionId}`, {
-        state: {
-          initialStatus: { state: "owned", processId },
-          initialTitle: trimmedMessage,
-          initialProvider: selectedProvider,
+      const navigationState: SessionNavigationState = {
+        initialStatus: {
+          owner: "self",
+          processId,
+          permissionMode: initialPermissionMode,
+          modeVersion: initialModeVersion,
         },
+        initialTitle: trimmedMessage,
+        initialProvider: selectedProvider ?? undefined,
+      };
+      navigate(`${basePath}/projects/${projectId}/sessions/${sessionId}`, {
+        state: navigationState,
       });
     } catch (err) {
       console.error("Failed to start session:", err);
-      draftControls.restoreFromStorage();
+      const restoreForm = shouldRestoreHistoricalEditAfterFailure(
+        err,
+        false,
+        sessionStartOutcomePending,
+      );
+      if (restoreForm) {
+        draftControls.restoreFromStorage();
+        setStartRetryBlockedMessage(null);
+      }
       setIsStarting(false);
 
       // Show user-visible error message
@@ -662,6 +1379,15 @@ export function NewSessionForm({
         } else {
           errorMessage = err.message;
         }
+      }
+      if (!restoreForm) {
+        if (!(err instanceof HistoricalEditQueueError)) {
+          errorMessage =
+            "The session start status is unknown. Do not retry from this form because the original request may already be running.";
+        }
+        // Preserve the form for inspection, but block every submit path until
+        // navigation/reload resolves the ambiguous queued or transport result.
+        setStartRetryBlockedMessage(errorMessage);
       }
       showToast(errorMessage, "error");
     }
@@ -702,6 +1428,34 @@ export function NewSessionForm({
   };
 
   const handlePaste = (e: ClipboardEvent) => {
+    const copiedInput = readClipboardUserInput(e.clipboardData);
+    if (copiedInput && copiedInput.images.length > 0) {
+      e.preventDefault();
+
+      if (copiedInput.text) {
+        const textarea = textareaRef.current;
+        const currentValue = textarea?.value ?? message;
+        const start = textarea?.selectionStart ?? currentValue.length;
+        const end = textarea?.selectionEnd ?? start;
+        const nextMessage = `${currentValue.slice(0, start)}${copiedInput.text}${currentValue.slice(end)}`;
+        const nextCursor = start + copiedInput.text.length;
+
+        setInterimTranscript("");
+        setMessage(nextMessage);
+        setTimeout(() => {
+          textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
+        }, 0);
+      }
+
+      const newPendingFiles: PendingFile[] = copiedInput.images.map((file) => ({
+        id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        file,
+        previewUrl: URL.createObjectURL(file),
+      }));
+      setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+      return;
+    }
+
     const items = e.clipboardData?.items;
     if (!items) return;
 
@@ -793,21 +1547,50 @@ export function NewSessionForm({
 
   const hasContent = message.trim() || pendingFiles.length > 0;
   const savedDefaults = settings?.newSessionDefaults;
+  const savedProviderDefaults = selectedProvider
+    ? getNewSessionProviderDefaults(savedDefaults, selectedProvider)
+    : undefined;
   const codexMcpDefaultsMatch =
     selectedProvider === "codex"
-      ? (savedDefaults?.codexMcpMode ?? "standard") === selectedCodexMcpMode
+      ? (savedProviderDefaults?.codexMcpMode ?? "standard") ===
+        selectedCodexMcpMode
       : true;
   const thinkingDefaultsMatch = supportsThinkingToggle
-    ? (savedDefaults?.thinking ?? undefined) ===
-      getThinkingOption(thinkingMode, thinkingLevel)
+    ? (savedProviderDefaults?.thinking ?? undefined) === thinkingForRequest
     : true;
+  const reasoningEffortDefaultsMatch =
+    selectedProvider === "codex" ||
+    selectedProvider === "pi" ||
+    selectedProvider === "kimi"
+      ? (savedProviderDefaults?.reasoningEffort ?? undefined) ===
+        selectedReasoningEffort
+      : true;
+  const gatewayDefaultsMatch =
+    selectedProvider === "pi"
+      ? sameLlmGatewayConfig(
+          savedProviderDefaults?.llmGatewayConfig,
+          llmGatewayConfigForRequest,
+        )
+      : true;
+  const savedPermissionMode = normalizeProviderPermissionMode(
+    selectedProvider,
+    savedProviderDefaults?.permissionMode,
+    selectedProviderInfo?.permissionModes,
+  );
   const defaultsMatchCurrent =
     (savedDefaults?.provider ?? undefined) ===
       (selectedProvider ?? undefined) &&
-    (savedDefaults?.model ?? undefined) === (selectedModel ?? undefined) &&
-    (savedDefaults?.permissionMode ?? DEFAULT_PERMISSION_MODE) === mode &&
+    (savedProviderDefaults?.model ?? undefined) === modelForRequest &&
+    (savedProviderDefaults?.codexModelProvider ?? undefined) ===
+      codexModelProviderForRequest &&
+    savedPermissionMode === mode &&
     thinkingDefaultsMatch &&
-    codexMcpDefaultsMatch;
+    reasoningEffortDefaultsMatch &&
+    (serviceTierForRequest === undefined ||
+      (savedProviderDefaults?.serviceTier ?? "default") ===
+        serviceTierForRequest) &&
+    codexMcpDefaultsMatch &&
+    gatewayDefaultsMatch;
 
   // Split providers into available vs unavailable so the unavailable ones can
   // be tucked behind a toggle (keeps the grid from looking ragged).
@@ -828,8 +1611,15 @@ export function NewSessionForm({
         key={p.name}
         type="button"
         className={`provider-option ${isSelected ? "selected" : ""} ${!isAvailable ? "disabled" : ""}`}
+        data-provider={p.name}
+        style={
+          {
+            "--provider-option-accent": getNewSessionProviderAccent(p.name),
+          } as CSSProperties
+        }
         onClick={() => isAvailable && handleProviderSelect(p.name)}
         disabled={isStarting || !isAvailable}
+        aria-pressed={isSelected}
         title={
           !isAvailable
             ? t("newSessionProviderUnavailable", {
@@ -909,16 +1699,18 @@ export function NewSessionForm({
             disabled={isStarting}
             className="toolbar-button"
           />
-          {commandButtons.map((button) => (
-            <SlashCommandButton
-              key={button.prefix}
-              commands={button.commands}
-              onSelectCommand={handleSelectCommand}
-              disabled={isStarting}
-              prefix={button.prefix}
-              label={button.label}
-            />
-          ))}
+          {commandButtons
+            .filter((button) => button.showButton && button.commands.length > 0)
+            .map((button) => (
+              <SlashCommandButton
+                key={button.prefix}
+                commands={button.commands}
+                onSelectCommand={handleSelectCommand}
+                disabled={isStarting}
+                prefix={button.prefix}
+                label={button.label}
+              />
+            ))}
           {supportsThinkingToggle && compact && (
             <button
               type="button"
@@ -931,7 +1723,9 @@ export function NewSessionForm({
                   : thinkingMode === "auto"
                     ? t("newSessionThinkingAuto")
                     : t("newSessionThinkingOn", {
-                        level: getEffortLabel(thinkingLevel),
+                        level: getEffortLabel(
+                          effectiveCodexReasoningEffort ?? thinkingLevel,
+                        ),
                       })
               }
               aria-label={t("newSessionThinkingMode", { mode: thinkingMode })}
@@ -980,9 +1774,15 @@ export function NewSessionForm({
         <button
           type="button"
           onClick={handleStartSession}
-          disabled={isStarting || !hasContent}
+          disabled={
+            isStarting ||
+            Boolean(startRetryBlockedMessage) ||
+            !hasContent ||
+            hasGatewayConfigError
+          }
           className="send-button"
           aria-label={t("newSessionStartAction")}
+          title={startRetryBlockedMessage ?? undefined}
         >
           {isStarting ? (
             <span className="send-spinner" />
@@ -991,6 +1791,11 @@ export function NewSessionForm({
           )}
         </button>
       </div>
+      {startRetryBlockedMessage && (
+        <p className="new-session-limit-error" role="alert">
+          {startRetryBlockedMessage}
+        </p>
+      )}
       {supportsThinkingToggle && compact && (
         <div className="new-session-effort-control">
           <span className="new-session-effort-label">
@@ -1012,6 +1817,31 @@ export function NewSessionForm({
                   aria-label={`${t("newSessionEffortTitle")}: ${label}`}
                 >
                   {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {showKimiReasoningSelector && compact && (
+        <div className="new-session-effort-control">
+          <span className="new-session-effort-label">
+            {t("newSessionThinkingControlTitle")}
+          </span>
+          <div className="new-session-effort-options">
+            {kimiReasoningOptions.map((option) => {
+              const selected = effectiveKimiReasoningEffort === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`new-session-effort-option ${selected ? "selected" : ""}`}
+                  onClick={() => setKimiReasoningEffort(option.value)}
+                  disabled={isStarting}
+                  aria-pressed={selected}
+                  aria-label={`${t("newSessionThinkingControlTitle")}: ${option.label}`}
+                >
+                  {option.label}
                 </button>
               );
             })}
@@ -1075,6 +1905,8 @@ export function NewSessionForm({
     return (
       <div
         className={`new-session-form new-session-form-compact ${interimTranscript ? "voice-recording" : ""}`}
+        data-provider={selectedProvider ?? undefined}
+        style={newSessionThemeStyle}
       >
         {inputArea}
       </div>
@@ -1085,11 +1917,15 @@ export function NewSessionForm({
   return (
     <div
       className={`new-session-form new-session-container ${interimTranscript ? "voice-recording" : ""}`}
+      data-provider={selectedProvider ?? undefined}
+      style={newSessionThemeStyle}
     >
       <div className="new-session-header">
         <h1>{t("newSessionHeaderTitle")}</h1>
         <p className="new-session-subtitle">{t("newSessionHeaderSubtitle")}</p>
       </div>
+
+      {selectedProvider === "codex" && <CodexUsageCard />}
 
       <div className="new-session-input-area">{inputArea}</div>
 
@@ -1123,19 +1959,110 @@ export function NewSessionForm({
 
       {/* Model / Thinking Selection */}
       {selectedProvider &&
-        (modelOptions.length > 0 || supportsThinkingToggle) && (
+        (modelOptions.length > 0 ||
+          supportsThinkingToggle ||
+          showKimiReasoningSelector) && (
           <div className="new-session-model-section">
             <div className="new-session-model-controls">
               {modelOptions.length > 0 && (
                 <div className="new-session-config-field">
                   <h3>{t("newSessionModelTitle")}</h3>
+                  <div className="new-session-model-picker">
+                    <FilterDropdown
+                      label={t("newSessionModelTitle")}
+                      options={modelOptions}
+                      selected={selectedModel ? [selectedModel] : []}
+                      onChange={handleModelSelect}
+                      accentColor={selectedProviderAccent}
+                      multiSelect={false}
+                      placeholder={t("newSessionModelPlaceholder")}
+                      selectedDescription={
+                        selectedModelCapabilitySummary ?? undefined
+                      }
+                    />
+                    {showCodexFastMode && (
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={serviceTierForRequest === "priority"}
+                        aria-label={t("codexFastModeLabel")}
+                        className="new-session-fast-toggle"
+                        disabled={isStarting || !supportsCodexFastMode}
+                        onClick={() => setCodexFastMode((enabled) => !enabled)}
+                        title={
+                          supportsCodexFastMode
+                            ? t("newSessionCodexFastDescription")
+                            : t("newSessionCodexFastUnavailable")
+                        }
+                      >
+                        <span
+                          className="new-session-fast-indicator"
+                          aria-hidden="true"
+                        />
+                        {t("codexFastModeLabel")}
+                      </button>
+                    )}
+                  </div>
+                  {unavailableCodexSourceHints.length > 0 && (
+                    <ul className="new-session-model-source-hints">
+                      {unavailableCodexSourceHints.map((hint) => (
+                        <li key={hint}>{hint}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+              {showGatewayEndpointSelector && (
+                <div className="new-session-config-field">
+                  <h3>{t("newSessionGatewayEndpointTitle")}</h3>
+                  <div className="new-session-endpoint-options">
+                    <button
+                      type="button"
+                      className={`new-session-endpoint-option ${selectedGatewayProtocol === "openai-compatible" ? "selected" : ""}`}
+                      onClick={() =>
+                        handleGatewayProtocolSelect("openai-compatible")
+                      }
+                      disabled={
+                        isStarting ||
+                        !selectedGatewayProtocols.includes("openai-compatible")
+                      }
+                      aria-pressed={
+                        selectedGatewayProtocol === "openai-compatible"
+                      }
+                    >
+                      {t("newSessionGatewayEndpointOpenAI")}
+                    </button>
+                    <button
+                      type="button"
+                      className={`new-session-endpoint-option ${selectedGatewayProtocol === "anthropic" ? "selected" : ""}`}
+                      onClick={() => handleGatewayProtocolSelect("anthropic")}
+                      disabled={
+                        isStarting ||
+                        !selectedGatewayProtocols.includes("anthropic")
+                      }
+                      aria-pressed={selectedGatewayProtocol === "anthropic"}
+                    >
+                      {t("newSessionGatewayEndpointAnthropic")}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {showKimiReasoningSelector && (
+                <div className="new-session-config-field">
+                  <h3>{t("newSessionThinkingControlTitle")}</h3>
                   <FilterDropdown
-                    label={t("newSessionModelTitle")}
-                    options={modelOptions}
-                    selected={selectedModel ? [selectedModel] : []}
-                    onChange={handleModelSelect}
+                    label={t("newSessionThinkingControlTitle")}
+                    options={kimiReasoningOptions}
+                    selected={
+                      effectiveKimiReasoningEffort
+                        ? [effectiveKimiReasoningEffort]
+                        : []
+                    }
+                    onChange={handleKimiReasoningSelect}
+                    accentColor={selectedProviderAccent}
                     multiSelect={false}
-                    placeholder={t("newSessionModelPlaceholder")}
+                    placeholder={t("newSessionThinkingControlTitle")}
+                    align="right"
                   />
                 </div>
               )}
@@ -1147,6 +2074,7 @@ export function NewSessionForm({
                     options={thinkingOptions}
                     selected={[selectedThinkingPreset]}
                     onChange={handleThinkingSelect}
+                    accentColor={selectedProviderAccent}
                     multiSelect={false}
                     placeholder={t("newSessionThinkingControlTitle")}
                     align="right"
@@ -1161,6 +2089,9 @@ export function NewSessionForm({
       {selectedProvider === "codex" && (
         <div className="new-session-codex-mcp-section">
           <h3>{t("newSessionCodexMcpTitle")}</h3>
+          <p className="new-session-section-hint">
+            {t("newSessionCodexMcpDescription")}
+          </p>
           <div className="codex-mcp-options">
             {CODEX_MCP_MODE_ORDER.map((mcpMode) => (
               <button
@@ -1189,55 +2120,55 @@ export function NewSessionForm({
         </div>
       )}
 
-      {/* Executor Selection - only show if remote executors are configured */}
-      {!executorsLoading && remoteExecutors.length > 0 && (
-        <div className="new-session-executor-section">
-          <h3>{t("newSessionRunOnTitle")}</h3>
-          <div className="executor-options">
-            <button
-              key="local"
-              type="button"
-              className={`executor-option ${selectedExecutor === null ? "selected" : ""}`}
-              onClick={() => setSelectedExecutor(null)}
-              disabled={isStarting}
-            >
-              <span className="executor-option-dot executor-local" />
-              <div className="executor-option-content">
-                <span className="executor-option-label">
-                  {t("newSessionRunOnLocal")}
-                </span>
-                <span className="executor-option-desc">
-                  {t("newSessionRunOnLocalDesc")}
-                </span>
-              </div>
-            </button>
-            {remoteExecutors.map((host) => (
-              <button
-                key={host}
-                type="button"
-                className={`executor-option ${selectedExecutor === host ? "selected" : ""}`}
-                onClick={() => setSelectedExecutor(host)}
-                disabled={isStarting}
-              >
-                <span className="executor-option-dot executor-remote" />
-                <div className="executor-option-content">
-                  <span className="executor-option-label">{host}</span>
-                  <span className="executor-option-desc">
-                    {t("newSessionRunOnRemoteDesc")}
+      {/* Read-only ZCode MCP server status snapshot, informational only */}
+      {selectedProvider === "zcode" && (
+        <div className="new-session-mcp-section">
+          <h3>{t("newSessionZcodeMcpTitle")}</h3>
+          {zcodeMcpLoading ? (
+            <p className="settings-hint">{t("newSessionZcodeMcpLoading")}</p>
+          ) : zcodeMcpError ? (
+            <p className="new-session-limit-error" role="alert">
+              {t("newSessionZcodeMcpError", { message: zcodeMcpError })}
+            </p>
+          ) : !zcodeMcpServers || Object.keys(zcodeMcpServers).length === 0 ? (
+            <p className="settings-hint">{t("newSessionZcodeMcpNone")}</p>
+          ) : (
+            <ul className="new-session-mcp-list">
+              {Object.entries(zcodeMcpServers).map(([name, server]) => (
+                <li key={name} className="new-session-mcp-item">
+                  <span className="new-session-mcp-name">{name}</span>
+                  <span className="new-session-mcp-meta">
+                    {zcodeMcpStatusLabels[server.status] ?? server.status}
+                    {server.toolCount !== undefined
+                      ? ` · ${t("newSessionZcodeMcpToolCount", {
+                          count: server.toolCount,
+                        })}`
+                      : ""}
+                    {server.transport ? ` · ${server.transport}` : ""}
                   </span>
-                </div>
-              </button>
-            ))}
-          </div>
+                  {server.error && (
+                    <span className="new-session-mcp-error">
+                      {server.error}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 
       {/* Permission Mode Selection - only for providers that support it */}
-      {supportsPermissionMode && (
+      {selectedProvider && supportsPermissionMode && (
         <div className="new-session-mode-section">
-          <h3>{t("newSessionModeTitle")}</h3>
+          <h3>{permissionModeTitle}</h3>
+          {permissionModeDescription && (
+            <p className="new-session-section-hint">
+              {permissionModeDescription}
+            </p>
+          )}
           <div className="mode-options">
-            {MODE_ORDER.map((m) => (
+            {permissionModes.map((m) => (
               <button
                 key={m}
                 type="button"
@@ -1269,6 +2200,7 @@ export function NewSessionForm({
                 isSavingDefaults ||
                 settingsLoading ||
                 !selectedProvider ||
+                hasGatewayConfigError ||
                 defaultsMatchCurrent
               }
             >

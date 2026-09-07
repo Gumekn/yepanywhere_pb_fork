@@ -1,0 +1,818 @@
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { CodexSessionEntry, UrlProjectId } from "@yep-anywhere/shared";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  type CodexEventEnvelope,
+  type CodexEventStore,
+  type CodexEventStoreSource,
+  InMemoryCodexEventStore,
+  JsonlCodexEventStore,
+} from "../../src/codex-events/index.js";
+import type { SessionInteractionService } from "../../src/interactions/SessionInteractionService.js";
+import {
+  type SessionsDeps,
+  createSessionsRoutes,
+} from "../../src/routes/sessions.js";
+import type { LoadedSession } from "../../src/sessions/types.js";
+import type { Project } from "../../src/supervisor/types.js";
+import { GeneratedArtifactMaterializer } from "../../src/uploads/generated-artifact.js";
+import { UploadManager } from "../../src/uploads/manager.js";
+import { testDraft, testEvent } from "../codex-events/helpers.js";
+
+const projectId = "proj-1" as UrlProjectId;
+const sessionId = "session-1";
+const tempRoots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    tempRoots.splice(0).map((root) => rm(root, { recursive: true })),
+  );
+});
+
+describe("sessions route canonical Codex refresh overlay", () => {
+  it("uses the provider-first journal without mixing bridge sequences", async () => {
+    const providerStore = await seededStore(
+      "thread-provider",
+      "turn-provider",
+      "agent-provider",
+      "provider answer",
+    );
+    const bridgeStore = await seededStore(
+      "thread-bridge",
+      "turn-bridge",
+      "agent-bridge",
+      "bridge answer",
+    );
+    const bridgeReplay = vi.spyOn(bridgeStore, "replay");
+    const routes = createTestRoutes("provider answer", [
+      fixedSource("provider", providerStore),
+      fixedSource("bridge", bridgeStore),
+    ]);
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0]).toMatchObject({
+      type: "assistant",
+      codexCanonicalRefresh: true,
+      codexThreadId: "thread-provider",
+      codexTurnId: "turn-provider",
+      codexThreadItemLifecycle: "completed",
+      codexThreadItem: {
+        id: "agent-provider",
+        type: "agentMessage",
+        text: "provider answer",
+      },
+    });
+    expect(body.codexCanonicalView).toMatchObject({
+      requested: true,
+      source: "provider",
+      sourceKind: "provider",
+      coverage: "retained-complete-prefix",
+      fallback: "rollout",
+      firstAvailableSequence: 1,
+    });
+    expect(JSON.stringify(body)).not.toContain("bridge answer");
+    expect(bridgeReplay).not.toHaveBeenCalled();
+
+    const lightweightResponse = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}`,
+    );
+    expect(lightweightResponse.status).toBe(200);
+    expect(JSON.stringify(await lightweightResponse.json())).not.toContain(
+      "bridge answer",
+    );
+    expect(bridgeReplay).not.toHaveBeenCalled();
+  });
+
+  it("preserves canonical output across warm reads and applies appended events", async () => {
+    const providerStore = await seededStore(
+      "thread-provider",
+      "turn-provider",
+      "agent-provider",
+      "provider answer",
+    );
+    const replay = vi.spyOn(providerStore, "replay");
+    const routes = createTestRoutes("provider answer", [
+      fixedSource("provider", providerStore),
+    ]);
+    const path = `/projects/${projectId}/sessions/${sessionId}?view=canonical`;
+
+    const first = await routes.request(path);
+    const second = await routes.request(path);
+    for (const response of [first, second]) {
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.messages[0]).toMatchObject({
+        codexCanonicalRefresh: true,
+        codexThreadItem: { id: "agent-provider" },
+      });
+    }
+
+    await providerStore.append(
+      testDraft(
+        "future/item/delta",
+        { opaque: true },
+        { sessionId, eventId: "future-event" },
+      ),
+    );
+    const appended = await routes.request(path);
+    const appendedBody = await appended.json();
+    expect(
+      appendedBody.messages.some(
+        (message: { warningKind?: string }) =>
+          message.warningKind === "unknown_codex_notification",
+      ),
+    ).toBe(true);
+    expect(replay).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the normalized legacy response unchanged without a journal", async () => {
+    const routes = createTestRoutes("legacy answer", []);
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0]).toMatchObject({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "legacy answer" }],
+      },
+    });
+    expect(body.messages[0].codexThreadItem).toBeUndefined();
+    expect(body.messages[0].codexCanonicalRefresh).toBeUndefined();
+  });
+
+  it("defaults to legacy normalization even when a canonical journal exists", async () => {
+    // A populated provider journal must NOT trigger canonical overlay
+    // unless the caller explicitly opts in via view=canonical.
+    const providerStore = await seededStore(
+      "thread-provider",
+      "turn-provider",
+      "agent-provider",
+      "provider answer",
+    );
+    const routes = createTestRoutes("legacy answer", [
+      fixedSource("provider", providerStore),
+    ]);
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0]).toMatchObject({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "legacy answer" }],
+      },
+    });
+    expect(body.messages[0].codexThreadItem).toBeUndefined();
+    expect(body.messages[0].codexCanonicalRefresh).toBeUndefined();
+    expect(body.messages[0].codexThreadId).toBeUndefined();
+  });
+
+  it("surfaces persisted provider failures in the default lightweight view", async () => {
+    const providerStore = new InMemoryCodexEventStore({ now: () => 2_000 });
+    await providerStore.append(
+      testDraft(
+        "error",
+        {
+          threadId: "thread-provider",
+          turnId: "turn-provider",
+          willRetry: true,
+          error: {
+            message: "server overloaded",
+            codexErrorInfo: "serverOverloaded",
+          },
+        },
+        {
+          sessionId,
+          eventId: "retry-event",
+          receivedAtMs: Date.parse("2026-08-08T00:00:02.000Z"),
+        },
+      ),
+    );
+    await providerStore.append(
+      testDraft(
+        "error",
+        {
+          threadId: "thread-provider",
+          turnId: "turn-provider",
+          willRetry: false,
+          error: { message: "unknown Codex error" },
+        },
+        {
+          sessionId,
+          eventId: "terminal-event",
+          receivedAtMs: Date.parse("2026-08-08T00:00:03.000Z"),
+        },
+      ),
+    );
+    const routes = createTestRoutes("legacy answer", [
+      fixedSource("provider", providerStore),
+    ]);
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.messages).toHaveLength(3);
+    expect(body.messages[0]).toMatchObject({ type: "assistant" });
+    expect(body.messages[1]).toMatchObject({
+      type: "system",
+      warningKind: "codex_provider_retry",
+      willRetry: true,
+    });
+    expect(body.messages[2]).toMatchObject({
+      type: "error",
+      error: "server overloaded",
+      codexRetryExhausted: true,
+      codexCanonicalRefresh: true,
+    });
+    expect(body.session).toMatchObject({
+      lastTurnStatus: "failed",
+      lastErrorMessage: "server overloaded",
+    });
+  });
+
+  it("does not consult an old bridge full journal for the normal lightweight view", async () => {
+    const bridgeStore = await seededStore(
+      "thread-bridge",
+      "turn-bridge",
+      "agent-bridge",
+      "bridge-only answer",
+    );
+    const createStore = vi.fn(() => bridgeStore);
+    const routes = createTestRoutes("rollout answer", [
+      {
+        id: "bridge",
+        legacyBridgeFull: true,
+        createStore,
+      },
+    ]);
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}`,
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(JSON.stringify(body)).toContain("rollout answer");
+    expect(JSON.stringify(body)).not.toContain("bridge-only answer");
+    expect(createStore).not.toHaveBeenCalled();
+  });
+
+  it("falls back to normalized rollout when the canonical journal is unreadable", async () => {
+    // An unreadable journal now fails at the freshness probe rather than at
+    // replay, because source selection has to compare journals before choosing
+    // one. Either way the request must fall back to legacy normalization.
+    const failingStore = {
+      latestEventAtMs: vi.fn(async () => {
+        throw new Error("synthetic canonical read failure");
+      }),
+      replay: vi.fn(async () => {
+        throw new Error("synthetic canonical read failure");
+      }),
+    } as unknown as CodexEventStore;
+    const routes = createTestRoutes("legacy fallback", [
+      fixedSource("provider", failingStore),
+    ]);
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.messages[0]?.message?.content).toMatchObject([
+      { type: "text", text: "legacy fallback" },
+    ]);
+    expect(body.messages[0]?.codexCanonicalRefresh).toBeUndefined();
+    expect(body.codexCanonicalView).toMatchObject({
+      requested: true,
+      source: "rollout",
+      sourceKind: "rollout",
+      coverage: "rollout-only",
+      fallback: "rollout",
+      fallbackReason: "canonical_read_failed",
+    });
+    expect(failingStore.latestEventAtMs).toHaveBeenCalledOnce();
+  });
+
+  it("keeps canonical refresh paths intact without mutating rollout input", async () => {
+    const managedPath = "/tmp/yep-test/uploads/session-1/report.pdf";
+    const prompt = `Review report\n\nUser uploaded files:\n- report.pdf (4.0 KB, application/pdf): ${managedPath}`;
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2026-08-08T00:00:00.500Z",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: prompt }],
+        },
+      },
+      {
+        type: "response_item",
+        timestamp: "2026-08-08T00:00:01.000Z",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "provider answer" }],
+        },
+      },
+    ];
+    const providerStore = await seededStore(
+      "thread-provider",
+      "turn-provider",
+      "agent-provider",
+      "provider answer",
+    );
+    const routes = createTestRoutes(
+      "provider answer",
+      [fixedSource("provider", providerStore)],
+      { entries, title: prompt },
+    );
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("[managed attachment]");
+    expect(serialized).toContain(managedPath);
+    expect(body.session.title).toContain(managedPath);
+    expect(JSON.stringify(entries)).toContain(managedPath);
+  });
+
+  it("rebuilds only live generated manifests from the selected journal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-artifact-refresh-"));
+    tempRoots.push(root);
+    const workspace = join(root, "workspace");
+    const uploadsDir = join(root, "uploads");
+    const eventStorePath = join(root, "events.jsonl");
+    await Promise.all([
+      mkdir(workspace, { recursive: true }),
+      mkdir(uploadsDir, { recursive: true }),
+    ]);
+    await writeFile(join(workspace, "refresh.txt"), "safe refresh\n");
+    const nowMs = Date.now();
+
+    const writer = new JsonlCodexEventStore({
+      filePath: eventStorePath,
+      now: () => 1_000,
+    });
+    const persisted = await writer.append(
+      testDraft(
+        "item/completed",
+        {
+          threadId: "thread-provider",
+          turnId: "turn-provider",
+          item: {
+            id: "file-provider",
+            type: "fileChange",
+            status: "completed",
+            changes: [{ path: "refresh.txt", kind: { type: "add" }, diff: "" }],
+          },
+        },
+        { sessionId, eventId: "provider-file-event" },
+      ),
+    );
+    const uploadManager = new UploadManager({ uploadsDir });
+    const materializer = new GeneratedArtifactMaterializer({
+      uploadManager,
+      now: () => nowMs,
+      retentionMs: 10_000,
+    });
+    const live = await materializer.materialize(
+      {
+        lifecycle: "completed",
+        item: {
+          id: "file-provider",
+          type: "fileChange",
+          status: "completed",
+          changes: [{ path: "refresh.txt", kind: { type: "add" }, diff: "" }],
+        },
+        threadId: "thread-provider",
+        turnId: "turn-provider",
+      },
+      {
+        projectId,
+        sessionId,
+        taskId: "task-provider",
+        workspaceRoot: workspace,
+        threadId: "thread-provider",
+        turnId: "turn-provider",
+        canonicalEventId: persisted.event.eventId,
+        canonicalEventSequence: persisted.event.sequence,
+      },
+    );
+    expect(live.artifacts).toHaveLength(1);
+
+    const reopenedManager = new UploadManager({ uploadsDir });
+    const routes = createTestRoutes(
+      "provider answer",
+      [
+        {
+          id: "provider",
+          createStore: () =>
+            new JsonlCodexEventStore({ filePath: eventStorePath }),
+        },
+      ],
+      {
+        generatedArtifactUploadManager: {
+          listReplayableGeneratedArtifacts: (scope, events) =>
+            reopenedManager.listReplayableGeneratedArtifacts(
+              scope,
+              events,
+              nowMs + 500,
+            ),
+        },
+      },
+    );
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+    const body = await response.json();
+    const artifactMessage = body.messages.find(
+      (message: { codexGeneratedArtifacts?: unknown }) =>
+        Array.isArray(message.codexGeneratedArtifacts),
+    );
+    expect(artifactMessage?.codexGeneratedArtifacts).toEqual(live.artifacts);
+
+    const warmResponse = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+    const warmBody = await warmResponse.json();
+    const warmArtifactMessage = warmBody.messages.find(
+      (message: { codexGeneratedArtifacts?: unknown }) =>
+        Array.isArray(message.codexGeneratedArtifacts),
+    );
+    expect(warmArtifactMessage?.codexGeneratedArtifacts).toEqual(
+      live.artifacts,
+    );
+
+    const artifact = live.artifacts[0];
+    if (!artifact) throw new Error("missing live artifact");
+    const registryPath = join(
+      uploadsDir,
+      projectId,
+      sessionId,
+      ".generated",
+      `${artifact.id}.json`,
+    );
+    await rename(registryPath, `${registryPath}.missing`);
+    const missingResponse = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+    expect(JSON.stringify(await missingResponse.json())).not.toContain(
+      artifact.id,
+    );
+  });
+});
+
+function fixedSource(
+  id: string,
+  store: CodexEventStore,
+  options: { legacyBridgeFull?: boolean } = {},
+): CodexEventStoreSource {
+  return {
+    id,
+    ...(options.legacyBridgeFull ? { legacyBridgeFull: true } : {}),
+    createStore: () => store,
+  };
+}
+
+async function seededStore(
+  threadId: string,
+  turnId: string,
+  itemId: string,
+  text: string,
+): Promise<InMemoryCodexEventStore> {
+  const store = new InMemoryCodexEventStore({ now: () => 2_000 });
+  await store.append(
+    testDraft(
+      "item/completed",
+      {
+        threadId,
+        turnId,
+        item: {
+          id: itemId,
+          type: "agentMessage",
+          text,
+          phase: "final_answer",
+        },
+      },
+      { sessionId, eventId: `${itemId}-event` },
+    ),
+  );
+  return store;
+}
+
+function createTestRoutes(
+  text: string,
+  codexEventStoreSources: readonly CodexEventStoreSource[],
+  options: {
+    entries?: CodexSessionEntry[];
+    title?: string;
+    generatedArtifactUploadManager?: SessionsDeps["generatedArtifactUploadManager"];
+    canonicalOverlayBudgetMs?: number;
+  } = {},
+) {
+  const project: Project = {
+    id: projectId,
+    path: "/tmp/codex-project",
+    name: "codex-project",
+    sessionCount: 1,
+    sessionDir: "/tmp/codex-sessions",
+    activeOwnedCount: 0,
+    activeExternalCount: 0,
+    lastActivity: null,
+    provider: "codex",
+  };
+  const entries: CodexSessionEntry[] = options.entries ?? [
+    {
+      type: "response_item",
+      timestamp: "2026-08-08T00:00:01.000Z",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      },
+    },
+  ];
+  const loaded: LoadedSession = {
+    summary: {
+      id: sessionId,
+      projectId,
+      title: options.title ?? "Codex session",
+      fullTitle: options.title ?? "Codex session",
+      createdAt: "2026-08-08T00:00:00.000Z",
+      updatedAt: "2026-08-08T00:00:01.000Z",
+      messageCount: entries.length,
+      ownership: { owner: "none" },
+      provider: "codex",
+    },
+    data: {
+      provider: "codex",
+      session: { entries },
+    },
+  };
+
+  return createSessionsRoutes({
+    supervisor: {} as SessionsDeps["supervisor"],
+    runtimeController: {
+      getProcessSnapshotForSession: vi.fn(async () => null),
+      wasEverOwned: vi.fn(async () => false),
+    } as unknown as NonNullable<SessionsDeps["runtimeController"]>,
+    sessionInteractionService: {
+      getPendingInput: vi.fn(async () => null),
+    } as unknown as SessionInteractionService,
+    scanner: {
+      getOrCreateProject: vi.fn(async () => project),
+    } as unknown as SessionsDeps["scanner"],
+    readerFactory: vi.fn(
+      () =>
+        ({
+          getSession: vi.fn(async () => structuredClone(loaded)),
+        }) as unknown as ReturnType<SessionsDeps["readerFactory"]>,
+    ),
+    codexEventStoreSources,
+    ...(options.canonicalOverlayBudgetMs === undefined
+      ? {}
+      : { canonicalOverlayBudgetMs: options.canonicalOverlayBudgetMs }),
+    ...(options.generatedArtifactUploadManager
+      ? {
+          generatedArtifactUploadManager:
+            options.generatedArtifactUploadManager,
+        }
+      : {}),
+  });
+}
+
+/**
+ * Ordering contract around the event ceiling.
+ *
+ * The ceiling used to be evaluated inside the overlay, i.e. after the journal
+ * replay *and* after the generated-artifact scan had already walked every
+ * replayed event. A session above the ceiling therefore paid for that scan on
+ * every request and had the result discarded by the next statement. On the real
+ * 144k-event session that waste measured 25-39 ms warm and ~1 s on a cold store,
+ * repeated 692 times in one day's logs.
+ */
+describe("sessions route canonical ceiling ordering", () => {
+  /**
+   * A journal that is mostly filler so it clears the ceiling, with a few real
+   * items at the tail so a windowed overlay leaves observable traces.
+   */
+  function oversizedStore(fillerCount: number): CodexEventStore {
+    const filler = Array.from({ length: fillerCount }, (_, index) =>
+      testEvent(index + 1, "warning", { message: `w${index}` }),
+    );
+    const items = Array.from({ length: 3 }, (_, index) =>
+      testEvent(
+        fillerCount + index + 1,
+        "item/completed",
+        {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            id: `tail-item-${index + 1}`,
+            type: "agentMessage",
+            text: `tail answer ${index + 1}`,
+          },
+        },
+        { eventId: `tail-event-${index + 1}` },
+      ),
+    );
+    const events = [...filler, ...items];
+    return {
+      append: vi.fn(),
+      appendMany: vi.fn(),
+      latestSequence: vi.fn(async () => events.length),
+      latestEventAtMs: vi.fn(async () => events.at(-1)?.receivedAtMs ?? 0),
+      replay: vi.fn(async () => events),
+    } as unknown as CodexEventStore;
+  }
+
+  it("skips the generated-artifact scan for an unwindowed journal above the ceiling", async () => {
+    const listReplayableGeneratedArtifacts = vi.fn(async () => []);
+    const routes = createTestRoutes(
+      "provider answer",
+      [fixedSource("provider", oversizedStore(100_001))],
+      { generatedArtifactUploadManager: { listReplayableGeneratedArtifacts } },
+    );
+
+    // No maxMessages, so the request cannot be windowed and the ceiling applies.
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(listReplayableGeneratedArtifacts).not.toHaveBeenCalled();
+    // Legacy normalization still answers the request, with no canonical rows.
+    const body = await response.json();
+    expect(body.messages).toHaveLength(1);
+    expect(JSON.stringify(body.messages[0].message.content)).toContain(
+      "provider answer",
+    );
+    expect(
+      body.messages.some(
+        (message: { codexThreadItem?: unknown }) =>
+          message.codexThreadItem !== undefined,
+      ),
+    ).toBe(false);
+  });
+
+  it("still overlays a windowed journal above the ceiling", async () => {
+    const listReplayableGeneratedArtifacts = vi.fn(async () => []);
+    const routes = createTestRoutes(
+      "provider answer",
+      [fixedSource("provider", oversizedStore(100_001))],
+      { generatedArtifactUploadManager: { listReplayableGeneratedArtifacts } },
+    );
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical&maxMessages=50`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    // The observable proof that the overlay ran: canonical rows from the tail
+    // are present. Asserting only that the artifact scan happened would pass
+    // against the old ordering too, where the scan ran before the rejection.
+    const canonical = body.messages.filter(
+      (message: { codexThreadItem?: { id?: string } }) =>
+        message.codexThreadItem !== undefined,
+    );
+    expect(canonical).toHaveLength(3);
+    expect(
+      canonical.map((message: { codexThreadItem: { id?: string } }) =>
+        String(message.codexThreadItem.id),
+      ),
+    ).toEqual(["tail-item-1", "tail-item-2", "tail-item-3"]);
+    expect(listReplayableGeneratedArtifacts).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The budget bounds the overlay, not the journal load.
+ *
+ * The 2 s clock used to start when the canonical phase began, so journal
+ * selection and replay were charged to it. Journal replay is an uninterruptible
+ * cold-load cost -- measured at 3.4 s per store on a production journal, against
+ * a 2 s budget -- so the very first canonical request after every restart was
+ * denied its overlay because *loading* was slow, not because projecting was.
+ * Live logs showed exactly one such fallback ~17 s after each of the last three
+ * restarts.
+ */
+describe("sessions route canonical overlay budget", () => {
+  /** A store whose replay is slow enough to exhaust a small budget on its own. */
+  function slowStore(
+    events: readonly CodexEventEnvelope[],
+    replayDelayMs: number,
+  ): CodexEventStore {
+    const sleep = (ms: number) =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+    return {
+      append: vi.fn(),
+      appendMany: vi.fn(),
+      latestSequence: vi.fn(async () => events.at(-1)?.sequence ?? 0),
+      latestEventAtMs: vi.fn(async () => events.at(-1)?.receivedAtMs ?? 0),
+      replay: vi.fn(async () => {
+        await sleep(replayDelayMs);
+        return events;
+      }),
+    } as unknown as CodexEventStore;
+  }
+
+  const canonicalItem = testEvent(
+    1,
+    "item/completed",
+    {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: {
+        id: "budget-item",
+        type: "agentMessage",
+        text: "budget answer",
+      },
+    },
+    { eventId: "budget-event" },
+  );
+
+  it("still overlays when the journal load alone outlasts the budget", async () => {
+    const routes = createTestRoutes(
+      "provider answer",
+      [fixedSource("provider", slowStore([canonicalItem], 120))],
+      { canonicalOverlayBudgetMs: 60 },
+    );
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    // 120 ms of replay against a 60 ms budget: under the old clock the first
+    // deadline check inside the overlay tripped immediately and the response
+    // fell back to legacy normalization with no canonical rows at all.
+    const canonical = body.messages.filter(
+      (message: { codexThreadItem?: { id?: string } }) =>
+        message.codexThreadItem !== undefined,
+    );
+    expect(canonical).toHaveLength(1);
+    expect(String(canonical[0].codexThreadItem.id)).toBe("budget-item");
+  });
+
+  it("still enforces the budget on work that happens after the load", async () => {
+    // The budget must remain a real bound on everything it now covers. The
+    // generated-artifact scan runs inside the window on purpose: it walks every
+    // replayed event, so it is exactly the kind of post-load work that has to be
+    // bounded rather than excluded along with the replay.
+    const routes = createTestRoutes(
+      "provider answer",
+      [fixedSource("provider", slowStore([canonicalItem], 0))],
+      {
+        canonicalOverlayBudgetMs: 10,
+        generatedArtifactUploadManager: {
+          listReplayableGeneratedArtifacts: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            return [];
+          },
+        },
+      },
+    );
+
+    const response = await routes.request(
+      `/projects/${projectId}/sessions/${sessionId}?view=canonical`,
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(
+      body.messages.some(
+        (message: { codexThreadItem?: unknown }) =>
+          message.codexThreadItem !== undefined,
+      ),
+    ).toBe(false);
+  });
+});

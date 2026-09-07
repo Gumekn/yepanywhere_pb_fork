@@ -38,9 +38,6 @@ export function AboutSettings() {
     useState<DeploymentStatusResponse | null>(null);
   const [deploymentLoading, setDeploymentLoading] = useState(false);
   const [deploymentError, setDeploymentError] = useState<string | null>(null);
-  const [deploymentSuccess, setDeploymentSuccess] = useState<string | null>(
-    null,
-  );
 
   // Fetch worker activity on mount
   useEffect(() => {
@@ -51,22 +48,19 @@ export function AboutSettings() {
       .catch(() => {});
   }, []);
 
-  const refreshDeploymentStatus = useCallback(
-    async (fresh = false) => {
-      if (!deploymentCapable) return;
+  const refreshDeploymentStatus = useCallback(async () => {
+    if (!deploymentCapable) return;
 
-      setDeploymentLoading(true);
-      try {
-        setDeploymentStatus(await api.getDeploymentStatus(fresh));
-        setDeploymentError(null);
-      } catch (err) {
-        setDeploymentError(getErrorMessage(err));
-      } finally {
-        setDeploymentLoading(false);
-      }
-    },
-    [deploymentCapable],
-  );
+    setDeploymentLoading(true);
+    try {
+      setDeploymentStatus(await api.getDeploymentStatus());
+      setDeploymentError(null);
+    } catch (err) {
+      setDeploymentError(getErrorMessage(err));
+    } finally {
+      setDeploymentLoading(false);
+    }
+  }, [deploymentCapable]);
 
   // When activity bus reconnects after restart, clear restarting state
   useEffect(() => {
@@ -80,21 +74,19 @@ export function AboutSettings() {
   }, [refetchVersionFresh, refreshDeploymentStatus, restarting]);
 
   useEffect(() => {
-    // 挂载即主动 git fetch origin，满足“别的电脑 push 到 origin 后，本机打开设置页即能检测到 GitHub 有新版本”。
-    void refreshDeploymentStatus(true);
+    void refreshDeploymentStatus();
   }, [refreshDeploymentStatus]);
 
   const handleCheckUpdates = useCallback(async () => {
     await Promise.allSettled([
       refetchVersionFresh(),
-      refreshDeploymentStatus(true),
+      refreshDeploymentStatus(),
     ]);
   }, [refetchVersionFresh, refreshDeploymentStatus]);
 
   const handleRestart = useCallback(async () => {
     setRestarting(true);
     setDeploymentError(null);
-    setDeploymentSuccess(null);
     try {
       if (deploymentCapable) {
         const { job } = await api.startDeployment({ action: "server-restart" });
@@ -117,13 +109,7 @@ export function AboutSettings() {
   useEffect(() => {
     if (!restarting || !restartJobId) return;
 
-    // 兜底：轮询超过 15 分钟仍未拿到终态（极端情况下服务端彻底失联），
-    // 强制解除“更新中”，避免按钮永久卡死。
-    const MAX_ATTEMPTS = 360; // 2.5s * 360 ≈ 15 分钟
-    let attempts = 0;
-
     const interval = window.setInterval(() => {
-      attempts += 1;
       void api
         .getDeploymentJob(restartJobId)
         .then(({ job }) => {
@@ -133,34 +119,19 @@ export function AboutSettings() {
 
           if (job.status === "running") return;
 
-          // 任务结束：无论成功/失败都先解除“更新中”状态
           setRestartJobId(null);
           setRestarting(false);
 
           if (job.status === "failed") {
-            setDeploymentSuccess(null);
-            setDeploymentError(
-              job.errorReason
-                ? `更新失败：${job.errorReason}`
-                : t("aboutRestartDeployFailed"),
-            );
+            setDeploymentError(t("aboutRestartDeployFailed"));
             return;
           }
 
-          // 更新成功
-          setDeploymentError(null);
-          setDeploymentSuccess(t("aboutDeploySuccess"));
           void refetchVersionFresh();
           void refreshDeploymentStatus();
         })
         .catch(() => {
-          // 服务端在重启过程中可能短暂不可用，继续轮询；超过上限则兜底退出。
-          if (attempts >= MAX_ATTEMPTS) {
-            window.clearInterval(interval);
-            setRestartJobId(null);
-            setRestarting(false);
-            setDeploymentError(t("aboutDeployStatusUnknown"));
-          }
+          // The server can be unavailable briefly while the deploy job restarts it.
         });
     }, 2500);
 
@@ -189,50 +160,6 @@ export function AboutSettings() {
   const hasRegistryUpdate =
     !!versionInfo?.updateAvailable && !!versionInfo.latest;
   const showRegistryUpdate = hasRegistryUpdate && !usesLocalDeployment;
-
-  // Handler for "Update Now" button
-  const handleUpdateNow = useCallback(async () => {
-    setRestarting(true);
-    setDeploymentError(null);
-    setDeploymentSuccess(null);
-    try {
-      const { job } = await api.startDeployment({ action: "git-pull-update" });
-      setRestartJobId(job.id);
-      setDeploymentStatus((current) =>
-        current ? { ...current, currentJob: job } : current,
-      );
-    } catch (err) {
-      setDeploymentError(getErrorMessage(err));
-      setRestarting(false);
-    }
-  }, []);
-
-  // Handler for "Update to Local" button.
-  // skipChecks:true because for self-hosted production updates the deploy
-  // script's biome:check / typecheck preflight is a development-time gate and
-  // shouldn't block end users from picking up local fixes (it also runs on the
-  // build machine before release, so the artifact already passed those checks).
-  // The git-pull-update path is left unchanged — its preflight also covers
-  // real environment checks (native push, session title, local media) that
-  // should not be skipped.
-  const handleUpdateToLocal = useCallback(async () => {
-    setRestarting(true);
-    setDeploymentError(null);
-    setDeploymentSuccess(null);
-    try {
-      const { job } = await api.startDeployment({
-        action: "server",
-        skipChecks: true,
-      });
-      setRestartJobId(job.id);
-      setDeploymentStatus((current) =>
-        current ? { ...current, currentJob: job } : current,
-      );
-    } catch (err) {
-      setDeploymentError(getErrorMessage(err));
-      setRestarting(false);
-    }
-  }, []);
 
   return (
     <section className="settings-section">
@@ -267,190 +194,79 @@ export function AboutSettings() {
         <div className="settings-item">
           <div className="settings-item-info">
             <strong>{t("aboutVersionTitle")}</strong>
-
-            {/* Git Version Information */}
-            {deploymentStatus?.available && (
-              <>
-                {/* Local Git Version */}
-                {deploymentStatus.localGitVersion && (
-                  <div style={{ marginTop: "12px" }}>
-                    <p style={{ fontWeight: "500" }}>
-                      {t("aboutLocalGitVersion")}
-                    </p>
-                    <p
-                      style={{
-                        marginLeft: "12px",
-                        fontSize: "0.9em",
-                        opacity: 0.8,
-                      }}
-                    >
-                      {t("aboutBranch")}:{" "}
-                      {deploymentStatus.localGitVersion.branch}
-                      <br />
-                      {t("aboutCommitHash")}:{" "}
-                      {deploymentStatus.localGitVersion.commitHash}
-                      <br />
-                      {t("aboutCommitDate")}:{" "}
-                      {new Date(
-                        deploymentStatus.localGitVersion.commitDate,
-                      ).toLocaleString()}
-                    </p>
-                  </div>
-                )}
-
-                {/* GitHub Version */}
-                {deploymentStatus.githubVersion && (
-                  <div style={{ marginTop: "12px" }}>
-                    <p style={{ fontWeight: "500" }}>
-                      {t("aboutGithubVersion")}
-                    </p>
-                    <p
-                      style={{
-                        marginLeft: "12px",
-                        fontSize: "0.9em",
-                        opacity: 0.8,
-                      }}
-                    >
-                      {t("aboutBranch")}:{" "}
-                      {deploymentStatus.githubVersion.branch}
-                      <br />
-                      {t("aboutCommitHash")}:{" "}
-                      {deploymentStatus.githubVersion.commitHash}
-                      <br />
-                      {t("aboutCommitDate")}:{" "}
-                      {new Date(
-                        deploymentStatus.githubVersion.commitDate,
-                      ).toLocaleString()}
-                    </p>
-                  </div>
-                )}
-
-                {/* Stable Version */}
-                {deploymentStatus.stableVersion && (
-                  <div style={{ marginTop: "12px" }}>
-                    <p style={{ fontWeight: "500" }}>
-                      {t("aboutStableVersion")}
-                    </p>
-                    <p
-                      style={{
-                        marginLeft: "12px",
-                        fontSize: "0.9em",
-                        opacity: 0.8,
-                      }}
-                    >
-                      {t("aboutBranch")}:{" "}
-                      {deploymentStatus.stableVersion.branch}
-                      <br />
-                      {t("aboutCommitHash")}:{" "}
-                      {deploymentStatus.stableVersion.commitHash}
-                      <br />
-                      {t("aboutCommitDate")}:{" "}
-                      {new Date(
-                        deploymentStatus.stableVersion.commitDate,
-                      ).toLocaleString()}
-                    </p>
-                  </div>
-                )}
-              </>
-            )}
-
-            {/* Legacy version display for non-deployment mode */}
-            {!deploymentStatus?.available && (
-              <>
-                <p>
-                  {t("aboutServerVersion")}{" "}
-                  {versionInfo ? (
-                    <>
-                      v{versionInfo.current}
-                      {showRegistryUpdate ? (
-                        <span className="settings-update-available">
-                          {" "}
-                          {t("aboutVersionAvailable", {
-                            version: versionInfo.latest ?? "",
-                          })}
-                        </span>
-                      ) : !hasRegistryUpdate && versionInfo.latest ? (
-                        <span className="settings-up-to-date">
-                          {" "}
-                          {t("aboutUpToDate")}
-                        </span>
-                      ) : null}
-                    </>
-                  ) : (
-                    t("loginLoading")
-                  )}
-                </p>
-                <p>
-                  {t("aboutClientVersion")} v{__APP_VERSION__}
-                  <br />
-                  <span style={{ opacity: 0.7 }}>
-                    {new Date(__BUILD_DATE__).toLocaleString()}
-                  </span>
-                </p>
-              </>
-            )}
-
+            <p>
+              {t("aboutServerVersion")}{" "}
+              {versionInfo ? (
+                <>
+                  v{versionInfo.current}
+                  {showRegistryUpdate ? (
+                    <span className="settings-update-available">
+                      {" "}
+                      {t("aboutVersionAvailable", {
+                        version: versionInfo.latest ?? "",
+                      })}
+                    </span>
+                  ) : !hasRegistryUpdate && versionInfo.latest ? (
+                    <span className="settings-up-to-date">
+                      {" "}
+                      {t("aboutUpToDate")}
+                    </span>
+                  ) : null}
+                </>
+              ) : (
+                t("loginLoading")
+              )}
+            </p>
+            <p>
+              {t("aboutClientVersion")} v{__APP_VERSION__}
+              <br />
+              <span style={{ opacity: 0.7 }}>
+                {new Date(__BUILD_DATE__).toLocaleString()}
+              </span>
+            </p>
             {versionError && (
               <p className="settings-warning">{t("aboutUnableRefresh")}</p>
             )}
             {showRegistryUpdate && (
               <p className="settings-update-hint">{t("aboutUpdateHint")}</p>
             )}
+            {deploymentStatus?.available && (
+              <p>
+                {t("deploymentRepoVersion")}{" "}
+                {localPackageVersion ? `v${localPackageVersion}` : "unknown"}
+                {localPackageDiffers && (
+                  <span className="settings-update-available">
+                    {" "}
+                    {t("aboutLocalRepoUpdateAvailable")}
+                  </span>
+                )}
+                {deploymentStatus.stagedBuild && (
+                  <>
+                    <br />
+                    {t("deploymentStagedVersion")} v
+                    {deploymentStatus.stagedBuild.version}
+                    {stagedBuildDiffers && (
+                      <span className="settings-pending">
+                        {" "}
+                        {t("aboutStagedBundleOutdated")}
+                      </span>
+                    )}
+                  </>
+                )}
+              </p>
+            )}
             {deploymentError && (
               <p className="settings-warning">{deploymentError}</p>
             )}
-            {deploymentSuccess && (
-              <p className="settings-update-success">{deploymentSuccess}</p>
-            )}
           </div>
-          <div style={{ display: "flex", gap: "8px", flexDirection: "column" }}>
-            <button
-              type="button"
-              className="settings-button"
-              onClick={() => void handleCheckUpdates()}
-              disabled={checkingUpdates}
-            >
-              {checkingUpdates ? t("aboutChecking") : t("aboutCheckUpdates")}
-            </button>
-            {deploymentStatus?.hasGithubUpdate && (
-              <button
-                type="button"
-                className="settings-button settings-button-primary"
-                onClick={() => {
-                  if (window.confirm(t("aboutUpdateConfirmGithub"))) {
-                    void handleUpdateNow();
-                  }
-                }}
-                disabled={restarting}
-                style={{
-                  backgroundColor: "#4CAF50",
-                  color: "white",
-                  fontWeight: "bold",
-                }}
-              >
-                {restarting ? t("aboutUpdating") : t("aboutUpdateToGithub")}
-              </button>
-            )}
-            {deploymentStatus?.hasLocalUpdate && (
-              <button
-                type="button"
-                className="settings-button settings-button-primary"
-                onClick={() => {
-                  if (window.confirm(t("aboutUpdateConfirmLocal"))) {
-                    void handleUpdateToLocal();
-                  }
-                }}
-                disabled={restarting}
-                style={{
-                  backgroundColor: "#2196F3",
-                  color: "white",
-                  fontWeight: "bold",
-                }}
-              >
-                {restarting ? t("aboutUpdating") : t("aboutUpdateToLocal")}
-              </button>
-            )}
-          </div>
+          <button
+            type="button"
+            className="settings-button"
+            onClick={() => void handleCheckUpdates()}
+            disabled={checkingUpdates}
+          >
+            {checkingUpdates ? t("aboutChecking") : t("aboutCheckUpdates")}
+          </button>
         </div>
         <div className="settings-item">
           <div className="settings-item-info">
@@ -484,7 +300,7 @@ export function AboutSettings() {
             <p>{t("aboutReportBugDescription")}</p>
           </div>
           <a
-            href="https://github.com/kzahel/yepanywhere/issues"
+            href="https://github.com/hustc5622/yepanywhere/issues"
             target="_blank"
             rel="noopener noreferrer"
             className="settings-button"

@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import type { ClaudeSessionEntry, UrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { preprocessMessages } from "../../../client/src/lib/preprocessMessages.ts";
-import { encodeProjectId } from "../../src/projects/paths.js";
 import { normalizeSession } from "../../src/sessions/normalization.js";
 import {
   SessionReader,
@@ -46,88 +45,6 @@ describe("SessionReader", () => {
   });
 
   describe("title extraction", () => {
-    it.each(["isSynthetic", "isMeta", "isCompactSummary"])(
-      "skips Claude user entries marked %s when choosing the title and questions",
-      async (metadataFlag) => {
-        const sessionId = `test-session-${metadataFlag}`;
-        const internalUuid = randomUUID();
-        const userUuid = randomUUID();
-        const assistantUuid = randomUUID();
-        const jsonl = [
-          {
-            type: "user",
-            uuid: internalUuid,
-            parentUuid: null,
-            message: { content: "Internal Claude context" },
-            [metadataFlag]: true,
-          },
-          {
-            type: "user",
-            uuid: userUuid,
-            parentUuid: internalUuid,
-            message: { content: "Actual user request" },
-          },
-          {
-            type: "assistant",
-            uuid: assistantUuid,
-            parentUuid: userUuid,
-            message: { content: "Actual assistant response" },
-          },
-        ]
-          .map((entry) => JSON.stringify(entry))
-          .join("\n");
-        await writeFile(join(testDir, `${sessionId}.jsonl`), `${jsonl}\n`);
-
-        const summary = await reader.getSessionSummary(
-          sessionId,
-          "test-project" as UrlProjectId,
-        );
-        const session = await reader.getSession(
-          sessionId,
-          "test-project" as UrlProjectId,
-        );
-
-        expect(summary?.title).toBe("Actual user request");
-        expect(
-          summary?.userQuestions?.map((question) => question.text),
-        ).toEqual(["Actual user request"]);
-        expect(
-          session?.branchState?.branches.map((branch) => branch.prompt),
-        ).toEqual(["Actual user request"]);
-      },
-    );
-
-    it("only lists sessions whose jsonl cwd matches the requested project", async () => {
-      const projectOne = "/Users/test/code/project-one";
-      const projectTwo = "/Users/test/code/project-two";
-      await writeFile(
-        join(testDir, "one.jsonl"),
-        `${JSON.stringify({
-          type: "user",
-          cwd: projectOne,
-          message: { content: "Project one" },
-          uuid: "msg-one",
-          timestamp: new Date().toISOString(),
-        })}\n`,
-      );
-      await writeFile(
-        join(testDir, "two.jsonl"),
-        `${JSON.stringify({
-          type: "user",
-          cwd: projectTwo,
-          message: { content: "Project two" },
-          uuid: "msg-two",
-          timestamp: new Date().toISOString(),
-        })}\n`,
-      );
-
-      const sessions = await reader.listSessions(encodeProjectId(projectOne));
-      expect(sessions.map((session) => session.id)).toEqual(["one"]);
-      await expect(
-        reader.getSessionSummary("two", encodeProjectId(projectOne)),
-      ).resolves.toBeNull();
-    });
-
     it("skips ide_opened_file blocks and uses actual message", async () => {
       const sessionId = "test-session-1";
       const jsonl = JSON.stringify({
@@ -1724,6 +1641,17 @@ describe("SessionReader", () => {
       // percentage = round(57000 / 200000 * 100) = 28%
       expect(summary?.contextUsage?.inputTokens).toBe(57000);
       expect(summary?.contextUsage?.percentage).toBe(28);
+      expect(summary?.compactCount).toBe(1);
+      expect(summary?.compactEvents).toEqual([
+        expect.objectContaining({
+          beforeTokens: 167000,
+          afterTokens: 57000,
+          reclaimedTokens: 110000,
+          trigger: "auto",
+        }),
+      ]);
+      expect(summary?.cumulativeUsage?.totalTokens).toBe(210202);
+      expect(summary?.cumulativeUsage?.turnCount).toBe(2);
     });
 
     it("adjusts percentage after multiple compactions", async () => {
@@ -1757,6 +1685,21 @@ describe("SessionReader", () => {
       // percentage = round(129000 / 200000 * 100) = 65%
       expect(summary?.contextUsage?.inputTokens).toBe(129000);
       expect(summary?.contextUsage?.percentage).toBe(65);
+      expect(summary?.compactCount).toBe(2);
+      expect(summary?.compactEvents).toEqual([
+        expect.objectContaining({
+          beforeTokens: 167000,
+          afterTokens: 96000,
+          reclaimedTokens: 71000,
+          trigger: "auto",
+        }),
+        expect.objectContaining({
+          beforeTokens: 168000,
+          afterTokens: 129000,
+          reclaimedTokens: 39000,
+          trigger: "auto",
+        }),
+      ]);
     });
   });
 

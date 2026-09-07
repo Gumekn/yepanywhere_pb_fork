@@ -4,7 +4,11 @@ import { fileURLToPath } from "node:url";
 import type { CodexBranchState, CodexSessionEntry } from "@yep-anywhere/shared";
 import { describe, expect, it } from "vitest";
 import { preprocessMessages } from "../../../client/src/lib/preprocessMessages.ts";
-import { buildCodexBranchView } from "../../src/sessions/codex-rollback.js";
+import { publicCodexFileChangePath } from "../../src/codex/path-projection.js";
+import {
+  buildCodexBranchView,
+  computeCodexRollbackNumTurns,
+} from "../../src/sessions/codex-rollback.js";
 import { normalizeSession } from "../../src/sessions/normalization.js";
 import type { LoadedSession } from "../../src/sessions/types.js";
 
@@ -360,6 +364,139 @@ describe("Codex Normalization", () => {
     });
   });
 
+  it("preserves the native Codex item identity for live/disk reconciliation", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "message",
+          id: "msg-native-1",
+          role: "assistant",
+          phase: "commentary",
+          content: [{ type: "output_text", text: "Checking the repository." }],
+          internal_chat_message_metadata_passthrough: {
+            turn_id: "turn-native-1",
+          },
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+
+    expect(result.messages).toEqual([
+      expect.objectContaining({
+        codexTurnId: "turn-native-1",
+        codexCorrelationKey: "codex:turn-native-1:agent-message:msg-native-1",
+      }),
+    ]);
+  });
+
+  it("projects persisted user client identity onto the owning response item", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2026-08-27T09:31:11.130Z",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: "# AGENTS.md instructions for /repo" },
+          ],
+        },
+      },
+      {
+        type: "response_item",
+        timestamp: "2026-08-27T09:31:11.197Z",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: "Inspect the screenshot" },
+            {
+              type: "input_text",
+              text: '<image name=[Image #1] path="/tmp/screenshot.png">',
+            },
+            {
+              type: "input_image",
+              image_url: "data:image/png;base64,AA==",
+            },
+            { type: "input_text", text: "</image>" },
+          ],
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2026-08-27T09:31:11.198Z",
+        payload: {
+          type: "user_message",
+          client_id: "client-message-1",
+          message: "Inspect the screenshot",
+          images: [],
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    const prompt = result.messages.find(
+      (message) => message.clientUserMessageId === "client-message-1",
+    );
+
+    expect(prompt).toMatchObject({
+      type: "user",
+      clientUserMessageId: "client-message-1",
+      codexCorrelationKey: "codex:user-message:client-message-1",
+    });
+    expect(prompt?.uuid).not.toBe("client-message-1");
+    expect(
+      result.messages.find((message) =>
+        firstMessageText(message)?.startsWith("# AGENTS.md instructions"),
+      ),
+    ).not.toHaveProperty("clientUserMessageId");
+  });
+
+  it("projects current item_completed user identity onto the owning response item", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2026-09-01T11:47:42.595Z",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Inspect the duplicate" }],
+          internal_chat_message_metadata_passthrough: {
+            turn_id: "turn-current-user-1",
+          },
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2026-09-01T11:47:42.597Z",
+        payload: {
+          type: "item_completed",
+          turn_id: "turn-current-user-1",
+          item: {
+            type: "UserMessage",
+            id: "native-user-item-1",
+            client_id: "client-current-user-1",
+            content: [{ type: "text", text: "Inspect the duplicate" }],
+          },
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+
+    expect(result.messages).toEqual([
+      expect.objectContaining({
+        type: "user",
+        codexTurnId: "turn-current-user-1",
+        clientUserMessageId: "client-current-user-1",
+        codexCorrelationKey: "codex:user-message:client-current-user-1",
+      }),
+    ]);
+  });
+
   it("applies Codex thread_rolled_back markers before normalizing", () => {
     const entries: CodexSessionEntry[] = [
       codexUserMessage("q1", 1),
@@ -586,6 +723,80 @@ describe("Codex Normalization", () => {
       query: "weather: Shanghai",
       results: [],
       codexActionLabel: "Search: weather: Shanghai",
+    });
+  });
+
+  it("normalizes a Codex web.run function_call into a WebSearch row with a derived action", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "function_call",
+          name: "run",
+          namespace: "web",
+          call_id: "call-web-run",
+          arguments: JSON.stringify({
+            search_query: [{ q: "bilibili video downloader" }],
+            response_length: "long",
+          }),
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+
+    const renderItems = preprocessMessages(normalized.messages);
+    const webSearchItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "WebSearch",
+    );
+
+    expect(webSearchItem?.type).toBe("tool_call");
+    if (webSearchItem?.type !== "tool_call") {
+      throw new Error("Expected WebSearch render item");
+    }
+
+    expect(webSearchItem.toolName).toBe("WebSearch");
+    expect(webSearchItem.toolInput).toMatchObject({
+      query: "bilibili video downloader",
+      action: {
+        type: "search",
+        query: "bilibili video downloader",
+      },
+    });
+  });
+
+  it("derives find_in_page action for a Codex web.run function_call", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "function_call",
+          name: "run",
+          namespace: "web",
+          call_id: "call-web-find",
+          arguments: JSON.stringify({
+            find: [{ ref_id: "turn2view2", pattern: "--cookies-from-browser" }],
+          }),
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const webSearchItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "WebSearch",
+    );
+
+    if (webSearchItem?.type !== "tool_call") {
+      throw new Error("Expected WebSearch render item");
+    }
+    expect(webSearchItem.toolInput).toMatchObject({
+      action: {
+        type: "find_in_page",
+        pattern: "--cookies-from-browser",
+      },
     });
   });
 
@@ -870,6 +1081,311 @@ describe("Codex Normalization", () => {
         cmd: "pnpm lint",
         command: "pnpm lint",
       },
+    });
+  });
+
+  it("normalizes Codex code-mode exec scripts into an Exec tool row", () => {
+    const script =
+      'const result = await tools.exec_command({cmd: "pnpm test", yield_time_ms: 30000});';
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "custom_tool_call",
+          call_id: "call-code-exec",
+          name: "exec",
+          input: script,
+        },
+      },
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:02Z",
+        payload: {
+          type: "custom_tool_call_output",
+          call_id: "call-code-exec",
+          output: [
+            {
+              type: "input_text",
+              text: "Script completed\nWall time 0.2 seconds\nOutput:\n",
+            },
+            { type: "input_text", text: "Tests passed" },
+          ],
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    const toolUseContent = result.messages[0]?.message?.content;
+    const block = Array.isArray(toolUseContent)
+      ? toolUseContent[0]
+      : toolUseContent;
+
+    expect(block).toMatchObject({
+      type: "tool_use",
+      id: "call-code-exec",
+      name: "CodexExec",
+      input: { script },
+    });
+
+    const toolResultMessage = result.messages[1];
+    const toolResultContent = toolResultMessage?.message?.content;
+    expect(
+      Array.isArray(toolResultContent)
+        ? toolResultContent[0]
+        : toolResultContent,
+    ).toMatchObject({
+      type: "tool_result",
+      tool_use_id: "call-code-exec",
+      content: "Script completed\nWall time 0.2 seconds\nOutput:\nTests passed",
+    });
+    expect(toolResultMessage?.toolUseResult).toEqual([
+      {
+        type: "input_text",
+        text: "Script completed\nWall time 0.2 seconds\nOutput:\n",
+      },
+      { type: "input_text", text: "Tests passed" },
+    ]);
+  });
+
+  it("projects code-mode patch_apply_end events into completed Edit rows", () => {
+    const entries = loadCodexFixtureEntries("code-mode-apply-patch");
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const editItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "Edit",
+    );
+
+    expect(normalized.messages).toHaveLength(4);
+    expect(editItem?.type).toBe("tool_call");
+    if (editItem?.type !== "tool_call") {
+      throw new Error(
+        "Expected patch_apply_end to produce an Edit render item",
+      );
+    }
+
+    expect(editItem.status).toBe("complete");
+    expect(editItem.id).toBe("exec-inner-patch");
+    expect(editItem.toolInput).toMatchObject({
+      changes: [
+        {
+          path: "/repo/src/a.ts",
+          kind: "add",
+          diff: "export const value = 1;\n",
+        },
+        {
+          path: "/repo/src/z.ts",
+          kind: "update",
+          diff: "@@ -1 +1 @@\n-old\n+new\n",
+        },
+      ],
+    });
+    expect(editItem.toolResult?.content).toContain(
+      "Success. Updated the following files:",
+    );
+  });
+
+  it("restores temp and Downloads filenames from existing code-mode JSONL patches", () => {
+    const paths = [
+      "/var/folders/aa/private-user/T/authoring_run/api_request.py",
+      "/Users/private-user/Downloads/report/api_request.py",
+    ];
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "session_meta",
+        timestamp: "2026-08-26T12:00:00Z",
+        payload: {
+          id: "test-session",
+          timestamp: "2026-08-26T12:00:00Z",
+          cwd: "/repo",
+        },
+      },
+      ...paths.map(
+        (path, i) =>
+          ({
+            type: "event_msg",
+            timestamp: `2026-08-26T12:00:0${i + 1}Z`,
+            payload: {
+              type: "patch_apply_end",
+              call_id: `patch-${i}`,
+              success: true,
+              stdout: `Success. Updated the following files:\nA ${path}`,
+              stderr: "",
+              changes: { [path]: { type: "add", content: "import json\n" } },
+            },
+          }) as CodexSessionEntry,
+      ),
+    ];
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const edits = preprocessMessages(normalized.messages).filter(
+      (item) => item.type === "tool_call" && item.toolName === "Edit",
+    );
+    expect(edits).toHaveLength(2);
+    for (const [index, path] of paths.entries()) {
+      const edit = edits[index];
+      if (edit?.type !== "tool_call") throw new Error("Expected Edit row");
+      expect(edit.toolInput).toMatchObject({
+        file_path: publicCodexFileChangePath(path),
+      });
+      expect(edit.toolResult?.content).toContain(
+        publicCodexFileChangePath(path),
+      );
+    }
+    expect(JSON.stringify(edits)).not.toContain("[path hidden]");
+    expect(JSON.stringify(edits)).toContain("private-user");
+  });
+
+  it("surfaces a literal code-mode update_plan alongside the outer exec", () => {
+    const script = `
+      const plan = await tools.update_plan({
+        explanation: "Starting verification",
+        plan: [
+          { step: "Inspect changes", status: "completed" },
+          { step: "Run tests", status: "inProgress" }
+        ]
+      });
+      const result = await tools.exec_command({ cmd: "pnpm test" });
+      text(JSON.stringify({ plan, result }));
+    `;
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "custom_tool_call",
+          call_id: "call-code-plan",
+          name: "exec",
+          input: script,
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    const content = result.messages[0]?.message?.content;
+
+    expect(content).toEqual([
+      {
+        type: "tool_use",
+        id: "call-code-plan",
+        name: "CodexExec",
+        input: { script },
+      },
+      {
+        type: "tool_use",
+        id: "call-code-plan-update-plan",
+        name: "UpdatePlan",
+        input: {
+          explanation: "Starting verification",
+          plan: [
+            { step: "Inspect changes", status: "completed" },
+            { step: "Run tests", status: "in_progress" },
+          ],
+        },
+        status: "completed",
+      },
+    ]);
+  });
+
+  it("does not evaluate dynamic code-mode update_plan arguments", () => {
+    const script = "await tools.update_plan(planInput);";
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "custom_tool_call",
+          call_id: "call-dynamic-plan",
+          name: "exec",
+          input: script,
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    expect(result.messages[0]?.message?.content).toEqual([
+      {
+        type: "tool_use",
+        id: "call-dynamic-plan",
+        name: "CodexExec",
+        input: { script },
+      },
+    ]);
+  });
+
+  it("ignores update_plan examples inside strings and comments", () => {
+    const script = `
+      const example = 'tools.update_plan({plan: [{step: "Fake", status: "completed"}]})';
+      // tools.update_plan({plan: [{step: "Comment", status: "completed"}]});
+      /* tools.update_plan({plan: [{step: "Block", status: "completed"}]}); */
+      await tools.exec_command({cmd: "pnpm test"});
+    `;
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "custom_tool_call",
+          call_id: "call-plan-example",
+          name: "exec",
+          input: script,
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    expect(result.messages[0]?.message?.content).toEqual([
+      {
+        type: "tool_use",
+        id: "call-plan-example",
+        name: "CodexExec",
+        input: { script },
+      },
+    ]);
+  });
+
+  it("marks failed Codex code-mode exec output as an error", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "custom_tool_call",
+          call_id: "call-code-exec-failed",
+          name: "exec",
+          input: "throw new Error('boom')",
+        },
+      },
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:02Z",
+        payload: {
+          type: "custom_tool_call_output",
+          call_id: "call-code-exec-failed",
+          output: [
+            {
+              type: "input_text",
+              text: "Script failed\nWall time 0.0 seconds\nOutput:\n",
+            },
+            { type: "input_text", text: "Script error:\nboom" },
+          ],
+        },
+      },
+    ];
+
+    const result = normalizeSession(buildLoadedSession(entries));
+    const toolResultContent = result.messages[1]?.message?.content;
+
+    expect(
+      Array.isArray(toolResultContent)
+        ? toolResultContent[0]
+        : toolResultContent,
+    ).toMatchObject({
+      type: "tool_result",
+      tool_use_id: "call-code-exec-failed",
+      is_error: true,
+      content:
+        "Script failed\nWall time 0.0 seconds\nOutput:\nScript error:\nboom",
     });
   });
 
@@ -1365,6 +1881,136 @@ describe("Codex Normalization", () => {
     expect(toolResultMessage?.toolUseResult).toMatchObject({ ok: true });
   });
 
+  it("merges matching patch events into direct apply_patch without duplicates", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2026-08-03T07:18:17.000Z",
+        payload: {
+          type: "custom_tool_call",
+          call_id: "call-direct-patch",
+          name: "apply_patch",
+          input: "*** Begin Patch\n*** End Patch",
+        },
+      },
+      {
+        type: "event_msg",
+        timestamp: "2026-08-03T07:18:18.000Z",
+        payload: {
+          type: "patch_apply_end",
+          call_id: "call-direct-patch",
+          turn_id: "turn-1",
+          stdout: "Success. Updated the following files:\nM src/a.ts\n",
+          stderr: "",
+          success: true,
+          status: "completed",
+          changes: {
+            "src/a.ts": {
+              type: "update",
+              unified_diff: "@@ -1 +1 @@\n-old\n+new\n",
+              move_path: null,
+            },
+          },
+        },
+      },
+      {
+        type: "response_item",
+        timestamp: "2026-08-03T07:18:18.100Z",
+        payload: {
+          type: "custom_tool_call_output",
+          call_id: "call-direct-patch",
+          output: '{"ok":true}',
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const editItems = renderItems.filter(
+      (item) => item.type === "tool_call" && item.toolName === "Edit",
+    );
+
+    expect(normalized.messages).toHaveLength(2);
+    expect(editItems).toHaveLength(1);
+    expect(editItems[0]).toMatchObject({
+      type: "tool_call",
+      id: "call-direct-patch",
+      status: "complete",
+      toolInput: {
+        input: "*** Begin Patch\n*** End Patch",
+        file_path: "src/a.ts",
+        changes: [
+          {
+            path: "src/a.ts",
+            kind: "update",
+            diff: "@@ -1 +1 @@\n-old\n+new\n",
+          },
+        ],
+      },
+    });
+  });
+
+  it("marks failed patch_apply_end events as failed Edit rows", () => {
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "event_msg",
+        timestamp: "2026-08-03T07:18:18.000Z",
+        payload: {
+          type: "patch_apply_end",
+          call_id: "exec-failed-patch",
+          turn_id: "turn-1",
+          stdout: "",
+          stderr: "Failed to apply patch",
+          success: false,
+          status: "failed",
+          changes: {},
+        },
+      },
+    ];
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const renderItems = preprocessMessages(normalized.messages);
+    const editItem = renderItems.find(
+      (item) => item.type === "tool_call" && item.toolName === "Edit",
+    );
+
+    expect(editItem).toMatchObject({
+      type: "tool_call",
+      id: "exec-failed-patch",
+      status: "error",
+      toolResult: {
+        content: "Failed to apply patch",
+        isError: true,
+      },
+    });
+  });
+
+  it("preserves custom tool namespaces instead of treating namespaced exec as code mode", () => {
+    const result = normalizeSession(
+      buildLoadedSession([
+        {
+          type: "response_item",
+          timestamp: "2024-01-01T00:00:01Z",
+          payload: {
+            type: "custom_tool_call",
+            call_id: "call-namespaced-exec",
+            namespace: "mcp__python::",
+            name: "exec",
+            input: "print('hello')",
+          },
+        },
+      ]),
+    );
+
+    const content = result.messages[0]?.message?.content;
+    expect(Array.isArray(content) ? content[0] : content).toMatchObject({
+      type: "tool_use",
+      id: "call-namespaced-exec",
+      name: "mcp__python::exec",
+      input: "print('hello')",
+    });
+  });
+
   it("normalizes new tooling fixture (update_plan + write_stdin) with readable output text", () => {
     const entries = loadCodexFixtureEntries("new-tooling-format");
 
@@ -1624,5 +2270,159 @@ describe("Codex Normalization", () => {
       subtype: "compact_boundary",
       content: "Context compacted",
     });
+  });
+});
+
+describe("Codex public prompt projection", () => {
+  it("retains managed media paths without mutating rollout", () => {
+    const uploadPath =
+      "/test/runtime/uploads/cHJvamVjdA/session-1/123e4567-e89b-12d3-a456-426614174000_report.pdf";
+    const downloadUrl =
+      "/api/projects/cHJvamVjdA/sessions/session-1/upload/123e4567-e89b-12d3-a456-426614174000_report.pdf";
+    const imagePath = "/test/runtime/media/shot.png";
+    const prompt = `Review /workspace/project/README.md\n\nUser uploaded files:\n- report.pdf (2.0 KB, application/pdf): ${uploadPath}`;
+    const entries: CodexSessionEntry[] = [
+      {
+        type: "response_item",
+        timestamp: "2024-01-01T00:00:01Z",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: prompt },
+            {
+              type: "input_text",
+              text: `<image name=[Image #1] path="${imagePath}">`,
+            },
+            {
+              type: "input_image",
+              file_path: imagePath,
+              mime_type: "image/png",
+              image_url: "data:image/png;base64,AAAA",
+            },
+            { type: "input_text", text: "</image>" },
+          ],
+        },
+      },
+    ];
+    const original = structuredClone(entries);
+
+    const normalized = normalizeSession(buildLoadedSession(entries));
+    const serialized = JSON.stringify(normalized);
+
+    expect(serialized).not.toContain("[managed attachment]");
+    expect(serialized).not.toContain(downloadUrl);
+    expect(serialized).toContain("/workspace/project/README.md");
+    expect(serialized).toContain(uploadPath);
+    expect(serialized).toContain(imagePath);
+    expect(entries).toEqual(original);
+  });
+});
+
+describe("computeCodexRollbackNumTurns", () => {
+  const entries: CodexSessionEntry[] = [
+    codexUserMessage("q1", 1),
+    codexAssistantMessage("a1", 2),
+    codexUserMessage("q2", 3),
+    codexAssistantMessage("a2", 4),
+    codexUserMessage("q3", 5),
+    codexAssistantMessage("a3", 6),
+  ];
+
+  it("counts turns from the edited prompt to the active tip", () => {
+    const { branchState } = buildCodexBranchView(entries, "s");
+
+    expect(
+      computeCodexRollbackNumTurns(branchState, {
+        prompt: "q2",
+        timestamp: "2024-01-01T00:00:03Z",
+      }),
+    ).toBe(2);
+    expect(computeCodexRollbackNumTurns(branchState, { prompt: "q1" })).toBe(3);
+    expect(computeCodexRollbackNumTurns(branchState, { prompt: "q3" })).toBe(1);
+  });
+
+  it("returns null for unknown prompts", () => {
+    const { branchState } = buildCodexBranchView(entries, "s");
+    expect(
+      computeCodexRollbackNumTurns(branchState, { prompt: "missing" }),
+    ).toBeNull();
+    expect(
+      computeCodexRollbackNumTurns(branchState, { prompt: "   " }),
+    ).toBeNull();
+  });
+
+  it("counts turns on the active path after a prior rollback", () => {
+    const rolled: CodexSessionEntry[] = [
+      ...entries,
+      codexRollbackMarker(2, 7),
+      codexUserMessage("q2-1", 8),
+      codexAssistantMessage("a2-1", 9),
+    ];
+    const { branchState } = buildCodexBranchView(rolled, "s");
+
+    // Active path is q1 -> q2-1.
+    expect(computeCodexRollbackNumTurns(branchState, { prompt: "q2-1" })).toBe(
+      1,
+    );
+    expect(computeCodexRollbackNumTurns(branchState, { prompt: "q1" })).toBe(2);
+  });
+
+  it("unwinds to the common ancestor when editing a sibling branch turn", () => {
+    const rolled: CodexSessionEntry[] = [
+      ...entries,
+      codexRollbackMarker(2, 7),
+      codexUserMessage("q2-1", 8),
+      codexAssistantMessage("a2-1", 9),
+    ];
+    const { branchState } = buildCodexBranchView(rolled, "s");
+
+    // q2/q3 live on the rolled-back sibling branch. Editing q2 should unwind
+    // the active path back to q1 (drop q2-1 only).
+    expect(computeCodexRollbackNumTurns(branchState, { prompt: "q2" })).toBe(1);
+  });
+
+  it("disambiguates duplicate prompts by timestamp", () => {
+    const dup: CodexSessionEntry[] = [
+      codexUserMessage("same", 1),
+      codexAssistantMessage("a1", 2),
+      codexUserMessage("same", 3),
+      codexAssistantMessage("a2", 4),
+    ];
+    const { branchState } = buildCodexBranchView(dup, "s");
+
+    expect(
+      computeCodexRollbackNumTurns(branchState, {
+        prompt: "same",
+        timestamp: "2024-01-01T00:00:01Z",
+      }),
+    ).toBe(2);
+    expect(
+      computeCodexRollbackNumTurns(branchState, {
+        prompt: "same",
+        timestamp: "2024-01-01T00:00:03Z",
+      }),
+    ).toBe(1);
+    // Without a timestamp the most recent occurrence wins.
+    expect(computeCodexRollbackNumTurns(branchState, { prompt: "same" })).toBe(
+      1,
+    );
+  });
+
+  it("matches a public managed-attachment prompt against raw branch history", () => {
+    const path = "/test/runtime/uploads/report.pdf";
+    const rawPrompt = `Review\n\nUser uploaded files:\n- report.pdf (1.0 KB, application/pdf): ${path}`;
+    const publicPrompt = rawPrompt.replace(path, "[managed attachment]");
+    const { branchState } = buildCodexBranchView(
+      [codexUserMessage(rawPrompt, 1), codexAssistantMessage("answer", 2)],
+      "s",
+    );
+
+    expect(
+      computeCodexRollbackNumTurns(branchState, {
+        prompt: publicPrompt,
+        timestamp: "2024-01-01T00:00:01Z",
+      }),
+    ).toBe(1);
   });
 });

@@ -1,17 +1,22 @@
 import { memo, useCallback } from "react";
 import { getMessageId } from "../lib/mergeMessages";
+import { canEditPersistedUserPrompt } from "../lib/sessionBranching";
 import type { RenderItem } from "../types/renderItems";
+import { AssistantOutputToolGroupRow } from "./blocks/AssistantOutputToolGroupRow";
+import { DisplayToolGroupRow } from "./blocks/DisplayToolGroupRow";
+import { GoalInlineBlock } from "./blocks/GoalInlineRenderer";
 import { SessionSetupBlock } from "./blocks/SessionSetupBlock";
 import { TextBlock } from "./blocks/TextBlock";
 import { ThinkingBlock } from "./blocks/ThinkingBlock";
 import { ToolCallRow } from "./blocks/ToolCallRow";
 import { UserPromptBlock } from "./blocks/UserPromptBlock";
+import { CodexNativeItemBlock } from "./blocks/codex/CodexNativeItemBlock";
 
 interface Props {
   item: RenderItem;
   isStreaming: boolean;
   thinkingExpanded: boolean;
-  toggleThinkingExpanded: () => void;
+  toggleThinkingExpanded: (itemId: string) => void;
   sessionProvider?: string;
   /**
    * When provided, user prompts show an edit button. Called with the prompt's
@@ -174,6 +179,7 @@ export const RenderItemComponent = memo(function RenderItemComponent({
             text={item.text}
             isStreaming={item.isStreaming}
             augmentHtml={item.augmentHtml}
+            phase={item.phase}
           />
         );
 
@@ -183,7 +189,8 @@ export const RenderItemComponent = memo(function RenderItemComponent({
             thinking={item.thinking}
             status={item.status}
             isExpanded={thinkingExpanded}
-            onToggle={toggleThinkingExpanded}
+            onToggle={() => toggleThinkingExpanded(item.id)}
+            {...(item.detail ? { detail: item.detail } : {})}
           />
         );
 
@@ -196,22 +203,41 @@ export const RenderItemComponent = memo(function RenderItemComponent({
             toolResult={item.toolResult}
             status={item.status}
             sessionProvider={sessionProvider}
+            partialOutput={item.partialOutput}
+          />
+        );
+
+      case "display_tool_group":
+        return (
+          <DisplayToolGroupRow item={item} sessionProvider={sessionProvider} />
+        );
+
+      case "assistant_output_tool_group":
+        return (
+          <AssistantOutputToolGroupRow
+            item={item}
+            sessionProvider={sessionProvider}
           />
         );
 
       case "user_prompt": {
         const src = item.sourceMessages[0];
         const uuid = src ? getMessageId(src) : "";
+        const canEdit = canEditPersistedUserPrompt(
+          sessionProvider,
+          src?._source,
+        );
         return (
           <UserPromptBlock
             content={item.content}
+            isPending={src?.isOptimistic === true && src?._source !== "jsonl"}
             timestamp={src?.timestamp}
             contextBefore={src?.contextBefore}
             branch={src?.branch}
             codexBranch={src?.codexBranch}
             onSelectBranch={onSelectBranch}
             onEdit={
-              onEditUserPrompt && uuid
+              onEditUserPrompt && uuid && canEdit
                 ? (text) =>
                     onEditUserPrompt({
                       text,
@@ -228,14 +254,22 @@ export const RenderItemComponent = memo(function RenderItemComponent({
         return <SessionSetupBlock title={item.title} prompts={item.prompts} />;
 
       case "system": {
+        // Kimi goal lifecycle snapshots — render the inline goal card.
+        if (item.subtype === "kimi_goal") {
+          if (item.goalSnapshot) {
+            return <GoalInlineBlock snapshot={item.goalSnapshot} />;
+          }
+          return null;
+        }
         // Different styling for compacting vs completed compaction
         const isCompacting =
           item.subtype === "status" && item.status === "compacting";
         const isError = item.subtype === "error";
-        const icon = isError ? "!" : "⟳";
+        const isWarning = item.subtype === "warning";
+        const icon = isError ? "!" : isWarning ? "⚠" : "⟳";
         return (
           <div
-            className={`system-message ${isCompacting ? "system-message-compacting" : ""} ${isError ? "system-message-error" : ""}`}
+            className={`system-message ${isCompacting ? "system-message-compacting" : ""} ${isError ? "system-message-error" : ""} ${isWarning ? "system-message-warning" : ""}`}
           >
             <span
               className={`system-message-icon ${isCompacting ? "spinning" : ""}`}
@@ -246,6 +280,9 @@ export const RenderItemComponent = memo(function RenderItemComponent({
           </div>
         );
       }
+
+      case "codex_native_item":
+        return <CodexNativeItemBlock item={item} />;
 
       default:
         return null;

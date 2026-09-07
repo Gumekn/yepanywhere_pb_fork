@@ -1,23 +1,17 @@
-import { randomUUID } from "node:crypto";
 import type { HttpBindings } from "@hono/node-server";
 import type { Context, Hono } from "hono";
 import type { WSEvents } from "hono/ws";
 import type { WebSocket as RawWebSocket } from "ws";
 import type { DeviceBridgeService } from "../device/DeviceBridgeService.js";
-import { getLogger } from "../logging/logger.js";
 import { isAllowedOrigin } from "../middleware/allowed-hosts.js";
+import type { RuntimeController } from "../runtime/types.js";
 import type {
   BrowserProfileService,
   ConnectedBrowsersService,
 } from "../services/index.js";
-import type { Supervisor } from "../supervisor/Supervisor.js";
 import type { TerminalService } from "../terminal/TerminalService.js";
 import type { UploadManager } from "../uploads/manager.js";
-import type {
-  EventBus,
-  FocusedSessionWatchManager,
-  ProjectFileWatchManager,
-} from "../watcher/index.js";
+import type { EventBus, FocusedSessionWatchManager } from "../watcher/index.js";
 import {
   type ConnectionState,
   type WSAdapter,
@@ -47,8 +41,8 @@ export interface WsRoutesDeps {
    * before they reach the Hono router. See WsHandlerDeps.basePath.
    */
   basePath?: string;
-  /** Supervisor for subscribing to session events */
-  supervisor: Supervisor;
+  /** Runtime facade for subscribing to session events */
+  runtimeController: RuntimeController;
   /** Event bus for subscribing to activity events */
   eventBus: EventBus;
   /** Upload manager for handling file uploads */
@@ -59,8 +53,6 @@ export interface WsRoutesDeps {
   browserProfileService?: BrowserProfileService;
   /** Focused session watch manager for per-session targeted file watching (optional) */
   focusedSessionWatchManager?: FocusedSessionWatchManager;
-  /** Per-project repository file watcher for real-time repo tree updates (optional) */
-  projectFileWatchManager?: ProjectFileWatchManager;
   /** Emulator bridge service for Android emulator streaming (optional) */
   deviceBridgeService?: DeviceBridgeService;
   /** Terminal service for remote shell sessions (optional) */
@@ -85,13 +77,12 @@ export function createWsRoutes(
     upgradeWebSocket,
     app,
     baseUrl,
-    supervisor,
+    runtimeController,
     eventBus,
     uploadManager,
     connectedBrowsers,
     browserProfileService,
     focusedSessionWatchManager,
-    projectFileWatchManager,
     deviceBridgeService,
     terminalService,
   } = deps;
@@ -101,13 +92,12 @@ export function createWsRoutes(
     app,
     baseUrl,
     basePath: deps.basePath,
-    supervisor,
+    runtimeController,
     eventBus,
     uploadManager,
     connectedBrowsers,
     browserProfileService,
     focusedSessionWatchManager,
-    projectFileWatchManager,
     deviceBridgeService,
     terminalService,
   };
@@ -143,8 +133,6 @@ export function createWsRoutes(
     });
     // Ping interval for dead connection detection (set in onOpen, cleared in onClose)
     let pingInterval: ReturnType<typeof setInterval> | null = null;
-    const connectionId = randomUUID();
-    let connectedAt: number | undefined;
     // Send function (created on open, captures connState)
     let send: ReturnType<typeof createSendFn>;
     // WSAdapter wrapper
@@ -152,15 +140,9 @@ export function createWsRoutes(
 
     return {
       onOpen(_evt, ws) {
-        connectedAt = Date.now();
-        getLogger().info(
-          {
-            event: "ws_client_connected",
-            connectionId,
-          },
-          "WebSocket client connected",
-        );
+        console.log("[WS] Client connected");
         // Create WSAdapter wrapper for Hono's WSContext
+        const rawSocket = ws.raw as RawWebSocket | undefined;
         wsAdapter = {
           send(data: string | ArrayBuffer | Uint8Array<ArrayBuffer>): void {
             try {
@@ -176,12 +158,19 @@ export function createWsRoutes(
               // Already closed
             }
           },
+          // Outbound backpressure needs the socket's real buffer depth. Hono's
+          // WSContext does not surface it, so read it off the underlying `ws`
+          // socket; without it the send queue treats the link as never
+          // congested.
+          bufferedAmount(): number {
+            return rawSocket?.bufferedAmount ?? 0;
+          },
         };
         // Create the send function that captures this connection's state
         send = createSendFn(wsAdapter, connState);
 
         // Start WebSocket ping every 30s for dead connection detection
-        const rawWs = ws.raw as RawWebSocket | undefined;
+        const rawWs = rawSocket;
         if (rawWs?.ping) {
           pingInterval = setInterval(() => {
             try {
@@ -208,19 +197,12 @@ export function createWsRoutes(
             deviceSessions,
             terminalAttachId,
           ).catch((err) => {
-            getLogger().error(
-              {
-                event: "ws_client_error",
-                connectionId,
-                error: err instanceof Error ? err.message : String(err),
-              },
-              "Unexpected WebSocket message error",
-            );
+            console.error("[WS] Unexpected error:", err);
           }),
         );
       },
 
-      onClose(evt, _ws) {
+      onClose(_evt, _ws) {
         if (pingInterval) clearInterval(pingInterval);
         cleanupConnectionState(connState);
 
@@ -237,31 +219,11 @@ export function createWsRoutes(
 
         // Clean up all subscriptions
         cleanupSubscriptions(subscriptions);
-        const closeEvent = evt as { code?: number; reason?: string };
-        getLogger().info(
-          {
-            event: "ws_client_disconnected",
-            connectionId,
-            durationMs:
-              connectedAt === undefined
-                ? 0
-                : Math.max(0, Date.now() - connectedAt),
-            closeCode: closeEvent.code,
-            closeReason: closeEvent.reason || undefined,
-          },
-          "WebSocket client disconnected",
-        );
+        console.log("[WS] Client disconnected");
       },
 
       onError(evt, _ws) {
-        getLogger().error(
-          {
-            event: "ws_client_error",
-            connectionId,
-            error: evt instanceof Error ? evt.message : String(evt),
-          },
-          "WebSocket client error",
-        );
+        console.error("[WS] WebSocket error:", evt);
       },
     };
   });

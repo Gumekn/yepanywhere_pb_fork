@@ -8,6 +8,11 @@ import {
 import { validateToolResult } from "../../../lib/validateToolResult";
 import { SchemaWarning } from "../../SchemaWarning";
 import { Modal } from "../../ui/Modal";
+import {
+  BenchmarkReviewPreview,
+  BenchmarkReviewResult,
+  parseBenchmarkReviewBlock,
+} from "./BenchmarkReviewRenderer";
 import type { BashInput, BashResult, ToolRenderer } from "./types";
 
 const MAX_LINES_COLLAPSED = 20;
@@ -107,6 +112,7 @@ function BashModalContent({
   const command = getBashCommand(input);
   const stdout = result?.stdout || "";
   const stderr = result?.stderr || "";
+  const benchmarkReview = parseBenchmarkReviewBlock(stdout);
 
   return (
     <div className="bash-modal-sections">
@@ -121,11 +127,15 @@ function BashModalContent({
       {stdout && (
         <div className="bash-modal-section">
           <div className="bash-modal-label">Output</div>
-          <div className="bash-modal-code">
-            <pre className="code-block">
-              <code>{stdout}</code>
-            </pre>
-          </div>
+          {benchmarkReview ? (
+            <BenchmarkReviewResult block={benchmarkReview} />
+          ) : (
+            <div className="bash-modal-code">
+              <pre className="code-block">
+                <code>{stdout}</code>
+              </pre>
+            </div>
+          )}
         </div>
       )}
       {stderr && (
@@ -199,9 +209,11 @@ function BashToolUse({ input }: { input: BashInput }) {
 function BashToolResult({
   result: rawResult,
   isError,
+  input,
 }: {
   result: BashResult | string;
   isError: boolean;
+  input?: BashInput;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
   const { enabled, reportValidationError, isToolIgnored } =
@@ -230,6 +242,7 @@ function BashToolResult({
 
   const stdout = result.stdout || "";
   const stderr = result.stderr || "";
+  const benchmarkReview = parseBenchmarkReviewBlock(stdout);
   const stdoutLines = stdout.split("\n");
   const needsCollapse = stdoutLines.length > MAX_LINES_COLLAPSED;
   const displayStdout =
@@ -239,6 +252,12 @@ function BashToolResult({
 
   return (
     <div className={`bash-result ${isError ? "bash-result-error" : ""}`}>
+      {input && getBashCommand(input) && (
+        <div className="bash-command-details">
+          <div className="tool-detail-label">Command</div>
+          <BashToolUse input={input} />
+        </div>
+      )}
       {showValidationWarning && validationErrors && (
         <SchemaWarning toolName="Bash" errors={validationErrors} />
       )}
@@ -252,19 +271,25 @@ function BashToolResult({
       )}
       {stdout && (
         <div className="bash-stdout">
-          <pre className="code-block">
-            <code>{displayStdout}</code>
-          </pre>
-          {needsCollapse && (
-            <button
-              type="button"
-              className="expand-button"
-              onClick={() => setIsExpanded(!isExpanded)}
-            >
-              {isExpanded
-                ? "Show less"
-                : `Show all ${stdoutLines.length} lines`}
-            </button>
+          {benchmarkReview ? (
+            <BenchmarkReviewResult block={benchmarkReview} />
+          ) : (
+            <>
+              <pre className="code-block">
+                <code>{displayStdout}</code>
+              </pre>
+              {needsCollapse && (
+                <button
+                  type="button"
+                  className="expand-button"
+                  onClick={() => setIsExpanded(!isExpanded)}
+                >
+                  {isExpanded
+                    ? "Show less"
+                    : `Show all ${stdoutLines.length} lines`}
+                </button>
+              )}
+            </>
           )}
         </div>
       )}
@@ -357,6 +382,7 @@ function BashCollapsedPreview({
     result?.stdout || result?.stderr || "",
     provider,
   );
+  const benchmarkReview = parseBenchmarkReviewBlock(result?.stdout || "");
   const command = getBashCommand(input);
   const { text: previewText, truncated } = truncateOutput(
     output,
@@ -386,20 +412,27 @@ function BashCollapsedPreview({
             <SchemaWarning toolName="Bash" errors={validationErrors} />
           )}
         </div>
-        {hasOutput && (
+        {benchmarkReview ? (
           <div className="bash-preview-row bash-preview-output-row">
             <span className="bash-preview-label">OUT</span>
-            <div
-              className={`bash-preview-output ${truncated ? "bash-preview-truncated" : ""} ${isError || result?.stderr ? "bash-preview-error" : ""}`}
-            >
-              <pre>
-                <code>{previewText}</code>
-              </pre>
-              {truncated && <div className="bash-preview-fade" />}
-            </div>
+            <BenchmarkReviewPreview block={benchmarkReview} />
           </div>
+        ) : (
+          hasOutput && (
+            <div className="bash-preview-row bash-preview-output-row">
+              <span className="bash-preview-label">OUT</span>
+              <div
+                className={`bash-preview-output ${truncated ? "bash-preview-truncated" : ""} ${isError || result?.stderr ? "bash-preview-error" : ""}`}
+              >
+                <pre>
+                  <code>{previewText}</code>
+                </pre>
+                {truncated && <div className="bash-preview-fade" />}
+              </div>
+            </div>
+          )
         )}
-        {!hasOutput && result && !result.interrupted && (
+        {!benchmarkReview && !hasOutput && result && !result.interrupted && (
           <div className="bash-preview-row">
             <span className="bash-preview-label">OUT</span>
             <span className="bash-preview-empty">No output</span>
@@ -431,8 +464,18 @@ export const bashRenderer: ToolRenderer<BashInput, BashResult> = {
     return <BashToolUse input={input as BashInput} />;
   },
 
-  renderToolResult(result, isError, _context) {
-    return <BashToolResult result={result as BashResult} isError={isError} />;
+  renderToolResult(result, isError, context, input) {
+    return (
+      <BashToolResult
+        result={result as BashResult}
+        isError={isError}
+        input={
+          context.provider === "pi"
+            ? (input as BashInput | undefined)
+            : undefined
+        }
+      />
+    );
   },
 
   getUseSummary(input) {

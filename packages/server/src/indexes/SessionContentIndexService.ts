@@ -21,8 +21,10 @@ import {
   DEFAULT_PROVIDER,
   type ProviderName,
   type UrlProjectId,
+  isKimiAcpCompatibilityTitle,
 } from "@yep-anywhere/shared";
 import { getLogger } from "../logging/logger.js";
+import { isRetiredProviderName } from "../sdk/providers/policy.js";
 import type { ISessionReader, SessionFileEntry } from "../sessions/types.js";
 import type { Message } from "../supervisor/types.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
@@ -64,6 +66,13 @@ export interface SessionContentIndexState {
 }
 
 const CURRENT_VERSION = 1;
+
+function needsKimiTitleMigration(index: SessionContentIndexState): boolean {
+  return Object.values(index.sessions).some(
+    (session) =>
+      session.provider === "kimi" && isKimiAcpCompatibilityTitle(session.title),
+  );
+}
 
 /**
  * Loads a session's normalized messages on cache miss. Provided by the caller
@@ -210,7 +219,8 @@ export class SessionContentIndexService {
       const parsed = JSON.parse(content) as SessionContentIndexState;
       if (
         parsed.version === CURRENT_VERSION &&
-        parsed.projectId === projectId
+        parsed.projectId === projectId &&
+        !needsKimiTitleMigration(parsed)
       ) {
         this.indexCache.set(cacheKey, parsed);
         this.evictIfNeeded();
@@ -376,14 +386,10 @@ export class SessionContentIndexService {
     if (event.fileType !== "session") return;
 
     if (event.provider === "claude") {
-      const fileName = path.basename(event.relativePath);
+      const fileName = path.basename(event.path);
       if (!fileName.endsWith(".jsonl")) return;
       const sessionId = fileName.slice(0, -6);
-      const relativeDir = path.dirname(event.relativePath);
-      const sessionDir =
-        relativeDir === "."
-          ? this.projectsDir
-          : path.join(this.projectsDir, relativeDir);
+      const sessionDir = path.dirname(event.path);
 
       this.markSessionDirty(sessionDir, sessionId);
       if (event.changeType === "create" || event.changeType === "delete") {
@@ -399,6 +405,16 @@ export class SessionContentIndexService {
 
     if (event.provider === "gemini") {
       this.markMatchingScopesDirty("gemini::");
+      return;
+    }
+
+    if (event.provider === "pi") {
+      this.markMatchingScopesDirty("pi::");
+      return;
+    }
+
+    if (event.provider === "kimi") {
+      this.markMatchingScopesDirty("kimi::");
     }
   }
 
@@ -569,19 +585,24 @@ export class SessionContentIndexService {
   }
 
   /**
-   * Search all sessions within an index for `queryLower` (must be lowercased).
-   * Returns one result per matching session with up to `perSessionMatchLimit`
-   * snippets.
+   * Search sessions within an index for `queryLower` (must be lowercased).
+   * When `filterSessionId` is provided, only that exact session is inspected.
+   * Returns one result per matching session with up to
+   * `perSessionMatchLimit` snippets.
    */
   searchScope(
     index: SessionContentIndexState,
     queryLower: string,
     perSessionMatchLimit: number,
+    filterSessionId?: string,
   ): ScopeSearchResult[] {
     const results: ScopeSearchResult[] = [];
     if (!queryLower) return results;
 
     for (const [sessionId, session] of Object.entries(index.sessions)) {
+      if (filterSessionId && sessionId !== filterSessionId) continue;
+      if (isRetiredProviderName(session.provider)) continue;
+
       if (session.isEmpty) {
         // Still allow title-only matches for empty sessions.
         const titleMatch =

@@ -1,6 +1,8 @@
 import { Link, useNavigate } from "react-router-dom";
 import { shortenPath } from "../lib/text";
 import type { Project } from "../types";
+import { ProjectGitStatusInline } from "./ProjectGitStatusInline";
+import { RemoteProjectIcon } from "./RemoteProjectIcon";
 import { ThinkingIndicator } from "./ThinkingIndicator";
 
 interface ProjectCardProps {
@@ -62,7 +64,8 @@ export function ProjectCard({
                 {needsAttentionCount}
               </span>
             )}
-            {project.name}
+            <RemoteProjectIcon isRemoteProject={project.isRemoteProject} />
+            <span className="project-card__name-text">{project.name}</span>
           </strong>
           <button
             type="button"
@@ -107,6 +110,12 @@ export function ProjectCard({
                 <span className="project-card__time">
                   {formatRelativeTime(project.lastActivity)}
                 </span>
+              </>
+            )}
+            {project.gitStatus?.isGitRepo && (
+              <>
+                <span className="project-card__separator">·</span>
+                <ProjectGitStatusInline status={project.gitStatus} />
               </>
             )}
           </span>

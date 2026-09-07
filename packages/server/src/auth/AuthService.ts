@@ -13,16 +13,19 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import bcrypt from "bcrypt";
-import { enforceOwnerReadWriteFilePermissions } from "../utils/filePermissions.js";
-import { AUTH_ERROR_CODES, AuthError } from "./authErrors.js";
-import { writePrivateJsonAtomic } from "./privateJsonFile.js";
+import {
+  OWNER_READ_WRITE_FILE_MODE,
+  enforceOwnerReadWriteFilePermissions,
+} from "../utils/filePermissions.js";
 
 const BCRYPT_ROUNDS = 12;
 const SESSION_ID_BYTES = 32;
 
 export interface AuthState {
   /** Schema version for future migrations */
-  version: 2;
+  version: number;
+  /** Whether auth is enabled (can be enabled via settings UI) */
+  enabled?: boolean;
   /** Whether unauthenticated localhost access is allowed (bypasses desktop token floor) */
   localhostOpen?: boolean;
   /** Account credentials (undefined = setup mode) */
@@ -33,113 +36,17 @@ export interface AuthState {
     createdAt: string;
   };
   /** Active sessions: sessionId -> session data */
-  sessions: Record<string, AuthSession>;
-}
-
-export interface AuthSession {
-  createdAt: string;
-  lastActiveAt: string;
-  userAgent?: string;
-}
-
-const CURRENT_VERSION = 2;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function parseAccount(value: unknown): AuthState["account"] {
-  if (!isRecord(value)) {
-    throw new Error("Invalid authentication account");
-  }
-  if (
-    typeof value.passwordHash !== "string" ||
-    value.passwordHash.length === 0 ||
-    typeof value.createdAt !== "string" ||
-    value.createdAt.length === 0
-  ) {
-    throw new Error("Invalid authentication account");
-  }
-  return {
-    passwordHash: value.passwordHash,
-    createdAt: value.createdAt,
-  };
-}
-
-function parseSessions(value: unknown): Record<string, AuthSession> {
-  if (!isRecord(value)) {
-    throw new Error("Invalid authentication sessions");
-  }
-  const sessions: Record<string, AuthSession> = {};
-  for (const [sessionId, sessionValue] of Object.entries(value)) {
-    if (
-      !isRecord(sessionValue) ||
-      typeof sessionValue.createdAt !== "string" ||
-      typeof sessionValue.lastActiveAt !== "string" ||
-      (sessionValue.userAgent !== undefined &&
-        typeof sessionValue.userAgent !== "string")
-    ) {
-      throw new Error("Invalid authentication sessions");
+  sessions: Record<
+    string,
+    {
+      createdAt: string;
+      lastActiveAt: string;
+      userAgent?: string;
     }
-    sessions[sessionId] = {
-      createdAt: sessionValue.createdAt,
-      lastActiveAt: sessionValue.lastActiveAt,
-      ...(sessionValue.userAgent === undefined
-        ? {}
-        : { userAgent: sessionValue.userAgent }),
-    };
-  }
-  return sessions;
+  >;
 }
 
-function parseStoredState(value: unknown): {
-  state: AuthState;
-  migrated: boolean;
-} {
-  if (!isRecord(value)) {
-    throw new Error("Invalid authentication configuration");
-  }
-  if (
-    value.localhostOpen !== undefined &&
-    typeof value.localhostOpen !== "boolean"
-  ) {
-    throw new Error("Invalid localhostOpen value");
-  }
-
-  if (value.version === 2) {
-    const account =
-      value.account === undefined ? undefined : parseAccount(value.account);
-    return {
-      state: {
-        version: CURRENT_VERSION,
-        ...(value.localhostOpen === true ? { localhostOpen: true } : {}),
-        ...(account === undefined ? {} : { account }),
-        sessions: parseSessions(value.sessions),
-      },
-      migrated: false,
-    };
-  }
-
-  if (value.version === 1) {
-    if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
-      throw new Error("Invalid enabled value");
-    }
-    const enabled = value.enabled === true;
-    const account = enabled ? parseAccount(value.account) : undefined;
-    const sessions = parseSessions(value.sessions ?? {});
-    return {
-      state: {
-        version: CURRENT_VERSION,
-        ...(value.localhostOpen === true ? { localhostOpen: true } : {}),
-        ...(account === undefined ? {} : { account }),
-        sessions: enabled ? sessions : {},
-      },
-      migrated: true,
-    };
-  }
-
-  throw new Error("Unsupported authentication configuration version");
-}
+const CURRENT_VERSION = 1;
 
 export interface AuthServiceOptions {
   /** Directory to store auth state (defaults to dataDir) */
@@ -156,7 +63,8 @@ export class AuthService {
   private filePath: string;
   private sessionTtlMs: number;
   private cookieSecret: string;
-  private writeQueue: Promise<void> = Promise.resolve();
+  private savePromise: Promise<void> | null = null;
+  private pendingSave = false;
 
   constructor(options: AuthServiceOptions) {
     this.dataDir = options.dataDir;
@@ -172,28 +80,35 @@ export class AuthService {
    * Generates cookie secret if not provided.
    */
   async initialize(): Promise<void> {
-    await fs.mkdir(this.dataDir, { recursive: true });
-    await enforceOwnerReadWriteFilePermissions(this.filePath, "[AuthService]");
-
     try {
+      await fs.mkdir(this.dataDir, { recursive: true });
+      await enforceOwnerReadWriteFilePermissions(
+        this.filePath,
+        "[AuthService]",
+      );
+
       const content = await fs.readFile(this.filePath, "utf-8");
-      const parsed = parseStoredState(JSON.parse(content));
-      if (parsed.migrated) {
-        await writePrivateJsonAtomic(this.filePath, parsed.state);
-      }
-      this.state = parsed.state;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        this.state = { version: CURRENT_VERSION, sessions: {} };
-      } else if (error instanceof AuthError) {
-        throw error;
+      const parsed = JSON.parse(content) as AuthState;
+
+      if (parsed.version === CURRENT_VERSION) {
+        this.state = parsed;
       } else {
-        throw new AuthError(
-          AUTH_ERROR_CODES.configError,
-          "Authentication configuration could not be read",
-          { cause: error },
+        // Future: handle migrations
+        this.state = {
+          version: CURRENT_VERSION,
+          account: parsed.account,
+          sessions: parsed.sessions ?? {},
+        };
+        await this.save();
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.warn(
+          "[AuthService] Failed to load state, starting fresh:",
+          error,
         );
       }
+      this.state = { version: CURRENT_VERSION, sessions: {} };
     }
 
     // Generate cookie secret if not provided
@@ -209,7 +124,7 @@ export class AuthService {
    * Check if auth is enabled (via settings).
    */
   isEnabled(): boolean {
-    return this.hasAccount();
+    return this.state.enabled === true;
   }
 
   /**
@@ -223,16 +138,8 @@ export class AuthService {
    * Set whether unauthenticated localhost access is allowed.
    */
   async setLocalhostOpen(open: boolean): Promise<void> {
-    await this.enqueueWrite(async () => {
-      const targetState: AuthState = {
-        version: CURRENT_VERSION,
-        ...(this.state.account ? { account: this.state.account } : {}),
-        sessions: this.state.sessions,
-        ...(open ? { localhostOpen: true } : {}),
-      };
-      await writePrivateJsonAtomic(this.filePath, targetState);
-      this.state = targetState;
-    });
+    this.state.localhostOpen = open || undefined; // Don't persist false
+    await this.save();
   }
 
   /**
@@ -253,28 +160,22 @@ export class AuthService {
    * Enable auth with a password. Creates account if needed.
    * This is the main way to enable auth from the settings UI.
    *
+   * Security model note:
+   * - This project is localhost-first and starts with auth off.
+   * - Enabling auth while currently open is treated as adding protection,
+   *   not as recovering an ownership-locked account.
+   * - If someone enables auth unexpectedly, the operator can restart with
+   *   --auth-disable or run --setup-auth to recover.
    */
-  async setLoginPassword(newPassword: string): Promise<void> {
-    if (newPassword.length < 6) {
-      throw new AuthError(
-        AUTH_ERROR_CODES.passwordInvalid,
-        "Password must be at least 6 characters",
-      );
-    }
-    const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-    await this.enqueueWrite(async () => {
-      const targetState: AuthState = {
-        version: CURRENT_VERSION,
-        localhostOpen: this.state.localhostOpen,
-        account: {
-          passwordHash,
-          createdAt: new Date().toISOString(),
-        },
-        sessions: {},
-      };
-      await writePrivateJsonAtomic(this.filePath, targetState);
-      this.state = targetState;
-    });
+  async enableAuth(password: string): Promise<boolean> {
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    this.state.enabled = true;
+    this.state.account = {
+      passwordHash,
+      createdAt: new Date().toISOString(),
+    };
+    await this.save();
+    return true;
   }
 
   /**
@@ -285,15 +186,28 @@ export class AuthService {
    * should behave like fresh setup with a new password.
    */
   async disableAuth(): Promise<void> {
-    await this.enqueueWrite(async () => {
-      const targetState: AuthState = {
-        version: CURRENT_VERSION,
-        localhostOpen: this.state.localhostOpen,
-        sessions: {},
-      };
-      await writePrivateJsonAtomic(this.filePath, targetState);
-      this.state = targetState;
-    });
+    this.state.enabled = false;
+    this.state.account = undefined;
+    this.state.sessions = {}; // Clear all sessions
+    await this.save();
+  }
+
+  /**
+   * Create the initial account. Only works if no account exists.
+   * @deprecated Use enableAuth instead which also sets the enabled flag.
+   */
+  async createAccount(password: string): Promise<boolean> {
+    if (this.state.account) {
+      return false; // Account already exists
+    }
+
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    this.state.account = {
+      passwordHash,
+      createdAt: new Date().toISOString(),
+    };
+    await this.save();
+    return true;
   }
 
   /**
@@ -307,52 +221,35 @@ export class AuthService {
   }
 
   /**
-   * Verify the current login password and create a session only if the
-   * credential is still current when the session write reaches the queue.
+   * Change the account password.
+   * Requires an authenticated session (checked in route).
    */
-  async createSessionForPassword(
-    password: string,
-    userAgent?: string,
-  ): Promise<string | null> {
-    const passwordHash = this.state.account?.passwordHash;
-    if (!passwordHash || !(await bcrypt.compare(password, passwordHash))) {
-      return null;
+  async changePassword(newPassword: string): Promise<boolean> {
+    if (!this.state.account) {
+      return false;
     }
 
-    return this.enqueueWrite(async () => {
-      if (this.state.account?.passwordHash !== passwordHash) {
-        return null;
-      }
-      return this.persistNewSession(userAgent);
-    });
+    this.state.account.passwordHash = await bcrypt.hash(
+      newPassword,
+      BCRYPT_ROUNDS,
+    );
+    await this.save();
+    return true;
   }
 
   /**
    * Create a new session and return the session ID.
    */
   async createSession(userAgent?: string): Promise<string> {
-    return this.enqueueWrite(() => this.persistNewSession(userAgent));
-  }
-
-  private async persistNewSession(userAgent?: string): Promise<string> {
     const sessionId = crypto.randomBytes(SESSION_ID_BYTES).toString("hex");
     const now = new Date().toISOString();
 
-    const targetState: AuthState = {
-      version: CURRENT_VERSION,
-      ...(this.state.localhostOpen ? { localhostOpen: true } : {}),
-      ...(this.state.account ? { account: this.state.account } : {}),
-      sessions: {
-        ...this.state.sessions,
-        [sessionId]: {
-          createdAt: now,
-          lastActiveAt: now,
-          userAgent,
-        },
-      },
+    this.state.sessions[sessionId] = {
+      createdAt: now,
+      lastActiveAt: now,
+      userAgent,
     };
-    await writePrivateJsonAtomic(this.filePath, targetState);
-    this.state = targetState;
+    await this.save();
 
     return sessionId;
   }
@@ -362,52 +259,45 @@ export class AuthService {
    * Returns true if valid, false if expired or not found.
    */
   async validateSession(sessionId: string): Promise<boolean> {
-    return this.enqueueWrite(async () => {
-      const session = this.state.sessions[sessionId];
-      if (!session) {
-        return false;
-      }
-
-      const sessions = { ...this.state.sessions };
-      const createdAt = new Date(session.createdAt).getTime();
-      const now = Date.now();
-      if (now - createdAt <= this.sessionTtlMs) {
-        return true;
-      }
-
-      delete sessions[sessionId];
-      const targetState = this.withSessions(sessions);
-      await writePrivateJsonAtomic(this.filePath, targetState);
-      this.state = targetState;
+    const session = this.state.sessions[sessionId];
+    if (!session) {
       return false;
-    });
+    }
+
+    const createdAt = new Date(session.createdAt).getTime();
+    const now = Date.now();
+
+    if (now - createdAt > this.sessionTtlMs) {
+      // Session expired
+      delete this.state.sessions[sessionId];
+      await this.save();
+      return false;
+    }
+
+    // Update last active time (debounced via save)
+    session.lastActiveAt = new Date().toISOString();
+    // Don't await save here to avoid blocking every request
+    void this.save();
+
+    return true;
   }
 
   /**
    * Invalidate a session (logout).
    */
   async invalidateSession(sessionId: string): Promise<void> {
-    await this.enqueueWrite(async () => {
-      if (!this.state.sessions[sessionId]) {
-        return;
-      }
-      const sessions = { ...this.state.sessions };
-      delete sessions[sessionId];
-      const targetState = this.withSessions(sessions);
-      await writePrivateJsonAtomic(this.filePath, targetState);
-      this.state = targetState;
-    });
+    if (this.state.sessions[sessionId]) {
+      delete this.state.sessions[sessionId];
+      await this.save();
+    }
   }
 
   /**
    * Invalidate all sessions (logout everywhere).
    */
   async invalidateAllSessions(): Promise<void> {
-    await this.enqueueWrite(async () => {
-      const targetState = this.withSessions({});
-      await writePrivateJsonAtomic(this.filePath, targetState);
-      this.state = targetState;
-    });
+    this.state.sessions = {};
+    await this.save();
   }
 
   /**
@@ -421,40 +311,55 @@ export class AuthService {
    * Clean up expired sessions.
    */
   private async cleanupExpiredSessions(): Promise<void> {
-    await this.enqueueWrite(async () => {
-      const now = Date.now();
-      const sessions = Object.fromEntries(
-        Object.entries(this.state.sessions).filter(
-          ([, session]) =>
-            now - new Date(session.createdAt).getTime() <= this.sessionTtlMs,
-        ),
-      );
-      if (
-        Object.keys(sessions).length === Object.keys(this.state.sessions).length
-      ) {
-        return;
+    const now = Date.now();
+    let changed = false;
+
+    for (const [sessionId, session] of Object.entries(this.state.sessions)) {
+      const createdAt = new Date(session.createdAt).getTime();
+      if (now - createdAt > this.sessionTtlMs) {
+        delete this.state.sessions[sessionId];
+        changed = true;
       }
-      const targetState = this.withSessions(sessions);
-      await writePrivateJsonAtomic(this.filePath, targetState);
-      this.state = targetState;
-    });
+    }
+
+    if (changed) {
+      await this.save();
+    }
   }
 
-  private withSessions(sessions: Record<string, AuthSession>): AuthState {
-    return {
-      version: CURRENT_VERSION,
-      ...(this.state.localhostOpen ? { localhostOpen: true } : {}),
-      ...(this.state.account ? { account: this.state.account } : {}),
-      sessions,
-    };
+  /**
+   * Save state to disk with debouncing.
+   */
+  private async save(): Promise<void> {
+    if (this.savePromise) {
+      this.pendingSave = true;
+      return;
+    }
+
+    this.savePromise = this.doSave();
+    await this.savePromise;
+    this.savePromise = null;
+
+    if (this.pendingSave) {
+      this.pendingSave = false;
+      await this.save();
+    }
   }
 
-  private enqueueWrite<T>(write: () => Promise<T>): Promise<T> {
-    const result = this.writeQueue.then(write, write);
-    this.writeQueue = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+  private async doSave(): Promise<void> {
+    try {
+      const content = JSON.stringify(this.state, null, 2);
+      await fs.writeFile(this.filePath, content, {
+        encoding: "utf-8",
+        mode: OWNER_READ_WRITE_FILE_MODE,
+      });
+      await enforceOwnerReadWriteFilePermissions(
+        this.filePath,
+        "[AuthService]",
+      );
+    } catch (error) {
+      console.error("[AuthService] Failed to save state:", error);
+      throw error;
+    }
   }
 }

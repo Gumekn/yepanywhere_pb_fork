@@ -1,9 +1,11 @@
 /**
  * Search route - full-text search across session message content.
  *
- * Scope is global by default, or a single project via `?project=`.
+ * Scope is global by default, a single project via `?project=`, or a single
+ * session via `?project=&session=`.
  * Results are grouped per session, each with snippet matches that the client
- * can deep-link + highlight. Backed by SessionContentIndexService, which caches
+ * can deep-link + highlight. Ordering is controlled by `?sort=` (`recent`,
+ * default, or `relevance`). Backed by SessionContentIndexService, which caches
  * per-message text and only re-parses files that changed (mtime/size + watcher
  * dirty-tracking), so repeat searches are served from memory.
  */
@@ -18,12 +20,17 @@ import type {
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
+import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
+import type { KimiSessionReader } from "../sessions/kimi-reader.js";
 import { normalizeSession } from "../sessions/normalization.js";
+import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { resolveSessionSources } from "../sessions/provider-resolution.js";
 import type { ISessionReader } from "../sessions/types.js";
+import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { Project } from "../supervisor/types.js";
 import { buildProviderProjectCatalog } from "./provider-catalog.js";
 
@@ -38,6 +45,14 @@ export interface SearchDeps {
   geminiScanner?: GeminiSessionScanner;
   geminiSessionsDir?: string;
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
+  piScanner?: PiSessionScanner;
+  zcodeDbPath?: string;
+  piSessionsDir?: string;
+  piReaderFactory?: (projectPath: string) => PiSessionReader;
+  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
+  kimiScanner?: KimiSessionScanner;
+  kimiSessionsDir?: string;
+  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
 }
 
 export interface SearchMatch {
@@ -61,18 +76,33 @@ export interface SearchResultSession {
   matches: SearchMatch[];
 }
 
+/**
+ * Result ordering:
+ * - `recent`: newest session first (default; matches how the session lists sort).
+ * - `relevance`: title hits first, then match count, then recency.
+ */
+export type SearchSort = "recent" | "relevance";
+
+export const DEFAULT_SEARCH_SORT: SearchSort = "recent";
+
 export interface SearchResponse {
   query: string;
+  sort: SearchSort;
   results: SearchResultSession[];
   totalSessions: number;
   totalMatches: number;
   searchDurationMs: number;
 }
 
+function parseSort(raw: string | undefined): SearchSort {
+  return raw === "relevance" || raw === "recent" ? raw : DEFAULT_SEARCH_SORT;
+}
+
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const MIN_QUERY_LENGTH = 2;
 const MATCHES_PER_SESSION = 3;
+const MATCHES_FOR_SINGLE_SESSION = 200;
 
 /**
  * Build the loadMessages callback the content index uses on cache miss.
@@ -99,11 +129,13 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
   const routes = new Hono();
   const loadMessages = createLoadMessages();
 
-  // GET /api/search?q=&project=&limit=
+  // GET /api/search?q=&project=&session=&limit=&sort=
   routes.get("/", async (c) => {
     const start = Date.now();
     const rawQuery = c.req.query("q")?.trim() ?? "";
+    const sort = parseSort(c.req.query("sort"));
     const filterProjectId = c.req.query("project");
+    const filterSessionId = c.req.query("session")?.trim() || undefined;
     const limitParam = c.req.query("limit");
     const limit = Math.min(
       Math.max(1, Number.parseInt(limitParam || "", 10) || DEFAULT_LIMIT),
@@ -114,6 +146,7 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       return c.json(
         {
           query: rawQuery,
+          sort,
           results: [],
           totalSessions: 0,
           totalMatches: 0,
@@ -134,6 +167,8 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       projects: allProjects,
       codexScanner: deps.codexScanner,
       geminiScanner: deps.geminiScanner,
+      piScanner: deps.piScanner,
+      kimiScanner: deps.kimiScanner,
     });
 
     const resolutionDeps = {
@@ -143,6 +178,10 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       geminiSessionsDir: deps.geminiSessionsDir,
       geminiReaderFactory: deps.geminiReaderFactory,
       geminiHashToCwd: providerCatalog.geminiHashToCwd,
+      piSessionsDir: deps.piSessionsDir,
+      piReaderFactory: deps.piReaderFactory,
+      kimiSessionsDir: deps.kimiSessionsDir,
+      kimiReaderFactory: deps.kimiReaderFactory,
     };
 
     // sessionId -> result (dedupe across sources/projects; first wins)
@@ -169,7 +208,8 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
           const scopeResults = deps.sessionContentIndexService.searchScope(
             index,
             queryLower,
-            MATCHES_PER_SESSION,
+            filterSessionId ? MATCHES_FOR_SINGLE_SESSION : MATCHES_PER_SESSION,
+            filterSessionId,
           );
           for (const result of scopeResults) {
             if (bySession.has(result.sessionId)) continue;
@@ -209,25 +249,40 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       });
     }
 
-    // Rank: title matches first, then more matches, then most recent.
     const titleHit = (item: SearchResultSession): boolean =>
       (item.title?.toLowerCase().includes(queryLower) ?? false) ||
       (item.customTitle?.toLowerCase().includes(queryLower) ?? false) ||
       (item.aiTitle?.toLowerCase().includes(queryLower) ?? false);
 
-    items.sort((a, b) => {
-      const at = titleHit(a) ? 1 : 0;
-      const bt = titleHit(b) ? 1 : 0;
-      if (at !== bt) return bt - at;
-      if (a.matchCount !== b.matchCount) return b.matchCount - a.matchCount;
-      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-    });
+    const updatedAtMs = (item: SearchResultSession): number => {
+      const ms = new Date(item.updatedAt).getTime();
+      return Number.isFinite(ms) ? ms : 0;
+    };
+
+    if (sort === "relevance") {
+      // Title matches first, then more matches, then most recent.
+      items.sort((a, b) => {
+        const at = titleHit(a) ? 1 : 0;
+        const bt = titleHit(b) ? 1 : 0;
+        if (at !== bt) return bt - at;
+        if (a.matchCount !== b.matchCount) return b.matchCount - a.matchCount;
+        return updatedAtMs(b) - updatedAtMs(a);
+      });
+    } else {
+      // Newest session first, then more matches as tie-break.
+      items.sort((a, b) => {
+        const delta = updatedAtMs(b) - updatedAtMs(a);
+        if (delta !== 0) return delta;
+        return b.matchCount - a.matchCount;
+      });
+    }
 
     const totalSessions = items.length;
     const results = items.slice(0, limit);
 
     return c.json({
       query: rawQuery,
+      sort,
       results,
       totalSessions,
       totalMatches,

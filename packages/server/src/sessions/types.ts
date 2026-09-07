@@ -6,12 +6,16 @@
  */
 
 import type {
+  AgentMapping,
   CodexBranchState,
   SessionBranchState,
+  SubagentDescriptor,
+  SubagentMetrics,
   UnifiedSession,
   UrlProjectId,
 } from "@yep-anywhere/shared";
 import type { Message, Session, SessionSummary } from "../supervisor/types.js";
+import type { PaginationInfo } from "./pagination.js";
 
 /**
  * Options for reading a session.
@@ -21,6 +25,28 @@ export interface GetSessionOptions {
   includeOrphans?: boolean;
   /** Choose a derived branch id to render instead of the latest branch. */
   branchId?: string;
+  /** Omit inline Pi image data from the normalized transcript. */
+  deferMedia?: boolean;
+  /** Omit Pi thinking blocks from the normalized transcript. */
+  deferThinking?: boolean;
+  /**
+   * Return a body-free Inspector index. Codex may use safe semantic
+   * placeholders for media/provider-native items because the route removes
+   * those bodies before responding; ordinary transcript reads remain strict.
+   */
+  inspectorProjection?: boolean;
+  /** Return only a bounded message window (Codex uses this before parsing). */
+  maxMessages?: number;
+  /** Number of compact boundaries to retain at the tail (Codex). */
+  tailCompactions?: number;
+  /** Return the window before this message cursor (Codex). */
+  beforeMessageId?: string;
+  /** Return a window centered around this message cursor (Codex). */
+  aroundMessageId?: string;
+  /** Return the window after this message cursor (Codex). */
+  afterWindowMessageId?: string;
+  /** Revision attached to a Codex pagination cursor. */
+  rolloutRevision?: string;
 }
 
 // Return type that includes both the computed summary and the raw provider data
@@ -31,10 +57,38 @@ export interface LoadedSession {
   messagesAlreadyProjected?: boolean;
   /** Internal: orphaned tool IDs computed while projecting Claude messages. */
   orphanedToolUses?: Set<string>;
+  /** Internal: Codex page projection, so route normalization does not re-convert it. */
+  projectedMessages?: Message[];
+  /** Internal: pagination already applied by a bounded Codex reader. */
+  pagination?: PaginationInfo;
+  paginationApplied?: boolean;
+  /** Physical Codex rollout bytes used for large-history admission. */
+  codexRolloutBytes?: number;
+  /** Public history backend used for this snapshot. */
+  historySource?: "codex-app-server" | "codex-rollout";
+  /**
+   * Internal read-stage timings used to populate the session detail
+   * `Server-Timing` header without exposing provider data in the response.
+   */
+  historyReadTimings?: {
+    historyCapabilityMs?: number;
+    summaryScanMs?: number;
+    pageReadMs?: number;
+    normalizeMs?: number;
+  };
   /** Provider-agnostic branch state for sessions with editable DAG/rollback history. */
   branchState?: SessionBranchState;
   /** Codex-only branch state derived from thread_rolled_back markers. */
   codexBranchState?: CodexBranchState;
+  /**
+   * Pi messages projected while deriving the summary, avoiding a second
+   * conversion traversal in normalizeSession.
+   */
+  precomputedPiMessages?: {
+    messages: Message[];
+    deferMedia: boolean;
+    deferThinking: boolean;
+  };
 }
 
 export interface SessionFileEntry {
@@ -100,18 +154,32 @@ export interface ISessionReader {
   /**
    * Get mappings from tool use IDs to agent session IDs.
    * Used for Claude's Task tool to link tool_use to subagent sessions.
-   * Non-Claude providers should return an empty array.
+   * Providers without subagent transcript support should return an empty array.
+   *
+   * @param sessionId - Optional session scope. Providers whose subagent ids
+   *   are only unique within a session (e.g. Kimi's `agent-0`/`agent-1`) use
+   *   this to scope the mappings to one session. Providers with globally
+   *   unique agent ids (Claude) may ignore it.
    */
-  getAgentMappings(): Promise<{ toolUseId: string; agentId: string }[]>;
+  getAgentMappings(sessionId?: string): Promise<AgentMapping[]>;
 
   /**
    * Get an agent (subagent) session by ID.
    * Used for Claude's Task tool subagent sessions (agent-*.jsonl files).
-   * Non-Claude providers should return null.
+   * Providers without subagent transcript support should return null.
+   *
+   * @param sessionId - Optional session scope; see getAgentMappings.
    */
   getAgentSession(
     agentId: string,
-  ): Promise<{ messages: Message[]; status: string } | null>;
+    sessionId?: string,
+  ): Promise<{
+    messages: Message[];
+    status: string;
+    agentType?: string;
+    metrics?: SubagentMetrics;
+    descriptor?: SubagentDescriptor;
+  } | null>;
 
   /**
    * Get the file path for a session by ID.
@@ -119,6 +187,16 @@ export interface ISessionReader {
    * Returns null if the session is not found.
    */
   getSessionFilePath?(sessionId: string): Promise<string | null>;
+
+  /**
+   * Return provider-aware change stats for index caching.
+   * Readers whose session metadata spans multiple files can aggregate those
+   * files into one mtime/size pair. The index falls back to getSessionFilePath
+   * when this method is not implemented.
+   */
+  getSessionFileStats?(
+    sessionId: string,
+  ): Promise<{ mtime: number; size: number } | null>;
 
   /**
    * Enumerate session files in a directory with their IDs.

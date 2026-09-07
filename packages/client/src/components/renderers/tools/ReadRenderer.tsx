@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import type { ZodError } from "zod";
 import { useSchemaValidationContext } from "../../../contexts/SchemaValidationContext";
+import { useOptionalSessionMetadata } from "../../../contexts/SessionMetadataContext";
 import { validateToolResult } from "../../../lib/validateToolResult";
+import { FileViewerModal } from "../../FilePathLink";
 import { SchemaWarning } from "../../SchemaWarning";
-import { Modal } from "../../ui/Modal";
+import { DetailPanel } from "../../ui/DetailPanel";
 import type {
   ImageFile,
   PdfFile,
@@ -22,8 +24,17 @@ interface ReadResultWithAugment extends ReadResult {
   session_id?: string | number;
 }
 
+const PDF_OBJECT_URL_LIFETIME_MS = 60_000;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function getReadInputFilePath(input: unknown): string | undefined {
+  if (!isRecord(input)) return undefined;
+  return [input.file_path, input.path, input.filePath].find(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
 }
 
 function getReadSessionId(result: unknown): string | number | undefined {
@@ -51,18 +62,114 @@ function isPtyHandoffTextRead(
   return !!file && file.content.length === 0;
 }
 
+function normalizeReadResult(
+  result: ReadResultWithAugment | string | undefined,
+  input?: Partial<ReadInput>,
+): ReadResultWithAugment | undefined {
+  if (!result) {
+    return undefined;
+  }
+
+  if (typeof result !== "string") {
+    return result;
+  }
+
+  const filePath = getXmlTag(result, "path") ?? getReadInputFilePath(input);
+  if (!filePath) {
+    return undefined;
+  }
+
+  const rawContent =
+    getXmlTag(result, "content") ?? getXmlTag(result, "entries");
+  const type = getXmlTag(result, "type");
+  const text =
+    type === "directory"
+      ? (rawContent ?? result).trim()
+      : stripNumberedReadLines(rawContent ?? result);
+  const startLine = parseReadStartLine(rawContent ?? "");
+  const numLines = text ? text.split("\n").length : 0;
+  const totalLines =
+    parseReadTotalLines(result) ??
+    Math.max(startLine + Math.max(numLines - 1, 0), numLines);
+
+  return {
+    type: "text",
+    file: {
+      filePath,
+      content: text,
+      numLines,
+      startLine,
+      totalLines,
+    },
+  };
+}
+
+function getXmlTag(text: string, tag: string): string | undefined {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text);
+  return match?.[1]?.trim();
+}
+
+function stripNumberedReadLines(text: string): string {
+  return text
+    .split("\n")
+    .filter(
+      (line) =>
+        !line.startsWith("(End of file") && !line.startsWith("(Showing lines"),
+    )
+    .map((line) => line.replace(/^\d+:\s?/, ""))
+    .join("\n")
+    .trimEnd();
+}
+
+function parseReadStartLine(text: string): number {
+  const firstNumberedLine = text.match(/^(\d+):/m);
+  return firstNumberedLine?.[1] ? Number.parseInt(firstNumberedLine[1], 10) : 1;
+}
+
+function parseReadTotalLines(text: string): number | undefined {
+  const totalMatch =
+    text.match(/total\s+(\d+)\s+lines/i) ?? text.match(/of\s+(\d+)\s+lines/i);
+  return totalMatch?.[1] ? Number.parseInt(totalMatch[1], 10) : undefined;
+}
+
 /**
  * Extract filename from path
  */
-function getFileName(filePath: string): string {
+function getFileName(filePath: string | undefined): string {
+  if (!filePath) return "Reading...";
   return filePath.split("/").pop() || filePath;
+}
+
+function getProjectRelativePath(
+  filePath: string,
+  projectPath: string | null | undefined,
+): string | null {
+  if (!projectPath) return null;
+
+  const root = projectPath.replace(/\/+$/, "");
+  if (!root) return null;
+
+  if (filePath === root) return "";
+  if (!filePath.startsWith(`${root}/`)) return null;
+  return filePath.slice(root.length + 1);
+}
+
+function isProjectRelativePath(filePath: string): boolean {
+  return !filePath.startsWith("/") && !filePath.includes("://");
+}
+
+function getLineCountLabel(file: TextFile): string {
+  if (file.numLines < file.totalLines || file.startLine > 1) {
+    return `${file.numLines} of ${file.totalLines} lines`;
+  }
+  return `${file.numLines} lines`;
 }
 
 /**
  * Read tool use - shows file path being read
  */
-function ReadToolUse({ input }: { input: ReadInput }) {
-  const fileName = getFileName(input.file_path);
+function ReadToolUse({ input }: { input: Partial<ReadInput> }) {
+  const fileName = getFileName(getReadInputFilePath(input));
   return (
     <div className="read-tool-use">
       <span className="file-path">{fileName}</span>
@@ -93,6 +200,7 @@ function FileModalContent({
   const [showPreview, setShowPreview] = useState(false);
   const lines = (file.content ?? "").split("\n");
   const hasMarkdownPreview = !!renderedMarkdownHtml;
+  const showRangeNotice = file.startLine > 1 || file.numLines < file.totalLines;
 
   // Toggle button for markdown files
   const toggleButton = hasMarkdownPreview && (
@@ -118,6 +226,12 @@ function FileModalContent({
   if (showPreview && renderedMarkdownHtml) {
     return (
       <div className="file-content-modal">
+        {showRangeNotice && (
+          <div className="file-content-range-notice">
+            Showing lines {file.startLine}-{file.startLine + file.numLines - 1}{" "}
+            of {file.totalLines}
+          </div>
+        )}
         {toggleButton}
         <div className="markdown-preview">
           <div
@@ -134,6 +248,12 @@ function FileModalContent({
   if (highlightedHtml) {
     return (
       <div className="file-content-modal">
+        {showRangeNotice && (
+          <div className="file-content-range-notice">
+            Showing lines {file.startLine}-{file.startLine + file.numLines - 1}{" "}
+            of {file.totalLines}
+          </div>
+        )}
         {toggleButton}
         <div className="file-viewer-code file-viewer-code-highlighted">
           <div
@@ -154,6 +274,12 @@ function FileModalContent({
   // Fallback: plain text with line numbers
   return (
     <div className="file-content-modal">
+      {showRangeNotice && (
+        <div className="file-content-range-notice">
+          Showing lines {file.startLine}-{file.startLine + file.numLines - 1} of{" "}
+          {file.totalLines}
+        </div>
+      )}
       {toggleButton}
       <div className="file-content-with-lines">
         <div className="line-numbers">
@@ -190,6 +316,77 @@ function FileModalTitle({ file }: { file: TextFile }) {
   );
 }
 
+type ReadModalTarget =
+  | { type: "project"; relativePath: string; lineNumber?: number }
+  | { type: "fragment" };
+
+function useReadModalTarget(file: TextFile): ReadModalTarget {
+  const metadata = useOptionalSessionMetadata();
+  const relativeFromProject = getProjectRelativePath(
+    file.filePath,
+    metadata?.projectPath,
+  );
+  const lineNumber = file.startLine > 1 ? file.startLine : undefined;
+
+  if (metadata?.projectId && relativeFromProject) {
+    return {
+      type: "project",
+      relativePath: relativeFromProject,
+      lineNumber,
+    };
+  }
+
+  if (metadata?.projectId && isProjectRelativePath(file.filePath)) {
+    return {
+      type: "project",
+      relativePath: file.filePath,
+      lineNumber,
+    };
+  }
+
+  return { type: "fragment" };
+}
+
+function ReadFileModal({
+  target,
+  file,
+  highlightedHtml,
+  highlightedTruncated,
+  renderedMarkdownHtml,
+  onClose,
+}: {
+  target: ReadModalTarget;
+  file: TextFile;
+  highlightedHtml?: string;
+  highlightedTruncated?: boolean;
+  renderedMarkdownHtml?: string;
+  onClose: () => void;
+}) {
+  const metadata = useOptionalSessionMetadata();
+
+  if (target.type === "project" && metadata?.projectId) {
+    return (
+      <FileViewerModal
+        projectId={metadata.projectId}
+        filePath={target.relativePath}
+        lineNumber={target.lineNumber}
+        onClose={onClose}
+      />
+    );
+  }
+
+  return (
+    <DetailPanel title={<FileModalTitle file={file} />} onClose={onClose}>
+      <FileModalContent
+        file={file}
+        highlightedHtml={highlightedHtml}
+        highlightedTruncated={highlightedTruncated}
+        renderedMarkdownHtml={renderedMarkdownHtml}
+      />
+    </DetailPanel>
+  );
+}
+
 /**
  * Text file result - clickable filename that opens modal
  */
@@ -209,6 +406,7 @@ function TextFileResult({
   const [showModal, setShowModal] = useState(false);
   const fileName = getFileName(file.filePath);
   const showRange = file.startLine > 1 || file.numLines < file.totalLines;
+  const modalTarget = useReadModalTarget(file);
 
   if (isPtyHandoff) {
     return (
@@ -234,21 +432,18 @@ function TextFileResult({
               (lines {file.startLine}-{file.startLine + file.numLines - 1})
             </span>
           )}
-          <span className="file-line-count">{file.numLines} lines</span>
+          <span className="file-line-count">{getLineCountLabel(file)}</span>
         </button>
       </div>
       {showModal && (
-        <Modal
-          title={<FileModalTitle file={file} />}
+        <ReadFileModal
+          target={modalTarget}
+          file={file}
+          highlightedHtml={highlightedHtml}
+          highlightedTruncated={highlightedTruncated}
+          renderedMarkdownHtml={renderedMarkdownHtml}
           onClose={() => setShowModal(false)}
-        >
-          <FileModalContent
-            file={file}
-            highlightedHtml={highlightedHtml}
-            highlightedTruncated={highlightedTruncated}
-            renderedMarkdownHtml={renderedMarkdownHtml}
-          />
-        </Modal>
+        />
       )}
     </>
   );
@@ -298,7 +493,22 @@ function openPdfInNewTab(base64Data: string) {
   }
   const blob = new Blob([byteArray], { type: "application/pdf" });
   const url = URL.createObjectURL(blob);
-  window.open(url, "_blank");
+  try {
+    const openedWindow = window.open(url, "_blank");
+    if (!openedWindow) {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    // Give the browser/PDF viewer time to consume the Blob, then release the
+    // registry entry. Keeping it forever makes every click retain a full PDF.
+    window.setTimeout(
+      () => URL.revokeObjectURL(url),
+      PDF_OBJECT_URL_LIFETIME_MS,
+    );
+  } catch (error) {
+    URL.revokeObjectURL(url);
+    throw error;
+  }
 }
 
 /**
@@ -332,10 +542,13 @@ function PdfFileResult({
 function ReadToolResult({
   result,
   isError,
+  input,
 }: {
-  result: ReadResultWithAugment;
+  result: ReadResultWithAugment | string | undefined;
   isError: boolean;
+  input?: Partial<ReadInput>;
 }) {
+  const normalizedResult = normalizeReadResult(result, input);
   const { enabled, reportValidationError, isToolIgnored } =
     useSchemaValidationContext();
   const [validationErrors, setValidationErrors] = useState<ZodError | null>(
@@ -343,8 +556,8 @@ function ReadToolResult({
   );
 
   useEffect(() => {
-    if (enabled && result) {
-      const validation = validateToolResult("Read", result);
+    if (enabled && normalizedResult) {
+      const validation = validateToolResult("Read", normalizedResult);
       if (!validation.valid && validation.errors) {
         setValidationErrors(validation.errors);
         reportValidationError("Read", validation.errors);
@@ -352,12 +565,12 @@ function ReadToolResult({
         setValidationErrors(null);
       }
     }
-  }, [enabled, result, reportValidationError]);
+  }, [enabled, normalizedResult, reportValidationError]);
 
   const showValidationWarning =
     enabled && validationErrors && !isToolIgnored("Read");
 
-  if (isError || !result?.file) {
+  if (isError || !normalizedResult?.file) {
     const errorResult = result as unknown as { content?: unknown } | undefined;
     return (
       <div className="read-error">
@@ -371,24 +584,24 @@ function ReadToolResult({
     );
   }
 
-  if (result.type === "pdf") {
+  if (normalizedResult.type === "pdf") {
     return (
       <>
         {showValidationWarning && validationErrors && (
           <SchemaWarning toolName="Read" errors={validationErrors} />
         )}
-        <PdfFileResult file={result.file as PdfFile} />
+        <PdfFileResult file={normalizedResult.file as PdfFile} />
       </>
     );
   }
 
-  if (result.type === "image") {
+  if (normalizedResult.type === "image") {
     return (
       <>
         {showValidationWarning && validationErrors && (
           <SchemaWarning toolName="Read" errors={validationErrors} />
         )}
-        <ImageFileResult file={result.file as ImageFile} />
+        <ImageFileResult file={normalizedResult.file as ImageFile} />
       </>
     );
   }
@@ -399,11 +612,11 @@ function ReadToolResult({
         <SchemaWarning toolName="Read" errors={validationErrors} />
       )}
       <TextFileResult
-        file={result.file as TextFile}
-        highlightedHtml={result._highlightedContentHtml}
-        highlightedTruncated={result._highlightedTruncated}
-        renderedMarkdownHtml={result._renderedMarkdownHtml}
-        isPtyHandoff={isPtyHandoffTextRead(result)}
+        file={normalizedResult.file as TextFile}
+        highlightedHtml={normalizedResult._highlightedContentHtml}
+        highlightedTruncated={normalizedResult._highlightedTruncated}
+        renderedMarkdownHtml={normalizedResult._renderedMarkdownHtml}
+        isPtyHandoff={isPtyHandoffTextRead(normalizedResult)}
       />
     </>
   );
@@ -417,10 +630,11 @@ function ReadInteractiveSummary({
   result,
   isError,
 }: {
-  input: ReadInput;
-  result: ReadResultWithAugment | undefined;
+  input: Partial<ReadInput>;
+  result: ReadResultWithAugment | string | undefined;
   isError: boolean;
 }) {
+  const normalizedResult = normalizeReadResult(result, input);
   const [showModal, setShowModal] = useState(false);
   const { enabled, reportValidationError, isToolIgnored } =
     useSchemaValidationContext();
@@ -429,8 +643,8 @@ function ReadInteractiveSummary({
   );
 
   useEffect(() => {
-    if (enabled && result) {
-      const validation = validateToolResult("Read", result);
+    if (enabled && normalizedResult) {
+      const validation = validateToolResult("Read", normalizedResult);
       if (!validation.valid && validation.errors) {
         setValidationErrors(validation.errors);
         reportValidationError("Read", validation.errors);
@@ -438,12 +652,12 @@ function ReadInteractiveSummary({
         setValidationErrors(null);
       }
     }
-  }, [enabled, result, reportValidationError]);
+  }, [enabled, normalizedResult, reportValidationError]);
 
   const showValidationWarning =
     enabled && validationErrors && !isToolIgnored("Read");
 
-  const fileName = getFileName(input.file_path);
+  const fileName = getFileName(getReadInputFilePath(input));
 
   if (isError) {
     return (
@@ -456,12 +670,12 @@ function ReadInteractiveSummary({
     );
   }
 
-  if (!result?.file) {
+  if (!normalizedResult?.file) {
     return <span>{fileName}</span>;
   }
 
-  if (result.type === "pdf") {
-    const pdfFile = result.file as PdfFile;
+  if (normalizedResult.type === "pdf") {
+    const pdfFile = normalizedResult.file as PdfFile;
     return (
       <button
         type="button"
@@ -480,8 +694,8 @@ function ReadInteractiveSummary({
     );
   }
 
-  if (result.type === "image") {
-    const imageFile = result.file as ImageFile;
+  if (normalizedResult.type === "image") {
+    const imageFile = normalizedResult.file as ImageFile;
     return (
       <>
         <button
@@ -499,16 +713,44 @@ function ReadInteractiveSummary({
           )}
         </button>
         {showModal && (
-          <Modal title={fileName} onClose={() => setShowModal(false)}>
+          <DetailPanel title={fileName} onClose={() => setShowModal(false)}>
             <ImageFileResult file={imageFile} />
-          </Modal>
+          </DetailPanel>
         )}
       </>
     );
   }
 
-  const file = result.file as TextFile;
-  const isPtyHandoff = isPtyHandoffTextRead(result);
+  const file = normalizedResult.file as TextFile;
+  return (
+    <TextReadInteractiveSummary
+      file={file}
+      fileName={fileName}
+      result={normalizedResult}
+      isPtyHandoff={isPtyHandoffTextRead(normalizedResult)}
+      showValidationWarning={!!showValidationWarning}
+      validationErrors={validationErrors}
+    />
+  );
+}
+
+function TextReadInteractiveSummary({
+  file,
+  fileName,
+  result,
+  isPtyHandoff,
+  showValidationWarning,
+  validationErrors,
+}: {
+  file: TextFile;
+  fileName: string;
+  result: ReadResultWithAugment;
+  isPtyHandoff: boolean;
+  showValidationWarning: boolean;
+  validationErrors: ZodError | null;
+}) {
+  const [showModal, setShowModal] = useState(false);
+  const modalTarget = useReadModalTarget(file);
 
   if (isPtyHandoff) {
     return (
@@ -530,52 +772,55 @@ function ReadInteractiveSummary({
         }}
       >
         {fileName}
-        <span className="file-line-count-inline">{file.numLines} lines</span>
+        <span className="file-line-count-inline">
+          {getLineCountLabel(file)}
+        </span>
         {showValidationWarning && validationErrors && (
           <SchemaWarning toolName="Read" errors={validationErrors} />
         )}
       </button>
       {showModal && (
-        <Modal
-          title={<FileModalTitle file={file} />}
+        <ReadFileModal
+          target={modalTarget}
+          file={file}
+          highlightedHtml={result._highlightedContentHtml}
+          highlightedTruncated={result._highlightedTruncated}
+          renderedMarkdownHtml={result._renderedMarkdownHtml}
           onClose={() => setShowModal(false)}
-        >
-          <FileModalContent
-            file={file}
-            highlightedHtml={result._highlightedContentHtml}
-            highlightedTruncated={result._highlightedTruncated}
-            renderedMarkdownHtml={result._renderedMarkdownHtml}
-          />
-        </Modal>
+        />
       )}
     </>
   );
 }
 
-export const readRenderer: ToolRenderer<ReadInput, ReadResult> = {
+export const readRenderer: ToolRenderer<unknown, unknown> = {
   tool: "Read",
 
   renderToolUse(input, _context) {
-    return <ReadToolUse input={input as ReadInput} />;
+    return <ReadToolUse input={(input ?? {}) as Partial<ReadInput>} />;
   },
 
-  renderToolResult(result, isError, _context) {
+  renderToolResult(result, isError, _context, input) {
     return (
       <ReadToolResult
-        result={result as ReadResultWithAugment}
+        result={result as ReadResultWithAugment | string | undefined}
         isError={isError}
+        input={input as Partial<ReadInput> | undefined}
       />
     );
   },
 
   getUseSummary(input) {
-    return getFileName((input as ReadInput).file_path);
+    return getFileName(getReadInputFilePath(input));
   },
 
   getResultSummary(result, isError, input?) {
-    if (isError && input) return getFileName((input as ReadInput).file_path);
+    if (isError && input) return getFileName(getReadInputFilePath(input));
     if (isError) return "Error";
-    const r = result as ReadResultWithAugment;
+    const r = normalizeReadResult(
+      result as ReadResultWithAugment | string | undefined,
+      input as Partial<ReadInput> | undefined,
+    );
     if (!r?.file) return "Reading...";
     if (isPtyHandoffTextRead(r)) return "continues in Shell";
     if (r.type === "pdf") return "PDF";
@@ -584,10 +829,13 @@ export const readRenderer: ToolRenderer<ReadInput, ReadResult> = {
   },
 
   renderInteractiveSummary(input, result, isError, _context) {
+    const partialInput = (input ?? {}) as Partial<ReadInput>;
+    if (!isError && !getReadInputFilePath(partialInput) && result === undefined)
+      return null;
     return (
       <ReadInteractiveSummary
-        input={input as ReadInput}
-        result={result as ReadResultWithAugment | undefined}
+        input={partialInput}
+        result={result as ReadResultWithAugment | string | undefined}
         isError={isError}
       />
     );

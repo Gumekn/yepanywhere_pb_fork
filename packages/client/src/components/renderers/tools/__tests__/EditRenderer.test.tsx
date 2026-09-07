@@ -1,5 +1,7 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { I18nProvider } from "../../../../i18n";
+import { UI_KEYS } from "../../../../lib/storageKeys";
 import { editRenderer } from "../EditRenderer";
 
 vi.mock("../../../../contexts/SchemaValidationContext", () => ({
@@ -13,6 +15,10 @@ vi.mock("../../../../contexts/SchemaValidationContext", () => ({
   }),
 }));
 
+vi.mock("../../../../contexts/SessionMetadataContext", () => ({
+  useSessionMetadata: () => ({ projectPath: "/workspace" }),
+}));
+
 const renderContext = {
   isStreaming: false,
   theme: "dark" as const,
@@ -23,8 +29,80 @@ if (!editRenderer.renderCollapsedPreview) {
 const renderCollapsedPreview = editRenderer.renderCollapsedPreview;
 
 describe("EditRenderer collapsed preview fallback", () => {
+  it.each([false, true])(
+    "shows an external filename and its distinct full label (diff ready: %s)",
+    (withDiff) => {
+      const path = "/tmp/example/api_request.py";
+      if (!editRenderer.renderInteractiveSummary)
+        throw new Error("Missing Edit summary");
+      render(
+        <div>
+          {editRenderer.renderInteractiveSummary(
+            {
+              file_path: path,
+              ...(withDiff
+                ? {
+                    _structuredPatch: [
+                      {
+                        oldStart: 1,
+                        oldLines: 1,
+                        newStart: 1,
+                        newLines: 1,
+                        lines: ["-old", "+new"],
+                      },
+                    ],
+                  }
+                : {}),
+            } as never,
+            undefined,
+            false,
+            renderContext,
+          )}
+        </div>,
+      );
+      expect(screen.getByTitle(path).textContent).toContain("api_request.py");
+      expect(screen.queryByText("[path hidden]")).toBeNull();
+    },
+  );
+
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("opens a short structured Edit diff in the detail panel", () => {
+    localStorage.setItem(UI_KEYS.locale, "en");
+    vi.spyOn(window.history, "back").mockImplementation(() => undefined);
+    const input = {
+      file_path: "/workspace/src/example.ts",
+      old_string: "const x = 1;",
+      new_string: "const x = 2;",
+      _structuredPatch: [
+        {
+          oldStart: 1,
+          oldLines: 1,
+          newStart: 1,
+          newLines: 1,
+          lines: ["-const x = 1;", "+const x = 2;"],
+        },
+      ],
+    };
+
+    render(
+      <I18nProvider>
+        <div>
+          {renderCollapsedPreview(
+            input as never,
+            { ok: true } as never,
+            false,
+            renderContext,
+          )}
+        </div>
+      </I18nProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Show full diff" }));
+    expect(screen.getByRole("dialog", { name: "example.ts" })).toBeDefined();
   });
 
   it("renders raw patch text for completed rows when structured patch is missing", () => {
@@ -205,5 +283,58 @@ describe("EditRenderer collapsed preview fallback", () => {
     );
 
     expect(screen.getByRole("button", { name: /Foo\.tsx/i })).toBeDefined();
+  });
+
+  it("renders completed result diffs from input augment data", () => {
+    render(
+      <div>
+        {editRenderer.renderToolResult(
+          { content: "Edited successfully." } as never,
+          false,
+          renderContext,
+          {
+            file_path: "src/example.ts",
+            _structuredPatch: [
+              {
+                oldStart: 1,
+                oldLines: 1,
+                newStart: 1,
+                newLines: 1,
+                lines: ["-const x = 1;", "+const x = 2;"],
+              },
+            ],
+          } as never,
+        )}
+      </div>,
+    );
+
+    expect(screen.queryByText("(empty)")).toBeNull();
+    expect(screen.getByText("-const x = 1;")).toBeDefined();
+    expect(screen.getByText("+const x = 2;")).toBeDefined();
+  });
+
+  it("renders completed result raw patch from input when structured data is unavailable", () => {
+    render(
+      <div>
+        {editRenderer.renderToolResult(
+          { content: "Edited successfully." } as never,
+          false,
+          renderContext,
+          {
+            file_path: "src/example.ts",
+            _rawPatch: [
+              "--- src/example.ts",
+              "+++ src/example.ts",
+              "@@ -1,1 +1,1 @@",
+              "-const x = 1;",
+              "+const x = 2;",
+            ].join("\n"),
+          } as never,
+        )}
+      </div>,
+    );
+
+    expect(screen.queryByText("(empty)")).toBeNull();
+    expect(screen.getByText(/--- src\/example\.ts/)).toBeDefined();
   });
 });

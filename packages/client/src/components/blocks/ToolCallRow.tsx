@@ -7,6 +7,7 @@ import type { ToolResultData } from "../../types/renderItems";
 import { toolRegistry } from "../renderers/tools";
 import type { RenderContext } from "../renderers/types";
 import { getToolSummary } from "../tools/summaries";
+import { ToolRenderErrorBoundary } from "./ToolRenderErrorBoundary";
 
 interface Props {
   id: string;
@@ -15,15 +16,20 @@ interface Props {
   toolResult?: ToolResultData;
   status: "pending" | "complete" | "error" | "aborted";
   sessionProvider?: string;
+  /** Live streaming output preview while the tool is still running. */
+  partialOutput?: string;
 }
 
-export const ToolCallRow = memo(function ToolCallRow({
+type ToolCallStatus = Props["status"];
+
+const ToolCallRowContent = memo(function ToolCallRowContent({
   id,
   toolName,
   toolInput,
   toolResult,
   status,
   sessionProvider,
+  partialOutput,
 }: Props) {
   // Create a minimal render context for tool renderers
   const renderContext: RenderContext = useMemo(
@@ -39,7 +45,6 @@ export const ToolCallRow = memo(function ToolCallRow({
   // Get structured result for interactive summary
   const structuredResult = toolResult?.structured ?? toolResult?.content;
 
-  // Check if this tool renders inline (bypasses entire tool-row structure)
   const hasInlineRenderer = toolRegistry.hasInlineRenderer(toolName);
   const suppressCollapsedPreview = shouldSuppressBashCollapsedPreview(
     toolName,
@@ -98,7 +103,7 @@ export const ToolCallRow = memo(function ToolCallRow({
     collapsedPreviewContent !== undefined &&
     collapsedPreviewContent !== false;
   const hideSummaryWhenPreviewVisible =
-    toolName === "Bash" &&
+    isBashToolName(toolName) &&
     status === "pending" &&
     hasCollapsedPreview &&
     isCodexLikeBashInput(toolInput, sessionProvider);
@@ -111,8 +116,10 @@ export const ToolCallRow = memo(function ToolCallRow({
   );
 
   const summary = useMemo(() => {
-    return getToolSummary(toolName, toolInput, toolResult, status);
-  }, [toolName, toolInput, toolResult, status]);
+    return getToolSummary(toolName, toolInput, toolResult, status, {
+      provider: sessionProvider,
+    });
+  }, [toolName, toolInput, toolResult, status, sessionProvider]);
 
   const handleToggle = () => {
     if (!isNonExpandable) {
@@ -163,7 +170,7 @@ export const ToolCallRow = memo(function ToolCallRow({
         )}
 
         <span className="tool-name">
-          {toolRegistry.getDisplayName(toolName)}
+          {toolRegistry.getDisplayName(toolName, toolInput)}
         </span>
 
         {hasInteractiveSummary && status === "complete" ? (
@@ -193,6 +200,11 @@ export const ToolCallRow = memo(function ToolCallRow({
         </div>
       )}
 
+      {/* Live output stream while the command is still running (Codex TUI parity) */}
+      {status === "pending" && partialOutput && (
+        <LiveOutputPreview output={partialOutput} />
+      )}
+
       {expanded && !isNonExpandable && (
         <div className="tool-row-content">
           {status === "pending" || status === "aborted" ? (
@@ -215,13 +227,27 @@ export const ToolCallRow = memo(function ToolCallRow({
   );
 });
 
+export const ToolCallRow = memo(function ToolCallRow(props: Props) {
+  return (
+    <ToolRenderErrorBoundary
+      toolId={props.id}
+      toolName={props.toolName}
+      status={props.status}
+      input={props.toolInput}
+      result={props.toolResult}
+    >
+      <ToolCallRowContent {...props} />
+    </ToolRenderErrorBoundary>
+  );
+});
+
 function shouldSuppressBashCollapsedPreview(
   toolName: string,
   toolInput: unknown,
   sessionProvider?: string,
-  status?: "pending" | "complete" | "error" | "aborted",
+  status?: ToolCallStatus,
 ): boolean {
-  if (toolName !== "Bash") {
+  if (!isBashToolName(toolName)) {
     return false;
   }
 
@@ -246,6 +272,35 @@ function shouldSuppressBashCollapsedPreview(
   }
 
   return /^(rg|grep|sed|nl|cat)\b/.test(command.trimStart());
+}
+
+function isBashToolName(toolName: string): boolean {
+  const normalized = toolName.toLowerCase();
+  return normalized === "bash" || normalized === "shell";
+}
+
+const LIVE_OUTPUT_MAX_LINES = 12;
+
+/** Scrolling tail of a running command's output, like the Codex TUI exec cell. */
+function LiveOutputPreview({ output }: { output: string }) {
+  const tail = useMemo(() => {
+    const lines = output.replace(/\r\n?/g, "\n").split("\n");
+    // Drop a trailing blank line from a final newline so the tail stays dense.
+    if (lines.length > 1 && lines[lines.length - 1] === "") {
+      lines.pop();
+    }
+    return lines.slice(-LIVE_OUTPUT_MAX_LINES).join("\n");
+  }, [output]);
+
+  if (!tail.trim()) {
+    return null;
+  }
+
+  return (
+    <div className="tool-live-output" aria-live="polite">
+      <pre>{tail}</pre>
+    </div>
+  );
 }
 
 function ToolUseExpanded({

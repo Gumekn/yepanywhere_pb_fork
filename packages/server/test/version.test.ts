@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CODEX_PROTOCOL_BASELINE } from "../src/sdk/providers/codex-protocol/baseline.js";
 
 // Dynamic import so vi.resetModules() gives us fresh module state (clears cache)
 async function importVersion() {
@@ -11,10 +12,16 @@ describe("GET /version", () => {
 
   beforeEach(() => {
     vi.resetModules();
+    // These cases characterise the update-server contract, which only applies
+    // to the upstream release line. Fork and dev builds skip it entirely — see
+    // the "release channel gating" block below.
+    vi.stubEnv("YEP_RELEASE_CHANNEL", "upstream");
   });
 
   afterEach(() => {
     global.fetch = originalFetch;
+    vi.unstubAllEnvs();
+    vi.doUnmock("node:child_process");
   });
 
   function mockFetch(
@@ -26,13 +33,38 @@ describe("GET /version", () => {
     global.fetch = vi.fn(handler) as unknown as typeof fetch;
   }
 
-  it("parses tag_name from GitHub Releases response", async () => {
+  /**
+   * Pin `git describe --tags --always` for the next dynamic import. Only `exec`
+   * is replaced; build-info.ts reaches for `execFile` and must keep working.
+   */
+  function stubGitDescribe(describe: string) {
+    vi.doMock("node:child_process", async () => {
+      const actual =
+        await vi.importActual<typeof import("node:child_process")>(
+          "node:child_process",
+        );
+      return {
+        ...actual,
+        exec: (
+          _command: string,
+          _options: unknown,
+          callback: (
+            error: Error | null,
+            result: { stdout: string; stderr: string },
+          ) => void,
+        ) => callback(null, { stdout: `${describe}\n`, stderr: "" }),
+      };
+    });
+  }
+
+  it("parses version from update server 200 response", async () => {
     mockFetch(
       () =>
         new Response(
           JSON.stringify({
-            tag_name: "v99.0.0",
-            name: "Release 99.0.0",
+            version: "99.0.0",
+            notes: "New release",
+            pub_date: "2026-01-01T00:00:00Z",
           }),
         ),
     );
@@ -47,8 +79,8 @@ describe("GET /version", () => {
     expect(json.current).toBeDefined();
   });
 
-  it("treats a GitHub 404 as no published release", async () => {
-    mockFetch(() => new Response(null, { status: 404 }));
+  it("treats 204 as up-to-date", async () => {
+    mockFetch(() => new Response(null, { status: 204 }));
 
     const { createVersionRoutes } = await importVersion();
     const routes = createVersionRoutes();
@@ -88,29 +120,39 @@ describe("GET /version", () => {
     expect(json.updateAvailable).toBe(false);
   });
 
-  it("sends GitHub API headers without leaking installId", async () => {
+  it("sends installId as X-CFU-ID header", async () => {
     let capturedHeaders: Headers | undefined;
     mockFetch((_url, init) => {
       capturedHeaders = new Headers(init?.headers);
-      return new Response(null, { status: 404 });
+      return new Response(null, { status: 204 });
     });
 
     const { createVersionRoutes } = await importVersion();
     const routes = createVersionRoutes({ installId: "my-install-id" });
     await routes.request("/");
 
+    expect(capturedHeaders?.get("X-CFU-ID")).toBe("my-install-id");
+  });
+
+  it("omits X-CFU-ID header when installId is not provided", async () => {
+    let capturedHeaders: Headers | undefined;
+    mockFetch((_url, init) => {
+      capturedHeaders = new Headers(init?.headers);
+      return new Response(null, { status: 204 });
+    });
+
+    const { createVersionRoutes } = await importVersion();
+    const routes = createVersionRoutes();
+    await routes.request("/");
+
     expect(capturedHeaders?.get("X-CFU-ID")).toBeNull();
-    expect(capturedHeaders?.get("Accept")).toBe("application/vnd.github+json");
-    expect(capturedHeaders?.get("User-Agent")).toBe(
-      "yepanywhere-version-check",
-    );
   });
 
   it("sends current version in URL path", async () => {
     let capturedUrl = "";
     mockFetch((url) => {
       capturedUrl = String(url);
-      return new Response(null, { status: 404 });
+      return new Response(null, { status: 204 });
     });
 
     const { createVersionRoutes } = await importVersion();
@@ -118,7 +160,7 @@ describe("GET /version", () => {
     await routes.request("/");
 
     expect(capturedUrl).toMatch(
-      /https:\/\/api\.github\.com\/repos\/Gumekn\/yepanywhere_pb_fork\/releases\/latest/,
+      /https:\/\/updates\.yepanywhere\.com\/version\/.+/,
     );
   });
 
@@ -130,7 +172,7 @@ describe("GET /version", () => {
     let fetchCount = 0;
     mockFetch(() => {
       fetchCount++;
-      return new Response(JSON.stringify({ tag_name: "v1.0.0" }));
+      return new Response(JSON.stringify({ version: "1.0.0" }));
     });
 
     const { createVersionRoutes } = await importVersion();
@@ -156,7 +198,7 @@ describe("GET /version", () => {
     let fetchCount = 0;
     mockFetch(() => {
       fetchCount++;
-      return new Response(JSON.stringify({ tag_name: "v1.0.0" }));
+      return new Response(JSON.stringify({ version: "1.0.0" }));
     });
 
     const { createVersionRoutes } = await importVersion();
@@ -182,6 +224,70 @@ describe("GET /version", () => {
 
     expect(json.resumeProtocolVersion).toBeTypeOf("number");
     expect(Array.isArray(json.capabilities)).toBe(true);
+    expect(json.codexProtocol).toEqual({
+      version: CODEX_PROTOCOL_BASELINE.codexVersion,
+      schemaHash: CODEX_PROTOCOL_BASELINE.experimentalSchemaHash,
+      profile: "experimental",
+      experimentalApi: true,
+      unknownNotificationsTotal: expect.any(Number),
+      unknownServerRequestsTotal: expect.any(Number),
+      diagnostics: {
+        scope: "process_lifetime",
+        unknownNotificationsTotal: expect.any(Number),
+        unknownServerRequestsTotal: expect.any(Number),
+        bucketLimit: 32,
+        bucketOverflowTotal: expect.any(Number),
+        buckets: expect.any(Array),
+      },
+    });
+  });
+
+  it("exposes bounded plaintext Codex compatibility diagnostics", async () => {
+    mockFetch(() => new Response(null, { status: 204 }));
+
+    const { createVersionRoutes } = await importVersion();
+    const { recordUnknownCodexNotification, recordUnknownCodexServerRequest } =
+      await import("../src/codex-events/diagnostics.js");
+    const rawMethod = "future/route?authorization=route-secret";
+    const rawRequest = "future/request//private/workspace";
+    const runtime = {
+      codexVersion: "untrusted-version-route-secret",
+      schemaHash: "untrusted-schema-/private/workspace",
+      profile: "experimental" as const,
+      experimentalApi: true,
+    };
+    recordUnknownCodexNotification(rawMethod, runtime);
+    recordUnknownCodexServerRequest(rawRequest, runtime);
+
+    const routes = createVersionRoutes();
+    const res = await routes.request("/");
+    const json = await res.json();
+    expect(json.codexProtocol.diagnostics).toMatchObject({
+      scope: "process_lifetime",
+      unknownNotificationsTotal: 1,
+      unknownServerRequestsTotal: 1,
+      bucketLimit: 32,
+      bucketOverflowTotal: 0,
+      buckets: [
+        expect.objectContaining({
+          methodFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{20}$/),
+          runtimeVersion: runtime.codexVersion,
+          schemaFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{20}$/),
+        }),
+        expect.objectContaining({
+          methodFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{20}$/),
+          runtimeVersion: runtime.codexVersion,
+          schemaFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{20}$/),
+        }),
+      ],
+    });
+    const serialized = JSON.stringify(json.codexProtocol.diagnostics);
+    expect(serialized).toContain(rawMethod);
+    expect(serialized).toContain(rawRequest);
+    expect(serialized).toContain(runtime.codexVersion);
+    expect(serialized).toContain(runtime.schemaHash);
+    expect(serialized).toContain("route-secret");
+    expect(serialized).toContain("/private/");
   });
 
   it("reports update-available for stale bridge binaries", async () => {
@@ -216,5 +322,100 @@ describe("GET /version", () => {
 
     expect(capabilities).toContain("deviceBridge-download");
     expect(capabilities).not.toContain("deviceBridge-update");
+  });
+
+  describe("release channel gating", () => {
+    // The public update service only knows upstream versions. A fork build that
+    // asked it would be told to "update" to whatever upstream released last,
+    // which means installing upstream over the fork.
+    for (const channel of ["fork", "dev"] as const) {
+      it(`does not contact the update server on the ${channel} channel`, async () => {
+        vi.stubEnv("YEP_RELEASE_CHANNEL", channel);
+        let fetchCount = 0;
+        mockFetch(() => {
+          fetchCount++;
+          return new Response(JSON.stringify({ version: "99.0.0" }));
+        });
+
+        const { createVersionRoutes } = await importVersion();
+        const routes = createVersionRoutes({ installId: "test-id" });
+        const res = await routes.request("/");
+        const json = await res.json();
+
+        expect(fetchCount).toBe(0);
+        expect(json.latest).toBeNull();
+        expect(json.updateAvailable).toBe(false);
+        expect(json.build.releaseChannel).toBe(channel);
+      });
+
+      it(`still skips the update server on ${channel} when fresh=1 is forced`, async () => {
+        vi.stubEnv("YEP_RELEASE_CHANNEL", channel);
+        let fetchCount = 0;
+        mockFetch(() => {
+          fetchCount++;
+          return new Response(JSON.stringify({ version: "99.0.0" }));
+        });
+
+        const { createVersionRoutes } = await importVersion();
+        const routes = createVersionRoutes();
+        const res = await routes.request("/?fresh=1");
+        const json = await res.json();
+
+        expect(fetchCount).toBe(0);
+        expect(json.updateAvailable).toBe(false);
+      });
+    }
+
+    it("defaults to the dev channel when YEP_RELEASE_CHANNEL is unset", async () => {
+      vi.stubEnv("YEP_RELEASE_CHANNEL", undefined);
+      mockFetch(() => new Response(JSON.stringify({ version: "99.0.0" })));
+
+      const { createVersionRoutes } = await importVersion();
+      const routes = createVersionRoutes();
+      const res = await routes.request("/");
+      const json = await res.json();
+
+      expect(json.build.releaseChannel).toBe("dev");
+      expect(json.updateAvailable).toBe(false);
+    });
+
+    it("ignores an unrecognised channel rather than trusting it", async () => {
+      vi.stubEnv("YEP_RELEASE_CHANNEL", "not-a-channel");
+      mockFetch(() => new Response(JSON.stringify({ version: "99.0.0" })));
+
+      const { createVersionRoutes } = await importVersion();
+      const routes = createVersionRoutes();
+      const res = await routes.request("/");
+      const json = await res.json();
+
+      expect(json.build.releaseChannel).toBe("dev");
+      expect(json.updateAvailable).toBe(false);
+    });
+
+    it("reports an update on the upstream channel", async () => {
+      vi.stubEnv("YEP_RELEASE_CHANNEL", "upstream");
+      // The workspace package.json carries the 0.0.1 placeholder, so the route
+      // derives its version from `git describe --tags --always`. A shallow CI
+      // checkout has no tags, leaving a bare commit SHA that isNewerSemver
+      // cannot parse. Pin it so this asserts the channel gate rather than the
+      // checkout depth of whoever runs the suite.
+      stubGitDescribe("v1.0.0");
+      let fetchCount = 0;
+      mockFetch(() => {
+        fetchCount++;
+        return new Response(JSON.stringify({ version: "99.0.0" }));
+      });
+
+      const { createVersionRoutes } = await importVersion();
+      const routes = createVersionRoutes();
+      const res = await routes.request("/");
+      const json = await res.json();
+
+      expect(fetchCount).toBe(1);
+      expect(json.build.releaseChannel).toBe("upstream");
+      expect(json.current).toBe("1.0.0");
+      expect(json.latest).toBe("99.0.0");
+      expect(json.updateAvailable).toBe(true);
+    });
   });
 });

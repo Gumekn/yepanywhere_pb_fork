@@ -23,9 +23,20 @@ try {
     path.join(tempDir, "package.json"),
     `${JSON.stringify(packageJson, null, 2)}\n`,
   );
+  const npmCommand = process.platform === "win32" ? process.execPath : "npm";
+  const npmArgs =
+    process.platform === "win32"
+      ? [
+          path.join(
+            path.dirname(process.execPath),
+            "node_modules/npm/bin/npm-cli.js",
+          ),
+        ]
+      : [];
   execFileSync(
-    "npm",
+    npmCommand,
     [
+      ...npmArgs,
       "install",
       "--package-lock-only",
       "--ignore-scripts",

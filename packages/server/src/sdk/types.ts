@@ -1,4 +1,4 @@
-// Core types for Claude SDK abstraction
+// Core types shared by provider adapters and legacy test doubles.
 
 // Re-export PermissionMode from shared
 export type { PermissionMode } from "@yep-anywhere/shared";
@@ -12,10 +12,14 @@ export interface ContentBlock {
   id?: string;
   name?: string;
   input?: unknown;
+  /** Provider lifecycle status for a projected tool_use block. */
+  status?: string;
   /** For tool_result blocks - references the tool_use id */
   tool_use_id?: string;
   /** For tool_result blocks - the result content */
   content?: string;
+  /** Live streaming output preview for a still-running tool. */
+  partialOutput?: string;
 }
 
 /**
@@ -82,17 +86,61 @@ export type TimestampedSDKMessage<T extends SDKMessage = SDKMessage> = T & {
   timestamp: string;
 };
 
+/** Exact structured Codex app-server user inputs retained across queue/steer. */
+export type CodexStructuredUserInput =
+  | { type: "skill"; name: string; path: string }
+  | { type: "mention"; name: string; path: string };
+
 export interface UserMessage {
   text: string;
   images?: string[]; // base64 or file paths
   documents?: string[];
   /** File attachments with paths for agent to access via Read tool */
   attachments?: UploadedFile[];
+  /** Ordered provider-native Codex skill/mention inputs. */
+  codexInputs?: CodexStructuredUserInput[];
   mode?: PermissionMode;
   /** UUID to use for this message. If not provided, SDK will generate one. */
   uuid?: string;
   /** Client-generated temp ID for optimistic UI tracking. Echoed back in SSE. */
   tempId?: string;
+}
+
+/**
+ * Provider-neutral wire representation of a queued user message.
+ *
+ * This stays local so provider dependencies do not leak into the shared
+ * message queue.
+ */
+export interface QueuedUserMessage {
+  type: "user";
+  uuid?: string;
+  /** Provider-internal client correlation, retained only when enabled. */
+  tempId?: string;
+  /**
+   * Structured uploads retained for providers with native file-part support.
+   * MessageQueue only includes this field when explicitly configured so SDKs
+   * that validate their input shape do not receive provider-specific metadata.
+   */
+  attachments?: UploadedFile[];
+  /** Structured Codex input items, retained only when enabled. */
+  codexInputs?: CodexStructuredUserInput[];
+  message: {
+    role: "user";
+    content:
+      | string
+      | Array<
+          | { type: "text"; text: string }
+          | {
+              type: "image";
+              source: {
+                type: "base64";
+                media_type: string;
+                data: string;
+              };
+            }
+        >;
+  };
 }
 
 export interface SDKSessionOptions {
@@ -105,93 +153,53 @@ export interface ClaudeSDK {
   startSession(options: SDKSessionOptions): AsyncIterableIterator<SDKMessage>;
 }
 
-// New interface for real SDK with full features
-import type { MessageQueue } from "./messageQueue.js";
-
+/** Provider-neutral result returned by a user tool-approval decision. */
 export interface ToolApprovalResult {
   behavior: "allow" | "deny";
   updatedInput?: unknown;
   message?: string;
-  /**
-   * If true, interrupt execution and do not continue.
-   * Set to true when user denies without guidance (just clicks "No").
-   * Leave false/unset when user provides feedback for Claude to incorporate.
-   */
+  /** Whether denial should interrupt the current turn. */
   interrupt?: boolean;
+  /**
+   * Persistence scope of an approval. "always" asks the provider to remember
+   * the grant.
+   * Absent/"once" applies to this request only.
+   */
+  approvalScope?: "once" | "always";
+  /**
+   * Exact decision selected on Yep's pending-input control plane.
+   *
+   * Provider adapters with richer native responses (notably Codex
+   * permissions and MCP elicitation) must prefer this over reconstructing a
+   * choice from `behavior` / `approvalScope`. Generic providers may safely
+   * ignore it and continue using the provider-neutral fields above.
+   */
+  providerDecision?: ProviderApprovalDecision;
 }
+
+/** Exact pending-input decisions accepted by the API/runtime boundary. */
+export type ProviderApprovalDecision =
+  | "approve"
+  | "approve_accept_edits"
+  | "approve_for_session"
+  | "approve_strict_auto_review"
+  | "approve_always"
+  | "deny";
 
 export type CanUseTool = (
   toolName: string,
   input: unknown,
-  options: { signal: AbortSignal },
+  options: {
+    signal: AbortSignal;
+    /** Provider-native request id, when the provider exposes one. */
+    requestId?: string;
+    /** Provider-native request method used to disambiguate reused ids. */
+    requestMethod?: string;
+    /**
+     * The provider already applied its native permission policy and still
+     * decided this request needs a human. Skip Yep's mode-based auto-approval
+     * while continuing to honor explicit allow/deny rules.
+     */
+    respectProviderDecision?: boolean;
+  },
 ) => Promise<ToolApprovalResult>;
-
-export interface StartSessionOptions {
-  cwd: string;
-  initialMessage?: UserMessage;
-  resumeSessionId?: string;
-  /**
-   * Rewind/edit: resume only up to (and including) this message UUID, branching
-   * the conversation in place. Used with resumeSessionId. Maps to the SDK
-   * `resumeSessionAt` option.
-   */
-  resumeSessionAt?: string;
-  permissionMode?: PermissionMode;
-  /** Model to use (e.g., "sonnet", "opus", "haiku"). undefined = use CLI default */
-  model?: string;
-  /** Thinking configuration (undefined = thinking disabled) */
-  thinking?: import("@yep-anywhere/shared").ThinkingConfig;
-  /** Effort level for response quality (undefined = SDK default) */
-  effort?: import("@yep-anywhere/shared").EffortLevel;
-  onToolApproval?: CanUseTool;
-  /** SSH host for remote execution (undefined = local) */
-  executor?: string;
-  /** Environment variables to set on remote (for testing: CLAUDE_SESSIONS_DIR) */
-  remoteEnv?: Record<string, string>;
-  /** Global instructions to append to system prompt (from server settings) */
-  globalInstructions?: string;
-}
-
-export interface StartSessionResult {
-  iterator: AsyncIterableIterator<SDKMessage>;
-  queue: MessageQueue;
-  abort: () => void;
-  /** Check if the underlying CLI process is still alive (undefined = not available) */
-  isProcessAlive?: () => boolean;
-  /** OS PID of the spawned agent child process (undefined if not available) */
-  pid?: number | (() => number | undefined);
-  /**
-   * Change max thinking tokens without restarting the session.
-   * Pass null to disable thinking mode.
-   * Only supported by Claude SDK 0.2.7+.
-   */
-  setMaxThinkingTokens?: (tokens: number | null) => Promise<void>;
-  /**
-   * Interrupt the current turn gracefully without killing the process.
-   * Only supported by Claude SDK 0.2.7+.
-   */
-  interrupt?: () => Promise<void>;
-  /**
-   * Get the list of available models from the SDK.
-   * Only supported by Claude SDK 0.2.7+.
-   */
-  supportedModels?: () => Promise<
-    Array<{ id: string; name: string; description?: string }>
-  >;
-  /**
-   * Get the list of available slash commands from the SDK.
-   * Only supported by Claude SDK 0.2.7+.
-   */
-  supportedCommands?: () => Promise<
-    Array<{ name: string; description: string; argumentHint?: string }>
-  >;
-  /**
-   * Change the model mid-session without restarting.
-   * Only supported by Claude SDK 0.2.7+.
-   */
-  setModel?: (model?: string) => Promise<void>;
-}
-
-export interface RealClaudeSDKInterface {
-  startSession(options: StartSessionOptions): Promise<StartSessionResult>;
-}

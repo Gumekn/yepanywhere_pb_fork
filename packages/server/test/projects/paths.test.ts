@@ -14,7 +14,6 @@ import {
   normalizeProjectPathForDedup,
   readCwdFromSessionFile,
   resolveResumeCwd,
-  resolveStartCwd,
 } from "../../src/projects/paths.js";
 
 describe("Project Path Utilities", () => {
@@ -370,6 +369,26 @@ describe("Project Path Utilities", () => {
       expect(recovered).toBe(realPath);
     });
 
+    it("applies a remote-to-local cwd mapper before validating recovery", async () => {
+      const stalePath = join(testDir, "moved-away");
+      const realPath = join(testDir, "shared-project");
+      const sessionDir = join(testDir, "sessions");
+      await mkdir(realPath, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        join(sessionDir, "sess-remote.jsonl"),
+        '{"type":"user","cwd":"/mnt/utm/projects/shared","message":"hi"}\n',
+      );
+
+      const recovered = await resolveResumeCwd(
+        stalePath,
+        sessionDir,
+        "sess-remote",
+        (cwd) => (cwd === "/mnt/utm/projects/shared" ? realPath : cwd),
+      );
+      expect(recovered).toBe(realPath);
+    });
+
     it("returns null when both projectPath and recovered cwd are missing", async () => {
       const stalePath = join(testDir, "moved-away");
       const alsoGone = join(testDir, "also-gone");
@@ -395,50 +414,6 @@ describe("Project Path Utilities", () => {
         "missing-session",
       );
       expect(recovered).toBeNull();
-    });
-  });
-
-  describe("resolveStartCwd", () => {
-    let testDir: string;
-
-    beforeEach(async () => {
-      testDir = join(tmpdir(), `claude-start-test-${randomUUID()}`);
-      await mkdir(testDir, { recursive: true });
-    });
-
-    afterEach(async () => {
-      await rm(testDir, { recursive: true, force: true });
-    });
-
-    it("区分原路径有效", async () => {
-      const projectPath = join(testDir, "live");
-      await mkdir(projectPath);
-      await expect(
-        resolveStartCwd(projectPath, join(testDir, "sessions")),
-      ).resolves.toEqual({ status: "valid", cwd: projectPath });
-    });
-
-    it("区分从会话目录恢复", async () => {
-      const sessionDir = join(testDir, "sessions");
-      const recoveredPath = join(testDir, "moved");
-      await mkdir(sessionDir);
-      await mkdir(recoveredPath);
-      await writeFile(
-        join(sessionDir, "session.jsonl"),
-        `${JSON.stringify({ type: "user", cwd: recoveredPath })}\n`,
-      );
-      await expect(
-        resolveStartCwd(join(testDir, "gone"), sessionDir),
-      ).resolves.toEqual({ status: "recovered", cwd: recoveredPath });
-    });
-
-    it("区分无法恢复的失效路径", async () => {
-      await expect(
-        resolveStartCwd(
-          join(testDir, "gone"),
-          join(testDir, "missing-sessions"),
-        ),
-      ).resolves.toEqual({ status: "missing", cwd: null });
     });
   });
 });

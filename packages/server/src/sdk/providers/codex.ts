@@ -1,42 +1,129 @@
 /**
  * Codex Provider implementation using codex app-server JSON-RPC.
  *
- * Uses `codex app-server --listen stdio://` for turn execution so we can handle
- * server-initiated permission requests (command/file approval).
+ * Uses JSON-RPC over either a resident 4510 bridge WebSocket (when resuming a
+ * bridge-owned thread) or an isolated `stdio://` app-server. Both transports
+ * handle server-initiated permission requests (command/file approval).
  */
 
 import { type ChildProcess, exec, spawn } from "node:child_process";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import type { ModelInfo } from "@yep-anywhere/shared";
+import type {
+  AppContentBlock,
+  CodexRetryStatus,
+  ModelInfo,
+  ProviderGoalAction,
+  ProviderGoalState,
+  UserQuestionAnswers,
+} from "@yep-anywhere/shared";
+import { WebSocket } from "ws";
+import {
+  buildCodexInteractiveResponse,
+  toCodexInteractiveRequestView,
+} from "../../codex-bridge/interactions.js";
+import {
+  CODEX_EVENT_RUNTIME_IDENTITY,
+  CODEX_PROVIDER_RUNTIME_IDENTITY,
+  type CodexEventEnvelope,
+  CodexEventIngress,
+  type CodexEventProjectionMode,
+  type CodexEventRolloutConfig,
+  type CodexEventStore,
+  InMemoryCodexEventStore,
+  JsonlCodexEventStore,
+  classifyCodexNotification,
+  codexEventRolloutConfigFromEnv,
+  resolveCodexEventJournalMode,
+  resolveCodexEventProjectionMode,
+} from "../../codex-events/index.js";
 import {
   isCodexCorrelationDebugEnabled,
   logCodexCorrelationDebug,
   summarizeCodexNormalizedMessage,
 } from "../../codex/correlationDebugLogger.js";
 import {
+  type CanonicalCodexError,
+  classifyCodexError,
+  formatCodexRetryWarning,
+} from "../../codex/error-taxonomy.js";
+import {
+  type CodexFileChangeStatus,
+  type NormalizedCodexFileChange,
+  buildCodexEditInput,
+  formatCodexFileChangeResult,
+  isCodexFileChangeError,
+  normalizeCodexFileChangeStatus,
+  normalizeCodexFileChanges,
+  publicCodexFileChanges,
+  publicCodexFilePath,
+} from "../../codex/file-change.js";
+import {
   buildCodexImageGenerationResultText,
+  isCodexImageGenerationRecord,
   normalizeCodexImageGenerationRecord,
   summarizeCodexImageGenerationResult,
 } from "../../codex/image-generation.js";
 import {
-  discoverConfiguredCodexMcpServers,
   getCodexMcpAppServerArgs,
+  resolveCodexMcpThreadProfile,
 } from "../../codex/mcp-profile.js";
 import {
   type CodexToolCallContext,
+  canonicalizeCodexToolName,
+  deriveCodexWebRunInvocation,
+  extractCodexExecUpdatePlan,
   normalizeCodexCommandExecutionOutput,
   normalizeCodexToolInvocation,
+  normalizeCodexToolOutputWithContext,
+  parseCodexToolArguments,
 } from "../../codex/normalization.js";
+import { codexUserMessageIdentity } from "../../codex/user-message-identity.js";
+import { getDataDir } from "../../config.js";
 import { getLogger } from "../../logging/logger.js";
+import { encodeProjectId } from "../../projects/paths.js";
+import { ensureRuntimeToken } from "../../runtime/token.js";
+import {
+  GeneratedArtifactMaterializer,
+  UploadManager,
+} from "../../uploads/index.js";
 import { findCodexCliPath, whichCommand } from "../cli-detection.js";
 import { logSDKMessage } from "../messageLogger.js";
-import { MessageQueue } from "../messageQueue.js";
+import { MessageQueue, getUserPromptProjection } from "../messageQueue.js";
 import type {
+  CodexStructuredUserInput,
+  ProviderApprovalDecision,
   SDKMessage,
   TimestampedSDKMessage,
-  UserMessage,
+  ToolApprovalResult,
 } from "../types.js";
-import type { ToolApprovalResult } from "../types.js";
+import {
+  CODEX_NATIVE_CAPABILITIES,
+  type CodexNativeControlDataMap,
+  type CodexNativeControlRequest,
+  type CodexNativeControlResult,
+  codexControlFailure,
+} from "./codex-controls.js";
+import {
+  isCodexHistoryPaginationUnsupported,
+  isCodexLifecycleHistoryControlsUnsupported,
+  isCodexNoActiveTurnToSteer,
+} from "./codex-history-compat.js";
+import {
+  type CodexModelSourceDefinition,
+  DEFAULT_CODEX_MODEL_SOURCE,
+  getCodexModelSourceRegistry,
+} from "./codex-model-sources.js";
+import type { ThreadGoal as CodexThreadGoal } from "./codex-protocol/generated/v2/ThreadGoal.js";
+import type { ThreadGoalStatus as CodexThreadGoalStatus } from "./codex-protocol/generated/v2/ThreadGoalStatus.js";
+import type { ThreadReadResponse } from "./codex-protocol/generated/v2/ThreadReadResponse.js";
+import type { ThreadTurnsListParams } from "./codex-protocol/generated/v2/ThreadTurnsListParams.js";
+import type { ThreadTurnsListResponse } from "./codex-protocol/generated/v2/ThreadTurnsListResponse.js";
+import type { Turn } from "./codex-protocol/generated/v2/Turn.js";
+import type { TurnInterruptParams } from "./codex-protocol/generated/v2/TurnInterruptParams.js";
+import type { TurnInterruptResponse } from "./codex-protocol/generated/v2/TurnInterruptResponse.js";
+import type { TurnSteerParams } from "./codex-protocol/generated/v2/TurnSteerParams.js";
+import type { TurnSteerResponse } from "./codex-protocol/generated/v2/TurnSteerResponse.js";
 import type {
   AskForApproval as CodexAskForApproval,
   ErrorNotification as CodexErrorNotification,
@@ -44,10 +131,13 @@ import type {
   ItemStartedNotification as CodexItemStartedNotification,
   SandboxMode as CodexSandboxMode,
   ThreadItem as CodexThreadItem,
+  UserInput as CodexUserInput,
   CommandExecutionApprovalDecision,
   CommandExecutionRequestApprovalParams,
   FileChangeApprovalDecision,
   FileChangeRequestApprovalParams,
+  ThreadForkParams,
+  ThreadForkResponse,
   ThreadResumeParams,
   ThreadResumeResponse,
   ThreadStartParams,
@@ -128,8 +218,19 @@ const MODEL_LIST_TIMEOUT_MS = 15000;
 const APP_SERVER_INIT_REQUEST_ID = 1;
 const APP_SERVER_MODEL_LIST_REQUEST_ID = 2;
 const APP_SERVER_SHUTDOWN_GRACE_MS = 1500;
-const CODEX_CLOUD_MODEL_PROVIDER = "openai";
+const MAX_APP_SERVER_STDERR_LENGTH = 64 * 1024;
+const APP_SERVER_OVERLOAD_MAX_ATTEMPTS = 4;
+const APP_SERVER_OVERLOAD_BASE_DELAY_MS = 50;
+const CODEX_FORK_BOUNDARY_PAGE_LIMIT = 100;
+const CODEX_FORK_BOUNDARY_MAX_TURNS = 10_000;
+const CODEX_FORK_BOUNDARY_MAX_PAGES = 100;
+/** Max characters of live command output kept for the streaming preview. */
+const CODEX_COMMAND_OUTPUT_PREVIEW_LIMIT = 16_000;
+const CODEX_DEPRECATION_LOG_SUMMARY_LIMIT = 512;
+const CODEX_DEPRECATION_LOG_KEY_LIMIT = 32;
+const DEFAULT_CODEX_MODEL_PROVIDER = DEFAULT_CODEX_MODEL_SOURCE;
 const CODEX_MODEL_PROVIDER_NAMES = new Set(["openai", "azure"]);
+const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 
 /**
  * Local debug knobs for Codex app-server policy behavior.
@@ -159,6 +260,9 @@ const DECLARED_CODEX_ORIGINATOR = "Codex Desktop";
 // ("model is not supported when using Codex with a ChatGPT account"), so they
 // must never be the default the picker preselects.
 const PREFERRED_MODEL_ORDER = [
+  DEFAULT_CODEX_MODEL,
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
   "gpt-5.5",
   "gpt-5.4",
   "gpt-5.4-mini",
@@ -169,7 +273,62 @@ const PREFERRED_MODEL_ORDER = [
   "gpt-5.1-codex-mini",
 ] as const;
 
+const CODEX_REASONING_EFFORTS = [
+  {
+    reasoningEffort: "low",
+    description: "Fast responses with lighter reasoning",
+  },
+  {
+    reasoningEffort: "medium",
+    description: "Balances speed and reasoning depth for everyday tasks",
+  },
+  {
+    reasoningEffort: "high",
+    description: "Greater reasoning depth for complex problems",
+  },
+  {
+    reasoningEffort: "xhigh",
+    description: "Extra high reasoning depth for complex problems",
+  },
+  {
+    reasoningEffort: "max",
+    description: "Maximum reasoning depth for the hardest problems",
+  },
+] as const;
+
+const CODEX_ULTRA_REASONING_EFFORT = {
+  reasoningEffort: "ultra",
+  description: "Maximum reasoning with automatic task delegation",
+} as const;
+
 const FALLBACK_CODEX_MODELS: ModelInfo[] = [
+  {
+    id: "gpt-5.6-sol",
+    name: "GPT-5.6-Sol",
+    description: "Latest frontier agentic coding model.",
+    defaultReasoningEffort: "low",
+    supportedReasoningEfforts: [
+      ...CODEX_REASONING_EFFORTS,
+      CODEX_ULTRA_REASONING_EFFORT,
+    ],
+  },
+  {
+    id: "gpt-5.6-terra",
+    name: "GPT-5.6-Terra",
+    description: "Balanced agentic coding model for everyday work.",
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: [
+      ...CODEX_REASONING_EFFORTS,
+      CODEX_ULTRA_REASONING_EFFORT,
+    ],
+  },
+  {
+    id: "gpt-5.6-luna",
+    name: "GPT-5.6-Luna",
+    description: "Fast and affordable agentic coding model.",
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: [...CODEX_REASONING_EFFORTS],
+  },
   { id: "gpt-5.5", name: "GPT-5.5" },
   { id: "gpt-5.4", name: "GPT-5.4" },
   { id: "gpt-5.4-mini", name: "GPT-5.4-Mini" },
@@ -183,6 +342,18 @@ interface JsonRpcError {
   data?: unknown;
 }
 
+export class CodexJsonRpcError extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+    readonly data?: unknown,
+    readonly requestId?: JsonRpcId,
+  ) {
+    super(message);
+    this.name = "CodexJsonRpcError";
+  }
+}
+
 interface JsonRpcResponse {
   id?: JsonRpcId;
   result?: unknown;
@@ -192,6 +363,18 @@ interface JsonRpcResponse {
 interface JsonRpcNotification {
   method: string;
   params?: unknown;
+  emittedAtMs?: number;
+  canonicalEvent?: CodexEventEnvelope;
+}
+
+interface TurnPlanUpdatedNotificationParams {
+  threadId: string;
+  turnId: string;
+  explanation: string | null;
+  plan: Array<{
+    step: string;
+    status: string;
+  }>;
 }
 
 interface JsonRpcServerRequest extends JsonRpcNotification {
@@ -208,6 +391,13 @@ interface AppServerModel {
   hidden?: boolean;
   /** The model Codex itself selects by default for this account. */
   isDefault?: boolean;
+  supportedReasoningEfforts?: Array<{
+    reasoningEffort?: string;
+    description?: string;
+  }>;
+  defaultReasoningEffort?: string;
+  serviceTiers?: Array<{ id: string }>;
+  additionalSpeedTiers?: string[];
 }
 
 interface TokenUsageSnapshot {
@@ -220,24 +410,63 @@ interface TokenUsageSnapshot {
 interface CodexTurnRuntimeState {
   threadId: string;
   activeTurnId: string | null;
-}
-
-interface ThreadRollbackParams {
-  threadId: string;
-  numTurns: number;
-}
-
-interface ThreadRollbackResponse {
-  thread: ThreadResumeResponse["thread"];
+  ready: boolean;
 }
 
 type CodexMessagePhase = "commentary" | "final_answer";
+
+const GOAL_STATUS_LABELS: Record<CodexThreadGoalStatus, string> = {
+  active: "Active",
+  paused: "Paused",
+  blocked: "Blocked",
+  usageLimited: "Usage limited",
+  budgetLimited: "Budget limited",
+  complete: "Complete",
+};
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${remainder}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `${hours}h ${remainingMinutes}m`;
+}
+
+function formatTokens(used: number, budget: number | null): string {
+  const fmt = (n: number): string => {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return String(n);
+  };
+  return budget !== null && budget > 0
+    ? `${fmt(used)} / ${fmt(budget)}`
+    : fmt(used);
+}
+
+/**
+ * Format a Codex `ThreadGoal` as a human-readable status string, mirroring
+ * the Codex TUI `goal_display.rs` `goal_usage_summary` output.
+ */
+function formatCodexGoal(goal: CodexThreadGoal | null): string {
+  if (!goal) return "No goal set.";
+  const lines: string[] = [
+    `Objective: ${goal.objective}`,
+    `Status: ${GOAL_STATUS_LABELS[goal.status] ?? goal.status}`,
+  ];
+  if (goal.timeUsedSeconds > 0) {
+    lines.push(`Time: ${formatDuration(goal.timeUsedSeconds)}`);
+  }
+  lines.push(`Tokens: ${formatTokens(goal.tokensUsed, goal.tokenBudget)}`);
+  return lines.join("\n");
+}
 
 async function terminateChildProcess(
   child: ChildProcess | null | undefined,
   graceMs = APP_SERVER_SHUTDOWN_GRACE_MS,
 ): Promise<void> {
-  if (!child?.pid || child.killed || child.exitCode !== null) {
+  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) {
     return;
   }
 
@@ -255,7 +484,7 @@ async function terminateChildProcess(
   }
 
   const timer = setTimeout(() => {
-    if (child.exitCode !== null || child.killed) {
+    if (child.exitCode !== null || child.signalCode !== null) {
       return;
     }
     try {
@@ -270,12 +499,6 @@ async function terminateChildProcess(
   } finally {
     clearTimeout(timer);
   }
-}
-
-interface NormalizedFileChange {
-  path: string;
-  kind: "add" | "delete" | "update";
-  diff?: string;
 }
 
 type NormalizedThreadItem =
@@ -297,8 +520,8 @@ type NormalizedThreadItem =
   | {
       id: string;
       type: "file_change";
-      changes: NormalizedFileChange[];
-      status: string;
+      changes: NormalizedCodexFileChange[];
+      status: CodexFileChangeStatus;
     }
   | {
       id: string;
@@ -338,13 +561,33 @@ export interface CodexProviderConfig {
   baseUrl?: string;
   /** API key override (normally read from ~/.codex/auth.json) */
   apiKey?: string;
-  /**
-   * Model provider to send in thread/start & thread/resume (e.g. "openai",
-   * "ccvibe", "azure"). When omitted, codex uses its own configured default
-   * provider (from ~/.codex/config.toml), which lets yep-anywhere reuse the
-   * local codex's native provider instead of being hard-pinned to OpenAI cloud.
-   */
-  modelProvider?: string;
+  /** Canonical event-spine rollout/store overrides. */
+  eventSpine?: CodexEventRolloutConfig;
+  /** Managed generated-artifact storage override for tests and embedders. */
+  generatedArtifactUploadManager?: UploadManager;
+  /** Optional 4510 execution route used to rejoin bridge-owned threads. */
+  bridgeExecution?: CodexBridgeExecutionConfig;
+}
+
+export interface CodexBridgeExecutionConfig {
+  mode: "embedded" | "external" | "disabled";
+  controlUrl: string;
+  /** Optional bearer accepted by a remotely exposed bridge. */
+  authToken?: string;
+  /** Runtime token shared by the main server and a local bridge sidecar. */
+  authTokenFile?: string;
+  requestTimeoutMs?: number;
+}
+
+interface CodexBridgeExecutionTarget {
+  url: string;
+  headers?: Record<string, string>;
+}
+
+interface CodexAppServerWebSocketTransport {
+  kind: "websocket";
+  url: string;
+  headers?: Record<string, string>;
 }
 
 class AsyncQueue<T> {
@@ -416,15 +659,81 @@ class AsyncQueue<T> {
       this.waiters.push(waiter);
     });
   }
+
+  drain(): T[] {
+    return this.items.splice(0, this.items.length);
+  }
 }
 
 type AppServerRequestHandler = (
   request: JsonRpcServerRequest,
 ) => Promise<unknown>;
 
-class CodexAppServerClient {
+interface AppServerRequestMetadata {
+  clientMessageId?: string;
+}
+
+interface AppServerRetryUpdate {
+  requestId: JsonRpcId;
+  method: string;
+  retryStatus: CodexRetryStatus;
+  metadata?: AppServerRequestMetadata;
+}
+
+type CodexLifecycleHistorySupport = "unknown" | "exclude-turns" | "legacy-only";
+
+interface CodexForkBoundaryExchange {
+  requestId: JsonRpcId;
+  method: "thread/turns/list" | "thread/read";
+  params: ThreadTurnsListParams | { threadId: string; includeTurns: true };
+  result: ThreadTurnsListResponse | ThreadReadResponse;
+}
+
+type CodexForkBoundaryResult =
+  | {
+      kind: "boundary";
+      turn: Turn;
+      examinedTurnCount: number;
+      pageCount: number;
+      exchanges: CodexForkBoundaryExchange[];
+    }
+  | {
+      kind: "empty-child";
+      sourceTurnCount: number;
+      pageCount: number;
+      exchanges: CodexForkBoundaryExchange[];
+    };
+
+type AppServerRetryHandler = (
+  update: AppServerRetryUpdate,
+) => void | Promise<void>;
+
+interface AppServerEventObserver {
+  onClientRequest(input: {
+    requestId: JsonRpcId;
+    method: string;
+    params?: unknown;
+    metadata?: AppServerRequestMetadata;
+  }): Promise<void>;
+  onClientResponse(input: {
+    requestId: JsonRpcId;
+    method: string;
+    result?: unknown;
+    error?: unknown;
+    metadata?: AppServerRequestMetadata;
+  }): Promise<void>;
+  onServerRequest(request: JsonRpcServerRequest): Promise<void>;
+  onServerNotification(
+    notification: JsonRpcNotification,
+  ): Promise<CodexEventEnvelope>;
+}
+
+export class CodexAppServerClient {
   private process: ChildProcess | null = null;
+  private socket: WebSocket | null = null;
   private stdoutBuffer = "";
+  private stderrBuffer = "";
+  private closeError: Error | null = null;
 
   /** OS PID of the spawned app-server child process */
   get pid(): number | undefined {
@@ -432,6 +741,7 @@ class CodexAppServerClient {
   }
 
   isAlive(): boolean {
+    if (this.socket) return this.socket.readyState === WebSocket.OPEN;
     const child = this.process;
     return Boolean(child?.pid && child.exitCode === null && !child.killed);
   }
@@ -441,26 +751,63 @@ class CodexAppServerClient {
     {
       resolve: (result: unknown) => void;
       reject: (error: Error) => void;
+      method: string;
+      params?: unknown;
+      metadata?: AppServerRequestMetadata;
     }
   >();
   private readonly notifications = new AsyncQueue<JsonRpcNotification>();
   private onServerRequest: AppServerRequestHandler | null = null;
+  private eventObserver: AppServerEventObserver | null = null;
+  private inboundObservationTail: Promise<void> = Promise.resolve();
+  private readonly reportedDeprecationSummaries = new Set<string>();
   private closed = false;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(
     private readonly command: string,
     private readonly cwd: string,
     private readonly env: NodeJS.ProcessEnv,
     private readonly appServerArgs: string[] = [],
+    private readonly transport?: CodexAppServerWebSocketTransport,
   ) {}
 
   setServerRequestHandler(handler: AppServerRequestHandler): void {
     this.onServerRequest = handler;
   }
 
+  async setEventObserver(observer: AppServerEventObserver): Promise<void> {
+    await this.inboundObservationTail;
+    this.eventObserver = observer;
+    const buffered = this.notifications.drain();
+    if (buffered.length === 0) return;
+    const canonicalizeBuffered = async () => {
+      for (const notification of buffered) {
+        const canonicalEvent =
+          await observer.onServerNotification(notification);
+        this.notifications.push({ ...notification, canonicalEvent });
+      }
+    };
+    this.inboundObservationTail = this.inboundObservationTail
+      .then(canonicalizeBuffered)
+      .catch((error: unknown) => {
+        this.handleProcessClose(
+          error instanceof Error
+            ? error
+            : new Error("Codex app-server event observation failed"),
+        );
+      });
+    await this.inboundObservationTail;
+  }
+
   async connect(): Promise<void> {
-    if (this.process) {
+    if (this.process || this.socket) {
       throw new Error("Codex app-server already connected");
+    }
+
+    if (this.transport?.kind === "websocket") {
+      await this.connectWebSocket(this.transport);
+      return;
     }
 
     const child = spawn(
@@ -491,6 +838,9 @@ class CodexAppServerClient {
     child.stderr?.on("data", (chunk: Buffer) => {
       const stderr = chunk.toString("utf-8").trim();
       if (stderr) {
+        this.stderrBuffer = `${this.stderrBuffer}${stderr}\n`.slice(
+          -MAX_APP_SERVER_STDERR_LENGTH,
+        );
         log.debug({ stderr }, "codex app-server stderr");
       }
     });
@@ -514,10 +864,73 @@ class CodexAppServerClient {
       };
       const onError = (error: Error) => {
         child.off("spawn", onSpawn);
-        reject(error);
+        reject(this.closeError ?? error);
       };
       child.once("spawn", onSpawn);
       child.once("error", onError);
+    });
+  }
+
+  private async connectWebSocket(
+    transport: CodexAppServerWebSocketTransport,
+  ): Promise<void> {
+    const socket = new WebSocket(transport.url, {
+      ...(transport.headers ? { headers: transport.headers } : {}),
+    });
+    this.socket = socket;
+
+    socket.on("message", (data, isBinary) => {
+      if (isBinary) {
+        log.debug("Ignoring binary Codex app-server WebSocket frame");
+        return;
+      }
+      this.handleJsonRpcLine(data.toString());
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanupHandshake = () => {
+        socket.off("open", onOpen);
+        socket.off("error", onHandshakeError);
+        socket.off("close", onHandshakeClose);
+      };
+      const onOpen = () => {
+        if (settled) return;
+        settled = true;
+        cleanupHandshake();
+        resolve();
+      };
+      const onHandshakeError = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanupHandshake();
+        this.socket = null;
+        socket.terminate();
+        reject(error);
+      };
+      const onHandshakeClose = (code: number) => {
+        if (settled) return;
+        settled = true;
+        cleanupHandshake();
+        this.socket = null;
+        reject(
+          new Error(
+            `Codex bridge WebSocket closed during connection (code=${code})`,
+          ),
+        );
+      };
+      socket.once("open", onOpen);
+      socket.once("error", onHandshakeError);
+      socket.once("close", onHandshakeClose);
+    });
+
+    socket.on("error", (error) => this.handleProcessClose(error));
+    socket.on("close", (code, reason) => {
+      this.handleProcessClose(
+        new Error(
+          `Codex bridge WebSocket closed (code=${code}, reason=${reason.toString() || "none"})`,
+        ),
+      );
     });
   }
 
@@ -543,11 +956,34 @@ class CodexAppServerClient {
           method,
           params: message.params,
         };
-        this.handleServerRequest(request);
+        const observer = this.eventObserver;
+        this.enqueueInboundObservation(async () => {
+          await observer?.onServerRequest(request);
+          this.handleServerRequest(request);
+        });
         return;
       }
 
-      this.notifications.push({ method, params: message.params });
+      const notification: JsonRpcNotification = {
+        method,
+        params: message.params,
+        ...(typeof message.emittedAtMs === "number" &&
+        Number.isFinite(message.emittedAtMs)
+          ? { emittedAtMs: message.emittedAtMs }
+          : {}),
+      };
+      if (method === "deprecationNotice") {
+        this.logDeprecationNotice(notification.params);
+      }
+      const observer = this.eventObserver;
+      this.enqueueInboundObservation(async () => {
+        const canonicalEvent =
+          await observer?.onServerNotification(notification);
+        this.notifications.push({
+          ...notification,
+          ...(canonicalEvent ? { canonicalEvent } : {}),
+        });
+      });
       return;
     }
 
@@ -558,16 +994,76 @@ class CodexAppServerClient {
       if (!pending) {
         return;
       }
-      this.pendingRequests.delete(id);
-
-      if (message.error && typeof message.error === "object") {
-        const error = message.error as JsonRpcError;
-        pending.reject(new Error(error.message ?? "JSON-RPC request failed"));
-        return;
-      }
-
-      pending.resolve(message.result);
+      const observer = this.eventObserver;
+      this.enqueueInboundObservation(async () => {
+        if (this.pendingRequests.get(id) !== pending) return;
+        this.pendingRequests.delete(id);
+        if (message.error && typeof message.error === "object") {
+          const error = message.error as JsonRpcError;
+          await observer?.onClientResponse({
+            requestId: id,
+            method: pending.method,
+            error,
+            ...(pending.metadata ? { metadata: pending.metadata } : {}),
+          });
+          pending.reject(
+            new CodexJsonRpcError(
+              typeof error.code === "number" ? error.code : -32000,
+              error.message ?? "JSON-RPC request failed",
+              error.data,
+              id,
+            ),
+          );
+          return;
+        }
+        await observer?.onClientResponse({
+          requestId: id,
+          method: pending.method,
+          result: message.result,
+          ...(pending.metadata ? { metadata: pending.metadata } : {}),
+        });
+        pending.resolve(message.result);
+      });
     }
+  }
+
+  private logDeprecationNotice(params: unknown): void {
+    const summaryValue = asRecord(params)?.summary;
+    if (typeof summaryValue !== "string") return;
+    const summary = summaryValue.trim();
+    if (!summary) return;
+    const boundedSummary = summary.slice(
+      0,
+      CODEX_DEPRECATION_LOG_SUMMARY_LIMIT,
+    );
+    if (
+      this.reportedDeprecationSummaries.has(boundedSummary) ||
+      this.reportedDeprecationSummaries.size >= CODEX_DEPRECATION_LOG_KEY_LIMIT
+    ) {
+      return;
+    }
+    this.reportedDeprecationSummaries.add(boundedSummary);
+    log.warn(
+      {
+        event: "codex_deprecation_notice_suppressed",
+        warningKind: "deprecationNotice",
+        summary: boundedSummary,
+        summaryTruncated: summary.length > boundedSummary.length,
+      },
+      "Recorded Codex protocol deprecation outside the user transcript",
+    );
+  }
+
+  private enqueueInboundObservation(operation: () => Promise<void>): void {
+    this.inboundObservationTail = this.inboundObservationTail
+      .then(operation)
+      .catch((error: unknown) => {
+        this.handleProcessClose(
+          error instanceof Error
+            ? error
+            : new Error("Codex app-server event observation failed"),
+        );
+      });
   }
 
   private handleServerRequest(request: JsonRpcServerRequest): void {
@@ -594,27 +1090,95 @@ class CodexAppServerClient {
         respond({ result: result ?? {} });
       })
       .catch((error) => {
+        const rpcError = error instanceof CodexJsonRpcError ? error : undefined;
         respond({
           error: {
-            code: -32000,
+            code: rpcError?.code ?? -32000,
             message:
               error instanceof Error ? error.message : "Server request failed",
+            ...(rpcError?.data === undefined ? {} : { data: rpcError.data }),
           },
         });
       });
   }
 
   async request<T>(method: string, params?: unknown): Promise<T> {
+    return (await this.requestTracked<T>(method, params)).result;
+  }
+
+  async requestTracked<T>(
+    method: string,
+    params?: unknown,
+    metadata?: AppServerRequestMetadata,
+    onRetry?: AppServerRetryHandler,
+  ): Promise<{ requestId: JsonRpcId; result: T }> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.requestOnceTracked<T>(method, params, metadata);
+      } catch (error) {
+        if (
+          !(error instanceof CodexJsonRpcError) ||
+          error.code !== -32001 ||
+          attempt >= APP_SERVER_OVERLOAD_MAX_ATTEMPTS
+        ) {
+          throw error;
+        }
+
+        const exponentialDelay =
+          APP_SERVER_OVERLOAD_BASE_DELAY_MS * 2 ** (attempt - 1);
+        const jitter = Math.floor(
+          Math.random() * APP_SERVER_OVERLOAD_BASE_DELAY_MS,
+        );
+        const delayMs = exponentialDelay + jitter;
+        if (error.requestId !== undefined) {
+          await onRetry?.({
+            requestId: error.requestId,
+            method,
+            retryStatus: {
+              state: attempt === 1 ? "queued" : "retrying",
+              category: "overloaded",
+              retryable: true,
+              attempt,
+              nextAttempt: attempt + 1,
+              maxAttempts: APP_SERVER_OVERLOAD_MAX_ATTEMPTS,
+              retryInMs: delayMs,
+            },
+            ...(metadata ? { metadata } : {}),
+          });
+        }
+        log.warn(
+          { method, attempt, delayMs, errorCode: error.code },
+          "Codex app-server overloaded; retrying request",
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  private async requestOnceTracked<T>(
+    method: string,
+    params?: unknown,
+    metadata?: AppServerRequestMetadata,
+  ): Promise<{ requestId: JsonRpcId; result: T }> {
     if (this.closed) {
-      throw new Error("Codex app-server client is closed");
+      throw this.closeError ?? new Error("Codex app-server client is closed");
     }
 
     const id = this.nextRequestId++;
+    await this.eventObserver?.onClientRequest({
+      requestId: id,
+      method,
+      params,
+      ...(metadata ? { metadata } : {}),
+    });
 
     const resultPromise = new Promise<T>((resolve, reject) => {
       this.pendingRequests.set(id, {
         resolve: (result) => resolve(result as T),
         reject,
+        method,
+        params,
+        ...(metadata ? { metadata } : {}),
       });
     });
 
@@ -625,7 +1189,7 @@ class CodexAppServerClient {
       params,
     });
 
-    return await resultPromise;
+    return { requestId: id, result: await resultPromise };
   }
 
   notify(method: string, params?: unknown): void {
@@ -641,10 +1205,17 @@ class CodexAppServerClient {
   }
 
   close(): void {
-    if (this.closed) return;
+    void this.closeAndWait();
+  }
+
+  /** Close the transport and wait until its local app-server child exits. */
+  closeAndWait(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    if (this.closed) return Promise.resolve();
     this.closed = true;
 
     const closeError = new Error("Codex app-server client closed");
+    this.closeError = closeError;
     for (const pending of this.pendingRequests.values()) {
       pending.reject(closeError);
     }
@@ -653,15 +1224,33 @@ class CodexAppServerClient {
 
     const child = this.process;
     this.process = null;
-    void terminateChildProcess(child);
+    const socket = this.socket;
+    this.socket = null;
+    if (
+      socket &&
+      (socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING)
+    ) {
+      socket.close(1000, "Yep session detached");
+    }
+    this.shutdownPromise = terminateChildProcess(child);
+    return this.shutdownPromise;
   }
 
   private handleProcessClose(error: Error): void {
     if (this.closed) return;
     this.closed = true;
+    const capturedStderr = this.stderrBuffer.trim();
+    const processError = capturedStderr
+      ? new Error(
+          `${error.message}\nCodex app-server stderr:\n${capturedStderr}`,
+          { cause: error },
+        )
+      : error;
+    this.closeError = processError;
 
     for (const pending of this.pendingRequests.values()) {
-      pending.reject(error);
+      pending.reject(processError);
     }
     this.pendingRequests.clear();
 
@@ -669,20 +1258,26 @@ class CodexAppServerClient {
     this.notifications.push({
       method: "error",
       params: {
-        error: { message: error.message },
+        error: { message: processError.message },
         willRetry: false,
       },
     });
-    this.notifications.close(error);
+    this.notifications.close(processError);
     this.process = null;
+    this.socket = null;
   }
 
   private sendRaw(payload: Record<string, unknown>): void {
-    if (!this.process?.stdin || this.closed) {
+    if (this.closed) {
       return;
     }
 
     try {
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        this.socket.send(JSON.stringify(payload));
+        return;
+      }
+      if (!this.process?.stdin) return;
       this.process.stdin.write(`${JSON.stringify(payload)}\n`);
     } catch (error) {
       this.handleProcessClose(
@@ -701,14 +1296,197 @@ export class CodexProvider implements AgentProvider {
   readonly name = "codex" as const;
   readonly displayName = "Codex";
   readonly supportsPermissionMode = true;
+  // auto/default/acceptEdits currently share the same cf-style thread policy.
+  // Expose only one representative so clients do not promise a distinction
+  // that Codex app-server cannot enforce.
+  readonly permissionModes = ["auto", "plan", "bypassPermissions"] as const;
   readonly supportsThinkingToggle = true;
   readonly supportsSlashCommands = false;
 
   private readonly config: CodexProviderConfig;
-  private modelCache: { models: ModelInfo[]; expiresAt: number } | null = null;
+  private bridgeExecution?: CodexBridgeExecutionConfig;
+  private readonly eventSpineConfig: CodexEventRolloutConfig;
+  private readonly eventStore: CodexEventStore;
+  /**
+   * Durable retention for the provider journal. Defaults to `lifecycle`: the
+   * always-on error/turn-health overlay and the opt-in canonical view keep
+   * every correlation-bearing record, while high-frequency deltas are
+   * projected live and then dropped instead of being written to disk.
+   */
+  private readonly eventJournalMode = resolveCodexEventJournalMode(
+    process.env.YEP_CODEX_EVENT_JOURNAL_MODE,
+  );
+  /**
+   * Retention sized against the reader's admission budget, not free disk.
+   *
+   * `selectCodexEventSource` refuses a journal whose retained bytes exceed
+   * `CODEX_EVENT_STORE_ADMISSION_BYTES` (512 MiB) and falls back to the
+   * rollout. The previous 256 MiB x 3 default could retain ~1 GiB, which put
+   * the journal permanently over that line: every canonical overlay was
+   * rejected, so the journal was being written and never read. Keeping the
+   * ceiling well under the budget is what makes the overlay reachable at all.
+   */
+  private static readonly DEFAULT_STORE_ROTATION = {
+    maxBytes: 64 * 1024 * 1024,
+    keepSegments: 2,
+  } as const;
+  /** Per-source model list cache (keyed by Codex model source id). */
+  private readonly modelCacheBySource = new Map<
+    string,
+    { models: ModelInfo[]; expiresAt: number }
+  >();
 
   constructor(config: CodexProviderConfig = {}) {
     this.config = config;
+    this.bridgeExecution = normalizeCodexBridgeExecutionConfig(
+      config.bridgeExecution,
+    );
+    this.eventSpineConfig = {
+      ...codexEventRolloutConfigFromEnv(),
+      ...config.eventSpine,
+    };
+    this.eventStore =
+      config.eventSpine?.store ??
+      (this.eventSpineConfig.durableStorePath
+        ? new JsonlCodexEventStore({
+            filePath: this.eventSpineConfig.durableStorePath,
+            // Readers attach their own instances to this path (see
+            // createDefaultCodexTranscriptStoreSources), so the provider's
+            // store only ever appends and must not retain the journal.
+            appendOnly: true,
+            onCorruptLine: ({ lineNumber, reason }) => {
+              log.warn(
+                { lineNumber, reason },
+                "Skipped malformed canonical Codex event-store line",
+              );
+            },
+            // The production singleton passes an override object even when
+            // neither env var is set. Resolve each field here so undefined
+            // overrides cannot fall back to the store's larger generic limits.
+            rotation: {
+              maxBytes:
+                this.eventSpineConfig.storeRotation?.maxBytes ??
+                CodexProvider.DEFAULT_STORE_ROTATION.maxBytes,
+              keepSegments:
+                this.eventSpineConfig.storeRotation?.keepSegments ??
+                CodexProvider.DEFAULT_STORE_ROTATION.keepSegments,
+            },
+            ...(this.eventSpineConfig.onStoreRotate
+              ? { onRotate: this.eventSpineConfig.onStoreRotate }
+              : {}),
+            ...(this.eventSpineConfig.onStoreJournalGaps
+              ? { onJournalGaps: this.eventSpineConfig.onStoreJournalGaps }
+              : {}),
+          })
+        : new InMemoryCodexEventStore());
+  }
+
+  /** Configure the production singleton after environment config is loaded. */
+  configureBridgeExecution(
+    config: CodexBridgeExecutionConfig | null | undefined,
+  ): void {
+    this.bridgeExecution = normalizeCodexBridgeExecutionConfig(config);
+  }
+
+  private async resolveBridgeExecutionTarget(
+    options: StartSessionOptions,
+  ): Promise<CodexBridgeExecutionTarget | null> {
+    const config = this.bridgeExecution;
+    const sessionId = options.resumeSessionId;
+    if (!config || config.mode === "disabled" || !sessionId) return null;
+
+    const timeoutMs = config.requestTimeoutMs ?? 3_000;
+    try {
+      const authToken =
+        config.authToken?.trim() ||
+        (config.authTokenFile
+          ? await ensureRuntimeToken(config.authTokenFile)
+          : undefined);
+      const headers = {
+        accept: "application/json",
+        ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+      };
+      const activeResponse = await fetch(
+        `${config.controlUrl}/sessions/${encodeURIComponent(sessionId)}/active`,
+        {
+          headers,
+          signal: AbortSignal.timeout(timeoutMs),
+        },
+      );
+      if (!activeResponse.ok) {
+        throw new Error(
+          `Codex bridge active probe returned ${activeResponse.status}`,
+        );
+      }
+      const activePayload = (await activeResponse.json()) as {
+        active?: unknown;
+        mcpProfile?: unknown;
+      };
+      if (activePayload.active !== true) return null;
+
+      const statusResponse = await fetch(`${config.controlUrl}/status`, {
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!statusResponse.ok) {
+        throw new Error(
+          `Codex bridge status returned ${statusResponse.status}`,
+        );
+      }
+      const status = (await statusResponse.json()) as {
+        listening?: unknown;
+        url?: unknown;
+      };
+      if (status.listening !== true || typeof status.url !== "string") {
+        throw new Error("Codex bridge is not accepting WebSocket clients");
+      }
+      const url = new URL(status.url);
+      if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+        throw new Error(
+          `Codex bridge returned unsupported transport ${url.protocol}`,
+        );
+      }
+      const controlUrl = new URL(config.controlUrl);
+      if (isWildcardBridgeHostname(url.hostname)) {
+        // A listener may advertise its bind-all address, which is not a
+        // routable or trustworthy credential destination. Reuse the host the
+        // configured control endpoint was actually reached through.
+        url.hostname = controlUrl.hostname;
+      } else if (!isSameTrustedBridgeHost(controlUrl.hostname, url.hostname)) {
+        throw new Error(
+          "Codex bridge returned a WebSocket endpoint on a different host",
+        );
+      }
+      const mcpProfile =
+        activePayload.mcpProfile === "clear" ||
+        activePayload.mcpProfile === "light" ||
+        activePayload.mcpProfile === "full"
+          ? activePayload.mcpProfile
+          : undefined;
+      if (
+        mcpProfile === "clear" ||
+        (!mcpProfile && options.codexMcpMode === "clear")
+      ) {
+        url.searchParams.set("mcp", "clear");
+      } else if (
+        mcpProfile === "full" ||
+        (!mcpProfile && options.codexMcpMode === "full")
+      ) {
+        url.searchParams.set("mcp", "full");
+      }
+
+      return {
+        url: url.toString(),
+        ...(authToken
+          ? { headers: { authorization: `Bearer ${authToken}` } }
+          : {}),
+      };
+    } catch (error) {
+      throw new Error(
+        "Codex bridge is unavailable; refusing to start a competing app-server for an external session",
+        { cause: error },
+      );
+    }
   }
 
   /**
@@ -757,23 +1535,6 @@ export class CodexProvider implements AgentProvider {
   }
 
   /**
-   * Resolve the model provider to request from the codex app-server.
-   *
-   * Returns `undefined` when no override is configured, which makes the
-   * app-server fall back to the codex CLI's own default provider (read from
-   * ~/.codex/config.toml). This lets yep-anywhere transparently reuse the
-   * local codex's configured provider (e.g. a ChatGPT-app-backed `ccvibe`
-   * provider) instead of being hard-pinned to the OpenAI cloud.
-   */
-  private resolveModelProvider(): string | undefined {
-    const fromConfig = this.config.modelProvider?.trim();
-    if (fromConfig) return fromConfig;
-    const fromEnv = process.env.YEP_CODEX_MODEL_PROVIDER?.trim();
-    if (fromEnv) return fromEnv;
-    return undefined;
-  }
-
-  /**
    * Check if Codex is authenticated.
    */
   async isAuthenticated(): Promise<boolean> {
@@ -795,52 +1556,95 @@ export class CodexProvider implements AgentProvider {
   }
 
   /**
-   * Get available models for Codex cloud.
-   * Queries Codex app-server's model/list endpoint with a static fallback.
+   * Get available models for Codex, aggregated across all available model
+   * sources (OpenAI live list + any configured custom sources such as
+   * DeepSeek). A single source failing (e.g. missing DeepSeek key) never blanks
+   * out the others.
    */
   async getAvailableModels(): Promise<ModelInfo[]> {
+    const registry = getCodexModelSourceRegistry();
+    const installed = await this.isCodexCliInstalled();
+    const aggregated: ModelInfo[] = [];
+
+    for (const source of registry.list()) {
+      const availability = registry.getAvailability(source.id);
+      if (!availability.available) continue;
+      try {
+        const models = await this.getModelsForSource(source, installed);
+        aggregated.push(...models);
+      } catch (error) {
+        log.warn(
+          { source: source.id, error },
+          "Failed to load Codex models for source; skipping",
+        );
+      }
+    }
+
+    return aggregated;
+  }
+
+  private async getModelsForSource(
+    source: CodexModelSourceDefinition,
+    installed: boolean,
+  ): Promise<ModelInfo[]> {
     const now = Date.now();
-    if (this.modelCache && this.modelCache.expiresAt > now) {
-      return this.modelCache.models;
+    const cached = this.modelCacheBySource.get(source.id);
+    if (cached && cached.expiresAt > now) {
+      return cached.models;
     }
 
-    let models: ModelInfo[] = [];
-    if (await this.isCodexCliInstalled()) {
-      models = await this.getModelsFromAppServer();
+    let models: ModelInfo[];
+    if (source.catalog) {
+      // Custom sources ship a managed catalog; model/list has no provider
+      // filter so we surface the catalog's allowlisted models directly.
+      models = getCodexModelSourceRegistry().getCatalogModelInfos(source);
+    } else {
+      // Built-in OpenAI: query a short-lived app-server for the live list,
+      // falling back to the static list when the query fails.
+      models = installed ? await this.getModelsFromAppServer(source) : [];
+      if (models.length === 0) {
+        models = FALLBACK_CODEX_MODELS.map((model) => ({
+          ...model,
+          modelProvider: source.id,
+          providerModelId: model.id,
+        }));
+      }
     }
 
-    if (models.length === 0) {
-      models = FALLBACK_CODEX_MODELS;
-    }
-
-    this.modelCache = {
+    this.modelCacheBySource.set(source.id, {
       models,
       expiresAt: now + MODEL_CACHE_TTL_MS,
-    };
-
+    });
     return models;
   }
 
-  private async getModelsFromAppServer(): Promise<ModelInfo[]> {
+  private async getModelsFromAppServer(
+    source: CodexModelSourceDefinition,
+  ): Promise<ModelInfo[]> {
     try {
-      const appServerModels = await this.requestAppServerModelList();
-      return this.normalizeModelList(appServerModels);
+      const appServerModels = await this.requestAppServerModelList(source);
+      return this.normalizeModelList(appServerModels, source);
     } catch (error) {
       log.debug(
-        { error },
+        { source: source.id, error },
         "Failed to query Codex app-server model list, using fallback models",
       );
       return [];
     }
   }
 
-  private async requestAppServerModelList(): Promise<AppServerModel[]> {
+  private async requestAppServerModelList(
+    source: CodexModelSourceDefinition,
+  ): Promise<AppServerModel[]> {
     const codexCommand = await this.resolveCodexCommand();
+    const sourceArgs = getCodexModelSourceRegistry().buildAppServerArgs(source);
+    const codexEnv = this.getCodexEnv();
     return new Promise((resolve, reject) => {
       const child = spawn(
         codexCommand,
         [
           "app-server",
+          ...sourceArgs,
           ...getCodexMcpAppServerArgs("standard"),
           "--listen",
           "stdio://",
@@ -848,7 +1652,7 @@ export class CodexProvider implements AgentProvider {
         {
           detached: process.platform !== "win32",
           stdio: ["pipe", "pipe", "pipe"],
-          env: this.getCodexEnv(),
+          env: codexEnv,
           shell: process.platform === "win32",
         },
       );
@@ -982,7 +1786,10 @@ export class CodexProvider implements AgentProvider {
     });
   }
 
-  private normalizeModelList(models: AppServerModel[]): ModelInfo[] {
+  private normalizeModelList(
+    models: AppServerModel[],
+    source: CodexModelSourceDefinition,
+  ): ModelInfo[] {
     const orderLookup = new Map<string, number>(
       PREFERRED_MODEL_ORDER.map((id, idx) => [id, idx]),
     );
@@ -1004,14 +1811,37 @@ export class CodexProvider implements AgentProvider {
 
       deduped.set(modelId, {
         id: modelId,
+        modelProvider: source.id,
+        providerModelId: modelId,
         name: this.formatModelName(model.displayName || modelId),
         description: model.description,
+        supportedReasoningEfforts: model.supportedReasoningEfforts
+          ?.filter(
+            (
+              option,
+            ): option is { reasoningEffort: string; description?: string } =>
+              typeof option.reasoningEffort === "string" &&
+              option.reasoningEffort.trim().length > 0,
+          )
+          .map((option) => ({
+            reasoningEffort: option.reasoningEffort.trim(),
+            description: option.description,
+          })),
+        defaultReasoningEffort:
+          model.defaultReasoningEffort?.trim() || undefined,
+        supportsFastMode:
+          source.id === "openai" &&
+          (model.serviceTiers?.some((tier) => tier.id === "priority") ===
+            true ||
+            model.additionalSpeedTiers?.includes("fast") === true),
       });
 
       const upgradeId = model.upgrade?.trim();
       if (upgradeId && !deduped.has(upgradeId)) {
         deduped.set(upgradeId, {
           id: upgradeId,
+          modelProvider: source.id,
+          providerModelId: upgradeId,
           name: this.formatModelName(upgradeId),
         });
       }
@@ -1022,8 +1852,11 @@ export class CodexProvider implements AgentProvider {
         model,
         index,
         rank: defaultIds.has(model.id)
-          ? -1
-          : (orderLookup.get(model.id) ?? PREFERRED_MODEL_ORDER.length + index),
+          ? -2
+          : model.id === DEFAULT_CODEX_MODEL
+            ? -1
+            : (orderLookup.get(model.id) ??
+              PREFERRED_MODEL_ORDER.length + index),
       }))
       .sort((a, b) => a.rank - b.rank)
       .map((entry) => entry.model);
@@ -1046,28 +1879,47 @@ export class CodexProvider implements AgentProvider {
   }
 
   private mapEffortToReasoningEffort(
-    effort?: string,
+    reasoningEffort?: string,
+    effort?: import("@yep-anywhere/shared").EffortLevel,
     thinking?: import("@yep-anywhere/shared").ThinkingConfig,
-  ): "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
-    if (thinking?.type === "disabled") {
-      return "low";
+    modelSource?: CodexModelSourceDefinition,
+    modelSlug?: string,
+  ): string | undefined {
+    const exactReasoningEffort = reasoningEffort?.trim();
+    let mapped: string | undefined;
+    if (exactReasoningEffort) {
+      mapped = exactReasoningEffort;
+    } else if (thinking?.type === "disabled") {
+      mapped = "low";
+    } else if (effort) {
+      switch (effort) {
+        case "low":
+          mapped = "low";
+          break;
+        case "medium":
+          mapped = "medium";
+          break;
+        case "high":
+          mapped = "high";
+          break;
+        case "xhigh":
+          mapped = "xhigh";
+          break;
+        case "max":
+          mapped = "xhigh";
+          break;
+      }
     }
-    if (!effort) {
-      return undefined;
+    // Clamp GPT-only tiers (xhigh/max/ultra) to a custom source's advertised
+    // reasoning set (e.g. low/medium/high for DeepSeek). OpenAI is untouched.
+    if (mapped && modelSource) {
+      return getCodexModelSourceRegistry().resolveReasoningEffort(
+        modelSource.id,
+        modelSlug,
+        mapped,
+      );
     }
-    // Pass through Codex-native reasoning-effort keywords verbatim so the
-    // frontend can send exactly what the local Codex accepts (e.g. "xhigh").
-    switch (effort) {
-      case "none":
-      case "minimal":
-      case "low":
-      case "medium":
-      case "high":
-      case "xhigh":
-        return effort;
-      default:
-        return undefined;
-    }
+    return mapped;
   }
 
   private mapPermissionModeToThreadPolicy(
@@ -1105,9 +1957,13 @@ export class CodexProvider implements AgentProvider {
     });
   }
 
-  private normalizeRollbackNumTurns(value?: number): number | null {
-    if (typeof value !== "number") return null;
-    if (!Number.isInteger(value) || value <= 0) return null;
+  private normalizeCodexForkExcludedTurnCount(value?: number): number | null {
+    if (value === undefined) return null;
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(
+        "Codex edit fork requires rollbackNumTurns to be a positive safe integer",
+      );
+    }
     return value;
   }
 
@@ -1115,11 +1971,16 @@ export class CodexProvider implements AgentProvider {
    * Start a new Codex session.
    */
   async startSession(options: StartSessionOptions): Promise<AgentSession> {
-    const queue = new MessageQueue();
+    const queue = new MessageQueue({
+      preserveAttachments: true,
+      preserveCodexInputs: true,
+      preserveClientMetadata: true,
+    });
     const abortController = new AbortController();
     const runtimeState: CodexTurnRuntimeState = {
       threadId: options.resumeSessionId ?? "",
       activeTurnId: null,
+      ready: false,
     };
 
     // Push initial message if provided
@@ -1149,20 +2010,81 @@ export class CodexProvider implements AgentProvider {
       get pid() {
         return activeClient?.pid;
       },
+      interrupt: async () => {
+        const client = activeClient;
+        const threadId = runtimeState.threadId;
+        const turnId = runtimeState.activeTurnId;
+        if (
+          !client ||
+          !client.isAlive() ||
+          !runtimeState.ready ||
+          !threadId ||
+          !turnId
+        ) {
+          throw new Error("Codex turn interrupt requires an active turn");
+        }
+        const params: TurnInterruptParams = { threadId, turnId };
+        await client.request<TurnInterruptResponse>("turn/interrupt", params);
+      },
+      codexControls: {
+        capabilities: CODEX_NATIVE_CAPABILITIES,
+        invoke: (request) =>
+          this.invokeCodexNativeControl({
+            getClient: () => activeClient,
+            runtimeState,
+            cwd: options.cwd,
+            request,
+          }),
+      },
+      getGoal: async () => {
+        return this.codexGoalToProviderState(
+          () => activeClient,
+          runtimeState,
+          options.cwd,
+          "show",
+        );
+      },
+      goalAction: async (action, objective) => {
+        return this.codexGoalToProviderState(
+          () => activeClient,
+          runtimeState,
+          options.cwd,
+          action,
+          objective,
+        );
+      },
       steer: async (message) => {
         if (!activeClient) return false;
         if (!runtimeState.threadId || !runtimeState.activeTurnId) return false;
 
-        const userPrompt = this.extractTextFromMessage(message);
-        if (!userPrompt) return true;
+        const { internalPrompt } = getUserPromptProjection(message);
+        if (!internalPrompt) return false;
 
         try {
-          await activeClient.request<{ turnId: string }>("turn/steer", {
+          const expectedTurnId = runtimeState.activeTurnId;
+          const params: TurnSteerParams = {
             threadId: runtimeState.threadId,
-            input: [{ type: "text", text: userPrompt, text_elements: [] }],
-            expectedTurnId: runtimeState.activeTurnId,
-          });
-          return true;
+            clientUserMessageId: message.uuid,
+            input: buildCodexUserInput(message, internalPrompt),
+            expectedTurnId,
+          };
+          const result = await activeClient.request<TurnSteerResponse>(
+            "turn/steer",
+            params,
+          );
+          const acceptedTurnId = this.getOptionalString(result?.turnId);
+          if (!acceptedTurnId || acceptedTurnId !== expectedTurnId) {
+            log.warn(
+              {
+                threadId: runtimeState.threadId,
+                expectedTurnId,
+                acceptedTurnId: acceptedTurnId ?? null,
+              },
+              "Codex turn/steer returned an invalid turn identity; caller should queue instead",
+            );
+            return false;
+          }
+          return { accepted: true, turnId: acceptedTurnId };
         } catch (error) {
           log.warn(
             {
@@ -1179,6 +2101,706 @@ export class CodexProvider implements AgentProvider {
   }
 
   /**
+   * Adapt the provider-neutral goal lifecycle (`ProviderGoalAction`) to Codex's
+   * native `thread/goal/*` controls and format the structured `ThreadGoal`
+   * response as a `ProviderGoalState` text summary.
+   *
+   * Action mapping:
+   * - "show" → `thread/goal/get` (read-only)
+   * - "set" → `thread/goal/set` with an active objective
+   * - "replace" → `thread/goal/clear`, then `thread/goal/set` with an active
+   *   objective so usage and budget state do not leak from the old goal
+   * - "pause" → `thread/goal/set` with `status: "paused"`
+   * - "resume" → `thread/goal/set` with `status: "active"`
+   * - "clear" → `thread/goal/clear`
+   */
+  private async codexGoalToProviderState(
+    getClient: () => CodexAppServerClient | null,
+    runtimeState: CodexTurnRuntimeState,
+    cwd: string,
+    action: ProviderGoalAction | "show",
+    objective?: string,
+  ): Promise<ProviderGoalState> {
+    const client = getClient();
+    if (!client?.isAlive() || !runtimeState.ready || !runtimeState.threadId) {
+      throw new Error("Codex goal requires an active session");
+    }
+
+    if (action === "clear") {
+      const result = await this.invokeCodexNativeControl({
+        getClient,
+        runtimeState,
+        cwd,
+        request: { control: "thread/goal/clear" },
+      });
+      if (!result.ok) {
+        throw new Error(result.error?.message ?? "Goal clear failed");
+      }
+      const cleared =
+        result.control === "thread/goal/clear" && result.data.cleared;
+      return {
+        response: cleared ? "Goal cleared." : "No goal to clear.",
+        startedTurn: false,
+      };
+    }
+
+    if (action === "show") {
+      const result = await this.invokeCodexNativeControl({
+        getClient,
+        runtimeState,
+        cwd,
+        request: { control: "thread/goal/get" },
+      });
+      if (!result.ok) {
+        throw new Error(result.error?.message ?? "Goal fetch failed");
+      }
+      const goal =
+        result.control === "thread/goal/get" ? result.data.goal : null;
+      return {
+        response: formatCodexGoal(goal),
+        startedTurn: false,
+      };
+    }
+
+    if (action === "replace") {
+      const clearResult = await this.invokeCodexNativeControl({
+        getClient,
+        runtimeState,
+        cwd,
+        request: { control: "thread/goal/clear" },
+      });
+      if (!clearResult.ok) {
+        throw new Error(clearResult.error?.message ?? "Goal clear failed");
+      }
+    }
+
+    const setStatus: CodexThreadGoalStatus | undefined =
+      action === "pause"
+        ? "paused"
+        : action === "resume" || action === "set" || action === "replace"
+          ? "active"
+          : undefined;
+    const result = await this.invokeCodexNativeControl({
+      getClient,
+      runtimeState,
+      cwd,
+      request: {
+        control: "thread/goal/set",
+        ...(objective !== undefined ? { objective } : {}),
+        ...(setStatus !== undefined ? { status: setStatus } : {}),
+      },
+    });
+    if (!result.ok) {
+      throw new Error(result.error?.message ?? "Goal set failed");
+    }
+    const goal = result.control === "thread/goal/set" ? result.data.goal : null;
+    return {
+      response: formatCodexGoal(goal),
+      // `thread/goal/set` returns before its runtime effects are authoritative:
+      // an active goal may subsequently start an automatic continuation. The
+      // current neutral response cannot observe that notification, so this
+      // compatibility field must not be used as Codex turn-lifecycle truth.
+      startedTurn: false,
+    };
+  }
+
+  private async invokeCodexNativeControl(input: {
+    getClient: () => CodexAppServerClient | null;
+    runtimeState: CodexTurnRuntimeState;
+    cwd: string;
+    request: CodexNativeControlRequest;
+  }): Promise<CodexNativeControlResult> {
+    const { request, runtimeState } = input;
+    if (!CODEX_NATIVE_CAPABILITIES.methods[request.control]) {
+      return codexControlFailure(
+        request.control,
+        "experimental_api_disabled",
+        `${request.control} requires Codex experimentalApi, which is disabled for this session`,
+      );
+    }
+
+    const client = input.getClient();
+    if (!client || !runtimeState.ready || !runtimeState.threadId) {
+      return codexControlFailure(
+        request.control,
+        "not_ready",
+        "Codex app-server session is not ready",
+        true,
+      );
+    }
+
+    try {
+      switch (request.control) {
+        case "skills/list": {
+          const data = await client.request<
+            CodexNativeControlDataMap["skills/list"]
+          >("skills/list", {
+            cwds: [input.cwd],
+            forceReload: request.forceReload ?? false,
+          });
+          return { ok: true, control: request.control, data };
+        }
+
+        case "review/start": {
+          const data = await client.request<
+            CodexNativeControlDataMap["review/start"]
+          >("review/start", {
+            threadId: runtimeState.threadId,
+            target: request.target,
+            ...(request.delivery === undefined
+              ? {}
+              : { delivery: request.delivery }),
+          });
+          return { ok: true, control: request.control, data };
+        }
+
+        case "thread/compact/start": {
+          const data = await client.request<
+            CodexNativeControlDataMap["thread/compact/start"]
+          >("thread/compact/start", { threadId: runtimeState.threadId });
+          return { ok: true, control: request.control, data };
+        }
+
+        case "thread/goal/get": {
+          const data = await client.request<
+            CodexNativeControlDataMap["thread/goal/get"]
+          >("thread/goal/get", { threadId: runtimeState.threadId });
+          return { ok: true, control: request.control, data };
+        }
+
+        case "thread/goal/set": {
+          const objective = request.objective;
+          if (
+            typeof objective === "string" &&
+            (objective.trim().length === 0 || objective.length > 4_000)
+          ) {
+            return codexControlFailure(
+              request.control,
+              "invalid_request",
+              "Goal objective must contain 1 to 4000 characters",
+            );
+          }
+          if (
+            request.tokenBudget !== undefined &&
+            request.tokenBudget !== null &&
+            (!Number.isSafeInteger(request.tokenBudget) ||
+              request.tokenBudget <= 0)
+          ) {
+            return codexControlFailure(
+              request.control,
+              "invalid_request",
+              "Goal tokenBudget must be a positive safe integer or null",
+            );
+          }
+          const data = await client.request<
+            CodexNativeControlDataMap["thread/goal/set"]
+          >("thread/goal/set", {
+            threadId: runtimeState.threadId,
+            ...(request.objective === undefined
+              ? {}
+              : { objective: request.objective }),
+            ...(request.status === undefined ? {} : { status: request.status }),
+            ...(request.tokenBudget === undefined
+              ? {}
+              : { tokenBudget: request.tokenBudget }),
+          });
+          return { ok: true, control: request.control, data };
+        }
+
+        case "thread/goal/clear": {
+          const data = await client.request<
+            CodexNativeControlDataMap["thread/goal/clear"]
+          >("thread/goal/clear", { threadId: runtimeState.threadId });
+          return { ok: true, control: request.control, data };
+        }
+
+        case "thread/shellCommand": {
+          if (!request.confirmed) {
+            return codexControlFailure(
+              request.control,
+              "invalid_request",
+              "thread/shellCommand requires explicit confirmation because it runs unsandboxed",
+            );
+          }
+          if (request.command.trim().length === 0) {
+            return codexControlFailure(
+              request.control,
+              "invalid_request",
+              "Shell command must not be empty",
+            );
+          }
+          const data = await client.request<
+            CodexNativeControlDataMap["thread/shellCommand"]
+          >("thread/shellCommand", {
+            threadId: runtimeState.threadId,
+            command: request.command,
+          });
+          return { ok: true, control: request.control, data };
+        }
+
+        case "thread/backgroundTerminals/list":
+        case "thread/backgroundTerminals/terminate":
+        case "thread/backgroundTerminals/clean":
+          return codexControlFailure(
+            request.control,
+            "experimental_api_disabled",
+            `${request.control} requires Codex experimentalApi, which is disabled for this session`,
+          );
+      }
+    } catch (error) {
+      log.warn(
+        {
+          control: request.control,
+          threadId: runtimeState.threadId,
+          errorCode:
+            error instanceof CodexJsonRpcError ? error.code : undefined,
+          errorType: error instanceof Error ? error.name : typeof error,
+        },
+        "Codex native control request failed",
+      );
+      if (error instanceof CodexJsonRpcError) {
+        if (error.code === -32601) {
+          return codexControlFailure(
+            request.control,
+            "unsupported_method",
+            `Codex app-server does not support ${request.control}`,
+          );
+        }
+        if (error.code === -32602) {
+          return codexControlFailure(
+            request.control,
+            "invalid_request",
+            "Codex app-server rejected invalid control parameters",
+          );
+        }
+        return codexControlFailure(
+          request.control,
+          "provider_error",
+          error.code === -32001
+            ? "Codex app-server is overloaded; retry the control request"
+            : "Codex app-server control request failed",
+          error.code === -32001,
+        );
+      }
+      return codexControlFailure(
+        request.control,
+        "provider_error",
+        "Codex app-server control request failed",
+      );
+    }
+  }
+
+  /**
+   * Await one JSON-RPC request while yielding only the client's safe overload
+   * decision. Raw JSON-RPC error messages/data never enter the UI projection.
+   */
+  private async *requestTrackedWithRetryProjection<T>(input: {
+    appServer: CodexAppServerClient;
+    method: string;
+    params?: unknown;
+    metadata?: AppServerRequestMetadata;
+    sessionId?: () => string | undefined;
+    onRetry?: (
+      update: AppServerRetryUpdate,
+    ) => Promise<CodexEventEnvelope | undefined>;
+  }): AsyncGenerator<
+    SDKMessage,
+    { requestId: JsonRpcId; result: T },
+    undefined
+  > {
+    const updates = new AsyncQueue<{
+      update: AppServerRetryUpdate;
+      canonicalEvent?: CodexEventEnvelope;
+    }>();
+    const request = input.appServer.requestTracked<T>(
+      input.method,
+      input.params,
+      input.metadata,
+      async (update) => {
+        const canonicalEvent = await input.onRetry?.(update);
+        updates.push({
+          update,
+          ...(canonicalEvent ? { canonicalEvent } : {}),
+        });
+      },
+    );
+    const settled = request.then(
+      (result) => ({ kind: "result" as const, result }),
+      (error: unknown) => ({ kind: "error" as const, error }),
+    );
+    let nextUpdate = updates.shift().then(
+      (value) => ({ kind: "retry" as const, value }),
+      () => ({ kind: "closed" as const }),
+    );
+
+    try {
+      for (;;) {
+        const outcome = await Promise.race([settled, nextUpdate]);
+        if (outcome.kind === "retry") {
+          yield buildCodexRetryWarning(
+            outcome.value.update,
+            input.sessionId?.(),
+            outcome.value.canonicalEvent,
+          );
+          nextUpdate = updates.shift().then(
+            (value) => ({ kind: "retry" as const, value }),
+            () => ({ kind: "closed" as const }),
+          );
+          continue;
+        }
+        if (outcome.kind === "result") return outcome.result;
+        if (outcome.kind === "error") throw outcome.error;
+        throw new Error("Codex retry status channel closed unexpectedly");
+      }
+    } finally {
+      updates.close(new Error("Codex request settled"));
+    }
+  }
+
+  /**
+   * Prefer bounded lifecycle responses while retaining a single, narrowly
+   * classified retry for app-server versions that reject `excludeTurns`.
+   */
+  private async *requestLifecycleWithExcludeTurnsFallback<
+    TParams extends { excludeTurns?: boolean; initialTurnsPage?: unknown },
+    TResponse,
+  >(input: {
+    appServer: CodexAppServerClient;
+    method: "thread/resume" | "thread/fork";
+    params: TParams;
+    historySupport: CodexLifecycleHistorySupport;
+    sessionId?: () => string | undefined;
+    onRetry?: (
+      update: AppServerRetryUpdate,
+    ) => Promise<CodexEventEnvelope | undefined>;
+  }): AsyncGenerator<
+    SDKMessage,
+    {
+      requestId: JsonRpcId;
+      result: TResponse;
+      params: TParams;
+      historySupport: CodexLifecycleHistorySupport;
+    },
+    undefined
+  > {
+    const params = { ...input.params };
+    if (input.historySupport === "legacy-only") {
+      Reflect.deleteProperty(params, "excludeTurns");
+      Reflect.deleteProperty(params, "initialTurnsPage");
+    }
+
+    try {
+      const tracked = yield* this.requestTrackedWithRetryProjection<TResponse>({
+        appServer: input.appServer,
+        method: input.method,
+        params,
+        sessionId: input.sessionId,
+        onRetry: input.onRetry,
+      });
+      return {
+        ...tracked,
+        params,
+        historySupport:
+          params.excludeTurns === true ? "exclude-turns" : input.historySupport,
+      };
+    } catch (error) {
+      if (
+        params.excludeTurns !== true ||
+        !isCodexLifecycleHistoryControlsUnsupported(error)
+      ) {
+        throw error;
+      }
+
+      const fallbackParams = { ...params };
+      Reflect.deleteProperty(fallbackParams, "excludeTurns");
+      Reflect.deleteProperty(fallbackParams, "initialTurnsPage");
+      log.warn(
+        {
+          event: "codex_lifecycle_compatibility_fallback",
+          method: input.method,
+          sessionId: input.sessionId?.() ?? null,
+          errorCode:
+            error instanceof CodexJsonRpcError ? error.code : undefined,
+          historySupport: "legacy-only",
+        },
+        "Codex app-server rejected bounded lifecycle history controls; retrying once with legacy hydration",
+      );
+      const tracked = yield* this.requestTrackedWithRetryProjection<TResponse>({
+        appServer: input.appServer,
+        method: input.method,
+        params: fallbackParams,
+        sessionId: input.sessionId,
+        onRetry: input.onRetry,
+      });
+      return {
+        ...tracked,
+        params: fallbackParams,
+        historySupport: "legacy-only",
+      };
+    }
+  }
+
+  private resolveCodexForkBoundaryFromFullHistory(input: {
+    sourceThreadId: string;
+    excludedTurnCount: number;
+    turns: Turn[];
+    pageCount: number;
+    exchanges: CodexForkBoundaryExchange[];
+  }): CodexForkBoundaryResult {
+    if (input.excludedTurnCount > input.turns.length) {
+      throw new Error(
+        `Cannot fork Codex thread ${input.sourceThreadId}: requested exclusion of ${input.excludedTurnCount} trailing turns, but the source contains ${input.turns.length}`,
+      );
+    }
+    if (input.excludedTurnCount === input.turns.length) {
+      return {
+        kind: "empty-child",
+        sourceTurnCount: input.turns.length,
+        pageCount: input.pageCount,
+        exchanges: input.exchanges,
+      };
+    }
+
+    const boundaryTurn =
+      input.turns[input.turns.length - input.excludedTurnCount - 1];
+    if (
+      !boundaryTurn ||
+      typeof boundaryTurn.id !== "string" ||
+      boundaryTurn.id.length === 0 ||
+      boundaryTurn.status === "inProgress"
+    ) {
+      throw new Error(
+        `Cannot fork Codex thread ${input.sourceThreadId}: the retained turn boundary is missing or still in progress`,
+      );
+    }
+    return {
+      kind: "boundary",
+      turn: boundaryTurn,
+      examinedTurnCount: input.turns.length,
+      pageCount: input.pageCount,
+      exchanges: input.exchanges,
+    };
+  }
+
+  /** Load only the descending suffix needed to identify an inclusive fork boundary. */
+  private async *loadCodexForkBoundary(input: {
+    appServer: CodexAppServerClient;
+    sourceThreadId: string;
+    excludedTurnCount: number;
+    resumeParams: ThreadResumeParams;
+    resumeResponse: ThreadResumeResponse;
+    sessionId: () => string | undefined;
+    onRetry?: (
+      update: AppServerRetryUpdate,
+    ) => Promise<CodexEventEnvelope | undefined>;
+  }): AsyncGenerator<SDKMessage, CodexForkBoundaryResult, undefined> {
+    const requiredTurnCount = input.excludedTurnCount + 1;
+    if (requiredTurnCount > CODEX_FORK_BOUNDARY_MAX_TURNS) {
+      throw new Error(
+        `Cannot fork Codex thread ${input.sourceThreadId}: requested boundary exceeds the ${CODEX_FORK_BOUNDARY_MAX_TURNS}-turn safety limit`,
+      );
+    }
+
+    const exchanges: CodexForkBoundaryExchange[] = [];
+    // A legacy compatibility retry (or an older server that ignored the field)
+    // may already have returned full chronological turns.
+    if (
+      input.resumeParams.excludeTurns !== true ||
+      input.resumeResponse.thread.turns.length > 0
+    ) {
+      return this.resolveCodexForkBoundaryFromFullHistory({
+        sourceThreadId: input.sourceThreadId,
+        excludedTurnCount: input.excludedTurnCount,
+        turns: input.resumeResponse.thread.turns,
+        pageCount: 0,
+        exchanges,
+      });
+    }
+
+    const descendingTurns: Turn[] = [];
+    const seenTurnIds = new Set<string>();
+    const seenCursors = new Set<string>();
+    let pageCount = 0;
+    let cursor: string | null = null;
+    let exhausted = false;
+
+    const appendPage = (page: {
+      data: Turn[];
+      nextCursor: string | null;
+    }): void => {
+      pageCount += 1;
+      for (const turn of page.data) {
+        if (
+          typeof turn.id !== "string" ||
+          turn.id.length === 0 ||
+          seenTurnIds.has(turn.id)
+        ) {
+          throw new Error(
+            `Cannot fork Codex thread ${input.sourceThreadId}: paginated turn history repeated or omitted a turn identity`,
+          );
+        }
+        seenTurnIds.add(turn.id);
+        descendingTurns.push(turn);
+      }
+      cursor = page.nextCursor;
+      exhausted = cursor === null;
+    };
+
+    if (input.resumeResponse.initialTurnsPage) {
+      appendPage(input.resumeResponse.initialTurnsPage);
+    } else if (input.resumeResponse.thread.status.type === "active") {
+      throw new Error(
+        `Cannot fork Codex thread ${input.sourceThreadId}: active resume did not return its requested initial turn page`,
+      );
+    }
+
+    while (descendingTurns.length < requiredTurnCount && !exhausted) {
+      if (pageCount >= CODEX_FORK_BOUNDARY_MAX_PAGES) {
+        throw new Error(
+          `Cannot fork Codex thread ${input.sourceThreadId}: paginated turn history exceeded the ${CODEX_FORK_BOUNDARY_MAX_PAGES}-page safety limit`,
+        );
+      }
+      const requestCursor = cursor;
+      if (requestCursor !== null) {
+        if (seenCursors.has(requestCursor)) {
+          throw new Error(
+            `Cannot fork Codex thread ${input.sourceThreadId}: paginated turn history returned a repeated cursor`,
+          );
+        }
+        seenCursors.add(requestCursor);
+      }
+      const params: ThreadTurnsListParams = {
+        threadId: input.sourceThreadId,
+        cursor: requestCursor,
+        limit: Math.min(
+          CODEX_FORK_BOUNDARY_PAGE_LIMIT,
+          requiredTurnCount - descendingTurns.length,
+        ),
+        sortDirection: "desc",
+        itemsView: "notLoaded",
+      };
+      try {
+        const tracked =
+          yield* this.requestTrackedWithRetryProjection<ThreadTurnsListResponse>(
+            {
+              appServer: input.appServer,
+              method: "thread/turns/list",
+              params,
+              sessionId: input.sessionId,
+              onRetry: input.onRetry,
+            },
+          );
+        exchanges.push({
+          requestId: tracked.requestId,
+          method: "thread/turns/list",
+          params,
+          result: tracked.result,
+        });
+        if (
+          tracked.result.data.length === 0 &&
+          tracked.result.nextCursor !== null
+        ) {
+          throw new Error(
+            `Cannot fork Codex thread ${input.sourceThreadId}: paginated turn history returned an empty non-terminal page`,
+          );
+        }
+        appendPage(tracked.result);
+      } catch (error) {
+        if (
+          !isCodexHistoryPaginationUnsupported(error) ||
+          input.resumeResponse.thread.historyMode !== "legacy"
+        ) {
+          throw error;
+        }
+
+        const readParams = {
+          threadId: input.sourceThreadId,
+          includeTurns: true as const,
+        };
+        log.warn(
+          {
+            event: "codex_fork_boundary_legacy_fallback",
+            sourceThreadId: input.sourceThreadId,
+            errorCode:
+              error instanceof CodexJsonRpcError ? error.code : undefined,
+          },
+          "Codex legacy thread does not support turn paging; reading its full history once",
+        );
+        const tracked =
+          yield* this.requestTrackedWithRetryProjection<ThreadReadResponse>({
+            appServer: input.appServer,
+            method: "thread/read",
+            params: readParams,
+            sessionId: input.sessionId,
+            onRetry: input.onRetry,
+          });
+        if (tracked.result.thread.historyMode !== "legacy") {
+          throw new Error(
+            `Cannot fork Codex thread ${input.sourceThreadId}: refusing full hydration after history mode changed`,
+          );
+        }
+        exchanges.push({
+          requestId: tracked.requestId,
+          method: "thread/read",
+          params: readParams,
+          result: tracked.result,
+        });
+        return this.resolveCodexForkBoundaryFromFullHistory({
+          sourceThreadId: input.sourceThreadId,
+          excludedTurnCount: input.excludedTurnCount,
+          turns: tracked.result.thread.turns,
+          pageCount,
+          exchanges,
+        });
+      }
+    }
+
+    log.debug(
+      {
+        event: "codex_fork_boundary_page_loaded",
+        sourceThreadId: input.sourceThreadId,
+        excludedTurnCount: input.excludedTurnCount,
+        examinedTurnCount: descendingTurns.length,
+        pageCount,
+        historyMode: input.resumeResponse.thread.historyMode,
+      },
+      "Loaded bounded Codex fork history suffix",
+    );
+
+    if (descendingTurns.length > input.excludedTurnCount) {
+      const boundaryTurn = descendingTurns[input.excludedTurnCount];
+      if (
+        !boundaryTurn ||
+        typeof boundaryTurn.id !== "string" ||
+        boundaryTurn.id.length === 0 ||
+        boundaryTurn.status === "inProgress"
+      ) {
+        throw new Error(
+          `Cannot fork Codex thread ${input.sourceThreadId}: the retained turn boundary is missing or still in progress`,
+        );
+      }
+      return {
+        kind: "boundary",
+        turn: boundaryTurn,
+        examinedTurnCount: descendingTurns.length,
+        pageCount,
+        exchanges,
+      };
+    }
+    if (descendingTurns.length === input.excludedTurnCount && exhausted) {
+      return {
+        kind: "empty-child",
+        sourceTurnCount: descendingTurns.length,
+        pageCount,
+        exchanges,
+      };
+    }
+    throw new Error(
+      `Cannot fork Codex thread ${input.sourceThreadId}: requested exclusion of ${input.excludedTurnCount} trailing turns, but the source contains ${descendingTurns.length}`,
+    );
+  }
+
+  /**
    * Main session loop using codex app-server.
    */
   private async *runSession(
@@ -1188,21 +2810,67 @@ export class CodexProvider implements AgentProvider {
     runtimeState: CodexTurnRuntimeState,
     setActiveClient: (client: CodexAppServerClient) => void,
   ): AsyncIterableIterator<SDKMessage> {
-    const codexCommand = await this.resolveCodexCommand();
-    const configuredMcpServers =
-      options.codexMcpMode === "clear"
-        ? await discoverConfiguredCodexMcpServers(codexCommand)
-        : [];
-    const appServer = new CodexAppServerClient(
-      codexCommand,
-      options.cwd,
-      this.getCodexEnv(),
-      getCodexMcpAppServerArgs(options.codexMcpMode, configuredMcpServers),
+    // Resolve the session's Codex model source and start the app-server with
+    // its provider/catalog overrides so model discovery, catalog, auth, and the
+    // thread `modelProvider` all point at the same source.
+    const registry = getCodexModelSourceRegistry();
+    const modelSource = registry.require(
+      options.codexModelProvider ?? DEFAULT_CODEX_MODEL_PROVIDER,
     );
-    setActiveClient(appServer);
+    const codexEnv = this.getCodexEnv();
+    let appServer: CodexAppServerClient | undefined;
+    let startupStage = "transport-selection";
+    let transportKind: "stdio" | "bridge-websocket" = "stdio";
 
     let sessionId = options.resumeSessionId ?? "";
+    let eventIngress: CodexEventIngress | null = null;
+    const startupRetryUpdates: AppServerRetryUpdate[] = [];
+    const captureStartupRetry = async (update: AppServerRetryUpdate) => {
+      startupRetryUpdates.push(update);
+      return undefined;
+    };
+    let projectionMode: CodexEventProjectionMode = "shadow";
     const usageByTurnId = new Map<string, TokenUsageSnapshot>();
+    const customToolContexts = new Map<string, CodexToolCallContext>();
+    const shadowToolContexts = new Map<string, CodexToolCallContext>();
+    // Accumulated live stdout/stderr per command item (itemId-turnId), so the
+    // UI can stream command output like the Codex TUI does.
+    const commandOutputBuffers = new Map<string, string>();
+    const shadowCommandOutputBuffers = new Map<string, string>();
+    /** Methods whose canonical/legacy divergence has already been reported. */
+    const reportedParityMismatchMethods = new Set<string>();
+    const canonicalRetryableErrorsByTurnId = new Map<
+      string,
+      CanonicalCodexError
+    >();
+    const legacyRetryableErrorsByTurnId = new Map<
+      string,
+      CanonicalCodexError
+    >();
+    let generatedArtifactRuntime:
+      | {
+          uploadManager: UploadManager;
+          materializer: GeneratedArtifactMaterializer;
+        }
+      | undefined;
+    const getGeneratedArtifactRuntime = async () => {
+      if (generatedArtifactRuntime) return generatedArtifactRuntime;
+      const uploadManager =
+        this.config.generatedArtifactUploadManager ?? new UploadManager();
+      generatedArtifactRuntime = {
+        uploadManager,
+        materializer: new GeneratedArtifactMaterializer({ uploadManager }),
+      };
+      await uploadManager
+        .cleanupExpiredTaskAttachments({ limit: 25 })
+        .catch(() => {
+          log.warn(
+            { sessionId: sessionId || undefined },
+            "Generated artifact retention cleanup failed safely",
+          );
+        });
+      return generatedArtifactRuntime;
+    };
     const logMessage = (message: SDKMessage): SDKMessage => {
       const messageSessionId =
         typeof (message as { session_id?: unknown }).session_id === "string"
@@ -1212,21 +2880,102 @@ export class CodexProvider implements AgentProvider {
       return message;
     };
 
-    appServer.setServerRequestHandler(async (request) => {
-      return await this.handleServerRequestApproval(request, options, signal);
-    });
-
     try {
+      const bridgeTarget = await this.resolveBridgeExecutionTarget(options);
+      transportKind = bridgeTarget ? "bridge-websocket" : "stdio";
+      const needsPaginatedHistoryApi =
+        bridgeTarget !== null || options.rollbackNumTurns !== undefined;
+      const codexCommand = bridgeTarget
+        ? "codex-bridge"
+        : await this.resolveCodexCommand();
+      startupStage = "transport-connect";
+      appServer = new CodexAppServerClient(
+        codexCommand,
+        options.cwd,
+        codexEnv,
+        [
+          ...registry.buildAppServerArgs(modelSource),
+          ...getCodexMcpAppServerArgs(options.codexMcpMode),
+        ],
+        bridgeTarget
+          ? {
+              kind: "websocket",
+              url: bridgeTarget.url,
+              ...(bridgeTarget.headers
+                ? { headers: bridgeTarget.headers }
+                : {}),
+            }
+          : undefined,
+      );
+      setActiveClient(appServer);
+      appServer.setServerRequestHandler(async (request) => {
+        const ingress = eventIngress;
+        try {
+          const result = await this.handleServerRequestApproval(
+            request,
+            options,
+            signal,
+          );
+          if (ingress) {
+            await ingress.ingestServerRequestResolution({
+              requestId: request.id,
+              method: request.method,
+              result,
+            });
+          }
+          return result;
+        } catch (error) {
+          if (ingress) {
+            await ingress.ingestServerRequestResolution({
+              requestId: request.id,
+              method: request.method,
+              error,
+            });
+          }
+          throw error;
+        }
+      });
+
       await appServer.connect();
 
-      await appServer.request<{ userAgent: string }>("initialize", {
-        clientInfo: {
-          name: this.getCodexClientName(),
-          version: "dev",
+      startupStage = "initialize";
+      yield* this.requestTrackedWithRetryProjection<{ userAgent: string }>({
+        appServer,
+        method: "initialize",
+        params: {
+          clientInfo: {
+            name: this.getCodexClientName(),
+            version: "dev",
+          },
+          capabilities: needsPaginatedHistoryApi
+            ? { experimentalApi: true }
+            : null,
         },
-        capabilities: null,
+        sessionId: () => sessionId || options.resumeSessionId,
+        onRetry: captureStartupRetry,
       });
       appServer.notify("initialized");
+
+      // Read the same app-server's effective config for this cwd. This is both
+      // substantially faster than spawning `codex mcp list --json` and keeps
+      // project-level .codex/config.toml layers aligned with the thread.
+      startupStage = "config-read";
+      const configRead = (yield* this.requestTrackedWithRetryProjection<{
+        config?: unknown;
+      }>({
+        appServer,
+        method: "config/read",
+        params: {
+          includeLayers: false,
+          cwd: options.cwd,
+        },
+        sessionId: () => sessionId || options.resumeSessionId,
+        onRetry: captureStartupRetry,
+      })).result;
+      const mcpProfile = resolveCodexMcpThreadProfile(
+        options.codexMcpMode,
+        configRead.config,
+      );
 
       const policy = this.mapPermissionModeToThreadPolicy(
         options.permissionMode,
@@ -1237,75 +2986,401 @@ export class CodexProvider implements AgentProvider {
           {
             sessionId: options.resumeSessionId ?? null,
             requestedModel: options.model,
-            modelProvider: CODEX_CLOUD_MODEL_PROVIDER,
+            modelProvider: modelSource.id,
           },
           "Ignoring Codex model option that looks like a model provider",
         );
       }
 
-      const modelProvider = this.resolveModelProvider();
+      const forkExcludedTurnCount = this.normalizeCodexForkExcludedTurnCount(
+        options.rollbackNumTurns,
+      );
+      if (forkExcludedTurnCount !== null && !options.resumeSessionId) {
+        throw new Error("Codex edit fork requires a source session ID");
+      }
+      // Bridge rejoin and edit/fork bootstrap an authoritative bounded page in
+      // the native resume response. Ordinary stdio resume needs no history.
+      const initialResumeTurnsPage =
+        forkExcludedTurnCount !== null
+          ? {
+              limit: Math.min(
+                CODEX_FORK_BOUNDARY_PAGE_LIMIT,
+                forkExcludedTurnCount + 1,
+              ),
+              sortDirection: "desc" as const,
+              itemsView: "notLoaded" as const,
+            }
+          : transportKind === "bridge-websocket"
+            ? {
+                limit: 1,
+                sortDirection: "desc" as const,
+                itemsView: "notLoaded" as const,
+              }
+            : undefined;
+      // "default" explicitly opts out of Fast, including config/model defaults.
+      // Omission leaves the native thread tier intact on ordinary resume.
+      const serviceTier =
+        modelSource.id === "openai" ? options.serviceTier : undefined;
       const threadResumeParams: ThreadResumeParams = {
         threadId: options.resumeSessionId ?? sessionId,
         model: requestedModel,
-        ...(modelProvider ? { modelProvider } : {}),
+        modelProvider: modelSource.id,
+        ...(serviceTier !== undefined ? { serviceTier } : {}),
         cwd: options.cwd,
         approvalPolicy: policy.approvalPolicy,
         sandbox: policy.sandbox,
+        config: mcpProfile.threadConfig,
+        excludeTurns: true,
+        ...(initialResumeTurnsPage
+          ? { initialTurnsPage: initialResumeTurnsPage }
+          : {}),
       };
       const threadStartParams: ThreadStartParams = {
         model: requestedModel,
-        ...(modelProvider ? { modelProvider } : {}),
+        modelProvider: modelSource.id,
+        ...(serviceTier !== undefined ? { serviceTier } : {}),
         cwd: options.cwd,
         approvalPolicy: policy.approvalPolicy,
         sandbox: policy.sandbox,
+        config: mcpProfile.threadConfig,
       };
-      const threadResult: ThreadResumeResponse | ThreadStartResponse =
-        options.resumeSessionId
-          ? await appServer.request<ThreadResumeResponse>(
-              "thread/resume",
-              threadResumeParams,
-            )
-          : await appServer.request<ThreadStartResponse>(
-              "thread/start",
-              threadStartParams,
+      let lifecycleHistorySupport: CodexLifecycleHistorySupport = "unknown";
+      let resumedActiveTurnId: string | undefined;
+      let resumedActiveTurnLookupUncertain = false;
+
+      let threadResult:
+        | ThreadResumeResponse
+        | ThreadStartResponse
+        | ThreadForkResponse;
+      let threadExchange: {
+        requestId: JsonRpcId;
+        method: "thread/resume" | "thread/start";
+        params: ThreadResumeParams | ThreadStartParams;
+        result: ThreadResumeResponse | ThreadStartResponse;
+      };
+      if (options.resumeSessionId) {
+        try {
+          startupStage = "thread-resume";
+          const tracked = yield* this.requestLifecycleWithExcludeTurnsFallback<
+            ThreadResumeParams,
+            ThreadResumeResponse
+          >({
+            appServer,
+            method: "thread/resume",
+            params: threadResumeParams,
+            historySupport: lifecycleHistorySupport,
+            sessionId: () => sessionId || options.resumeSessionId,
+            onRetry: captureStartupRetry,
+          });
+          lifecycleHistorySupport = tracked.historySupport;
+          if (transportKind === "bridge-websocket") {
+            const resumeTurns =
+              tracked.result.initialTurnsPage?.data ??
+              (tracked.params.excludeTurns === true
+                ? []
+                : tracked.result.thread.turns);
+            resumedActiveTurnId = findLastInProgressCodexTurnId(resumeTurns);
+            resumedActiveTurnLookupUncertain =
+              !resumedActiveTurnId &&
+              tracked.result.thread.status.type === "active";
+          }
+          threadResult = tracked.result;
+          threadExchange = {
+            requestId: tracked.requestId,
+            method: "thread/resume",
+            params: tracked.params,
+            result: tracked.result,
+          };
+        } catch (error) {
+          if (
+            !options.allowMissingRolloutReplacement ||
+            !isNoRolloutFoundError(error, options.resumeSessionId)
+          ) {
+            throw error;
+          }
+          if (forkExcludedTurnCount !== null) {
+            throw new Error(
+              `Cannot fork Codex thread ${options.resumeSessionId}: the source has no persisted rollout`,
             );
+          }
+          log.warn(
+            {
+              event: "codex_provisional_thread_replaced",
+              previousSessionId: options.resumeSessionId,
+            },
+            "Codex provisional thread had no rollout; starting replacement thread",
+          );
+          startupStage = "thread-start-replacement";
+          const tracked =
+            yield* this.requestTrackedWithRetryProjection<ThreadStartResponse>({
+              appServer,
+              method: "thread/start",
+              params: threadStartParams,
+              sessionId: () => sessionId || options.resumeSessionId,
+              onRetry: captureStartupRetry,
+            });
+          threadResult = tracked.result;
+          threadExchange = {
+            requestId: tracked.requestId,
+            method: "thread/start",
+            params: threadStartParams,
+            result: tracked.result,
+          };
+        }
+      } else {
+        startupStage = "thread-start";
+        const tracked =
+          yield* this.requestTrackedWithRetryProjection<ThreadStartResponse>({
+            appServer,
+            method: "thread/start",
+            params: threadStartParams,
+            sessionId: () => sessionId || options.resumeSessionId,
+            onRetry: captureStartupRetry,
+          });
+        threadResult = tracked.result;
+        threadExchange = {
+          requestId: tracked.requestId,
+          method: "thread/start",
+          params: threadStartParams,
+          result: tracked.result,
+        };
+      }
 
       sessionId = threadResult.thread.id;
       runtimeState.threadId = sessionId;
-
-      const rollbackNumTurns = this.normalizeRollbackNumTurns(
-        options.rollbackNumTurns,
-      );
-      if (rollbackNumTurns !== null) {
-        const beforeRollbackThreadId = sessionId;
-        const rollbackParams: ThreadRollbackParams = {
-          threadId: sessionId,
-          numTurns: rollbackNumTurns,
-        };
-        log.info(
-          {
-            event: "codex_thread_rollback_requested",
-            sessionId: beforeRollbackThreadId,
-            rollbackNumTurns,
-          },
-          "Requesting Codex app-server thread rollback",
-        );
-        const rollbackResult = await appServer.request<ThreadRollbackResponse>(
-          "thread/rollback",
-          rollbackParams,
-        );
-        sessionId = rollbackResult.thread.id;
-        runtimeState.threadId = sessionId;
-        log.info(
-          {
-            event: "codex_thread_rollback_completed",
-            beforeRollbackThreadId,
-            sessionId,
-            rollbackNumTurns,
-          },
-          "Rolled back Codex app-server thread before edited turn",
+      startupStage = "thread-ready";
+      if (
+        forkExcludedTurnCount !== null &&
+        sessionId !== options.resumeSessionId
+      ) {
+        throw new Error(
+          `Cannot fork Codex thread ${options.resumeSessionId}: thread/resume returned unexpected source ID ${sessionId}`,
         );
       }
+
+      let historyForkPending = forkExcludedTurnCount !== null;
+      let forkParentSessionId: string | undefined;
+      let forkStartedFresh = false;
+      const forkBoundaryExchanges: CodexForkBoundaryExchange[] = [];
+      let forkExchange:
+        | {
+            requestId: JsonRpcId;
+            method: "thread/fork";
+            params: ThreadForkParams;
+            result: ThreadForkResponse;
+          }
+        | {
+            requestId: JsonRpcId;
+            method: "thread/start";
+            params: ThreadStartParams;
+            result: ThreadStartResponse;
+          }
+        | undefined;
+      if (forkExcludedTurnCount !== null) {
+        const sourceThreadId = sessionId;
+        forkParentSessionId = sourceThreadId;
+        const boundary = yield* this.loadCodexForkBoundary({
+          appServer,
+          sourceThreadId,
+          excludedTurnCount: forkExcludedTurnCount,
+          resumeParams: threadExchange.params as ThreadResumeParams,
+          resumeResponse: threadResult as ThreadResumeResponse,
+          sessionId: () => sessionId || options.resumeSessionId,
+          onRetry: captureStartupRetry,
+        });
+        forkBoundaryExchanges.push(...boundary.exchanges);
+
+        if (boundary.kind === "empty-child") {
+          // Stable 0.147 has no stable "fork before the first turn" boundary.
+          // Start an empty child and persist its lineage in Yep metadata.
+          log.info(
+            {
+              event: "codex_thread_fork_fresh_start_requested",
+              sourceThreadId,
+              excludedTurnCount: forkExcludedTurnCount,
+              sourceTurnCount: boundary.sourceTurnCount,
+              boundaryPageCount: boundary.pageCount,
+            },
+            "Starting an empty Codex child for a first-prompt edit fork",
+          );
+          const tracked =
+            yield* this.requestTrackedWithRetryProjection<ThreadStartResponse>({
+              appServer,
+              method: "thread/start",
+              params: threadStartParams,
+              sessionId: () => sessionId || options.resumeSessionId,
+              onRetry: captureStartupRetry,
+            });
+          threadResult = tracked.result;
+          forkStartedFresh = true;
+          forkExchange = {
+            requestId: tracked.requestId,
+            method: "thread/start",
+            params: threadStartParams,
+            result: tracked.result,
+          };
+        } else {
+          // Use only the stable inclusive boundary. Keep the current-main MCP
+          // enablement in thread config; never send experimental beforeTurnId.
+          const forkParams: ThreadForkParams = {
+            threadId: sourceThreadId,
+            lastTurnId: boundary.turn.id,
+            model: requestedModel,
+            modelProvider: modelSource.id,
+            cwd: options.cwd,
+            approvalPolicy: policy.approvalPolicy,
+            sandbox: policy.sandbox,
+            config: mcpProfile.threadConfig,
+            excludeTurns: true,
+          };
+          log.info(
+            {
+              event: "codex_thread_fork_requested",
+              sourceThreadId,
+              lastTurnId: boundary.turn.id,
+              excludedTurnCount: forkExcludedTurnCount,
+              examinedTurnCount: boundary.examinedTurnCount,
+              boundaryPageCount: boundary.pageCount,
+            },
+            "Requesting a source-preserving Codex history fork",
+          );
+          const tracked = yield* this.requestLifecycleWithExcludeTurnsFallback<
+            ThreadForkParams,
+            ThreadForkResponse
+          >({
+            appServer,
+            method: "thread/fork",
+            params: forkParams,
+            historySupport: lifecycleHistorySupport,
+            sessionId: () => sessionId || options.resumeSessionId,
+            onRetry: captureStartupRetry,
+          });
+          lifecycleHistorySupport = tracked.historySupport;
+          threadResult = tracked.result;
+          forkExchange = {
+            requestId: tracked.requestId,
+            method: "thread/fork",
+            params: tracked.params,
+            result: tracked.result,
+          };
+        }
+
+        sessionId = threadResult.thread.id;
+        if (!sessionId || sessionId === sourceThreadId) {
+          throw new Error(
+            `Codex edit fork did not return a new thread ID for source ${sourceThreadId}`,
+          );
+        }
+        runtimeState.threadId = sessionId;
+        // Active-turn lookup belongs to the resumed source thread. Once a
+        // fork switches execution to its child, the first edited prompt must
+        // start a child turn instead of steering the source turn identity.
+        resumedActiveTurnId = undefined;
+        resumedActiveTurnLookupUncertain = false;
+        log.info(
+          {
+            event: "codex_thread_fork_completed",
+            sourceThreadId,
+            sessionId,
+            excludedTurnCount: forkExcludedTurnCount,
+            lastTurnId:
+              forkExchange?.method === "thread/fork"
+                ? forkExchange.params.lastTurnId
+                : null,
+            fallback: forkExchange?.method === "thread/start",
+          },
+          "Created source-preserving Codex history fork",
+        );
+      }
+
+      projectionMode = resolveCodexEventProjectionMode(
+        {
+          sessionId,
+          accountId: options.codexEventAccountId,
+        },
+        this.eventSpineConfig,
+      );
+      eventIngress = await CodexEventIngress.create({
+        store: this.eventStore,
+        runtime: needsPaginatedHistoryApi
+          ? CODEX_PROVIDER_RUNTIME_IDENTITY
+          : CODEX_EVENT_RUNTIME_IDENTITY,
+        sessionId,
+        workspaceRoot: options.cwd,
+        journalMode: this.eventJournalMode,
+        ...(options.codexEventProjectId
+          ? { projectId: options.codexEventProjectId }
+          : {}),
+        ...(options.codexEventAccountId
+          ? { accountId: options.codexEventAccountId }
+          : {}),
+      });
+      const activeEventIngress = eventIngress;
+      for (const update of startupRetryUpdates) {
+        await activeEventIngress.ingestClientRetry({
+          requestId: update.requestId,
+          method: update.method,
+          retryStatus: update.retryStatus,
+          threadId: sessionId,
+          ...(update.metadata?.clientMessageId
+            ? { clientMessageId: update.metadata.clientMessageId }
+            : {}),
+        });
+      }
+      await activeEventIngress.ingestClientExchange({
+        ...threadExchange,
+        result: threadExchange.result,
+      });
+      for (const exchange of forkBoundaryExchanges) {
+        await activeEventIngress.ingestClientExchange(exchange);
+      }
+      if (forkExchange) {
+        await activeEventIngress.ingestClientExchange({
+          requestId: forkExchange.requestId,
+          method: forkExchange.method,
+          params: forkExchange.params,
+          result: forkExchange.result,
+        });
+      }
+      await appServer.setEventObserver({
+        onClientRequest: async (input) => {
+          await activeEventIngress.ingestClientRequest({
+            requestId: input.requestId,
+            method: input.method,
+            params: input.params,
+            ...(input.metadata?.clientMessageId
+              ? { clientMessageId: input.metadata.clientMessageId }
+              : {}),
+          });
+        },
+        onClientResponse: async (input) => {
+          await activeEventIngress.ingestClientResponse({
+            requestId: input.requestId,
+            method: input.method,
+            ...(input.result === undefined ? {} : { result: input.result }),
+            ...(input.error === undefined ? {} : { error: input.error }),
+            ...(input.metadata?.clientMessageId
+              ? { clientMessageId: input.metadata.clientMessageId }
+              : {}),
+          });
+        },
+        onServerRequest: async (request) => {
+          await activeEventIngress.ingestServerRequest({
+            requestId: request.id,
+            method: request.method,
+            params: request.params,
+          });
+        },
+        onServerNotification: async (notification) =>
+          await activeEventIngress.ingestNotification(notification),
+      });
+
+      runtimeState.ready = true;
+
+      // The app-server returns the provider it actually bound the thread to;
+      // trust that effective value over the requested one for logs/metadata.
+      const effectiveModelProvider =
+        threadResult.modelProvider || modelSource.id;
 
       log.info(
         {
@@ -1314,12 +3389,22 @@ export class CodexProvider implements AgentProvider {
           approvalPolicy: policy.approvalPolicy,
           sandbox: policy.sandbox,
           codexMcpMode: options.codexMcpMode ?? "standard",
+          codexEventProjectionMode: projectionMode,
+          codexEventConnectionId: eventIngress.connectionId,
+          paginatedHistoryApiEnabled: needsPaginatedHistoryApi,
           policyOverrides: {
             approvalPolicy: CODEX_POLICY_OVERRIDES.approvalPolicy,
             sandbox: CODEX_POLICY_OVERRIDES.sandbox,
           },
           model: requestedModel,
-          modelProvider: modelProvider ?? "(codex default)",
+          codexModelProvider: effectiveModelProvider,
+          serviceTier: threadResult.serviceTier,
+          transport: transportKind,
+          credentialPresent: Boolean(
+            modelSource.providerConfig?.envKey
+              ? process.env[modelSource.providerConfig.envKey]
+              : true,
+          ),
         },
         "Started Codex app-server session thread",
       );
@@ -1332,96 +3417,362 @@ export class CodexProvider implements AgentProvider {
           session_id: sessionId,
           cwd: options.cwd,
           model: threadResult.model,
+          modelProvider: effectiveModelProvider,
           reasoningEffort: threadResult.reasoningEffort,
           serviceTier: threadResult.serviceTier,
+          ...(forkParentSessionId ? { forkParentSessionId } : {}),
         } as SDKMessage),
       );
 
       const messageGen = queue.generator();
-      let isFirstMessage = !options.resumeSessionId;
+      let isFirstMessage = !options.resumeSessionId || forkStartedFresh;
+      startupStage = "turn-runtime";
 
       for await (const message of messageGen) {
         if (signal.aborted) {
           break;
         }
 
-        let userPrompt = this.extractTextFromMessage(message);
-        if (!userPrompt) {
+        let { internalPrompt, publicPrompt } = getUserPromptProjection(message);
+        if (!internalPrompt) {
           continue;
         }
 
         // Prepend global instructions to the first message of new sessions
         if (isFirstMessage && options.globalInstructions) {
-          userPrompt = `[Global context]\n${options.globalInstructions}\n\n---\n\n${userPrompt}`;
+          const prefix = `[Global context]\n${options.globalInstructions}\n\n---\n\n`;
+          internalPrompt = `${prefix}${internalPrompt}`;
+          publicPrompt = `${prefix}${publicPrompt}`;
           isFirstMessage = false;
         } else {
           isFirstMessage = false;
         }
 
-        // Emit user message with UUID from queue to enable deduplication.
+        const turnStartParams: TurnStartParams = {
+          threadId: sessionId,
+          clientUserMessageId: message.uuid,
+          input: buildCodexUserInput(message, internalPrompt),
+          effort: this.mapEffortToReasoningEffort(
+            options.reasoningEffort,
+            options.effort,
+            options.thinking,
+            modelSource,
+            options.model,
+          ),
+        };
+        const retryObserver = async (update: AppServerRetryUpdate) =>
+          await activeEventIngress.ingestClientRetry({
+            requestId: update.requestId,
+            method: update.method,
+            retryStatus: update.retryStatus,
+            threadId: sessionId,
+            ...(update.metadata?.clientMessageId
+              ? { clientMessageId: update.metadata.clientMessageId }
+              : {}),
+          });
+        let turnResult: TurnStartResponse | undefined;
+        let activeTurnId: string;
+        let sourceEvent: "turn/start" | "turn/steer" = "turn/start";
+        if (resumedActiveTurnId) {
+          const expectedTurnId = resumedActiveTurnId;
+          resumedActiveTurnId = undefined;
+          const steerParams: TurnSteerParams = {
+            threadId: sessionId,
+            clientUserMessageId: message.uuid,
+            input: buildCodexUserInput(message, internalPrompt),
+            expectedTurnId,
+          };
+          try {
+            const steer =
+              yield* this.requestTrackedWithRetryProjection<TurnSteerResponse>({
+                appServer,
+                method: "turn/steer",
+                params: steerParams,
+                metadata: message.uuid
+                  ? { clientMessageId: message.uuid }
+                  : undefined,
+                sessionId: () => sessionId,
+                onRetry: retryObserver,
+              });
+            if (steer.result.turnId !== expectedTurnId) {
+              throw new Error(
+                "Codex turn/steer returned an unexpected active turn ID",
+              );
+            }
+            activeTurnId = steer.result.turnId;
+            sourceEvent = "turn/steer";
+          } catch (error) {
+            if (!isCodexNoActiveTurnToSteer(error)) {
+              throw error;
+            }
+            const latest = await appServer.request<ThreadReadResponse>(
+              "thread/read",
+              { threadId: sessionId, includeTurns: false },
+            );
+            if (latest.thread.status.type !== "idle") {
+              throw new Error(
+                "Bridge-owned Codex thread is not idle after turn/steer rejection",
+                { cause: error },
+              );
+            }
+            log.info(
+              { sessionId, expectedTurnId },
+              "Bridge-owned Codex turn completed before steer; starting a new turn",
+            );
+            turnResult =
+              (yield* this.requestTrackedWithRetryProjection<TurnStartResponse>(
+                {
+                  appServer,
+                  method: "turn/start",
+                  params: turnStartParams,
+                  metadata: message.uuid
+                    ? { clientMessageId: message.uuid }
+                    : undefined,
+                  sessionId: () => sessionId,
+                  onRetry: retryObserver,
+                },
+              )).result;
+            activeTurnId = turnResult.turn.id;
+          }
+        } else if (resumedActiveTurnLookupUncertain) {
+          resumedActiveTurnLookupUncertain = false;
+          throw new Error(
+            "Bridge-owned Codex thread is active, but resume did not identify its active turn",
+          );
+        } else {
+          turnResult =
+            (yield* this.requestTrackedWithRetryProjection<TurnStartResponse>({
+              appServer,
+              method: "turn/start",
+              params: turnStartParams,
+              metadata: message.uuid
+                ? { clientMessageId: message.uuid }
+                : undefined,
+              sessionId: () => sessionId,
+              onRetry: retryObserver,
+            })).result;
+          activeTurnId = turnResult.turn.id;
+        }
+
+        runtimeState.activeTurnId = activeTurnId;
+        // Publish the provider-accepted echo only after turn/start returns the
+        // authoritative turn identity. Process separately publishes the
+        // optimistic admission echo with the same UUID. A resumed active turn
+        // uses steer, so its echo remains pending until userMessage arrives.
         const userMessage = withCodexTimestamp({
           type: "user",
           uuid: message.uuid,
+          tempId: message.tempId,
           session_id: sessionId,
+          clientUserMessageId: message.uuid,
+          ...codexUserMessageIdentity(message.uuid),
+          turnId: activeTurnId,
+          codexTurnId: activeTurnId,
+          isOptimistic: sourceEvent === "turn/steer",
           message: {
             role: "user",
-            content: userPrompt,
+            content: publicPrompt,
           },
         } as SDKMessage);
         logSdkCorrelationDebug(sessionId, userMessage, {
           eventKind: "user_message",
-          phase: "submitted",
-          sourceEvent: "queued_input",
+          turnId: activeTurnId,
+          phase: "accepted",
+          sourceEvent,
         });
         yield logMessage(userMessage);
-
-        const turnStartParams: TurnStartParams = {
-          threadId: sessionId,
-          input: [{ type: "text", text: userPrompt, text_elements: [] }],
-          effort: this.mapEffortToReasoningEffort(
-            options.effort,
-            options.thinking,
-          ),
-        };
-        const turnResult = await appServer.request<TurnStartResponse>(
-          "turn/start",
-          turnStartParams,
-        );
-
-        const activeTurnId = turnResult.turn.id;
-        runtimeState.activeTurnId = activeTurnId;
+        if (historyForkPending) {
+          historyForkPending = false;
+          yield logMessage(
+            withCodexTimestamp({
+              type: "system",
+              subtype: "history_fork_complete",
+              uuid: `codex-history-fork-${activeTurnId}`,
+              session_id: sessionId,
+              forkParentSessionId,
+              turnId: activeTurnId,
+              messageUuid: message.uuid,
+            } as SDKMessage),
+          );
+        }
         log.info(
           {
             sessionId,
             turnId: activeTurnId,
-            turnStatus: turnResult.turn.status,
+            turnStatus: turnResult?.turn.status ?? "inProgress",
+            sourceEvent,
           },
-          "Started Codex app-server turn",
+          sourceEvent === "turn/steer"
+            ? "Steered bridge-owned Codex turn"
+            : "Started Codex app-server turn",
         );
-        let turnComplete = turnResult.turn.status !== "inProgress";
+        let turnComplete =
+          turnResult !== undefined && turnResult.turn.status !== "inProgress";
         let emittedTurnError = false;
 
         while (!turnComplete && !signal.aborted) {
-          const notification = await appServer.nextNotification(signal);
+          const rawNotification = await appServer.nextNotification(signal);
+          const canonicalEvent =
+            rawNotification.canonicalEvent ??
+            (await activeEventIngress.ingestNotification(rawNotification));
+          const canonicalNotification =
+            activeEventIngress.notificationFromEvent(canonicalEvent);
 
-          if (notification.method === "thread/tokenUsage/updated") {
-            const usage = this.extractTurnUsage(notification.params);
+          if (canonicalNotification.method === "thread/tokenUsage/updated") {
+            const usage = this.extractTurnUsage(canonicalNotification.params);
             if (usage) {
               usageByTurnId.set(usage.turnId, usage.snapshot);
             }
           }
 
-          const messages = this.convertNotificationToSDKMessages(
-            notification,
-            sessionId,
-            usageByTurnId,
-          );
+          let messages: SDKMessage[];
+          if (projectionMode === "legacy") {
+            messages = this.convertNotificationToSDKMessages(
+              rawNotification,
+              sessionId,
+              usageByTurnId,
+              customToolContexts,
+              commandOutputBuffers,
+              true,
+              false,
+              legacyRetryableErrorsByTurnId,
+              options.cwd,
+            );
+          } else {
+            const canonicalMessages = this.convertNotificationToSDKMessages(
+              canonicalNotification,
+              sessionId,
+              usageByTurnId,
+              projectionMode === "primary"
+                ? customToolContexts
+                : shadowToolContexts,
+              projectionMode === "primary"
+                ? commandOutputBuffers
+                : shadowCommandOutputBuffers,
+              projectionMode === "primary",
+              true,
+              canonicalRetryableErrorsByTurnId,
+              options.cwd,
+            );
+            const legacyMessages = this.convertNotificationToSDKMessages(
+              rawNotification,
+              sessionId,
+              usageByTurnId,
+              projectionMode === "shadow"
+                ? customToolContexts
+                : shadowToolContexts,
+              projectionMode === "shadow"
+                ? commandOutputBuffers
+                : shadowCommandOutputBuffers,
+              projectionMode === "shadow",
+              false,
+              legacyRetryableErrorsByTurnId,
+              options.cwd,
+            );
+            const parity = activeEventIngress.recordProjectionParity(
+              canonicalEvent,
+              legacyMessages,
+              canonicalMessages,
+            );
+            if (
+              parity.lastMismatch?.eventId === canonicalEvent.eventId &&
+              parity.mismatched > 0 &&
+              !reportedParityMismatchMethods.has(parity.lastMismatch.method)
+            ) {
+              // One line per method, not per event. Divergence here is
+              // systematic rather than incidental (the canonical side reads a
+              // redacted payload), so an unthrottled warning produced tens of
+              // thousands of identical lines per process and buried everything
+              // else in the log. Running totals stay on the parity snapshot.
+              reportedParityMismatchMethods.add(parity.lastMismatch.method);
+              log.warn(
+                {
+                  sessionId,
+                  method: parity.lastMismatch.method,
+                  eventId: canonicalEvent.eventId,
+                  projectionMode,
+                  legacyHash: parity.lastMismatch.legacyHash,
+                  canonicalHash: parity.lastMismatch.canonicalHash,
+                  mismatchCount: parity.mismatched,
+                  comparedCount: parity.compared,
+                },
+                "Canonical Codex projection differs from legacy projection",
+              );
+            }
+            messages =
+              projectionMode === "primary"
+                ? this.attachCanonicalCodexItem(
+                    canonicalMessages,
+                    canonicalEvent,
+                    sessionId,
+                  )
+                : legacyMessages;
+          }
+          if (
+            canonicalEvent.method === "item/completed" &&
+            canonicalEvent.threadId &&
+            canonicalEvent.turnId
+          ) {
+            const materializationItem =
+              selectCanonicalGeneratedArtifactSourceItem(
+                rawNotification,
+                canonicalEvent,
+              );
+            if (materializationItem) {
+              const { materializer } = await getGeneratedArtifactRuntime();
+              const generated = await materializer.materialize(
+                {
+                  lifecycle: "completed",
+                  item: materializationItem,
+                  threadId: canonicalEvent.threadId,
+                  turnId: canonicalEvent.turnId,
+                  replay: canonicalEvent.source.replay,
+                },
+                {
+                  projectId:
+                    options.codexEventProjectId ?? encodeProjectId(options.cwd),
+                  sessionId,
+                  taskId: message.uuid ?? activeTurnId,
+                  workspaceRoot: options.cwd,
+                  threadId: canonicalEvent.threadId,
+                  turnId: canonicalEvent.turnId,
+                  canonicalEventId: canonicalEvent.eventId,
+                  canonicalEventSequence: canonicalEvent.sequence,
+                },
+              );
+              if (
+                generated.artifacts.length > 0 ||
+                generated.warnings.length > 0
+              ) {
+                messages = this.attachCanonicalCodexItem(
+                  messages,
+                  canonicalEvent,
+                  sessionId,
+                ).map(
+                  (sdkMessage) =>
+                    ({
+                      ...sdkMessage,
+                      ...(generated.artifacts.length > 0
+                        ? { codexGeneratedArtifacts: generated.artifacts }
+                        : {}),
+                      ...(generated.warnings.length > 0
+                        ? {
+                            codexGeneratedArtifactWarnings: generated.warnings,
+                          }
+                        : {}),
+                    }) as SDKMessage,
+                );
+              }
+            }
+          }
           for (const msg of messages) {
             yield logMessage(msg);
           }
 
-          if (this.isTurnTerminalNotification(notification, activeTurnId)) {
-            if (notification.method === "error") {
+          if (
+            this.isTurnTerminalNotification(canonicalNotification, activeTurnId)
+          ) {
+            if (canonicalNotification.method === "error") {
               emittedTurnError = true;
             }
             turnComplete = true;
@@ -1432,33 +3783,61 @@ export class CodexProvider implements AgentProvider {
         // If turn failed without an emitted error notification, surface start response error.
         if (
           !emittedTurnError &&
-          turnResult.turn.status === "failed" &&
+          turnResult?.turn.status === "failed" &&
           turnResult.turn.error?.message
         ) {
+          const codexError = classifyCodexError(turnResult.turn.error, {
+            correlationId: activeTurnId,
+          });
           yield logMessage({
             type: "error",
             session_id: sessionId,
-            error: turnResult.turn.error.message,
+            error: codexError.publicMessage,
+            codexError,
+            turnId: activeTurnId,
+            codexTurnId: activeTurnId,
+            clientUserMessageId: message.uuid,
           } as SDKMessage);
         }
 
         yield logMessage({
           type: "result",
           session_id: sessionId,
+          turnId: activeTurnId,
+          codexTurnId: activeTurnId,
+          clientUserMessageId: message.uuid,
         } as SDKMessage);
       }
     } catch (error) {
-      log.error({ error }, "Error in codex app-server session");
+      const classifiedError =
+        transportKind === "bridge-websocket"
+          ? new Error("Codex bridge execution failed", { cause: error })
+          : error;
+      const codexError = classifyCodexError(classifiedError);
+      log.error(
+        {
+          code: codexError.code,
+          category: codexError.category,
+          retryable: codexError.retryable,
+          startupStage,
+          transport: transportKind,
+          errorType: error instanceof Error ? error.name : typeof error,
+          rpcCode: error instanceof CodexJsonRpcError ? error.code : undefined,
+        },
+        "Error in codex app-server session",
+      );
       if (!signal.aborted) {
         yield logMessage({
           type: "error",
           session_id: sessionId,
-          error: error instanceof Error ? error.message : String(error),
+          error: codexError.publicMessage,
+          codexError,
         } as SDKMessage);
       }
     } finally {
       runtimeState.activeTurnId = null;
-      appServer.close();
+      runtimeState.ready = false;
+      await appServer?.closeAndWait();
     }
 
     yield logMessage({
@@ -1491,10 +3870,20 @@ export class CodexProvider implements AgentProvider {
     const notification = this.asThreadTokenUsageUpdatedNotification(params);
     if (!notification) return null;
 
+    const freshInputTokens = notification.tokenUsage.last.inputTokens;
+    const compactedContextTokens =
+      typeof notification.tokenUsage.last.totalTokens === "number"
+        ? notification.tokenUsage.last.totalTokens
+        : 0;
+
     return {
       turnId: notification.turnId,
       snapshot: {
-        inputTokens: notification.tokenUsage.last.inputTokens,
+        // Immediately after compaction Codex reports inputTokens=0 and puts
+        // the compacted summary size in last.totalTokens. Keep this aligned
+        // with the persisted reader and bridge-owned session path.
+        inputTokens:
+          freshInputTokens > 0 ? freshInputTokens : compactedContextTokens,
         outputTokens: notification.tokenUsage.last.outputTokens,
         cachedInputTokens: notification.tokenUsage.last.cachedInputTokens,
         modelContextWindow: notification.tokenUsage.modelContextWindow,
@@ -1548,25 +3937,46 @@ export class CodexProvider implements AgentProvider {
           },
           "Handling Codex command approval request",
         );
+        const availableDecisions = getEffectiveCommandApprovalDecisions(
+          commandParams as unknown as Record<string, unknown>,
+        );
         const toolInput = {
+          requestMethod: request.method,
+          approvalKind: "command_execution",
           command: commandParams.command,
           cwd: commandParams.cwd,
           reason: commandParams.reason,
           commandActions: commandParams.commandActions ?? [],
+          additionalPermissions: commandParams.additionalPermissions ?? null,
+          networkApprovalContext: commandParams.networkApprovalContext ?? null,
           proposedExecpolicyAmendment:
             commandParams.proposedExecpolicyAmendment ?? null,
+          proposedNetworkPolicyAmendments:
+            commandParams.proposedNetworkPolicyAmendments ?? null,
+          availableDecisions,
+          approvalId: commandParams.approvalId ?? null,
           threadId: commandParams.threadId,
           turnId: commandParams.turnId,
           itemId: commandParams.itemId,
         };
+        const sessionDecision = availableDecisions.includes("acceptForSession")
+          ? ("acceptForSession" as const)
+          : undefined;
+        const alwaysDecision =
+          availableDecisions.find(isPolicyAmendmentCommandApprovalDecision) ??
+          sessionDecision;
         const decision: CommandExecutionApprovalDecision =
-          await this.resolveApprovalDecision(
+          await this.resolveApprovalDecision<CommandExecutionApprovalDecision>(
             options,
             "Bash",
             toolInput,
             signal,
             "accept",
             "decline",
+            request.id,
+            sessionDecision,
+            "cancel",
+            alwaysDecision,
           );
         log.info(
           {
@@ -1609,9 +4019,17 @@ export class CodexProvider implements AgentProvider {
           "Handling Codex file-change approval request",
         );
         const toolInput = {
+          requestMethod: request.method,
+          approvalKind: "file_change",
           file_path: grantRoot ?? undefined,
           reason: fileParams.reason ?? null,
           grantRoot,
+          availableDecisions: [
+            "accept",
+            "acceptForSession",
+            "decline",
+            "cancel",
+          ],
           threadId: fileParams.threadId,
           turnId: fileParams.turnId,
           itemId: fileParams.itemId,
@@ -1624,6 +4042,10 @@ export class CodexProvider implements AgentProvider {
             signal,
             "accept",
             "decline",
+            request.id,
+            "acceptForSession",
+            "cancel",
+            "acceptForSession",
           );
         log.info(
           {
@@ -1639,6 +4061,128 @@ export class CodexProvider implements AgentProvider {
         return { decision };
       }
 
+      case "item/permissions/requestApproval": {
+        const threadId = this.getOptionalString(params.threadId);
+        const turnId = this.getOptionalString(params.turnId);
+        const itemId = this.getOptionalString(params.itemId);
+        if (!threadId || !turnId || !itemId || !asRecord(params.permissions)) {
+          throw new CodexJsonRpcError(
+            -32602,
+            "Invalid item/permissions/requestApproval params",
+          );
+        }
+
+        const requestView = toCodexInteractiveRequestView(
+          codexServerRequestId(request.id),
+          "item/permissions/requestApproval",
+          threadId,
+          params,
+          new Date().toISOString(),
+        );
+        const result = await this.requestToolApprovalResult(
+          options,
+          requestView.inputRequest.toolName ?? "Permissions",
+          {
+            ...(asRecord(requestView.inputRequest.toolInput) ?? {}),
+            approvalPrompt: requestView.inputRequest.prompt,
+            requestMethod: request.method,
+          },
+          signal,
+          request.id,
+        );
+        const providerDecision = getProviderApprovalDecision(result);
+        const response = buildCodexInteractiveResponse(
+          "item/permissions/requestApproval",
+          params,
+          providerDecision,
+        );
+        log.info(
+          {
+            method: request.method,
+            requestId: request.id,
+            threadId,
+            turnId,
+            itemId,
+            providerDecision,
+          },
+          "Resolved Codex permissions approval request",
+        );
+        return response;
+      }
+
+      case "mcpServer/elicitation/request": {
+        const threadId = this.getOptionalString(params.threadId);
+        const serverName = this.getOptionalString(params.serverName);
+        const mode = this.getOptionalString(params.mode);
+        const message = this.getOptionalString(params.message);
+        if (
+          !threadId ||
+          !serverName ||
+          !message ||
+          (mode !== "form" && mode !== "openai/form" && mode !== "url") ||
+          (mode === "url" &&
+            (!this.getOptionalString(params.url) ||
+              !this.getOptionalString(params.elicitationId))) ||
+          (mode !== "url" && !("requestedSchema" in params))
+        ) {
+          throw new CodexJsonRpcError(
+            -32602,
+            "Invalid mcpServer/elicitation/request params",
+          );
+        }
+
+        const requestView = toCodexInteractiveRequestView(
+          codexServerRequestId(request.id),
+          "mcpServer/elicitation/request",
+          threadId,
+          params,
+          new Date().toISOString(),
+        );
+        const result = await this.requestToolApprovalResult(
+          options,
+          requestView.inputRequest.toolName ?? "MCP",
+          {
+            ...(asRecord(requestView.inputRequest.toolInput) ?? {}),
+            approvalPrompt: requestView.inputRequest.prompt,
+            requestMethod: request.method,
+          },
+          signal,
+          request.id,
+        );
+        const providerDecision = getProviderApprovalDecision(result);
+        const updatedInput = asRecord(result.updatedInput);
+        const answers = updatedInput?.answers as
+          | UserQuestionAnswers
+          | undefined;
+        const response = buildCodexInteractiveResponse(
+          "mcpServer/elicitation/request",
+          params,
+          providerDecision,
+          answers,
+        ) as Record<string, unknown>;
+        if (
+          result.behavior === "deny" &&
+          result.interrupt === true &&
+          response.action === "decline"
+        ) {
+          response.action = "cancel";
+        }
+        log.info(
+          {
+            method: request.method,
+            requestId: request.id,
+            threadId,
+            turnId: this.getOptionalString(params.turnId),
+            serverName,
+            mode,
+            providerDecision,
+            action: response.action,
+          },
+          "Resolved Codex MCP elicitation request",
+        );
+        return response;
+      }
+
       // Backward-compatible protocol variants.
       case "execCommandApproval": {
         const commandParts = Array.isArray(params.command)
@@ -1647,6 +4191,8 @@ export class CodexProvider implements AgentProvider {
             )
           : [];
         const toolInput = {
+          requestMethod: request.method,
+          approvalKind: "legacy_command_execution",
           command: commandParts.join(" "),
           cwd: this.getOptionalString(params.cwd),
           reason: this.getOptionalString(params.reason),
@@ -1660,6 +4206,7 @@ export class CodexProvider implements AgentProvider {
           signal,
           "approved",
           "denied",
+          request.id,
         );
         log.info(
           {
@@ -1681,6 +4228,8 @@ export class CodexProvider implements AgentProvider {
             : {};
         const paths = Object.keys(fileChanges);
         const toolInput = {
+          requestMethod: request.method,
+          approvalKind: "legacy_file_change",
           changes: paths.map((path) => ({ path, kind: "update" })),
           reason: this.getOptionalString(params.reason),
           grantRoot: this.getOptionalString(params.grantRoot),
@@ -1693,6 +4242,7 @@ export class CodexProvider implements AgentProvider {
           signal,
           "approved",
           "denied",
+          request.id,
         );
         log.info(
           {
@@ -1709,87 +4259,310 @@ export class CodexProvider implements AgentProvider {
 
       case "item/tool/requestUserInput": {
         const requestInput = this.asToolRequestUserInputParams(request.params);
-        const questions = requestInput?.questions ?? [];
-
-        // MVP: return empty answers so request can complete without blocking.
-        const answers: ToolRequestUserInputResponse["answers"] = {};
-        for (const question of questions) {
-          answers[question.id] = { answers: [] };
+        if (!requestInput) {
+          throw new CodexJsonRpcError(
+            -32602,
+            "Invalid item/tool/requestUserInput params",
+          );
         }
-        log.warn(
+        if (!options.onToolApproval) {
+          throw new CodexJsonRpcError(
+            -32601,
+            "No interactive input handler is available",
+          );
+        }
+
+        const requestView = toCodexInteractiveRequestView(
+          codexServerRequestId(request.id),
+          "item/tool/requestUserInput",
+          requestInput.threadId,
+          params,
+          new Date().toISOString(),
+        );
+        const toolInput = {
+          ...(asRecord(requestView.inputRequest.toolInput) ?? {}),
+          requestMethod: request.method,
+          isBlocking: requestInput.isBlocking,
+          threadId: requestInput.threadId,
+          turnId: requestInput.turnId,
+          itemId: requestInput.itemId,
+        };
+        const timeoutMs = normalizeAutoResolutionMs(
+          requestInput.autoResolutionMs,
+        );
+        const timeoutController =
+          timeoutMs === null ? null : new AbortController();
+        const approvalSignal = timeoutController
+          ? AbortSignal.any([signal, timeoutController.signal])
+          : signal;
+        const timeout =
+          timeoutController && timeoutMs !== null
+            ? setTimeout(() => timeoutController.abort(), timeoutMs)
+            : undefined;
+        timeout?.unref?.();
+
+        let result: ToolApprovalResult;
+        try {
+          result = await this.requestToolApprovalResult(
+            options,
+            requestView.inputRequest.toolName ?? "AskUserQuestion",
+            toolInput,
+            approvalSignal,
+            request.id,
+          );
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
+
+        if (result.behavior !== "allow") {
+          throw new CodexJsonRpcError(
+            -32000,
+            "Codex tool user input request was declined",
+          );
+        }
+        const updatedInput = asRecord(result.updatedInput);
+        const answers = updatedInput?.answers as
+          | UserQuestionAnswers
+          | undefined;
+        const response = buildCodexInteractiveResponse(
+          "item/tool/requestUserInput",
+          params,
+          getProviderApprovalDecision(result),
+          answers,
+        ) as ToolRequestUserInputResponse;
+        log.info(
           {
             method: request.method,
             requestId: request.id,
-            questionCount: questions.length,
-            threadId: requestInput?.threadId ?? null,
-            turnId: requestInput?.turnId ?? null,
-            itemId: requestInput?.itemId ?? null,
+            questionCount: requestInput.questions.length,
+            threadId: requestInput.threadId,
+            turnId: requestInput.turnId,
+            itemId: requestInput.itemId,
+            resolution: "answered",
           },
-          "Codex requested tool user input; returning empty answers in MVP",
+          "Resolved Codex tool user input request",
         );
-        const response: ToolRequestUserInputResponse = { answers };
         return response;
       }
+
+      case "item/tool/call":
+        return this.rejectUnownedServerCapability(
+          request,
+          "dynamic tools are not registered by this client",
+        );
+
+      case "account/chatgptAuthTokens/refresh":
+        return this.rejectUnownedServerCapability(
+          request,
+          "ChatGPT auth-token refresh is not owned by this client",
+        );
+
+      case "attestation/generate":
+        return this.rejectUnownedServerCapability(
+          request,
+          "attestation generation was not requested during initialization",
+        );
+
+      case "currentTime/read":
+        return this.rejectUnownedServerCapability(
+          request,
+          "the experimental external-clock capability is disabled",
+        );
 
       default: {
         log.warn(
           { method: request.method, requestId: request.id },
           "Unhandled codex server request",
         );
-        return {};
+        throw new CodexJsonRpcError(
+          -32601,
+          `Unsupported Codex server request: ${request.method}`,
+        );
       }
     }
   }
 
-  private async resolveApprovalDecision<TDecision extends string>(
+  private rejectUnownedServerCapability(
+    request: JsonRpcServerRequest,
+    reason: string,
+  ): never {
+    log.warn(
+      {
+        method: request.method,
+        requestId: request.id,
+        owner: "app-server-client",
+        outcome: "rejected",
+      },
+      "Rejected disabled Codex server-request capability",
+    );
+    throw new CodexJsonRpcError(
+      -32601,
+      `Unsupported Codex server request: ${request.method} (${reason})`,
+    );
+  }
+
+  private async requestToolApprovalResult(
+    options: StartSessionOptions,
+    toolName: string,
+    toolInput: unknown,
+    signal: AbortSignal,
+    requestId?: JsonRpcId,
+  ): Promise<ToolApprovalResult> {
+    if (signal.aborted) {
+      return {
+        behavior: "deny",
+        message: "Interactive approval request was aborted",
+        interrupt: true,
+      };
+    }
+    if (!options.onToolApproval) {
+      log.warn(
+        { toolName },
+        "No onToolApproval handler available; denying Codex approval request",
+      );
+      return {
+        behavior: "deny",
+        message: "No interactive approval handler is available",
+      };
+    }
+
+    let result: ToolApprovalResult;
+    try {
+      const requestMethod = asRecord(toolInput)?.requestMethod;
+      result = await options.onToolApproval(toolName, toolInput, {
+        signal,
+        requestId:
+          requestId === undefined ? undefined : codexServerRequestId(requestId),
+        requestMethod:
+          typeof requestMethod === "string" ? requestMethod : undefined,
+        respectProviderDecision: true,
+      });
+    } catch (error) {
+      const aborted =
+        signal.aborted ||
+        (error instanceof Error && error.name === "AbortError");
+      log.warn(
+        {
+          toolName,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          aborted,
+        },
+        "onToolApproval threw; denying Codex approval request",
+      );
+      return {
+        behavior: "deny",
+        message: aborted
+          ? "Interactive approval request was aborted"
+          : "Interactive approval handler failed",
+        ...(aborted ? { interrupt: true } : {}),
+      };
+    }
+
+    log.info(
+      {
+        toolName,
+        behavior: result.behavior,
+        approvalScope: result.approvalScope ?? "once",
+        providerDecision: result.providerDecision ?? null,
+        interrupt: result.interrupt ?? false,
+      },
+      "Resolved tool approval callback result",
+    );
+    return result;
+  }
+
+  private async resolveApprovalDecision<TDecision>(
     options: StartSessionOptions,
     toolName: string,
     toolInput: unknown,
     signal: AbortSignal,
     allowDecision: TDecision,
     denyDecision: TDecision,
+    requestId?: JsonRpcId,
+    sessionDecision?: TDecision,
+    cancelDecision?: TDecision,
+    alwaysDecision?: TDecision,
   ): Promise<TDecision> {
-    if (!options.onToolApproval) {
-      log.warn(
-        { toolName },
-        "No onToolApproval handler available; denying Codex approval request",
-      );
-      return denyDecision;
-    }
-
-    let result: ToolApprovalResult;
-    try {
-      result = await options.onToolApproval(toolName, toolInput, { signal });
-    } catch (error) {
-      log.warn(
-        { toolName, error },
-        "onToolApproval threw; denying Codex approval request",
-      );
-      return denyDecision;
-    }
-
-    log.info(
-      { toolName, behavior: result.behavior },
-      "Resolved tool approval callback result",
+    const result = await this.requestToolApprovalResult(
+      options,
+      toolName,
+      toolInput,
+      signal,
+      requestId,
     );
 
-    return result.behavior === "allow" ? allowDecision : denyDecision;
+    if (result.behavior === "allow" && result.providerDecision !== "deny") {
+      if (
+        result.providerDecision === "approve_always" ||
+        (!result.providerDecision && result.approvalScope === "always")
+      ) {
+        return alwaysDecision ?? sessionDecision ?? allowDecision;
+      }
+      if (
+        result.providerDecision === "approve_accept_edits" ||
+        result.providerDecision === "approve_for_session"
+      ) {
+        return sessionDecision ?? allowDecision;
+      }
+      return allowDecision;
+    }
+    // An explicit user denial means native `decline`; `cancel` is reserved for
+    // transport abort/cancellation paths without a selected native decision.
+    if (result.providerDecision === "deny") return denyDecision;
+    return result.interrupt && cancelDecision !== undefined
+      ? cancelDecision
+      : denyDecision;
   }
 
   private convertNotificationToSDKMessages(
     notification: JsonRpcNotification,
     sessionId: string,
     usageByTurnId: Map<string, TokenUsageSnapshot>,
+    customToolContexts: Map<string, CodexToolCallContext> = new Map(),
+    commandOutputBuffers: Map<string, string> = new Map(),
+    emitProjectionDiagnostics = true,
+    emitUnknownCompatibilityMessage = false,
+    retryableErrorsByTurnId: Map<string, CanonicalCodexError> = new Map(),
+    workspaceRoot?: string,
   ): SDKMessage[] {
     switch (notification.method) {
+      case "thread/tokenUsage/updated": {
+        const usage = this.extractTurnUsage(notification.params);
+        if (!usage) return [];
+        return [
+          withCodexTimestamp({
+            type: "system",
+            subtype: "turn_usage",
+            session_id: sessionId,
+            turnId: usage.turnId,
+            codexTurnId: usage.turnId,
+            usage: {
+              input_tokens: usage.snapshot.inputTokens,
+              output_tokens: usage.snapshot.outputTokens,
+              cached_input_tokens: usage.snapshot.cachedInputTokens,
+              model_context_window: usage.snapshot.modelContextWindow,
+            },
+          } as SDKMessage),
+        ];
+      }
+
       case "turn/completed": {
         const params = this.asTurnCompletedNotification(notification.params);
         const turnId = params?.turn.id ?? null;
+        const turnStatus = params?.turn.status ?? "completed";
+        if (turnId) {
+          const keyPrefix = `${turnId}\0`;
+          for (const key of commandOutputBuffers.keys()) {
+            if (key.startsWith(keyPrefix)) commandOutputBuffers.delete(key);
+          }
+        }
         const usage = turnId ? usageByTurnId.get(turnId) : undefined;
         const message = withCodexTimestamp({
           type: "system",
           subtype: "turn_complete",
           session_id: sessionId,
+          turnId,
+          turnStatus,
           usage: usage
             ? {
                 input_tokens: usage.inputTokens,
@@ -1805,23 +4578,78 @@ export class CodexProvider implements AgentProvider {
           phase: "completed",
           sourceEvent: notification.method,
         });
+        if (turnStatus === "failed") {
+          const classifiedError = classifyCodexError(
+            params?.turn.error ?? notification.params,
+            turnId ? { correlationId: turnId } : {},
+          );
+          const retryCause = turnId
+            ? retryableErrorsByTurnId.get(turnId)
+            : undefined;
+          const retryExhausted =
+            classifiedError.category === "unknown" && retryCause !== undefined;
+          const codexError = retryExhausted ? retryCause : classifiedError;
+          if (turnId) retryableErrorsByTurnId.delete(turnId);
+          return [
+            {
+              type: "error",
+              session_id: sessionId,
+              error: codexError.publicMessage,
+              codexError,
+              ...(retryExhausted ? { codexRetryExhausted: true } : {}),
+              ...(turnId ? { turnId } : {}),
+            } as SDKMessage,
+            message,
+          ];
+        }
+        if (turnId) retryableErrorsByTurnId.delete(turnId);
         return [message];
       }
 
       case "error": {
         const params = this.asErrorNotification(notification.params);
-        const errorMessage = params?.error.message;
-        const message =
-          (typeof errorMessage === "string" && errorMessage) ||
-          (typeof (notification.params as { message?: unknown })?.message ===
-          "string"
-            ? (notification.params as { message: string }).message
-            : "Codex turn failed");
+        const codexError = classifyCodexError(
+          params ?? notification.params,
+          params?.turnId ? { correlationId: params.turnId } : {},
+        );
+
+        if (params?.willRetry) {
+          if (params.turnId) {
+            retryableErrorsByTurnId.set(params.turnId, codexError);
+          }
+          const warning = formatCodexRetryWarning(codexError);
+          return [
+            {
+              type: "system",
+              subtype: "warning",
+              session_id: sessionId,
+              content: warning,
+              warning,
+              codexError,
+              willRetry: true,
+              threadId: params.threadId,
+              turnId: params.turnId,
+            } as SDKMessage,
+          ];
+        }
+
+        const retryCause = params?.turnId
+          ? retryableErrorsByTurnId.get(params.turnId)
+          : undefined;
+        const retryExhausted =
+          codexError.category === "unknown" && retryCause !== undefined;
+        const effectiveError = retryExhausted ? retryCause : codexError;
+        if (params?.turnId) retryableErrorsByTurnId.delete(params.turnId);
 
         const errorEvent = {
           type: "error",
           session_id: sessionId,
-          error: message,
+          error: effectiveError.publicMessage,
+          codexError: effectiveError,
+          ...(retryExhausted ? { codexRetryExhausted: true } : {}),
+          willRetry: false,
+          threadId: params?.threadId,
+          turnId: params?.turnId,
         } as SDKMessage;
         logSdkCorrelationDebug(sessionId, errorEvent, {
           eventKind: "error",
@@ -1839,19 +4667,223 @@ export class CodexProvider implements AgentProvider {
             : this.asItemCompletedNotification(notification.params);
         if (!params) return [];
 
+        // A steer response only admits input to Codex's pending queue. The
+        // userMessage lifecycle is emitted when that input enters the turn's
+        // history. Echo its client identity to confirm the optimistic bubble.
+        if (params.item.type === "userMessage") {
+          const identity = codexUserMessageIdentity(params.item.clientId);
+          // Inputs from older clients without a correlation id remain owned
+          // by history hydration; do not add an unmatchable second prompt.
+          if (!identity) return [];
+          return [
+            withCodexTimestamp({
+              type: "user",
+              uuid: identity.clientUserMessageId,
+              session_id: sessionId,
+              ...identity,
+              turnId: params.turnId,
+              codexTurnId: params.turnId,
+              isOptimistic: false,
+              message: {
+                role: "user",
+                content: params.item.content.flatMap<AppContentBlock>(
+                  (input) => {
+                    switch (input.type) {
+                      case "text":
+                        return [{ type: "text", text: input.text }];
+                      case "image":
+                        return [{ type: "input_image", image_url: input.url }];
+                      case "localImage":
+                        return [{ type: "input_image", file_path: input.path }];
+                      default:
+                        return [];
+                    }
+                  },
+                ),
+              },
+            } as SDKMessage),
+          ];
+        }
+
         const normalized = this.normalizeThreadItem(params.item);
         if (!normalized) {
           return [];
         }
 
         const turnId = params.turnId;
+        if (notification.method === "item/completed") {
+          commandOutputBuffers.delete(`${turnId}\0${normalized.id}`);
+        }
 
         return this.convertItemToSDKMessages(
           normalized,
           sessionId,
           turnId,
           notification.method,
+          workspaceRoot,
+        ).map((message) => ({
+          ...message,
+          turnId,
+          codexTurnId: turnId,
+        }));
+      }
+
+      case "rawResponseItem/completed":
+        return this.convertRawResponseItemToSDKMessages(
+          notification.params,
+          sessionId,
+          customToolContexts,
         );
+
+      case "turn/plan/updated": {
+        const params = this.asTurnPlanUpdatedNotification(notification.params);
+        if (!params || params.threadId !== sessionId) return [];
+        const toolUseId = `codex-plan-${params.turnId}`;
+        return [
+          withCodexTimestamp({
+            type: "assistant",
+            session_id: sessionId,
+            uuid: toolUseId,
+            turnId: params.turnId,
+            codexTurnId: params.turnId,
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: toolUseId,
+                  name: "UpdatePlan",
+                  input: {
+                    ...(params.explanation
+                      ? { explanation: params.explanation }
+                      : {}),
+                    plan: params.plan.map((item) => ({
+                      step: item.step,
+                      status:
+                        item.status === "inProgress"
+                          ? "in_progress"
+                          : item.status,
+                    })),
+                  },
+                  status: "completed",
+                },
+              ],
+            },
+          } as unknown as SDKMessage),
+        ];
+      }
+
+      case "item/agentMessage/delta": {
+        const params = notification.params as
+          | {
+              threadId?: string;
+              turnId?: string;
+              itemId?: string;
+              delta?: string;
+            }
+          | undefined;
+        const itemId = this.getOptionalString(params?.itemId);
+        const turnId = this.getOptionalString(params?.turnId);
+        const delta =
+          typeof params?.delta === "string" ? params.delta : undefined;
+        if (!itemId || !turnId || !delta) return [];
+        // Keep the shared SDK stream shape used by live clients and Feishu.
+        // The authoritative final text still arrives on item/completed.
+        return [
+          withCodexTimestamp({
+            type: "stream_event",
+            session_id: sessionId,
+            uuid: `${itemId}-${turnId}`,
+            turnId,
+            codexTurnId: turnId,
+            event: {
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: delta },
+            },
+          } as unknown as SDKMessage),
+        ];
+      }
+
+      case "item/commandExecution/outputDelta": {
+        // Live command output streaming - mirror the Codex TUI's scrolling
+        // exec cell. The delta merges into the pending tool_use block via the
+        // shared block-merge path (same message uuid, same tool_use id).
+        const params = notification.params as
+          | {
+              threadId?: string;
+              turnId?: string;
+              itemId?: string;
+              delta?: string;
+            }
+          | undefined;
+        const itemId = this.getOptionalString(params?.itemId);
+        const turnId = this.getOptionalString(params?.turnId);
+        const delta =
+          typeof params?.delta === "string" ? params.delta : undefined;
+        if (!itemId || !turnId || !delta) return [];
+
+        const bufferKey = `${turnId}\0${itemId}`;
+        const combined = (commandOutputBuffers.get(bufferKey) ?? "") + delta;
+        // Keep the streaming preview bounded; the complete output arrives
+        // with the item/completed tool_result.
+        const bounded =
+          combined.length > CODEX_COMMAND_OUTPUT_PREVIEW_LIMIT
+            ? combined.slice(-CODEX_COMMAND_OUTPUT_PREVIEW_LIMIT)
+            : combined;
+        commandOutputBuffers.set(bufferKey, bounded);
+
+        return [
+          withCodexTimestamp({
+            type: "assistant",
+            session_id: sessionId,
+            uuid: `${itemId}-${turnId}`,
+            turnId,
+            codexTurnId: turnId,
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: itemId,
+                  partialOutput: bounded,
+                },
+              ],
+            },
+          } as unknown as SDKMessage),
+        ];
+      }
+
+      case "deprecationNotice":
+        // Protocol migration guidance is actionable by Yep maintainers, not
+        // by the end user. CodexAppServerClient already records a bounded,
+        // per-client diagnostic for it.
+        return [];
+
+      case "warning":
+      case "guardianWarning":
+      case "configWarning": {
+        const params = notification.params as
+          | {
+              message?: string;
+              summary?: string;
+              details?: string | null;
+            }
+          | undefined;
+        const summary =
+          this.getOptionalString(params?.message) ??
+          this.getOptionalString(params?.summary);
+        if (!summary) return [];
+        const details = this.getOptionalString(params?.details ?? undefined);
+        return [
+          withCodexTimestamp({
+            type: "system",
+            subtype: "warning",
+            session_id: sessionId,
+            content: details ? `${summary}\n${details}` : summary,
+            warningKind: notification.method,
+          } as SDKMessage),
+        ];
       }
 
       case "account/rateLimits/updated": {
@@ -1860,9 +4892,236 @@ export class CodexProvider implements AgentProvider {
         return [];
       }
 
-      default:
+      default: {
+        const classification = classifyCodexNotification(notification.method);
+        if (!classification.known) {
+          if (emitProjectionDiagnostics) {
+            log.warn(
+              { sessionId },
+              "Recorded unknown Codex notification for compatibility",
+            );
+          }
+          return emitUnknownCompatibilityMessage
+            ? [
+                withCodexTimestamp({
+                  type: "system",
+                  subtype: "warning",
+                  session_id: sessionId,
+                  content:
+                    "Codex sent a newer event; Yep preserved it but this version cannot display its details yet.",
+                  warningKind: "unknown_codex_notification",
+                } as SDKMessage),
+              ]
+            : [];
+        }
+        if (emitProjectionDiagnostics) {
+          log.debug(
+            {
+              sessionId,
+              method: notification.method,
+              domain: classification.domain,
+              disposition: classification.disposition,
+            },
+            "Canonical Codex notification recorded without a legacy UI projection",
+          );
+        }
         return [];
+      }
     }
+  }
+
+  private attachCanonicalCodexItem(
+    messages: SDKMessage[],
+    event: CodexEventEnvelope,
+    sessionId: string,
+  ): SDKMessage[] {
+    if (event.method !== "item/started" && event.method !== "item/completed") {
+      return messages;
+    }
+    const payload = asRecord(event.payload.data);
+    const item = asRecord(payload?.item);
+    if (!item || typeof item.type !== "string") return messages;
+
+    const lifecycle =
+      event.method === "item/completed"
+        ? ("completed" as const)
+        : ("started" as const);
+    const provenance = {
+      ...(typeof item.id === "string" ? { codexThreadItemId: item.id } : {}),
+      codexThreadItemLifecycle: lifecycle,
+      ...(event.threadId ? { codexThreadId: event.threadId } : {}),
+      ...(event.turnId ? { codexTurnId: event.turnId } : {}),
+      codexEventSequence: event.sequence,
+      ...(item.type === "reasoning" ? { codexRawReasoningAllowed: true } : {}),
+    };
+    const dedicatedThreadItem = isBoundedDedicatedCodexThreadItem(item)
+      ? publicCodexThreadItem(item)
+      : null;
+    if (messages.length === 0) {
+      if (!dedicatedThreadItem) return messages;
+      return [
+        withCodexTimestamp(
+          {
+            type: "system",
+            subtype: "codex_native_item",
+            session_id: sessionId,
+            uuid: `codex-native-${event.itemId ?? event.eventId}-${event.sequence}`,
+            ...provenance,
+            codexThreadItem: dedicatedThreadItem,
+          } as SDKMessage,
+          new Date(event.receivedAtMs).toISOString(),
+        ),
+      ];
+    }
+    return messages.map(
+      (message) =>
+        ({
+          ...message,
+          ...provenance,
+          ...(dedicatedThreadItem
+            ? { codexThreadItem: dedicatedThreadItem }
+            : {}),
+        }) as SDKMessage,
+    );
+  }
+
+  private convertRawResponseItemToSDKMessages(
+    params: unknown,
+    sessionId: string,
+    customToolContexts: Map<string, CodexToolCallContext>,
+  ): SDKMessage[] {
+    if (!params || typeof params !== "object") return [];
+    const record = params as Record<string, unknown>;
+    const turnId = this.getOptionalString(record.turnId);
+    if (!turnId || !record.item || typeof record.item !== "object") return [];
+
+    const item = record.item as Record<string, unknown>;
+    const type = this.getOptionalString(item.type);
+    const callId = this.getOptionalString(item.call_id);
+    if (!callId) return [];
+
+    const contextKey = `${sessionId}:${callId}`;
+    const observedAt = new Date().toISOString();
+    const itemId = this.getOptionalString(item.id) ?? callId;
+
+    if (type === "custom_tool_call") {
+      const rawToolName = this.getOptionalString(item.name);
+      if (!rawToolName) return [];
+      const namespace = this.getOptionalString(item.namespace) ?? undefined;
+      const toolName = canonicalizeCodexToolName(rawToolName, namespace);
+      const rawInput =
+        item.input !== undefined
+          ? item.input
+          : parseCodexToolArguments(
+              this.getOptionalString(item.arguments) ?? undefined,
+            );
+      const normalized =
+        deriveCodexWebRunInvocation(rawToolName, namespace, rawInput) ??
+        normalizeCodexToolInvocation(toolName, rawInput);
+      customToolContexts.set(contextKey, {
+        toolName: normalized.toolName,
+        input: normalized.input,
+        readShellInfo: normalized.readShellInfo,
+        writeShellInfo: normalized.writeShellInfo,
+      });
+
+      const content: Array<{
+        type: "tool_use";
+        id: string;
+        name: string;
+        input: unknown;
+        status?: "completed";
+      }> = [
+        {
+          type: "tool_use",
+          id: callId,
+          name: normalized.toolName,
+          input: normalized.input,
+        },
+      ];
+      const nestedPlan =
+        normalized.toolName === "CodexExec"
+          ? extractCodexExecUpdatePlan(normalized.input)
+          : null;
+      if (nestedPlan) {
+        content.push({
+          type: "tool_use",
+          id: `${callId}-update-plan`,
+          name: "UpdatePlan",
+          input: nestedPlan,
+          status: "completed",
+        });
+      }
+
+      const message = withCodexTimestamp(
+        {
+          type: "assistant",
+          session_id: sessionId,
+          uuid: `${itemId}-${turnId}-custom-call`,
+          turnId,
+          codexTurnId: turnId,
+          message: {
+            role: "assistant",
+            content,
+          },
+          codexToolName: rawToolName,
+          ...(namespace ? { codexToolNamespace: namespace } : {}),
+        } as SDKMessage,
+        observedAt,
+      );
+      logSdkCorrelationDebug(sessionId, message, {
+        eventKind: "custom_tool_call",
+        turnId,
+        itemId,
+        callId,
+        phase: "completed",
+        sourceEvent: "rawResponseItem/completed",
+      });
+      return [message];
+    }
+
+    if (type === "custom_tool_call_output") {
+      const context = customToolContexts.get(contextKey);
+      const normalized = normalizeCodexToolOutputWithContext(
+        item.output,
+        context,
+      );
+      customToolContexts.delete(contextKey);
+      const toolResult = {
+        type: "tool_result",
+        tool_use_id: callId,
+        content: normalized.content,
+        ...(normalized.isError ? { is_error: true } : {}),
+      };
+      const message = withCodexTimestamp(
+        {
+          type: "user",
+          session_id: sessionId,
+          uuid: `${itemId}-${turnId}-custom-result`,
+          turnId,
+          codexTurnId: turnId,
+          message: {
+            role: "user",
+            content: [toolResult],
+          },
+          ...(normalized.structured !== undefined
+            ? { toolUseResult: normalized.structured }
+            : {}),
+        } as SDKMessage,
+        observedAt,
+      );
+      logSdkCorrelationDebug(sessionId, message, {
+        eventKind: "custom_tool_result",
+        turnId,
+        itemId,
+        callId,
+        phase: "completed",
+        sourceEvent: "rawResponseItem/completed",
+      });
+      return [message];
+    }
+
+    return [];
   }
 
   private normalizeThreadItem(
@@ -1915,52 +5174,11 @@ export class CodexProvider implements AgentProvider {
       }
 
       case "file_change": {
-        const changesRaw = Array.isArray(itemRecord.changes)
-          ? itemRecord.changes
-          : [];
-        const changes: NormalizedFileChange[] = [];
-        for (const change of changesRaw) {
-          if (!change || typeof change !== "object") continue;
-          const record = change as Record<string, unknown>;
-          const path = this.getOptionalString(record.path);
-          if (!path) continue;
-
-          let kind: "add" | "delete" | "update" = "update";
-          const rawKind = record.kind;
-          if (typeof rawKind === "string") {
-            if (
-              rawKind === "add" ||
-              rawKind === "delete" ||
-              rawKind === "update"
-            ) {
-              kind = rawKind;
-            }
-          } else if (rawKind && typeof rawKind === "object") {
-            const rawType = this.getOptionalString(
-              (rawKind as Record<string, unknown>).type,
-            );
-            if (
-              rawType === "add" ||
-              rawType === "delete" ||
-              rawType === "update"
-            ) {
-              kind = rawType;
-            }
-          }
-
-          const diff = this.getOptionalString(record.diff) ?? undefined;
-          changes.push({
-            path,
-            kind,
-            ...(diff ? { diff } : {}),
-          });
-        }
-
         return {
           id,
           type: "file_change",
-          changes,
-          status: this.normalizeStatus(itemRecord.status),
+          changes: normalizeCodexFileChanges(itemRecord.changes),
+          status: normalizeCodexFileChangeStatus(itemRecord.status),
         };
       }
 
@@ -2032,6 +5250,7 @@ export class CodexProvider implements AgentProvider {
         const image = normalizeCodexImageGenerationRecord(itemRecord, {
           defaultStatus: "completed",
         });
+        const publicUrl = publicCodexImageUrl(image.url);
 
         return {
           id,
@@ -2040,9 +5259,12 @@ export class CodexProvider implements AgentProvider {
           ...(image.revisedPrompt
             ? { revised_prompt: image.revisedPrompt }
             : {}),
-          ...(image.result ? { result: image.result } : {}),
-          ...(image.path ? { path: image.path } : {}),
-          ...(image.url ? { url: image.url } : {}),
+          ...(image.result && !isLocalImagePathValue(image.result)
+            ? { result: image.result }
+            : {}),
+          // Provider-local paths are materialization hints, not client
+          // capabilities. Only the managed artifact manifest is public.
+          ...(publicUrl ? { url: publicUrl } : {}),
         };
       }
 
@@ -2101,6 +5323,37 @@ export class CodexProvider implements AgentProvider {
       return null;
     }
     return params as TurnCompletedNotification;
+  }
+
+  private asTurnPlanUpdatedNotification(
+    params: unknown,
+  ): TurnPlanUpdatedNotificationParams | null {
+    if (!params || typeof params !== "object") return null;
+    const record = params as Record<string, unknown>;
+    if (
+      typeof record.threadId !== "string" ||
+      typeof record.turnId !== "string" ||
+      !Array.isArray(record.plan)
+    ) {
+      return null;
+    }
+
+    const plan: TurnPlanUpdatedNotificationParams["plan"] = [];
+    for (const item of record.plan) {
+      if (!item || typeof item !== "object") return null;
+      const step = (item as Record<string, unknown>).step;
+      const status = (item as Record<string, unknown>).status;
+      if (typeof step !== "string" || typeof status !== "string") return null;
+      plan.push({ step, status });
+    }
+
+    return {
+      threadId: record.threadId,
+      turnId: record.turnId,
+      explanation:
+        typeof record.explanation === "string" ? record.explanation : null,
+      plan,
+    };
   }
 
   private asErrorNotification(params: unknown): CodexErrorNotification | null {
@@ -2231,6 +5484,7 @@ export class CodexProvider implements AgentProvider {
     sessionId: string,
     turnId: string,
     sourceEvent: "item/started" | "item/completed",
+    workspaceRoot?: string,
   ): SDKMessage[] {
     const isComplete = sourceEvent === "item/completed";
     const observedAt = new Date().toISOString();
@@ -2244,6 +5498,7 @@ export class CodexProvider implements AgentProvider {
             type: "assistant",
             session_id: sessionId,
             uuid,
+            codexCorrelationKey: `codex:${turnId}:reasoning:${item.id}`,
             message: {
               role: "assistant",
               content: [
@@ -2272,6 +5527,7 @@ export class CodexProvider implements AgentProvider {
             type: "assistant",
             session_id: sessionId,
             uuid,
+            codexCorrelationKey: `codex:${turnId}:agent-message:${item.id}`,
             ...(item.phase ? { codexMessagePhase: item.phase } : {}),
             message: {
               role: "assistant",
@@ -2316,6 +5572,7 @@ export class CodexProvider implements AgentProvider {
                   id: item.id,
                   name: normalizedInvocation.toolName,
                   input: normalizedInvocation.input,
+                  status: item.status,
                 },
               ],
             },
@@ -2388,16 +5645,10 @@ export class CodexProvider implements AgentProvider {
       }
 
       case "file_change": {
-        const changesSummary = item.changes
-          .map((c) => `${c.kind}: ${c.path}`)
-          .join("\n");
-        const editInput: Record<string, unknown> = {
-          changes: item.changes,
-        };
-        const singlePath = item.changes[0]?.path;
-        if (singlePath && item.changes.length === 1) {
-          editInput.file_path = singlePath;
-        }
+        const publicChanges = publicCodexFileChanges(item.changes, {
+          workspaceRoot,
+        });
+        const editInput = buildCodexEditInput(publicChanges);
 
         const toolUseMessage = withCodexTimestamp(
           {
@@ -2442,12 +5693,13 @@ export class CodexProvider implements AgentProvider {
                   {
                     type: "tool_result",
                     tool_use_id: item.id,
-                    content:
-                      item.status === "completed"
-                        ? `File changes applied:\n${changesSummary}`
-                        : item.status === "declined"
-                          ? `File changes declined:\n${changesSummary}`
-                          : `File changes failed:\n${changesSummary}`,
+                    content: formatCodexFileChangeResult(
+                      publicChanges,
+                      item.status,
+                    ),
+                    ...(isCodexFileChangeError(item.status)
+                      ? { is_error: true }
+                      : {}),
                   },
                 ],
               },
@@ -2485,6 +5737,7 @@ export class CodexProvider implements AgentProvider {
                   id: item.id,
                   name: `${item.server}:${item.tool}`,
                   input: item.arguments,
+                  status: item.status,
                 },
               ],
             },
@@ -2518,6 +5771,7 @@ export class CodexProvider implements AgentProvider {
                       item.status === "completed"
                         ? JSON.stringify(item.result)
                         : item.error?.message || "MCP tool call failed",
+                    ...(item.status === "completed" ? {} : { is_error: true }),
                   },
                 ],
               },
@@ -2631,6 +5885,7 @@ export class CodexProvider implements AgentProvider {
 
       case "image_view": {
         // Represent as a ViewImage tool_use + tool_result pair
+        const publicPath = publicCodexFilePath(item.path);
         const toolUseMessage = withCodexTimestamp(
           {
             type: "assistant",
@@ -2643,7 +5898,7 @@ export class CodexProvider implements AgentProvider {
                   type: "tool_use",
                   id: item.id,
                   name: "ViewImage",
-                  input: { path: item.path },
+                  input: { path: publicPath },
                 },
               ],
             },
@@ -2671,7 +5926,7 @@ export class CodexProvider implements AgentProvider {
                   {
                     type: "tool_result",
                     tool_use_id: item.id,
-                    content: `Viewed image: ${item.path}`,
+                    content: `Viewed image: ${publicPath}`,
                   },
                 ],
               },
@@ -2803,56 +6058,10 @@ export class CodexProvider implements AgentProvider {
         });
         return [message];
       }
-
-      default:
-        return [];
-    }
-  }
-
-  /**
-   * Extract text content from a user message.
-   */
-  private extractTextFromMessage(message: unknown): string {
-    if (!message || typeof message !== "object") {
-      return "";
     }
 
-    // Handle UserMessage format
-    const userMsg = message as UserMessage;
-    if (typeof userMsg.text === "string") {
-      return userMsg.text;
-    }
-
-    // Handle SDK message format
-    const sdkMsg = message as {
-      message?: { content?: string | unknown[] };
-    };
-    const content = sdkMsg.message?.content;
-
-    if (typeof content === "string") {
-      return content;
-    }
-
-    if (Array.isArray(content)) {
-      return content
-        .map((block: unknown) => {
-          if (typeof block === "string") return block;
-          if (
-            typeof block === "object" &&
-            block !== null &&
-            "type" in block &&
-            (block as { type: string }).type === "text" &&
-            "text" in block
-          ) {
-            return (block as { text: string }).text;
-          }
-          return "";
-        })
-        .filter(Boolean)
-        .join("\n");
-    }
-
-    return "";
+    const exhaustiveItem: never = item;
+    return exhaustiveItem;
   }
 
   private getOptionalString(value: unknown): string | null {
@@ -2870,19 +6079,436 @@ export class CodexProvider implements AgentProvider {
   }
 }
 
+function codexServerRequestId(id: JsonRpcId): string {
+  return `codex:${typeof id}:${String(id)}`;
+}
+
+function getProviderApprovalDecision(
+  result: ToolApprovalResult,
+): ProviderApprovalDecision {
+  if (result.behavior === "deny") return "deny";
+  if (result.providerDecision) return result.providerDecision;
+  return result.approvalScope === "always" ? "approve_always" : "approve";
+}
+
+function isNoRolloutFoundError(
+  error: unknown,
+  expectedThreadId: string,
+): boolean {
+  return (
+    error instanceof CodexJsonRpcError &&
+    error.code === -32600 &&
+    error.message === `no rollout found for thread id ${expectedThreadId}`
+  );
+}
+
+function normalizeAutoResolutionMs(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return Math.min(Math.floor(value), 2_147_483_647);
+}
+
+function isCommandApprovalDecision(
+  value: unknown,
+): value is CommandExecutionApprovalDecision {
+  if (
+    value === "accept" ||
+    value === "acceptForSession" ||
+    value === "decline" ||
+    value === "cancel"
+  ) {
+    return true;
+  }
+  const decision = asRecord(value);
+  return Boolean(
+    decision &&
+      (asRecord(decision.acceptWithExecpolicyAmendment) ||
+        asRecord(decision.applyNetworkPolicyAmendment)),
+  );
+}
+
+function isPolicyAmendmentCommandApprovalDecision(
+  decision: CommandExecutionApprovalDecision,
+): boolean {
+  if (typeof decision !== "object") return false;
+  if ("acceptWithExecpolicyAmendment" in decision) return true;
+  const amendment = asRecord(decision.applyNetworkPolicyAmendment);
+  const networkPolicy = asRecord(amendment?.network_policy_amendment);
+  return networkPolicy?.action === "allow";
+}
+
+/** Mirrors Codex TUI's stable-protocol fallback when availableDecisions is absent. */
+function getEffectiveCommandApprovalDecisions(
+  params: Record<string, unknown>,
+): CommandExecutionApprovalDecision[] {
+  if (Array.isArray(params.availableDecisions)) {
+    return params.availableDecisions.filter(isCommandApprovalDecision);
+  }
+
+  if (params.networkApprovalContext != null) {
+    const decisions: CommandExecutionApprovalDecision[] = [
+      "accept",
+      "acceptForSession",
+    ];
+    const amendment = Array.isArray(params.proposedNetworkPolicyAmendments)
+      ? params.proposedNetworkPolicyAmendments.find(
+          (candidate) => asRecord(candidate)?.action === "allow",
+        )
+      : undefined;
+    if (amendment) {
+      decisions.push({
+        applyNetworkPolicyAmendment: {
+          network_policy_amendment: amendment as {
+            host: string;
+            action: "allow" | "deny";
+          },
+        },
+      });
+    }
+    decisions.push("cancel");
+    return decisions;
+  }
+
+  if (params.additionalPermissions != null) {
+    return ["accept", "cancel"];
+  }
+
+  const decisions: CommandExecutionApprovalDecision[] = ["accept"];
+  if (Array.isArray(params.proposedExecpolicyAmendment)) {
+    decisions.push({
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: params.proposedExecpolicyAmendment.filter(
+          (part): part is string => typeof part === "string",
+        ),
+      },
+    });
+  }
+  decisions.push("cancel");
+  return decisions;
+}
+
+function buildCodexRetryWarning(
+  update: AppServerRetryUpdate,
+  sessionId: string | undefined,
+  canonicalEvent: CodexEventEnvelope | undefined,
+): SDKMessage {
+  const status = update.retryStatus;
+  const content =
+    status.state === "queued"
+      ? `Codex is busy. The request is queued for bounded attempt ${status.nextAttempt}/${status.maxAttempts}.`
+      : `Codex is busy. Retrying with bounded attempt ${status.nextAttempt}/${status.maxAttempts}.`;
+  return withCodexTimestamp({
+    type: "system",
+    subtype: "warning",
+    uuid: `codex-retry-${String(update.requestId)}-${status.attempt}`,
+    ...(sessionId ? { session_id: sessionId } : {}),
+    content,
+    warning: content,
+    warningKind: "codex_app_server_overloaded",
+    willRetry: true,
+    codexRetryStatus: { ...status },
+    ...(canonicalEvent
+      ? {
+          codexEventSequence: canonicalEvent.sequence,
+          codexEventId: canonicalEvent.eventId,
+        }
+      : {}),
+  } as SDKMessage);
+}
+
+export function buildCodexUserInput(
+  message: {
+    attachments?: Array<{ path: string; mimeType: string }>;
+    codexInputs?: CodexStructuredUserInput[];
+    message?: { content?: unknown };
+  },
+  text: string,
+): CodexUserInput[] {
+  const input: CodexUserInput[] = [{ type: "text", text, text_elements: [] }];
+
+  const content = message.message?.content;
+  if (Array.isArray(content)) {
+    for (const rawBlock of content) {
+      const block = asRecord(rawBlock);
+      const source = asRecord(block?.source);
+      if (
+        block?.type !== "image" ||
+        source?.type !== "base64" ||
+        typeof source.data !== "string" ||
+        typeof source.media_type !== "string"
+      ) {
+        continue;
+      }
+      input.push({
+        type: "image",
+        url: `data:${source.media_type};base64,${source.data}`,
+      });
+    }
+  }
+
+  for (const attachment of message.attachments ?? []) {
+    if (!isAbsolute(attachment.path)) continue;
+    const mimeType = attachment.mimeType.toLowerCase();
+    if (mimeType.startsWith("image/")) {
+      input.push({ type: "localImage", path: attachment.path });
+    } else if (mimeType.startsWith("audio/")) {
+      input.push({ type: "localAudio", path: attachment.path });
+    }
+  }
+
+  for (const structuredInput of message.codexInputs ?? []) {
+    if (!structuredInput.name || !structuredInput.path) continue;
+    input.push({ ...structuredInput });
+  }
+
+  return input;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function isBoundedDedicatedCodexThreadItem(
+  item: Record<string, unknown>,
+): boolean {
+  if (
+    item.type !== "plan" &&
+    item.type !== "collabAgentToolCall" &&
+    item.type !== "subAgentActivity"
+  ) {
+    return false;
+  }
+  const pending: unknown[] = [item];
+  const seen = new WeakSet<object>();
+  let size = 0;
+  while (pending.length > 0 && size <= 64 * 1024) {
+    const value = pending.pop();
+    if (typeof value === "string") size += value.length;
+    else if (Array.isArray(value)) {
+      size += value.length * 8;
+      for (const entry of value) pending.push(entry);
+    } else if (value && typeof value === "object") {
+      if (seen.has(value)) continue;
+      seen.add(value);
+      const entries = Object.entries(value);
+      size += entries.length * 16;
+      for (const [key, entry] of entries) {
+        size += key.length;
+        pending.push(entry);
+      }
+    } else {
+      size += 8;
+    }
+  }
+  return size <= 64 * 1024;
+}
+
+export function publicCodexThreadItem(
+  item: Record<string, unknown>,
+): Record<string, unknown> {
+  const clone = structuredClone(item);
+  if (clone.type === "fileChange" || clone.type === "file_change") {
+    clone.changes = publicCodexFileChanges(clone.changes);
+  }
+  if (isCodexImageGenerationRecord(clone)) {
+    Reflect.deleteProperty(clone, "result");
+  }
+  return clone;
+}
+
+function isLocalImagePathValue(value: string): boolean {
+  const trimmed = value.trim();
+  return (
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("file://") ||
+    /^[A-Za-z]:[\\/]/.test(trimmed)
+  );
+}
+
+export function publicCodexImageUrl(
+  value: string | undefined,
+): string | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    if (
+      (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+      parsed.username ||
+      parsed.password
+    ) {
+      return undefined;
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The canonical envelope proves that this is the completed item for the
+ * active thread/turn. Materialization still uses the matching live payload so
+ * a valid inline image is not destroyed by bounded journal serialization.
+ */
+function selectCanonicalGeneratedArtifactSourceItem(
+  notification: JsonRpcNotification,
+  event: CodexEventEnvelope,
+): Record<string, unknown> | null {
+  if (
+    notification.method !== "item/completed" ||
+    event.method !== "item/completed" ||
+    event.source.replay === true ||
+    !event.threadId ||
+    !event.turnId
+  ) {
+    return null;
+  }
+  const livePayload = asRecord(notification.params);
+  const canonicalPayload = asRecord(event.payload.data);
+  const liveItem = asRecord(livePayload?.item);
+  const canonicalItem = asRecord(canonicalPayload?.item);
+  if (
+    !liveItem ||
+    !canonicalItem ||
+    livePayload?.threadId !== event.threadId ||
+    livePayload?.turnId !== event.turnId ||
+    liveItem.id !== canonicalItem.id ||
+    (event.itemId !== undefined && liveItem.id !== event.itemId) ||
+    liveItem.type !== canonicalItem.type ||
+    liveItem.status !== "completed" ||
+    canonicalItem.status !== "completed" ||
+    (liveItem.type !== "imageGeneration" && liveItem.type !== "fileChange")
+  ) {
+    return null;
+  }
+  return liveItem;
+}
+
+function normalizeCodexBridgeExecutionConfig(
+  config: CodexBridgeExecutionConfig | null | undefined,
+): CodexBridgeExecutionConfig | undefined {
+  if (!config || config.mode === "disabled") return undefined;
+  const controlUrl = config.controlUrl.trim().replace(/\/+$/, "");
+  if (!controlUrl) return undefined;
+  return {
+    ...config,
+    controlUrl,
+    ...(config.authToken?.trim()
+      ? { authToken: config.authToken.trim() }
+      : { authToken: undefined }),
+  };
+}
+
+function normalizeBridgeHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+function isWildcardBridgeHostname(hostname: string): boolean {
+  const normalized = normalizeBridgeHostname(hostname);
+  return normalized === "0.0.0.0" || normalized === "::";
+}
+
+function isLoopbackBridgeHostname(hostname: string): boolean {
+  const normalized = normalizeBridgeHostname(hostname);
+  return (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    /^127(?:\.\d{1,3}){3}$/.test(normalized)
+  );
+}
+
+function isSameTrustedBridgeHost(left: string, right: string): boolean {
+  const normalizedLeft = normalizeBridgeHostname(left);
+  const normalizedRight = normalizeBridgeHostname(right);
+  return (
+    normalizedLeft === normalizedRight ||
+    (isLoopbackBridgeHostname(normalizedLeft) &&
+      isLoopbackBridgeHostname(normalizedRight))
+  );
+}
+
+function findLastInProgressCodexTurnId(
+  turns: ThreadResumeResponse["thread"]["turns"],
+): string | undefined {
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (turn?.status === "inProgress") return turn.id;
+  }
+  return undefined;
+}
+
+/**
+ * Parse a positive-integer env override, ignoring unset or malformed values.
+ */
+function parsePositiveIntegerEnv(
+  value: string | undefined,
+): number | undefined {
+  if (!value?.trim()) return undefined;
+  const parsed = Number(value.trim());
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 /**
  * Default Codex provider instance.
- *
- * `YEP_CODEX_MODEL_PROVIDER` lets operators pin the model provider sent to the
- * codex app-server (e.g. "openai", "ccvibe"). When unset, yep-anywhere omits
- * the field so codex uses its own configured default provider.
- * `YEP_CODEX_PATH` / `CODEX_CLI_PATH` (honored in findCodexCliPath) can point
- * at a specific codex binary (e.g. the ChatGPT-app-bundled one).
  */
 export const codexProvider = new CodexProvider({
-  modelProvider: process.env.YEP_CODEX_MODEL_PROVIDER?.trim() || undefined,
-  codexPath:
-    process.env.YEP_CODEX_PATH?.trim() ||
-    process.env.CODEX_CLI_PATH?.trim() ||
-    undefined,
+  eventSpine: {
+    // The process-wide provider is the production path. Keep ad-hoc provider
+    // instances in-memory for tests/embedders, while making the real path
+    // restart-safe without requiring an opt-in environment variable.
+    durableStorePath:
+      process.env.YEP_CODEX_EVENT_STORE_PATH?.trim() ||
+      join(getDataDir(), "codex-events", "events.jsonl"),
+    storeRotation: {
+      maxBytes: parsePositiveIntegerEnv(
+        process.env.YEP_CODEX_EVENT_STORE_ROTATE_BYTES,
+      ),
+      keepSegments: parsePositiveIntegerEnv(
+        process.env.YEP_CODEX_EVENT_STORE_KEEP_SEGMENTS,
+      ),
+    },
+    onStoreRotate: ({ from, to, pruned, prunedSummary }) => {
+      log.info(
+        {
+          event: "codex_event_store_rotated",
+          from,
+          to,
+          prunedCount: pruned.length,
+          pruned,
+          // Pruning permanently deletes the earliest events of every session the
+          // segment held. Naming them is the difference between a recoverable
+          // question ("was this session's canonical history cut?") and an
+          // unanswerable one.
+          prunedSessions: prunedSummary.map((segment) => ({
+            path: segment.path,
+            known: segment.known,
+            eventCount: segment.eventCount,
+            sessionCount: segment.sessions.length,
+            topSessions: segment.sessions.slice(0, 10),
+          })),
+        },
+        pruned.length > 0
+          ? "Rotated canonical Codex event journal and pruned closed segments"
+          : "Rotated canonical Codex event journal",
+      );
+    },
+    onStoreJournalGaps: ({ gaps, sessionCount, journalFiles }) => {
+      log.warn(
+        {
+          event: "codex_event_store_journal_truncated",
+          sessionCount,
+          journalFiles,
+          truncatedSessionCount: gaps.length,
+          missingLeadingEventsTotal: gaps.reduce(
+            (sum, gap) => sum + gap.missingLeadingEvents,
+            0,
+          ),
+          topGaps: gaps.slice(0, 10),
+        },
+        "Canonical Codex journal no longer contains the start of some sessions; their projections are incomplete",
+      );
+    },
+  },
 });

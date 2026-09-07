@@ -4,8 +4,12 @@
 
 import type {
   AgentActivity,
+  ContextCompactEvent,
+  ContextCumulativeUsage,
   ContextUsage,
   PendingInputType,
+  SessionLastTurnStatus,
+  SessionRetryStatus,
   UrlProjectId,
 } from "@yep-anywhere/shared";
 import type { SessionOwnership, SessionSummary } from "../supervisor/types.js";
@@ -13,7 +17,13 @@ import type { SessionOwnership, SessionSummary } from "../supervisor/types.js";
 export type FileChangeType = "create" | "modify" | "delete";
 
 /** Provider that owns the watched directory */
-export type WatchProvider = "claude" | "gemini" | "codex" | "project";
+export type WatchProvider =
+  | "claude"
+  | "gemini"
+  | "codex"
+  | "pi"
+  | "kimi"
+  | "zcode";
 
 export interface FileChangeEvent {
   type: "file-change";
@@ -39,12 +49,24 @@ export interface SessionStatusEvent {
   /** Base64url-encoded project path (UrlProjectId format) */
   projectId: UrlProjectId;
   ownership: SessionOwnership;
+  /** Session-specific activity when the tracker can prove it. */
+  activity?: AgentActivity;
   timestamp: string;
 }
 
 export interface SessionCreatedEvent {
   type: "session-created";
   session: SessionSummary;
+  timestamp: string;
+}
+
+/** Event emitted when a provider replaces a temporary session ID. */
+export interface SessionIdChangedEvent {
+  type: "session-id-changed";
+  oldSessionId: string;
+  newSessionId: string;
+  projectId: UrlProjectId;
+  executor?: string;
   timestamp: string;
 }
 
@@ -80,6 +102,12 @@ export interface ProcessStateEvent {
   activity: AgentActivity;
   /** Type of pending input (only set when activity is "waiting-input") */
   pendingInputType?: PendingInputType;
+  /** Terminal status of the most recent turn (bridge-reported). */
+  lastTurnStatus?: SessionLastTurnStatus;
+  /** Most recent provider error message, if the last turn failed. */
+  lastErrorMessage?: string;
+  /** Present while the provider is retrying a failed request. */
+  retryStatus?: SessionRetryStatus;
   timestamp: string;
 }
 
@@ -129,10 +157,11 @@ export interface WorkerActivityEvent {
   queueLength: number;
   /** True if any worker is running or waiting-input (unsafe to restart) */
   hasActiveWork: boolean;
+  runtimeMode?: "embedded" | "external";
   timestamp: string;
 }
 
-/** Event emitted when session metadata changes (title, AI title, archived, starred) */
+/** Event emitted when session metadata changes (title, AI title, archived, pinned) */
 export interface SessionMetadataChangedEvent {
   type: "session-metadata-changed";
   sessionId: string;
@@ -144,10 +173,10 @@ export interface SessionMetadataChangedEvent {
   aiTitle?: string;
   /** Updated archived status (if changed) */
   archived?: boolean;
-  /** Updated starred status (if changed) */
+  /** Updated pin status (if changed) */
+  pinned?: boolean;
+  /** @deprecated Compatibility alias for older clients. */
   starred?: boolean;
-  /** Preset model for next session start (if changed) */
-  model?: string;
   timestamp: string;
 }
 
@@ -168,6 +197,8 @@ export interface SessionUpdatedEvent {
   type: "session-updated";
   sessionId: string;
   projectId: UrlProjectId;
+  /** Optional producer identity for diagnostics and downstream dedup logs. */
+  trigger?: "codex-plan-updated" | "zcode-db-reconcile";
   /** New title (derived from first user message) */
   title?: string | null;
   /** New message count */
@@ -176,12 +207,22 @@ export interface SessionUpdatedEvent {
   updatedAt?: string;
   /** Context window usage from the last assistant message */
   contextUsage?: ContextUsage;
+  /** Cumulative token spend across the whole session, when available. */
+  cumulativeUsage?: ContextCumulativeUsage;
+  /** Number of context compactions recorded in the active session history. */
+  compactCount?: number;
+  /** Best-effort details for each recorded context compaction. */
+  compactEvents?: ContextCompactEvent[];
   /** Resolved model name (e.g., "claude-sonnet-4-5-20250929") */
   model?: string;
-  /** Provider-specific reasoning effort (e.g. "xhigh") */
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
   reasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g. "fast") */
   serviceTier?: string;
+  /** Terminal/interrupted status derived from the newest persisted turn. */
+  lastTurnStatus?: SessionLastTurnStatus | null;
+  /** Provider error associated with the newest failed turn. */
+  lastErrorMessage?: string | null;
   timestamp: string;
 }
 
@@ -229,6 +270,7 @@ export type BusEvent =
   | FileChangeEvent
   | SessionStatusEvent
   | SessionCreatedEvent
+  | SessionIdChangedEvent
   | SourceChangeEvent
   | BackendReloadedEvent
   | SessionSeenEvent

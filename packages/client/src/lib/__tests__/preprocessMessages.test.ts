@@ -2,78 +2,32 @@ import { describe, expect, it } from "vitest";
 import type { Message } from "../../types";
 import { preprocessMessages } from "../preprocessMessages";
 
-describe("preprocessMessages", () => {
-  it.each(["isSynthetic", "isMeta", "isCompactSummary"])(
-    "does not render Claude user entries marked %s as user prompts",
-    (metadataFlag) => {
-      const messages: Message[] = [
-        {
-          id: "internal-message",
-          type: "user",
-          message: { role: "user", content: "Internal Claude context" },
-          [metadataFlag]: true,
-        },
-        {
-          id: "actual-message",
-          type: "user",
-          message: { role: "user", content: "Actual user request" },
-        },
-      ];
-
-      const items = preprocessMessages(messages);
-
-      expect(items).toHaveLength(1);
-      expect(items[0]).toMatchObject({
-        type: "user_prompt",
-        content: "Actual user request",
-      });
+function codexWaitPair(
+  id: string,
+  timestamp: number,
+  output: string,
+  input: Record<string, unknown> = {
+    cell_id: "1",
+    yield_time_ms: 10000,
+  },
+): Message[] {
+  return [
+    {
+      id: `${id}-use`,
+      role: "assistant",
+      content: [{ type: "tool_use", id, name: "wait", input }],
+      timestamp: `2024-01-01T00:00:${String(timestamp).padStart(2, "0")}Z`,
     },
-  );
+    {
+      id: `${id}-result`,
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: id, content: output }],
+      timestamp: `2024-01-01T00:00:${String(timestamp + 1).padStart(2, "0")}Z`,
+    },
+  ];
+}
 
-  it("still pairs synthetic Claude tool-result messages with their tool calls", () => {
-    const messages: Message[] = [
-      {
-        id: "assistant-message",
-        type: "assistant",
-        message: {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_use",
-              id: "tool-1",
-              name: "Read",
-              input: { file_path: "test.ts" },
-            },
-          ],
-        },
-      },
-      {
-        id: "tool-result-message",
-        type: "user",
-        isSynthetic: true,
-        message: {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "tool-1",
-              content: "file contents",
-            },
-          ],
-        },
-      },
-    ];
-
-    const items = preprocessMessages(messages);
-
-    expect(items).toHaveLength(1);
-    expect(items[0]).toMatchObject({
-      type: "tool_call",
-      id: "tool-1",
-      status: "complete",
-    });
-  });
-
+describe("preprocessMessages", () => {
   it("pairs tool_use with tool_result", () => {
     const messages: Message[] = [
       {
@@ -113,6 +67,476 @@ describe("preprocessMessages", () => {
       status: "complete",
       toolResult: { content: "file contents", isError: false },
     });
+  });
+
+  it("collapses adjacent silent Codex wait polls but preserves progress text", () => {
+    const running =
+      "Script running with cell ID 1\nWall time 10.0 seconds\nOutput:\n";
+    const terminated = "Script terminated\nWall time 0.0 seconds\nOutput:\n";
+    const messages: Message[] = [
+      ...codexWaitPair("wait-1", 1, running),
+      ...codexWaitPair("wait-2", 3, running),
+      ...codexWaitPair("wait-3", 5, running),
+      {
+        id: "progress",
+        type: "assistant",
+        content: "I am checking the official integration status.",
+        codexMessagePhase: "commentary",
+        timestamp: "2024-01-01T00:00:07Z",
+      },
+      ...codexWaitPair("wait-4", 8, running),
+      ...codexWaitPair("wait-5", 10, terminated, {
+        cell_id: "1",
+        yield_time_ms: 1000,
+        terminate: true,
+      }),
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(3);
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      id: "wait-1",
+      toolName: "wait",
+      toolInput: {
+        cell_id: "1",
+        poll_count: 3,
+        total_wall_time_seconds: 30,
+      },
+    });
+    expect(items[1]).toMatchObject({
+      type: "text",
+      phase: "commentary",
+      text: "I am checking the official integration status.",
+    });
+    expect(items[2]).toMatchObject({
+      type: "tool_call",
+      id: "wait-4",
+      toolInput: {
+        cell_id: "1",
+        terminate: true,
+        poll_count: 2,
+        total_wall_time_seconds: 10,
+      },
+    });
+  });
+
+  it("does not collapse wait calls that returned useful output", () => {
+    const messages: Message[] = [
+      ...codexWaitPair(
+        "wait-output",
+        1,
+        "Script running with cell ID 1\nWall time 10.0 seconds\nOutput:\nfirst result",
+      ),
+      ...codexWaitPair(
+        "wait-silent",
+        3,
+        "Script running with cell ID 1\nWall time 10.0 seconds\nOutput:\n",
+      ),
+    ];
+
+    const items = preprocessMessages(messages);
+    expect(items).toHaveLength(2);
+    expect(items.map((item) => item.type === "tool_call" && item.id)).toEqual([
+      "wait-output",
+      "wait-silent",
+    ]);
+  });
+
+  it("pairs tool_result blocks from the same assistant message", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-1",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "call_1",
+            name: "websearch",
+            input: { query: "ST4000VN006 ST4000VN008" },
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "call_1",
+            content:
+              "Found comparison notes at https://www.seagate.com/products/nas-drives/ironwolf-hard-drive/",
+            is_error: false,
+          },
+        ],
+        timestamp: "2024-01-01T00:00:00Z",
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      id: "call_1",
+      toolName: "websearch",
+      status: "complete",
+      toolResult: {
+        content:
+          "Found comparison notes at https://www.seagate.com/products/nas-drives/ironwolf-hard-drive/",
+        isError: false,
+      },
+    });
+  });
+
+  it("normalizes Kimi native file-tool fields and string results", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-kimi-write",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "kimi-write",
+            name: "Write",
+            input: {
+              path: "src/app.ts",
+              content: "export const value = 2;\n",
+            },
+          },
+        ],
+        timestamp: "2026-07-25T00:00:00Z",
+      },
+      {
+        id: "result-kimi-write",
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "kimi-write",
+            content: "Wrote 24 bytes to src/app.ts",
+          },
+        ],
+        timestamp: "2026-07-25T00:00:01Z",
+      },
+      {
+        id: "msg-kimi-read",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "kimi-read",
+            name: "Read",
+            input: {
+              path: "src/app.ts",
+              line_offset: 3,
+              n_lines: 2,
+            },
+          },
+        ],
+        timestamp: "2026-07-25T00:00:02Z",
+      },
+      {
+        id: "result-kimi-read",
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "kimi-read",
+            content: "3\texport const value = 2;\n4\treturn value;",
+          },
+        ],
+        timestamp: "2026-07-25T00:00:03Z",
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      id: "kimi-write",
+      toolName: "Write",
+      status: "complete",
+      toolInput: {
+        path: "src/app.ts",
+        file_path: "src/app.ts",
+        content: "export const value = 2;\n",
+      },
+      toolResult: {
+        isError: false,
+        structured: {
+          type: "text",
+          file: {
+            filePath: "src/app.ts",
+            content: "export const value = 2;\n",
+            numLines: 2,
+          },
+        },
+      },
+    });
+    expect(items[1]).toMatchObject({
+      type: "tool_call",
+      id: "kimi-read",
+      toolName: "Read",
+      status: "complete",
+      toolInput: {
+        path: "src/app.ts",
+        file_path: "src/app.ts",
+        line_offset: 3,
+        offset: 3,
+        n_lines: 2,
+        limit: 2,
+      },
+      toolResult: {
+        isError: false,
+        structured: {
+          type: "text",
+          file: {
+            filePath: "src/app.ts",
+            content: "export const value = 2;\nreturn value;",
+            startLine: 3,
+            totalLines: 4,
+          },
+        },
+      },
+    });
+  });
+
+  it("keeps Kimi ReadMediaFile arrays as bounded structured results", () => {
+    const hash = "c".repeat(64);
+    const messages: Message[] = [
+      {
+        id: "media-use",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "ReadMediaFile:0",
+            name: "ReadMediaFile",
+            input: { path: "/tmp/example.png" },
+          },
+        ],
+      },
+      {
+        id: "media-result",
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "ReadMediaFile:0",
+            content: [
+              { type: "text", text: '<image path="/tmp/example.png">' },
+              {
+                type: "image_url",
+                imageUrl: { url: `blobref:image/png;${hash}` },
+              },
+              { type: "text", text: "</image>" },
+            ],
+          },
+        ],
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      toolName: "ReadMediaFile",
+      status: "complete",
+      toolResult: {
+        content: "image loaded",
+        isError: false,
+        structured: {
+          type: "media",
+          kind: "image",
+          path: "/tmp/example.png",
+          mimeType: "image/png",
+        },
+      },
+    });
+    const toolItem = items[0];
+    expect(
+      JSON.stringify(
+        toolItem?.type === "tool_call" ? toolItem.toolResult : undefined,
+      ),
+    ).not.toContain("blobref:");
+  });
+
+  it("upgrades a live Kimi media result with its persisted preview", () => {
+    const messages: Message[] = [
+      {
+        id: "media-use",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "ReadMediaFile:0",
+            name: "ReadMediaFile",
+            input: { path: "/tmp/example.png" },
+          },
+        ],
+      },
+      {
+        id: "media-live-result",
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "ReadMediaFile:0",
+            content: "image loaded: example.png",
+          },
+        ],
+        toolUseResult: {
+          type: "media",
+          kind: "image",
+          path: "/tmp/example.png",
+          mimeType: "image/png",
+          bytes: 4,
+        },
+      },
+      {
+        id: "media-persisted-result",
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "ReadMediaFile:0",
+            content: "image loaded: example.png",
+          },
+        ],
+        toolUseResult: {
+          type: "media",
+          kind: "image",
+          path: "/tmp/example.png",
+          mimeType: "image/png",
+          filePath: "/safe/blobs/image-hash",
+          previewUrl: "/api/local-image?path=safe",
+        },
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      status: "complete",
+      toolResult: {
+        structured: {
+          type: "media",
+          kind: "image",
+          filePath: "/safe/blobs/image-hash",
+          previewUrl: "/api/local-image?path=safe",
+        },
+      },
+    });
+  });
+
+  it("upgrades a lazy-created Kimi Write call when rawInput arrives later", () => {
+    const messages: Message[] = [
+      {
+        id: "write-lazy",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "Write:10",
+            name: "Write",
+            input: {},
+          },
+        ],
+      },
+      {
+        id: "write-full",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "Write:10",
+            name: "Write",
+            input: {
+              path: "/repo/src/app.ts",
+              content: "export const value = 1;\n",
+            },
+          },
+        ],
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      id: "Write:10",
+      status: "pending",
+      toolInput: {
+        path: "/repo/src/app.ts",
+        file_path: "/repo/src/app.ts",
+        content: "export const value = 1;\n",
+      },
+    });
+  });
+
+  it("normalizes Kimi JSON question answers without inventing a missing answer", () => {
+    const questions = [
+      {
+        header: "Interaction",
+        question: "Which interaction do you prefer?",
+        options: [
+          { label: "Wizard", description: "Step by step" },
+          { label: "Single page", description: "Progressive disclosure" },
+        ],
+      },
+      {
+        header: "Scope",
+        question: "Should the retry dialog be included?",
+        options: [
+          { label: "Launch only", description: "Smaller scope" },
+          { label: "Share components", description: "Broader scope" },
+        ],
+      },
+    ];
+    const messages: Message[] = [
+      {
+        id: "msg-kimi-question-use",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "AskUserQuestion:5",
+            name: "AskUserQuestion",
+            input: { questions },
+          },
+        ],
+      },
+      {
+        id: "msg-kimi-question-result",
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "AskUserQuestion:5",
+            content: JSON.stringify({
+              answers: { "Which interaction do you prefer?": "Wizard" },
+            }),
+          },
+        ],
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+    const item = items[0];
+    if (!item || item.type !== "tool_call") {
+      throw new Error("expected a tool_call item");
+    }
+    expect(item.toolResult?.structured).toEqual({
+      questions,
+      answers: { "Which interaction do you prefer?": "Wizard" },
+    });
+    expect(
+      Object.keys(
+        (item.toolResult?.structured as { answers: Record<string, string> })
+          .answers,
+      ),
+    ).toHaveLength(1);
   });
 
   it("collapses repeated plan progress snapshots within one user turn", () => {
@@ -175,6 +599,45 @@ describe("preprocessMessages", () => {
           { step: "Inspect code", status: "completed" },
           { step: "Patch renderer", status: "in_progress" },
         ],
+      },
+    });
+  });
+
+  it("keeps a synthetic code-mode plan complete without a tool result", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-code-mode",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "exec-1",
+            name: "CodexExec",
+            input: { script: "await tools.update_plan({...});" },
+          },
+          {
+            type: "tool_use",
+            id: "exec-1-update-plan",
+            name: "UpdatePlan",
+            input: {
+              plan: [{ step: "Inspect code", status: "completed" }],
+            },
+            status: "completed",
+          },
+        ],
+      },
+    ];
+
+    const planItem = preprocessMessages(messages).find(
+      (item) => item.type === "tool_call" && item.toolName === "UpdatePlan",
+    );
+
+    expect(planItem).toMatchObject({
+      type: "tool_call",
+      id: "exec-1-update-plan",
+      status: "complete",
+      toolInput: {
+        plan: [{ step: "Inspect code", status: "completed" }],
       },
     });
   });
@@ -293,6 +756,65 @@ describe("preprocessMessages", () => {
     });
   });
 
+  it("collapses repeated Kimi TodoList writes using the latest title snapshot", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-user",
+        role: "user",
+        content: "Implement the feature",
+      },
+      {
+        id: "msg-kimi-todo-1",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "kimi-todo-1",
+            name: "TodoList",
+            input: {
+              todos: [
+                { title: "Inspect code", status: "in_progress" },
+                { title: "Patch renderer", status: "pending" },
+              ],
+            },
+          },
+        ],
+      },
+      {
+        id: "msg-kimi-todo-2",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "kimi-todo-2",
+            name: "TodoList",
+            input: {
+              todos: [
+                { title: "Inspect code", status: "done" },
+                { title: "Patch renderer", status: "in_progress" },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+
+    const todoItems = preprocessMessages(messages).filter(
+      (item) => item.type === "tool_call" && item.toolName === "TodoList",
+    );
+
+    expect(todoItems).toHaveLength(1);
+    expect(todoItems[0]).toMatchObject({
+      id: "kimi-todo-1",
+      toolInput: {
+        todos: [
+          { title: "Inspect code", status: "done" },
+          { title: "Patch renderer", status: "in_progress" },
+        ],
+      },
+    });
+  });
+
   it("preserves Agent tool summaries for rendering completed tasks", () => {
     const messages: Message[] = [
       {
@@ -357,6 +879,55 @@ describe("preprocessMessages", () => {
           totalTokens: 200,
           totalToolUseCount: 3,
           totalDurationMs: 1000,
+        },
+      },
+    });
+  });
+
+  it("structures completed Kimi AgentSwarm results for the Task renderer", () => {
+    const messages: Message[] = [
+      {
+        id: "msg-1",
+        type: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "Swarm_0",
+            name: "AgentSwarm",
+            input: {
+              description: "Explore frontend and backend",
+              subagent_type: "explore",
+            },
+          },
+        ],
+      },
+      {
+        id: "msg-2",
+        type: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "Swarm_0",
+            content:
+              '<agent_swarm_result><subagent agent_id="agent-0" outcome="completed">frontend findings</subagent><subagent agent_id="agent-1" outcome="failed">backend error</subagent></agent_swarm_result>',
+          },
+        ],
+      },
+    ];
+
+    const items = preprocessMessages(messages);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: "tool_call",
+      id: "Swarm_0",
+      toolName: "AgentSwarm",
+      status: "complete",
+      toolResult: {
+        isError: false,
+        structured: {
+          agentId: "agent-0",
+          status: "completed",
         },
       },
     });
@@ -1480,6 +2051,472 @@ Details with a &gt; comparison.</result>
         id: "tool-1",
         status: "pending", // Already pending, stays pending
       });
+    });
+  });
+
+  describe("streaming partial output", () => {
+    it("carries partialOutput onto the pending tool call", () => {
+      const messages: Message[] = [
+        {
+          id: "msg-1",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-live",
+              name: "Bash",
+              input: { command: "make build" },
+              partialOutput: "compiling...\n",
+            },
+          ],
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({
+        type: "tool_call",
+        id: "tool-live",
+        status: "pending",
+        partialOutput: "compiling...\n",
+      });
+    });
+
+    it("refreshes partialOutput from replayed tool_use snapshots", () => {
+      const messages: Message[] = [
+        {
+          id: "msg-1",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-live",
+              name: "Bash",
+              input: { command: "make build" },
+              partialOutput: "compiling...\n",
+            },
+          ],
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+        {
+          id: "msg-2",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-live",
+              name: "Bash",
+              input: { command: "make build" },
+              partialOutput: "compiling...\nlinking...\n",
+            },
+          ],
+          timestamp: "2024-01-01T00:00:01Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({
+        type: "tool_call",
+        partialOutput: "compiling...\nlinking...\n",
+      });
+    });
+  });
+
+  describe("duplicate & batched tool results", () => {
+    it("does not fan out message-level toolUseResult to parallel tool results", () => {
+      const messages: Message[] = [
+        {
+          id: "msg-1",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-a",
+              name: "Read",
+              input: { file_path: "a.ts" },
+            },
+            {
+              type: "tool_use",
+              id: "tool-b",
+              name: "Read",
+              input: { file_path: "b.ts" },
+            },
+          ],
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+        {
+          id: "msg-2",
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "tool-a", content: "aaa" },
+            { type: "tool_result", tool_use_id: "tool-b", content: "bbb" },
+          ],
+          timestamp: "2024-01-01T00:00:01Z",
+          // Ambiguous: belongs to one of the two blocks, not both.
+          toolUseResult: { lineCount: 1, filePath: "/a.ts" },
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+
+      expect(items).toHaveLength(2);
+      for (const item of items) {
+        expect(item.type).toBe("tool_call");
+        if (item.type === "tool_call") {
+          expect(item.toolResult?.structured).not.toEqual({
+            lineCount: 1,
+            filePath: "/a.ts",
+          });
+        }
+      }
+    });
+
+    it("still attaches message-level toolUseResult for single-result messages", () => {
+      const messages: Message[] = [
+        {
+          id: "msg-1",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-a",
+              name: "Read",
+              input: { file_path: "a.ts" },
+            },
+          ],
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+        {
+          id: "msg-2",
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "tool-a", content: "aaa" },
+          ],
+          timestamp: "2024-01-01T00:00:01Z",
+          toolUseResult: { lineCount: 1, filePath: "/a.ts" },
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+
+      expect(items).toHaveLength(1);
+      const item = items[0];
+      if (item?.type === "tool_call") {
+        expect(item.toolResult?.structured).toEqual({
+          lineCount: 1,
+          filePath: "/a.ts",
+        });
+      }
+    });
+
+    it("upgrades a partial result when a richer duplicate arrives later", () => {
+      const messages: Message[] = [
+        {
+          id: "msg-1",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-a",
+              name: "Bash",
+              input: { command: "ls" },
+            },
+          ],
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+        {
+          id: "msg-2",
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "tool-a", content: "par" },
+          ],
+          timestamp: "2024-01-01T00:00:01Z",
+        },
+        {
+          id: "msg-3",
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-a",
+              content: "partial output now complete",
+            },
+          ],
+          timestamp: "2024-01-01T00:00:02Z",
+          toolUseResult: { stdout: "partial output now complete" },
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+
+      expect(items).toHaveLength(1);
+      const item = items[0];
+      expect(item?.type).toBe("tool_call");
+      if (item?.type === "tool_call") {
+        expect(item.toolResult?.content).toBe("partial output now complete");
+        expect(item.toolResult?.structured).toEqual({
+          stdout: "partial output now complete",
+        });
+      }
+    });
+
+    it("keeps the richer result when a shorter duplicate arrives later", () => {
+      const messages: Message[] = [
+        {
+          id: "msg-1",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-a",
+              name: "Bash",
+              input: { command: "ls" },
+            },
+          ],
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+        {
+          id: "msg-2",
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-a",
+              content: "complete output",
+            },
+          ],
+          timestamp: "2024-01-01T00:00:01Z",
+          toolUseResult: { stdout: "complete output" },
+        },
+        {
+          id: "msg-3",
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "tool-a", content: "com" },
+          ],
+          timestamp: "2024-01-01T00:00:02Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+
+      expect(items).toHaveLength(1);
+      const item = items[0];
+      if (item?.type === "tool_call") {
+        expect(item.toolResult?.content).toBe("complete output");
+        expect(item.toolResult?.structured).toEqual({
+          stdout: "complete output",
+        });
+      }
+    });
+  });
+
+  describe("codex_native_item system messages", () => {
+    it("extracts plan ThreadItem as codex_native_item render item", () => {
+      const messages: Message[] = [
+        {
+          id: "plan-item",
+          type: "system",
+          subtype: "codex_native_item",
+          codexThreadItem: {
+            type: "plan",
+            id: "plan-1",
+            text: "1. Do thing A\n2. Do thing B",
+          },
+          codexThreadItemLifecycle: "completed",
+          codexThreadId: "thread-1",
+          codexTurnId: "turn-1",
+          codexCanonicalRefresh: true,
+          _source: "jsonl",
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({
+        type: "codex_native_item",
+        id: "plan-item",
+        lifecycle: "completed",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        threadItem: {
+          type: "plan",
+          id: "plan-1",
+          text: "1. Do thing A\n2. Do thing B",
+        },
+      });
+    });
+
+    it("extracts subAgentActivity ThreadItem with started lifecycle", () => {
+      const messages: Message[] = [
+        {
+          id: "activity-1",
+          type: "system",
+          subtype: "codex_native_item",
+          codexThreadItem: {
+            type: "subAgentActivity",
+            id: "act-1",
+            kind: "started",
+            agentThreadId: "thread-child",
+            agentPath: "/root/explore",
+          },
+          codexThreadItemLifecycle: "started",
+          _source: "jsonl",
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({
+        type: "codex_native_item",
+        lifecycle: "started",
+        threadItem: {
+          type: "subAgentActivity",
+          kind: "started",
+          agentThreadId: "thread-child",
+          agentPath: "/root/explore",
+        },
+      });
+    });
+
+    it("extracts collabAgentToolCall ThreadItem with agentsStates", () => {
+      const messages: Message[] = [
+        {
+          id: "spawn-1",
+          type: "system",
+          subtype: "codex_native_item",
+          codexThreadItem: {
+            type: "collabAgentToolCall",
+            id: "spawn-1",
+            tool: "spawnAgent",
+            model: "gpt-5",
+            reasoningEffort: "high",
+            agentsStates: {
+              "thread-child": {
+                nickname: "Einstein",
+                role: "explorer",
+                status: "running",
+              },
+            },
+          },
+          codexThreadItemLifecycle: "completed",
+          _source: "jsonl",
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+      expect(items).toHaveLength(1);
+      expect(items[0]?.type).toBe("codex_native_item");
+    });
+
+    it("suppresses known canonical placeholders but keeps native UI and future types", () => {
+      const messages: Message[] = [
+        ...["reasoning", "commandExecution", "agentMessage"].map(
+          (type, index) => ({
+            id: `known-${index}`,
+            type: "system" as const,
+            subtype: "codex_native_item",
+            codexThreadItem: { type, id: `thread-item-${index}` },
+            codexThreadItemLifecycle: "completed",
+            _source: "jsonl" as const,
+          }),
+        ),
+        {
+          id: "turn-plan",
+          type: "system",
+          subtype: "codex_native_item",
+          codexThreadItem: {
+            type: "turnPlan",
+            steps: [{ step: "Fix the renderer", status: "in_progress" }],
+          },
+          codexThreadItemLifecycle: "completed",
+          _source: "jsonl",
+        },
+        {
+          id: "future-item",
+          type: "system",
+          subtype: "codex_native_item",
+          codexThreadItem: { type: "futureThreadItem" },
+          codexThreadItemLifecycle: "started",
+          _source: "jsonl",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+
+      expect(items.map((item) => item.id)).toEqual([
+        "turn-plan",
+        "future-item",
+      ]);
+    });
+
+    it("skips codex_native_item without a valid threadItem payload", () => {
+      const messages: Message[] = [
+        {
+          id: "broken-1",
+          type: "system",
+          subtype: "codex_native_item",
+          codexThreadItem: null,
+          _source: "jsonl",
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+      expect(items).toHaveLength(0);
+    });
+
+    it("defaults lifecycle to started when codexThreadItemLifecycle is absent", () => {
+      const messages: Message[] = [
+        {
+          id: "no-lifecycle",
+          type: "system",
+          subtype: "codex_native_item",
+          codexThreadItem: { type: "plan", text: "draft" },
+          _source: "jsonl",
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({
+        type: "codex_native_item",
+        lifecycle: "started",
+      });
+    });
+
+    it("still renders compact_boundary and warning system messages", () => {
+      const messages: Message[] = [
+        {
+          id: "boundary-1",
+          type: "system",
+          subtype: "compact_boundary",
+          content: "Context compacted",
+          _source: "jsonl",
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+        {
+          id: "warn-1",
+          type: "system",
+          subtype: "warning",
+          content: "Heads up",
+          _source: "jsonl",
+          timestamp: "2024-01-01T00:00:01Z",
+        },
+      ];
+
+      const items = preprocessMessages(messages);
+      expect(items).toHaveLength(2);
+      expect(items[0]?.type).toBe("system");
+      expect(items[1]?.type).toBe("system");
     });
   });
 });

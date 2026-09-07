@@ -1,17 +1,75 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { type Server, type ServerResponse, createServer } from "node:http";
 import type { IncomingMessage } from "node:http";
-import { basename } from "node:path";
-import type { UrlProjectId } from "@yep-anywhere/shared";
-import { type RawData, WebSocket, WebSocketServer } from "ws";
+import { basename, dirname, join } from "node:path";
 import {
-  discoverConfiguredCodexMcpServers,
+  type ContextUsage,
+  type UrlProjectId,
+  type UserQuestionAnswers,
+  getModelContextWindow,
+} from "@yep-anywhere/shared";
+import { type RawData, WebSocket, WebSocketServer } from "ws";
+import { BridgeEventNotifier } from "../bridge-common/BridgeEventNotifier.js";
+import type {
+  BridgeInputResolutionContext,
+  BridgePendingInputBinding,
+} from "../bridge-common/types.js";
+import {
+  asRecord,
+  findAvailablePort,
+  isChildRunning,
+  isLocalAddress,
+  terminateProcessGroup,
+  writeJson,
+} from "../bridge-common/util.js";
+import type { CodexEventStore } from "../codex-events/index.js";
+import { classifyCodexError } from "../codex/error-taxonomy.js";
+import {
   getCodexMcpAppServerArgs,
+  resolveCodexMcpThreadProfile,
 } from "../codex/mcp-profile.js";
+import { getCodexSubagentMetadata } from "../codex/subagent.js";
 import { encodeProjectId } from "../projects/paths.js";
+import { ensureRuntimeToken } from "../runtime/token.js";
 import { findCodexCliPath } from "../sdk/cli-detection.js";
+import { sanitizeManagedAttachmentPrompt } from "../sdk/messageQueue.js";
+import { validateQuestionAnswers } from "../sessions/question-answers.js";
 import type { SessionSummary } from "../supervisor/types.js";
 import type { EventBus } from "../watcher/index.js";
+import {
+  type CodexBridgeClientRequestScope,
+  CodexBridgeEventPersistenceError,
+  CodexBridgeEventSpine,
+  createCodexBridgeEventIdentity,
+  createCodexBridgeEventStore,
+} from "./CodexBridgeEventSpine.js";
+import {
+  AsyncCodexBridgeJournal,
+  type CodexBridgeJournalRecordKind,
+  type CodexBridgeJournalWriter,
+  createCodexBridgeJournalRecord,
+} from "./CodexBridgeJournal.js";
+import { readCodexUsage } from "./CodexUsageService.js";
+import {
+  type CodexInteractiveMethod,
+  buildCodexInteractiveResponse,
+  buildCodexPendingInputId,
+  idKey,
+  isCodexInteractiveMethod,
+  toCodexInteractiveRequestView,
+} from "./interactions.js";
+import {
+  CODEX_BRIDGE_TERMINAL_METHODS,
+  type CodexBridgeJournalMode,
+  classifyCodexBridgeNotification,
+  resolveCodexBridgeJournalMode,
+  safeCodexBridgeMethod,
+  shouldJournalClientMethod,
+  shouldJournalServerNotification,
+} from "./journal-policy.js";
+import { CodexBridgeMetrics } from "./metrics.js";
 import { bridgeOwnership, isLiveBridgeSession } from "./session-state.js";
 import type {
   CodexBridgeController,
@@ -22,11 +80,13 @@ import type {
   CodexBridgeSessionView,
   CodexBridgeStatus,
   CodexBridgeUpstreamProfile,
+  CodexUsageRequestOptions,
+  CodexUsageResponse,
   JsonRpcId,
   JsonRpcMessage,
 } from "./types.js";
 
-interface CodexBridgeServiceOptions {
+export interface CodexBridgeServiceOptions {
   enabled: boolean;
   host: string;
   port: number;
@@ -39,11 +99,43 @@ interface CodexBridgeServiceOptions {
   codexPath?: string;
   eventBus?: EventBus;
   startupTimeoutMs?: number;
+  /**
+   * When set, session records survive bridge restarts by being persisted to
+   * this JSON file (metadata only; live connection state is rebuilt).
+   */
+  statePath?: string;
+  /** Test/custom adapter override. Production derives JSONL from statePath. */
+  eventStore?: CodexEventStore;
+  eventStorePath?: string;
+  /** Defaults to lifecycle even when the environment variable is absent. */
+  journalMode?: CodexBridgeJournalMode;
+  /** Compact lifecycle/full diagnostic path override. */
+  journalPath?: string;
+  /** Test/custom async writer. Never used by legacy-blocking mode. */
+  journalWriter?: CodexBridgeJournalWriter;
+  /** Test/benchmark-only delay injected inside the background writer. */
+  journalFlushDelayMs?: number;
+  journalMaxQueueBytes?: number;
+  journalMaxConnectionQueueBytes?: number;
+  journalMaxSegmentBytes?: number;
+  journalKeepSegments?: number;
+  journalTerminalDatasync?: boolean;
+  /** Bearer accepted when the bridge is exposed beyond loopback. */
+  authToken?: string;
+  /** Shared runtime control token used by the main-server sidecar client. */
+  authTokenFile?: string;
 }
 
 interface ClientRequestRecord {
   method: string;
-  params?: unknown;
+  sessionId: string;
+  eventScope?: CodexBridgeClientRequestScope;
+  mcpStartupCompatibilityServerIds?: string[];
+}
+
+interface ProfiledClientMessage {
+  message: JsonRpcMessage;
+  mcpStartupCompatibilityServerIds?: string[];
 }
 
 interface BridgeConnection {
@@ -53,10 +145,18 @@ interface BridgeConnection {
   upstream: WebSocket | null;
   downstreamQueue: QueuedFrame[];
   pendingClientRequests: Map<string, ClientRequestRecord>;
+  pendingInternalRequests: Map<string, PendingInternalRequest>;
   pendingServerRequests: Map<string, PendingServerRequest>;
   resolvedServerRequestIds: Set<string>;
   threadIds: Set<string>;
+  downstreamAttached: boolean;
   closed: boolean;
+  connectionSessionId: string;
+  legacyEventSpine: CodexBridgeEventSpine | null;
+  upstreamReady: Promise<void> | null;
+  clientFrameChain: Promise<void>;
+  serverFrameChain: Promise<void>;
+  nextInternalRequestId: number;
 }
 
 interface QueuedFrame {
@@ -69,12 +169,19 @@ interface ForwardedFrame {
   isBinary: boolean;
 }
 
+interface PendingInternalRequest {
+  method: string;
+  resolve: (result: unknown) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
 interface PendingServerRequest {
   inputId: string;
   rpcId: JsonRpcId;
   rpcKey: string;
   requestKey: string;
-  method: string;
+  method: CodexInteractiveMethod;
   params: Record<string, unknown>;
   threadId: string;
   turnId?: string;
@@ -83,13 +190,27 @@ interface PendingServerRequest {
   pendingInputType: "tool-approval" | "user-question";
   connection: BridgeConnection;
   createdAt: string;
+  eventSessionId: string;
 }
 
 interface SessionRecord {
   id: string;
+  isSubagent: boolean;
+  threadMetadataKnown: boolean;
+  parentThreadId?: string;
+  agentPath?: string;
+  agentNickname?: string;
+  agentRole?: string;
   projectId: UrlProjectId;
   projectPath: string;
   projectName: string;
+  /**
+   * True once a real cwd arrived from thread metadata. Records created from
+   * bare threadIds fall back to the bridge process cwd, which must never be
+   * exposed as the session's project (it files the session under the wrong
+   * project in the UI).
+   */
+  projectPathKnown: boolean;
   title: string | null;
   fullTitle: string | null;
   createdAt: string;
@@ -99,14 +220,65 @@ interface SessionRecord {
   reasoningEffort?: string;
   serviceTier?: string;
   activity?: "in-turn" | "idle" | "waiting-input";
+  activityBeforePending?: "in-turn" | "idle";
+  /** True while a turn is in progress (turn/started .. turn terminal). */
+  turnActive?: boolean;
+  /** Terminal status of the most recent turn, from turn/completed. */
+  lastTurnStatus?: "completed" | "interrupted" | "failed";
+  /** Message of the most recent turn error/`error` notification. */
+  lastErrorMessage?: string;
   pendingInputType?: "tool-approval" | "user-question";
+  /** Context window fill from the latest thread/tokenUsage/updated. */
+  contextUsage?: ContextUsage;
   connectionIds: Set<number>;
+  completedTurnIds: Set<string>;
+}
+
+/** JSON-serializable subset of SessionRecord persisted across bridge restarts. */
+interface PersistedSessionRecord {
+  id: string;
+  isSubagent: boolean;
+  threadMetadataKnown: boolean;
+  parentThreadId?: string;
+  projectPath: string;
+  projectPathKnown: boolean;
+  title: string | null;
+  fullTitle: string | null;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+  model?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
+  contextUsage?: ContextUsage;
+  lastTurnStatus?: "completed" | "interrupted" | "failed";
+  lastErrorMessage?: string;
+  completedTurnIds: string[];
+  emitted: boolean;
+}
+
+interface PendingInputBinding extends BridgePendingInputBinding {
+  sessionId: string;
+  requestId: string;
 }
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
-const JSON_RPC_VERSION = "2.0";
-const CODEX_CLEAR_BASE_ARG_COUNT = 4;
 const MAX_MCP_STARTUP_EVENTS = 50;
+const MAX_RESOLVED_SERVER_REQUEST_IDS = 1_000;
+const MAX_COMPLETED_TURN_IDS = 256;
+const CODEX_USAGE_CACHE_TTL_MS = 30_000;
+const INTERNAL_REQUEST_TIMEOUT_MS = 10_000;
+const JOURNAL_SHUTDOWN_FLUSH_TIMEOUT_MS = 2_000;
+
+function isMcpThreadLifecycleMethod(
+  method: string | undefined,
+): method is "thread/start" | "thread/resume" | "thread/fork" {
+  return (
+    method === "thread/start" ||
+    method === "thread/resume" ||
+    method === "thread/fork"
+  );
+}
 
 interface CodexBridgeUpstreamState {
   process: ChildProcess | null;
@@ -144,6 +316,30 @@ export class CodexBridgeService implements CodexBridgeController {
     CodexBridgeUpstreamState
   >();
   private reservedUpstreamPorts = new Set<number>();
+  private cachedUsage: {
+    response: CodexUsageResponse;
+    expiresAt: number;
+  } | null = null;
+  private usageRequest: Promise<CodexUsageResponse> | null = null;
+  private readonly statePath?: string;
+  private readonly journalMode: CodexBridgeJournalMode;
+  private readonly legacyEventStore: CodexEventStore | null;
+  private readonly journalWriter: CodexBridgeJournalWriter | null;
+  private readonly journalInstanceId: string;
+  private readonly metrics = new CodexBridgeMetrics();
+  private readonly remoteAuthToken?: string;
+  private controlToken?: string;
+  private readonly authTokenFile?: string;
+  private readonly requiresAuthentication: boolean;
+  private readonly pendingInputBindings = new Map<
+    string,
+    PendingInputBinding
+  >();
+  private readonly eventTasks = new Set<Promise<void>>();
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Serializes atomic writes so concurrent state changes cannot race on .tmp. */
+  private persistChain: Promise<void> = Promise.resolve();
+  private readonly eventNotifier = new BridgeEventNotifier();
 
   constructor(options: CodexBridgeServiceOptions) {
     this.enabled = options.enabled;
@@ -160,6 +356,70 @@ export class CodexBridgeService implements CodexBridgeController {
     this.eventBus = options.eventBus;
     this.startupTimeoutMs =
       options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
+    this.statePath = options.statePath;
+    this.journalMode = resolveCodexBridgeJournalMode(
+      options.journalMode ?? process.env.YEP_CODEX_BRIDGE_JOURNAL_MODE,
+    );
+    this.journalInstanceId = randomUUID();
+    this.legacyEventStore =
+      this.journalMode === "legacy-blocking"
+        ? createCodexBridgeEventStore({
+            store: options.eventStore,
+            eventStorePath: options.eventStorePath,
+            statePath: options.statePath,
+          })
+        : null;
+    const journalPath =
+      options.journalPath ??
+      (options.statePath
+        ? deriveLightweightJournalPath(options.statePath, this.journalMode)
+        : undefined);
+    this.journalWriter =
+      this.journalMode === "lifecycle" || this.journalMode === "full"
+        ? (options.journalWriter ??
+          (journalPath
+            ? new AsyncCodexBridgeJournal({
+                mode: this.journalMode,
+                filePath: journalPath,
+                instanceId: this.journalInstanceId,
+                writeDelayMs: options.journalFlushDelayMs,
+                maxQueueBytes:
+                  options.journalMaxQueueBytes ??
+                  readPositiveIntegerEnv(
+                    "YEP_CODEX_BRIDGE_JOURNAL_MAX_QUEUE_BYTES",
+                  ),
+                maxConnectionQueueBytes:
+                  options.journalMaxConnectionQueueBytes ??
+                  readPositiveIntegerEnv(
+                    "YEP_CODEX_BRIDGE_JOURNAL_MAX_CONNECTION_QUEUE_BYTES",
+                  ),
+                maxSegmentBytes:
+                  options.journalMaxSegmentBytes ??
+                  readPositiveIntegerEnv(
+                    "YEP_CODEX_BRIDGE_JOURNAL_MAX_SEGMENT_BYTES",
+                  ),
+                keepSegments:
+                  options.journalKeepSegments ??
+                  readNonNegativeIntegerEnv(
+                    "YEP_CODEX_BRIDGE_JOURNAL_KEEP_SEGMENTS",
+                  ),
+                terminalDatasync:
+                  options.journalTerminalDatasync ??
+                  process.env.YEP_CODEX_BRIDGE_JOURNAL_TERMINAL_DATASYNC ===
+                    "true",
+                onFlush: (durationMs) => this.metrics.observeFlush(durationMs),
+                onFailure: (code) => {
+                  this.lastError = `Codex bridge journal degraded (${code})`;
+                  console.warn(
+                    `[CodexBridge] Optional journal circuit opened code=${code}`,
+                  );
+                },
+              })
+            : null))
+        : null;
+    this.remoteAuthToken = options.authToken?.trim() || undefined;
+    this.authTokenFile = options.authTokenFile;
+    this.requiresAuthentication = !isLocalAddress(this.host);
   }
 
   async start(): Promise<void> {
@@ -167,11 +427,42 @@ export class CodexBridgeService implements CodexBridgeController {
       return;
     }
 
+    if (this.authTokenFile) {
+      try {
+        this.controlToken = await ensureRuntimeToken(this.authTokenFile);
+      } catch {
+        this.listening = false;
+        this.lastError = "Codex bridge bearer authentication is unavailable";
+        return;
+      }
+    }
+
+    if (
+      this.requiresAuthentication &&
+      !this.remoteAuthToken &&
+      !this.controlToken
+    ) {
+      this.listening = false;
+      this.lastError =
+        "Refusing non-loopback Codex bridge without explicit bearer authentication";
+      return;
+    }
+
+    await this.restorePersistedSessions();
+
     const server = createServer((req, res) => {
       this.handleHttpRequest(req, res).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: message }));
+        const diagnostic = projectBridgePublicDiagnostic(error);
+        this.lastError = diagnostic.publicMessage;
+        console.warn(
+          `[CodexBridge] HTTP request failed ${diagnostic.logFields}`,
+        );
+        writeBridgeHttpError(
+          res,
+          500,
+          "bridge_internal_error",
+          diagnostic.publicMessage,
+        );
       });
     });
     const wss = new WebSocketServer({ server });
@@ -183,66 +474,41 @@ export class CodexBridgeService implements CodexBridgeController {
     this.server = server;
     this.wss = wss;
 
-    let settled = false;
     await new Promise<void>((resolve) => {
-      const onStartError = (error: Error) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        this.lastError = error.message;
+      const onError = (error: Error) => {
+        const diagnostic = projectBridgePublicDiagnostic(error);
+        this.lastError = diagnostic.publicMessage;
         this.listening = false;
         this.server = null;
         this.wss = null;
+        wss.close();
+        console.warn(`[CodexBridge] Failed to listen ${diagnostic.logFields}`);
         cleanup();
-        try {
-          wss.close();
-        } catch {
-          // ignore close errors during failed startup
-        }
-        try {
-          server.close();
-        } catch {
-          // ignore close errors during failed startup
-        }
-        console.warn(
-          `[CodexBridge] Failed to listen on ws://${this.host}:${this.port}: ${error.message}`,
-        );
         resolve();
       };
       const onListening = () => {
-        if (settled) {
-          return;
-        }
-        settled = true;
         this.listening = true;
         this.lastError = null;
-        cleanup();
-        // Keep a long-lived handler so later wss errors do not crash the process.
-        wss.on("error", (error) => {
-          this.lastError = error.message;
-          console.warn(`[CodexBridge] WebSocketServer error: ${error.message}`);
-        });
         console.log(
-          `[CodexBridge] Listening on ws://${this.host}:${this.port}`,
+          `[CodexBridge] Listening on ws://${this.host}:${this.port} journal=${this.journalMode}`,
         );
+        cleanup();
         resolve();
       };
       const cleanup = () => {
-        server.off("error", onStartError);
+        server.off("error", onError);
         server.off("listening", onListening);
-        wss.off("error", onStartError);
       };
 
-      server.once("error", onStartError);
+      server.once("error", onError);
       server.once("listening", onListening);
-      wss.once("error", onStartError);
       server.listen(this.port, this.host);
     });
 
     server.on("error", (error) => {
-      this.lastError = error.message;
-      console.warn(`[CodexBridge] Server error: ${error.message}`);
+      const diagnostic = projectBridgePublicDiagnostic(error);
+      this.lastError = diagnostic.publicMessage;
+      console.warn(`[CodexBridge] Server error ${diagnostic.logFields}`);
     });
   }
 
@@ -251,6 +517,17 @@ export class CodexBridgeService implements CodexBridgeController {
       this.closeConnection(connection, "shutdown");
     }
     this.connections.clear();
+
+    await Promise.allSettled(Array.from(this.eventTasks));
+
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    this.eventNotifier.close();
+    await this.persistSessions();
+    await this.journalWriter?.close(JOURNAL_SHUTDOWN_FLUSH_TIMEOUT_MS);
+    this.metrics.close();
 
     if (this.wss) {
       await new Promise<void>((resolve) => this.wss?.close(() => resolve()));
@@ -265,13 +542,21 @@ export class CodexBridgeService implements CodexBridgeController {
   }
 
   getStatus(): CodexBridgeStatus {
+    const canonicalIngressCount = Array.from(this.connections.values()).reduce(
+      (total, connection) =>
+        total + (connection.legacyEventSpine?.getIngressCount() ?? 0),
+      0,
+    );
     return {
       enabled: this.enabled,
       listening: this.listening,
       host: this.host,
       port: this.port,
       url: `ws://${this.host}:${this.port}`,
-      upstreamUrl: this.upstreamUrlOverride ?? this.getManagedUpstreamUrl(),
+      journalMode: this.journalMode,
+      upstreamUrl: sanitizeBridgePublicUrl(
+        this.upstreamUrlOverride ?? this.getManagedUpstreamUrl(),
+      ),
       upstreamRunning: this.isAnyManagedUpstreamRunning(),
       upstreamMode: this.upstreamUrlOverride ? "external" : "managed",
       upstreams: {
@@ -280,13 +565,58 @@ export class CodexBridgeService implements CodexBridgeController {
         full: this.getUpstreamStatus("full"),
       },
       connectionCount: this.connections.size,
-      sessionCount: this.sessions.size,
-      pendingInputCount: this.pendingByInputId.size,
+      attachedClientCount: Array.from(this.connections.values()).filter(
+        (connection) => connection.downstreamAttached,
+      ).length,
+      detachedConnectionCount: Array.from(this.connections.values()).filter(
+        (connection) => !connection.downstreamAttached,
+      ).length,
+      sessionCount: Array.from(this.sessions.values()).filter((record) =>
+        this.isTopLevelSessionRecord(record),
+      ).length,
+      pendingInputCount: this.getLogicalPendingInputCount(),
       recentMcpStartupEvents: this.recentMcpStartupEvents.map((event) => ({
         ...event,
       })),
+      metrics: this.metrics.snapshot(
+        this.journalWriter?.getStats() ?? null,
+        canonicalIngressCount,
+      ),
       lastError: this.lastError,
     };
+  }
+
+  async getUsage(
+    options: CodexUsageRequestOptions = {},
+  ): Promise<CodexUsageResponse> {
+    const now = Date.now();
+    if (
+      !options.fresh &&
+      this.cachedUsage &&
+      this.cachedUsage.expiresAt > now
+    ) {
+      return this.cachedUsage.response;
+    }
+    if (this.usageRequest) return this.usageRequest;
+
+    this.usageRequest = readCodexUsage(this.codexPathOverride)
+      .then((usage) => {
+        const response: CodexUsageResponse = { usage, error: null };
+        this.cachedUsage = {
+          response,
+          expiresAt: Date.now() + CODEX_USAGE_CACHE_TTL_MS,
+        };
+        return response;
+      })
+      .catch((error: unknown) => ({
+        usage: null,
+        error: projectBridgePublicDiagnostic(error).publicMessage,
+      }))
+      .finally(() => {
+        this.usageRequest = null;
+      });
+
+    return this.usageRequest;
   }
 
   listSessionViews(): CodexBridgeSessionView[] {
@@ -297,11 +627,16 @@ export class CodexBridgeService implements CodexBridgeController {
         projectName: session.projectName,
         activity: session.activity,
         pendingInputType: session.pendingInputType,
+        pendingInputRequestId: this.getPendingInputRequest(session.id)?.id,
+        // Published so the main server can answer liveness for a whole list
+        // from this snapshot instead of probing /active per session.
+        active: isLiveBridgeSession(session),
       }));
   }
 
   listSessions(): CodexBridgeSession[] {
     return Array.from(this.sessions.values())
+      .filter((record) => this.isTopLevelSessionRecord(record))
       .map((record) => this.toBridgeSession(record))
       .sort(
         (a, b) =>
@@ -311,7 +646,7 @@ export class CodexBridgeService implements CodexBridgeController {
 
   getSessionView(sessionId: string): CodexBridgeSessionView | null {
     const record = this.sessions.get(sessionId);
-    if (!record) return null;
+    if (!record || !this.isTopLevelSessionRecord(record)) return null;
     const session = this.toBridgeSession(record);
     if (!this.isDisplayableBridgeSession(session)) return null;
     return {
@@ -319,57 +654,228 @@ export class CodexBridgeService implements CodexBridgeController {
       projectName: session.projectName,
       activity: session.activity,
       pendingInputType: session.pendingInputType,
+      pendingInputRequestId: this.getPendingInputRequest(session.id)?.id,
+      active: isLiveBridgeSession(session),
     };
   }
 
   isSessionActive(sessionId: string): boolean {
     const record = this.sessions.get(sessionId);
-    return !!record && isLiveBridgeSession(this.toBridgeSession(record));
+    return (
+      !!record &&
+      this.isTopLevelSessionRecord(record) &&
+      isLiveBridgeSession(this.toBridgeSession(record))
+    );
+  }
+
+  private getSessionExecutionProfile(
+    sessionId: string,
+  ): CodexBridgeUpstreamProfile | null {
+    const record = this.sessions.get(sessionId);
+    if (!record) return null;
+    const candidates = Array.from(record.connectionIds)
+      .map((connectionId) => this.connections.get(connectionId))
+      .filter((connection): connection is BridgeConnection =>
+        Boolean(connection && !connection.closed),
+      );
+    return (
+      candidates.find((connection) => connection.downstreamAttached)?.profile ??
+      candidates[0]?.profile ??
+      null
+    );
   }
 
   getPendingInputRequest(
     sessionId: string,
   ): CodexBridgePendingInput["request"] | null {
-    const ids = this.pendingIdsByThread.get(sessionId);
-    if (!ids) return null;
-    const firstId = ids.values().next().value;
-    if (!firstId) return null;
-    return this.pendingByInputId.get(firstId)?.inputRequest ?? null;
+    const pending = this.findPendingForVisibleSession(sessionId);
+    if (!pending) return null;
+    return {
+      ...pending.inputRequest,
+      sessionId: this.getTopLevelSessionId(pending.threadId),
+    };
+  }
+
+  bindPendingInputInteraction(
+    sessionId: string,
+    requestId: string,
+    binding: BridgePendingInputBinding,
+  ): boolean {
+    const pending = this.pendingByInputId.get(requestId);
+    if (
+      !pending ||
+      (pending.threadId !== sessionId &&
+        this.getTopLevelSessionId(pending.threadId) !== sessionId) ||
+      !isValidOperationId(binding.operationId) ||
+      !Number.isSafeInteger(binding.operationVersion) ||
+      binding.operationVersion < 0
+    ) {
+      return false;
+    }
+
+    const existing = this.pendingInputBindings.get(requestId);
+    // The main server may restart while the sidecar/provider request remains
+    // live. A newly authenticated operation may therefore replace the old
+    // operation id; versions within one operation must stay monotonic.
+    if (
+      existing &&
+      existing.operationId === binding.operationId &&
+      binding.operationVersion < existing.operationVersion
+    ) {
+      return false;
+    }
+    this.pendingInputBindings.set(requestId, {
+      sessionId,
+      requestId,
+      operationId: binding.operationId,
+      operationVersion: binding.operationVersion,
+    });
+    return true;
   }
 
   respondToInput(
     sessionId: string,
     requestId: string,
     response: CodexBridgeInputResponse,
-    answers?: Record<string, string>,
+    answers?: UserQuestionAnswers,
+    context?: BridgeInputResolutionContext,
   ): boolean {
     const pending = this.pendingByInputId.get(requestId);
-    if (!pending || pending.threadId !== sessionId) {
+    if (
+      !pending ||
+      (pending.threadId !== sessionId &&
+        this.getTopLevelSessionId(pending.threadId) !== sessionId)
+    ) {
       return false;
     }
     if (
       !pending.connection.upstream ||
-      pending.connection.upstream.readyState !== WebSocket.OPEN
+      pending.connection.upstream.readyState !== WebSocket.OPEN ||
+      pending.connection.resolvedServerRequestIds.has(pending.rpcKey)
     ) {
       return false;
     }
 
-    const result = this.buildServerRequestResponse(pending, response, answers);
+    if (response !== "deny") {
+      const request = this.getPendingInputRequest(sessionId);
+      if (request?.id === requestId) {
+        const validation = validateQuestionAnswers(request, answers);
+        if (!validation.valid) return false;
+      }
+    }
+
+    if (context && !this.consumePendingInputBinding(pending, context)) {
+      return false;
+    }
+
+    const result = buildCodexInteractiveResponse(
+      pending.method,
+      pending.params,
+      response,
+      answers,
+    );
     const message: JsonRpcMessage = {
-      jsonrpc: JSON_RPC_VERSION,
       id: pending.rpcId,
       result,
     };
-    pending.connection.upstream.send(JSON.stringify(message));
-    pending.connection.resolvedServerRequestIds.add(pending.rpcKey);
-    this.resolvePendingRequest(pending, "yep");
+    const upstream = pending.connection.upstream;
+    this.markLogicalRequestResolved(pending);
+    if (pending.connection.legacyEventSpine) {
+      this.enqueueFrameTask(pending.connection, "client", async () => {
+        try {
+          await pending.connection.legacyEventSpine?.observeServerRequestResolution(
+            message,
+            {
+              method: pending.method,
+              sessionId: pending.eventSessionId,
+            },
+          );
+          if (
+            !pending.connection.closed &&
+            upstream.readyState === WebSocket.OPEN
+          ) {
+            upstream.send(JSON.stringify(message));
+          }
+        } finally {
+          this.resolveLogicalRequest(pending, "yep");
+        }
+      });
+      return true;
+    }
+
+    this.enqueueLightweightJournal(
+      pending.connection,
+      "server-request-resolution",
+      message,
+      Buffer.byteLength(JSON.stringify(message)),
+      pending.threadId,
+      pending.method,
+    );
+    if (!pending.connection.closed && upstream.readyState === WebSocket.OPEN) {
+      const startedAt = performance.now();
+      upstream.send(JSON.stringify(message));
+      this.metrics.observeForward(performance.now() - startedAt);
+    }
+    this.resolveLogicalRequest(pending, "yep");
     return true;
+  }
+
+  private consumePendingInputBinding(
+    pending: PendingServerRequest,
+    context: BridgeInputResolutionContext,
+  ): boolean {
+    const binding = this.pendingInputBindings.get(pending.inputId);
+    if (
+      !binding ||
+      binding.operationId !== context.operationId ||
+      context.operationVersion !== binding.operationVersion + 1 ||
+      !isValidResolutionActor(context.actor)
+    ) {
+      return false;
+    }
+    this.pendingInputBindings.delete(pending.inputId);
+    return true;
+  }
+
+  private getTopLevelSessionId(threadId: string): string {
+    let currentId = threadId;
+    const visited = new Set<string>();
+
+    while (!visited.has(currentId)) {
+      visited.add(currentId);
+      const record = this.sessions.get(currentId);
+      if (!record?.isSubagent || !record.parentThreadId) {
+        return currentId;
+      }
+      currentId = record.parentThreadId;
+    }
+
+    return threadId;
+  }
+
+  private findPendingForVisibleSession(
+    sessionId: string,
+  ): PendingServerRequest | null {
+    for (const pending of this.pendingByInputId.values()) {
+      if (
+        pending.threadId === sessionId ||
+        this.getTopLevelSessionId(pending.threadId) === sessionId
+      ) {
+        return pending;
+      }
+    }
+    return null;
   }
 
   private async handleHttpRequest(
     req: IncomingMessage,
     res: ServerResponse,
   ): Promise<void> {
+    if (!this.isAuthorizedRequest(req)) {
+      writeBridgeHttpError(res, 401, "bridge_unauthorized", "Unauthorized");
+      return;
+    }
+
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathParts = url.pathname
       .split("/")
@@ -377,19 +883,57 @@ export class CodexBridgeService implements CodexBridgeController {
       .map((part) => decodeURIComponent(part));
 
     if (req.method === "GET" && url.pathname === "/readyz") {
-      this.writeJson(res, 200, this.getStatus());
+      writeJson(res, 200, this.getStatus());
       return;
     }
     if (req.method === "GET" && url.pathname === "/status") {
-      this.writeJson(res, 200, this.getStatus());
+      writeJson(res, 200, this.getStatus());
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/events") {
+      // SSE change signal for the main server's poll-on-push subscription.
+      this.eventNotifier.attach(res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/usage") {
+      writeJson(
+        res,
+        200,
+        await this.getUsage({ fresh: url.searchParams.get("fresh") === "1" }),
+      );
       return;
     }
     if (req.method === "GET" && url.pathname === "/sessions") {
-      this.writeJson(res, 200, { sessions: this.listSessions() });
+      // Same freshness rule as /session-views: both are projections of the
+      // session map. This list is fetched on demand (session-locator misses,
+      // the main server's /api/codex-bridge/sessions), and at ~100 KiB an
+      // unconditional response was a full re-parse per lookup.
+      const etag = this.eventNotifier.snapshotEtag();
+      res.setHeader("etag", etag);
+      res.setHeader("cache-control", "no-cache");
+      if (req.headers["if-none-match"] === etag) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
+      writeJson(res, 200, { sessions: this.listSessions() });
       return;
     }
     if (req.method === "GET" && url.pathname === "/session-views") {
-      this.writeJson(res, 200, { sessions: this.listSessionViews() });
+      const revision = this.eventNotifier.getRevision();
+      const etag = this.eventNotifier.snapshotEtag(revision);
+      res.setHeader("etag", etag);
+      res.setHeader("cache-control", "no-cache");
+      if (req.headers["if-none-match"] === etag) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
+      writeJson(res, 200, {
+        instanceId: this.eventNotifier.getInstanceId(),
+        revision,
+        sessions: this.listSessionViews(),
+      });
       return;
     }
 
@@ -399,114 +943,306 @@ export class CodexBridgeService implements CodexBridgeController {
         const session =
           this.listSessions().find((candidate) => candidate.id === sessionId) ??
           null;
-        this.writeJson(res, 200, { session });
+        writeJson(res, 200, { session });
         return;
       }
       if (req.method === "GET" && pathParts[2] === "view") {
-        this.writeJson(res, 200, {
+        writeJson(res, 200, {
           sessionView: this.getSessionView(sessionId),
         });
         return;
       }
       if (req.method === "GET" && pathParts[2] === "active") {
-        this.writeJson(res, 200, {
-          active: this.isSessionActive(sessionId),
+        const active = this.isSessionActive(sessionId);
+        writeJson(res, 200, {
+          active,
+          ...(active
+            ? { mcpProfile: this.getSessionExecutionProfile(sessionId) }
+            : {}),
         });
         return;
       }
       if (req.method === "GET" && pathParts[2] === "pending-input") {
-        this.writeJson(res, 200, {
+        writeJson(res, 200, {
           request: this.getPendingInputRequest(sessionId),
         });
         return;
       }
+      if (
+        req.method === "POST" &&
+        (pathParts[2] === "input-binding" || pathParts[2] === "input")
+      ) {
+        if (!this.hasValidControlBearer(req)) {
+          writeBridgeHttpError(
+            res,
+            401,
+            "bridge_control_unauthorized",
+            "Unauthorized",
+          );
+          return;
+        }
+        if (
+          req.headers.origin !== undefined ||
+          readSingleHeader(req, "x-yep-anywhere") !== "true"
+        ) {
+          writeBridgeHttpError(
+            res,
+            403,
+            "bridge_control_forbidden",
+            "Forbidden",
+          );
+          return;
+        }
+      }
+      if (req.method === "POST" && pathParts[2] === "input-binding") {
+        const body = await readJsonBody(req);
+        const requestId = readBodyString(body, "requestId");
+        const operationId = readBodyString(body, "operationId");
+        const operationVersion = body?.operationVersion;
+        if (
+          !requestId ||
+          !operationId ||
+          !isValidOperationId(operationId) ||
+          !Number.isSafeInteger(operationVersion) ||
+          (operationVersion as number) < 0
+        ) {
+          writeBridgeHttpError(
+            res,
+            409,
+            "interaction_identity_invalid",
+            "Interaction identity is invalid",
+          );
+          return;
+        }
+        if (!this.pendingByInputId.has(requestId)) {
+          writeBridgeHttpError(
+            res,
+            404,
+            "interaction_not_found",
+            "Pending interaction not found",
+          );
+          return;
+        }
+        const bound = this.bindPendingInputInteraction(sessionId, requestId, {
+          operationId,
+          operationVersion: operationVersion as number,
+        });
+        if (!bound) {
+          writeBridgeHttpError(
+            res,
+            409,
+            "interaction_binding_conflict",
+            "Interaction binding is stale or conflicts with the pending request",
+          );
+          return;
+        }
+        writeJson(res, 200, { bound: true });
+        return;
+      }
       if (req.method === "POST" && pathParts[2] === "input") {
         const body = await readJsonBody(req);
-        const requestId =
-          body && typeof body.requestId === "string" ? body.requestId : null;
+        const requestId = readBodyString(body, "requestId");
         const response = parseBridgeInputResponse(body?.response);
         const answers =
           body && typeof body.answers === "object" && body.answers !== null
-            ? (body.answers as Record<string, string>)
+            ? (body.answers as UserQuestionAnswers)
             : undefined;
+        const context = parseInputResolutionContext(body);
 
         if (!requestId || !response) {
-          this.writeJson(res, 400, {
+          writeJson(res, 400, {
             error: "requestId and response are required",
           });
           return;
         }
-
-        this.writeJson(res, 200, {
-          accepted: this.respondToInput(
-            sessionId,
-            requestId,
-            response,
-            answers,
-          ),
-        });
+        if (!context) {
+          writeBridgeHttpError(
+            res,
+            409,
+            "interaction_identity_required",
+            "A broker operation identity, claimed version, and actor are required",
+          );
+          return;
+        }
+        if (!this.pendingByInputId.has(requestId)) {
+          writeBridgeHttpError(
+            res,
+            404,
+            "interaction_not_found",
+            "Pending interaction not found",
+          );
+          return;
+        }
+        const accepted = this.respondToInput(
+          sessionId,
+          requestId,
+          response,
+          answers,
+          context,
+        );
+        if (!accepted) {
+          writeBridgeHttpError(
+            res,
+            409,
+            "interaction_resolution_conflict",
+            "Interaction is stale, already resolved, or rejected",
+          );
+          return;
+        }
+        writeJson(res, 200, { accepted: true });
         return;
       }
     }
 
-    this.writeJson(res, 404, { error: "Not found" });
+    writeJson(res, 404, { error: "Not found" });
   }
 
-  private writeJson(res: ServerResponse, status: number, body: unknown): void {
-    res.writeHead(status, { "content-type": "application/json" });
-    res.end(JSON.stringify(body));
+  private isAuthorizedRequest(req: IncomingMessage): boolean {
+    if (this.requiresAuthentication) return this.hasValidBearer(req);
+    return isLocalAddress(req.socket.remoteAddress ?? "");
+  }
+
+  private hasValidBearer(req: IncomingMessage): boolean {
+    return (
+      bearerTokenMatches(req.headers.authorization, this.controlToken) ||
+      bearerTokenMatches(req.headers.authorization, this.remoteAuthToken)
+    );
+  }
+
+  private hasValidControlBearer(req: IncomingMessage): boolean {
+    return bearerTokenMatches(
+      req.headers.authorization,
+      this.controlToken ?? this.remoteAuthToken,
+    );
   }
 
   private handleConnection(downstream: WebSocket, req: IncomingMessage): void {
-    const remoteAddress = req.socket.remoteAddress ?? "";
-    if (!this.isLocalAddress(remoteAddress)) {
-      downstream.close(1008, "Codex bridge only accepts local connections");
+    if (!this.isAuthorizedRequest(req)) {
+      downstream.close(1008, "Codex bridge authentication required");
       return;
     }
 
-    const profile = parseMcpProfile(req.url, req.headers.authorization);
+    const profile = parseMcpProfile(
+      req.url,
+      req.headers.authorization,
+      readSingleHeader(req, "x-yep-codex-profile"),
+      this.requiresAuthentication,
+    );
+    const connectionId = this.nextConnectionId++;
+    const eventIdentity = createCodexBridgeEventIdentity({
+      serviceInstanceId: this.journalInstanceId,
+      connectionId,
+      profile,
+    });
     const connection: BridgeConnection = {
-      id: this.nextConnectionId++,
+      id: connectionId,
       profile,
       downstream,
       upstream: null,
       downstreamQueue: [],
       pendingClientRequests: new Map(),
+      pendingInternalRequests: new Map(),
       pendingServerRequests: new Map(),
       resolvedServerRequestIds: new Set(),
       threadIds: new Set(),
+      downstreamAttached: true,
       closed: false,
+      connectionSessionId: eventIdentity.connectionSessionId,
+      legacyEventSpine: this.legacyEventStore
+        ? new CodexBridgeEventSpine({
+            store: this.legacyEventStore,
+            ...eventIdentity,
+            onPersistenceError: (stage, error) => {
+              this.lastError = `Codex event spine ${stage} persistence failed: ${classifyCodexError(error).publicMessage}`;
+            },
+          })
+        : null,
+      upstreamReady: null,
+      clientFrameChain: Promise.resolve(),
+      serverFrameChain: Promise.resolve(),
+      nextInternalRequestId: 1,
     };
     this.connections.set(connection.id, connection);
     console.log(
-      `[CodexBridge] Connection ${connection.id} profile=${profile} request=${req.url ?? "/"}`,
+      `[CodexBridge] Connection ${connection.id} profile=${profile} request=websocket`,
     );
 
     downstream.on("message", (data, isBinary) => {
-      if (!this.observeClientData(connection, data)) {
-        return;
-      }
-      if (connection.upstream?.readyState === WebSocket.OPEN) {
-        sendFrame(connection.upstream, data, isBinary);
-      } else {
-        connection.downstreamQueue.push({ data, isBinary });
-      }
+      this.enqueueFrameTask(connection, "client", () =>
+        this.forwardClientFrame(connection, data, isBinary),
+      );
     });
-    downstream.on("close", () => this.closeConnection(connection, "client"));
+    downstream.on("close", () =>
+      this.handleDownstreamClosed(connection, "client"),
+    );
     downstream.on("error", (error) => {
-      this.lastError = error.message;
-      this.closeConnection(connection, "client-error");
+      this.lastError = projectBridgePublicDiagnostic(error).publicMessage;
+      this.handleDownstreamClosed(connection, "client-error");
     });
 
-    this.connectUpstream(connection).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      this.lastError = message;
-      console.warn(`[CodexBridge] Upstream connection failed: ${message}`);
+    const upstreamReady = this.connectUpstream(connection);
+    connection.upstreamReady = upstreamReady;
+    upstreamReady.catch((error: unknown) => {
+      const diagnostic = projectBridgePublicDiagnostic(error);
+      this.lastError = diagnostic.publicMessage;
+      console.warn(
+        `[CodexBridge] Upstream connection failed ${diagnostic.logFields}`,
+      );
       if (downstream.readyState === WebSocket.OPEN) {
         downstream.close(1011, "Failed to connect Codex app-server");
       }
       this.closeConnection(connection, "upstream-connect-error");
     });
+  }
+
+  private async forwardClientFrame(
+    connection: BridgeConnection,
+    data: RawData,
+    isBinary: boolean,
+  ): Promise<void> {
+    if (connection.closed) return;
+    const forwardedFrame = await this.observeClientData(
+      connection,
+      data,
+      isBinary,
+    );
+    if (!forwardedFrame || connection.closed) return;
+    this.sendClientFrameToUpstream(connection, forwardedFrame);
+  }
+
+  private sendClientFrameToUpstream(
+    connection: BridgeConnection,
+    frame: ForwardedFrame,
+  ): void {
+    if (connection.closed) return;
+    if (connection.upstream?.readyState === WebSocket.OPEN) {
+      const startedAt = performance.now();
+      sendFrame(connection.upstream, frame.data, frame.isBinary);
+      this.metrics.observeForward(performance.now() - startedAt);
+    } else {
+      connection.downstreamQueue.push(frame);
+    }
+  }
+
+  private sendServerFramesToDownstream(
+    connection: BridgeConnection,
+    forwardedFrames: readonly ForwardedFrame[],
+  ): void {
+    for (const forwardedFrame of forwardedFrames) {
+      if (
+        connection.closed ||
+        connection.downstream.readyState !== WebSocket.OPEN
+      ) {
+        break;
+      }
+      const startedAt = performance.now();
+      sendFrame(
+        connection.downstream,
+        forwardedFrame.data,
+        forwardedFrame.isBinary,
+      );
+      this.metrics.observeForward(performance.now() - startedAt);
+    }
   }
 
   private async connectUpstream(connection: BridgeConnection): Promise<void> {
@@ -519,7 +1255,7 @@ export class CodexBridgeService implements CodexBridgeController {
 
       upstream.on("open", () => {
         console.log(
-          `[CodexBridge] Connection ${connection.id} profile=${connection.profile} upstream=${upstreamUrl}`,
+          `[CodexBridge] Connection ${connection.id} profile=${connection.profile} upstream=${sanitizeBridgePublicUrl(upstreamUrl) ?? "configured"}`,
         );
         while (
           connection.downstreamQueue.length > 0 &&
@@ -530,32 +1266,92 @@ export class CodexBridgeService implements CodexBridgeController {
             sendFrame(upstream, frame.data, frame.isBinary);
           }
         }
+        this.maybeCloseDetachedConnection(connection, "upstream-open");
         resolve();
       });
 
       upstream.on("message", (data, isBinary) => {
-        const forwardedFrame = this.observeServerData(
-          connection,
-          data,
-          isBinary,
-        );
-        if (connection.downstream.readyState === WebSocket.OPEN) {
-          if (forwardedFrame) {
-            sendFrame(
-              connection.downstream,
-              forwardedFrame.data,
-              forwardedFrame.isBinary,
+        if (connection.closed) return;
+        if (this.journalMode === "legacy-blocking") {
+          this.enqueueFrameTask(connection, "server", async () => {
+            if (connection.closed) return;
+            const forwardedFrames = await this.observeServerDataLegacy(
+              connection,
+              data,
+              isBinary,
             );
-          }
+            this.sendServerFramesToDownstream(connection, forwardedFrames);
+            this.maybeCloseDetachedConnection(connection, "server-frame");
+          });
+          return;
+        }
+        try {
+          const forwardedFrames = this.observeServerDataLightweight(
+            connection,
+            data,
+            isBinary,
+          );
+          this.sendServerFramesToDownstream(connection, forwardedFrames);
+          this.maybeCloseDetachedConnection(connection, "server-frame");
+        } catch (error) {
+          this.handleFrameProcessingError(connection, "server", error);
         }
       });
 
       upstream.on("close", () => this.closeConnection(connection, "upstream"));
       upstream.on("error", (error) => {
-        this.lastError = error.message;
+        this.lastError = projectBridgePublicDiagnostic(error).publicMessage;
         reject(error);
       });
     });
+  }
+
+  private handleDownstreamClosed(
+    connection: BridgeConnection,
+    reason: string,
+  ): void {
+    if (connection.closed || !connection.downstreamAttached) return;
+    connection.downstreamAttached = false;
+    if (this.shouldRetainDetachedConnection(connection)) {
+      console.log(
+        `[CodexBridge] Retaining detached connection ${connection.id} while Codex is active`,
+      );
+      return;
+    }
+    this.closeConnection(connection, reason);
+  }
+
+  private shouldRetainDetachedConnection(
+    connection: BridgeConnection,
+  ): boolean {
+    if (connection.downstreamAttached || connection.closed) return false;
+    if (
+      connection.downstreamQueue.length > 0 ||
+      connection.pendingClientRequests.size > 0 ||
+      connection.pendingInternalRequests.size > 0 ||
+      connection.pendingServerRequests.size > 0
+    ) {
+      return true;
+    }
+    for (const threadId of connection.threadIds) {
+      const activity = this.sessions.get(threadId)?.activity;
+      if (activity === "in-turn" || activity === "waiting-input") return true;
+    }
+    return false;
+  }
+
+  private maybeCloseDetachedConnection(
+    connection: BridgeConnection,
+    reason: string,
+  ): void {
+    if (
+      connection.downstreamAttached ||
+      connection.closed ||
+      this.shouldRetainDetachedConnection(connection)
+    ) {
+      return;
+    }
+    this.closeConnection(connection, reason);
   }
 
   private closeConnection(connection: BridgeConnection, reason: string): void {
@@ -563,15 +1359,30 @@ export class CodexBridgeService implements CodexBridgeController {
     connection.closed = true;
 
     this.connections.delete(connection.id);
+    for (const pending of connection.pendingInternalRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(
+        new Error(
+          `Codex bridge connection closed during ${pending.method}: ${reason}`,
+        ),
+      );
+    }
+    connection.pendingInternalRequests.clear();
     for (const pending of connection.pendingServerRequests.values()) {
       this.resolvePendingRequest(pending, reason);
     }
     connection.pendingServerRequests.clear();
 
-    if (connection.downstream.readyState === WebSocket.OPEN) {
+    if (
+      connection.downstream.readyState === WebSocket.OPEN ||
+      connection.downstream.readyState === WebSocket.CONNECTING
+    ) {
       connection.downstream.close();
     }
-    if (connection.upstream?.readyState === WebSocket.OPEN) {
+    if (
+      connection.upstream?.readyState === WebSocket.OPEN ||
+      connection.upstream?.readyState === WebSocket.CONNECTING
+    ) {
       connection.upstream.close();
     }
 
@@ -582,77 +1393,363 @@ export class CodexBridgeService implements CodexBridgeController {
       record.updatedAt = new Date().toISOString();
       if (record.connectionIds.size === 0) {
         record.activity = "idle";
+        record.turnActive = false;
+        record.activityBeforePending = undefined;
         record.pendingInputType = undefined;
         this.emitSessionStatus(record, { owner: "none" });
         this.emitProcessState(record, "idle");
       }
     }
+    this.schedulePersist();
   }
 
-  private observeClientData(
+  private enqueueFrameTask(
+    connection: BridgeConnection,
+    direction: "client" | "server",
+    operation: () => Promise<void>,
+  ): void {
+    const previous =
+      direction === "client"
+        ? connection.clientFrameChain
+        : connection.serverFrameChain;
+    const task = previous.then(operation).catch((error: unknown) => {
+      if (error instanceof CodexBridgeEventPersistenceError) {
+        this.lastError = error.message;
+        console.warn(
+          `[CodexBridge] Event spine persistence failed stage=${error.stage} connection=${connection.id}; closing connection`,
+        );
+        if (connection.downstream.readyState === WebSocket.OPEN) {
+          connection.downstream.close(1011, "Codex event persistence failed");
+        }
+        if (connection.upstream?.readyState === WebSocket.OPEN) {
+          connection.upstream.close(1011, "Codex event persistence failed");
+        }
+        this.closeConnection(connection, "event-spine-persistence-error");
+        return;
+      }
+      this.handleFrameProcessingError(connection, direction, error);
+    });
+    if (direction === "client") {
+      connection.clientFrameChain = task;
+    } else {
+      connection.serverFrameChain = task;
+    }
+    this.eventTasks.add(task);
+    void task.then(() => this.eventTasks.delete(task));
+  }
+
+  private handleFrameProcessingError(
+    connection: BridgeConnection,
+    direction: "client" | "server",
+    error: unknown,
+  ): void {
+    const diagnostic = classifyCodexError(error);
+    this.lastError = diagnostic.publicMessage;
+    console.warn(
+      `[CodexBridge] ${direction} frame processing failed connection=${connection.id} code=${diagnostic.code} category=${diagnostic.category} retryable=${String(diagnostic.retryable)}`,
+    );
+    this.closeConnection(connection, `${direction}-frame-error`);
+  }
+
+  private async observeClientData(
     connection: BridgeConnection,
     data: RawData,
-  ): boolean {
-    const messages = parseJsonRpcData(data);
-    if (!messages) {
-      return true;
-    }
+    isBinary: boolean,
+  ): Promise<ForwardedFrame | null> {
+    const parseStartedAt = performance.now();
+    const envelope = parseJsonRpcEnvelope(data);
+    this.metrics.observeParse(performance.now() - parseStartedAt);
+    if (!envelope) return { data, isBinary };
+    const wireBytes = rawDataByteLength(data);
 
-    let shouldForward = true;
-    for (const message of messages) {
+    const messagesToForward: JsonRpcMessage[] = [];
+    let modified = false;
+    let flushedPrefix = false;
+    for (const originalMessage of envelope.messages) {
+      if (
+        isMcpThreadLifecycleMethod(originalMessage.method) &&
+        messagesToForward.length > 0
+      ) {
+        // config/read must run after earlier protocol messages such as
+        // `initialized`. Flush a batch prefix first and rely on WebSocket
+        // ordering before issuing the internal request.
+        const prefixFrame = serializeJsonRpcEnvelope(
+          envelope.isBatch,
+          messagesToForward,
+        );
+        if (prefixFrame) {
+          this.sendClientFrameToUpstream(connection, prefixFrame);
+        }
+        messagesToForward.length = 0;
+        flushedPrefix = true;
+      }
+      const profileStartedAt = performance.now();
+      const profiledMessage = await this.applyMcpProfileToClientMessage(
+        connection,
+        originalMessage,
+      );
+      this.metrics.observeProfile(performance.now() - profileStartedAt);
+      const message = profiledMessage.message;
+      if (message !== originalMessage) modified = true;
       if (message.method && message.id !== undefined) {
+        const sessionId = this.resolveLightweightSessionId(
+          connection,
+          message.params,
+        );
+        const eventScope = connection.legacyEventSpine
+          ? await connection.legacyEventSpine.observeClientRequest(message)
+          : undefined;
         connection.pendingClientRequests.set(idKey(message.id), {
           method: message.method,
-          params: message.params,
+          sessionId: eventScope?.sessionId ?? sessionId,
+          ...(eventScope ? { eventScope } : {}),
+          ...(profiledMessage.mcpStartupCompatibilityServerIds?.length
+            ? {
+                mcpStartupCompatibilityServerIds:
+                  profiledMessage.mcpStartupCompatibilityServerIds,
+              }
+            : {}),
         });
+        this.enqueueLightweightJournal(
+          connection,
+          "client-request",
+          message,
+          wireBytes,
+          eventScope?.sessionId ?? sessionId,
+        );
+        messagesToForward.push(message);
         continue;
       }
 
       if (!message.method && message.id !== undefined) {
         const key = idKey(message.id);
+        const alreadyResolved = connection.resolvedServerRequestIds.has(key);
         const pending = this.findPendingByConnectionAndRpcId(
           connection,
           message.id,
         );
-        if (pending) {
-          this.resolvePendingRequest(pending, "tui");
+        if (alreadyResolved) {
+          continue;
         }
-        if (connection.resolvedServerRequestIds.has(key)) {
-          shouldForward = false;
+        if (connection.legacyEventSpine) {
+          await connection.legacyEventSpine.observeServerRequestResolution(
+            message,
+          );
+        }
+        if (pending) {
+          this.enqueueLightweightJournal(
+            connection,
+            "server-request-resolution",
+            message,
+            wireBytes,
+            pending.threadId,
+            pending.method,
+          );
+          this.markLogicalRequestResolved(pending, connection);
+          this.resolveLogicalRequest(pending, "tui");
         }
       }
+      messagesToForward.push(message);
     }
 
-    return shouldForward;
+    if (messagesToForward.length === 0) return null;
+    if (
+      !modified &&
+      !flushedPrefix &&
+      messagesToForward.length === envelope.messages.length
+    ) {
+      return { data, isBinary };
+    }
+    return serializeJsonRpcEnvelope(envelope.isBatch, messagesToForward);
   }
 
-  private observeServerData(
+  private async applyMcpProfileToClientMessage(
+    connection: BridgeConnection,
+    message: JsonRpcMessage,
+  ): Promise<ProfiledClientMessage> {
+    if (!isMcpThreadLifecycleMethod(message.method)) {
+      return { message };
+    }
+
+    const params = asRecord(message.params) ?? {};
+    const existingConfig = asRecord(params.config) ?? {};
+    const cwd = await this.resolveMcpConfigCwd(
+      connection,
+      message.method,
+      params,
+    );
+    const configReadResult = asRecord(
+      await this.requestUpstream(connection, "config/read", {
+        includeLayers: false,
+        ...(cwd ? { cwd } : {}),
+      }),
+    );
+    if (!configReadResult || !("config" in configReadResult)) {
+      throw new Error("Codex config/read returned no effective config");
+    }
+    const mcpMode =
+      connection.profile === "light" ? "standard" : connection.profile;
+    const mcpProfile = resolveCodexMcpThreadProfile(
+      mcpMode,
+      configReadResult.config,
+      existingConfig,
+    );
+    return {
+      message: {
+        ...message,
+        params: {
+          ...params,
+          config: {
+            ...existingConfig,
+            mcp_servers: mcpProfile.threadConfig.mcp_servers,
+          },
+        },
+      },
+      mcpStartupCompatibilityServerIds:
+        mcpProfile.clientExpectedDisabledServerIds,
+    };
+  }
+
+  private async resolveMcpConfigCwd(
+    connection: BridgeConnection,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<string | undefined> {
+    const explicitCwd = getString(params.cwd);
+    if (explicitCwd) return explicitCwd;
+
+    const threadId = getString(params.threadId) ?? getString(params.thread_id);
+    if (!threadId) return undefined;
+    const known = this.sessions.get(threadId);
+    if (known?.projectPathKnown) return known.projectPath;
+    if (method === "thread/start") return undefined;
+
+    // Resume/fork requests from some Codex clients omit cwd. Resolve it from
+    // persisted thread metadata so project-level MCP config is still applied.
+    try {
+      const threadRead = asRecord(
+        await this.requestUpstream(connection, "thread/read", {
+          threadId,
+          includeTurns: false,
+        }),
+      );
+      return getString(asRecord(threadRead?.thread)?.cwd);
+    } catch (error) {
+      const diagnostic = projectBridgePublicDiagnostic(error);
+      const safeThreadId = sanitizeBridgeDiagnosticIdentifier(threadId);
+      console.debug(
+        `[CodexBridge] Could not resolve MCP cwd method=${method}${safeThreadId ? ` thread=${safeThreadId}` : ""} ${diagnostic.logFields}`,
+      );
+      return undefined;
+    }
+  }
+
+  private async requestUpstream(
+    connection: BridgeConnection,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (connection.upstreamReady) await connection.upstreamReady;
+    if (connection.closed) {
+      throw new Error("Codex bridge connection closed");
+    }
+    const upstream = connection.upstream;
+    if (!upstream || upstream.readyState !== WebSocket.OPEN) {
+      throw new Error("Codex app-server connection is not ready");
+    }
+
+    const id = `yep-internal:${connection.id}:${connection.nextInternalRequestId++}`;
+    return await new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        connection.pendingInternalRequests.delete(idKey(id));
+        reject(
+          new Error(
+            `Timed out waiting for Codex app-server ${method} after ${INTERNAL_REQUEST_TIMEOUT_MS}ms`,
+          ),
+        );
+      }, INTERNAL_REQUEST_TIMEOUT_MS);
+      connection.pendingInternalRequests.set(idKey(id), {
+        method,
+        resolve,
+        reject,
+        timeout,
+      });
+      try {
+        upstream.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+          }),
+        );
+      } catch (error) {
+        clearTimeout(timeout);
+        connection.pendingInternalRequests.delete(idKey(id));
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  private async observeServerDataLegacy(
     connection: BridgeConnection,
     data: RawData,
     isBinary: boolean,
-  ): ForwardedFrame | null {
+  ): Promise<ForwardedFrame[]> {
     const envelope = parseJsonRpcEnvelope(data);
     const messages = envelope?.messages;
     if (!messages) {
-      return { data, isBinary };
+      return [{ data, isBinary }];
     }
 
     const messagesToForward: JsonRpcMessage[] = [];
+    const compatibilityMessages: JsonRpcMessage[] = [];
+    let modified = false;
     for (const message of messages) {
+      if (!message.method && message.id !== undefined) {
+        const key = idKey(message.id);
+        const internal = connection.pendingInternalRequests.get(key);
+        if (internal) {
+          modified = true;
+          clearTimeout(internal.timeout);
+          connection.pendingInternalRequests.delete(key);
+          const error = asRecord(message.error);
+          if (error) {
+            internal.reject(
+              new Error(
+                getString(error.message) ??
+                  `Codex app-server ${internal.method} failed`,
+              ),
+            );
+          } else {
+            internal.resolve(message.result);
+          }
+          continue;
+        }
+      }
+
+      messagesToForward.push(message);
       if (message.method && message.id !== undefined) {
-        this.recordServerRequest(connection, message);
-        messagesToForward.push(message);
+        const eventSessionId =
+          await connection.legacyEventSpine?.observeServerRequest(message);
+        if (!connection.closed) {
+          this.recordServerRequest(
+            connection,
+            message,
+            eventSessionId ?? undefined,
+          );
+        }
         continue;
       }
 
       if (message.method) {
-        this.handleServerNotification(
-          connection,
-          message.method,
-          message.params,
-        );
-        if (message.method !== "mcpServer/startupStatus/updated") {
-          messagesToForward.push(message);
+        await connection.legacyEventSpine?.observeServerNotification(message);
+        if (!connection.closed) {
+          this.handleServerNotification(
+            connection,
+            message.method,
+            message.params,
+          );
         }
         continue;
       }
@@ -660,49 +1757,283 @@ export class CodexBridgeService implements CodexBridgeController {
       if (message.id !== undefined) {
         const request = connection.pendingClientRequests.get(idKey(message.id));
         if (request) {
+          await connection.legacyEventSpine?.observeClientResponse(
+            message,
+            request.eventScope,
+          );
           connection.pendingClientRequests.delete(idKey(message.id));
-          this.handleClientRequestResponse(connection, request, message);
+          if (!connection.closed) {
+            compatibilityMessages.push(
+              ...this.handleClientRequestResponse(connection, request, message),
+            );
+          }
         }
       }
+    }
+    const primaryFrame = modified
+      ? serializeJsonRpcEnvelope(envelope.isBatch, messagesToForward)
+      : { data, isBinary };
+    const frames = primaryFrame ? [primaryFrame] : [];
+    for (const message of compatibilityMessages) {
+      const frame = serializeJsonRpcEnvelope(false, [message]);
+      if (frame) frames.push(frame);
+    }
+    return frames;
+  }
+
+  /**
+   * Production data path. It performs only connection-local correlation and
+   * bounded session projection before synchronously returning the original
+   * frame. Optional journal work is enqueue-only and cannot extend this call.
+   */
+  private observeServerDataLightweight(
+    connection: BridgeConnection,
+    data: RawData,
+    isBinary: boolean,
+  ): ForwardedFrame[] {
+    const parseStartedAt = performance.now();
+    const envelope = parseJsonRpcEnvelope(data);
+    this.metrics.observeParse(performance.now() - parseStartedAt);
+    const messages = envelope?.messages;
+    if (!messages) return [{ data, isBinary }];
+
+    const wireBytes = rawDataByteLength(data);
+    const messagesToForward: JsonRpcMessage[] = [];
+    const compatibilityMessages: JsonRpcMessage[] = [];
+    let modified = false;
+    const projectionStartedAt = performance.now();
+
+    for (const message of messages) {
+      if (!message.method && message.id !== undefined) {
+        const key = idKey(message.id);
+        const internal = connection.pendingInternalRequests.get(key);
+        if (internal) {
+          modified = true;
+          clearTimeout(internal.timeout);
+          connection.pendingInternalRequests.delete(key);
+          const error = asRecord(message.error);
+          if (error) {
+            internal.reject(
+              new Error(
+                getString(error.message) ??
+                  `Codex app-server ${internal.method} failed`,
+              ),
+            );
+          } else {
+            internal.resolve(message.result);
+          }
+          continue;
+        }
+      }
+
       messagesToForward.push(message);
+      if (message.method && message.id !== undefined) {
+        const sessionId = this.resolveLightweightSessionId(
+          connection,
+          message.params,
+        );
+        // Critical ordering invariant: publish pending identity before the
+        // request can be observed by TUI/Yep/Feishu downstream consumers.
+        this.recordServerRequest(connection, message, sessionId);
+        this.enqueueLightweightJournal(
+          connection,
+          "server-request",
+          message,
+          wireBytes,
+          sessionId,
+        );
+        continue;
+      }
+
+      if (message.method) {
+        const classification = classifyCodexBridgeNotification(message.method);
+        if (classification === "delta") {
+          this.metrics.observeDeltaFrame();
+        } else {
+          if (classification === "diagnostic") {
+            this.metrics.observeDiagnosticFrame();
+          }
+          this.handleServerNotification(
+            connection,
+            message.method,
+            message.params,
+          );
+        }
+        this.enqueueLightweightJournal(
+          connection,
+          "server-notification",
+          message,
+          wireBytes,
+          this.resolveLightweightSessionId(connection, message.params),
+        );
+        continue;
+      }
+
+      if (message.id !== undefined) {
+        const key = idKey(message.id);
+        const request = connection.pendingClientRequests.get(key);
+        if (request) {
+          connection.pendingClientRequests.delete(key);
+          this.enqueueLightweightJournal(
+            connection,
+            "client-response",
+            message,
+            wireBytes,
+            request.sessionId,
+            request.method,
+          );
+          compatibilityMessages.push(
+            ...this.handleClientRequestResponse(connection, request, message),
+          );
+        }
+      }
     }
 
-    if (messagesToForward.length === messages.length) {
-      return { data, isBinary };
+    this.metrics.observeProjection(performance.now() - projectionStartedAt);
+    const primaryFrame = modified
+      ? serializeJsonRpcEnvelope(envelope.isBatch, messagesToForward)
+      : { data, isBinary };
+    const frames = primaryFrame ? [primaryFrame] : [];
+    for (const message of compatibilityMessages) {
+      const frame = serializeJsonRpcEnvelope(false, [message]);
+      if (frame) frames.push(frame);
+    }
+    return frames;
+  }
+
+  private resolveLightweightSessionId(
+    connection: BridgeConnection,
+    value: unknown,
+  ): string {
+    return readBridgeThreadId(value) ?? connection.connectionSessionId;
+  }
+
+  private enqueueLightweightJournal(
+    connection: BridgeConnection,
+    kind: CodexBridgeJournalRecordKind,
+    message: JsonRpcMessage,
+    wireBytes: number,
+    suppliedSessionId: string,
+    suppliedMethod?: string,
+  ): void {
+    const writer = this.journalWriter;
+    if (!writer) return;
+    const rawMethod = suppliedMethod ?? message.method ?? "response";
+    if (
+      (kind === "client-request" || kind === "client-response") &&
+      !shouldJournalClientMethod(this.journalMode, rawMethod)
+    ) {
+      return;
+    }
+    if (
+      kind === "server-notification" &&
+      !shouldJournalServerNotification(this.journalMode, rawMethod)
+    ) {
+      return;
     }
 
-    if (messagesToForward.length === 0) {
-      return null;
-    }
-
-    return {
-      data: Buffer.from(
-        JSON.stringify(
-          envelope.isBatch ? messagesToForward : messagesToForward[0],
-        ),
-      ),
-      isBinary: false,
-    };
+    const params = asRecord(message.params);
+    const result = asRecord(message.result);
+    const nestedTurn = asRecord(params?.turn);
+    const nestedItem = asRecord(params?.item);
+    const nestedThread = asRecord(params?.thread) ?? asRecord(result?.thread);
+    const sessionId = sanitizeBridgeDiagnosticIdentifier(
+      readBridgeThreadId(message.params) ??
+        readBridgeThreadId(message.result) ??
+        suppliedSessionId,
+    );
+    const turnId = sanitizeBridgeDiagnosticIdentifier(
+      getString(params?.turnId) ?? getString(nestedTurn?.id),
+    );
+    const itemId = sanitizeBridgeDiagnosticIdentifier(
+      getString(params?.itemId) ??
+        getString(params?.callId) ??
+        getString(nestedItem?.id),
+    );
+    const status = sanitizeBridgeDiagnosticIdentifier(
+      getString(params?.status) ??
+        getString(nestedTurn?.status) ??
+        getString(asRecord(nestedThread?.status)?.type),
+    );
+    const classification =
+      kind === "server-notification"
+        ? classifyCodexBridgeNotification(rawMethod)
+        : kind === "client-response"
+          ? "response"
+          : "request";
+    const terminal =
+      kind === "server-request" ||
+      kind === "server-request-resolution" ||
+      CODEX_BRIDGE_TERMINAL_METHODS.has(rawMethod);
+    const coalesceKey = terminal
+      ? undefined
+      : classification === "delta" ||
+          rawMethod === "thread/status/changed" ||
+          rawMethod === "thread/tokenUsage/updated" ||
+          rawMethod === "thread/name/updated" ||
+          rawMethod === "thread/goal/updated"
+        ? [
+            connection.id,
+            sessionId ?? "connection",
+            safeCodexBridgeMethod(rawMethod),
+            itemId ?? "",
+          ].join(":")
+        : undefined;
+    const startedAt = performance.now();
+    writer.enqueue(
+      createCodexBridgeJournalRecord({
+        instanceId: this.journalInstanceId,
+        mode: this.journalMode as "lifecycle" | "full",
+        kind,
+        classification,
+        direction:
+          kind === "client-request" || kind === "server-request-resolution"
+            ? "client"
+            : "server",
+        connectionId: connection.id,
+        profile: connection.profile,
+        method: safeCodexBridgeMethod(rawMethod),
+        ...(sessionId ? { sessionId } : {}),
+        ...(turnId ? { turnId } : {}),
+        ...(itemId ? { itemId } : {}),
+        ...(status ? { status } : {}),
+        ...(message.id === undefined
+          ? {}
+          : {
+              requestId:
+                typeof message.id === "string"
+                  ? message.id.slice(0, 2_048)
+                  : message.id,
+            }),
+        wireBytes,
+      }),
+      {
+        connectionId: connection.id,
+        ...(coalesceKey ? { coalesceKey } : {}),
+        priority: terminal ? "terminal" : "normal",
+      },
+    );
+    this.metrics.observeEnqueue(performance.now() - startedAt);
   }
 
   private handleClientRequestResponse(
     connection: BridgeConnection,
     request: ClientRequestRecord,
     response: JsonRpcMessage,
-  ): void {
+  ): JsonRpcMessage[] {
     if (
       request.method !== "thread/start" &&
       request.method !== "thread/resume" &&
       request.method !== "thread/fork" &&
       request.method !== "thread/read"
     ) {
-      return;
+      return [];
     }
 
     const result = asRecord(response.result);
-    if (!result) return;
+    if (!result) return [];
     const thread = asRecord(result.thread);
-    if (!thread) return;
+    if (!thread) return [];
 
     this.upsertThread(connection, thread, {
       cwd: getString(result.cwd) ?? getString(thread.cwd),
@@ -710,6 +2041,27 @@ export class CodexBridgeService implements CodexBridgeController {
       reasoningEffort: getString(result.reasoningEffort),
       serviceTier: getString(result.serviceTier),
     });
+
+    const threadId = getString(thread.id);
+    if (!threadId || !request.mcpStartupCompatibilityServerIds?.length) {
+      return [];
+    }
+
+    // Codex 0.147's TUI derives its expected MCP startup set from the local,
+    // unprofiled config, while app-server correctly emits events only for the
+    // thread's effective profile. Terminal ready sentinels make that client-
+    // side accounting converge; they do not enable servers or advertise tools,
+    // and deliberately stay out of the bridge event spine and diagnostics.
+    return request.mcpStartupCompatibilityServerIds.map((name) => ({
+      method: "mcpServer/startupStatus/updated",
+      params: {
+        threadId,
+        name,
+        status: "ready",
+        error: null,
+        failureReason: null,
+      },
+    }));
   }
 
   private handleServerNotification(
@@ -719,6 +2071,11 @@ export class CodexBridgeService implements CodexBridgeController {
   ): void {
     const p = asRecord(params);
     switch (method) {
+      case "item/started":
+      case "item/completed": {
+        this.recordCollaborationThreadMetadata(p);
+        break;
+      }
       case "thread/started": {
         const thread = asRecord(p?.thread);
         if (thread) {
@@ -734,17 +2091,27 @@ export class CodexBridgeService implements CodexBridgeController {
         if (!threadId) break;
         this.trackThreadConnection(connection, threadId);
         const record = this.ensureSessionRecord(threadId, {});
-        const activity = this.activityFromThreadStatus(p?.status);
-        record.activity = activity;
-        if (activity !== "waiting-input") {
-          record.pendingInputType = undefined;
+        const pending = this.findPendingForThread(threadId);
+        const statusActivity = this.activityFromThreadStatus(p?.status);
+        const activity = pending ? "waiting-input" : statusActivity;
+        record.turnActive = statusActivity !== "idle";
+        if (getString(asRecord(p?.status)?.type) === "systemError") {
+          record.lastTurnStatus = "failed";
         }
+        record.activityBeforePending = pending
+          ? statusActivity === "idle"
+            ? "idle"
+            : "in-turn"
+          : undefined;
+        record.activity = activity;
+        record.pendingInputType = pending?.pendingInputType;
         record.updatedAt = new Date().toISOString();
         this.emitSessionStatus(
           record,
           bridgeOwnership(this.isSessionActive(threadId)),
         );
         this.emitProcessState(record, activity, record.pendingInputType);
+        this.schedulePersist();
         break;
       }
       case "thread/name/updated": {
@@ -752,7 +2119,7 @@ export class CodexBridgeService implements CodexBridgeController {
         if (!threadId) break;
         const record = this.sessions.get(threadId);
         if (!record) break;
-        const name = getString(p?.threadName);
+        const name = sanitizeBridgePublicTitle(getString(p?.threadName));
         if (name) {
           record.title = name;
           record.fullTitle = name;
@@ -761,16 +2128,81 @@ export class CodexBridgeService implements CodexBridgeController {
         }
         break;
       }
+      case "thread/goal/updated":
+      case "thread/goal/cleared": {
+        const threadId = getString(p?.threadId);
+        if (!threadId) break;
+        const record = this.sessions.get(threadId);
+        if (!record) break;
+        record.updatedAt = new Date().toISOString();
+        this.emitSessionUpdated(record);
+        break;
+      }
       case "turn/started": {
         const threadId = getString(p?.threadId);
         if (!threadId) break;
         this.trackThreadConnection(connection, threadId);
         const record = this.ensureSessionRecord(threadId, {});
-        record.activity = "in-turn";
+        const pending = this.findPendingForThread(threadId);
+        record.turnActive = true;
+        record.lastTurnStatus = undefined;
+        record.lastErrorMessage = undefined;
+        record.activityBeforePending = pending ? "in-turn" : undefined;
+        record.activity = pending ? "waiting-input" : "in-turn";
         record.updatedAt = new Date().toISOString();
         this.emitSessionCreated(record);
         this.emitSessionStatus(record, { owner: "external" });
-        this.emitProcessState(record, "in-turn");
+        this.emitProcessState(record, record.activity, record.pendingInputType);
+        this.schedulePersist();
+        break;
+      }
+      case "turn/plan/updated": {
+        const threadId = getString(p?.threadId);
+        if (!threadId) break;
+        const record = this.sessions.get(threadId);
+        if (!record) break;
+        // The code-mode exec call is persisted before update_plan runs. Tell
+        // Yep clients to reload that durable message so the nested plan card
+        // appears while an external Codex turn is still active.
+        record.updatedAt = new Date().toISOString();
+        this.emitSessionUpdated(record, "codex-plan-updated");
+        break;
+      }
+      case "thread/tokenUsage/updated": {
+        const threadId = getString(p?.threadId);
+        if (!threadId) break;
+        const record = this.sessions.get(threadId);
+        if (!record) break;
+        const tokenUsage = asRecord(p?.tokenUsage);
+        const last = asRecord(tokenUsage?.last);
+        // Mirror codex-reader semantics: normally the context meter tracks the
+        // latest turn's fresh input tokens. Immediately after compaction Codex
+        // reports inputTokens=0 and puts the compacted summary size in
+        // last.totalTokens, which is the new current context fill.
+        const freshInputTokens =
+          typeof last?.inputTokens === "number" ? last.inputTokens : 0;
+        const compactedContextTokens =
+          typeof last?.totalTokens === "number" ? last.totalTokens : 0;
+        const inputTokens =
+          freshInputTokens > 0 ? freshInputTokens : compactedContextTokens;
+        if (inputTokens <= 0) break;
+        const reportedWindow =
+          typeof tokenUsage?.modelContextWindow === "number" &&
+          tokenUsage.modelContextWindow > 0
+            ? tokenUsage.modelContextWindow
+            : undefined;
+        const contextWindow =
+          reportedWindow ?? getModelContextWindow(record.model, "codex");
+        record.contextUsage = {
+          inputTokens,
+          percentage: Math.min(
+            100,
+            Math.round((inputTokens / contextWindow) * 100),
+          ),
+          contextWindow,
+        };
+        this.emitSessionUpdated(record);
+        this.schedulePersist();
         break;
       }
       case "turn/completed": {
@@ -778,8 +2210,37 @@ export class CodexBridgeService implements CodexBridgeController {
         if (!threadId) break;
         const record = this.sessions.get(threadId);
         if (!record) break;
-        record.messageCount += 1;
+        const turn = asRecord(p?.turn);
+        const turnId = getString(turn?.id);
+        if (!turnId || !record.completedTurnIds.has(turnId)) {
+          record.messageCount += 1;
+          if (turnId) {
+            record.completedTurnIds.add(turnId);
+            trimOldestSetValues(
+              record.completedTurnIds,
+              MAX_COMPLETED_TURN_IDS,
+            );
+          }
+        }
+        // turn/completed is the terminal notification for every turn; the
+        // turn.status field distinguishes completed/interrupted/failed.
+        const turnStatus = getString(turn?.status);
+        record.lastTurnStatus =
+          turnStatus === "failed"
+            ? "failed"
+            : turnStatus === "interrupted"
+              ? "interrupted"
+              : "completed";
+        record.lastErrorMessage =
+          turnStatus === "failed"
+            ? sanitizeBridgePublicError(
+                turn?.error ?? record.lastErrorMessage ?? "Codex turn failed",
+              )
+            : undefined;
+        this.resolvePendingForThread(threadId, "turn-completed");
+        record.turnActive = false;
         record.activity = "idle";
+        record.activityBeforePending = undefined;
         record.pendingInputType = undefined;
         record.updatedAt = new Date().toISOString();
         this.emitSessionCreated(record);
@@ -789,16 +2250,68 @@ export class CodexBridgeService implements CodexBridgeController {
           bridgeOwnership(this.isSessionActive(threadId)),
         );
         this.emitProcessState(record, "idle");
+        this.schedulePersist();
+        break;
+      }
+      case "error": {
+        // Non-retryable errors terminate the active turn. Retryable errors
+        // (willRetry=true) keep the turn alive per the app-server contract.
+        const threadId = getString(p?.threadId);
+        if (!threadId) break;
+        const record = this.sessions.get(threadId);
+        if (!record) break;
+        record.lastErrorMessage = sanitizeBridgePublicError(
+          p?.error ?? "Codex reported an error",
+        );
+        record.updatedAt = new Date().toISOString();
+        if (p?.willRetry !== true) {
+          record.lastTurnStatus = "failed";
+          record.turnActive = false;
+          this.resolvePendingForThread(threadId, "turn-error");
+          record.activity = "idle";
+          record.activityBeforePending = undefined;
+          record.pendingInputType = undefined;
+          this.emitSessionStatus(
+            record,
+            bridgeOwnership(this.isSessionActive(threadId)),
+          );
+          this.emitProcessState(record, "idle");
+        }
+        this.schedulePersist();
+        break;
+      }
+      case "thread/closed": {
+        const threadId = getString(p?.threadId);
+        if (!threadId) break;
+        this.resolvePendingForThread(threadId, "thread-closed");
+        connection.threadIds.delete(threadId);
+        const record = this.sessions.get(threadId);
+        if (!record) break;
+        record.connectionIds.delete(connection.id);
+        record.updatedAt = new Date().toISOString();
+        if (record.connectionIds.size === 0) {
+          record.activity = "idle";
+          record.turnActive = false;
+          record.activityBeforePending = undefined;
+          record.pendingInputType = undefined;
+          this.emitSessionStatus(record, { owner: "none" });
+          this.emitProcessState(record, "idle");
+        }
+        this.schedulePersist();
         break;
       }
       case "serverRequest/resolved": {
         const threadId = getString(p?.threadId);
         const requestId = p?.requestId as JsonRpcId | undefined;
         if (!threadId || requestId === undefined) break;
-        const pending = this.findPendingByThreadAndRpcId(threadId, requestId);
+        const rpcKey = idKey(requestId);
+        this.addResolvedServerRequestId(connection, rpcKey);
+        const pending =
+          this.findPendingByConnectionAndRpcId(connection, requestId) ??
+          this.findPendingByThreadAndRpcId(threadId, requestId);
         if (pending) {
-          pending.connection.resolvedServerRequestIds.add(pending.requestKey);
-          this.resolvePendingRequest(pending, "server");
+          this.markLogicalRequestResolved(pending);
+          this.resolveLogicalRequest(pending, "server");
         }
         break;
       }
@@ -809,19 +2322,88 @@ export class CodexBridgeService implements CodexBridgeController {
     }
   }
 
+  private recordCollaborationThreadMetadata(
+    params: Record<string, unknown> | null,
+  ): void {
+    const item = asRecord(params?.item);
+    if (!item) return;
+
+    const itemType = getString(item.type);
+    if (itemType === "subAgentActivity") {
+      const parentThreadId = getString(params?.threadId);
+      const agentThreadId = getString(item.agentThreadId);
+      if (!parentThreadId || !agentThreadId) return;
+      this.registerSubagentThread(parentThreadId, agentThreadId, {
+        agentPath: getString(item.agentPath),
+        activityKind: getString(item.kind),
+      });
+      return;
+    }
+
+    if (
+      itemType !== "collabAgentToolCall" ||
+      getString(item.tool) !== "spawnAgent"
+    ) {
+      return;
+    }
+
+    const parentThreadId =
+      getString(item.senderThreadId) ?? getString(params?.threadId);
+    if (!parentThreadId || !Array.isArray(item.receiverThreadIds)) return;
+
+    for (const receiverThreadId of item.receiverThreadIds) {
+      if (typeof receiverThreadId !== "string") continue;
+      this.registerSubagentThread(parentThreadId, receiverThreadId);
+    }
+  }
+
+  private registerSubagentThread(
+    parentThreadId: string,
+    threadId: string,
+    metadata: { agentPath?: string; activityKind?: string } = {},
+  ): void {
+    const parent = this.sessions.get(parentThreadId);
+    const record = this.ensureSessionRecord(threadId, {
+      cwd: parent?.projectPath,
+      isSubagent: true,
+      threadMetadataKnown: true,
+      parentThreadId,
+      agentPath: metadata.agentPath,
+    });
+
+    if (
+      metadata.activityKind === "started" ||
+      metadata.activityKind === "interacted"
+    ) {
+      record.activity = "in-turn";
+    } else if (metadata.activityKind === "interrupted") {
+      record.activity = "idle";
+    }
+    record.updatedAt = new Date().toISOString();
+  }
+
   private recordMcpStartupStatus(
     connection: BridgeConnection,
     params: Record<string, unknown> | null,
   ): void {
+    const rawError = params?.error;
+    const diagnostic =
+      rawError === null || rawError === undefined
+        ? null
+        : projectBridgePublicDiagnostic(rawError);
     const event: CodexBridgeMcpStartupEvent = {
       timestamp: new Date().toISOString(),
       profile: connection.profile,
       connectionId: connection.id,
-      error: formatDiagnosticValue(params?.error),
+      error: diagnostic?.publicMessage ?? null,
     };
-    const threadId = getString(params?.threadId);
-    const name = getString(params?.name);
-    const status = getString(params?.status);
+    const threadId = sanitizeBridgeDiagnosticIdentifier(
+      getString(params?.threadId),
+    );
+    const name = sanitizeBridgeDiagnosticIdentifier(getString(params?.name));
+    const status = sanitizeBridgeDiagnosticIdentifier(
+      getString(params?.status),
+    );
     if (threadId) event.threadId = threadId;
     if (name) event.name = name;
     if (status) event.status = status;
@@ -842,7 +2424,7 @@ export class CodexBridgeService implements CodexBridgeController {
         event.threadId ? `thread=${event.threadId}` : null,
         event.name ? `server=${event.name}` : null,
         event.status ? `status=${event.status}` : null,
-        event.error ? `error=${event.error}` : null,
+        diagnostic ? diagnostic.logFields : null,
       ]
         .filter((part): part is string => typeof part === "string")
         .join(" "),
@@ -852,29 +2434,34 @@ export class CodexBridgeService implements CodexBridgeController {
   private recordServerRequest(
     connection: BridgeConnection,
     message: JsonRpcMessage,
+    eventSessionId?: string,
   ): void {
     if (message.id === undefined || !message.method) return;
-    if (!isUserResolvableServerRequest(message.method)) return;
+    if (!isCodexInteractiveMethod(message.method)) return;
 
     const params = asRecord(message.params) ?? {};
-    const threadId = getString(params.threadId);
+    const threadId =
+      getString(params.threadId) ?? getString(params.conversationId);
     if (!threadId) return;
 
     this.trackThreadConnection(connection, threadId);
 
     const rpcKey = idKey(message.id);
-    const requestKey = this.buildPendingInputId(message, threadId, params);
+    const requestKey = buildCodexPendingInputId(
+      connection.id,
+      message,
+      threadId,
+      params,
+    );
     connection.resolvedServerRequestIds.delete(rpcKey);
     const createdAt = new Date().toISOString();
-    const inputRequest = this.toInputRequest(
+    const view = toCodexInteractiveRequestView(
       requestKey,
       message.method,
       threadId,
       params,
       createdAt,
     );
-    const pendingInputType =
-      inputRequest.type === "tool-approval" ? "tool-approval" : "user-question";
     const pending: PendingServerRequest = {
       inputId: requestKey,
       rpcId: message.id,
@@ -884,11 +2471,12 @@ export class CodexBridgeService implements CodexBridgeController {
       params,
       threadId,
       turnId: getString(params.turnId),
-      itemId: getString(params.itemId),
-      inputRequest,
-      pendingInputType,
+      itemId: getString(params.itemId) ?? getString(params.callId),
+      inputRequest: view.inputRequest,
+      pendingInputType: view.pendingInputType,
       connection,
       createdAt,
+      eventSessionId: eventSessionId ?? threadId,
     };
 
     connection.pendingServerRequests.set(requestKey, pending);
@@ -902,226 +2490,37 @@ export class CodexBridgeService implements CodexBridgeController {
 
     const cwd = getString(params.cwd);
     const record = this.ensureSessionRecord(threadId, cwd ? { cwd } : {});
+    if (record.activity !== "waiting-input") {
+      record.activityBeforePending =
+        getString(params.turnId) ||
+        message.method !== "mcpServer/elicitation/request"
+          ? "in-turn"
+          : record.activity === "in-turn"
+            ? "in-turn"
+            : "idle";
+    }
     record.activity = "waiting-input";
-    record.pendingInputType = pendingInputType;
+    record.pendingInputType = view.pendingInputType;
     record.updatedAt = createdAt;
-    this.emitSessionCreated(record);
-    this.emitSessionStatus(record, { owner: "external" });
-    this.emitProcessState(record, "waiting-input", pendingInputType);
-  }
 
-  private toInputRequest(
-    id: string,
-    method: string,
-    threadId: string,
-    params: Record<string, unknown>,
-    timestamp: string,
-  ): CodexBridgePendingInput["request"] {
-    if (method === "item/tool/requestUserInput") {
-      const questions = normalizeCodexQuestions(params.questions);
-      return {
-        id,
-        sessionId: threadId,
-        type: "question",
-        prompt: questions[0]?.question ?? "Codex needs input",
-        toolName: "AskUserQuestion",
-        toolInput: { questions, codexQuestions: params.questions ?? [] },
-        timestamp,
-      };
-    }
-
-    if (method === "mcpServer/elicitation/request") {
-      if (isMcpToolApprovalElicitation(params)) {
-        const meta = getElicitationMeta(params);
-        const prompt = getString(params.message) ?? "Allow MCP tool execution?";
-        const serverName =
-          getString(params.serverName) ??
-          getString(meta?.connector_name) ??
-          getString(meta?.connector_id);
-        const mcpToolName =
-          getString(meta?.tool_name) ?? parseMcpToolNameFromPrompt(prompt);
-        const toolTitle = getString(meta?.tool_title) ?? mcpToolName;
-
-        return {
-          id,
-          sessionId: threadId,
-          type: "tool-approval",
-          prompt,
-          toolName: "MCP",
-          toolInput: {
-            approvalKind: "mcp_tool_call",
-            approvalPrompt: prompt,
-            serverName,
-            mcpToolName,
-            toolTitle,
-            toolDescription: meta?.tool_description,
-            toolParams: meta?.tool_params,
-            toolParamsDisplay: meta?.tool_params_display,
-            persistScopes: normalizeMcpPersistScopes(meta?.persist),
-            threadId,
-            turnId: params.turnId,
-            raw: params,
-          },
-          timestamp,
-        };
+    const visibleRecord =
+      this.sessions.get(this.getTopLevelSessionId(threadId)) ?? record;
+    if (visibleRecord !== record) {
+      if (visibleRecord.activity !== "waiting-input") {
+        visibleRecord.activityBeforePending =
+          visibleRecord.activity === "in-turn" ? "in-turn" : "idle";
       }
-
-      return {
-        id,
-        sessionId: threadId,
-        type: "question",
-        prompt: getString(params.message) ?? "Codex needs MCP input",
-        toolName: "AskUserQuestion",
-        toolInput: {
-          questions: [
-            {
-              question: getString(params.message) ?? "Response",
-              options: [],
-            },
-          ],
-          raw: params,
-        },
-        timestamp,
-      };
+      visibleRecord.activity = "waiting-input";
+      visibleRecord.pendingInputType = view.pendingInputType;
+      visibleRecord.updatedAt = createdAt;
     }
-
-    if (method === "item/permissions/requestApproval") {
-      return {
-        id,
-        sessionId: threadId,
-        type: "tool-approval",
-        prompt: getString(params.reason) ?? "Allow requested permissions?",
-        toolName: "Permissions",
-        toolInput: {
-          cwd: params.cwd,
-          reason: params.reason,
-          permissions: params.permissions,
-          environmentId: params.environmentId,
-          threadId,
-          turnId: params.turnId,
-          itemId: params.itemId,
-        },
-        timestamp,
-      };
-    }
-
-    if (
-      method === "item/fileChange/requestApproval" ||
-      method === "applyPatchApproval"
-    ) {
-      return {
-        id,
-        sessionId: threadId,
-        type: "tool-approval",
-        prompt: "Allow file changes?",
-        toolName: "Edit",
-        toolInput: {
-          reason: params.reason,
-          grantRoot: params.grantRoot,
-          fileChanges: params.fileChanges,
-          threadId,
-          turnId: params.turnId,
-          itemId: params.itemId,
-        },
-        timestamp,
-      };
-    }
-
-    return {
-      id,
-      sessionId: threadId,
-      type: "tool-approval",
-      prompt: "Allow command?",
-      toolName: "Bash",
-      toolInput: {
-        command: params.command,
-        cwd: params.cwd,
-        reason: params.reason,
-        commandActions: params.commandActions,
-        additionalPermissions: params.additionalPermissions,
-        availableDecisions: params.availableDecisions,
-        networkApprovalContext: params.networkApprovalContext,
-        proposedExecpolicyAmendment: params.proposedExecpolicyAmendment,
-        proposedNetworkPolicyAmendments: params.proposedNetworkPolicyAmendments,
-        threadId,
-        turnId: params.turnId,
-        itemId: params.itemId,
-        approvalId: params.approvalId,
-      },
-      timestamp,
-    };
-  }
-
-  private buildServerRequestResponse(
-    pending: PendingServerRequest,
-    response: CodexBridgeInputResponse,
-    answers?: Record<string, string>,
-  ): unknown {
-    const approved = response !== "deny";
-    const approveForSession =
-      response === "approve_accept_edits" || response === "approve_for_session";
-    const approveAlways = response === "approve_always";
-
-    switch (pending.method) {
-      case "item/commandExecution/requestApproval":
-        return {
-          decision: approved
-            ? approveForSession
-              ? this.getCommandPersistentApprovalDecision(pending.params)
-              : "accept"
-            : "decline",
-        };
-      case "item/fileChange/requestApproval":
-        return {
-          decision: approved
-            ? approveForSession
-              ? "acceptForSession"
-              : "accept"
-            : "decline",
-        };
-      case "execCommandApproval":
-      case "applyPatchApproval":
-        return { decision: approved ? "approved" : "denied" };
-      case "item/permissions/requestApproval": {
-        if (!approved) {
-          return { permissions: {}, scope: "turn" };
-        }
-        const requested = asRecord(pending.params.permissions);
-        const granted: Record<string, unknown> = {};
-        const network = requested ? requested.network : undefined;
-        const fileSystem = requested ? requested.fileSystem : undefined;
-        if (network !== null && network !== undefined)
-          granted.network = network;
-        if (fileSystem !== null && fileSystem !== undefined)
-          granted.fileSystem = fileSystem;
-        return {
-          permissions: granted,
-          scope: approveForSession ? "session" : "turn",
-        };
-      }
-      case "item/tool/requestUserInput":
-        return {
-          answers: buildCodexUserInputAnswers(
-            pending.params.questions,
-            answers,
-          ),
-        };
-      case "mcpServer/elicitation/request":
-        if (isMcpToolApprovalElicitation(pending.params)) {
-          if (!approved) {
-            return { action: "cancel" };
-          }
-          const content: Record<string, unknown> = {};
-          if (approveForSession) content.persist = "session";
-          if (approveAlways) content.persist = "always";
-          return Object.keys(content).length > 0
-            ? { action: "accept", content }
-            : { action: "accept" };
-        }
-        return approved ? { values: answers ?? {} } : { values: {} };
-      default:
-        return {};
-    }
+    this.emitSessionCreated(visibleRecord);
+    this.emitSessionStatus(visibleRecord, { owner: "external" });
+    this.emitProcessState(
+      visibleRecord,
+      "waiting-input",
+      view.pendingInputType,
+    );
   }
 
   private resolvePendingRequest(
@@ -1129,6 +2528,7 @@ export class CodexBridgeService implements CodexBridgeController {
     _source: string,
   ): void {
     this.pendingByInputId.delete(pending.inputId);
+    this.pendingInputBindings.delete(pending.inputId);
     pending.connection.pendingServerRequests.delete(pending.requestKey);
     const ids = this.pendingIdsByThread.get(pending.threadId);
     if (ids) {
@@ -1141,20 +2541,124 @@ export class CodexBridgeService implements CodexBridgeController {
     const record = this.sessions.get(pending.threadId);
     if (!record) return;
 
-    const nextPending = this.getPendingInputRequest(pending.threadId);
-    if (nextPending) {
-      record.activity = "waiting-input";
-      record.pendingInputType =
-        nextPending.type === "tool-approval"
-          ? "tool-approval"
-          : "user-question";
-      this.emitProcessState(record, "waiting-input", record.pendingInputType);
-    } else {
-      record.pendingInputType = undefined;
-      if (record.activity === "waiting-input") {
-        record.activity = "in-turn";
-        this.emitProcessState(record, "in-turn");
+    this.updatePendingState(
+      record,
+      this.findPendingForThread(pending.threadId),
+    );
+
+    const visibleRecord = this.sessions.get(
+      this.getTopLevelSessionId(pending.threadId),
+    );
+    if (visibleRecord && visibleRecord !== record) {
+      this.updatePendingState(
+        visibleRecord,
+        this.findPendingForVisibleSession(visibleRecord.id),
+      );
+    }
+    this.maybeCloseDetachedConnection(pending.connection, "input-resolved");
+  }
+
+  private resolveLogicalRequest(
+    pending: PendingServerRequest,
+    source: string,
+  ): void {
+    for (const candidate of this.findLogicalRequests(pending)) {
+      this.resolvePendingRequest(candidate, source);
+    }
+  }
+
+  private resolvePendingForThread(threadId: string, source: string): void {
+    const ids = Array.from(this.pendingIdsByThread.get(threadId) ?? []);
+    for (const id of ids) {
+      const pending = this.pendingByInputId.get(id);
+      if (pending) this.resolvePendingRequest(pending, source);
+    }
+  }
+
+  private findLogicalRequests(
+    pending: PendingServerRequest,
+  ): PendingServerRequest[] {
+    return Array.from(this.pendingByInputId.values()).filter(
+      (candidate) =>
+        candidate.threadId === pending.threadId &&
+        candidate.rpcKey === pending.rpcKey &&
+        candidate.method === pending.method &&
+        (this.upstreamUrlOverride !== undefined ||
+          candidate.connection.profile === pending.connection.profile),
+    );
+  }
+
+  private getLogicalPendingInputCount(): number {
+    const keys = new Set<string>();
+    for (const pending of this.pendingByInputId.values()) {
+      const upstreamKey = this.upstreamUrlOverride
+        ? "external"
+        : pending.connection.profile;
+      keys.add(
+        [upstreamKey, pending.threadId, pending.rpcKey, pending.method].join(
+          "|",
+        ),
+      );
+    }
+    return keys.size;
+  }
+
+  private markLogicalRequestResolved(
+    pending: PendingServerRequest,
+    exceptConnection?: BridgeConnection,
+  ): void {
+    for (const candidate of this.findLogicalRequests(pending)) {
+      if (candidate.connection === exceptConnection) continue;
+      this.addResolvedServerRequestId(candidate.connection, candidate.rpcKey);
+    }
+  }
+
+  private addResolvedServerRequestId(
+    connection: BridgeConnection,
+    rpcKey: string,
+  ): void {
+    connection.resolvedServerRequestIds.add(rpcKey);
+    if (
+      connection.resolvedServerRequestIds.size > MAX_RESOLVED_SERVER_REQUEST_IDS
+    ) {
+      const oldest = connection.resolvedServerRequestIds.values().next().value;
+      if (typeof oldest === "string") {
+        connection.resolvedServerRequestIds.delete(oldest);
       }
+    }
+  }
+
+  private findPendingForThread(threadId: string): PendingServerRequest | null {
+    const ids = this.pendingIdsByThread.get(threadId);
+    if (!ids) return null;
+    for (const id of ids) {
+      const pending = this.pendingByInputId.get(id);
+      if (pending) return pending;
+    }
+    return null;
+  }
+
+  private updatePendingState(
+    record: SessionRecord,
+    pending: PendingServerRequest | null,
+  ): void {
+    record.updatedAt = new Date().toISOString();
+    if (pending) {
+      record.activity = "waiting-input";
+      record.pendingInputType = pending.pendingInputType;
+      this.emitProcessState(record, "waiting-input", record.pendingInputType);
+      return;
+    }
+
+    record.pendingInputType = undefined;
+    if (record.activity === "waiting-input") {
+      // Fall back to the tracked turn state: defaulting to "in-turn" left
+      // sessions stuck as "running" when the pending input outlived the turn.
+      record.activity =
+        record.activityBeforePending ??
+        (record.turnActive ? "in-turn" : "idle");
+      record.activityBeforePending = undefined;
+      this.emitProcessState(record, record.activity);
     }
   }
 
@@ -1183,66 +2687,6 @@ export class CodexBridgeService implements CodexBridgeController {
     return null;
   }
 
-  private buildPendingInputId(
-    message: JsonRpcMessage,
-    threadId: string,
-    params: Record<string, unknown>,
-  ): string {
-    return [
-      idKey(message.id as JsonRpcId),
-      message.method,
-      threadId,
-      getString(params.turnId),
-      getString(params.itemId),
-      getString(params.approvalId),
-    ]
-      .filter((part): part is string => typeof part === "string" && part !== "")
-      .join("|");
-  }
-
-  private getCommandPersistentApprovalDecision(
-    params: Record<string, unknown>,
-  ): unknown {
-    const availableDecisions = Array.isArray(params.availableDecisions)
-      ? params.availableDecisions
-      : [];
-    const offeredPersistentDecision = availableDecisions.find(
-      isPersistentCommandDecision,
-    );
-    if (offeredPersistentDecision) {
-      return offeredPersistentDecision;
-    }
-
-    const execpolicyAmendment = params.proposedExecpolicyAmendment;
-    if (Array.isArray(execpolicyAmendment)) {
-      return {
-        acceptWithExecpolicyAmendment: {
-          execpolicy_amendment: execpolicyAmendment,
-        },
-      };
-    }
-
-    const networkAmendments = Array.isArray(
-      params.proposedNetworkPolicyAmendments,
-    )
-      ? params.proposedNetworkPolicyAmendments
-      : [];
-    const networkAmendment = networkAmendments.find(
-      (value) => asRecord(value) !== null,
-    );
-    if (networkAmendment) {
-      return {
-        applyNetworkPolicyAmendment: {
-          network_policy_amendment: networkAmendment,
-        },
-      };
-    }
-
-    return availableDecisions.includes("acceptForSession")
-      ? "acceptForSession"
-      : "accept";
-  }
-
   private upsertThread(
     connection: BridgeConnection,
     thread: Record<string, unknown>,
@@ -1257,26 +2701,45 @@ export class CodexBridgeService implements CodexBridgeController {
     if (!id) return;
 
     const cwd = extra.cwd ?? getString(thread.cwd);
+    const subagent = getCodexSubagentMetadata(thread);
     const record = this.ensureSessionRecord(id, {
       cwd,
+      isSubagent: subagent.isSubagent,
+      parentThreadId: subagent.parentThreadId,
+      agentPath: subagent.agentPath,
+      agentNickname: subagent.agentNickname,
+      agentRole: subagent.agentRole,
       model: extra.model ?? getString(thread.model),
       reasoningEffort: extra.reasoningEffort,
       serviceTier: extra.serviceTier,
-      title: getString(thread.name) ?? getString(thread.preview),
+      title: sanitizeBridgePublicTitle(
+        getString(thread.name) ?? getString(thread.preview),
+      ),
       createdAt: timestampFromThreadValue(thread.createdAt),
       updatedAt: timestampFromThreadValue(thread.updatedAt),
       messageCount: Array.isArray(thread.turns)
         ? thread.turns.length
         : undefined,
     });
+    if (Array.isArray(thread.turns)) {
+      for (const rawTurn of thread.turns.slice(-MAX_COMPLETED_TURN_IDS)) {
+        const turnId = getString(asRecord(rawTurn)?.id);
+        if (turnId) record.completedTurnIds.add(turnId);
+      }
+    }
     this.trackThreadConnection(connection, id);
 
     const status = asRecord(thread.status);
     if (status) {
-      record.activity = this.activityFromThreadStatus(status);
-      if (record.activity !== "waiting-input") {
-        record.pendingInputType = undefined;
-      }
+      const pending = this.findPendingForThread(id);
+      const statusActivity = this.activityFromThreadStatus(status);
+      record.activity = pending ? "waiting-input" : statusActivity;
+      record.activityBeforePending = pending
+        ? statusActivity === "idle"
+          ? "idle"
+          : "in-turn"
+        : undefined;
+      record.pendingInputType = pending?.pendingInputType;
     }
 
     this.emitSessionCreated(record);
@@ -1290,6 +2753,12 @@ export class CodexBridgeService implements CodexBridgeController {
     threadId: string,
     values: {
       cwd?: string;
+      isSubagent?: boolean;
+      threadMetadataKnown?: boolean;
+      parentThreadId?: string;
+      agentPath?: string;
+      agentNickname?: string;
+      agentRole?: string;
       model?: string;
       reasoningEffort?: string;
       serviceTier?: string;
@@ -1304,16 +2773,26 @@ export class CodexBridgeService implements CodexBridgeController {
     const projectPath = values.cwd ?? existing?.projectPath ?? process.cwd();
     const record: SessionRecord = existing ?? {
       id: threadId,
+      isSubagent: values.isSubagent ?? false,
+      threadMetadataKnown:
+        values.threadMetadataKnown ?? values.isSubagent !== undefined,
+      parentThreadId: values.parentThreadId,
+      agentPath: values.agentPath,
+      agentNickname: values.agentNickname,
+      agentRole: values.agentRole,
       projectId: encodeProjectId(projectPath),
       projectPath,
       projectName: basename(projectPath),
+      projectPathKnown: values.cwd !== undefined,
       title: null,
       fullTitle: null,
       createdAt: values.createdAt ?? now,
       updatedAt: values.updatedAt ?? now,
       messageCount: 0,
       activity: "idle",
+      turnActive: false,
       connectionIds: new Set(),
+      completedTurnIds: new Set(),
     };
 
     if (values.cwd && values.cwd !== record.projectPath) {
@@ -1321,6 +2800,23 @@ export class CodexBridgeService implements CodexBridgeController {
       record.projectId = encodeProjectId(values.cwd);
       record.projectName = basename(values.cwd);
     }
+    if (values.cwd) {
+      record.projectPathKnown = true;
+    }
+    // Classification is monotonic: once Codex identifies a child thread, a
+    // later partial notification must not promote it back to a root session.
+    if (values.isSubagent === true) {
+      record.isSubagent = true;
+    } else if (values.isSubagent === false && !record.threadMetadataKnown) {
+      record.isSubagent = false;
+    }
+    if (values.threadMetadataKnown || values.isSubagent !== undefined) {
+      record.threadMetadataKnown = true;
+    }
+    if (values.parentThreadId) record.parentThreadId = values.parentThreadId;
+    if (values.agentPath) record.agentPath = values.agentPath;
+    if (values.agentNickname) record.agentNickname = values.agentNickname;
+    if (values.agentRole) record.agentRole = values.agentRole;
     if (values.model) record.model = values.model;
     if (values.reasoningEffort) {
       record.reasoningEffort = values.reasoningEffort;
@@ -1337,6 +2833,7 @@ export class CodexBridgeService implements CodexBridgeController {
     }
 
     this.sessions.set(threadId, record);
+    this.schedulePersist();
     return record;
   }
 
@@ -1347,6 +2844,134 @@ export class CodexBridgeService implements CodexBridgeController {
     connection.threadIds.add(threadId);
     const record = this.ensureSessionRecord(threadId, {});
     record.connectionIds.add(connection.id);
+  }
+
+  /**
+   * Debounced persistence of session metadata. The bridge previously kept all
+   * session state in memory only, so a 4510 restart forgot every external
+   * session until the TUI reconnected.
+   */
+  private schedulePersist(): void {
+    if (!this.statePath || this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      void this.persistSessions();
+    }, 500);
+    this.persistTimer.unref?.();
+  }
+
+  private persistSessions(): Promise<void> {
+    const statePath = this.statePath;
+    if (!statePath) return Promise.resolve();
+    const records: PersistedSessionRecord[] = Array.from(this.sessions.values())
+      .filter((record) => !record.isSubagent && record.projectPathKnown)
+      .map((record) => ({
+        id: record.id,
+        isSubagent: record.isSubagent,
+        threadMetadataKnown: record.threadMetadataKnown,
+        parentThreadId: record.parentThreadId,
+        projectPath: record.projectPath,
+        projectPathKnown: record.projectPathKnown,
+        title: record.title,
+        fullTitle: record.fullTitle,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        messageCount: record.messageCount,
+        model: record.model,
+        reasoningEffort: record.reasoningEffort,
+        serviceTier: record.serviceTier,
+        contextUsage: record.contextUsage,
+        lastTurnStatus: record.lastTurnStatus,
+        lastErrorMessage: record.lastErrorMessage,
+        completedTurnIds: Array.from(record.completedTurnIds),
+        emitted: this.emittedSessionIds.has(record.id),
+      }));
+    const payload = JSON.stringify({ version: 1, sessions: records });
+    const writeSnapshot = async (): Promise<void> => {
+      try {
+        await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
+        const tmpPath = `${statePath}.tmp`;
+        await writeFile(tmpPath, payload, { encoding: "utf8", mode: 0o600 });
+        await rename(tmpPath, statePath);
+      } catch (error) {
+        const diagnostic = projectBridgePublicDiagnostic(error);
+        console.warn(
+          `[CodexBridge] Failed to persist session state ${diagnostic.logFields}`,
+        );
+      }
+    };
+    this.persistChain = this.persistChain.then(writeSnapshot, writeSnapshot);
+    return this.persistChain;
+  }
+
+  private async restorePersistedSessions(): Promise<void> {
+    if (!this.statePath) return;
+    let parsed: { version?: number; sessions?: PersistedSessionRecord[] };
+    try {
+      parsed = JSON.parse(await readFile(this.statePath, "utf8"));
+    } catch {
+      return; // No state file yet, or unreadable - start fresh.
+    }
+    if (!Array.isArray(parsed.sessions)) return;
+    let needsSafeRewrite = false;
+    for (const stored of parsed.sessions) {
+      if (!stored || typeof stored.id !== "string" || !stored.projectPath) {
+        continue;
+      }
+      if (this.sessions.has(stored.id)) continue;
+      const restoredTitle = sanitizeBridgePublicTitle(stored.title);
+      const restoredFullTitle = sanitizeBridgePublicTitle(stored.fullTitle);
+      const restoredLastError =
+        typeof stored.lastErrorMessage === "string"
+          ? sanitizeBridgePublicError(stored.lastErrorMessage)
+          : undefined;
+      if (
+        restoredTitle !== (stored.title ?? undefined) ||
+        restoredFullTitle !== (stored.fullTitle ?? undefined) ||
+        restoredLastError !== stored.lastErrorMessage
+      ) {
+        needsSafeRewrite = true;
+      }
+      const record: SessionRecord = {
+        id: stored.id,
+        isSubagent: stored.isSubagent === true,
+        threadMetadataKnown: stored.threadMetadataKnown === true,
+        parentThreadId: stored.parentThreadId,
+        projectId: encodeProjectId(stored.projectPath),
+        projectPath: stored.projectPath,
+        projectName: basename(stored.projectPath),
+        projectPathKnown: stored.projectPathKnown === true,
+        title: restoredTitle ?? null,
+        fullTitle: restoredFullTitle ?? null,
+        createdAt: stored.createdAt,
+        updatedAt: stored.updatedAt,
+        messageCount:
+          typeof stored.messageCount === "number" ? stored.messageCount : 0,
+        model: stored.model,
+        reasoningEffort: stored.reasoningEffort,
+        serviceTier: stored.serviceTier,
+        contextUsage: stored.contextUsage,
+        // Restored sessions have no live connection; they are idle until a
+        // TUI reconnects and reports fresh status.
+        activity: "idle",
+        turnActive: false,
+        lastTurnStatus: stored.lastTurnStatus,
+        lastErrorMessage: restoredLastError,
+        connectionIds: new Set(),
+        completedTurnIds: new Set(
+          Array.isArray(stored.completedTurnIds)
+            ? stored.completedTurnIds.slice(-MAX_COMPLETED_TURN_IDS)
+            : [],
+        ),
+      };
+      this.sessions.set(record.id, record);
+      if (stored.emitted) {
+        this.emittedSessionIds.add(record.id);
+      }
+    }
+    if (needsSafeRewrite) {
+      await this.persistSessions();
+    }
   }
 
   private activityFromThreadStatus(
@@ -1368,11 +2993,25 @@ export class CodexBridgeService implements CodexBridgeController {
     return "in-turn";
   }
 
+  private isTopLevelSessionRecord(record: SessionRecord): boolean {
+    // projectPathKnown gate: sessions created from bare threadIds fall back
+    // to the bridge process cwd. Exposing them would file the session under
+    // the wrong project, so they stay hidden until thread metadata arrives
+    // (thread/start response or thread/started notification carries cwd).
+    return (
+      record.threadMetadataKnown &&
+      !record.isSubagent &&
+      record.projectPathKnown
+    );
+  }
+
   private emitSessionCreated(record: SessionRecord): void {
+    if (!this.isTopLevelSessionRecord(record)) return;
     const session = this.toBridgeSession(record);
     if (!this.isDisplayableBridgeSession(session)) {
       return;
     }
+    this.eventNotifier.notify(record.id);
     if (this.emittedSessionIds.has(record.id)) {
       return;
     }
@@ -1388,6 +3027,8 @@ export class CodexBridgeService implements CodexBridgeController {
     record: SessionRecord,
     ownership: SessionSummary["ownership"],
   ): void {
+    if (!this.isTopLevelSessionRecord(record)) return;
+    this.eventNotifier.notify(record.id);
     this.eventBus?.emit({
       type: "session-status-changed",
       sessionId: record.id,
@@ -1402,27 +3043,38 @@ export class CodexBridgeService implements CodexBridgeController {
     activity: "in-turn" | "idle" | "waiting-input",
     pendingInputType?: "tool-approval" | "user-question",
   ): void {
+    if (!this.isTopLevelSessionRecord(record)) return;
+    this.eventNotifier.notify(record.id);
     this.eventBus?.emit({
       type: "process-state-changed",
       sessionId: record.id,
       projectId: record.projectId,
       activity,
       pendingInputType,
+      lastTurnStatus: record.lastTurnStatus,
+      lastErrorMessage: record.lastErrorMessage,
       timestamp: new Date().toISOString(),
     });
   }
 
-  private emitSessionUpdated(record: SessionRecord): void {
+  private emitSessionUpdated(
+    record: SessionRecord,
+    trigger?: "codex-plan-updated",
+  ): void {
+    if (!this.isTopLevelSessionRecord(record)) return;
+    this.eventNotifier.notify(record.id);
     this.eventBus?.emit({
       type: "session-updated",
       sessionId: record.id,
       projectId: record.projectId,
+      ...(trigger ? { trigger } : {}),
       title: record.title,
       messageCount: record.messageCount,
       updatedAt: record.updatedAt,
       model: record.model,
       reasoningEffort: record.reasoningEffort,
       serviceTier: record.serviceTier,
+      ...(record.contextUsage ? { contextUsage: record.contextUsage } : {}),
       timestamp: new Date().toISOString(),
     });
   }
@@ -1444,6 +3096,9 @@ export class CodexBridgeService implements CodexBridgeController {
       serviceTier: record.serviceTier,
       activity: record.activity,
       pendingInputType: record.pendingInputType,
+      lastTurnStatus: record.lastTurnStatus,
+      lastErrorMessage: record.lastErrorMessage,
+      contextUsage: record.contextUsage,
       connectionIds: Array.from(record.connectionIds),
     };
   }
@@ -1463,6 +3118,9 @@ export class CodexBridgeService implements CodexBridgeController {
       model: session.model,
       reasoningEffort: session.reasoningEffort,
       serviceTier: session.serviceTier,
+      lastTurnStatus: session.lastTurnStatus,
+      lastErrorMessage: session.lastErrorMessage,
+      contextUsage: session.contextUsage,
       originator: "Yep Codex Bridge",
       createdBy: "external",
       source: "codex-bridge",
@@ -1505,42 +3163,55 @@ export class CodexBridgeService implements CodexBridgeController {
     }
 
     const startPort = this.upstreamStartPort ?? this.port + 1;
+    const state = this.getUpstreamState(profile);
+    const mcpMode = profile === "light" ? "standard" : profile;
+    const args = getCodexMcpAppServerArgs(
+      mcpMode,
+      this.upstreamArgsByProfile[profile],
+    );
     const port = await this.findAvailableManagedPort(startPort);
     const url = `ws://127.0.0.1:${port}`;
-    const state = this.getUpstreamState(profile);
-    const configuredMcpServers =
-      profile === "clear"
-        ? await discoverConfiguredCodexMcpServers(codexPath)
-        : [];
-    const discoveredArgs = getCodexMcpAppServerArgs(
-      profile === "clear" ? "clear" : "full",
-      configuredMcpServers,
-    );
-    const args = [
-      ...this.upstreamArgsByProfile[profile],
-      ...discoveredArgs.slice(
-        profile === "clear" ? CODEX_CLEAR_BASE_ARG_COUNT : 0,
-      ),
-    ];
     const spawnArgs = ["app-server", ...args, "--listen", url];
     console.log(
-      `[CodexBridge] Starting managed Codex app-server profile=${profile} path=${codexPath} args=${JSON.stringify(spawnArgs)}`,
+      `[CodexBridge] Starting managed Codex app-server profile=${profile} configuredArgs=${args.length}`,
     );
     const child = spawn(codexPath, spawnArgs, {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
       env: process.env,
     });
+    let rejectChildError: (error: Error) => void = () => undefined;
+    const childError = new Promise<never>((_resolve, reject) => {
+      rejectChildError = reject;
+    });
+    child.on("error", (error) => {
+      const diagnostic = projectBridgePublicDiagnostic(error);
+      this.lastError = diagnostic.publicMessage;
+      console.warn(
+        `[CodexBridge] Managed app-server profile=${profile} process error ${diagnostic.logFields}`,
+      );
+      rejectChildError(error);
+    });
     state.process = child;
     state.url = url;
 
     child.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8").trim();
-      if (text) console.debug(`[CodexBridge upstream:${profile}] ${text}`);
+      if (text) {
+        const diagnostic = projectBridgePublicDiagnostic(text);
+        console.debug(
+          `[CodexBridge upstream:${profile}] stdout ${diagnostic.logFields}`,
+        );
+      }
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8").trim();
-      if (text) console.debug(`[CodexBridge upstream:${profile}] ${text}`);
+      if (text) {
+        const diagnostic = projectBridgePublicDiagnostic(text);
+        console.debug(
+          `[CodexBridge upstream:${profile}] stderr ${diagnostic.logFields}`,
+        );
+      }
     });
     child.once("exit", (code, signal) => {
       this.reservedUpstreamPorts.delete(port);
@@ -1554,7 +3225,10 @@ export class CodexBridgeService implements CodexBridgeController {
     });
 
     try {
-      await waitForWebSocket(url, this.startupTimeoutMs);
+      await Promise.race([
+        waitForWebSocket(url, this.startupTimeoutMs),
+        childError,
+      ]);
     } catch (error) {
       this.reservedUpstreamPorts.delete(port);
       if (state.process === child) {
@@ -1570,7 +3244,7 @@ export class CodexBridgeService implements CodexBridgeController {
     }
 
     console.log(
-      `[CodexBridge] Managed Codex app-server profile=${profile} ready at ${url}`,
+      `[CodexBridge] Managed Codex app-server profile=${profile} ready`,
     );
     return url;
   }
@@ -1591,29 +3265,8 @@ export class CodexBridgeService implements CodexBridgeController {
     state.process = null;
     state.url = null;
     state.startPromise = null;
-    if (!child?.pid || child.exitCode !== null || child.killed) {
-      return;
-    }
-
-    const pid = process.platform !== "win32" ? -child.pid : child.pid;
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      return;
-    }
-
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {}
-        resolve();
-      }, 1500);
-      child.once("exit", () => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
+    if (!child) return;
+    await terminateProcessGroup(child);
   }
 
   private getUpstreamState(
@@ -1621,23 +3274,20 @@ export class CodexBridgeService implements CodexBridgeController {
   ): CodexBridgeUpstreamState {
     let state = this.upstreams.get(profile);
     if (!state) {
-      state = { process: null, url: null, startPromise: null };
+      state = {
+        process: null,
+        url: null,
+        startPromise: null,
+      };
       this.upstreams.set(profile, state);
     }
     return state;
   }
 
   private async findAvailableManagedPort(startPort: number): Promise<number> {
-    for (let port = Math.max(1, startPort); port < startPort + 100; port++) {
-      if (this.reservedUpstreamPorts.has(port)) continue;
-      this.reservedUpstreamPorts.add(port);
-      const available = await isPortAvailable("127.0.0.1", port);
-      if (available) {
-        return port;
-      }
-      this.reservedUpstreamPorts.delete(port);
-    }
-    throw new Error(`No available port found near ${startPort}`);
+    return findAvailablePort(startPort, {
+      reservedPorts: this.reservedUpstreamPorts,
+    });
   }
 
   private getManagedUpstreamUrl(): string | null {
@@ -1655,36 +3305,29 @@ export class CodexBridgeService implements CodexBridgeController {
     const running = this.isManagedUpstreamRunning(profile);
     return {
       profile,
-      url: this.upstreamUrlOverride ?? state?.url ?? null,
+      url: sanitizeBridgePublicUrl(
+        this.upstreamUrlOverride ?? state?.url ?? null,
+      ),
       running: this.upstreamUrlOverride ? false : running,
       starting: this.upstreamUrlOverride
         ? false
         : !!state?.startPromise && !running,
       pid: this.upstreamUrlOverride ? null : (process?.pid ?? null),
-      args: [...this.upstreamArgsByProfile[profile]],
+      args: summarizeBridgePublicArgs(this.upstreamArgsByProfile[profile]),
     };
   }
 
   private isManagedUpstreamRunning(
     profile: CodexBridgeUpstreamProfile,
   ): boolean {
-    const child = this.upstreams.get(profile)?.process;
-    return !!child && !child.killed && child.exitCode === null;
+    return isChildRunning(this.upstreams.get(profile)?.process ?? null);
   }
 
   private isAnyManagedUpstreamRunning(): boolean {
     return (
+      this.isManagedUpstreamRunning("clear") ||
       this.isManagedUpstreamRunning("light") ||
       this.isManagedUpstreamRunning("full")
-    );
-  }
-
-  private isLocalAddress(address: string): boolean {
-    return (
-      address === "127.0.0.1" ||
-      address === "::1" ||
-      address === "::ffff:127.0.0.1" ||
-      address === "localhost"
     );
   }
 }
@@ -1692,10 +3335,6 @@ export class CodexBridgeService implements CodexBridgeController {
 interface JsonRpcEnvelope {
   messages: JsonRpcMessage[];
   isBatch: boolean;
-}
-
-function parseJsonRpcData(data: RawData): JsonRpcMessage[] | null {
-  return parseJsonRpcEnvelope(data)?.messages ?? null;
 }
 
 function parseJsonRpcEnvelope(data: RawData): JsonRpcEnvelope | null {
@@ -1712,13 +3351,30 @@ function parseJsonRpcEnvelope(data: RawData): JsonRpcEnvelope | null {
   }
 }
 
+function serializeJsonRpcEnvelope(
+  isBatch: boolean,
+  messages: JsonRpcMessage[],
+): ForwardedFrame | null {
+  if (messages.length === 0) return null;
+  return {
+    data: Buffer.from(JSON.stringify(isBatch ? messages : messages[0]), "utf8"),
+    isBinary: false,
+  };
+}
+
 function parseMcpProfile(
   url: string | undefined,
   authorization: string | undefined,
+  profileHeader: string | undefined,
+  authenticationRequired: boolean,
 ): CodexBridgeUpstreamProfile {
-  const token = authorization
-    ?.replace(/^Bearer\s+/i, "")
-    .trim()
+  const token = (
+    profileHeader ??
+    (authenticationRequired
+      ? undefined
+      : authorization?.replace(/^Bearer\s+/i, ""))
+  )
+    ?.trim()
     .toLowerCase();
   if (token) {
     if (token === "full" || token === "mcp=full" || token === "profile:full") {
@@ -1750,6 +3406,15 @@ function rawDataToString(data: RawData): string {
   return Buffer.from(data).toString("utf8");
 }
 
+function rawDataByteLength(data: RawData): number {
+  if (typeof data === "string") return Buffer.byteLength(data);
+  if (Buffer.isBuffer(data)) return data.byteLength;
+  if (Array.isArray(data)) {
+    return data.reduce((total, chunk) => total + chunk.byteLength, 0);
+  }
+  return data.byteLength;
+}
+
 async function readJsonBody(
   req: IncomingMessage,
 ): Promise<Record<string, unknown> | null> {
@@ -1777,10 +3442,103 @@ function parseBridgeInputResponse(
   return value === "approve" ||
     value === "approve_accept_edits" ||
     value === "approve_for_session" ||
+    value === "approve_strict_auto_review" ||
     value === "approve_always" ||
     value === "deny"
     ? value
     : null;
+}
+
+function bearerTokenMatches(
+  authorization: string | undefined,
+  expected: string | undefined,
+): boolean {
+  if (!authorization || !expected) return false;
+  const match = /^Bearer\s+([^\s]+)$/i.exec(authorization);
+  if (!match) return false;
+  const supplied = Buffer.from(match[1] as string, "utf8");
+  const wanted = Buffer.from(expected, "utf8");
+  return supplied.length === wanted.length && timingSafeEqual(supplied, wanted);
+}
+
+function readSingleHeader(
+  req: IncomingMessage,
+  name: string,
+): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function writeBridgeHttpError(
+  res: ServerResponse,
+  status: 401 | 403 | 404 | 409 | 500,
+  code: string,
+  error: string,
+): void {
+  writeJson(res, status, { error, code });
+}
+
+function readBodyString(
+  body: Record<string, unknown> | null,
+  key: string,
+): string | null {
+  const value = body?.[key];
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isValidOperationId(value: string): boolean {
+  return /^int_[A-Za-z0-9_-]{16,124}$/.test(value);
+}
+
+function isValidResolutionActor(
+  actor: BridgeInputResolutionContext["actor"],
+): boolean {
+  return (
+    actor.id.length > 0 &&
+    actor.id.length <= 512 &&
+    (actor.displayName === undefined || actor.displayName.length <= 512) &&
+    (actor.channel === "yep" ||
+      actor.channel === "feishu" ||
+      actor.channel === "provider" ||
+      actor.channel === "system")
+  );
+}
+
+function parseInputResolutionContext(
+  body: Record<string, unknown> | null,
+): BridgeInputResolutionContext | null {
+  const operationId = readBodyString(body, "operationId");
+  const operationVersion = body?.operationVersion;
+  const actorRecord = asRecord(body?.actor);
+  const actorId = getString(actorRecord?.id)?.trim();
+  const displayName = getString(actorRecord?.displayName)?.trim();
+  const channel = getString(actorRecord?.channel);
+  if (
+    !operationId ||
+    !isValidOperationId(operationId) ||
+    !Number.isSafeInteger(operationVersion) ||
+    (operationVersion as number) < 1 ||
+    !actorId ||
+    actorId.length > 512 ||
+    (displayName?.length ?? 0) > 512 ||
+    (channel !== "yep" &&
+      channel !== "feishu" &&
+      channel !== "provider" &&
+      channel !== "system")
+  ) {
+    return null;
+  }
+  return {
+    operationId,
+    operationVersion: operationVersion as number,
+    actor: {
+      id: actorId,
+      ...(displayName ? { displayName } : {}),
+      channel,
+    },
+  };
 }
 
 function sendFrame(ws: WebSocket, data: RawData, isBinary: boolean): void {
@@ -1791,125 +3549,100 @@ function isJsonRpcMessage(value: unknown): value is JsonRpcMessage {
   return !!value && typeof value === "object";
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
 function getString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function formatDiagnosticValue(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "string") return value;
-  if (value instanceof Error) return value.message;
+function sanitizeBridgePublicTitle(
+  value: string | null | undefined,
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const sanitized = sanitizeManagedAttachmentPrompt(value).trim();
+  return sanitized.length > 0 ? sanitized : undefined;
+}
 
-  const record = asRecord(value);
-  const message = getString(record?.message);
-  if (message) return message;
+function sanitizeBridgePublicError(error: unknown): string {
+  return classifyCodexError(error).publicMessage;
+}
 
+function projectBridgePublicDiagnostic(error: unknown): {
+  publicMessage: string;
+  logFields: string;
+} {
+  const classified = classifyCodexError(error);
+  return {
+    publicMessage: classified.publicMessage,
+    logFields: `code=${classified.code} category=${classified.category} retryable=${String(classified.retryable)} message=${JSON.stringify(classified.publicMessage)}`,
+  };
+}
+
+function sanitizeBridgePublicUrl(
+  value: string | null | undefined,
+): string | null {
+  if (!value) return null;
   try {
-    return JSON.stringify(value);
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "ws:" &&
+      parsed.protocol !== "wss:" &&
+      parsed.protocol !== "http:" &&
+      parsed.protocol !== "https:"
+    ) {
+      return null;
+    }
+    return value;
   } catch {
-    return String(value);
+    return null;
   }
 }
 
-function getElicitationMeta(
-  params: Record<string, unknown>,
-): Record<string, unknown> | null {
-  return asRecord(params._meta) ?? asRecord(params.meta);
+function summarizeBridgePublicArgs(args: readonly string[]): string[] {
+  return [...args];
 }
 
-function isMcpToolApprovalElicitation(
-  params: Record<string, unknown>,
-): boolean {
-  const meta = getElicitationMeta(params);
-  return getString(meta?.codex_approval_kind) === "mcp_tool_call";
+function sanitizeBridgeDiagnosticIdentifier(
+  value: string | undefined,
+): string | undefined {
+  return value && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
+    ? value
+    : undefined;
 }
 
-function normalizeMcpPersistScopes(value: unknown): string[] {
-  const rawScopes = Array.isArray(value) ? value : [value];
-  const scopes = rawScopes.filter(
-    (scope): scope is string => scope === "session" || scope === "always",
-  );
-  return Array.from(new Set(scopes));
-}
-
-function parseMcpToolNameFromPrompt(prompt: string): string | undefined {
-  return /run tool "([^"]+)"/.exec(prompt)?.[1];
-}
-
-function idKey(id: JsonRpcId): string {
-  return `${typeof id}:${String(id)}`;
-}
-
-function isPersistentCommandDecision(value: unknown): boolean {
-  const decision = asRecord(value);
+function readBridgeThreadId(value: unknown): string | undefined {
+  const record = asRecord(value);
   return (
-    !!asRecord(decision?.acceptWithExecpolicyAmendment) ||
-    !!asRecord(decision?.applyNetworkPolicyAmendment)
+    getString(record?.threadId) ??
+    getString(record?.conversationId) ??
+    getString(asRecord(record?.thread)?.id)
   );
 }
 
-function isUserResolvableServerRequest(method: string): boolean {
-  return (
-    method === "item/commandExecution/requestApproval" ||
-    method === "item/fileChange/requestApproval" ||
-    method === "item/permissions/requestApproval" ||
-    method === "item/tool/requestUserInput" ||
-    method === "mcpServer/elicitation/request" ||
-    method === "execCommandApproval" ||
-    method === "applyPatchApproval"
+function deriveLightweightJournalPath(
+  statePath: string,
+  mode: CodexBridgeJournalMode,
+): string {
+  return join(
+    dirname(statePath),
+    mode === "full" ? "full-diagnostic.jsonl" : "lifecycle.jsonl",
   );
 }
 
-function normalizeCodexQuestions(
-  value: unknown,
-): Array<{ question: string; options: string[] }> {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((raw) => {
-      const question = asRecord(raw);
-      if (!question) return null;
-      const prompt = getString(question.question) ?? getString(question.header);
-      if (!prompt) return null;
-      const options = Array.isArray(question.options)
-        ? question.options
-            .map((option) =>
-              typeof option === "string"
-                ? option
-                : getString(asRecord(option)?.label),
-            )
-            .filter((option): option is string => !!option)
-        : [];
-      return { question: prompt, options };
-    })
-    .filter(
-      (question): question is { question: string; options: string[] } =>
-        !!question,
-    );
-}
-
-function buildCodexUserInputAnswers(
-  questionsValue: unknown,
-  answers: Record<string, string> | undefined,
-): Record<string, { answers: string[] }> {
-  const result: Record<string, { answers: string[] }> = {};
-  if (!Array.isArray(questionsValue)) return result;
-
-  for (const raw of questionsValue) {
-    const question = asRecord(raw);
-    const id = getString(question?.id);
-    if (!id) continue;
-    const prompt = getString(question?.question) ?? getString(question?.header);
-    const answer =
-      (prompt ? answers?.[prompt] : undefined) ?? answers?.[id] ?? "";
-    result[id] = { answers: answer ? [answer] : [] };
+function trimOldestSetValues<T>(values: Set<T>, maximum: number): void {
+  while (values.size > maximum) {
+    const oldest = values.values().next().value as T | undefined;
+    if (oldest === undefined) break;
+    values.delete(oldest);
   }
-  return result;
+}
+
+function readPositiveIntegerEnv(name: string): number | undefined {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function readNonNegativeIntegerEnv(name: string): number | undefined {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function timestampFromThreadValue(value: unknown): string | undefined {
@@ -1918,17 +3651,6 @@ function timestampFromThreadValue(value: unknown): string | undefined {
   }
   const ms = value > 1_000_000_000_000 ? value : value * 1000;
   return new Date(ms).toISOString();
-}
-
-async function isPortAvailable(host: string, port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const server = createServer();
-    server.once("error", () => resolve(false));
-    server.once("listening", () => {
-      server.close(() => resolve(true));
-    });
-    server.listen(port, host);
-  });
 }
 
 async function waitForWebSocket(url: string, timeoutMs: number): Promise<void> {

@@ -150,10 +150,16 @@ export interface UseGlobalSessionsOptions {
   searchQuery?: string;
   limit?: number;
   includeArchived?: boolean;
-  starred?: boolean;
   sessionKind?: SessionKind | null;
   excludeSessionKind?: SessionKind | null;
   includeStats?: boolean;
+  /** Append pinned sessions that fall outside the ordinary page limit. */
+  includePinned?: boolean;
+  /**
+   * Ask the server to keep at least one session per project that was active
+   * within the last N days, even when the global `limit` would drop it.
+   */
+  projectCoverageDays?: number;
   /** Skip initial fetch and live refetches while the consuming UI is hidden. */
   enabled?: boolean;
   /** Subscribe to live session activity and reconnect refreshes. */
@@ -178,10 +184,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     searchQuery,
     limit,
     includeArchived,
-    starred,
     sessionKind,
     excludeSessionKind,
     includeStats = false,
+    includePinned = false,
+    projectCoverageDays,
     enabled = true,
     liveUpdates = true,
     metadataLiveUpdates = liveUpdates,
@@ -192,6 +199,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const [hasMore, setHasMore] = useState(false);
+  const nextCursorRef = useRef<string | null>(null);
   const refetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingTitleRefetchTimersRef = useRef<
     Map<string, Set<ReturnType<typeof setTimeout>>>
@@ -210,10 +218,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     searchQuery?: string;
     limit?: number;
     includeArchived?: boolean;
-    starred?: boolean;
     sessionKind?: SessionKind | null;
     excludeSessionKind?: SessionKind | null;
     includeStats?: boolean;
+    includePinned?: boolean;
+    projectCoverageDays?: number;
     enabled?: boolean;
   }>({});
 
@@ -255,10 +264,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       lastFetchOptionsRef.current.projectId !== projectId ||
       lastFetchOptionsRef.current.searchQuery !== searchQuery ||
       lastFetchOptionsRef.current.includeArchived !== includeArchived ||
-      lastFetchOptionsRef.current.starred !== starred ||
       lastFetchOptionsRef.current.sessionKind !== sessionKind ||
       lastFetchOptionsRef.current.excludeSessionKind !== excludeSessionKind ||
       lastFetchOptionsRef.current.includeStats !== includeStats ||
+      lastFetchOptionsRef.current.includePinned !== includePinned ||
+      lastFetchOptionsRef.current.projectCoverageDays !== projectCoverageDays ||
       lastFetchOptionsRef.current.enabled !== enabled;
 
     if (optionsChanged) {
@@ -270,10 +280,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       searchQuery,
       limit,
       includeArchived,
-      starred,
       sessionKind,
       excludeSessionKind,
       includeStats,
+      includePinned,
+      projectCoverageDays,
       enabled,
     };
 
@@ -289,10 +300,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         q: searchQuery || undefined,
         limit,
         includeArchived,
-        starred,
         includeStats: false,
         kind: sessionKind ?? undefined,
         excludeKind: excludeSessionKind ?? undefined,
+        includePinned,
+        projectCoverageDays,
       });
 
       for (const session of data.sessions) {
@@ -329,6 +341,9 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       }
 
       setHasMore(data.hasMore);
+      nextCursorRef.current = data.hasMore
+        ? (data.nextCursor ?? data.sessions.at(-1)?.updatedAt ?? null)
+        : null;
       if (!includeStats || projectId) {
         setStats(DEFAULT_STATS);
       }
@@ -343,10 +358,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     searchQuery,
     limit,
     includeArchived,
-    starred,
     sessionKind,
     excludeSessionKind,
     includeStats,
+    includePinned,
+    projectCoverageDays,
     enabled,
     clearPendingTitleRefetch,
   ]);
@@ -426,6 +442,11 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
               originator: data.session.originator ?? existing.originator,
               source: data.session.source ?? existing.source,
               contextUsage: data.session.contextUsage ?? existing.contextUsage,
+              cumulativeUsage:
+                data.session.cumulativeUsage ?? existing.cumulativeUsage,
+              compactCount: data.session.compactCount ?? existing.compactCount,
+              compactEvents:
+                data.session.compactEvents ?? existing.compactEvents,
               model: data.session.model ?? existing.model,
               reasoningEffort:
                 data.session.reasoningEffort ?? existing.reasoningEffort,
@@ -455,17 +476,16 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   const loadMore = useCallback(async () => {
     if (!enabled || !hasMore || sessions.length === 0) return;
 
-    const lastSession = sessions[sessions.length - 1];
-    if (!lastSession) return;
+    const nextCursor = nextCursorRef.current;
+    if (!nextCursor) return;
 
     try {
       const data = await api.getGlobalSessions({
         project: projectId ?? undefined,
         q: searchQuery || undefined,
         limit,
-        after: lastSession.updatedAt,
+        after: nextCursor,
         includeArchived,
-        starred,
         includeStats: false,
         kind: sessionKind ?? undefined,
         excludeKind: excludeSessionKind ?? undefined,
@@ -479,6 +499,9 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       });
 
       setHasMore(data.hasMore);
+      nextCursorRef.current = data.hasMore
+        ? (data.nextCursor ?? data.sessions.at(-1)?.updatedAt ?? null)
+        : null;
     } catch (err) {
       setError(err instanceof Error ? err : new Error(String(err)));
     }
@@ -489,7 +512,6 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     searchQuery,
     limit,
     includeArchived,
-    starred,
     sessionKind,
     excludeSessionKind,
     enabled,
@@ -516,7 +538,9 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
       prev.map((session) => {
         if (session.id !== event.sessionId) return session;
         const activity =
-          event.ownership.owner === "none" ? undefined : session.activity;
+          event.ownership.owner === "none"
+            ? undefined
+            : (event.activity ?? session.activity);
         return {
           ...session,
           ownership: event.ownership,
@@ -544,6 +568,9 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           ...session,
           activity: event.activity,
           pendingInputType,
+          lastTurnStatus: event.lastTurnStatus,
+          lastErrorMessage: event.lastErrorMessage,
+          retryStatus: event.retryStatus,
           runtime: updateRuntimeSnapshot(
             session,
             session.ownership,
@@ -561,9 +588,6 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
 
       // If we have a project filter, only add sessions from that project
       if (projectId && event.session.projectId !== projectId) return;
-
-      // If we have a starred filter, only add starred sessions
-      if (starred && !event.session.isStarred) return;
 
       if (
         !matchesSessionKindFilters(event.session, {
@@ -619,9 +643,14 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           originator: event.session.originator,
           source: event.session.source,
           contextUsage: event.session.contextUsage,
+          cumulativeUsage: event.session.cumulativeUsage,
+          compactCount: event.session.compactCount,
+          compactEvents: event.session.compactEvents,
           model: event.session.model,
           reasoningEffort: event.session.reasoningEffort,
           serviceTier: event.session.serviceTier,
+          lastTurnStatus: event.session.lastTurnStatus,
+          lastErrorMessage: event.session.lastErrorMessage,
         };
 
         return [globalSession, ...prev];
@@ -630,7 +659,6 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     [
       projectId,
       searchQuery,
-      starred,
       sessionKind,
       excludeSessionKind,
       enabled,
@@ -643,6 +671,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
   const handleSessionMetadataChange = useCallback(
     (event: SessionMetadataChangedEvent) => {
       if (!enabled) return;
+      const pinned = event.pinned ?? event.starred;
 
       if (event.title?.trim() || event.aiTitle?.trim()) {
         clearPendingTitleRefetch(event.sessionId);
@@ -664,7 +693,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
             ...(event.title !== undefined && { customTitle: nextCustomTitle }),
             ...(event.aiTitle !== undefined && { aiTitle: nextAiTitle }),
             ...(event.archived !== undefined && { isArchived: event.archived }),
-            ...(event.starred !== undefined && { isStarred: event.starred }),
+            ...(pinned !== undefined && { isStarred: pinned }),
           };
         });
 
@@ -675,11 +704,6 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
           }),
         );
 
-        // If this hook has a starred filter, remove sessions that are no longer starred
-        if (starred && event.starred === false) {
-          return filtered.filter((s) => s.id !== event.sessionId);
-        }
-
         return filtered;
       });
 
@@ -687,12 +711,16 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         debouncedRefetch();
       } else if (existingSession && refreshProjectId) {
         void refreshSessionMetadata(event.sessionId, refreshProjectId);
-      } else if (sessionKind || excludeSessionKind) {
+      } else if (
+        (includePinned && pinned !== undefined) ||
+        sessionKind ||
+        excludeSessionKind
+      ) {
         debouncedRefetch();
       }
     },
     [
-      starred,
+      includePinned,
       sessionKind,
       excludeSessionKind,
       searchQuery,
@@ -749,12 +777,27 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
             ...(event.contextUsage !== undefined && {
               contextUsage: event.contextUsage,
             }),
+            ...(event.cumulativeUsage !== undefined && {
+              cumulativeUsage: event.cumulativeUsage,
+            }),
+            ...(event.compactCount !== undefined && {
+              compactCount: event.compactCount,
+            }),
+            ...(event.compactEvents !== undefined && {
+              compactEvents: event.compactEvents,
+            }),
             ...(event.model !== undefined && { model: event.model }),
             ...(event.reasoningEffort !== undefined && {
               reasoningEffort: event.reasoningEffort,
             }),
             ...(event.serviceTier !== undefined && {
               serviceTier: event.serviceTier,
+            }),
+            ...(event.lastTurnStatus !== undefined && {
+              lastTurnStatus: event.lastTurnStatus ?? undefined,
+            }),
+            ...(event.lastErrorMessage !== undefined && {
+              lastErrorMessage: event.lastErrorMessage ?? undefined,
             }),
           };
         });
@@ -790,7 +833,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     onSessionMetadataChange: metadataLiveUpdates
       ? handleSessionMetadataChange
       : undefined,
-    // Seen/unread is a metadata-level change (like title/starred), not a
+    // Seen/unread is a metadata-level change (like title/pinned), not a
     // high-frequency process activity. Bind it to metadataLiveUpdates so the
     // sidebar (liveUpdates=false, metadataLiveUpdates=true) still clears the
     // unread dot via a single-item update instead of waiting for a full refetch.

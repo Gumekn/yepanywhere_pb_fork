@@ -4,24 +4,59 @@ import {
   type CodexSessionMetaEntry,
   parseCodexSessionEntry,
 } from "@yep-anywhere/shared";
+import {
+  type CodexManifestFileHeader,
+  scanCodexManifestHeadersInWorker,
+} from "../codex-history/CodexManifestScanWorker.js";
+import { getCodexSubagentMetadata } from "../codex/subagent.js";
 import { getLogger } from "../logging/logger.js";
 import { canonicalizeProjectPath } from "../projects/paths.js";
-import { readFirstLine } from "../utils/jsonl.js";
+import {
+  CODEX_ROLLOUT_COMPRESSED_SUFFIX,
+  isCodexRolloutDecompressionSupported,
+  isCompressedCodexRolloutPath,
+  plainCodexRolloutPath,
+  readCodexRolloutFirstLine,
+} from "./codex-rollout-file.js";
 
 export interface CodexSessionManifestEntry {
   id: string;
   cwd: string;
+  /**
+   * Path to the rollout on disk.
+   *
+   * This may be either a plain `.jsonl` file or Codex's compressed
+   * `.jsonl.zst`, so it is NOT safe to treat as text. Decode it only through
+   * `codex-rollout-file.ts` (or `readSharedCodexEntries`, which builds on it);
+   * `readFile(path, "utf-8")` does not fail on compressed bytes, it silently
+   * returns mojibake. Stat-ing, moving and copying the path are byte-level and
+   * remain safe for both forms.
+   */
   filePath: string;
+  /** True when `filePath` holds compressed bytes rather than JSONL text. */
+  compressed: boolean;
   timestamp: string;
   mtime: number;
   size: number;
   isSubagent: boolean;
+  /** Parent thread id, when this session is a sub-agent. */
+  parentThreadId?: string;
+  /** Agent path (e.g. "/root/task_name"), when available. */
+  agentPath?: string;
+  /** Randomly assigned nickname (e.g. "Einstein"), when available. */
+  agentNickname?: string;
+  /** Agent role (e.g. "explorer", "worker", "default"), when available. */
+  agentRole?: string;
+  /** Spawn depth from the root thread, when available. */
+  depth?: number;
 }
 
 export interface CodexSessionManifest {
   sessions: CodexSessionManifestEntry[];
   byId: Map<string, CodexSessionManifestEntry>;
   byProjectPath: Map<string, CodexSessionManifestEntry[]>;
+  /** Sub-agent sessions keyed by parent thread id. */
+  byParentThread: Map<string, CodexSessionManifestEntry[]>;
 }
 
 const CODEX_META_READ_MAX_BYTES = 1024 * 1024;
@@ -98,9 +133,15 @@ async function buildCodexSessionManifest(
     return createManifest([]);
   }
 
-  const files = await findJsonlFiles(sessionsDir);
+  const workerRows = await scanCodexManifestHeadersInWorker(
+    sessionsDir,
+    CODEX_META_READ_MAX_BYTES,
+  );
+  const files = workerRows
+    ? dedupeWorkerRows(workerRows)
+    : await findRolloutFiles(sessionsDir);
   getLogger().debug(
-    `[CodexManifest] Found ${files.length} .jsonl files in ${sessionsDir}`,
+    `[CodexManifest] Found ${files.length} rollout files in ${sessionsDir}`,
   );
 
   const sessions: CodexSessionManifestEntry[] = [];
@@ -108,7 +149,15 @@ async function buildCodexSessionManifest(
 
   for (let i = 0; i < files.length; i += MANIFEST_SCAN_BATCH_SIZE) {
     const batch = files.slice(i, i + MANIFEST_SCAN_BATCH_SIZE);
-    const results = await Promise.all(batch.map(readSessionManifestEntry));
+    const results = await Promise.all(
+      batch.map((file) =>
+        typeof file === "string"
+          ? readSessionManifestEntry(file)
+          : file.firstLine
+            ? manifestEntryFromHeader(file)
+            : readSessionManifestEntry(file.filePath),
+      ),
+    );
     for (const result of results) {
       if (result) {
         sessions.push(result);
@@ -119,8 +168,9 @@ async function buildCodexSessionManifest(
   }
 
   if (files.length > 0 && sessions.length === 0) {
+    const firstFile = files[0];
     getLogger().warn(
-      `[CodexManifest] Found ${files.length} .jsonl files but parsed 0 sessions (${failCount} failed). First file: ${files[0]}`,
+      `[CodexManifest] Found ${files.length} rollout files but parsed 0 sessions (${failCount} failed). First file: ${typeof firstFile === "string" ? firstFile : firstFile?.filePath}`,
     );
   } else if (failCount > 0) {
     getLogger().debug(
@@ -131,15 +181,65 @@ async function buildCodexSessionManifest(
   return createManifest(sessions);
 }
 
+function dedupeWorkerRows(
+  rows: CodexManifestFileHeader[],
+): CodexManifestFileHeader[] {
+  const plain = new Set(
+    rows
+      .filter((row) => row.filePath.endsWith(".jsonl"))
+      .map((row) => row.filePath),
+  );
+  return rows.filter(
+    (row) =>
+      !row.filePath.endsWith(`.jsonl${CODEX_ROLLOUT_COMPRESSED_SUFFIX}`) ||
+      !plain.has(plainCodexRolloutPath(row.filePath)),
+  );
+}
+
+function manifestEntryFromHeader(
+  header: CodexManifestFileHeader,
+): CodexSessionManifestEntry | null {
+  const entry = parseCodexSessionEntry(header.firstLine ?? "");
+  if (!entry || entry.type !== "session_meta") return null;
+  const meta = entry.payload;
+  if (!meta.id || !meta.cwd) return null;
+  const subagentMeta = getCodexSubagentMetadata(meta);
+  return {
+    id: meta.id,
+    cwd: meta.cwd,
+    filePath: header.filePath,
+    compressed: false,
+    timestamp: meta.timestamp,
+    mtime: header.mtimeMs,
+    size: header.size,
+    isSubagent: subagentMeta.isSubagent,
+    ...(subagentMeta.parentThreadId !== undefined
+      ? { parentThreadId: subagentMeta.parentThreadId }
+      : {}),
+    ...(subagentMeta.agentPath !== undefined
+      ? { agentPath: subagentMeta.agentPath }
+      : {}),
+    ...(subagentMeta.agentNickname !== undefined
+      ? { agentNickname: subagentMeta.agentNickname }
+      : {}),
+    ...(subagentMeta.agentRole !== undefined
+      ? { agentRole: subagentMeta.agentRole }
+      : {}),
+    ...(subagentMeta.depth !== undefined ? { depth: subagentMeta.depth } : {}),
+  };
+}
+
 function createManifest(
   entries: CodexSessionManifestEntry[],
 ): CodexSessionManifest {
   const sessions = [...entries].sort((a, b) => b.mtime - a.mtime);
   const byId = new Map<string, CodexSessionManifestEntry>();
   const byProjectPath = new Map<string, CodexSessionManifestEntry[]>();
+  const byParentThread = new Map<string, CodexSessionManifestEntry[]>();
 
   for (const session of sessions) {
-    if (!byId.has(session.id)) {
+    const isNewestForId = !byId.has(session.id);
+    if (isNewestForId) {
       byId.set(session.id, session);
     }
 
@@ -150,36 +250,75 @@ function createManifest(
     } else {
       byProjectPath.set(projectPath, [session]);
     }
+
+    if (isNewestForId && session.parentThreadId) {
+      const siblings = byParentThread.get(session.parentThreadId);
+      if (siblings) {
+        siblings.push(session);
+      } else {
+        byParentThread.set(session.parentThreadId, [session]);
+      }
+    }
   }
 
   return {
     sessions,
     byId,
     byProjectPath,
+    byParentThread,
   };
 }
 
-async function findJsonlFiles(dir: string): Promise<string[]> {
-  const files: string[] = [];
+/**
+ * Collect rollout files, accepting both plain `.jsonl` and Codex's compressed
+ * `.jsonl.zst` form.
+ *
+ * During a resume Codex materializes a compressed rollout back to plain without
+ * immediately removing the `.zst`, so both can exist for the same session. The
+ * plain file is the live copy in that window, so it wins and the compressed
+ * sibling is dropped rather than scanned into a duplicate manifest entry.
+ *
+ * On a runtime without zstd support (Node < 22.15.0, still within this package's
+ * supported range) compressed rollouts are skipped entirely: surfacing a session
+ * whose every read is guaranteed to fail is worse than leaving it hidden, which
+ * is what those runtimes did before compressed rollouts were understood at all.
+ */
+async function findRolloutFiles(dir: string): Promise<string[]> {
+  const canReadCompressed = isCodexRolloutDecompressionSupported();
+  const plain = new Set<string>();
+  const compressed: string[] = [];
 
-  try {
-    const entries = await readdir(dir, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        files.push(...(await findJsonlFiles(fullPath)));
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-        files.push(fullPath);
+  const walk = async (current: string): Promise<void> => {
+    try {
+      const entries = await readdir(current, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = join(current, entry.name);
+        if (entry.isDirectory()) {
+          await walk(fullPath);
+        } else if (!entry.isFile()) {
+          // Symlinks and special files are not rollouts.
+        } else if (entry.name.endsWith(".jsonl")) {
+          plain.add(fullPath);
+        } else if (
+          canReadCompressed &&
+          entry.name.endsWith(`.jsonl${CODEX_ROLLOUT_COMPRESSED_SUFFIX}`)
+        ) {
+          compressed.push(fullPath);
+        }
       }
+    } catch (error) {
+      getLogger().debug(
+        `[CodexManifest] Error scanning directory ${current}: ${error instanceof Error ? error.message : error}`,
+      );
     }
-  } catch (error) {
-    getLogger().debug(
-      `[CodexManifest] Error scanning directory ${dir}: ${error instanceof Error ? error.message : error}`,
-    );
-  }
+  };
 
-  return files;
+  await walk(dir);
+
+  return [
+    ...plain,
+    ...compressed.filter((path) => !plain.has(plainCodexRolloutPath(path))),
+  ];
 }
 
 async function readSessionManifestEntry(
@@ -188,7 +327,7 @@ async function readSessionManifestEntry(
   try {
     const [stats, firstLine] = await Promise.all([
       stat(filePath),
-      readFirstLine(filePath, CODEX_META_READ_MAX_BYTES),
+      readCodexRolloutFirstLine(filePath, CODEX_META_READ_MAX_BYTES),
     ]);
 
     if (!firstLine) {
@@ -214,14 +353,31 @@ async function readSessionManifestEntry(
       return null;
     }
 
+    const subagentMeta = getCodexSubagentMetadata(meta);
     return {
       id: meta.id,
       cwd: meta.cwd,
       filePath,
+      compressed: isCompressedCodexRolloutPath(filePath),
       timestamp: meta.timestamp,
       mtime: stats.mtimeMs,
       size: stats.size,
-      isSubagent: isSubagentSessionMeta(meta),
+      isSubagent: subagentMeta.isSubagent,
+      ...(subagentMeta.parentThreadId !== undefined
+        ? { parentThreadId: subagentMeta.parentThreadId }
+        : {}),
+      ...(subagentMeta.agentPath !== undefined
+        ? { agentPath: subagentMeta.agentPath }
+        : {}),
+      ...(subagentMeta.agentNickname !== undefined
+        ? { agentNickname: subagentMeta.agentNickname }
+        : {}),
+      ...(subagentMeta.agentRole !== undefined
+        ? { agentRole: subagentMeta.agentRole }
+        : {}),
+      ...(subagentMeta.depth !== undefined
+        ? { depth: subagentMeta.depth }
+        : {}),
     };
   } catch (error) {
     getLogger().debug(
@@ -229,12 +385,4 @@ async function readSessionManifestEntry(
     );
     return null;
   }
-}
-
-function isSubagentSessionMeta(
-  meta: CodexSessionMetaEntry["payload"],
-): boolean {
-  const source = meta.source;
-  if (!source || typeof source !== "object") return false;
-  return "subagent" in source || "subAgent" in source;
 }

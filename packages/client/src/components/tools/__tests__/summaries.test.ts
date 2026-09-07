@@ -69,4 +69,19 @@ describe("getToolSummary", () => {
       "sed -n '1,140p' packages/client/src/layouts/NavigationLayout.tsx → No output",
     );
   });
+
+  it("keeps the Codex code-mode exec command overview after completion", () => {
+    const summary = getToolSummary(
+      "CodexExec",
+      {
+        script:
+          'const result = await tools.exec_command({"cmd": "pnpm lint"});',
+      },
+      { content: "Script completed", isError: false },
+      "complete",
+      { provider: "codex" },
+    );
+
+    expect(summary).toBe("pnpm lint");
+  });
 });

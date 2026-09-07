@@ -1,6 +1,15 @@
-import { memo, useState } from "react";
-import { useRemoteImage } from "../../hooks/useRemoteImage";
+import { isManagedUploadDownloadUrl } from "@yep-anywhere/shared";
+import { type ReactNode, memo, useState } from "react";
+import { useFetchedImage } from "../../hooks/useRemoteImage";
+import { useOptionalI18n } from "../../i18n";
+import { apiPath as resolveApiPath } from "../../lib/apiPath";
 import {
+  createLinkPattern,
+  splitTrailingUrlPunctuation,
+} from "../../lib/autolink";
+import type { ClipboardImageSource } from "../../lib/clipboard";
+import {
+  type FeishuPromptInfo,
   type SkillInfo,
   type UploadedFileInfo,
   getFilename,
@@ -20,6 +29,8 @@ const MAX_CHARS = MAX_LINES * 100;
 
 interface Props {
   content: string | ContentBlock[];
+  /** Server received this prompt; the provider has not adopted it yet. */
+  isPending?: boolean;
   /** ISO timestamp from the source JSONL entry, used for hover-revealed time. */
   timestamp?: string;
   /** Context-window usage snapshot associated with this prompt. */
@@ -92,16 +103,121 @@ function isImageMimeType(mimeType: string): boolean {
   return mimeType.startsWith("image/");
 }
 
+function isGenericFeishuAttachmentName(name: string): boolean {
+  return /^(?:[0-9a-f-]{36}_)?feishu-\d+\.[a-z0-9_-]+$/i.test(name);
+}
+
+function managedUploadHref(path: string): string {
+  const endpoint = path.startsWith("/api") ? path.slice(4) : path;
+  return resolveApiPath(endpoint);
+}
+
+/**
+ * Characters that end a bare URL. Besides whitespace and markup delimiters we
+ * treat CJK/full-width characters as boundaries: Chinese prose routinely puts
+ * a full-width comma or more text right after a URL with no space in between
+ * (`https://example.com/，完成`), and a plain `[^\s]+` match would swallow it.
+ */
+function renderPromptTextWithLinks(text: string): ReactNode[] {
+  const pattern = createLinkPattern();
+  const rendered: ReactNode[] = [];
+  let cursor = 0;
+
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > cursor) rendered.push(text.slice(cursor, index));
+
+    const markdownLabel = match[1];
+    const markdownUrl = match[2];
+    let url = markdownUrl ?? match[3] ?? "";
+    let trailing = "";
+    if (!markdownUrl) {
+      [url, trailing] = splitTrailingUrlPunctuation(url);
+    }
+
+    if (!url) {
+      rendered.push(match[0]);
+      cursor = index + match[0].length;
+      continue;
+    }
+
+    rendered.push(
+      <a
+        key={`${index}-${url}`}
+        className="user-prompt-link"
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {markdownLabel ?? url}
+      </a>,
+    );
+    if (trailing) rendered.push(trailing);
+    cursor = index + match[0].length;
+  }
+
+  if (cursor < text.length) rendered.push(text.slice(cursor));
+  return rendered;
+}
+
+function FeishuPromptSource({ info }: { info?: FeishuPromptInfo }) {
+  const i18n = useOptionalI18n();
+  if (!info) return null;
+
+  const contextLabels: string[] = [];
+  if (info.messageCount > 1) {
+    contextLabels.push(
+      i18n?.t("userPromptFeishuMessageCount", {
+        count: info.messageCount,
+      }) ?? `${info.messageCount} messages`,
+    );
+  }
+  if (info.contextMode === "current+quoted") {
+    contextLabels.push(i18n?.t("userPromptFeishuQuoted") ?? "Includes quote");
+  } else if (info.contextMode === "topic") {
+    contextLabels.push(i18n?.t("userPromptFeishuTopic") ?? "Topic context");
+  } else if (info.contextMode === "merge-forward") {
+    contextLabels.push(
+      i18n?.t("userPromptFeishuForwarded") ?? "Forwarded thread",
+    );
+  }
+  const hasImportWarning = !info.complete || info.hasWarnings;
+
+  return (
+    <div className="feishu-prompt-source">
+      <span className="feishu-prompt-source-badge">
+        {i18n?.t("userPromptSourceFeishu") ?? "From Feishu"}
+      </span>
+      {contextLabels.length > 0 && (
+        <span className="feishu-prompt-context">
+          {contextLabels.join(" · ")}
+        </span>
+      )}
+      {hasImportWarning && (
+        <span
+          className="feishu-prompt-warning"
+          title={
+            i18n?.t("userPromptFeishuImportWarning") ??
+            "Some Feishu context could not be imported"
+          }
+        >
+          ⚠
+        </span>
+      )}
+    </div>
+  );
+}
+
 /**
  * Extract URL components from an uploaded file path.
  * Path format: /.../.yep-anywhere/uploads/{projectId}/{sessionId}/{filename}
  */
 function getUploadUrl(filePath: string): string | null {
-  // Guard against invalid input
-  if (!filePath || typeof filePath !== "string") return null;
+  const publicLocation: unknown = filePath;
+  if (isManagedUploadDownloadUrl(publicLocation)) return publicLocation;
 
   // Split path and get last 3 components: projectId, sessionId, filename
-  const parts = filePath.split("/");
+  const parts = filePath.replaceAll("\\", "/").split("/");
   if (parts.length < 3) return null;
 
   const filename = parts[parts.length - 1];
@@ -114,6 +230,45 @@ function getUploadUrl(filePath: string): string | null {
   if (!/^[0-9a-f-]{36}_/.test(filename)) return null;
 
   return `/api/projects/${projectId}/sessions/${sessionId}/upload/${encodeURIComponent(filename)}`;
+}
+
+function getClipboardImageSourceUrl(
+  file: UploadedFileInfo,
+): string | undefined {
+  const previewUrl = file.previewUrl?.trim();
+  if (previewUrl) {
+    return previewUrl.startsWith("/api")
+      ? managedUploadHref(previewUrl)
+      : previewUrl;
+  }
+
+  const path = file.path.trim();
+  if (/^(?:https?:|data:|blob:)/i.test(path)) return path;
+  if (path.startsWith("/api")) return managedUploadHref(path);
+
+  const uploadUrl = getUploadUrl(path);
+  if (uploadUrl) return managedUploadHref(uploadUrl);
+
+  // Provider-native image blocks can retain an allowed absolute path instead
+  // of a managed upload URL. The local-image endpoint applies the server's
+  // configured allowlist before returning any bytes.
+  if (path.startsWith("/")) {
+    return resolveApiPath(`/local-image?path=${encodeURIComponent(path)}`);
+  }
+
+  return undefined;
+}
+
+function getClipboardImageSources(
+  files: UploadedFileInfo[],
+): ClipboardImageSource[] {
+  return files
+    .filter((file) => isImageMimeType(file.mimeType))
+    .map((file) => ({
+      name: file.originalName,
+      mimeType: file.mimeType,
+      sourceUrl: getClipboardImageSourceUrl(file),
+    }));
 }
 
 function isInputImageBlock(block: ContentBlock): block is InputImageBlock {
@@ -203,6 +358,17 @@ function filenameFromUrl(imageUrl: string): string | null {
   }
 }
 
+const CODEX_INLINE_IMAGE_PATH_PREFIX = "codex-inline://image/";
+
+/**
+ * A Codex `input_image` block that carries no identity of its own (no
+ * file_path, no URL-derived filename). This includes deferred blocks whose
+ * inline payload was stripped server-side, so we can only show a placeholder.
+ */
+function isAnonymousCodexInlineImage(file: UploadedFileInfo): boolean {
+  return file.path.startsWith(CODEX_INLINE_IMAGE_PATH_PREFIX);
+}
+
 function extractCodexImageFiles(content: ContentBlock[]): UploadedFileInfo[] {
   const files: UploadedFileInfo[] = [];
   let imageIndex = 0;
@@ -232,7 +398,7 @@ function extractCodexImageFiles(content: ContentBlock[]): UploadedFileInfo[] {
     const path =
       filePath ||
       (imageUrl && !imageUrl.startsWith("data:") ? imageUrl : "") ||
-      `codex-inline://image/${imageIndex}`;
+      `${CODEX_INLINE_IMAGE_PATH_PREFIX}${imageIndex}`;
 
     files.push({
       originalName: fileName,
@@ -252,8 +418,44 @@ function mergeUploadedFiles(
 ): UploadedFileInfo[] {
   const seen = new Set<string>();
   const merged: UploadedFileInfo[] = [];
+  const remainingSecondary = [...secondary];
 
-  for (const file of [...primary, ...secondary]) {
+  for (const file of primary) {
+    if (seen.has(file.path)) continue;
+    seen.add(file.path);
+
+    // A managed upload listed in the prompt text and a Codex input_image
+    // block usually describe the same image. Fold the Codex block into the
+    // named attachment when it either carries inline preview data or is an
+    // anonymous placeholder (e.g. deferred media with image_url stripped),
+    // so the same image is not rendered twice.
+    const companionIndex = remainingSecondary.findIndex(
+      (candidate) =>
+        candidate.path === file.path ||
+        (!file.previewUrl &&
+          isImageMimeType(file.mimeType) &&
+          isImageMimeType(candidate.mimeType) &&
+          (Boolean(candidate.previewUrl) ||
+            isAnonymousCodexInlineImage(candidate))),
+    );
+    if (companionIndex === -1) {
+      merged.push(file);
+      continue;
+    }
+
+    const [companion] = remainingSecondary.splice(companionIndex, 1);
+    if (!companion) {
+      merged.push(file);
+      continue;
+    }
+    seen.add(companion.path);
+    merged.push({
+      ...file,
+      ...(companion.previewUrl ? { previewUrl: companion.previewUrl } : {}),
+    });
+  }
+
+  for (const file of remainingSecondary) {
     if (seen.has(file.path)) continue;
     seen.add(file.path);
     merged.push(file);
@@ -262,18 +464,73 @@ function mergeUploadedFiles(
   return merged;
 }
 
+function UploadedImageError({ message }: { message: string }) {
+  return (
+    <div className="uploaded-image-error" role="alert">
+      <strong>Failed to load image</strong>
+      <pre>{message}</pre>
+    </div>
+  );
+}
+
+function FetchedUploadedImage({
+  apiPath,
+  alt,
+}: {
+  apiPath: string;
+  alt: string;
+}) {
+  const { url, loading, error, bytes, mimeType } = useFetchedImage(apiPath);
+  const [decodeError, setDecodeError] = useState<string | null>(null);
+
+  if (loading) return <div className="image-loading">Loading image...</div>;
+  if (error) return <UploadedImageError message={error} />;
+  if (!url) {
+    return (
+      <UploadedImageError
+        message={`Image request completed without a preview URL\nURL: ${apiPath}`}
+      />
+    );
+  }
+  if (decodeError) return <UploadedImageError message={decodeError} />;
+
+  return (
+    <img
+      src={url}
+      alt={alt}
+      onError={() => {
+        const message = [
+          "Image bytes were fetched, but Android WebView could not decode them.",
+          `URL: ${apiPath}`,
+          `Blob Content-Type: ${mimeType ?? "unknown"}`,
+          `Blob bytes: ${bytes ?? "unknown"}`,
+        ].join("\n");
+        console.error("[UploadedFileItem] Failed to decode fetched image", {
+          apiPath,
+          mimeType,
+          bytes,
+        });
+        setDecodeError(message);
+      }}
+    />
+  );
+}
+
 /**
  * Single uploaded file attachment - clickable for images
  */
-function UploadedFileItem({ file }: { file: UploadedFileInfo }) {
+function UploadedFileItem({
+  file,
+  displayName,
+}: {
+  file: UploadedFileInfo;
+  displayName: string;
+}) {
+  const i18n = useOptionalI18n();
   const [showModal, setShowModal] = useState(false);
   const isImage = isImageMimeType(file.mimeType);
-  const apiPath = isImage ? getUploadUrl(file.path) : null;
+  const apiPath = getUploadUrl(file.path);
   const directPreviewUrl = isImage ? (file.previewUrl ?? null) : null;
-
-  // Use the remote image hook to handle fetching the image
-  const { url: remoteImageUrl, loading, error } = useRemoteImage(apiPath);
-  const imageUrl = directPreviewUrl ?? remoteImageUrl;
 
   if (isImage && (apiPath || directPreviewUrl)) {
     return (
@@ -281,21 +538,24 @@ function UploadedFileItem({ file }: { file: UploadedFileInfo }) {
         <button
           type="button"
           className="uploaded-file uploaded-file-clickable"
-          title={`${file.mimeType}, ${file.size}`}
+          title={`${file.mimeType}, ${file.size}\n${file.path}`}
+          aria-label={
+            i18n?.t("userPromptOpenAttachment", { name: displayName }) ??
+            `Open ${displayName}`
+          }
           onClick={() => setShowModal(true)}
         >
-          📎 {file.originalName}
+          <span aria-hidden="true">🖼️</span>
+          <span>{displayName}</span>
         </button>
         {showModal && (
-          <Modal title={file.originalName} onClose={() => setShowModal(false)}>
+          <Modal title={displayName} onClose={() => setShowModal(false)}>
             <div className="uploaded-image-modal">
-              {apiPath && loading && (
-                <div className="image-loading">Loading...</div>
-              )}
-              {apiPath && error && (
-                <div className="image-error">Failed to load image</div>
-              )}
-              {imageUrl && <img src={imageUrl} alt={file.originalName} />}
+              {directPreviewUrl ? (
+                <img src={directPreviewUrl} alt={displayName} />
+              ) : apiPath ? (
+                <FetchedUploadedImage apiPath={apiPath} alt={displayName} />
+              ) : null}
             </div>
           </Modal>
         )}
@@ -303,9 +563,32 @@ function UploadedFileItem({ file }: { file: UploadedFileInfo }) {
     );
   }
 
+  if (apiPath) {
+    return (
+      <a
+        className="uploaded-file uploaded-file-clickable"
+        href={managedUploadHref(apiPath)}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={`${file.mimeType}, ${file.size}\n${file.path}`}
+        aria-label={
+          i18n?.t("userPromptOpenAttachment", { name: displayName }) ??
+          `Open ${displayName}`
+        }
+      >
+        <span aria-hidden="true">📄</span>
+        <span>{displayName}</span>
+      </a>
+    );
+  }
+
   return (
-    <span className="uploaded-file" title={`${file.mimeType}, ${file.size}`}>
-      📎 {file.originalName}
+    <span
+      className="uploaded-file"
+      title={`${file.mimeType}, ${file.size}\n${file.path}`}
+    >
+      <span aria-hidden="true">📎</span>
+      <span>{displayName}</span>
     </span>
   );
 }
@@ -313,14 +596,35 @@ function UploadedFileItem({ file }: { file: UploadedFileInfo }) {
 /**
  * Renders uploaded file attachments below the user prompt
  */
-function UploadedFilesMetadata({ files }: { files: UploadedFileInfo[] }) {
+function UploadedFilesMetadata({
+  files,
+  feishu,
+}: {
+  files: UploadedFileInfo[];
+  feishu?: FeishuPromptInfo;
+}) {
+  const i18n = useOptionalI18n();
   if (files.length === 0) return null;
 
   return (
     <div className="user-prompt-metadata">
-      {files.map((file) => (
-        <UploadedFileItem key={file.path} file={file} />
-      ))}
+      {files.map((file, index) => {
+        const displayName =
+          feishu && isGenericFeishuAttachmentName(file.originalName)
+            ? isImageMimeType(file.mimeType)
+              ? (i18n?.t("userPromptImageAttachment", { index: index + 1 }) ??
+                `Image ${index + 1}`)
+              : (i18n?.t("userPromptFileAttachment", { index: index + 1 }) ??
+                `File ${index + 1}`)
+            : file.originalName;
+        return (
+          <UploadedFileItem
+            key={file.path}
+            file={file}
+            displayName={displayName}
+          />
+        );
+      })}
     </div>
   );
 }
@@ -438,6 +742,7 @@ function BranchControls({
  * Renders text content with optional truncation and "Show more" button
  */
 function CollapsibleText({ text }: { text: string }) {
+  const i18n = useOptionalI18n();
   const [isExpanded, setIsExpanded] = useState(false);
   const lines = text.split("\n");
   const exceedsLines = lines.length > MAX_LINES;
@@ -447,14 +752,14 @@ function CollapsibleText({ text }: { text: string }) {
   if (!needsTruncation || isExpanded) {
     return (
       <div className="text-block">
-        {text}
+        {renderPromptTextWithLinks(text)}
         {isExpanded && needsTruncation && (
           <button
             type="button"
             className="show-more-btn"
             onClick={() => setIsExpanded(false)}
           >
-            Show less
+            {i18n?.t("userPromptShowLess") ?? "Show less"}
           </button>
         )}
       </div>
@@ -472,7 +777,7 @@ function CollapsibleText({ text }: { text: string }) {
   return (
     <div className="text-block collapsible-text">
       <div className="truncated-content">
-        {truncatedText}
+        {renderPromptTextWithLinks(truncatedText)}
         <div className="fade-overlay" />
       </div>
       <button
@@ -480,14 +785,37 @@ function CollapsibleText({ text }: { text: string }) {
         className="show-more-btn"
         onClick={() => setIsExpanded(true)}
       >
-        Show more
+        {i18n?.t("userPromptShowMore") ?? "Show more"}
       </button>
+    </div>
+  );
+}
+
+function UserPromptContainer({
+  children,
+  isPending,
+}: {
+  children: ReactNode;
+  isPending?: boolean;
+}) {
+  const i18n = useOptionalI18n();
+  return (
+    <div
+      className={`user-prompt-container${isPending ? " user-prompt-awaiting" : ""}`}
+    >
+      {children}
+      {isPending && (
+        <div className="pending-message-status" role="status">
+          {i18n?.t("userPromptAwaiting") ?? "Waiting to be picked up"}
+        </div>
+      )}
     </div>
   );
 }
 
 export const UserPromptBlock = memo(function UserPromptBlock({
   content,
+  isPending,
   timestamp,
   contextBefore,
   branch,
@@ -500,15 +828,47 @@ export const UserPromptBlock = memo(function UserPromptBlock({
   const handleSelectBranch = onSelectBranch ?? onSelectCodexBranch;
 
   if (typeof content === "string") {
-    const { text, openedFiles, uploadedFiles, skills } =
+    const { text, openedFiles, uploadedFiles, skills, feishu } =
       parseUserPrompt(content);
+    const copyImages = getClipboardImageSources(uploadedFiles);
 
     // Don't render if there's no actual text content
     if (!text && skills.length === 0) {
       const hasMetadata = openedFiles.length > 0 || uploadedFiles.length > 0;
+      if (copyImages.length > 0) {
+        return (
+          <UserPromptContainer isPending={isPending}>
+            <div className="message message-user-prompt message-user-prompt-copyable">
+              <MessageActions
+                copyText=""
+                copyImages={copyImages}
+                placement="bubble"
+              />
+              <div className="message-content">
+                <FeishuPromptSource info={feishu} />
+                <UploadedFilesMetadata files={uploadedFiles} feishu={feishu} />
+              </div>
+            </div>
+            <OpenedFilesMetadata files={openedFiles} />
+          </UserPromptContainer>
+        );
+      }
+      if (hasMetadata && (feishu || isPending)) {
+        return (
+          <UserPromptContainer isPending={isPending}>
+            <div className="message message-user-prompt">
+              <div className="message-content">
+                <FeishuPromptSource info={feishu} />
+                <UploadedFilesMetadata files={uploadedFiles} feishu={feishu} />
+              </div>
+            </div>
+            <OpenedFilesMetadata files={openedFiles} />
+          </UserPromptContainer>
+        );
+      }
       return hasMetadata ? (
         <>
-          <UploadedFilesMetadata files={uploadedFiles} />
+          <UploadedFilesMetadata files={uploadedFiles} feishu={feishu} />
           <OpenedFilesMetadata files={openedFiles} />
         </>
       ) : null;
@@ -517,18 +877,23 @@ export const UserPromptBlock = memo(function UserPromptBlock({
     const copyText = text || getSkillCopyText(skills);
 
     return (
-      <div className="user-prompt-container">
+      <UserPromptContainer isPending={isPending}>
         <MessageActions
           timestamp={timestamp}
           contextBefore={contextBefore}
-          copyText={copyText}
-          onEdit={onEdit && text ? () => onEdit(text) : undefined}
+          onEdit={!isPending && onEdit && text ? () => onEdit(text) : undefined}
         />
-        <div className="message message-user-prompt">
+        <div className="message message-user-prompt message-user-prompt-copyable">
+          <MessageActions
+            copyText={copyText}
+            copyImages={copyImages}
+            placement="bubble"
+          />
           <div className="message-content">
+            <FeishuPromptSource info={feishu} />
             {text && <CollapsibleText text={text} />}
             <SkillReferences skills={skills} />
-            <UploadedFilesMetadata files={uploadedFiles} />
+            <UploadedFilesMetadata files={uploadedFiles} feishu={feishu} />
           </div>
         </div>
         {branchMetadata && (
@@ -538,7 +903,7 @@ export const UserPromptBlock = memo(function UserPromptBlock({
           />
         )}
         <OpenedFilesMetadata files={openedFiles} />
-      </div>
+      </UserPromptContainer>
     );
   }
 
@@ -554,25 +919,47 @@ export const UserPromptBlock = memo(function UserPromptBlock({
       : textContent;
 
   // Parse the combined text content for metadata
-  const { text, openedFiles, uploadedFiles, mentionedFiles, skills } =
+  const { text, openedFiles, uploadedFiles, skills, feishu } =
     parseUserPrompt(textForParsing);
-  const visibleUploadedFiles =
-    codexImageFiles.length > 0
-      ? uploadedFiles.filter(
-          (file) =>
-            !mentionedFiles.some((mentioned) => mentioned.path === file.path),
-        )
-      : uploadedFiles;
-  const allUploadedFiles = mergeUploadedFiles(
-    visibleUploadedFiles,
-    codexImageFiles,
-  );
+  const allUploadedFiles = mergeUploadedFiles(uploadedFiles, codexImageFiles);
+  const copyImages = getClipboardImageSources(allUploadedFiles);
 
   if (!text && skills.length === 0) {
     const hasMetadata = openedFiles.length > 0 || allUploadedFiles.length > 0;
+    if (copyImages.length > 0) {
+      return (
+        <UserPromptContainer isPending={isPending}>
+          <div className="message message-user-prompt message-user-prompt-copyable">
+            <MessageActions
+              copyText=""
+              copyImages={copyImages}
+              placement="bubble"
+            />
+            <div className="message-content">
+              <FeishuPromptSource info={feishu} />
+              <UploadedFilesMetadata files={allUploadedFiles} feishu={feishu} />
+            </div>
+          </div>
+          <OpenedFilesMetadata files={openedFiles} />
+        </UserPromptContainer>
+      );
+    }
+    if (hasMetadata && (feishu || isPending)) {
+      return (
+        <UserPromptContainer isPending={isPending}>
+          <div className="message message-user-prompt">
+            <div className="message-content">
+              <FeishuPromptSource info={feishu} />
+              <UploadedFilesMetadata files={allUploadedFiles} feishu={feishu} />
+            </div>
+          </div>
+          <OpenedFilesMetadata files={openedFiles} />
+        </UserPromptContainer>
+      );
+    }
     return hasMetadata ? (
       <>
-        <UploadedFilesMetadata files={allUploadedFiles} />
+        <UploadedFilesMetadata files={allUploadedFiles} feishu={feishu} />
         <OpenedFilesMetadata files={openedFiles} />
       </>
     ) : (
@@ -587,24 +974,29 @@ export const UserPromptBlock = memo(function UserPromptBlock({
   const copyText = text || getSkillCopyText(skills);
 
   return (
-    <div className="user-prompt-container">
+    <UserPromptContainer isPending={isPending}>
       <MessageActions
         timestamp={timestamp}
         contextBefore={contextBefore}
-        copyText={copyText}
-        onEdit={onEdit && text ? () => onEdit(text) : undefined}
+        onEdit={!isPending && onEdit && text ? () => onEdit(text) : undefined}
       />
-      <div className="message message-user-prompt">
+      <div className="message message-user-prompt message-user-prompt-copyable">
+        <MessageActions
+          copyText={copyText}
+          copyImages={copyImages}
+          placement="bubble"
+        />
         <div className="message-content">
+          <FeishuPromptSource info={feishu} />
           {text && <CollapsibleText text={text} />}
           <SkillReferences skills={skills} />
-          <UploadedFilesMetadata files={allUploadedFiles} />
+          <UploadedFilesMetadata files={allUploadedFiles} feishu={feishu} />
         </div>
       </div>
       {branchMetadata && (
         <BranchControls branch={branchMetadata} onSelect={handleSelectBranch} />
       )}
       <OpenedFilesMetadata files={openedFiles} />
-    </div>
+    </UserPromptContainer>
   );
 });

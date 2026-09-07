@@ -2,11 +2,17 @@ import type {
   ClaudeSessionContent,
   ClaudeSessionEntry,
   CodexSessionContent,
+  KimiSessionContent,
+  PiSessionContent,
   UnifiedSession,
   UrlProjectId,
 } from "@yep-anywhere/shared";
 import { describe, expect, it } from "vitest";
-import { normalizeSession } from "../../src/sessions/normalization.js";
+import {
+  convertKimiMessages,
+  convertPiSession,
+  normalizeSession,
+} from "../../src/sessions/normalization.js";
 import type { LoadedSession } from "../../src/sessions/types.js";
 
 describe("normalizeSession", () => {
@@ -112,6 +118,627 @@ describe("normalizeSession", () => {
     expect(toolResultIds).toContain("task-1");
     expect(toolResultIds).toContain("task-2");
     expect(toolResultIds).toContain("task-3");
+  });
+
+  it("defers Pi media and thinking while deriving summary data in one pass", () => {
+    const piSession: PiSessionContent = {
+      header: {
+        type: "session",
+        id: "session-pi-deferred",
+        timestamp: "2026-08-18T00:00:00.000Z",
+        cwd: "/tmp/project",
+      },
+      entries: [
+        {
+          type: "message",
+          id: "user-1",
+          parentId: null,
+          timestamp: "2026-08-18T00:00:01.000Z",
+          message: {
+            role: "user",
+            content: [
+              { type: "text", text: "Review this" },
+              {
+                type: "image",
+                mimeType: "image/png",
+                data: "a".repeat(256),
+              },
+            ],
+          },
+        },
+        {
+          type: "message",
+          id: "assistant-1",
+          parentId: "user-1",
+          timestamp: "2026-08-18T00:00:02.000Z",
+          message: {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "private reasoning" },
+              { type: "text", text: "Done" },
+              {
+                type: "image",
+                mimeType: "image/jpeg",
+                data: "b".repeat(256),
+              },
+            ],
+          },
+        },
+      ],
+      activeEntries: [],
+    };
+    piSession.activeEntries = piSession.entries;
+
+    const conversion = convertPiSession(piSession, {
+      deferMedia: true,
+      deferThinking: true,
+    });
+    expect(conversion.derived.messageCount).toBe(2);
+    expect(conversion.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          uuid: "user-1",
+          message: expect.objectContaining({
+            content: [
+              { type: "text", text: "Review this" },
+              { type: "input_image", mime_type: "image/png", deferred: true },
+            ],
+          }),
+        }),
+        expect.objectContaining({
+          uuid: "assistant-1",
+          message: expect.objectContaining({
+            content: [
+              { type: "thinking", thinking: "private reasoning" },
+              { type: "text", text: "Done" },
+              { type: "image", mime_type: "image/jpeg", deferred: true },
+            ],
+          }),
+        }),
+      ]),
+    );
+
+    const normalized = normalizeSession(
+      {
+        summary: {
+          id: "session-pi-deferred",
+          projectId: "test-project" as UrlProjectId,
+          title: "Pi images",
+          fullTitle: "Pi images",
+          createdAt: piSession.header.timestamp,
+          updatedAt: "2026-08-18T00:00:02.000Z",
+          messageCount: 2,
+          status: { state: "idle" },
+          provider: "pi",
+        },
+        data: { provider: "pi", session: piSession },
+      },
+      { deferMedia: true, deferThinking: true },
+    );
+    expect(JSON.stringify(normalized)).not.toContain("base64");
+  });
+
+  it("renders Kimi prompt images as input_image blocks and hides the compression notice", () => {
+    const blobsDir =
+      "/home/u/.kimi-code/sessions/wd_x/session_y/agents/main/blobs";
+    const hash = "a".repeat(64);
+    const mockSession: LoadedSession = {
+      summary: {
+        id: "session-kimi-img",
+        projectId: "test-project" as UrlProjectId,
+        title: "Kimi images",
+        fullTitle: "Kimi images",
+        createdAt: "2026-07-28T00:00:00.000Z",
+        updatedAt: "2026-07-28T00:00:01.000Z",
+        messageCount: 2,
+        status: { state: "idle" },
+        provider: "kimi",
+      },
+      data: {
+        provider: "kimi",
+        session: {
+          sessionId: "session-kimi-img",
+          createdAt: "2026-07-28T00:00:00.000Z",
+          blobsDir,
+          records: [
+            {
+              type: "turn.prompt",
+              input: [
+                { type: "text", text: "What is in this screenshot?" },
+                {
+                  type: "text",
+                  text: "<system>Image compressed to fit model limits: original 1290x2796 -> sent 923x2000.</system>",
+                },
+                {
+                  type: "image_url",
+                  imageUrl: { url: `blobref:image/png;${hash}` },
+                },
+                {
+                  type: "image_url",
+                  imageUrl: { url: "data:image/jpeg;base64,AAAB" },
+                },
+              ],
+              time: 1,
+            },
+          ],
+        },
+      } as UnifiedSession,
+    };
+
+    const normalized = normalizeSession(mockSession);
+    const content = normalized.messages[0]?.message?.content;
+
+    expect(content).toEqual([
+      { type: "text", text: "What is in this screenshot?" },
+      {
+        type: "input_image",
+        mime_type: "image/png",
+        file_path: `${blobsDir}/${hash}`,
+      },
+      {
+        type: "input_image",
+        mime_type: "image/jpeg",
+        image_url: "data:image/jpeg;base64,AAAB",
+      },
+    ]);
+  });
+
+  it("normalizes Kimi file tools and emits pairable tool result messages", () => {
+    const mockSession: LoadedSession = {
+      summary: {
+        id: "session-kimi",
+        projectId: "test-project" as UrlProjectId,
+        title: "Kimi tools",
+        fullTitle: "Kimi tools",
+        createdAt: "2026-07-25T00:00:00.000Z",
+        updatedAt: "2026-07-25T00:00:01.000Z",
+        messageCount: 7,
+        status: { state: "idle" },
+        provider: "kimi",
+      },
+      data: {
+        provider: "kimi",
+        session: {
+          sessionId: "session-kimi",
+          createdAt: "2026-07-25T00:00:00.000Z",
+          records: [
+            {
+              type: "turn.prompt",
+              input: [{ type: "text", text: "Inspect and update the file" }],
+              time: 1,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "content.part",
+                part: { type: "think", think: "User" },
+              },
+              time: 1,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "content.part",
+                part: { type: "think", think: " wants" },
+              },
+              time: 1,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "content.part",
+                part: { type: "text", text: "Starting" },
+              },
+              time: 1,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "content.part",
+                part: { type: "text", text: "." },
+              },
+              time: 1,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "tool.call",
+                toolCallId: "read-1",
+                name: "Read",
+                args: {
+                  path: "src/app.ts",
+                  line_offset: 3,
+                  n_lines: 2,
+                },
+              },
+              time: 2,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "tool.result",
+                toolCallId: "read-1",
+                result: { output: "3\tconst oldValue = 1;\n4\t" },
+              },
+              time: 3,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "tool.call",
+                toolCallId: "write-1",
+                name: "Write",
+                args: {
+                  path: "src/new.ts",
+                  content: "export const value = 2;\n",
+                },
+              },
+              time: 4,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "tool.result",
+                toolCallId: "write-1",
+                result: { output: "Wrote 24 bytes to src/new.ts" },
+              },
+              time: 5,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "tool.call",
+                toolCallId: "edit-1",
+                name: "Edit",
+                args: {
+                  path: "src/app.ts",
+                  old_string: "const oldValue = 1;",
+                  new_string: "const oldValue = 2;",
+                },
+              },
+              time: 6,
+            },
+            {
+              type: "context.append_loop_event",
+              event: {
+                type: "tool.result",
+                toolCallId: "edit-1",
+                result: {
+                  output: "old_string was not found",
+                  isError: true,
+                },
+              },
+              time: 7,
+            },
+          ],
+        },
+      } as UnifiedSession,
+    };
+
+    const normalized = normalizeSession(mockSession);
+
+    expect(normalized.messages).toHaveLength(7);
+    expect(normalized.messages[1]?.message?.content).toEqual([
+      {
+        type: "thinking",
+        thinking: "User wants",
+      },
+      {
+        type: "text",
+        text: "Starting.",
+      },
+      {
+        type: "tool_use",
+        id: "read-1",
+        name: "Read",
+        input: {
+          path: "src/app.ts",
+          file_path: "src/app.ts",
+          line_offset: 3,
+          offset: 3,
+          n_lines: 2,
+          limit: 2,
+        },
+      },
+    ]);
+    expect(normalized.messages[2]).toMatchObject({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "read-1",
+            content: "3\tconst oldValue = 1;\n4\t",
+          },
+        ],
+      },
+    });
+    expect(normalized.messages[3]?.message?.content).toEqual([
+      {
+        type: "tool_use",
+        id: "write-1",
+        name: "Write",
+        input: {
+          path: "src/new.ts",
+          file_path: "src/new.ts",
+          content: "export const value = 2;\n",
+        },
+      },
+    ]);
+    expect(normalized.messages[5]?.message?.content).toEqual([
+      {
+        type: "tool_use",
+        id: "edit-1",
+        name: "Edit",
+        input: {
+          path: "src/app.ts",
+          file_path: "src/app.ts",
+          old_string: "const oldValue = 1;",
+          new_string: "const oldValue = 2;",
+        },
+      },
+    ]);
+    expect(normalized.messages[6]).toMatchObject({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "edit-1",
+            content: "old_string was not found",
+            is_error: true,
+          },
+        ],
+      },
+    });
+  });
+
+  it("annotates ZCode user prompts with cross-session branch alternatives", () => {
+    const createdAtMs = Date.UTC(2026, 7, 12, 12, 0, 0);
+    const createdAtIso = new Date(createdAtMs).toISOString();
+    const mockSession: LoadedSession = {
+      summary: {
+        id: "ses_parent",
+        projectId: "test-project" as UrlProjectId,
+        title: "ZCode branch",
+        fullTitle: "ZCode branch",
+        createdAt: createdAtIso,
+        updatedAt: createdAtIso,
+        messageCount: 2,
+        status: { state: "idle" },
+        provider: "zcode",
+      },
+      branchState: {
+        sessionId: "ses_parent",
+        provider: "zcode",
+        activeBranchId: "u2_edit",
+        selectedBranchId: "u2_edit",
+        branches: [
+          {
+            id: "u2",
+            sessionId: "ses_parent",
+            parentId: "u1",
+            prompt: "original",
+            title: "original",
+            depth: 2,
+            index: 1,
+            siblingIndex: 1,
+            siblingCount: 2,
+            isActive: false,
+            createdAt: createdAtIso,
+            provider: "zcode",
+          },
+          {
+            id: "u2_edit",
+            sessionId: "ses_child",
+            parentId: "u1",
+            prompt: "edited",
+            title: "edited",
+            depth: 2,
+            index: 2,
+            siblingIndex: 2,
+            siblingCount: 2,
+            isActive: true,
+            createdAt: new Date(createdAtMs + 400).toISOString(),
+            provider: "zcode",
+          },
+        ],
+      },
+      data: {
+        provider: "zcode",
+        session: {
+          sessionId: "ses_parent",
+          messages: [
+            {
+              id: "u2",
+              role: "user",
+              createdAt: createdAtMs,
+              parts: [
+                {
+                  id: "u2-p0",
+                  messageID: "u2",
+                  sessionID: "ses_parent",
+                  type: "text",
+                  text: "original",
+                },
+              ],
+            },
+          ],
+        },
+      } as UnifiedSession,
+    };
+
+    const normalized = normalizeSession(mockSession);
+    expect(normalized.branchState).toBe(mockSession.branchState);
+    expect(normalized.messages[0]).toMatchObject({
+      uuid: "u2",
+      timestamp: createdAtIso,
+      branch: {
+        sessionId: "ses_parent",
+        branchId: "u2",
+        siblingCount: 2,
+        alternatives: [
+          expect.objectContaining({ id: "u2", sessionId: "ses_parent" }),
+          expect.objectContaining({ id: "u2_edit", sessionId: "ses_child" }),
+        ],
+      },
+    });
+  });
+
+  it("resolves a ZCode copied prompt to the canonical option by timestamp and text", () => {
+    const createdAtMs = Date.UTC(2026, 7, 12, 12, 0, 0);
+    const createdAtIso = new Date(createdAtMs).toISOString();
+    const mockSession: LoadedSession = {
+      summary: {
+        id: "ses_child",
+        projectId: "test-project" as UrlProjectId,
+        title: "ZCode branch",
+        fullTitle: "ZCode branch",
+        createdAt: createdAtIso,
+        updatedAt: createdAtIso,
+        messageCount: 1,
+        status: { state: "idle" },
+        provider: "zcode",
+      },
+      branchState: {
+        sessionId: "ses_child",
+        provider: "zcode",
+        activeBranchId: "u2_edit",
+        selectedBranchId: "u2_edit",
+        branches: [
+          {
+            id: "u2",
+            sessionId: "ses_parent",
+            parentId: "u1",
+            prompt: "original",
+            title: "original",
+            depth: 2,
+            index: 1,
+            siblingIndex: 1,
+            siblingCount: 2,
+            isActive: false,
+            createdAt: createdAtIso,
+            provider: "zcode",
+          },
+          {
+            id: "u2_edit",
+            sessionId: "ses_child",
+            parentId: "u1",
+            prompt: "edited",
+            title: "edited",
+            depth: 2,
+            index: 2,
+            siblingIndex: 2,
+            siblingCount: 2,
+            isActive: true,
+            provider: "zcode",
+          },
+        ],
+      },
+      data: {
+        provider: "zcode",
+        session: {
+          sessionId: "ses_child",
+          messages: [
+            // Copied original prompt with a fresh native id: id matching
+            // fails, the timestamp/text fallback resolves the canonical one.
+            {
+              id: "u2_copy",
+              role: "user",
+              createdAt: createdAtMs,
+              parts: [
+                {
+                  id: "u2_copy-p0",
+                  messageID: "u2_copy",
+                  sessionID: "ses_child",
+                  type: "text",
+                  text: "original",
+                },
+              ],
+            },
+          ],
+        },
+      } as UnifiedSession,
+    };
+
+    const normalized = normalizeSession(mockSession);
+    expect(normalized.messages[0]).toMatchObject({
+      uuid: "u2_copy",
+      branch: { sessionId: "ses_parent", branchId: "u2", siblingCount: 2 },
+    });
+  });
+
+  it("preserves same-session Claude branch annotation", () => {
+    const mockSession: LoadedSession = {
+      summary: {
+        id: "claude-session",
+        projectId: "test-project" as UrlProjectId,
+        title: "Claude branch",
+        fullTitle: "Claude branch",
+        createdAt: "2026-07-15T00:00:00.000Z",
+        updatedAt: "2026-07-15T00:00:01.000Z",
+        messageCount: 1,
+        status: { state: "idle" },
+        provider: "claude",
+      },
+      messagesAlreadyProjected: true,
+      branchState: {
+        sessionId: "claude-session",
+        provider: "claude",
+        activeBranchId: "u2-edit",
+        selectedBranchId: "u2-edit",
+        branches: [
+          {
+            id: "u2-original",
+            sessionId: "claude-session",
+            parentId: "a1",
+            prompt: "original",
+            title: "original",
+            depth: 2,
+            index: 1,
+            siblingIndex: 1,
+            siblingCount: 2,
+            isActive: false,
+            provider: "claude",
+          },
+          {
+            id: "u2-edit",
+            sessionId: "claude-session",
+            parentId: "a1",
+            prompt: "edited",
+            title: "edited",
+            depth: 2,
+            index: 2,
+            siblingIndex: 2,
+            siblingCount: 2,
+            isActive: true,
+            provider: "claude",
+          },
+        ],
+      },
+      data: {
+        provider: "claude",
+        session: {
+          messages: [
+            {
+              type: "user",
+              uuid: "u2-edit",
+              parentUuid: "a1",
+              message: { role: "user", content: "edited" },
+            },
+          ],
+        },
+      } as UnifiedSession,
+    };
+
+    const normalized = normalizeSession(mockSession);
+    expect(normalized.messages[0]?.branch).toMatchObject({
+      sessionId: "claude-session",
+      branchId: "u2-edit",
+      siblingCount: 2,
+    });
   });
 
   it("normalizes codex-oss sessions correctly", () => {
@@ -488,6 +1115,317 @@ describe("normalizeSession", () => {
       "i'm talking out of turn!",
       "saying a second thing out of turn",
       "saying a third thing out of turn",
+    ]);
+  });
+});
+
+describe("convertKimiMessages", () => {
+  it("projects persisted ReadMediaFile arrays into bounded structured results", () => {
+    const hash = "a".repeat(64);
+    const messages = convertKimiMessages({
+      sessionId: "session-media",
+      blobsDir: "/tmp/kimi-session/agents/main/blobs",
+      records: [
+        {
+          type: "context.append_loop_event",
+          event: {
+            type: "tool.call",
+            toolCallId: "ReadMediaFile:0",
+            name: "ReadMediaFile",
+            args: { path: "/tmp/example.png" },
+          },
+          time: 1,
+        },
+        {
+          type: "context.append_loop_event",
+          event: {
+            type: "tool.result",
+            toolCallId: "ReadMediaFile:0",
+            result: {
+              output: [
+                { type: "text", text: '<image path="/tmp/example.png">' },
+                {
+                  type: "image_url",
+                  imageUrl: { url: `blobref:image/png;${hash}` },
+                },
+                { type: "text", text: "</image>" },
+              ],
+            },
+          },
+          time: 2,
+        },
+      ],
+    });
+
+    expect(messages[1]).toMatchObject({
+      type: "user",
+      message: {
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "ReadMediaFile:0",
+            content: "image loaded: example.png",
+          },
+        ],
+      },
+      toolUseResult: {
+        type: "media",
+        kind: "image",
+        path: "/tmp/example.png",
+        mimeType: "image/png",
+        filePath: `/tmp/kimi-session/agents/main/blobs/${hash}`,
+        previewUrl: expect.stringContaining("/api/local-image?path="),
+      },
+    });
+    expect(JSON.stringify(messages)).not.toContain("blobref:");
+  });
+
+  it("replays TodoList from the durable tool call without duplicating its store update", () => {
+    const messages = convertKimiMessages({
+      sessionId: "session-todo",
+      records: [
+        {
+          type: "turn.prompt",
+          input: [{ type: "text", text: "fix the renderer" }],
+          time: 1,
+        },
+        {
+          type: "context.append_loop_event",
+          event: {
+            type: "tool.call",
+            toolCallId: "TodoList_1",
+            name: "TodoList",
+            args: {
+              todos: [
+                { title: "Inspect code", status: "done" },
+                { title: "Patch renderer", status: "in_progress" },
+              ],
+            },
+          },
+          time: 2,
+        },
+        {
+          type: "tools.update_store",
+          key: "todo",
+          value: [
+            { title: "Inspect code", status: "done" },
+            { title: "Patch renderer", status: "in_progress" },
+          ],
+          time: 3,
+        },
+        {
+          type: "context.append_loop_event",
+          event: {
+            type: "tool.result",
+            toolCallId: "TodoList_1",
+            result: { output: "Todo list updated." },
+          },
+          time: 4,
+        },
+      ],
+    });
+
+    const blocks = messages.flatMap((message) => {
+      const content = message.message?.content;
+      return Array.isArray(content) ? content : [];
+    });
+    expect(blocks.filter((block) => block.type === "tool_use")).toEqual([
+      expect.objectContaining({
+        id: "TodoList_1",
+        name: "TodoList",
+        input: {
+          todos: [
+            { title: "Inspect code", status: "done" },
+            { title: "Patch renderer", status: "in_progress" },
+          ],
+        },
+      }),
+    ]);
+    expect(blocks.filter((block) => block.type === "thinking")).toHaveLength(0);
+  });
+
+  it("keeps persisted provider.filtered failures visible after reload", () => {
+    const session: KimiSessionContent = {
+      sessionId: "session-filtered",
+      records: [
+        {
+          type: "turn.prompt",
+          input: [{ type: "text", text: "inspect the project" }],
+          time: 1,
+        },
+        {
+          type: "context.append_loop_event",
+          event: {
+            type: "content.part",
+            part: { type: "text", text: "I cannot provide that content." },
+          },
+          time: 2,
+        },
+        {
+          type: "context.append_loop_event",
+          event: {
+            type: "step.end",
+            finishReason: "filtered",
+            providerFinishReason: "filtered",
+            rawFinishReason: "content_filter",
+          },
+          time: 2,
+        },
+        {
+          type: "turn.ended",
+          turnId: 0,
+          reason: "failed",
+          error: {
+            code: "provider.filtered",
+            message: "Provider safety policy blocked the response.",
+            name: "ProviderFilteredError",
+            retryable: false,
+          },
+          time: 3,
+        },
+      ],
+    };
+
+    expect(convertKimiMessages(session)).toMatchObject([
+      { type: "user" },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: "I cannot provide that content." }],
+        },
+      },
+      {
+        uuid: "session-filtered-turn-0-error",
+        type: "error",
+        error: "Provider safety policy blocked the response.",
+        content: "Provider safety policy blocked the response.",
+        errorCode: "provider.filtered",
+        retryable: false,
+        finishReason: "filtered",
+        providerFinishReason: "filtered",
+        rawFinishReason: "content_filter",
+      },
+    ]);
+  });
+
+  it("merges goal lifecycle snapshots as inline kimi_goal messages", () => {
+    const session: KimiSessionContent = {
+      sessionId: "session-goal",
+      records: [
+        {
+          type: "goal.create",
+          goalId: "g1",
+          objective: "build feature X",
+          time: 1,
+        },
+        {
+          type: "turn.prompt",
+          input: [{ type: "text", text: "go" }],
+          time: 2,
+        },
+        {
+          type: "goal.update",
+          status: "blocked",
+          reason: "rate limit",
+          turnsUsed: 3,
+          budgetLimits: { turnBudget: 10 },
+          time: 3,
+        },
+        {
+          type: "goal.clear",
+          time: 4,
+        },
+      ],
+    };
+
+    const messages = convertKimiMessages(session);
+    const goalMessages = messages.filter((m) => m.type === "kimi_goal");
+    expect(goalMessages).toHaveLength(3);
+
+    // created snapshot
+    expect(goalMessages[0]?.goal).toMatchObject({
+      goalId: "g1",
+      objective: "build feature X",
+      status: "active",
+      turnsUsed: 0,
+      budgetLimits: {},
+      change: "created",
+    });
+
+    // status change → blocked
+    expect(goalMessages[1]?.goal).toMatchObject({
+      status: "blocked",
+      reason: "rate limit",
+      turnsUsed: 3,
+      budgetLimits: { turnBudget: 10 },
+      change: "status",
+    });
+
+    // cleared
+    expect(goalMessages[2]?.goal).toMatchObject({
+      status: "cleared",
+      change: "cleared",
+    });
+
+    // The goal messages should interleave with the user turn by timestamp.
+    const userTurnIdx = messages.findIndex((m) => m.type === "user");
+    const createdIdx = messages.findIndex(
+      (m) =>
+        m.type === "kimi_goal" &&
+        (m.goal as { change?: string }).change === "created",
+    );
+    // created (time 1) comes before the user turn (time 2).
+    expect(createdIdx).toBeLessThan(userTurnIdx);
+  });
+
+  it("does not emit goal messages for a child wire without goal records", () => {
+    const session: KimiSessionContent = {
+      sessionId: "session-child",
+      records: [
+        {
+          type: "turn.prompt",
+          input: [{ type: "text", text: "do work" }],
+          time: 1,
+        },
+        {
+          type: "context.append_loop_event",
+          event: { type: "content.part", part: { type: "text", text: "done" } },
+          time: 2,
+        },
+      ],
+    };
+
+    const messages = convertKimiMessages(session);
+    expect(messages.filter((m) => m.type === "kimi_goal")).toHaveLength(0);
+  });
+
+  it("places a goal marker after transcript messages with the same timestamp", () => {
+    const messages = convertKimiMessages({
+      sessionId: "session-goal-tie",
+      records: [
+        {
+          type: "turn.prompt",
+          input: [{ type: "text", text: "start" }],
+          time: 10,
+        },
+        {
+          type: "context.append_loop_event",
+          event: { type: "content.part", part: { type: "text", text: "work" } },
+          time: 10,
+        },
+        {
+          type: "goal.create",
+          goalId: "g-tie",
+          objective: "finish",
+          time: 10,
+        },
+      ],
+    });
+
+    expect(messages.map((message) => message.type)).toEqual([
+      "user",
+      "assistant",
+      "kimi_goal",
     ]);
   });
 });

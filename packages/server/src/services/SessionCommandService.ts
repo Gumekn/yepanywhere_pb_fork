@@ -1,0 +1,2235 @@
+import {
+  ALL_CODEX_MCP_MODES,
+  ALL_PERMISSION_MODES,
+  type CodexMcpMode,
+  type CodexServiceTier,
+  type LlmGatewayJsonObject,
+  type LlmGatewayModelCapabilities,
+  type LlmGatewayModelLimits,
+  type LlmGatewayRequestProtocol,
+  type LlmGatewaySessionConfig,
+  type PermissionRules,
+  type ProviderName,
+  type SessionCreatedBy,
+  type SessionOriginChannel,
+  type ThinkingOption,
+  type UploadedFile,
+  type UrlProjectId,
+  isUrlProjectId,
+  thinkingOptionToConfig,
+} from "@yep-anywhere/shared";
+import type {
+  RespondToInputOptions,
+  SessionInputResponseBody,
+  SessionInteractionService,
+} from "../interactions/SessionInteractionService.js";
+import { getLogger } from "../logging/logger.js";
+import type { SessionMetadataService } from "../metadata/index.js";
+import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
+import {
+  encodeProjectId,
+  resolveResumeCwd,
+  resolveStartCwd,
+} from "../projects/paths.js";
+import type { ProjectScanner } from "../projects/scanner.js";
+import type { RecentsService } from "../recents/index.js";
+import { resolveSessionModel } from "../routes/session-model.js";
+import type {
+  RuntimeController,
+  RuntimeProcessSnapshot,
+  RuntimeSessionEventEmitter,
+  RuntimeSessionStartResponse,
+  RuntimeSessionSubscription,
+  RuntimeSessionSubscriptionOptions,
+  RuntimeStartedProcess,
+} from "../runtime/types.js";
+import type {
+  CodexNativeControlRequest,
+  CodexNativeControlResult,
+} from "../sdk/providers/codex-controls.js";
+import {
+  CodexModelSourceError,
+  getCodexModelSourceRegistry,
+} from "../sdk/providers/codex-model-sources.js";
+import {
+  isProviderEnabled,
+  isRetiredProviderName,
+} from "../sdk/providers/policy.js";
+import type {
+  CodexStructuredUserInput,
+  PermissionMode,
+  UserMessage,
+} from "../sdk/types.js";
+import { CodexSessionReader } from "../sessions/codex-reader.js";
+import { computeCodexRollbackNumTurns } from "../sessions/codex-rollback.js";
+import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
+import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { PiSessionReader } from "../sessions/pi-reader.js";
+import {
+  type ProviderResolutionDeps,
+  findSessionSummaryAcrossProviders,
+} from "../sessions/provider-resolution.js";
+import type { ISessionReader } from "../sessions/types.js";
+import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
+import type {
+  ImmediateStartUnavailableResponse,
+  QueueFullResponse,
+} from "../supervisor/Supervisor.js";
+import type { QueuedResponse } from "../supervisor/WorkerQueue.js";
+import type { Project, SessionSummary } from "../supervisor/types.js";
+import {
+  isValidSshHostAlias,
+  normalizeSshHostAlias,
+} from "../utils/sshHostAlias.js";
+import type { EventBus } from "../watcher/index.js";
+import type { ModelInfoService } from "./ModelInfoService.js";
+import type { ServerSettingsService } from "./ServerSettingsService.js";
+
+export interface SessionCommandServiceDeps {
+  runtimeController: RuntimeController;
+  scanner: ProjectScanner;
+  readerFactory: (project: Project) => ISessionReader;
+  /** Sole pending-input/CAS authority shared by HTTP and channel adapters. */
+  sessionInteractionService: SessionInteractionService;
+  /** Persists permission mode when no resident process exists. */
+  sessionMetadataService?: SessionMetadataService;
+  eventBus?: EventBus;
+  serverSettingsService?: ServerSettingsService;
+  modelInfoService?: ModelInfoService;
+  recentsService?: RecentsService;
+  codexSessionsDir?: string;
+  codexReaderFactory?: (projectPath: string) => CodexSessionReader;
+  geminiScanner?: GeminiSessionScanner;
+  geminiSessionsDir?: string;
+  geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
+  zcodeDbPath?: string;
+  piSessionsDir?: string;
+  piReaderFactory?: (projectPath: string) => PiSessionReader;
+  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
+  kimiSessionsDir?: string;
+  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  enabledProviders?: readonly string[];
+}
+
+export interface StartSessionCommandInput {
+  projectId: string;
+  body: StartSessionBody;
+  origin?: SessionCommandOrigin;
+  /** Reject atomically before worker-queue admission when an ID is needed now. */
+  requireImmediate?: boolean;
+}
+
+export interface CreateSessionCommandInput {
+  projectId: string;
+  body?: CreateSessionBody;
+  origin?: SessionCommandOrigin;
+  /** Reject atomically when a create-only session cannot start immediately. */
+  requireImmediate?: boolean;
+}
+
+export interface ResumeSessionCommandInput {
+  projectId: string;
+  sessionId: string;
+  body: StartSessionBody;
+  origin?: SessionCommandOrigin;
+  /** Reject atomically when resuming would enter the worker queue. */
+  requireImmediate?: boolean;
+  /** Internal provider-native action to run after a message-free resume. */
+  controlAfterResume?: Extract<
+    CodexNativeControlRequest,
+    { control: "thread/compact/start" }
+  >;
+  /** Internal-only source override used by the Feishu usage-limit router. */
+  codexModelProviderOverride?: {
+    sourceId: string;
+    reason: "usage_limit_fallback" | "usage_limit_recovered";
+  };
+  /** Replace a create-only Codex thread when no rollout was materialized yet. */
+  allowMissingRolloutReplacement?: boolean;
+}
+
+export interface ResumeCodexControlCommandInput {
+  projectId: string;
+  sessionId: string;
+  request: Extract<
+    CodexNativeControlRequest,
+    { control: "thread/compact/start" }
+  >;
+  body?: CreateSessionBody;
+  origin?: SessionCommandOrigin;
+}
+
+export interface QueueSessionMessageCommandInput {
+  sessionId: string;
+  body: QueueSessionMessageBody;
+  /** Reject atomically if accepting this message requires a queued restart. */
+  requireImmediate?: boolean;
+  /** Keep this input as its own provider turn instead of steering an active one. */
+  allowSteer?: boolean;
+}
+
+export interface SendSessionMessageCommandInput
+  extends ResumeSessionCommandInput {
+  /** Keep this input as its own provider turn instead of steering an active one. */
+  allowSteer?: boolean;
+}
+
+export interface SwitchCodexModelSourceCommandInput {
+  projectId: string;
+  sessionId: string;
+  body: StartSessionBody;
+  origin?: SessionCommandOrigin;
+  /** Remove the just-failed, side-effect-free turn before replaying its input. */
+  excludeFailedTurn?: boolean;
+}
+
+export interface SessionCommandOrigin {
+  createdBy?: SessionCreatedBy;
+  originChannel?: SessionOriginChannel;
+  /** Stable, non-secret channel account key used only for Codex event rollout. */
+  codexEventAccountId?: string;
+}
+
+export interface StartSessionBody {
+  message: string;
+  images?: string[];
+  documents?: string[];
+  attachments?: UploadedFile[];
+  /** Ordered native Codex skill/mention input items. */
+  codexInputs?: CodexStructuredUserInput[];
+  mode?: PermissionMode;
+  model?: string;
+  thinking?: ThinkingOption;
+  /** Exact provider reasoning effort / gateway model variant. */
+  reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
+  provider?: ProviderName;
+  /** Codex MCP profile. Only used when provider resolves to Codex. */
+  codexMcpMode?: CodexMcpMode;
+  /** Codex model source (Codex `model_provider`). Only used for Codex. */
+  codexModelProvider?: string;
+  /** Managed gateway provider/model configuration. */
+  llmGatewayConfig?: LlmGatewaySessionConfig;
+  /** Client-generated temp ID for optimistic UI tracking. */
+  tempId?: string;
+  /** SSH host alias for remote execution (undefined = local). */
+  executor?: string;
+  /** Permission rules for tool filtering (deny/allow patterns). */
+  permissions?: PermissionRules;
+  resumeSessionAt?: string;
+  rollbackNumTurns?: number;
+  rollbackTarget?: {
+    messageId?: string;
+    timestamp?: string;
+    text?: string;
+  };
+}
+
+export interface CreateSessionBody {
+  mode?: PermissionMode;
+  model?: string;
+  thinking?: ThinkingOption;
+  reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
+  provider?: ProviderName;
+  codexMcpMode?: CodexMcpMode;
+  codexModelProvider?: string;
+  llmGatewayConfig?: LlmGatewaySessionConfig;
+  executor?: string;
+  permissions?: PermissionRules;
+}
+
+export interface QueueSessionMessageBody extends StartSessionBody {
+  deferred?: boolean;
+}
+
+export interface ExecuteCodexControlCommandInput {
+  sessionId: string;
+  request: CodexNativeControlRequest;
+}
+
+export type SessionCommandStatus =
+  | 200
+  | 202
+  | 400
+  | 404
+  | 409
+  | 410
+  | 502
+  | 503;
+
+export type SessionCommandResult<T extends Record<string, unknown>> =
+  | { ok: true; status: 200 | 202; body: T }
+  | {
+      ok: false;
+      status: Exclude<SessionCommandStatus, 200 | 202>;
+      body: { error: string } & Record<string, unknown>;
+    };
+
+function commandSuccess<T extends Record<string, unknown>>(
+  body: T,
+  status: 200 | 202 = 200,
+): SessionCommandResult<T> {
+  return { ok: true, status, body };
+}
+
+function commandFailure(
+  error: string,
+  status: Exclude<SessionCommandStatus, 200 | 202>,
+  details: Record<string, unknown> = {},
+): SessionCommandResult<never> {
+  return { ok: false, status, body: { error, ...details } };
+}
+
+function isQueuedResponse(
+  result: RuntimeSessionStartResponse,
+): result is QueuedResponse {
+  return "queued" in result && result.queued === true;
+}
+
+function isQueueFullResponse(
+  result: RuntimeSessionStartResponse,
+): result is QueueFullResponse {
+  return "error" in result && result.error === "queue_full";
+}
+
+function isImmediateStartUnavailableResponse(
+  result: RuntimeSessionStartResponse,
+): result is ImmediateStartUnavailableResponse {
+  return "error" in result && result.error === "immediate_start_unavailable";
+}
+
+function isStartedResponse(
+  result: RuntimeSessionStartResponse,
+): result is RuntimeStartedProcess {
+  return "id" in result && "sessionId" in result;
+}
+
+function parseOptionalExecutor(rawExecutor: unknown): {
+  executor: string | undefined;
+  error?: string;
+} {
+  if (rawExecutor === undefined || rawExecutor === null) {
+    return { executor: undefined };
+  }
+  if (typeof rawExecutor !== "string") {
+    return { executor: undefined, error: "executor must be a string" };
+  }
+
+  const executor = normalizeSshHostAlias(rawExecutor);
+  if (!executor) return { executor: undefined };
+  if (!isValidSshHostAlias(executor)) {
+    return {
+      executor: undefined,
+      error: "executor must be a valid SSH host alias",
+    };
+  }
+  return { executor };
+}
+
+function parseOptionalCodexMcpMode(rawMode: unknown): {
+  codexMcpMode: CodexMcpMode | undefined;
+  error?: string;
+} {
+  if (rawMode === undefined || rawMode === null || rawMode === "") {
+    return { codexMcpMode: undefined };
+  }
+  if (
+    typeof rawMode === "string" &&
+    ALL_CODEX_MCP_MODES.includes(rawMode as CodexMcpMode)
+  ) {
+    return { codexMcpMode: rawMode as CodexMcpMode };
+  }
+  return { codexMcpMode: undefined, error: "codexMcpMode is invalid" };
+}
+
+function resolveCodexModelProviderForStart(
+  provider: ProviderName | undefined,
+  codexModelProvider: string | undefined,
+  model: string | undefined,
+): { value?: string; error?: string; code?: string } {
+  if (provider !== "codex") return { value: undefined };
+  const registry = getCodexModelSourceRegistry();
+  // Channel entry points (e.g. the Feishu bot) only carry a model slug and
+  // never name a source. Infer the custom source that owns the slug, mirroring
+  // `resolveCodexResumeSource`, so a managed model such as `deepseek-v4-flash`
+  // never starts against the built-in OpenAI source.
+  const sourceId =
+    codexModelProvider?.trim() ||
+    registry.findModelSource(model?.trim()) ||
+    "openai";
+  try {
+    const source = registry.require(sourceId);
+    registry.assertModelSelectable(source.id, model);
+    return { value: source.id };
+  } catch (error) {
+    if (error instanceof CodexModelSourceError) {
+      return { error: error.message, code: error.code };
+    }
+    throw error;
+  }
+}
+
+function supportsResumeSessionAt(
+  provider: ProviderName | string | undefined,
+): boolean {
+  return provider === "claude" || provider === "pi" || provider === "zcode";
+}
+
+function resolveCodexResumeSource(
+  model: string | undefined,
+  persistedSource: string | undefined,
+): string | undefined {
+  const trimmedPersistedSource = persistedSource?.trim();
+  if (trimmedPersistedSource) return trimmedPersistedSource;
+
+  const registry = getCodexModelSourceRegistry();
+  const trimmedModel = model?.trim();
+  return trimmedModel ? registry.findModelSource(trimmedModel) : undefined;
+}
+
+function parseOptionalPositiveInteger(
+  value: unknown,
+  fieldName: string,
+): { value: number | undefined; error?: string } {
+  if (value === undefined || value === null) return { value: undefined };
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return { value: undefined, error: `${fieldName} must be a number` };
+  }
+  if (!Number.isInteger(value) || value < 1) {
+    return {
+      value: undefined,
+      error: `${fieldName} must be a positive integer`,
+    };
+  }
+  return { value };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function validateOptionalCodexInputs(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) return "codexInputs must be an array";
+  if (value.length > 64) return "codexInputs must contain at most 64 items";
+
+  for (let index = 0; index < value.length; index += 1) {
+    const input = value[index];
+    if (!isPlainObject(input)) {
+      return `codexInputs[${index}] must be an object`;
+    }
+    if (input.type !== "skill" && input.type !== "mention") {
+      return `codexInputs[${index}].type must be skill or mention`;
+    }
+    if (typeof input.name !== "string" || input.name.trim().length === 0) {
+      return `codexInputs[${index}].name must be a non-empty string`;
+    }
+    if (typeof input.path !== "string" || input.path.trim().length === 0) {
+      return `codexInputs[${index}].path must be a non-empty string`;
+    }
+    if (input.name.length > 256 || input.path.length > 8_192) {
+      return `codexInputs[${index}] exceeds the supported size`;
+    }
+  }
+  return undefined;
+}
+
+function parseGatewayModelLimits(rawLimits: unknown): {
+  limits: LlmGatewayModelLimits | undefined;
+  error?: string;
+} {
+  if (rawLimits === undefined || rawLimits === null || rawLimits === "") {
+    return { limits: undefined };
+  }
+  if (!isPlainObject(rawLimits)) {
+    return {
+      limits: undefined,
+      error: "llmGatewayConfig.limits must be an object",
+    };
+  }
+
+  const hasContext =
+    rawLimits.context !== undefined && rawLimits.context !== null;
+  const hasOutput = rawLimits.output !== undefined && rawLimits.output !== null;
+  if (!hasContext && !hasOutput) return { limits: undefined };
+  if (!hasContext || !hasOutput) {
+    return {
+      limits: undefined,
+      error: "llmGatewayConfig.limits requires both context and output",
+    };
+  }
+
+  const context = parseOptionalPositiveInteger(
+    rawLimits.context,
+    "llmGatewayConfig.limits.context",
+  );
+  if (context.error) return { limits: undefined, error: context.error };
+  const output = parseOptionalPositiveInteger(
+    rawLimits.output,
+    "llmGatewayConfig.limits.output",
+  );
+  if (output.error) return { limits: undefined, error: output.error };
+  if (context.value === undefined || output.value === undefined) {
+    return {
+      limits: undefined,
+      error: "llmGatewayConfig.limits requires both context and output",
+    };
+  }
+  const input = parseOptionalPositiveInteger(
+    rawLimits.input,
+    "llmGatewayConfig.limits.input",
+  );
+  if (input.error) return { limits: undefined, error: input.error };
+  return {
+    limits: {
+      context: context.value,
+      ...(input.value === undefined ? {} : { input: input.value }),
+      output: output.value,
+    },
+  };
+}
+
+function validateGatewayJson(
+  value: unknown,
+  fieldName: string,
+  depth = 0,
+): string | undefined {
+  if (depth > 12) return `${fieldName} is nested too deeply`;
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return undefined;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? undefined : `${fieldName} must be JSON`;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const error = validateGatewayJson(
+        value[index],
+        `${fieldName}[${index}]`,
+        depth + 1,
+      );
+      if (error) return error;
+    }
+    return undefined;
+  }
+  if (!isPlainObject(value)) return `${fieldName} must be JSON`;
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "__proto__" || key === "prototype" || key === "constructor") {
+      return `${fieldName} contains a reserved key`;
+    }
+    const error = validateGatewayJson(item, `${fieldName}.${key}`, depth + 1);
+    if (error) return error;
+  }
+  return undefined;
+}
+
+function parseGatewayAdvancedObject(
+  value: unknown,
+  fieldName: string,
+): { value?: LlmGatewayJsonObject; error?: string } {
+  if (value === undefined || value === null) return {};
+  if (!isPlainObject(value)) return { error: `${fieldName} must be an object` };
+  const error = validateGatewayJson(value, fieldName);
+  if (error) return { error };
+  if (JSON.stringify(value).length > 65_536) {
+    return { error: `${fieldName} is too large` };
+  }
+  return { value: value as LlmGatewayJsonObject };
+}
+
+export function parseOptionalLlmGatewayConfig(raw: unknown): {
+  llmGatewayConfig: LlmGatewaySessionConfig | undefined;
+  error?: string;
+} {
+  if (raw === undefined || raw === null || raw === "") {
+    return { llmGatewayConfig: undefined };
+  }
+  if (!isPlainObject(raw)) {
+    return {
+      llmGatewayConfig: undefined,
+      error: "llmGatewayConfig must be an object",
+    };
+  }
+  const model = typeof raw.model === "string" ? raw.model.trim() : "";
+  if (
+    !model ||
+    model.length > 512 ||
+    model === "__proto__" ||
+    model === "prototype" ||
+    model === "constructor" ||
+    Array.from(model).some((character) => character.charCodeAt(0) < 32)
+  ) {
+    return {
+      llmGatewayConfig: undefined,
+      error: "llmGatewayConfig.model must be a valid model ID",
+    };
+  }
+  const requestProtocol = raw.requestProtocol;
+  if (
+    requestProtocol !== "openai-compatible" &&
+    requestProtocol !== "anthropic"
+  ) {
+    return {
+      llmGatewayConfig: undefined,
+      error: "llmGatewayConfig.requestProtocol is invalid",
+    };
+  }
+  const parsedLimits = parseGatewayModelLimits(raw.limits);
+  if (parsedLimits.error) {
+    return { llmGatewayConfig: undefined, error: parsedLimits.error };
+  }
+
+  let capabilities: LlmGatewayModelCapabilities | undefined;
+  if (raw.capabilities !== undefined && raw.capabilities !== null) {
+    if (!isPlainObject(raw.capabilities)) {
+      return {
+        llmGatewayConfig: undefined,
+        error: "llmGatewayConfig.capabilities must be an object",
+      };
+    }
+    capabilities = {};
+    for (const key of [
+      "attachment",
+      "reasoning",
+      "temperature",
+      "toolCall",
+    ] as const) {
+      const value = raw.capabilities[key];
+      if (value === undefined) continue;
+      if (typeof value !== "boolean") {
+        return {
+          llmGatewayConfig: undefined,
+          error: `llmGatewayConfig.capabilities.${key} must be a boolean`,
+        };
+      }
+      capabilities[key] = value;
+    }
+  }
+
+  let advanced: LlmGatewaySessionConfig["advanced"];
+  if (raw.advanced !== undefined && raw.advanced !== null) {
+    if (!isPlainObject(raw.advanced)) {
+      return {
+        llmGatewayConfig: undefined,
+        error: "llmGatewayConfig.advanced must be an object",
+      };
+    }
+    const provider = parseGatewayAdvancedObject(
+      raw.advanced.provider,
+      "llmGatewayConfig.advanced.provider",
+    );
+    if (provider.error) {
+      return { llmGatewayConfig: undefined, error: provider.error };
+    }
+    const modelPatch = parseGatewayAdvancedObject(
+      raw.advanced.model,
+      "llmGatewayConfig.advanced.model",
+    );
+    if (modelPatch.error) {
+      return { llmGatewayConfig: undefined, error: modelPatch.error };
+    }
+    if (provider.value || modelPatch.value) {
+      advanced = { provider: provider.value, model: modelPatch.value };
+    }
+  }
+
+  let name: string | undefined;
+  if (raw.name !== undefined && raw.name !== null && raw.name !== "") {
+    if (typeof raw.name !== "string" || raw.name.trim().length > 200) {
+      return {
+        llmGatewayConfig: undefined,
+        error: "llmGatewayConfig.name must be a string up to 200 characters",
+      };
+    }
+    name = raw.name.trim();
+  }
+  return {
+    llmGatewayConfig: {
+      model,
+      requestProtocol: requestProtocol as LlmGatewayRequestProtocol,
+      ...(name ? { name } : {}),
+      ...(parsedLimits.limits ? { limits: parsedLimits.limits } : {}),
+      ...(capabilities && Object.keys(capabilities).length > 0
+        ? { capabilities }
+        : {}),
+      ...(advanced ? { advanced } : {}),
+    },
+  };
+}
+
+export function parseOptionalReasoningEffort(rawEffort: unknown): {
+  reasoningEffort?: string;
+  error?: string;
+} {
+  if (rawEffort === undefined || rawEffort === null || rawEffort === "") {
+    return {};
+  }
+  if (typeof rawEffort !== "string") {
+    return { error: "reasoningEffort must be a string" };
+  }
+  const reasoningEffort = rawEffort.trim();
+  if (
+    reasoningEffort.length === 0 ||
+    reasoningEffort.length > 64 ||
+    Array.from(reasoningEffort).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x1f || codePoint === 0x7f;
+    })
+  ) {
+    return { error: "Invalid reasoningEffort" };
+  }
+  return { reasoningEffort };
+}
+
+export function normalizeReasoningEffortForProvider(
+  provider: ProviderName | undefined,
+  reasoningEffort: string | undefined,
+): string | undefined {
+  return provider === "pi" && reasoningEffort === "default"
+    ? undefined
+    : reasoningEffort;
+}
+
+/**
+ * Provider-neutral application boundary for session commands.
+ *
+ * Pending-input operations deliberately delegate to SessionInteractionService
+ * so every caller shares one durable broker and one provider-resolution path.
+ */
+export class SessionCommandService {
+  constructor(private readonly deps: SessionCommandServiceDeps) {}
+
+  async start(
+    input: StartSessionCommandInput,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const { projectId, body } = input;
+    const providerFailure = this.validateRequestedProvider(body.provider);
+    if (providerFailure) return providerFailure;
+    if (!isUrlProjectId(projectId)) {
+      return commandFailure("Invalid project ID format", 400);
+    }
+
+    let project = await this.deps.scanner.getOrCreateProject(projectId);
+    if (!project) {
+      return commandFailure("Project not found or path does not exist", 404);
+    }
+
+    const recoverySessionDir = project.sessionDir;
+    const recoveredCwd = await resolveStartCwd(
+      project.path,
+      recoverySessionDir,
+      (cwd) => this.deps.scanner.mapSessionCwdToLocal(cwd, recoverySessionDir),
+    );
+    if (recoveredCwd) {
+      const recoveredId = encodeProjectId(recoveredCwd);
+      const fresh = await this.deps.scanner.getOrCreateProject(recoveredId);
+      if (!fresh) {
+        return commandFailure(
+          `Project directory ${project.path} no longer exists and recovered path ${recoveredCwd} is also invalid`,
+          404,
+        );
+      }
+      console.warn(
+        `[startSession] Stale projectId: ${project.path} no longer exists; recovered cwd=${recoveredCwd}`,
+      );
+      project = fresh;
+    }
+
+    if (!body.message) {
+      return commandFailure("Message is required", 400);
+    }
+    const codexInputsError = validateOptionalCodexInputs(body.codexInputs);
+    if (codexInputsError) return commandFailure(codexInputsError, 400);
+
+    const prepared = this.prepareNewSession(project, body);
+    if (!prepared.ok) return prepared.result;
+
+    console.log("[startSession] Request body:", {
+      provider: body.provider,
+      executor: prepared.executor,
+      model: body.model,
+      llmGatewayConfig: prepared.llmGatewayConfig
+        ? {
+            model: prepared.llmGatewayConfig.model,
+            requestProtocol: prepared.llmGatewayConfig.requestProtocol,
+            limits: prepared.llmGatewayConfig.limits,
+          }
+        : undefined,
+    });
+
+    const result = await this.deps.runtimeController.startSession({
+      projectPath: project.path,
+      message: this.toUserMessage(body),
+      permissionMode: body.mode,
+      modelSettings: {
+        ...prepared.modelSettings,
+        codexEventAccountId: input.origin?.codexEventAccountId,
+      },
+      requireImmediate: input.requireImmediate,
+    });
+    const admissionFailure = this.mapAdmissionFailure(result);
+    if (admissionFailure) return admissionFailure;
+    if (isQueuedResponse(result)) {
+      return commandSuccess(result as unknown as Record<string, unknown>, 202);
+    }
+    if (!isStartedResponse(result)) {
+      return commandFailure("Session could not start", 503);
+    }
+
+    this.recordGatewayContextWindowOverride({
+      provider: result.provider,
+      model: prepared.llmGatewayConfig?.model ?? prepared.model,
+      sessionId: result.sessionId,
+      limits: prepared.llmGatewayConfig?.limits,
+    });
+    await this.persistNewSessionMetadata(result, prepared, body.provider);
+    await this.recordSessionOrigin(result.sessionId, project, input.origin);
+
+    return commandSuccess({
+      sessionId: result.sessionId,
+      processId: result.id,
+      permissionMode: result.permissionMode,
+      modeVersion: result.modeVersion,
+    });
+  }
+
+  async create(
+    input: CreateSessionCommandInput,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const { projectId } = input;
+    const body = input.body ?? {};
+    const providerFailure = this.validateRequestedProvider(body.provider);
+    if (providerFailure) return providerFailure;
+    if (!isUrlProjectId(projectId)) {
+      return commandFailure("Invalid project ID format", 400);
+    }
+
+    const project = await this.deps.scanner.getOrCreateProject(projectId);
+    if (!project) {
+      return commandFailure("Project not found or path does not exist", 404);
+    }
+
+    const prepared = this.prepareNewSession(project, body);
+    if (!prepared.ok) return prepared.result;
+
+    const result = await this.deps.runtimeController.createSession({
+      projectPath: project.path,
+      permissionMode: body.mode,
+      modelSettings: {
+        ...prepared.modelSettings,
+        codexEventAccountId: input.origin?.codexEventAccountId,
+      },
+      requireImmediate: input.requireImmediate,
+    });
+    const admissionFailure = this.mapAdmissionFailure(result);
+    if (admissionFailure) return admissionFailure;
+    if (isQueuedResponse(result)) {
+      return commandSuccess(result as unknown as Record<string, unknown>, 202);
+    }
+    if (!isStartedResponse(result)) {
+      return commandFailure("Session could not start", 503);
+    }
+
+    this.recordGatewayContextWindowOverride({
+      provider: result.provider,
+      model: prepared.llmGatewayConfig?.model ?? prepared.model,
+      sessionId: result.sessionId,
+      limits: prepared.llmGatewayConfig?.limits,
+    });
+    await this.persistNewSessionMetadata(result, prepared, body.provider, true);
+    await this.recordSessionOrigin(result.sessionId, project, input.origin);
+
+    return commandSuccess({
+      sessionId: result.sessionId,
+      processId: result.id,
+      permissionMode: result.permissionMode,
+      modeVersion: result.modeVersion,
+    });
+  }
+
+  async resume(
+    input: ResumeSessionCommandInput,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const { projectId, sessionId, body } = input;
+    const controlAfterResume = input.controlAfterResume;
+    const persistedProvider =
+      this.deps.sessionMetadataService?.getPersistedProvider?.(sessionId) ??
+      this.deps.sessionMetadataService?.getProvider(sessionId);
+    const providerFailure = this.validateRequestedProvider(
+      persistedProvider ?? body.provider,
+    );
+    if (providerFailure) return providerFailure;
+    if (!isUrlProjectId(projectId)) {
+      return commandFailure("Invalid project ID format", 400);
+    }
+
+    let project = await this.deps.scanner.getOrCreateProject(projectId);
+    if (!project) {
+      return commandFailure("Project not found or path does not exist", 404);
+    }
+    let resolvedProjectId: UrlProjectId = projectId as UrlProjectId;
+
+    const recoverySessionDir = project.sessionDir;
+    const recoveredCwd = await resolveResumeCwd(
+      project.path,
+      recoverySessionDir,
+      sessionId,
+      (cwd) => this.deps.scanner.mapSessionCwdToLocal(cwd, recoverySessionDir),
+    );
+    if (recoveredCwd) {
+      const recoveredId = encodeProjectId(recoveredCwd);
+      const fresh = await this.deps.scanner.getOrCreateProject(recoveredId);
+      if (!fresh) {
+        return commandFailure(
+          `Project directory ${project.path} no longer exists and recovered path ${recoveredCwd} is also invalid`,
+          404,
+        );
+      }
+      console.warn(
+        `[resume] Stale projectId for session ${sessionId}: ${project.path} no longer exists; recovered cwd=${recoveredCwd}`,
+      );
+      project = fresh;
+      resolvedProjectId = recoveredId;
+      await this.deps.recentsService?.recordVisit(sessionId, recoveredId);
+    }
+
+    if (!body.message && !controlAfterResume) {
+      return commandFailure("Message is required", 400);
+    }
+    const codexInputsError = validateOptionalCodexInputs(body.codexInputs);
+    if (codexInputsError) return commandFailure(codexInputsError, 400);
+    if (body.mode !== undefined && !this.isPermissionMode(body.mode)) {
+      return commandFailure("Invalid permission mode", 400);
+    }
+    const effectivePermissionMode =
+      body.mode ??
+      this.deps.sessionMetadataService?.getPermissionMode?.(sessionId);
+
+    const parsedBodyExecutor = parseOptionalExecutor(body.executor);
+    if (parsedBodyExecutor.error) {
+      return commandFailure(parsedBodyExecutor.error, 400);
+    }
+    const parsedRollbackNumTurns = parseOptionalPositiveInteger(
+      body.rollbackNumTurns,
+      "rollbackNumTurns",
+    );
+    if (parsedRollbackNumTurns.error) {
+      return commandFailure(parsedRollbackNumTurns.error, 400);
+    }
+    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
+    if (parsedCodexMcpMode.error) {
+      return commandFailure(parsedCodexMcpMode.error, 400);
+    }
+    const parsedGatewayConfig = parseOptionalLlmGatewayConfig(
+      body.llmGatewayConfig,
+    );
+    if (parsedGatewayConfig.error) {
+      return commandFailure(parsedGatewayConfig.error, 400);
+    }
+    const parsedReasoningEffort = parseOptionalReasoningEffort(
+      body.reasoningEffort,
+    );
+    if (parsedReasoningEffort.error) {
+      return commandFailure(parsedReasoningEffort.error, 400);
+    }
+
+    const { thinking, effort } = body.thinking
+      ? thinkingOptionToConfig(body.thinking)
+      : { thinking: undefined, effort: undefined };
+    let executor = parsedBodyExecutor.executor;
+    if (!executor) {
+      const parsedSavedExecutor = parseOptionalExecutor(
+        this.deps.sessionMetadataService?.getExecutor(sessionId),
+      );
+      if (parsedSavedExecutor.error) {
+        return commandFailure(parsedSavedExecutor.error, 400);
+      }
+      executor = parsedSavedExecutor.executor;
+    }
+    if (executor) {
+      await this.deps.sessionMetadataService?.setExecutor(sessionId, executor);
+    }
+
+    const metadataProvider = persistedProvider as ProviderName | undefined;
+    const llmGatewayConfig =
+      parsedGatewayConfig.llmGatewayConfig ??
+      this.deps.sessionMetadataService?.getLlmGatewayConfig?.(sessionId);
+
+    let sessionSummary: SessionSummary | null = null;
+    let providerName = metadataProvider ?? body.provider;
+    if (!providerName || !parsedReasoningEffort.reasoningEffort) {
+      const sessionSummaryResult = await findSessionSummaryAcrossProviders(
+        project,
+        sessionId,
+        resolvedProjectId,
+        this.toProviderResolutionDeps(),
+        metadataProvider ?? body.provider,
+      );
+      sessionSummary = sessionSummaryResult?.summary ?? null;
+      providerName =
+        providerName ??
+        sessionSummary?.provider ??
+        metadataProvider ??
+        body.provider ??
+        project.provider;
+    }
+    if (controlAfterResume && providerName !== "codex") {
+      return commandFailure(
+        "Only Codex sessions can resume for native compaction",
+        400,
+        { code: "unsupported_provider" },
+      );
+    }
+
+    const model = resolveSessionModel(body.model, providerName);
+    let effectiveCodexForkExcludedTurns = parsedRollbackNumTurns.value;
+    if (
+      providerName === "codex" &&
+      typeof body.rollbackTarget?.text === "string" &&
+      body.rollbackTarget.text.trim().length > 0
+    ) {
+      const codexReader = this.getCodexReader(project.path);
+      if (codexReader) {
+        try {
+          const loaded = await codexReader.getSession(
+            sessionId,
+            resolvedProjectId,
+          );
+          const branchState = loaded?.codexBranchState ?? loaded?.branchState;
+          const computed = branchState
+            ? computeCodexRollbackNumTurns(branchState, {
+                timestamp: body.rollbackTarget.timestamp,
+                prompt: body.rollbackTarget.text,
+              })
+            : null;
+          getLogger().info(
+            {
+              event: "codex_fork_excluded_turns_resolved",
+              sessionId,
+              clientExcludedTurns: parsedRollbackNumTurns.value ?? null,
+              computedExcludedTurns: computed,
+              forkTargetTimestamp: body.rollbackTarget.timestamp ?? null,
+            },
+            "Resolved Codex fork exclusion count from persisted turn tree",
+          );
+          if (computed !== null) effectiveCodexForkExcludedTurns = computed;
+        } catch (error) {
+          getLogger().warn(
+            {
+              event: "codex_fork_excluded_turns_resolution_failed",
+              sessionId,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "Falling back to the client-provided Codex fork exclusion count",
+          );
+        }
+      }
+    }
+
+    getLogger().info(
+      {
+        event: "session_resume_requested",
+        sessionId,
+        projectId: resolvedProjectId,
+        projectPath: project.path,
+        providerName,
+        bodyProvider: body.provider ?? null,
+        metadataProvider: metadataProvider ?? null,
+        executor: executor ?? null,
+        codexMcpMode:
+          parsedCodexMcpMode.codexMcpMode ??
+          this.deps.sessionMetadataService?.getCodexMcpMode?.(sessionId) ??
+          null,
+        resumeSessionAt: supportsResumeSessionAt(providerName)
+          ? (body.resumeSessionAt ?? null)
+          : null,
+        rollbackNumTurns:
+          providerName === "codex"
+            ? (effectiveCodexForkExcludedTurns ?? null)
+            : null,
+        ignoredResumeSessionAt: !supportsResumeSessionAt(providerName)
+          ? (body.resumeSessionAt ?? null)
+          : null,
+        ignoredRollbackNumTurns:
+          providerName !== "codex"
+            ? (parsedRollbackNumTurns.value ?? null)
+            : null,
+        tempId: body.tempId ?? null,
+        messageLength: body.message.length,
+        controlAfterResume: controlAfterResume?.control ?? null,
+        llmGatewayConfig: llmGatewayConfig
+          ? {
+              model: llmGatewayConfig.model,
+              requestProtocol: llmGatewayConfig.requestProtocol,
+              limits: llmGatewayConfig.limits,
+            }
+          : undefined,
+      },
+      "Session resume requested",
+    );
+
+    const providerRestoresReasoningEffort =
+      providerName === "codex" ||
+      providerName === "pi" ||
+      providerName === "kimi";
+    const resumeReasoningEffort =
+      parsedReasoningEffort.reasoningEffort ??
+      (providerRestoresReasoningEffort
+        ? sessionSummary?.reasoningEffort
+        : undefined);
+    const resumeCodexModelProvider =
+      providerName === "codex"
+        ? (input.codexModelProviderOverride?.sourceId ??
+          resolveCodexResumeSource(
+            sessionSummary?.model ?? model,
+            sessionSummary?.codexModelProvider ??
+              this.deps.sessionMetadataService?.getCodexModelProvider?.(
+                sessionId,
+              ),
+          ))
+        : undefined;
+    if (
+      providerName === "codex" &&
+      body.codexModelProvider &&
+      resumeCodexModelProvider &&
+      body.codexModelProvider !== resumeCodexModelProvider &&
+      !input.codexModelProviderOverride
+    ) {
+      getLogger().warn(
+        {
+          event: "codex_model_provider_resume_conflict",
+          sessionId,
+          requested: body.codexModelProvider,
+          persisted: resumeCodexModelProvider,
+        },
+        "Ignoring codexModelProvider on resume; keeping the session's original source",
+      );
+    }
+    if (input.codexModelProviderOverride) {
+      getLogger().info(
+        {
+          event: "codex_model_provider_failover_requested",
+          sessionId,
+          model,
+          modelProvider: input.codexModelProviderOverride.sourceId,
+          reason: input.codexModelProviderOverride.reason,
+        },
+        "Switching the Codex model source for channel failover",
+      );
+    }
+
+    const isSourcePreservingFork =
+      (providerName === "codex" &&
+        effectiveCodexForkExcludedTurns !== undefined) ||
+      ((providerName === "pi" || providerName === "zcode") &&
+        Boolean(body.resumeSessionAt));
+    const result = await this.deps.runtimeController.resumeSession({
+      sessionId,
+      projectPath: project.path,
+      ...(controlAfterResume
+        ? {}
+        : { message: this.toUserMessage(body, effectivePermissionMode) }),
+      permissionMode: effectivePermissionMode,
+      requireImmediate:
+        input.requireImmediate ||
+        isSourcePreservingFork ||
+        !!controlAfterResume,
+      allowMissingRolloutReplacement: input.allowMissingRolloutReplacement,
+      modelSettings: {
+        model,
+        thinking,
+        effort,
+        reasoningEffort: normalizeReasoningEffortForProvider(
+          providerName,
+          resumeReasoningEffort,
+        ),
+        providerName,
+        codexMcpMode:
+          providerName === "codex"
+            ? (parsedCodexMcpMode.codexMcpMode ??
+              this.deps.sessionMetadataService?.getCodexMcpMode?.(sessionId))
+            : undefined,
+        codexModelProvider: resumeCodexModelProvider,
+        codexEventAccountId: input.origin?.codexEventAccountId,
+        llmGatewayConfig,
+        executor,
+        globalInstructions:
+          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
+          undefined,
+        permissions: body.permissions,
+        resumeSessionAt: supportsResumeSessionAt(providerName)
+          ? body.resumeSessionAt
+          : undefined,
+        rollbackNumTurns:
+          providerName === "codex"
+            ? effectiveCodexForkExcludedTurns
+            : undefined,
+      },
+    });
+
+    if (providerName === "codex" && parsedCodexMcpMode.codexMcpMode) {
+      await this.deps.sessionMetadataService?.setCodexMcpMode?.(
+        sessionId,
+        parsedCodexMcpMode.codexMcpMode,
+      );
+    }
+    if (
+      providerName === "codex" &&
+      resumeCodexModelProvider &&
+      !input.codexModelProviderOverride
+    ) {
+      await this.deps.sessionMetadataService?.setCodexModelProvider?.(
+        sessionId,
+        resumeCodexModelProvider,
+      );
+    }
+    if (parsedGatewayConfig.llmGatewayConfig) {
+      await this.deps.sessionMetadataService?.setLlmGatewayConfig(
+        sessionId,
+        parsedGatewayConfig.llmGatewayConfig,
+      );
+    }
+
+    const admissionFailure = this.mapAdmissionFailure(result);
+    if (admissionFailure) return admissionFailure;
+    if (isQueuedResponse(result)) {
+      await this.persistPermissionMode(sessionId, effectivePermissionMode);
+      getLogger().info(
+        {
+          event: "session_resume_queued",
+          sessionId,
+          projectId: resolvedProjectId,
+          providerName,
+          queueId: result.queueId,
+          position: result.position,
+        },
+        "Session resume queued",
+      );
+      return commandSuccess(result as unknown as Record<string, unknown>, 202);
+    }
+    if (!isStartedResponse(result)) {
+      return commandFailure("Session could not resume", 503);
+    }
+
+    const actualSessionId = result.sessionId ?? sessionId;
+    if (providerName === "codex" && resumeCodexModelProvider) {
+      await this.deps.sessionMetadataService?.setCodexModelProvider?.(
+        actualSessionId,
+        resumeCodexModelProvider,
+      );
+    }
+    await this.persistPermissionMode(
+      actualSessionId,
+      result.permissionMode ?? effectivePermissionMode,
+    );
+    if (actualSessionId !== sessionId) {
+      if (providerName) {
+        await this.deps.sessionMetadataService?.setProvider(
+          actualSessionId,
+          providerName,
+        );
+      }
+      if (executor) {
+        await this.deps.sessionMetadataService?.setExecutor(
+          actualSessionId,
+          executor,
+        );
+      }
+      if (llmGatewayConfig) {
+        await this.deps.sessionMetadataService?.setLlmGatewayConfig(
+          actualSessionId,
+          llmGatewayConfig,
+        );
+      }
+      if (
+        providerName === "codex" &&
+        effectiveCodexForkExcludedTurns !== undefined
+      ) {
+        const sourceMetadata =
+          this.deps.sessionMetadataService?.getMetadata(sessionId);
+        const forkSourceSummary =
+          sessionSummary ??
+          (
+            await findSessionSummaryAcrossProviders(
+              project,
+              sessionId,
+              resolvedProjectId,
+              this.toProviderResolutionDeps(),
+              providerName,
+            )
+          )?.summary;
+        const inheritedFamilyTitle =
+          sourceMetadata?.forkFamilyTitle ??
+          sourceMetadata?.customTitle ??
+          sourceMetadata?.aiTitle ??
+          forkSourceSummary?.title ??
+          undefined;
+        const inheritedFamilyFullTitle =
+          sourceMetadata?.forkFamilyFullTitle ??
+          sourceMetadata?.customTitle ??
+          sourceMetadata?.aiTitle ??
+          forkSourceSummary?.fullTitle ??
+          inheritedFamilyTitle;
+        const forkTargetMessageId =
+          typeof body.rollbackTarget?.messageId === "string" &&
+          body.rollbackTarget.messageId.trim().length > 0 &&
+          body.rollbackTarget.messageId.length <= 4_096
+            ? body.rollbackTarget.messageId.trim()
+            : undefined;
+        await this.deps.sessionMetadataService?.setEditForkMetadata?.(
+          actualSessionId,
+          {
+            forkParentSessionId: sessionId,
+            forkTargetMessageId,
+            forkFamilyTitle: inheritedFamilyTitle ?? undefined,
+            forkFamilyFullTitle: inheritedFamilyFullTitle ?? undefined,
+          },
+        );
+        const codexMcpMode =
+          parsedCodexMcpMode.codexMcpMode ??
+          this.deps.sessionMetadataService?.getCodexMcpMode?.(sessionId);
+        if (codexMcpMode) {
+          await this.deps.sessionMetadataService?.setCodexMcpMode?.(
+            actualSessionId,
+            codexMcpMode,
+          );
+        }
+        if (resumeCodexModelProvider) {
+          await this.deps.sessionMetadataService?.setCodexModelProvider?.(
+            actualSessionId,
+            resumeCodexModelProvider,
+          );
+        }
+      }
+      if (
+        (providerName === "pi" || providerName === "zcode") &&
+        body.resumeSessionAt
+      ) {
+        // Record edit-fork lineage so list views can collapse the family.
+        await this.deps.sessionMetadataService?.setForkParentSessionId?.(
+          actualSessionId,
+          sessionId,
+        );
+      }
+      await this.recordSessionOrigin(actualSessionId, project, input.origin);
+    }
+
+    this.recordGatewayContextWindowOverride({
+      provider: providerName,
+      model: llmGatewayConfig?.model ?? model,
+      sessionId: actualSessionId,
+      limits: llmGatewayConfig?.limits,
+    });
+    getLogger().info(
+      {
+        event: "session_resume_process_started",
+        sessionId,
+        actualSessionId,
+        projectId: resolvedProjectId,
+        providerName,
+        processId: result.id,
+        permissionMode: result.permissionMode,
+        modeVersion: result.modeVersion,
+      },
+      "Session resume process started",
+    );
+
+    const resumeBody = {
+      sessionId: actualSessionId,
+      ...(actualSessionId !== sessionId && isSourcePreservingFork
+        ? { forkParentSessionId: sessionId }
+        : {}),
+      processId: result.id,
+      permissionMode: result.permissionMode,
+      modeVersion: result.modeVersion,
+      reasoningEffort: resumeReasoningEffort,
+    };
+
+    if (controlAfterResume) {
+      const controlResult =
+        await this.deps.runtimeController.executeCodexControl({
+          sessionId: actualSessionId,
+          request: controlAfterResume,
+        });
+      if (!controlResult.ok) {
+        const status =
+          controlResult.error.code === "provider_error"
+            ? 502
+            : controlResult.error.code === "not_ready"
+              ? 410
+              : 400;
+        return commandFailure(controlResult.error.message, status, {
+          code: controlResult.error.code,
+          control: controlResult.control,
+          retryable: controlResult.error.retryable,
+          ...resumeBody,
+        });
+      }
+      getLogger().info(
+        {
+          event: "codex_compact_after_resume_started",
+          sessionId: actualSessionId,
+          processId: result.id,
+          projectId: resolvedProjectId,
+        },
+        "Resumed inactive Codex session and started native compaction",
+      );
+      return commandSuccess({
+        ...resumeBody,
+        control: controlResult.control,
+        data: controlResult.data,
+      });
+    }
+
+    return commandSuccess(resumeBody);
+  }
+
+  async resumeCodexControl(
+    input: ResumeCodexControlCommandInput,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const existing =
+      await this.deps.runtimeController.getProcessSnapshotForSession(
+        input.sessionId,
+      );
+    if (existing) {
+      if (existing.provider !== "codex") {
+        return commandFailure(
+          "Session is not backed by Codex app-server",
+          400,
+          { code: "unsupported_provider" },
+        );
+      }
+      if (existing.state !== "idle") {
+        return commandFailure(
+          "Wait for the active Codex turn to finish before compacting",
+          409,
+          { code: "session_busy" },
+        );
+      }
+      const controlResult = await this.executeCodexControl({
+        sessionId: input.sessionId,
+        request: input.request,
+      });
+      if (!controlResult.ok) return controlResult;
+      return commandSuccess({
+        sessionId: input.sessionId,
+        processId: existing.id,
+        permissionMode: existing.permissionMode,
+        modeVersion: existing.modeVersion,
+        ...controlResult.body,
+      });
+    }
+
+    return this.resume({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      body: {
+        ...input.body,
+        message: "",
+        provider: "codex",
+      },
+      origin: input.origin,
+      requireImmediate: true,
+      controlAfterResume: input.request,
+    });
+  }
+
+  async queue(
+    input: QueueSessionMessageCommandInput,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const { sessionId, body } = input;
+    const process =
+      await this.deps.runtimeController.getProcessSnapshotForSession(sessionId);
+    if (!process) {
+      return commandFailure("No active process for session", 404);
+    }
+    if (!body.message) return commandFailure("Message is required", 400);
+    const codexInputsError = validateOptionalCodexInputs(body.codexInputs);
+    if (codexInputsError) return commandFailure(codexInputsError, 400);
+    if (
+      body.tempId &&
+      process.messageHistory.some(
+        (message) => (message as { tempId?: unknown }).tempId === body.tempId,
+      )
+    ) {
+      return commandSuccess({
+        queued: true,
+        duplicate: true,
+        processId: process.id,
+      });
+    }
+
+    if (body.mode !== undefined && !this.isPermissionMode(body.mode)) {
+      return commandFailure("Invalid permission mode", 400);
+    }
+    const effectivePermissionMode =
+      body.mode ??
+      process.permissionMode ??
+      this.deps.sessionMetadataService?.getPermissionMode?.(sessionId);
+    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
+    if (parsedCodexMcpMode.error) {
+      return commandFailure(parsedCodexMcpMode.error, 400);
+    }
+    const parsedGatewayConfig = parseOptionalLlmGatewayConfig(
+      body.llmGatewayConfig,
+    );
+    if (parsedGatewayConfig.error) {
+      return commandFailure(parsedGatewayConfig.error, 400);
+    }
+    const parsedReasoningEffort = parseOptionalReasoningEffort(
+      body.reasoningEffort,
+    );
+    if (parsedReasoningEffort.error) {
+      return commandFailure(parsedReasoningEffort.error, 400);
+    }
+
+    const userMessage = this.toUserMessage(body, effectivePermissionMode);
+    if (process.state === "terminated") {
+      return commandFailure("Process terminated", 410, {
+        reason: process.terminationReason,
+      });
+    }
+    if (body.deferred) {
+      const deferred = await this.deps.runtimeController.deferMessage(
+        sessionId,
+        userMessage,
+      );
+      return deferred.queued
+        ? commandSuccess({ queued: true, deferred: true })
+        : commandFailure("No active process for session", 410);
+    }
+
+    const { thinking, effort } = body.thinking
+      ? thinkingOptionToConfig(body.thinking)
+      : { thinking: undefined, effort: undefined };
+    const metadataProvider = this.deps.sessionMetadataService?.getProvider(
+      sessionId,
+    ) as ProviderName | undefined;
+    const metadataExecutor = parseOptionalExecutor(
+      this.deps.sessionMetadataService?.getExecutor(sessionId),
+    );
+    if (metadataExecutor.error) {
+      return commandFailure(metadataExecutor.error, 400);
+    }
+    const parsedBodyExecutor = parseOptionalExecutor(body.executor);
+    if (parsedBodyExecutor.error) {
+      return commandFailure(parsedBodyExecutor.error, 400);
+    }
+
+    const providerName = metadataProvider ?? body.provider ?? process.provider;
+    const model =
+      body.model === undefined
+        ? process.model
+        : resolveSessionModel(body.model, providerName);
+    const llmGatewayConfig =
+      parsedGatewayConfig.llmGatewayConfig ??
+      this.deps.sessionMetadataService?.getLlmGatewayConfig?.(sessionId);
+    const result = await this.deps.runtimeController.queueMessage({
+      sessionId,
+      projectPath: process.projectPath,
+      message: userMessage,
+      permissionMode: effectivePermissionMode,
+      requireImmediate: input.requireImmediate,
+      allowSteer: input.allowSteer,
+      modelSettings: {
+        model,
+        thinking,
+        effort,
+        reasoningEffort:
+          parsedReasoningEffort.reasoningEffort !== undefined
+            ? normalizeReasoningEffortForProvider(
+                providerName,
+                parsedReasoningEffort.reasoningEffort,
+              )
+            : process.requestedReasoningEffort,
+        providerName,
+        codexMcpMode:
+          providerName === "codex"
+            ? (parsedCodexMcpMode.codexMcpMode ??
+              this.deps.sessionMetadataService?.getCodexMcpMode?.(sessionId))
+            : undefined,
+        codexModelProvider:
+          providerName === "codex"
+            ? this.deps.sessionMetadataService?.getCodexModelProvider?.(
+                sessionId,
+              )
+            : undefined,
+        llmGatewayConfig,
+        executor:
+          parsedBodyExecutor.executor ??
+          metadataExecutor.executor ??
+          process.executor ??
+          undefined,
+        globalInstructions:
+          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
+          undefined,
+        permissions: body.permissions,
+      },
+    });
+    if (!result.success) {
+      if (result.error === "immediate_start_unavailable") {
+        return commandFailure("Session could not restart immediately", 503, {
+          code: result.error,
+        });
+      }
+      return commandFailure("Failed to queue message", 410, {
+        reason: result.error,
+      });
+    }
+
+    await this.persistPermissionMode(sessionId, effectivePermissionMode);
+    this.recordGatewayContextWindowOverride({
+      provider: providerName,
+      model: llmGatewayConfig?.model ?? model,
+      sessionId,
+      limits: llmGatewayConfig?.limits,
+    });
+    return commandSuccess({
+      queued: true,
+      restarted: result.restarted,
+      processId: result.process.id,
+    });
+  }
+
+  /** Queue into an owned process, otherwise resume the persisted session. */
+  async send(
+    input: SendSessionMessageCommandInput,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const process =
+      await this.deps.runtimeController.getProcessSnapshotForSession(
+        input.sessionId,
+      );
+    if (process && process.state !== "terminated") {
+      return this.queue({
+        sessionId: input.sessionId,
+        body: input.body,
+        requireImmediate: input.requireImmediate,
+        allowSteer: input.allowSteer,
+      });
+    }
+    return this.resume(input);
+  }
+
+  /**
+   * Keep the Codex CLI/runtime and switch only its model source. A failed
+   * usage-limit turn is forked away before replay; recovery switches a quiet
+   * resident thread back to its preferred source without rewriting history.
+   */
+  async switchCodexModelSource(
+    input: SwitchCodexModelSourceCommandInput,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const model = input.body.model?.trim();
+    if (!model)
+      return commandFailure("Codex source switch requires a model", 400);
+    const source = resolveCodexModelProviderForStart("codex", undefined, model);
+    if (!source.value || source.error) {
+      return commandFailure(
+        source.error ?? "Codex model source is unavailable",
+        400,
+        {
+          ...(source.code ? { code: source.code } : {}),
+        },
+      );
+    }
+
+    const process =
+      await this.deps.runtimeController.getProcessSnapshotForSession(
+        input.sessionId,
+      );
+    if (process && process.provider !== "codex") {
+      return commandFailure("Session is not backed by Codex app-server", 400, {
+        code: "unsupported_provider",
+      });
+    }
+    if (
+      !input.excludeFailedTurn &&
+      process &&
+      process.state !== "idle" &&
+      process.state !== "terminated"
+    ) {
+      return commandFailure(
+        "Wait for the active Codex turn before switching model source",
+        409,
+        { code: "session_busy" },
+      );
+    }
+    if (!input.excludeFailedTurn && process?.state === "idle") {
+      const released = await this.releaseSession(input.sessionId);
+      if (!released.ok) return released;
+    }
+
+    return this.resume({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      body: {
+        ...input.body,
+        provider: "codex",
+        model,
+        codexModelProvider: source.value,
+        ...(input.excludeFailedTurn ? { rollbackNumTurns: 1 } : {}),
+      },
+      origin: input.origin,
+      requireImmediate: true,
+      allowMissingRolloutReplacement: true,
+      codexModelProviderOverride: {
+        sourceId: source.value,
+        reason:
+          source.value === "deepseek"
+            ? "usage_limit_fallback"
+            : "usage_limit_recovered",
+      },
+    });
+  }
+
+  async interrupt(
+    sessionId: string,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const process =
+      await this.deps.runtimeController.getProcessSnapshotForSession(sessionId);
+    if (!process) {
+      return commandFailure("No active process for session", 404);
+    }
+
+    const result = await this.deps.runtimeController.interruptProcess(
+      process.id,
+    );
+    if (!result.success && !result.supported) {
+      return commandFailure("Interrupt not supported for this process", 400);
+    }
+    if (result.success) {
+      await this.terminateInteractionAliases(sessionId, process);
+    }
+    return commandSuccess({
+      interrupted: result.success,
+      supported: result.supported,
+      processId: process.id,
+    });
+  }
+
+  /** Release runtime ownership without deleting persisted provider history. */
+  async releaseSession(
+    sessionId: string,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const process =
+      await this.deps.runtimeController.getProcessSnapshotForSession(sessionId);
+    if (!process) {
+      await this.deps.sessionInteractionService.terminateInteractionOperations(
+        sessionId,
+        "interrupt",
+      );
+      return commandSuccess({ released: true, hadProcess: false });
+    }
+
+    const result = await this.deps.runtimeController.abortProcess(process.id);
+    if (!result.aborted) {
+      const remaining =
+        await this.deps.runtimeController.getProcessSnapshotForSession(
+          sessionId,
+        );
+      if (remaining) {
+        return commandFailure("Session process could not be released", 409, {
+          code: "session_release_failed",
+        });
+      }
+    }
+
+    await this.terminateInteractionAliases(sessionId, process);
+    return commandSuccess({
+      released: true,
+      hadProcess: true,
+      processId: process.id,
+    });
+  }
+
+  async executeCodexControl(input: ExecuteCodexControlCommandInput): Promise<
+    SessionCommandResult<{
+      control: CodexNativeControlResult["control"];
+      data: unknown;
+    }>
+  > {
+    const snapshot =
+      await this.deps.runtimeController.getProcessSnapshotForSession(
+        input.sessionId,
+      );
+    if (!snapshot) {
+      return commandFailure("No active process for session", 404);
+    }
+    if (snapshot.provider !== "codex") {
+      return commandFailure("Session is not backed by Codex app-server", 400, {
+        code: "unsupported_provider",
+        control: input.request.control,
+      });
+    }
+
+    const result = await this.deps.runtimeController.executeCodexControl(input);
+    if (result.ok) {
+      return commandSuccess({ control: result.control, data: result.data });
+    }
+
+    const status =
+      result.error.code === "provider_error"
+        ? 502
+        : result.error.code === "not_ready"
+          ? 410
+          : 400;
+    return commandFailure(result.error.message, status, {
+      code: result.error.code,
+      control: result.control,
+      retryable: result.error.retryable,
+    });
+  }
+
+  getSessionSnapshot(
+    sessionId: string,
+  ): Promise<RuntimeProcessSnapshot | null> {
+    return this.deps.runtimeController.getProcessSnapshotForSession(sessionId);
+  }
+
+  getRuntimeStatus() {
+    return this.deps.runtimeController.getStatus();
+  }
+
+  async setPermissionMode(
+    sessionId: string,
+    mode: PermissionMode,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    if (!mode) return commandFailure("mode is required", 400);
+
+    try {
+      const result = await this.deps.runtimeController.setPermissionMode({
+        sessionId,
+        mode,
+      });
+      if (!result.ok) {
+        if (!this.deps.sessionMetadataService) {
+          return commandFailure("No active process for session", 404);
+        }
+        await this.deps.sessionMetadataService.setPermissionMode(
+          sessionId,
+          mode,
+        );
+        return commandSuccess({ permissionMode: mode, modeVersion: 0 });
+      }
+
+      const confirmedMode = result.permissionMode ?? mode;
+      await this.deps.sessionMetadataService?.setPermissionMode(
+        sessionId,
+        confirmedMode,
+      );
+      return commandSuccess({
+        permissionMode: confirmedMode,
+        modeVersion: result.modeVersion ?? 0,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      getLogger().warn(
+        {
+          event: "session_permission_mode_sync_failed",
+          sessionId,
+          mode,
+          error: message,
+        },
+        "Provider rejected the permission mode change",
+      );
+      return commandFailure(`Failed to apply permission mode: ${message}`, 502);
+    }
+  }
+
+  getPendingInput(
+    sessionId: string,
+    options?: { processSnapshot: RuntimeProcessSnapshot | null },
+  ) {
+    return this.deps.sessionInteractionService.getPendingInput(
+      sessionId,
+      options,
+    );
+  }
+
+  respondToInput(
+    sessionId: string,
+    body: SessionInputResponseBody,
+    options?: RespondToInputOptions,
+  ) {
+    return this.deps.sessionInteractionService.respondToInput(
+      sessionId,
+      body,
+      options,
+    );
+  }
+
+  terminateInteractionOperations(
+    sessionId: string,
+    reason: Parameters<
+      SessionInteractionService["terminateInteractionOperations"]
+    >[1],
+    keepRequestId?: string,
+  ) {
+    return this.deps.sessionInteractionService.terminateInteractionOperations(
+      sessionId,
+      reason,
+      keepRequestId,
+    );
+  }
+
+  getInteractionOperation(operationId: string) {
+    return this.deps.sessionInteractionService.getInteractionOperation(
+      operationId,
+    );
+  }
+
+  getInteractionOperations(sessionId: string) {
+    return this.deps.sessionInteractionService.getInteractionOperations(
+      sessionId,
+    );
+  }
+
+  getInteractionBroker() {
+    return this.deps.sessionInteractionService.getInteractionBroker();
+  }
+
+  subscribe(
+    sessionId: string,
+    emit: RuntimeSessionEventEmitter,
+    options?: RuntimeSessionSubscriptionOptions,
+  ): Promise<RuntimeSessionSubscription | null> {
+    return this.deps.runtimeController.subscribeSession(
+      sessionId,
+      emit,
+      options,
+    );
+  }
+
+  private validateRequestedProvider(
+    provider: unknown,
+  ): SessionCommandResult<never> | null {
+    if (isRetiredProviderName(provider)) {
+      return commandFailure("OpenCode provider has been retired", 410, {
+        code: "provider_retired",
+      });
+    }
+    if (
+      typeof provider === "string" &&
+      !isProviderEnabled(provider, this.deps.enabledProviders)
+    ) {
+      return commandFailure("Provider is not enabled", 404, {
+        code: "provider_disabled",
+      });
+    }
+    return null;
+  }
+
+  private prepareNewSession(
+    project: Project,
+    body: CreateSessionBody | StartSessionBody,
+  ):
+    | {
+        ok: true;
+        executor?: string;
+        model?: string;
+        llmGatewayConfig?: LlmGatewaySessionConfig;
+        codexMcpMode?: CodexMcpMode;
+        codexModelProvider?: string;
+        modelSettings: Parameters<
+          RuntimeController["createSession"]
+        >[0]["modelSettings"];
+      }
+    | { ok: false; result: SessionCommandResult<never> } {
+    if (body.mode !== undefined && !this.isPermissionMode(body.mode)) {
+      return {
+        ok: false,
+        result: commandFailure("Invalid permission mode", 400),
+      };
+    }
+    const parsedExecutor = parseOptionalExecutor(body.executor);
+    if (parsedExecutor.error) {
+      return { ok: false, result: commandFailure(parsedExecutor.error, 400) };
+    }
+    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
+    if (parsedCodexMcpMode.error) {
+      return {
+        ok: false,
+        result: commandFailure(parsedCodexMcpMode.error, 400),
+      };
+    }
+    const parsedGatewayConfig = parseOptionalLlmGatewayConfig(
+      body.llmGatewayConfig,
+    );
+    if (parsedGatewayConfig.error) {
+      return {
+        ok: false,
+        result: commandFailure(parsedGatewayConfig.error, 400),
+      };
+    }
+    const parsedReasoningEffort = parseOptionalReasoningEffort(
+      body.reasoningEffort,
+    );
+    if (parsedReasoningEffort.error) {
+      return {
+        ok: false,
+        result: commandFailure(parsedReasoningEffort.error, 400),
+      };
+    }
+
+    const { thinking, effort } = body.thinking
+      ? thinkingOptionToConfig(body.thinking)
+      : { thinking: undefined, effort: undefined };
+    const provider = body.provider ?? project.provider;
+    const providerFailure = this.validateRequestedProvider(provider);
+    if (providerFailure) return { ok: false, result: providerFailure };
+    if (
+      body.serviceTier !== undefined &&
+      (provider !== "codex" ||
+        (body.serviceTier !== "default" && body.serviceTier !== "priority"))
+    ) {
+      return {
+        ok: false,
+        result: commandFailure(
+          "serviceTier must be default or priority for Codex",
+          400,
+        ),
+      };
+    }
+    const model = resolveSessionModel(body.model, provider);
+    const parsedCodexModelProvider = resolveCodexModelProviderForStart(
+      provider,
+      body.codexModelProvider,
+      model,
+    );
+    if (parsedCodexModelProvider.error) {
+      return {
+        ok: false,
+        result: commandFailure(parsedCodexModelProvider.error, 400, {
+          code: parsedCodexModelProvider.code,
+        }),
+      };
+    }
+
+    return {
+      ok: true,
+      executor: parsedExecutor.executor,
+      model,
+      llmGatewayConfig: parsedGatewayConfig.llmGatewayConfig,
+      codexMcpMode: parsedCodexMcpMode.codexMcpMode,
+      codexModelProvider: parsedCodexModelProvider.value,
+      modelSettings: {
+        model,
+        thinking,
+        effort,
+        reasoningEffort: normalizeReasoningEffortForProvider(
+          provider,
+          parsedReasoningEffort.reasoningEffort,
+        ),
+        serviceTier: body.serviceTier,
+        providerName: provider,
+        codexMcpMode: parsedCodexMcpMode.codexMcpMode,
+        codexModelProvider: parsedCodexModelProvider.value,
+        llmGatewayConfig: parsedGatewayConfig.llmGatewayConfig,
+        executor: parsedExecutor.executor,
+        globalInstructions:
+          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
+          undefined,
+        permissions: body.permissions,
+      },
+    };
+  }
+
+  private toUserMessage(
+    body: StartSessionBody,
+    permissionMode: PermissionMode | undefined = body.mode,
+  ): UserMessage {
+    return {
+      text: body.message,
+      images: body.images,
+      documents: body.documents,
+      attachments: body.attachments,
+      codexInputs: body.codexInputs?.map((input) => ({ ...input })),
+      mode: permissionMode,
+      tempId: body.tempId,
+    };
+  }
+
+  private getCodexReader(projectPath: string): CodexSessionReader | null {
+    return (
+      this.deps.codexReaderFactory?.(projectPath) ??
+      (this.deps.codexSessionsDir
+        ? new CodexSessionReader({
+            sessionsDir: this.deps.codexSessionsDir,
+            projectPath,
+          })
+        : null)
+    );
+  }
+
+  private toProviderResolutionDeps(): ProviderResolutionDeps {
+    return {
+      readerFactory: this.deps.readerFactory,
+      codexSessionsDir: this.deps.codexSessionsDir,
+      codexReaderFactory: this.deps.codexReaderFactory,
+      geminiSessionsDir: this.deps.geminiSessionsDir,
+      geminiReaderFactory: this.deps.geminiReaderFactory,
+      geminiHashToCwd: this.deps.geminiScanner?.getHashToCwd(),
+      piSessionsDir: this.deps.piSessionsDir,
+      piReaderFactory: this.deps.piReaderFactory,
+      kimiSessionsDir: this.deps.kimiSessionsDir,
+      kimiReaderFactory: this.deps.kimiReaderFactory,
+      zcodeDbPath: this.deps.zcodeDbPath,
+      zcodeReaderFactory: this.deps.zcodeReaderFactory,
+      sessionMetadataService: this.deps.sessionMetadataService,
+    };
+  }
+
+  private mapAdmissionFailure(
+    result: RuntimeSessionStartResponse,
+  ): SessionCommandResult<never> | null {
+    if (isQueueFullResponse(result)) {
+      return commandFailure("Queue is full", 503, {
+        maxQueueSize: result.maxQueueSize,
+      });
+    }
+    if (isImmediateStartUnavailableResponse(result)) {
+      return commandFailure("Immediate start unavailable", 503, {
+        code: result.error,
+      });
+    }
+    return null;
+  }
+
+  private isPermissionMode(value: unknown): value is PermissionMode {
+    return (
+      typeof value === "string" &&
+      ALL_PERMISSION_MODES.includes(value as PermissionMode)
+    );
+  }
+
+  private async persistPermissionMode(
+    sessionId: string,
+    permissionMode: PermissionMode | undefined,
+  ): Promise<void> {
+    if (!permissionMode) return;
+    await this.deps.sessionMetadataService?.setPermissionMode?.(
+      sessionId,
+      permissionMode,
+    );
+  }
+
+  private async persistNewSessionMetadata(
+    result: RuntimeStartedProcess,
+    prepared: {
+      executor?: string;
+      llmGatewayConfig?: LlmGatewaySessionConfig;
+      codexMcpMode?: CodexMcpMode;
+      codexModelProvider?: string;
+    },
+    requestedProvider: ProviderName | undefined,
+    persistCodexModelProvider = false,
+  ): Promise<void> {
+    const metadata = this.deps.sessionMetadataService;
+    if (!metadata) return;
+    if (requestedProvider) {
+      await metadata.setProvider(result.sessionId, requestedProvider);
+    }
+    if (prepared.executor) {
+      await metadata.setExecutor(result.sessionId, prepared.executor);
+    }
+    if (prepared.llmGatewayConfig) {
+      await metadata.setLlmGatewayConfig(
+        result.sessionId,
+        prepared.llmGatewayConfig,
+      );
+    }
+    if (result.provider === "codex" && prepared.codexMcpMode) {
+      await metadata.setCodexMcpMode?.(result.sessionId, prepared.codexMcpMode);
+    }
+    if (
+      persistCodexModelProvider &&
+      result.provider === "codex" &&
+      prepared.codexModelProvider
+    ) {
+      await metadata.setCodexModelProvider?.(
+        result.sessionId,
+        prepared.codexModelProvider,
+      );
+    }
+    if (result.permissionMode) {
+      await metadata.setPermissionMode?.(
+        result.sessionId,
+        result.permissionMode,
+      );
+    }
+  }
+
+  private async recordSessionOrigin(
+    sessionId: string,
+    project: Project,
+    origin: SessionCommandOrigin | undefined,
+  ): Promise<void> {
+    const metadata = this.deps.sessionMetadataService;
+    if (!metadata) return;
+    const resolvedOrigin = {
+      createdBy: origin?.createdBy ?? "yep",
+      originChannel: origin?.originChannel,
+    };
+    if (typeof metadata.setOrigin === "function") {
+      await metadata.setOrigin(sessionId, resolvedOrigin);
+    } else {
+      await metadata.setCreatedBy(sessionId, resolvedOrigin.createdBy);
+    }
+    await metadata.setProjectLocation(sessionId, project.id, project.path);
+    this.deps.eventBus?.emit({
+      type: "session-metadata-changed",
+      sessionId,
+      projectId: project.id,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private recordGatewayContextWindowOverride(input: {
+    provider?: ProviderName;
+    model?: string;
+    sessionId?: string;
+    limits?: LlmGatewayModelLimits;
+  }): void {
+    if (input.provider !== "pi" || !input.limits || input.limits.context <= 0) {
+      return;
+    }
+    if (input.model) {
+      this.deps.modelInfoService?.recordContextWindow(
+        input.model,
+        input.limits.context,
+        input.provider,
+      );
+    }
+    if (input.sessionId) {
+      this.deps.modelInfoService?.recordSessionContextWindow(
+        input.sessionId,
+        input.limits.context,
+        input.provider,
+      );
+    }
+  }
+
+  private async terminateInteractionAliases(
+    requestedSessionId: string,
+    process: RuntimeProcessSnapshot,
+  ): Promise<void> {
+    const canonicalSessionId =
+      process.pendingInputRequest?.sessionId || process.sessionId;
+    await Promise.all(
+      [...new Set([requestedSessionId, canonicalSessionId])].map((sessionId) =>
+        this.deps.sessionInteractionService.terminateInteractionOperations(
+          sessionId,
+          "interrupt",
+        ),
+      ),
+    );
+  }
+}

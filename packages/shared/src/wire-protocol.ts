@@ -71,11 +71,7 @@ export interface WireResponse {
 // ============================================================================
 
 /** Subscription channel types */
-export type WireSubscriptionChannel =
-  | "session"
-  | "activity"
-  | "session-watch"
-  | "project-files";
+export type WireSubscriptionChannel = "session" | "activity" | "session-watch";
 
 /** Client -> Server: Subscribe to events */
 export interface WireSubscribe {
@@ -86,7 +82,7 @@ export interface WireSubscribe {
   channel: WireSubscriptionChannel;
   /** Required for channel: "session" */
   sessionId?: string;
-  /** Required for channels: "session-watch" and "project-files" */
+  /** Required for channel: "session-watch" */
   projectId?: string;
   /** Optional provider hint for channel: "session-watch" */
   provider?: string;

@@ -2,7 +2,7 @@
  * ACP Client wrapper for Agent Client Protocol connections.
  *
  * Provides a reusable client for spawning and communicating with ACP agents
- * (Gemini, Codex, OpenCode, etc.) over JSON-RPC/stdio.
+ * (Gemini and other ACP-compatible agents) over JSON-RPC/stdio.
  *
  * Gemini uses a hybrid model where it executes its own tools internally,
  * but asks for permission on sensitive operations (file writes, shell commands).
@@ -14,11 +14,15 @@ import { Readable, Writable } from "node:stream";
 import {
   type Agent,
   type Client,
+  type ClientCapabilities,
   ClientSideConnection,
+  type ContentBlock,
   type InitializeResponse,
+  type PromptResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
+  type SetSessionConfigOptionResponse,
   ndJsonStream,
 } from "@agentclientprotocol/sdk";
 import { getLogger } from "../../../logging/logger.js";
@@ -72,6 +76,27 @@ export class ACPClient {
   /** OS PID of the spawned ACP agent child process */
   get pid(): number | undefined {
     return this.process?.pid;
+  }
+
+  /**
+   * Whether the spawned ACP agent child process is still running.
+   *
+   * Mirrors the liveness signal used by long-lived providers
+   * (the Node ChildProcess exit state). The supervisor's stale-process
+   * watchdog uses this to distinguish "process died silently" from "process
+   * is busy with a long-running turn" — e.g. Kimi orchestrating AgentSwarm /
+   * explore subagents keeps the parent ACP prompt silent for minutes while
+   * the child process is very much alive. Without this, the watchdog falls
+   * back to a time-based heuristic and kills the healthy process.
+   */
+  isAlive(): boolean {
+    const child = this.process;
+    return Boolean(
+      child?.pid &&
+        child.exitCode === null &&
+        child.signalCode === null &&
+        !child.killed,
+    );
   }
   private onSessionUpdate: SessionUpdateCallback | null = null;
   private onPermissionRequest: PermissionRequestCallback | null = null;
@@ -175,9 +200,15 @@ export class ACPClient {
   /**
    * Initialize the ACP connection.
    * Must be called after connect() and before newSession().
+   *
+   * The returned `agentCapabilities` describes what the agent's ACP layer can
+   * ingest (e.g. `promptCapabilities.image`). Note that it reflects the
+   * adapter, not the currently selected model — Kimi advertises
+   * `image: true` unconditionally and drops images later if the resolved model
+   * lacks the `image_in` capability.
    */
   async initialize(
-    capabilities: Record<string, boolean> = {},
+    capabilities: ClientCapabilities = {},
   ): Promise<InitializeResponse> {
     if (!this.connection) {
       throw new Error("ACPClient not connected. Call connect() first.");
@@ -232,13 +263,13 @@ export class ACPClient {
     await this.connection.loadSession({
       sessionId,
       cwd,
+      mcpServers: [],
     });
   }
 
   /**
    * Resume an existing session by ID.
-   * Uses the unstable session/resume method which may be supported even when
-   * session/load is not.
+   * Uses session/resume, which may be supported even when session/load is not.
    */
   async resumeSession(sessionId: string, cwd: string): Promise<string> {
     if (!this.connection) {
@@ -247,7 +278,7 @@ export class ACPClient {
 
     this.log.debug({ sessionId, cwd }, "Resuming existing ACP session");
 
-    const result = await this.connection.unstable_resumeSession({
+    const result = await this.connection.resumeSession({
       sessionId,
       cwd,
       mcpServers: [],
@@ -258,25 +289,89 @@ export class ACPClient {
   }
 
   /**
-   * Send a prompt to the agent and get a response.
+   * Change the agent-native mode for an active ACP session.
    *
-   * Note: In Phase 1, this is a simple request/response pattern.
-   * Session updates are delivered via the callback set with setSessionUpdateCallback().
-   * Phase 2+ will add streaming support.
+   * Kimi advertises `default`, `plan`, `auto`, and `yolo` while retaining the
+   * standard `session/set_mode` endpoint for ACP clients.
    */
-  async prompt(sessionId: string, text: string): Promise<unknown> {
+  async setSessionMode(sessionId: string, modeId: string): Promise<void> {
+    if (!this.connection) {
+      throw new Error("ACPClient not connected. Call connect() first.");
+    }
+
+    this.log.debug({ sessionId, modeId }, "Setting ACP session mode");
+    await this.connection.setSessionMode({ sessionId, modeId });
+  }
+
+  /**
+   * Set a select-valued configuration option for an active ACP session.
+   *
+   * Kimi exposes its model-specific thinking effort through the standard
+   * `thinking` config option (`category: "thought_level"`). The full response
+   * is returned so callers can verify that the agent accepted, rather than
+   * silently clamped, the requested value.
+   */
+  async setSessionConfigOption(
+    sessionId: string,
+    configId: string,
+    value: string,
+  ): Promise<SetSessionConfigOptionResponse> {
     if (!this.connection) {
       throw new Error("ACPClient not connected. Call connect() first.");
     }
 
     this.log.debug(
-      { sessionId, textLength: text.length },
+      { sessionId, configId, value },
+      "Setting ACP session config option",
+    );
+    return this.connection.setSessionConfigOption({
+      sessionId,
+      configId,
+      value,
+    });
+  }
+
+  /**
+   * Send a prompt to the agent and get a response.
+   *
+   * Accepts either a plain string (wrapped into a single `text` block) or a
+   * pre-built `ContentBlock[]` for multimodal prompts. Agents that advertise
+   * `promptCapabilities.image` / `.embeddedContext` consume `image` and
+   * `resource_link` blocks natively; a file path embedded in prompt text does
+   * not put the bytes in front of the model.
+   *
+   * Note: this is a simple request/response pattern. Session updates are
+   * delivered via the callback set with setSessionUpdateCallback().
+   */
+  async prompt(
+    sessionId: string,
+    content: string | readonly ContentBlock[],
+  ): Promise<PromptResponse> {
+    if (!this.connection) {
+      throw new Error("ACPClient not connected. Call connect() first.");
+    }
+
+    const blocks: ContentBlock[] =
+      typeof content === "string"
+        ? [{ type: "text", text: content }]
+        : [...content];
+
+    this.log.debug(
+      {
+        sessionId,
+        blockCount: blocks.length,
+        blockTypes: blocks.map((b) => b.type),
+        textLength: blocks.reduce(
+          (n, b) => n + (b.type === "text" ? b.text.length : 0),
+          0,
+        ),
+      },
       "Sending ACP prompt",
     );
 
     const result = await this.connection.prompt({
       sessionId,
-      prompt: [{ type: "text", text }],
+      prompt: blocks,
     });
 
     this.log.debug({ result }, "ACP prompt complete");

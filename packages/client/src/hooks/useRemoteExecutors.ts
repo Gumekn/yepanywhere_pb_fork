@@ -1,94 +1,59 @@
+import type { RemoteExecutorConfig } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type RemoteExecutorTestResult, api } from "../api/client";
 
-/**
- * Hook to fetch and manage remote executors configuration.
- *
- * Returns:
- * - executors: Array of SSH host aliases
- * - loading: Whether the initial fetch is in progress
- * - error: Any error that occurred during fetch
- * - refetch: Function to manually refresh the list
- * - addExecutor: Add a new executor and optionally test it first
- * - removeExecutor: Remove an executor from the list
- * - testExecutor: Test SSH connection to an executor
- */
 export function useRemoteExecutors() {
-  const [executors, setExecutors] = useState<string[]>([]);
+  const [executors, setExecutors] = useState<RemoteExecutorConfig[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
-  const hasFetchedRef = useRef(false);
+  const fetched = useRef(false);
 
-  const fetchExecutors = useCallback(async () => {
+  const refetch = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const data = await api.getRemoteExecutors();
-      setExecutors(data.executors);
-    } catch (err) {
-      setError(err instanceof Error ? err : new Error(String(err)));
+      const response = await api.getRemoteExecutors();
+      setExecutors(response.executors);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught : new Error(String(caught)));
     } finally {
       setLoading(false);
     }
   }, []);
 
-  // Initial fetch - only once (avoid StrictMode double-fetch)
   useEffect(() => {
-    if (hasFetchedRef.current) return;
-    hasFetchedRef.current = true;
-    fetchExecutors();
-  }, [fetchExecutors]);
+    if (fetched.current) return;
+    fetched.current = true;
+    void refetch();
+  }, [refetch]);
+
+  const save = useCallback(async (next: RemoteExecutorConfig[]) => {
+    const response = await api.updateRemoteExecutors(next);
+    setExecutors(response.executors);
+    return response.executors;
+  }, []);
 
   const addExecutor = useCallback(
-    async (host: string): Promise<void> => {
-      if (!host.trim()) return;
-      const trimmedHost = host.trim();
-
-      // Optimistic update
-      const prevExecutors = executors;
-      if (!executors.includes(trimmedHost)) {
-        setExecutors([...executors, trimmedHost]);
-      }
-
-      try {
-        const result = await api.updateRemoteExecutors([
-          ...prevExecutors.filter((e) => e !== trimmedHost),
-          trimmedHost,
-        ]);
-        setExecutors(result.executors);
-      } catch (err) {
-        // Revert on error
-        setExecutors(prevExecutors);
-        throw err;
-      }
+    async (executor: RemoteExecutorConfig) => {
+      const next = [
+        ...executors.filter((candidate) => candidate.host !== executor.host),
+        executor,
+      ];
+      await save(next);
     },
-    [executors],
+    [executors, save],
   );
 
   const removeExecutor = useCallback(
-    async (host: string): Promise<void> => {
-      // Optimistic update
-      const prevExecutors = executors;
-      setExecutors(executors.filter((e) => e !== host));
-
-      try {
-        const result = await api.updateRemoteExecutors(
-          prevExecutors.filter((e) => e !== host),
-        );
-        setExecutors(result.executors);
-      } catch (err) {
-        // Revert on error
-        setExecutors(prevExecutors);
-        throw err;
-      }
+    async (host: string) => {
+      await save(executors.filter((executor) => executor.host !== host));
     },
-    [executors],
+    [executors, save],
   );
 
   const testExecutor = useCallback(
-    async (host: string): Promise<RemoteExecutorTestResult> => {
-      return api.testRemoteExecutor(host);
-    },
+    (executor: RemoteExecutorConfig): Promise<RemoteExecutorTestResult> =>
+      api.testRemoteExecutor(executor),
     [],
   );
 
@@ -96,7 +61,7 @@ export function useRemoteExecutors() {
     executors,
     loading,
     error,
-    refetch: fetchExecutors,
+    refetch,
     addExecutor,
     removeExecutor,
     testExecutor,

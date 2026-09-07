@@ -1,20 +1,38 @@
 import type { ReactNode } from "react";
 import type { RenderContext } from "../types";
+import { mcpToolRenderer, parseMcpToolName } from "./McpToolRenderer";
 import type { ToolRenderer } from "./types";
 
 const TOOL_NAME_ALIASES: Record<string, string> = {
+  bash: "Bash",
+  shell: "Bash",
   shell_command: "Bash",
   exec_command: "Bash",
+  read: "Read",
+  write: "Write",
+  edit: "Edit",
+  glob: "Glob",
+  grep: "Grep",
+  todowrite: "TodoWrite",
+  todo: "TodoWrite",
   write_stdin: "WriteStdin",
+  wait: "CodexWait",
   update_plan: "UpdatePlan",
   apply_patch: "Edit",
   web_search_call: "WebSearch",
   search_query: "WebSearch",
+  websearch: "WebSearch",
+  webrun: "WebSearch", // codex web.run (namespace "web" + name "run")
+  web__run: "WebSearch", // codex code-mode nested web.run
+  webfetch: "WebFetch",
   Agent: "Task", // SDK 0.2.76+ renamed Task → Agent
+  AgentSwarm: "Task", // Kimi parallel subagent dispatch
   view_image: "ViewImage",
   imageView: "ViewImage",
   image_generation: "ViewImage",
   imageGeneration: "ViewImage",
+  readmediafile: "ReadMediaFile",
+  skill: "Skill",
 };
 
 function canonicalizeToolName(toolName: string): string {
@@ -42,7 +60,16 @@ class ToolRendererRegistry {
 
   get(toolName: string): ToolRenderer {
     const canonicalToolName = canonicalizeToolName(toolName);
-    return this.tools.get(canonicalToolName) || this.fallback;
+    const registered = this.tools.get(canonicalToolName);
+    if (registered) {
+      return registered;
+    }
+    // MCP tools (server:tool / mcp__server__tool) get a structured renderer
+    // instead of the raw-JSON fallback.
+    if (parseMcpToolName(canonicalToolName)) {
+      return mcpToolRenderer;
+    }
+    return this.fallback;
   }
 
   renderToolUse(
@@ -121,8 +148,17 @@ class ToolRendererRegistry {
     return null;
   }
 
-  getDisplayName(toolName: string): string {
+  getDisplayName(toolName: string, input?: unknown): string {
     const renderer = this.get(toolName);
+    if (renderer === mcpToolRenderer) {
+      const identity = parseMcpToolName(canonicalizeToolName(toolName));
+      if (identity) {
+        return `${identity.server} · ${identity.tool}`;
+      }
+    }
+    if (renderer.getDisplayName) {
+      return renderer.getDisplayName(input);
+    }
     return renderer.displayName || toolName;
   }
 }
@@ -155,12 +191,17 @@ export const toolRegistry = new ToolRendererRegistry(fallbackToolRenderer);
 import { askUserQuestionRenderer } from "./AskUserQuestionRenderer";
 import { bashOutputRenderer } from "./BashOutputRenderer";
 import { bashRenderer } from "./BashRenderer";
+import { codexCollaborationRenderers } from "./CodexCollaborationRenderer";
+import { codexExecRenderer } from "./CodexExecRenderer";
+import { codexWaitRenderer } from "./CodexWaitRenderer";
 import { editRenderer } from "./EditRenderer";
 import { exitPlanModeRenderer } from "./ExitPlanModeRenderer";
 import { globRenderer } from "./GlobRenderer";
 import { grepRenderer } from "./GrepRenderer";
 import { killShellRenderer } from "./KillShellRenderer";
+import { readMediaFileRenderer } from "./ReadMediaFileRenderer";
 import { readRenderer } from "./ReadRenderer";
+import { skillRenderer } from "./SkillRenderer";
 import { taskOutputRenderer } from "./TaskOutputRenderer";
 import { taskRenderer } from "./TaskRenderer";
 import { todoWriteRenderer } from "./TodoWriteRenderer";
@@ -173,12 +214,16 @@ import { writeStdinRenderer } from "./WriteStdinRenderer";
 
 // Tier 1 & 2: Core tools
 toolRegistry.register(bashRenderer);
+toolRegistry.register(codexExecRenderer);
+toolRegistry.register(codexWaitRenderer);
 toolRegistry.register(readRenderer);
+toolRegistry.register(readMediaFileRenderer);
 toolRegistry.register(editRenderer);
 toolRegistry.register(writeRenderer);
 toolRegistry.register(globRenderer);
 toolRegistry.register(grepRenderer);
 toolRegistry.register(todoWriteRenderer);
+toolRegistry.register(skillRenderer);
 
 // Tier 3: Less common tools
 toolRegistry.register(taskRenderer);
@@ -191,6 +236,9 @@ toolRegistry.register(writeStdinRenderer);
 
 // Codex-specific tools
 toolRegistry.register(viewImageRenderer);
+for (const renderer of codexCollaborationRenderers) {
+  toolRegistry.register(renderer);
+}
 
 // Tier 4: Background/async tools
 toolRegistry.register(bashOutputRenderer);

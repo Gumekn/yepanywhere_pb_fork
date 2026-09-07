@@ -1,12 +1,13 @@
 import {
   ALL_PROVIDERS,
+  type LiveProviderName,
   type ProviderName,
   SLASH_COMMAND_SESSION_KIND,
   type SessionKind,
   isSessionKind,
 } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { type GlobalSessionItem, api } from "../api/client";
 import { BulkActionBar } from "../components/BulkActionBar";
 import {
@@ -16,36 +17,68 @@ import {
 import { PageHeader } from "../components/PageHeader";
 import { SessionListItem } from "../components/SessionListItem";
 import { SessionListSkeleton } from "../components/Skeleton";
+import { ZCodeBridgeApprovals } from "../components/ZCodeBridgeApprovals";
+import { useToastContext } from "../contexts/ToastContext";
 import { useDrafts } from "../hooks/useDrafts";
 import { useGlobalSessions } from "../hooks/useGlobalSessions";
 import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
+import { compareSessionsByPinAndUpdatedAt } from "../lib/sessionOrdering";
 import { toUrlProjectId } from "../utils";
 
 // Long-press threshold for entering selection mode on mobile
 const LONG_PRESS_MS = 500;
 
 // Status filter options
-type StatusFilter = "all" | "unread" | "starred" | "archived";
+type StatusFilter = "all" | "unread" | "pinned" | "archived";
 
 // Age filter options (days)
 type AgeFilter = "3" | "7" | "14" | "30";
 
 // Provider colors for filter dropdown (matching ProviderBadge)
-const PROVIDER_COLORS: Record<ProviderName, string> = {
+const PROVIDER_COLORS: Record<LiveProviderName, string> = {
   claude: "var(--app-yep-green)",
   "claude-ollama": "var(--app-yep-green)", // Same as Claude
   codex: "#10a37f",
   "codex-oss": "#f97316",
   gemini: "#4285f4",
   "gemini-acp": "#4285f4", // Same as gemini
-  opencode: "#9333ea", // Purple for OpenCode
+  pi: "var(--provider-pi)",
+  kimi: "var(--provider-kimi)", // Kimi KMBlue
+  zcode: "var(--provider-zcode)", // ZCode
 };
 
 const getSessionListTitle = (session: GlobalSessionItem): string | null =>
   session.customTitle ?? session.aiTitle ?? session.title ?? null;
+
+/**
+ * A session can be archived only if it is not already archived and its runtime
+ * is not busy. The server hard-blocks (409) archiving of busy sessions
+ * (waiting-input / hold / in-turn / external), so filtering them out client-side
+ * avoids doomed requests and keeps bulk archive tolerant of mixed selections.
+ */
+const canArchiveSession = (session: GlobalSessionItem): boolean =>
+  !session.isArchived && session.runtime?.canArchive !== false;
+
+/** Max number of busy session names to spell out before summarizing the rest. */
+const MAX_BUSY_NAMES = 3;
+
+/** Build a readable "A, B, C +N more" list of busy session titles for a toast. */
+const formatBusyNames = (
+  busy: GlobalSessionItem[],
+  t: ReturnType<typeof useI18n>["t"],
+): string => {
+  const names = busy
+    .slice(0, MAX_BUSY_NAMES)
+    .map((s) => getSessionListTitle(s) ?? t("sessionUntitled"));
+  let label = names.join(", ");
+  if (busy.length > MAX_BUSY_NAMES) {
+    label += ` ${t("bulkArchiveMore", { count: busy.length - MAX_BUSY_NAMES })}`;
+  }
+  return label;
+};
 
 /**
  * Global sessions page showing all sessions across all projects.
@@ -54,8 +87,8 @@ const getSessionListTitle = (session: GlobalSessionItem): string | null =>
  */
 export function GlobalSessionsPage() {
   const { t } = useI18n();
-  const { openSidebar, isWideScreen, toggleSidebar, isSidebarCollapsed } =
-    useNavigationLayout();
+  const { showToast } = useToastContext();
+  const { openSidebar, isWideScreen } = useNavigationLayout();
   const basePath = useRemoteBasePath();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -76,8 +109,9 @@ export function GlobalSessionsPage() {
     if (!param) return [];
     return param
       .split(",")
+      .map((status) => (status === "starred" ? "pinned" : status))
       .filter((s): s is StatusFilter =>
-        ["all", "unread", "starred", "archived"].includes(s),
+        ["all", "unread", "pinned", "archived"].includes(s),
       );
   }, [searchParams]);
 
@@ -190,6 +224,9 @@ export function GlobalSessionsPage() {
       projectId: projectFilter,
       searchQuery,
       includeArchived,
+      // Pinned sessions must be present before the client can elevate them.
+      // The server appends pins that fall outside the ordinary recency page.
+      includePinned: true,
       includeStats: !projectFilter,
       sessionKind,
     });
@@ -199,7 +236,7 @@ export function GlobalSessionsPage() {
 
   // Filter sessions based on status and provider filters (client-side)
   const filteredSessions = useMemo(() => {
-    return sessions.filter((session) => {
+    const filtered = sessions.filter((session) => {
       // Status filtering (empty = show all non-archived)
       if (statusFilters.length === 0) {
         // Default: show non-archived
@@ -216,7 +253,7 @@ export function GlobalSessionsPage() {
               if (session.hasUnread && !session.isArchived)
                 matchesStatus = true;
               break;
-            case "starred":
+            case "pinned":
               if (session.isStarred) matchesStatus = true;
               break;
             case "archived":
@@ -253,6 +290,8 @@ export function GlobalSessionsPage() {
 
       return true;
     });
+
+    return filtered.sort(compareSessionsByPinAndUpdatedAt);
   }, [sessions, statusFilters, providerFilters, executorFilters, ageFilter]);
 
   // Track which sessions have unsent drafts
@@ -276,8 +315,8 @@ export function GlobalSessionsPage() {
         count: showCounts ? stats.unreadCount : undefined,
       },
       {
-        value: "starred",
-        label: t("globalSessionsStatusStarred"),
+        value: "pinned",
+        label: t("globalSessionsStatusPinned"),
         count: showCounts ? stats.starredCount : undefined,
       },
       {
@@ -447,43 +486,102 @@ export function GlobalSessionsPage() {
   );
 
   // Bulk action handlers
+
+  /**
+   * Archive a batch of sessions tolerantly:
+   * - skip sessions that are busy/already archived (would 409 server-side)
+   * - use allSettled so one failure never aborts the whole batch
+   * - report a per-batch summary, naming the busy sessions that were skipped
+   */
+  const archiveSessions = useCallback(
+    async (targets: GlobalSessionItem[]): Promise<void> => {
+      const archivable = targets.filter(canArchiveSession);
+      const busy = targets.filter(
+        (s) => !s.isArchived && !canArchiveSession(s),
+      );
+
+      if (archivable.length === 0) {
+        if (busy.length > 0) {
+          showToast(
+            t("bulkArchiveSkippedNames", { names: formatBusyNames(busy, t) }),
+            "error",
+          );
+        } else {
+          showToast(t("bulkArchiveNoneEligible"), "error");
+        }
+        return;
+      }
+
+      const results = await Promise.allSettled(
+        archivable.map((s) =>
+          api.updateSessionMetadata(s.id, { archived: true }),
+        ),
+      );
+      const succeeded = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - succeeded;
+
+      const parts: string[] = [];
+      if (succeeded > 0) {
+        parts.push(t("bulkArchiveSucceeded", { count: succeeded }));
+      }
+      if (busy.length > 0) {
+        parts.push(
+          t("bulkArchiveSkippedNames", { names: formatBusyNames(busy, t) }),
+        );
+      }
+      if (failed > 0) {
+        parts.push(t("bulkArchiveFailed", { count: failed }));
+      }
+      if (parts.length > 0) {
+        showToast(parts.join(" · "), failed > 0 ? "error" : "success");
+      }
+    },
+    [showToast, t],
+  );
+
   const handleBulkArchive = useCallback(async () => {
     if (isBulkActionPending) return;
     setIsBulkActionPending(true);
     try {
-      await Promise.all(
-        Array.from(selectedIds).map((id) =>
-          api.updateSessionMetadata(id, { archived: true }),
-        ),
-      );
+      await archiveSessions(sessions.filter((s) => selectedIds.has(s.id)));
       handleClearSelection();
     } finally {
       setIsBulkActionPending(false);
     }
-  }, [selectedIds, isBulkActionPending, handleClearSelection]);
+  }, [
+    sessions,
+    selectedIds,
+    isBulkActionPending,
+    handleClearSelection,
+    archiveSessions,
+  ]);
 
   const handleBulkUnarchive = useCallback(async () => {
     if (isBulkActionPending) return;
     setIsBulkActionPending(true);
     try {
-      await Promise.all(
+      const results = await Promise.allSettled(
         Array.from(selectedIds).map((id) =>
           api.updateSessionMetadata(id, { archived: false }),
         ),
       );
+      const failed = results.filter((r) => r.status === "rejected").length;
+      if (failed > 0) {
+        showToast(t("bulkArchiveFailed", { count: failed }), "error");
+      }
       handleClearSelection();
     } finally {
       setIsBulkActionPending(false);
     }
-  }, [selectedIds, isBulkActionPending, handleClearSelection]);
+  }, [selectedIds, isBulkActionPending, handleClearSelection, showToast, t]);
 
-  const handleBulkStar = useCallback(async () => {
+  const handleBulkPin = useCallback(async () => {
     if (isBulkActionPending) return;
     setIsBulkActionPending(true);
     try {
       await Promise.all(
         Array.from(selectedIds).map((id) =>
-          api.updateSessionMetadata(id, { starred: true }),
+          api.updateSessionMetadata(id, { pinned: true }),
         ),
       );
       handleClearSelection();
@@ -492,13 +590,13 @@ export function GlobalSessionsPage() {
     }
   }, [selectedIds, isBulkActionPending, handleClearSelection]);
 
-  const handleBulkUnstar = useCallback(async () => {
+  const handleBulkUnpin = useCallback(async () => {
     if (isBulkActionPending) return;
     setIsBulkActionPending(true);
     try {
       await Promise.all(
         Array.from(selectedIds).map((id) =>
-          api.updateSessionMetadata(id, { starred: false }),
+          api.updateSessionMetadata(id, { pinned: false }),
         ),
       );
       handleClearSelection();
@@ -536,23 +634,19 @@ export function GlobalSessionsPage() {
   // "Archive all" for filtered results (no manual selection needed)
   const handleArchiveAllFiltered = useCallback(async () => {
     if (isBulkActionPending) return;
-    const archivable = filteredSessions.filter((s) => !s.isArchived);
+    const archivable = filteredSessions.filter(canArchiveSession);
     if (archivable.length === 0) return;
     setIsBulkActionPending(true);
     try {
-      await Promise.all(
-        archivable.map((s) =>
-          api.updateSessionMetadata(s.id, { archived: true }),
-        ),
-      );
+      await archiveSessions(archivable);
     } finally {
       setIsBulkActionPending(false);
     }
-  }, [filteredSessions, isBulkActionPending]);
+  }, [filteredSessions, isBulkActionPending, archiveSessions]);
 
   // Count of archivable sessions in filtered results
   const archivableFilteredCount = useMemo(
-    () => filteredSessions.filter((s) => !s.isArchived).length,
+    () => filteredSessions.filter(canArchiveSession).length,
     [filteredSessions],
   );
 
@@ -560,10 +654,10 @@ export function GlobalSessionsPage() {
   const bulkActionState = useMemo(() => {
     const selectedSessions = sessions.filter((s) => selectedIds.has(s.id));
     return {
-      canArchive: selectedSessions.some((s) => !s.isArchived),
+      canArchive: selectedSessions.some(canArchiveSession),
       canUnarchive: selectedSessions.some((s) => s.isArchived),
-      canStar: selectedSessions.some((s) => !s.isStarred),
-      canUnstar: selectedSessions.some((s) => s.isStarred),
+      canPin: selectedSessions.some((s) => !s.isStarred),
+      canUnpin: selectedSessions.some((s) => s.isStarred),
       canMarkRead: selectedSessions.some((s) => s.hasUnread),
       canMarkUnread: selectedSessions.some((s) => !s.hasUnread),
     };
@@ -637,13 +731,14 @@ export function GlobalSessionsPage() {
         <PageHeader
           title={pageTitle}
           onOpenSidebar={openSidebar}
-          onToggleSidebar={toggleSidebar}
           isWideScreen={isWideScreen}
-          isSidebarCollapsed={isSidebarCollapsed}
         />
 
         <main className="page-scroll-container">
           <div className="page-content-inner">
+            {/* Pending approvals from external `zcode tui` sessions */}
+            <ZCodeBridgeApprovals />
+
             {/* Filter bar */}
             <div className="filter-bar">
               <form onSubmit={handleSearch} className="filter-search-form">
@@ -724,6 +819,28 @@ export function GlobalSessionsPage() {
                 >
                   {t("globalSessionsClearFilters")}
                 </button>
+              )}
+              {projectFilter && (
+                <Link
+                  to={`${basePath}/new-session?projectId=${encodeURIComponent(projectFilter)}`}
+                  className="btn-primary global-sessions-new-session-button"
+                >
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <line x1="12" y1="5" x2="12" y2="19" />
+                    <line x1="5" y1="12" x2="19" y2="12" />
+                  </svg>
+                  {t("sidebarNewSession")}
+                </Link>
               )}
             </div>
 
@@ -819,6 +936,9 @@ export function GlobalSessionsPage() {
                         status={session.ownership}
                         provider={session.provider}
                         interrupted={session.interrupted}
+                        lastTurnStatus={session.lastTurnStatus}
+                        lastErrorMessage={session.lastErrorMessage}
+                        retryStatus={session.retryStatus}
                         model={session.model}
                         reasoningEffort={session.reasoningEffort}
                         serviceTier={session.serviceTier}
@@ -826,12 +946,15 @@ export function GlobalSessionsPage() {
                         createdBy={session.createdBy}
                         originator={session.originator}
                         sessionSource={session.source}
-                        isStarred={session.isStarred}
+                        isPinned={session.isStarred}
                         isArchived={session.isArchived}
                         mode="card"
                         showContextUsage={false}
                         showSizeMeta
                         contextUsage={session.contextUsage}
+                        cumulativeUsage={session.cumulativeUsage}
+                        compactCount={session.compactCount}
+                        compactEvents={session.compactEvents}
                         isSelected={selectedIds.has(session.id)}
                         isSelectionMode={isSelectionMode && !isWideScreen}
                         onNavigate={() => {
@@ -880,16 +1003,16 @@ export function GlobalSessionsPage() {
               selectedCount={selectedIds.size}
               onArchive={handleBulkArchive}
               onUnarchive={handleBulkUnarchive}
-              onStar={handleBulkStar}
-              onUnstar={handleBulkUnstar}
+              onPin={handleBulkPin}
+              onUnpin={handleBulkUnpin}
               onMarkRead={handleBulkMarkRead}
               onMarkUnread={handleBulkMarkUnread}
               onClearSelection={handleClearSelection}
               isPending={isBulkActionPending}
               canArchive={bulkActionState.canArchive}
               canUnarchive={bulkActionState.canUnarchive}
-              canStar={bulkActionState.canStar}
-              canUnstar={bulkActionState.canUnstar}
+              canPin={bulkActionState.canPin}
+              canUnpin={bulkActionState.canUnpin}
               canMarkRead={bulkActionState.canMarkRead}
               canMarkUnread={bulkActionState.canMarkUnread}
               onArchiveAllFiltered={

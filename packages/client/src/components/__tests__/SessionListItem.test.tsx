@@ -1,4 +1,11 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { toUrlProjectId } from "@yep-anywhere/shared";
 import type { ComponentProps } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,12 +13,16 @@ import { ToastProvider } from "../../contexts/ToastContext";
 import { I18nProvider } from "../../i18n";
 import { SessionListItem } from "../SessionListItem";
 
-const { mockUpdateSessionMetadata } = vi.hoisted(() => ({
-  mockUpdateSessionMetadata: vi.fn(),
-}));
+const { mockGenerateSessionTitle, mockUpdateSessionMetadata } = vi.hoisted(
+  () => ({
+    mockGenerateSessionTitle: vi.fn(),
+    mockUpdateSessionMetadata: vi.fn(),
+  }),
+);
 
 vi.mock("../../api/client", () => ({
   api: {
+    generateSessionTitle: mockGenerateSessionTitle,
     updateSessionMetadata: mockUpdateSessionMetadata,
   },
 }));
@@ -39,7 +50,7 @@ function renderItem(
   );
 }
 
-describe("SessionListItem archive feedback", () => {
+describe("SessionListItem actions", () => {
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
@@ -51,25 +62,32 @@ describe("SessionListItem archive feedback", () => {
     vi.clearAllMocks();
   });
 
-  it("disables archive with the runtime block reason", () => {
-    renderItem({
-      runtime: {
-        ownership: { owner: "self", processId: "proc-1" },
-        activity: "in-turn",
-        isBusy: true,
-        hasResidentWorker: false,
-        canArchive: false,
-        archiveBlockCode: "agent_in_turn",
-        archiveBlockReason: "Agent is still running",
-      },
-    });
+  it.each(["card", "compact"] as const)(
+    "disables archive with the runtime block reason in %s mode",
+    (mode) => {
+      renderItem({
+        mode,
+        onSelectForArchive: mode === "compact" ? vi.fn() : undefined,
+        runtime: {
+          ownership: { owner: "self", processId: "proc-1" },
+          activity: "in-turn",
+          isBusy: true,
+          hasResidentWorker: false,
+          canArchive: false,
+          archiveBlockCode: "agent_in_turn",
+          archiveBlockReason: "Agent is still running",
+        },
+      });
 
-    fireEvent.click(screen.getByRole("button", { name: /options/i }));
+      fireEvent.click(screen.getByRole("button", { name: /options/i }));
 
-    const archiveButton = screen.getByRole("button", { name: /archive/i });
-    expect((archiveButton as HTMLButtonElement).disabled).toBe(true);
-    expect(archiveButton.getAttribute("title")).toBe("Agent is still running");
-  });
+      const archiveButton = screen.getByRole("button", { name: /archive/i });
+      expect((archiveButton as HTMLButtonElement).disabled).toBe(true);
+      expect(archiveButton.getAttribute("title")).toBe(
+        "Agent is still running",
+      );
+    },
+  );
 
   it("shows the server archive error in a toast", async () => {
     mockUpdateSessionMetadata.mockRejectedValueOnce(
@@ -95,13 +113,184 @@ describe("SessionListItem archive feedback", () => {
     });
   });
 
-  it("renders an unknown creation source when runtime data is not a string", () => {
-    renderItem({
-      sessionSource: {
-        subagent: { other: "guardian" },
-      } as unknown as string,
+  it.each(["card", "compact"] as const)(
+    "pins a %s session and only shows the pin icon on cards",
+    async (mode) => {
+      mockUpdateSessionMetadata.mockResolvedValueOnce({ updated: true });
+      const { container } = renderItem({ mode });
+
+      fireEvent.click(screen.getByRole("button", { name: /options/i }));
+      fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+
+      await waitFor(() => {
+        expect(mockUpdateSessionMetadata).toHaveBeenCalledWith("session-1", {
+          pinned: true,
+        });
+      });
+      expect(
+        container
+          .querySelector(".session-list-item")
+          ?.classList.contains("pinned"),
+      ).toBe(true);
+      expect(container.querySelector(".session-pin-icon") !== null).toBe(
+        mode === "card",
+      );
+    },
+  );
+
+  it("copies session info from the menu", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
     });
 
-    expect(screen.getByText("未知")).toBeTruthy();
+    const projectId = toUrlProjectId("/Users/someone/work/alpha");
+    renderItem({
+      projectId,
+      projectName: "Project Alpha",
+      model: "gpt-5-codex",
+      basePath: "/yep",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /options/i }));
+    fireEvent.click(screen.getByRole("button", { name: /copy session info/i }));
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalled();
+    });
+    const copiedText = writeText.mock.calls[0]?.[0] as string;
+    // The copied block must be self-locating: a bare session id cannot be
+    // resolved back to a project by any API, route or CLI.
+    expect(copiedText).toBe(
+      [
+        "Title: Session title",
+        "Session ID: session-1",
+        "Provider: codex",
+        "Project: /Users/someone/work/alpha",
+        `Link: ${window.location.origin}/projects/${projectId}/sessions/session-1`,
+      ].join("\n"),
+    );
+  });
+
+  it("copies only the displayed session title from the menu", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    renderItem({ title: "Title to copy" });
+
+    fireEvent.click(screen.getByRole("button", { name: /options/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy title" }));
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith("Title to copy");
+      expect(screen.getByText("Session title copied")).toBeTruthy();
+    });
+  });
+
+  it("generates a title only after the session menu action is clicked", async () => {
+    let resolveTitle!: (value: { title: string }) => void;
+    mockGenerateSessionTitle.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveTitle = resolve;
+        }),
+    );
+    renderItem();
+
+    expect(mockGenerateSessionTitle).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /options/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate title" }));
+
+    expect(
+      await screen.findByRole("status", { name: "Generating title..." }),
+    ).toBeTruthy();
+    await act(async () => {
+      resolveTitle({ title: "Generated session title" });
+    });
+
+    await waitFor(() => {
+      expect(mockGenerateSessionTitle).toHaveBeenCalledWith(
+        "project-1",
+        "session-1",
+      );
+      expect(screen.getByText("Generated session title")).toBeTruthy();
+      expect(screen.queryByRole("status")).toBeNull();
+    });
+  });
+
+  it("shows effective usage and compact count in compact mode", () => {
+    renderItem({
+      mode: "compact",
+      cumulativeUsage: {
+        totalTokens: 12_500,
+        inputTokens: 9_000,
+        outputTokens: 2_000,
+        cacheReadTokens: 1_500,
+        cacheCreationTokens: 0,
+        turnCount: 3,
+      },
+      compactCount: 2,
+      compactEvents: [
+        {
+          timestamp: "2026-01-01T00:02:00.000Z",
+          beforeTokens: 167_000,
+          afterTokens: 57_000,
+          reclaimedTokens: 110_000,
+          trigger: "auto",
+        },
+      ],
+    });
+
+    const usage = screen.getByText("11.0K");
+    expect(usage).toBeTruthy();
+    expect(usage.getAttribute("title")).toContain("Input: 9,000");
+    expect(usage.getAttribute("title")).toContain("Cache read: 1,500");
+    expect(usage.getAttribute("title")).toContain("Output: 2,000");
+    expect(usage.getAttribute("title")).toContain("Raw total: 12,500");
+    fireEvent.click(usage);
+    expect(screen.getByText("Effective")).toBeTruthy();
+    expect(screen.getByText("11,000 excl. cache")).toBeTruthy();
+    expect(screen.getByText("Cache read")).toBeTruthy();
+    const compact = screen.getByText("2 compacts");
+    fireEvent.click(compact);
+    expect(screen.getByText("#1 auto")).toBeTruthy();
+    expect(screen.getByText("167.0K -> 57.0K")).toBeTruthy();
+    expect(screen.getByText("110.0K")).toBeTruthy();
+  });
+
+  it("uses effective usage for card size metadata", () => {
+    renderItem({
+      showSizeMeta: true,
+      messageCount: 4,
+      contextUsage: {
+        inputTokens: 99_000,
+        percentage: 50,
+      },
+      cumulativeUsage: {
+        totalTokens: 12_500,
+        inputTokens: 9_000,
+        outputTokens: 2_000,
+        cacheReadTokens: 1_500,
+        cacheCreationTokens: 0,
+        turnCount: 3,
+      },
+      compactCount: 1,
+      compactEvents: [
+        {
+          beforeTokens: 167_000,
+          afterTokens: 57_000,
+          reclaimedTokens: 110_000,
+        },
+      ],
+    });
+
+    expect(screen.getByText("11.0K")).toBeTruthy();
+    const compact = screen.getByText("1 compact");
+    fireEvent.click(compact);
+    expect(screen.getByText("167.0K -> 57.0K")).toBeTruthy();
+    expect(screen.queryByText("99.0K")).toBeNull();
   });
 });

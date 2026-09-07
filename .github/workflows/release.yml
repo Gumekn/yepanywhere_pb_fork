@@ -1,0 +1,80 @@
+name: Release
+
+# This fork does not publish to npm. The `yepanywhere` package name belongs to
+# the upstream release line, so a release here means: validate, build the
+# bundle, and attach it to a GitHub Release on this repository.
+#
+# Triggered by `ya-v*` only. The bare `v*` namespace is reserved for upstream
+# and is deliberately not wired to anything. See docs/project/versioning.md.
+
+on:
+  push:
+    tags:
+      - 'ya-v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # For creating GitHub releases
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run linter
+        run: pnpm lint
+
+      - name: Run type checking
+        run: pnpm typecheck
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/ya-v}" >> $GITHUB_OUTPUT
+
+      - name: Verify release metadata
+        run: pnpm version:check --profile tag --tag "${GITHUB_REF#refs/tags/}"
+
+      - name: Build bundle
+        run: pnpm build:bundle
+        env:
+          NPM_VERSION: ${{ steps.version.outputs.VERSION }}
+          YEP_RELEASE_CHANNEL: fork
+
+      - name: Verify bundle version matches the tag
+        run: pnpm version:check --profile tag --build-info dist/npm-package/build-info.json
+
+      - name: Package bundle
+        run: |
+          cd dist
+          tar -czf "yepanywhere-${{ steps.version.outputs.VERSION }}.tgz" npm-package
+
+      - name: Extract changelog for release notes
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          awk "/^## \\[$VERSION\\]/{found=1; next} /^## \\[/{found=0} found" CHANGELOG.md > /tmp/release-notes.md
+          echo "Release notes for $VERSION:"
+          cat /tmp/release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ya-v${{ steps.version.outputs.VERSION }}
+          body_path: /tmp/release-notes.md
+          files: dist/yepanywhere-${{ steps.version.outputs.VERSION }}.tgz
+          draft: false
+          prerelease: false

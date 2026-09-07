@@ -1,3 +1,7 @@
+import type {
+  KimiGoalSnapshot,
+  SessionDisplaySegment,
+} from "@yep-anywhere/shared";
 import type { ContentBlock, Message } from "../types";
 
 /**
@@ -13,7 +17,10 @@ export type RenderItem =
   | ToolCallItem
   | UserPromptItem
   | SessionSetupItem
-  | SystemItem;
+  | SystemItem
+  | DisplayToolGroupItem
+  | AssistantOutputToolGroupItem
+  | CodexNativeItem;
 
 /** Base fields shared by all render items */
 interface RenderItemBase {
@@ -27,6 +34,8 @@ export interface TextItem extends RenderItemBase {
   type: "text";
   id: string;
   text: string;
+  /** Codex assistant phase; commentary is an explicit model progress update. */
+  phase?: "commentary" | "final_answer";
   /** True if this text is still being streamed */
   isStreaming?: boolean;
   /** Pre-rendered HTML from server (for completed messages) */
@@ -39,6 +48,23 @@ export interface ThinkingItem extends RenderItemBase {
   thinking: string;
   signature?: string;
   status: "streaming" | "complete";
+  /**
+   * Handle for reasoning that arrived as a bounded preview.
+   *
+   * The display page never ships full reasoning bodies; rows created from it
+   * carry this handle so expanding can fetch the remainder on demand.
+   */
+  detail?: ThinkingDetailRef;
+}
+
+export interface ThinkingDetailRef {
+  projectId: string;
+  sessionId: string;
+  revision: string;
+  branchId?: string;
+  detailRef: string;
+  /** True when the inline text is only a preview of a longer body. */
+  truncated: boolean;
 }
 
 export interface ToolCallItem extends RenderItemBase {
@@ -48,6 +74,8 @@ export interface ToolCallItem extends RenderItemBase {
   toolInput: unknown; // tool_use.input
   toolResult?: ToolResultData; // undefined while pending
   status: "pending" | "complete" | "error" | "aborted";
+  /** Live streaming output preview while the tool is still running. */
+  partialOutput?: string;
 }
 
 export interface ToolResultData {
@@ -77,4 +105,59 @@ export interface SystemItem extends RenderItemBase {
   content: string;
   /** For status subtype: the current status (e.g., "compacting") */
   status?: "compacting" | null;
+  /** Structured Kimi goal lifecycle state for the inline goal renderer. */
+  goalSnapshot?: KimiGoalSnapshot;
+}
+
+export type DisplayToolGroupSegment = Extract<
+  SessionDisplaySegment,
+  { type: "tool_group" | "action_required" }
+>;
+
+/** Lightweight group header whose normalized messages load only on expand. */
+export interface DisplayToolGroupItem extends RenderItemBase {
+  type: "display_tool_group";
+  id: string;
+  group: DisplayToolGroupSegment;
+  projectId: string;
+  sessionId: string;
+  revision: string;
+  branchId?: string;
+}
+
+/**
+ * In-memory tool batch closed by a later user-readable assistant message.
+ * Unlike display_tool_group, all details are already present from the live
+ * stream/legacy compatibility path and expansion never performs a request.
+ */
+export interface AssistantOutputToolGroupItem extends RenderItemBase {
+  type: "assistant_output_tool_group";
+  id: string;
+  tools: ToolCallItem[];
+}
+
+/**
+ * Codex app-server native ThreadItem projected through the canonical overlay.
+ *
+ * The server emits these as system messages with `subtype: "codex_native_item"`
+ * carrying a `codexThreadItem` payload. The client splits them out from generic
+ * system messages so dedicated renderers can surface plan, sub-agent activity,
+ * and collaboration tool-call content that the generic system renderer would
+ * silently drop.
+ */
+export interface CodexNativeItem extends RenderItemBase {
+  type: "codex_native_item";
+  id: string;
+  /** The projected ThreadItem payload (type + item-specific fields). */
+  threadItem: {
+    type: string;
+    id?: string;
+    [key: string]: unknown;
+  };
+  /** Whether this item is mid-stream ("started") or finished ("completed"). */
+  lifecycle: "started" | "completed";
+  /** The Codex thread id this item belongs to, when known. */
+  threadId?: string;
+  /** The Codex turn id this item belongs to, when known. */
+  turnId?: string;
 }

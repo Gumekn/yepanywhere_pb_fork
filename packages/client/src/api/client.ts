@@ -1,60 +1,60 @@
 import type {
   AgentActivity,
+  AgentMapping,
   BrowserProfilesResponse,
   CodexMcpMode,
+  CodexServiceTier,
   ConnectionsResponse,
+  ContextCompactEvent,
+  ContextCumulativeUsage,
   ContextStatusResponse,
   ContextUsage,
   DeviceInfo,
   EnrichedRecentEntry,
   FileContentResponse,
   GitStatusInfo,
+  LlmGatewaySessionConfig,
   NewSessionDefaults,
   PendingInputType,
+  ProviderGoalAction,
+  ProviderGoalState,
   ProviderInfo,
+  ProviderMcpServerStatus,
   ProviderName,
+  RemoteExecutorConfig,
+  ReportCommentAnchor,
+  ReportCommentMutationResponse,
   ReportDocumentResponse,
+  ReportImageUploadResponse,
   ReportUploadResponse,
   ReportsListResponse,
   SessionCreatedBy,
+  SessionDisplayPage,
   SessionKind,
+  SessionLastTurnStatus,
+  SessionLocateResponse,
   SessionQuestion,
+  SessionQuestionPage,
+  SessionRetryStatus,
   SessionRuntime,
+  SessionThinkingDetail,
+  SessionToolGroupDetailPage,
   SlashCommand,
   ThinkingOption,
   UploadedFile,
+  UserQuestionAnswers,
+  ZCodeBridgeDecision,
+  ZCodeBridgeExternalSession,
+  ZCodeBridgePendingInput,
 } from "@yep-anywhere/shared";
 import { authEvents } from "../lib/authEvents";
-
-/** A single entry returned by the project directory browser. */
-export interface ProjectBrowseEntry {
-  name: string;
-  /** Path relative to the project root. */
-  path: string;
-  type: "dir" | "file";
-  /** Present for files: byte size. */
-  size?: number;
-  /** Present for files: whether the file can be displayed inline as text. */
-  isText?: boolean;
-}
-
-/** Response from the project directory browser (`GET /files/browse`). */
-export interface ProjectBrowseResponse {
-  /** The relative directory that was listed ("" for project root). */
-  path: string;
-  /** Parent relative directory, or null at the project root. */
-  parent: string | null;
-  entries: ProjectBrowseEntry[];
-  /** Set when the server could not read the directory. */
-  error?: string;
-}
 import type {
   AgentSession,
-  BrowserSessionMetadata,
   InputRequest,
   Message,
   PermissionMode,
   Project,
+  Session,
   SessionStatus,
   SessionSummary,
 } from "../types";
@@ -70,6 +70,47 @@ export interface PaginationInfo {
   totalCompactions: number;
   targetMessageId?: string;
   targetMessageFound?: boolean;
+  rolloutRevision?: string;
+}
+
+export interface CodexCanonicalViewInfo {
+  source: string;
+  sourceKind: "provider" | "legacy-bridge-full" | "custom" | "rollout";
+  fallback: "rollout";
+  fallbackReason?: string;
+}
+
+export interface ResumeSessionStartedResponse {
+  sessionId: string;
+  processId: string;
+  permissionMode: PermissionMode;
+  modeVersion: number;
+  reasoningEffort?: string;
+}
+
+export interface ResumeSessionQueuedResponse {
+  queued: true;
+  queueId: string;
+  position: number;
+}
+
+export type ResumeSessionResponse =
+  | ResumeSessionStartedResponse
+  | ResumeSessionQueuedResponse;
+
+export type StartSessionResponse = ResumeSessionResponse;
+export type CreateSessionResponse = ResumeSessionResponse;
+
+export interface ResumedCodexControlResponse
+  extends ResumeSessionStartedResponse {
+  control: string;
+  data: unknown;
+}
+
+export function isQueuedResumeSessionResponse(
+  response: ResumeSessionResponse,
+): response is ResumeSessionQueuedResponse {
+  return "queued" in response && response.queued === true;
 }
 
 /**
@@ -111,7 +152,7 @@ export interface GlobalSessionItem {
   title: string | null;
   createdAt: string;
   updatedAt: string;
-  messageCount: number;
+  messageCount?: number;
   userQuestions?: SessionQuestion[];
   provider: ProviderName;
   projectId: string;
@@ -135,9 +176,15 @@ export interface GlobalSessionItem {
   source?: string;
   /** Cached context window usage if the server has it. */
   contextUsage?: ContextUsage;
+  /** Cumulative token spend across the whole session, when available. */
+  cumulativeUsage?: ContextCumulativeUsage;
+  /** Number of context compactions recorded in the active session history. */
+  compactCount?: number;
+  /** Best-effort details for each recorded context compaction. */
+  compactEvents?: ContextCompactEvent[];
   /** Model name from the session summary (e.g. "opus", "gpt-5.5"). */
   model?: string;
-  /** Provider-specific reasoning effort (e.g. "xhigh"). */
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh"). */
   reasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g. "fast"). */
   serviceTier?: string;
@@ -146,6 +193,12 @@ export interface GlobalSessionItem {
    * restart) and it can be resumed. Only set for owner==="none" sessions.
    */
   interrupted?: boolean;
+  /** Terminal status of the most recent turn (bridge-reported). */
+  lastTurnStatus?: SessionLastTurnStatus;
+  /** Most recent provider error message, if the last turn failed. */
+  lastErrorMessage?: string;
+  /** Present while the provider is retrying a failed request. */
+  retryStatus?: SessionRetryStatus;
 }
 
 /** Stats about all sessions (computed during full scan on server) */
@@ -166,12 +219,34 @@ export interface ProjectOption {
   name: string;
 }
 
+export interface ProjectDirectoryEntry {
+  name: string;
+  path: string;
+  hidden: boolean;
+}
+
+export interface ProjectDirectoryBrowseResponse {
+  /** Absolute directory whose children are being listed. */
+  path: string;
+  /** Absolute parent directory, or null at the filesystem root. */
+  parent: string | null;
+  /** Absolute home directory for the server process. */
+  home: string;
+  directories: ProjectDirectoryEntry[];
+  /** Whether the requested input was itself an existing directory. */
+  exact: boolean;
+  /** Whether more matching directories exist beyond this response. */
+  truncated: boolean;
+}
+
 /**
  * Response from the global sessions API.
  */
 export interface GlobalSessionsResponse {
   sessions: GlobalSessionItem[];
   hasMore: boolean;
+  /** Cursor for the next ordinary recency page, before coverage extras. */
+  nextCursor?: string;
   /** Global stats computed from all sessions (not just paginated results) */
   stats: GlobalSessionStats;
   /** All projects for filter dropdown */
@@ -204,15 +279,20 @@ export interface SearchResultSession {
   matches: SearchMatch[];
 }
 
+/** Result ordering for content search. */
+export type SearchSort = "recent" | "relevance";
+
 export interface SearchResponse {
   query: string;
+  /** Ordering actually applied by the server. */
+  sort: SearchSort;
   results: SearchResultSession[];
   totalSessions: number;
   totalMatches: number;
   searchDurationMs: number;
 }
 
-export type ArchiveProvider = "claude" | "codex";
+export type ArchiveProvider = "claude" | "codex" | "pi" | "kimi" | "zcode";
 export type ArchiveReason = "manual" | "auto";
 
 export interface ArchivedFileRecord {
@@ -256,6 +336,10 @@ export interface SessionMetadataUpdateResponse {
   };
 }
 
+export interface GenerateSessionTitleResponse {
+  title: string;
+}
+
 export interface ApiError extends Error {
   status: number;
   code?: string;
@@ -263,6 +347,7 @@ export interface ApiError extends Error {
   path?: string;
   details?: unknown;
   runtime?: SessionRuntime;
+  setupRequired?: boolean;
 }
 
 export interface SessionOptions {
@@ -270,11 +355,25 @@ export interface SessionOptions {
   /** Model ID (e.g., "sonnet", "opus", "qwen2.5-coder:0.5b") */
   model?: string;
   thinking?: ThinkingOption;
+  /** Exact provider reasoning effort / gateway model variant. */
+  reasoningEffort?: string;
+  /** Initial Codex service tier; omitted preserves the provider default. */
+  serviceTier?: CodexServiceTier;
   provider?: ProviderName;
   codexMcpMode?: CodexMcpMode;
+  /** Codex model source (Codex `model_provider`), e.g. "openai"/"deepseek". */
+  codexModelProvider?: string;
+  /** Managed LLM gateway provider/model configuration. */
+  llmGatewayConfig?: LlmGatewaySessionConfig;
   /** SSH host alias for remote execution (undefined = local) */
   executor?: string;
+  /** Ephemeral provider-native input. Never persist this in message drafts. */
+  codexInputs?: CodexStructuredUserInput[];
 }
+
+export type CodexStructuredUserInput =
+  | { type: "skill"; name: string; path: string }
+  | { type: "mention"; name: string; path: string };
 
 export type { UploadedFile } from "@yep-anywhere/shared";
 
@@ -307,12 +406,50 @@ export function getDesktopAuthToken(): string | null {
 }
 
 export interface AuthStatus {
+  /** Whether auth is enabled in settings */
   enabled: boolean;
+  /** Whether user has a valid session (or auth is disabled) */
   authenticated: boolean;
+  /** Whether initial account setup is needed */
+  setupRequired: boolean;
+  /** Whether auth is bypassed by --auth-disable flag (for recovery) */
+  disabledByEnv: boolean;
+  /** Path to auth.json file (for recovery instructions) */
+  authFilePath: string;
+  /** Whether the server has a desktop auth token (Tauri app) */
   hasDesktopToken: boolean;
+  /** Whether unauthenticated localhost access is allowed */
   localhostOpen: boolean;
-  localManagementAllowed: boolean;
 }
+
+export interface CodexUsageWindow {
+  usedPercent: number;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+
+export interface CodexUsageBucket {
+  id: string;
+  name: string | null;
+  primary: CodexUsageWindow | null;
+  secondary: CodexUsageWindow | null;
+  planType: string | null;
+}
+
+export interface CodexUsageResponse {
+  usage: {
+    primary: CodexUsageWindow | null;
+    secondary: CodexUsageWindow | null;
+    planType: string | null;
+    resetCredits: { availableCount: number } | null;
+    additionalBuckets: CodexUsageBucket[];
+    updatedAt: string;
+  } | null;
+  error: string | null;
+}
+
+/** Claude usage is normalized server-side to the same window/bucket shape. */
+export type ClaudeUsageResponse = CodexUsageResponse;
 
 export async function fetchJSON<T>(
   path: string,
@@ -366,6 +503,8 @@ export async function fetchJSON<T>(
       // Response body wasn't JSON, use default message
     }
 
+    // Include setup required info in error for auth handling
+    const setupRequired = res.headers.get("X-Setup-Required") === "true";
     const error = new Error(errorMessage) as ApiError;
     error.status = res.status;
     if (typeof errorBody?.code === "string") error.code = errorBody.code;
@@ -377,6 +516,7 @@ export async function fetchJSON<T>(
     if (errorBody?.runtime !== undefined) {
       error.runtime = errorBody.runtime as SessionRuntime;
     }
+    if (setupRequired) error.setupRequired = true;
     throw error;
   }
 
@@ -476,13 +616,13 @@ export interface UpdateBindingResponse {
 export type DeploymentActionId =
   | "full"
   | "server"
+  | "server-dev"
   | "server-restart"
   | "services-restart"
   | "server-build"
   | "apk"
   | "apk-build"
-  | "apk-install-existing"
-  | "git-pull-update";
+  | "apk-install-existing";
 
 export type DeploymentJobStatus = "running" | "succeeded" | "failed";
 
@@ -516,7 +656,6 @@ export interface DeploymentJob {
   exitCode?: number | null;
   signal?: string | null;
   log?: string;
-  errorReason?: string;
 }
 
 export type ApkBuildType = "release" | "debug";
@@ -528,14 +667,6 @@ export interface DeploymentApkInfo {
   mtimeMs: number;
   builtAt: string;
   downloadPath: string;
-}
-
-export interface GitVersionInfo {
-  commitHash: string;
-  commitHashFull: string;
-  commitDate: string;
-  branch: string;
-  version: string;
 }
 
 export interface DeploymentStatusResponse {
@@ -560,11 +691,6 @@ export interface DeploymentStatusResponse {
     artifacts: DeploymentApkInfo[];
   };
   currentJob: DeploymentJob | null;
-  localGitVersion?: GitVersionInfo | null;
-  githubVersion?: GitVersionInfo | null;
-  stableVersion?: GitVersionInfo | null;
-  hasLocalUpdate?: boolean;
-  hasGithubUpdate?: boolean;
 }
 
 export interface StartDeploymentRequest {
@@ -573,13 +699,13 @@ export interface StartDeploymentRequest {
   install?: boolean;
   deviceId?: string;
   skipChecks?: boolean;
+  allowSessionInterrupt?: boolean;
   restartTargets?: DeploymentRestartTargets;
 }
 
 export interface DeploymentRestartTargets {
   server?: boolean;
   codexBridge?: boolean;
-  claudeBridge?: boolean;
 }
 
 export interface GetVersionOptions {
@@ -653,7 +779,11 @@ async function fetchBlob(
   };
 }
 
-async function uploadReportFile(file: File): Promise<ReportUploadResponse> {
+async function uploadReportForm<T>(
+  endpoint: string,
+  file: File,
+  fields: Record<string, string> = {},
+): Promise<T> {
   const headers: Record<string, string> = {
     "X-Yep-Anywhere": "true",
   };
@@ -663,8 +793,11 @@ async function uploadReportFile(file: File): Promise<ReportUploadResponse> {
 
   const formData = new FormData();
   formData.append("file", file);
+  for (const [key, value] of Object.entries(fields)) {
+    formData.append(key, value);
+  }
 
-  const res = await fetch(`${API_BASE}/reports/upload`, {
+  const res = await fetch(`${API_BASE}${endpoint}`, {
     method: "POST",
     credentials: "include",
     headers,
@@ -697,6 +830,38 @@ async function uploadReportFile(file: File): Promise<ReportUploadResponse> {
   return res.json();
 }
 
+function uploadReportFile(file: File): Promise<ReportUploadResponse> {
+  return uploadReportForm("/reports/upload", file);
+}
+
+function uploadReportImageFile(
+  path: string,
+  file: File,
+): Promise<ReportImageUploadResponse> {
+  return uploadReportForm("/reports/images/upload", file, { path });
+}
+
+async function loadReportImageFile(
+  url: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const headers: Record<string, string> = {
+    "X-Yep-Anywhere": "true",
+  };
+  if (desktopAuthToken) {
+    headers["X-Desktop-Token"] = desktopAuthToken;
+  }
+  const response = await fetch(url, {
+    credentials: "include",
+    headers,
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to load report image: HTTP ${response.status}`);
+  }
+  return response.blob();
+}
+
 export const api = {
   // Version API
   getVersion: (options?: GetVersionOptions) =>
@@ -704,6 +869,18 @@ export const api = {
 
   // Server info API (host/port binding for Local Access settings)
   getServerInfo: () => fetchJSON<ServerInfo>("/server-info"),
+
+  getCodexUsage: (options?: { fresh?: boolean }) =>
+    fetchJSON<CodexUsageResponse>(
+      options?.fresh ? "/codex-bridge/usage?fresh=1" : "/codex-bridge/usage",
+    ),
+
+  getClaudeUsage: (options?: { fresh?: boolean }) =>
+    fetchJSON<ClaudeUsageResponse>(
+      options?.fresh
+        ? "/providers/claude/usage?fresh=1"
+        : "/providers/claude/usage",
+    ),
 
   // Network binding API (runtime port/interface configuration)
   getNetworkBinding: () => fetchJSON<NetworkBindingState>("/network-binding"),
@@ -725,10 +902,8 @@ export const api = {
       method: "POST",
     }),
 
-  getDeploymentStatus: (fresh = false) =>
-    fetchJSON<DeploymentStatusResponse>(
-      fresh ? "/deploy/status?fresh=1" : "/deploy/status",
-    ),
+  getDeploymentStatus: () =>
+    fetchJSON<DeploymentStatusResponse>("/deploy/status"),
 
   startDeployment: (request: StartDeploymentRequest) =>
     fetchJSON<{ job: DeploymentJob }>("/deploy/jobs", {
@@ -746,8 +921,49 @@ export const api = {
     return fetchBlob(`/deploy/apk/download${qs ? `?${qs}` : ""}`);
   },
 
+  downloadCodexTranscript: (
+    sessionId: string,
+    format: "markdown" | "json" = "markdown",
+  ) =>
+    fetchBlob(
+      `/sessions/${encodeURIComponent(sessionId)}/codex-transcript?format=${format}`,
+    ),
+
   // Provider API
   getProviders: () => fetchJSON<{ providers: ProviderInfo[] }>("/providers"),
+
+  getProvider: (name: ProviderName, options?: { fresh?: boolean }) =>
+    fetchJSON<{ provider: ProviderInfo }>(
+      `/providers/${encodeURIComponent(name)}${options?.fresh ? "?fresh=1" : ""}`,
+    ),
+
+  /**
+   * Read-only ZCode MCP server status snapshot for a project's workspace.
+   * The server spawns a short-lived app-server and queries mcp/list in
+   * "status" mode; no MCP connections are opened.
+   */
+  listZCodeMcpServers: (projectId: string) =>
+    fetchJSON<{ servers: Record<string, ProviderMcpServerStatus> }>(
+      `/providers/zcode/mcp-servers?projectId=${encodeURIComponent(projectId)}`,
+    ),
+
+  // ZCode bridge (external `zcode tui` sessions observed via the hook plugin)
+  listZCodeBridgeSessions: () =>
+    fetchJSON<{
+      sessions: ZCodeBridgeExternalSession[];
+      installed: boolean;
+    }>("/zcode-bridge/sessions"),
+
+  listZCodeBridgePendingInputs: () =>
+    fetchJSON<{ pendingInputs: ZCodeBridgePendingInput[] }>(
+      "/zcode-bridge/pending-inputs",
+    ),
+
+  decideZCodeBridgePendingInput: (id: string, decision: ZCodeBridgeDecision) =>
+    fetchJSON<{ accepted: boolean }>(
+      `/zcode-bridge/pending-inputs/${encodeURIComponent(id)}/decision`,
+      { method: "POST", body: JSON.stringify(decision) },
+    ),
 
   getProjects: () => fetchJSON<{ projects: Project[] }>("/projects"),
 
@@ -762,25 +978,106 @@ export const api = {
       body: JSON.stringify({ path }),
     }),
 
+  /**
+   * List child directories for the project path picker.
+   *
+   * A partial final path segment is treated as an autocomplete prefix.
+   */
+  browseProjectDirectories: (path: string, includeHidden = false) => {
+    const params = new URLSearchParams();
+    if (path.trim()) params.set("path", path);
+    if (includeHidden) params.set("includeHidden", "true");
+    const query = params.toString();
+    return fetchJSON<ProjectDirectoryBrowseResponse>(
+      `/projects/directories${query ? `?${query}` : ""}`,
+    );
+  },
+
   getProject: (projectId: string) =>
     fetchJSON<{ project: Project }>(`/projects/${projectId}`),
+
+  getSessionDisplay: (
+    projectId: string,
+    sessionId: string,
+    options?: { cursor?: string; branchId?: string; limit?: number },
+  ) => {
+    const params = new URLSearchParams();
+    if (options?.cursor) params.set("cursor", options.cursor);
+    if (options?.branchId) params.set("branchId", options.branchId);
+    if (options?.limit !== undefined)
+      params.set("limit", String(options.limit));
+    const query = params.toString();
+    return fetchJSON<SessionDisplayPage>(
+      `/projects/${projectId}/sessions/${sessionId}/display${query ? `?${query}` : ""}`,
+    );
+  },
+
+  getSessionQuestions: (
+    projectId: string,
+    sessionId: string,
+    options?: { cursor?: string; branchId?: string },
+  ) => {
+    const params = new URLSearchParams();
+    if (options?.cursor) params.set("cursor", options.cursor);
+    if (options?.branchId) params.set("branchId", options.branchId);
+    const query = params.toString();
+    return fetchJSON<SessionQuestionPage>(
+      `/projects/${projectId}/sessions/${sessionId}/display/questions${query ? `?${query}` : ""}`,
+    );
+  },
+
+  getSessionToolGroupDetails: (
+    projectId: string,
+    sessionId: string,
+    detailRef: string,
+    options: { revision: string; cursor?: string; branchId?: string },
+  ) => {
+    const params = new URLSearchParams({ revision: options.revision });
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.branchId) params.set("branchId", options.branchId);
+    return fetchJSON<SessionToolGroupDetailPage<Message>>(
+      `/projects/${projectId}/sessions/${sessionId}/display/tool-groups/${encodeURIComponent(detailRef)}?${params.toString()}`,
+    );
+  },
+
+  getSessionThinkingDetail: (
+    projectId: string,
+    sessionId: string,
+    detailRef: string,
+    options: { revision: string; branchId?: string },
+  ) => {
+    const params = new URLSearchParams({ revision: options.revision });
+    if (options.branchId) params.set("branchId", options.branchId);
+    return fetchJSON<SessionThinkingDetail>(
+      `/projects/${projectId}/sessions/${sessionId}/display/thinking/${encodeURIComponent(detailRef)}?${params.toString()}`,
+    );
+  },
 
   getSession: (
     projectId: string,
     sessionId: string,
     afterMessageId?: string,
     options?: {
+      view?: "canonical";
       tailCompactions?: number;
       beforeMessageId?: string;
       aroundMessageId?: string;
       afterWindowMessageId?: string;
+      rolloutRevision?: string;
       branchId?: string;
       maxMessages?: number;
-      signal?: AbortSignal;
+      /** Omit inline Pi image payloads from the initial transcript response. */
+      deferMedia?: boolean;
+      /** Omit Pi thinking blocks when explicitly requested. */
+      deferThinking?: boolean;
+      /** Return the body-free message subset used by Session Inspector. */
+      inspectorProjection?: boolean;
     },
   ) => {
     const params = new URLSearchParams();
     if (afterMessageId) params.set("afterMessageId", afterMessageId);
+    if (options?.view) params.set("view", options.view);
+    if (options?.inspectorProjection) params.set("projection", "inspector");
     if (options?.tailCompactions !== undefined)
       params.set("tailCompactions", String(options.tailCompactions));
     if (options?.beforeMessageId)
@@ -789,21 +1086,34 @@ export const api = {
       params.set("aroundMessageId", options.aroundMessageId);
     if (options?.afterWindowMessageId)
       params.set("afterWindowMessageId", options.afterWindowMessageId);
+    if (options?.rolloutRevision)
+      params.set("rolloutRevision", options.rolloutRevision);
     if (options?.branchId) params.set("branchId", options.branchId);
     if (options?.maxMessages !== undefined)
       params.set("maxMessages", String(options.maxMessages));
+    // Pi sessions can contain very large inline images. Keep the fast path
+    // lightweight by default while allowing callers to request the complete
+    // media payload explicitly.
+    params.set("deferMedia", options?.deferMedia === false ? "0" : "1");
+    if (options?.deferThinking !== undefined) {
+      params.set("deferThinking", options.deferThinking ? "1" : "0");
+    }
     const qs = params.toString();
     return fetchJSON<{
-      session: BrowserSessionMetadata;
+      session: Session;
       messages: Message[];
       ownership: SessionStatus;
       runtime?: SessionRuntime;
+      permissionMode?: PermissionMode;
+      modeVersion?: number;
       pendingInputRequest?: InputRequest | null;
       slashCommands?: SlashCommand[] | null;
       pagination?: PaginationInfo;
-    }>(`/projects/${projectId}/sessions/${sessionId}${qs ? `?${qs}` : ""}`, {
-      signal: options?.signal,
-    });
+      /** Public history source selected by the server; introduced with app-server paging. */
+      historySource?: string;
+      historyFallbackReason?: string;
+      codexCanonicalView?: CodexCanonicalViewInfo;
+    }>(`/projects/${projectId}/sessions/${sessionId}${qs ? `?${qs}` : ""}`);
   },
 
   /**
@@ -812,9 +1122,11 @@ export const api = {
    */
   getSessionMetadata: (projectId: string, sessionId: string) =>
     fetchJSON<{
-      session: BrowserSessionMetadata;
+      session: Session;
       ownership: SessionStatus;
       runtime?: SessionRuntime;
+      permissionMode?: PermissionMode;
+      modeVersion?: number;
       pendingInputRequest?: InputRequest | null;
       slashCommands?: SlashCommand[] | null;
     }>(`/projects/${projectId}/sessions/${sessionId}/metadata`),
@@ -843,7 +1155,7 @@ export const api = {
    * Used to find agent sessions for pending Tasks on page reload.
    */
   getAgentMappings: (projectId: string, sessionId: string) =>
-    fetchJSON<{ mappings: Array<{ toolUseId: string; agentId: string }> }>(
+    fetchJSON<{ mappings: AgentMapping[] }>(
       `/projects/${projectId}/sessions/${sessionId}/agents`,
     ),
 
@@ -853,21 +1165,21 @@ export const api = {
     options?: SessionOptions,
     attachments?: UploadedFile[],
   ) =>
-    fetchJSON<{
-      sessionId: string;
-      processId: string;
-      permissionMode: PermissionMode;
-      modeVersion: number;
-    }>(`/projects/${projectId}/sessions`, {
+    fetchJSON<StartSessionResponse>(`/projects/${projectId}/sessions`, {
       method: "POST",
       body: JSON.stringify({
         message,
         mode: options?.mode,
         model: options?.model,
         thinking: options?.thinking,
+        reasoningEffort: options?.reasoningEffort,
+        serviceTier: options?.serviceTier,
         provider: options?.provider,
         codexMcpMode: options?.codexMcpMode,
+        codexModelProvider: options?.codexModelProvider,
+        llmGatewayConfig: options?.llmGatewayConfig,
         executor: options?.executor,
+        codexInputs: options?.codexInputs,
         attachments,
       }),
     }),
@@ -877,19 +1189,18 @@ export const api = {
    * Use this for two-phase flow: create session, upload files, then send message.
    */
   createSession: (projectId: string, options?: SessionOptions) =>
-    fetchJSON<{
-      sessionId: string;
-      processId: string;
-      permissionMode: PermissionMode;
-      modeVersion: number;
-    }>(`/projects/${projectId}/sessions/create`, {
+    fetchJSON<CreateSessionResponse>(`/projects/${projectId}/sessions/create`, {
       method: "POST",
       body: JSON.stringify({
         mode: options?.mode,
         model: options?.model,
         thinking: options?.thinking,
+        reasoningEffort: options?.reasoningEffort,
+        serviceTier: options?.serviceTier,
         provider: options?.provider,
         codexMcpMode: options?.codexMcpMode,
+        codexModelProvider: options?.codexModelProvider,
+        llmGatewayConfig: options?.llmGatewayConfig,
         executor: options?.executor,
       }),
     }),
@@ -902,37 +1213,96 @@ export const api = {
     attachments?: UploadedFile[],
     tempId?: string,
     /**
-     * Rewind/edit: resume only up to (and including) this message UUID,
-     * branching the conversation in place (same session). Pass the edited
-     * message's parentUuid. Maps to the SDK `resumeSessionAt` option.
+     * Provider-native edit boundary. Claude receives the edited message's
+     * parentUuid; native edit-fork providers receive the persisted user
+     * message's own id and fork before it.
      */
     resumeSessionAt?: string,
     /**
-     * Codex app-server rewind/edit: drop this many trailing user turns via
-     * `thread/rollback` before sending the edited prompt in the same session.
+     * Codex app-server edit fork: exclude this many trailing source user turns
+     * before sending the edited prompt in a new child thread. The parameter
+     * keeps its legacy name for compatibility with deployed servers.
      */
     rollbackNumTurns?: number,
+    /**
+     * Identity of the edited user turn (original prompt text + timestamp).
+     * Lets the server recompute the authoritative excluded-turn count from the
+     * persisted Codex turn tree instead of trusting the client-side count.
+     */
+    rollbackTarget?: {
+      messageId?: string;
+      timestamp?: string;
+      text?: string;
+    },
   ) =>
-    fetchJSON<{
-      processId: string;
-      permissionMode: PermissionMode;
-      modeVersion: number;
-    }>(`/projects/${projectId}/sessions/${sessionId}/resume`, {
-      method: "POST",
-      body: JSON.stringify({
-        message,
-        mode: options?.mode,
-        model: options?.model,
-        thinking: options?.thinking,
-        provider: options?.provider,
-        codexMcpMode: options?.codexMcpMode,
-        executor: options?.executor,
-        attachments,
-        tempId,
-        resumeSessionAt,
-        rollbackNumTurns,
-      }),
+    fetchJSON<ResumeSessionResponse>(
+      `/projects/${projectId}/sessions/${sessionId}/resume`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          message,
+          mode: options?.mode,
+          model: options?.model,
+          thinking: options?.thinking,
+          reasoningEffort: options?.reasoningEffort,
+          provider: options?.provider,
+          codexMcpMode: options?.codexMcpMode,
+          codexModelProvider: options?.codexModelProvider,
+          llmGatewayConfig: options?.llmGatewayConfig,
+          executor: options?.executor,
+          codexInputs: options?.codexInputs,
+          attachments,
+          tempId,
+          resumeSessionAt,
+          rollbackNumTurns,
+          rollbackTarget,
+        }),
+      },
+    ),
+
+  cancelQueuedRequest: (queueId: string) =>
+    fetchJSON<{ cancelled: boolean }>(`/queue/${encodeURIComponent(queueId)}`, {
+      method: "DELETE",
     }),
+
+  executeCodexControl: (
+    sessionId: string,
+    request: { control: string; [key: string]: unknown },
+  ) =>
+    fetchJSON<{ control: string; data: unknown }>(
+      `/sessions/${encodeURIComponent(sessionId)}/codex-control`,
+      {
+        method: "POST",
+        body: JSON.stringify(request),
+      },
+    ),
+
+  resumeAndExecuteCodexControl: (
+    projectId: string,
+    sessionId: string,
+    request: { control: "thread/compact/start" },
+    options?: SessionOptions,
+  ) =>
+    fetchJSON<ResumedCodexControlResponse>(
+      `/projects/${projectId}/sessions/${sessionId}/codex-control`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          request,
+          resume: {
+            mode: options?.mode,
+            model: options?.model,
+            thinking: options?.thinking,
+            reasoningEffort: options?.reasoningEffort,
+            provider: "codex",
+            codexMcpMode: options?.codexMcpMode,
+            codexModelProvider: options?.codexModelProvider,
+            llmGatewayConfig: options?.llmGatewayConfig,
+            executor: options?.executor,
+          },
+        }),
+      },
+    ),
 
   queueMessage: (
     sessionId: string,
@@ -941,7 +1311,9 @@ export const api = {
     attachments?: UploadedFile[],
     tempId?: string,
     thinking?: ThinkingOption,
+    reasoningEffort?: string,
     deferred?: boolean,
+    codexInputs?: CodexStructuredUserInput[],
   ) =>
     fetchJSON<{
       queued: boolean;
@@ -956,7 +1328,9 @@ export const api = {
         attachments,
         tempId,
         thinking,
+        reasoningEffort,
         deferred,
+        codexInputs,
       }),
     }),
 
@@ -979,14 +1353,54 @@ export const api = {
 
   getProcessModels: (processId: string) =>
     fetchJSON<{
-      models: Array<{ id: string; name: string; description?: string }>;
+      models: Array<{
+        id: string;
+        name: string;
+        description?: string;
+        /** Per-model reasoning/thought levels (e.g. ZCode thought levels). */
+        supportedReasoningEfforts?: Array<{ reasoningEffort: string }>;
+        defaultReasoningEffort?: string;
+      }>;
     }>(`/processes/${processId}/models`),
 
   setProcessModel: (processId: string, model?: string) =>
-    fetchJSON<{ success: boolean; model?: string }>(
-      `/processes/${processId}/model`,
-      { method: "POST", body: JSON.stringify({ model }) },
+    fetchJSON<{
+      success: boolean;
+      model?: string;
+      reasoningEffort?: string;
+    }>(`/processes/${processId}/model`, {
+      method: "POST",
+      body: JSON.stringify({ model }),
+    }),
+
+  /** Trigger a provider-native context compaction (ZCode session/compact). */
+  compactProcess: (processId: string) =>
+    fetchJSON<{ success: boolean }>(`/processes/${processId}/compact`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  /** Change the provider-native reasoning effort mid-session (ZCode thought level). */
+  setProcessReasoningEffort: (processId: string, effort: string) =>
+    fetchJSON<{ success: boolean; effort: string }>(
+      `/processes/${processId}/reasoning-effort`,
+      { method: "POST", body: JSON.stringify({ effort }) },
     ),
+
+  /**
+   * Provider-native Goal lifecycle actions (for example ZCode `session/goal`
+   * or Codex `thread/goal/*`). `show` returns provider-rendered status text;
+   * set/replace require an objective. A provider may report `startedTurn`,
+   * but Codex automatic continuations are observed through turn notifications.
+   */
+  processGoal: (
+    processId: string,
+    body: { action: ProviderGoalAction | "show"; objective?: string },
+  ) =>
+    fetchJSON<ProviderGoalState>(`/processes/${processId}/goal`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   respondToInput: (
     sessionId: string,
@@ -995,15 +1409,21 @@ export const api = {
       | "approve"
       | "approve_accept_edits"
       | "approve_for_session"
+      | "approve_strict_auto_review"
       | "approve_always"
       | "deny",
-    answers?: Record<string, string>,
+    answers?: UserQuestionAnswers,
     feedback?: string,
   ) =>
     fetchJSON<{ accepted: boolean }>(`/sessions/${sessionId}/input`, {
       method: "POST",
       body: JSON.stringify({ requestId, response, answers, feedback }),
     }),
+
+  getPendingInputRequest: (sessionId: string) =>
+    fetchJSON<{ request: InputRequest | null }>(
+      `/sessions/${encodeURIComponent(sessionId)}/pending-input`,
+    ),
 
   setPermissionMode: (sessionId: string, mode: PermissionMode) =>
     fetchJSON<{ permissionMode: PermissionMode; modeVersion: number }>(
@@ -1067,8 +1487,9 @@ export const api = {
     updates: {
       title?: string;
       archived?: boolean;
+      pinned?: boolean;
+      /** @deprecated Use `pinned`; accepted for older callers. */
       starred?: boolean;
-      model?: string;
     },
   ) =>
     fetchJSON<SessionMetadataUpdateResponse>(
@@ -1079,12 +1500,30 @@ export const api = {
       },
     ),
 
+  generateSessionTitle: (projectId: string, sessionId: string) =>
+    fetchJSON<GenerateSessionTitleResponse>(
+      `/projects/${projectId}/sessions/${sessionId}/title`,
+      { method: "POST" },
+    ),
+
   getArchivedSessions: () =>
     fetchJSON<ArchiveSessionsResponse>("/archive/sessions"),
 
   getArchivedSession: (sessionId: string) =>
     fetchJSON<ArchiveSessionResponse>(
       `/archive/sessions/${encodeURIComponent(sessionId)}`,
+    ),
+
+  /**
+   * Resolve a bare session id to the project that owns it.
+   *
+   * Every other session endpoint is keyed by `projectId + sessionId`, so this
+   * is the only way to act on an id that arrived without its project (pasted
+   * from a chat, a bug report, or another machine).
+   */
+  locateSession: (sessionId: string) =>
+    fetchJSON<SessionLocateResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/locate`,
     ),
 
   /**
@@ -1254,21 +1693,6 @@ export const api = {
     return `${API_BASE}/projects/${projectId}/files/raw?${params.toString()}`;
   },
 
-  // Project repository browser (powers the in-session repo explorer panel)
-  browseProjectFiles: (projectId: string, path = "") => {
-    const params = new URLSearchParams({ path });
-    return fetchJSON<ProjectBrowseResponse>(
-      `/projects/${projectId}/files/browse?${params.toString()}`,
-    );
-  },
-
-  // Write (create or overwrite) a text file inside the project.
-  updateFile: (projectId: string, path: string, content: string) =>
-    fetchJSON<{ ok: boolean; path: string }>(`/projects/${projectId}/files`, {
-      method: "PUT",
-      body: JSON.stringify({ path, content }),
-    }),
-
   // Reports API
   getReports: () => fetchJSON<ReportsListResponse>("/reports"),
 
@@ -1279,7 +1703,30 @@ export const api = {
     );
   },
 
+  createReportComment: (
+    path: string,
+    anchor: ReportCommentAnchor,
+    body: string,
+  ) =>
+    fetchJSON<ReportCommentMutationResponse>("/reports/comments", {
+      method: "POST",
+      body: JSON.stringify({ path, anchor, body }),
+    }),
+
+  updateReportComment: (path: string, id: string, body: string) =>
+    fetchJSON<ReportCommentMutationResponse>(
+      `/reports/comments/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ path, body }),
+      },
+    ),
+
   uploadReport: uploadReportFile,
+
+  uploadReportImage: uploadReportImageFile,
+
+  loadReportImage: loadReportImageFile,
 
   /**
    * Expand diff context to show full file.
@@ -1350,10 +1797,19 @@ export const api = {
     after?: string;
     limit?: number;
     includeArchived?: boolean;
+    pinned?: boolean;
+    /** @deprecated Use `pinned`; accepted by older servers. */
     starred?: boolean;
     includeStats?: boolean;
     kind?: SessionKind;
     excludeKind?: SessionKind;
+    /** Append pinned sessions that fall outside the ordinary page limit. */
+    includePinned?: boolean;
+    /**
+     * Keep at least one session per project that was active within the last N
+     * days, even if the global top-N cut it off.
+     */
+    projectCoverageDays?: number;
   }) => {
     const searchParams = new URLSearchParams();
     if (params?.project) searchParams.set("project", params.project);
@@ -1361,11 +1817,18 @@ export const api = {
     if (params?.after) searchParams.set("after", params.after);
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.includeArchived) searchParams.set("includeArchived", "true");
-    if (params?.starred) searchParams.set("starred", "true");
+    if (params?.pinned) searchParams.set("pinned", "true");
+    else if (params?.starred) searchParams.set("starred", "true");
     if (params?.includeStats) searchParams.set("includeStats", "true");
     if (params?.kind) searchParams.set("kind", params.kind);
     if (params?.excludeKind)
       searchParams.set("excludeKind", params.excludeKind);
+    if (params?.includePinned) searchParams.set("includePinned", "true");
+    if (params?.projectCoverageDays)
+      searchParams.set(
+        "projectCoverageDays",
+        String(params.projectCoverageDays),
+      );
     const query = searchParams.toString();
     return fetchJSON<GlobalSessionsResponse>(
       query ? `/sessions?${query}` : "/sessions",
@@ -1376,28 +1839,44 @@ export const api = {
       stats: GlobalSessionStats;
     }>("/sessions/stats"),
 
-  /** Full-text content search across sessions (global or per-project). */
-  search: (params: { q: string; project?: string; limit?: number }) => {
+  /** Full-text content search across sessions, a project, or one session. */
+  search: (params: {
+    q: string;
+    project?: string;
+    session?: string;
+    limit?: number;
+    sort?: SearchSort;
+  }) => {
     const searchParams = new URLSearchParams();
     searchParams.set("q", params.q);
     if (params.project) searchParams.set("project", params.project);
+    if (params.session) searchParams.set("session", params.session);
     if (params.limit) searchParams.set("limit", String(params.limit));
+    if (params.sort) searchParams.set("sort", params.sort);
     return fetchJSON<SearchResponse>(`/search?${searchParams.toString()}`);
   },
 
   // Auth API
   getAuthStatus: () => fetchJSON<AuthStatus>("/auth/status"),
 
-  enableAuth: (adminPassword: string, newPassword: string) =>
+  /** Enable auth with a password (fresh setup while auth is currently disabled) */
+  enableAuth: (password: string) =>
     fetchJSON<{ success: boolean }>("/auth/enable", {
       method: "POST",
-      body: JSON.stringify({ adminPassword, newPassword }),
+      body: JSON.stringify({ password }),
     }),
 
-  disableAuth: (adminPassword: string) =>
+  /** Disable auth (requires authenticated session) */
+  disableAuth: () =>
     fetchJSON<{ success: boolean }>("/auth/disable", {
       method: "POST",
-      body: JSON.stringify({ adminPassword }),
+    }),
+
+  /** @deprecated Use enableAuth instead */
+  setupAccount: (password: string) =>
+    fetchJSON<{ success: boolean }>("/auth/setup", {
+      method: "POST",
+      body: JSON.stringify({ password }),
     }),
 
   login: (password: string) =>
@@ -1411,10 +1890,10 @@ export const api = {
       method: "POST",
     }),
 
-  changePassword: (adminPassword: string, newPassword: string) =>
+  changePassword: (newPassword: string) =>
     fetchJSON<{ success: boolean }>("/auth/change-password", {
       method: "POST",
-      body: JSON.stringify({ adminPassword, newPassword }),
+      body: JSON.stringify({ newPassword }),
     }),
 
   /** Toggle unauthenticated localhost access (desktop token floor bypass) */
@@ -1470,6 +1949,15 @@ export const api = {
   // Server settings API (persistent server configuration)
   getServerSettings: () => fetchJSON<{ settings: ServerSettings }>("/settings"),
 
+  getOhMyRouterThroughputBenchmark: () =>
+    fetchJSON<OhMyRouterThroughputStatus>("/settings/ohmyrouter-throughput"),
+
+  startOhMyRouterThroughputBenchmark: () =>
+    fetchJSON<{ benchmark: OhMyRouterThroughputBenchmark }>(
+      "/settings/ohmyrouter-throughput",
+      { method: "POST" },
+    ),
+
   updateServerSettings: (settings: Partial<ServerSettings>) =>
     fetchJSON<{ settings: ServerSettings }>("/settings", {
       method: "PUT",
@@ -1481,21 +1969,25 @@ export const api = {
       ),
     }),
 
-  // Remote executors API
   getRemoteExecutors: () =>
-    fetchJSON<{ executors: string[] }>("/settings/remote-executors"),
-
-  updateRemoteExecutors: (executors: string[]) =>
-    fetchJSON<{ executors: string[] }>("/settings/remote-executors", {
-      method: "PUT",
-      body: JSON.stringify({ executors }),
-    }),
-
-  testRemoteExecutor: (host: string) =>
-    fetchJSON<RemoteExecutorTestResult>(
-      `/settings/remote-executors/${encodeURIComponent(host)}/test`,
-      { method: "POST" },
+    fetchJSON<{ executors: RemoteExecutorConfig[] }>(
+      "/settings/remote-executors",
     ),
+
+  updateRemoteExecutors: (executors: RemoteExecutorConfig[]) =>
+    fetchJSON<{ executors: RemoteExecutorConfig[] }>(
+      "/settings/remote-executors",
+      {
+        method: "PUT",
+        body: JSON.stringify({ executors }),
+      },
+    ),
+
+  testRemoteExecutor: (executor: RemoteExecutorConfig) =>
+    fetchJSON<RemoteExecutorTestResult>("/settings/remote-executors/test", {
+      method: "POST",
+      body: JSON.stringify({ executor }),
+    }),
 
   // Sharing API
   getSharingStatus: () => fetchJSON<{ configured: boolean }>("/sharing/status"),
@@ -1551,38 +2043,38 @@ export const api = {
     }>("/devices/bridge/download", { method: "POST" }),
 };
 
-/** Result of testing an SSH connection to a remote executor */
 export interface RemoteExecutorTestResult {
   success: boolean;
-  error?: string;
-  /** SSH host that was tested */
-  host?: string;
-  /** Remote home directory */
+  host: string;
   homeDir?: string;
-  /** Whether Claude CLI is available on remote */
   claudeAvailable?: boolean;
-  /** Claude CLI version on remote (e.g. "1.0.12") */
   claudeVersion?: string;
+  localRootAvailable?: boolean;
+  sharedRootAvailable?: boolean;
+  sessionStorageMode?: "shared" | "ssh-replica";
+  localProjectsDirAvailable?: boolean;
+  localProjectsDirPermissionsSecure?: boolean;
+  remoteProjectsDirAvailable?: boolean;
+  remoteProjectsDirPermissionsSecure?: boolean;
+  remoteSessionStoreLinked?: boolean;
+  credentialStoragePrivate?: boolean;
+  remoteClaudeConfigDirUnset?: boolean;
+  error?: string;
+  connectionTimeMs?: number;
 }
 
 /** Server-wide settings that persist across restarts */
 export interface ServerSettings {
   /** Whether clients should register the service worker */
   serviceWorkerEnabled: boolean;
-  /** SSH host aliases for remote executors */
-  remoteExecutors?: string[];
+  /** Remote-only Claude Code executors and path mappings. */
+  remoteExecutors?: RemoteExecutorConfig[];
   /** SSH host aliases for ChromeOS device bridge targets */
   chromeOsHosts?: string[];
   /** Allowed hostnames for host/origin validation. "*" = allow all, comma-separated = specific hosts. */
   allowedHosts?: string;
   /** Free-form instructions appended to the system prompt for all sessions */
   globalInstructions?: string;
-  /** Ollama server URL for claude-ollama provider */
-  ollamaUrl?: string;
-  /** Custom system prompt for Ollama provider */
-  ollamaSystemPrompt?: string;
-  /** Whether to use the full Claude system prompt for Ollama */
-  ollamaUseFullSystemPrompt?: boolean;
   /** Whether the device bridge (emulator/device streaming) feature is enabled */
   deviceBridgeEnabled?: boolean;
   /** Defaults applied when opening the new session form */
@@ -1595,4 +2087,34 @@ export interface ServerSettings {
   lifecycleWebhookToken?: string;
   /** When true, include dryRun=true in lifecycle webhook payloads */
   lifecycleWebhookDryRun?: boolean;
+}
+
+export interface OhMyRouterThroughputResult {
+  modelId: string;
+  modelName: string;
+  protocol: "openai-compatible" | "anthropic";
+  testedAt: string;
+  outputTokens?: number;
+  tokenCountSource?: "reported" | "estimated";
+  tokensPerSecond?: number;
+  timeToFirstTokenMs?: number;
+  generationDurationMs?: number;
+  error?: string;
+}
+
+export interface OhMyRouterThroughputBenchmark {
+  id: string;
+  status: "running" | "completed" | "failed" | "interrupted";
+  startedAt: string;
+  completedAt?: string;
+  totalModels: number;
+  completedModels: number;
+  results: OhMyRouterThroughputResult[];
+  error?: string;
+}
+
+export interface OhMyRouterThroughputStatus {
+  available: boolean;
+  unavailableReason?: string;
+  benchmark?: OhMyRouterThroughputBenchmark;
 }

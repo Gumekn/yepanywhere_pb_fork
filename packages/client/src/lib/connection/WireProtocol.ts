@@ -376,8 +376,11 @@ export class WireProtocol {
           if (response.status >= 400) {
             const error = new Error(
               `API error: ${response.status}`,
-            ) as Error & { status: number };
+            ) as Error & { status: number; setupRequired?: boolean };
             error.status = response.status;
+            if (response.headers?.["X-Setup-Required"] === "true") {
+              error.setupRequired = true;
+            }
             reject(error);
           } else {
             resolve(response.body as T);
@@ -620,53 +623,6 @@ export class WireProtocol {
           sessionId,
           projectId: options?.projectId,
           provider: options?.provider,
-        };
-        this.transport.sendMessage(msg);
-      })
-      .catch((err) => {
-        handlers.onError?.(err);
-        this.subscriptions.delete(subscriptionId);
-      });
-
-    return {
-      close: () => {
-        this.subscriptions.delete(subscriptionId);
-        this.trackRecentlyClosed(subscriptionId);
-        if (this.transport.isConnected()) {
-          const msg: WireUnsubscribe = {
-            type: "unsubscribe",
-            subscriptionId,
-          };
-          try {
-            this.transport.sendMessage(msg);
-          } catch {
-            // Ignore send errors on close
-          }
-        }
-        handlers.onClose?.();
-      },
-    };
-  }
-
-  /**
-   * Subscribe to recursive file-change events for a project's working dir.
-   */
-  subscribeProjectFiles(
-    projectId: string,
-    handlers: StreamHandlers,
-  ): Subscription {
-    const subscriptionId = generateId();
-
-    this.subscriptions.set(subscriptionId, handlers);
-
-    this.transport
-      .ensureConnected()
-      .then(() => {
-        const msg: WireSubscribe = {
-          type: "subscribe",
-          subscriptionId,
-          channel: "project-files",
-          projectId,
         };
         this.transport.sendMessage(msg);
       })

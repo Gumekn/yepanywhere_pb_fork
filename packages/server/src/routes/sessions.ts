@@ -1,53 +1,98 @@
 import { stat } from "node:fs/promises";
 import { join, relative } from "node:path";
 import {
-  ALL_CODEX_MCP_MODES,
-  type CodexMcpMode,
+  ALL_PERMISSION_MODES,
+  type ContextCompactEvent,
   type ContextCumulativeUsage,
   type ContextStatusResponse,
   type ContextUsage,
-  type ModelOption,
-  type PermissionRules,
+  type GeneratedArtifactManifest,
+  PI_THINKING_PREVIEW_MAX_LENGTH,
   type ProviderName,
-  type ThinkingOption,
-  type UploadedFile,
+  type SessionBranchState,
   type UrlProjectId,
   escalateContextWindow,
   getModelContextWindow,
   isUrlProjectId,
-  thinkingOptionToConfig,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
-import { compress } from "hono/compress";
 import {
   ArchiveError,
   type ArchivedSessionRecord,
   type SessionArchiveService,
 } from "../archive/index.js";
-import { augmentTextBlocks } from "../augments/markdown-augments.js";
-import { isLiveBridgeSessionView } from "../codex-bridge/session-state.js";
+import {
+  type BridgeControllers,
+  getAnyBridgeSessionView,
+} from "../bridge-common/multi.js";
+import {
+  isActiveBridgeSessionView,
+  isLiveBridgeSessionView,
+} from "../bridge-common/session-state.js";
+import type { FeishuDurableInbox } from "../channels/feishu/inbox.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
+import {
+  CodexEventSourceAdmissionError,
+  type CodexEventStoreSource,
+  CodexOverlayBudgetExceededError,
+  CodexOverlayNotViableError,
+  CodexProjectionCache,
+  assessCanonicalOverlayViability,
+  normalizeCodexEventStoreSources,
+  overlayCanonicalCodexSessionMessages,
+  overlayCodexProviderErrorMessages,
+  selectCodexEventSourceWithCache,
+  selectCodexProviderErrorEventSource,
+} from "../codex-events/index.js";
+import type {
+  CodexAppServerHistoryReader,
+  CodexForkBranchCandidate,
+} from "../codex-history/CodexAppServerHistoryReader.js";
+import type { CodexSessionCatalog } from "../codex-history/CodexSessionCatalog.js";
+import type { CodexHistoryFallbackReason } from "../codex-history/types.js";
+import type { ISessionIndexService } from "../indexes/types.js";
+import {
+  type SessionInputResponseBody,
+  SessionInteractionService,
+} from "../interactions/SessionInteractionService.js";
 import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
-import {
-  encodeProjectId,
-  resolveResumeCwd,
-  resolveStartCwd,
-} from "../projects/paths.js";
+import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import { canonicalizeProjectPath, encodeProjectId } from "../projects/paths.js";
+import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
-import { getProjectDirFromCwd, syncSessions } from "../sdk/session-sync.js";
+import { EmbeddedRuntimeController } from "../runtime/EmbeddedRuntimeController.js";
+import type { RuntimeController } from "../runtime/types.js";
+import {
+  type CodexNativeControlRequest,
+  isCodexNativeControlMethod,
+} from "../sdk/providers/codex-controls.js";
 import type { PermissionMode, SDKMessage, UserMessage } from "../sdk/types.js";
 import type { ModelInfoService } from "../services/ModelInfoService.js";
 import type { ServerSettingsService } from "../services/ServerSettingsService.js";
-import { createBrowserSessionProjection } from "../sessions/browser-session-projection.js";
+import {
+  type CreateSessionBody,
+  type QueueSessionMessageBody,
+  SessionCommandService,
+  type StartSessionBody,
+} from "../services/SessionCommandService.js";
+import {
+  ManualSessionTitleError,
+  type SessionTitleService,
+} from "../services/SessionTitleService.js";
 import { CodexSessionReader } from "../sessions/codex-reader.js";
 import { cloneClaudeSession, cloneCodexSession } from "../sessions/fork.js";
-import { GeminiSessionReader } from "../sessions/gemini-reader.js";
-import { normalizeSession } from "../sessions/normalization.js";
+import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
+import { projectSessionInspectorMessages } from "../sessions/inspector-projection.js";
+import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import {
+  annotateBranchMessages,
+  normalizeSession,
+} from "../sessions/normalization.js";
 import {
   type PaginationInfo,
   sliceAfterMessage,
@@ -56,90 +101,46 @@ import {
 } from "../sessions/pagination.js";
 import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.js";
 import { getPersistedAskUserQuestionInputRequest } from "../sessions/persisted-pending-input.js";
-import { findSessionSummaryAcrossProviders } from "../sessions/provider-resolution.js";
+import type { PiSessionReader } from "../sessions/pi-reader.js";
+import { normalizeProviderGroup } from "../sessions/provider-groups.js";
+import {
+  type ProviderResolutionDeps,
+  findSessionSummaryAcrossProviders,
+  resolveSessionSources,
+} from "../sessions/provider-resolution.js";
+import { locateSession } from "../sessions/session-locator.js";
 import {
   deriveSessionRuntime,
   pendingInputTypeFromProcess,
 } from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
 import { isUserPromptMessage } from "../sessions/user-prompt-message.js";
+import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
-import type { Process } from "../supervisor/Process.js";
-import type {
-  QueueFullResponse,
-  Supervisor,
-} from "../supervisor/Supervisor.js";
-import type { QueuedResponse } from "../supervisor/WorkerQueue.js";
+import type { Supervisor } from "../supervisor/Supervisor.js";
 import type {
   ContentBlock,
   Message,
   Project,
   SessionSummary,
 } from "../supervisor/types.js";
-import {
-  isValidSshHostAlias,
-  normalizeSshHostAlias,
-} from "../utils/sshHostAlias.js";
+import { UploadManager } from "../uploads/index.js";
 import type { EventBus } from "../watcher/index.js";
+import { conditionalJson } from "./conditional-json.js";
+import { ServerTimingRecorder } from "./server-timing.js";
+import { registerSessionDisplayRoutes } from "./session-display.js";
 
-/**
- * Type guard to check if a result is a QueuedResponse
- */
-function isQueuedResponse(
-  result: Process | QueuedResponse | QueueFullResponse,
-): result is QueuedResponse {
-  return "queued" in result && result.queued === true;
-}
-
-/**
- * Type guard to check if a result is a QueueFullResponse
- */
-function isQueueFullResponse(
-  result: Process | QueuedResponse | QueueFullResponse,
-): result is QueueFullResponse {
-  return "error" in result && result.error === "queue_full";
-}
-
-function parseOptionalExecutor(rawExecutor: unknown): {
-  executor: string | undefined;
-  error?: string;
-} {
-  if (rawExecutor === undefined || rawExecutor === null) {
-    return { executor: undefined };
-  }
-  if (typeof rawExecutor !== "string") {
-    return { executor: undefined, error: "executor must be a string" };
-  }
-
-  const executor = normalizeSshHostAlias(rawExecutor);
-  if (!executor) {
-    return { executor: undefined };
-  }
-  if (!isValidSshHostAlias(executor)) {
-    return {
-      executor: undefined,
-      error: "executor must be a valid SSH host alias",
-    };
-  }
-
-  return { executor };
-}
-
-function parseOptionalCodexMcpMode(rawMode: unknown): {
-  codexMcpMode: CodexMcpMode | undefined;
-  error?: string;
-} {
-  if (rawMode === undefined || rawMode === null || rawMode === "") {
-    return { codexMcpMode: undefined };
-  }
-  if (
-    typeof rawMode === "string" &&
-    ALL_CODEX_MCP_MODES.includes(rawMode as CodexMcpMode)
-  ) {
-    return { codexMcpMode: rawMode as CodexMcpMode };
-  }
-  return { codexMcpMode: undefined, error: "codexMcpMode is invalid" };
-}
+const SESSION_DETAIL_TIMING_NAMES = [
+  "projectLookup",
+  "bridgeView",
+  "historyCapability",
+  "summaryScan",
+  "pageRead",
+  "normalize",
+  "canonicalSelect",
+  "canonicalOverlay",
+  "augment",
+] as const;
 
 function isCodexProviderName(
   provider: ProviderName | string | undefined,
@@ -147,43 +148,56 @@ function isCodexProviderName(
   return provider === "codex" || provider === "codex-oss";
 }
 
-function parseOptionalPositiveInteger(
-  value: unknown,
-  fieldName: string,
-): { value: number | undefined; error?: string } {
-  if (value === undefined || value === null) {
-    return { value: undefined };
-  }
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return { value: undefined, error: `${fieldName} must be a number` };
-  }
-
-  if (!Number.isInteger(value) || value < 1) {
-    return {
-      value: undefined,
-      error: `${fieldName} must be a positive integer`,
-    };
-  }
-
-  return { value };
-}
+const CODEX_CANONICAL_MAX_ROLLOUT_BYTES = (() => {
+  const configured = Number.parseInt(
+    process.env.YEP_CODEX_CANONICAL_MAX_ROLLOUT_BYTES ?? "",
+    10,
+  );
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : 64 * 1024 * 1024;
+})();
 
 export interface SessionsDeps {
+  runtimeController?: RuntimeController;
+  /** Shared pending-input authority used by HTTP and channel adapters. */
+  sessionInteractionService?: SessionInteractionService;
+  /** Shared application boundary used by HTTP and channel adapters. */
+  sessionCommandService?: SessionCommandService;
   supervisor: Supervisor;
   scanner: ProjectScanner;
   readerFactory: (project: Project) => ISessionReader;
+  /** Resolves authenticated, opaque Feishu card links to provider sessions. */
+  feishuInbox?: Pick<FeishuDurableInbox, "findByTempId">;
   externalTracker?: ExternalSessionTracker;
   notificationService?: NotificationService;
   sessionMetadataService?: SessionMetadataService;
+  /** Explicit, user-triggered AI session title generation. */
+  sessionTitleService?: Pick<SessionTitleService, "generateTitleManually">;
   eventBus?: EventBus;
   codexScanner?: CodexSessionScanner;
   codexSessionsDir?: string;
   /** Optional shared Codex reader factory for cross-provider session lookups */
   codexReaderFactory?: (projectPath: string) => CodexSessionReader;
+  /** Read-only app-server history path for paginated Codex threads. */
+  codexAppServerHistoryReader?: CodexAppServerHistoryReader;
+  /** Provider-wide cheap Codex metadata and provider-resolution source. */
+  codexSessionCatalog?: CodexSessionCatalog;
+  /** Shared persisted summary cache used by context/status fallbacks. */
+  sessionIndexService?: ISessionIndexService;
   geminiScanner?: GeminiSessionScanner;
   geminiSessionsDir?: string;
   /** Optional shared Gemini reader factory for cross-provider session lookups */
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
+  piScanner?: PiSessionScanner;
+  zcodeDbPath?: string;
+  piSessionsDir?: string;
+  piReaderFactory?: (projectPath: string) => PiSessionReader;
+  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
+  kimiScanner?: KimiSessionScanner;
+  kimiSessionsDir?: string;
+  /** Optional shared Kimi reader factory for cross-provider session lookups */
+  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
   /** ServerSettingsService for reading global instructions */
   serverSettingsService?: ServerSettingsService;
   /** ModelInfoService for context window lookups */
@@ -192,70 +206,132 @@ export interface SessionsDeps {
   recentsService?: RecentsService;
   /** Codex bridge for externally launched `codex --remote` TUI sessions. */
   codexBridgeService?: CodexBridgeController;
+  /** Ordered, independently sequenced canonical journals for persisted refresh. */
+  codexEventStoreSources?: readonly CodexEventStoreSource[];
+  /** Process-level projection cache for incremental canonical replay. */
+  codexProjectionCache?: CodexProjectionCache;
+  /**
+   * Soft time budget for the canonical overlay's own work, in ms.
+   *
+   * Bounds the artifact scan plus the projection, measured from after the
+   * journal replay. Injectable so the boundary is testable without sleeping for
+   * the production default.
+   */
+  canonicalOverlayBudgetMs?: number;
+  /** Reads restart-safe generated manifests from the managed upload root. */
+  generatedArtifactUploadManager?: Pick<
+    UploadManager,
+    "listReplayableGeneratedArtifacts"
+  >;
   /** Physical cold-archive service for moving old provider JSONL files away from hot scan paths. */
   sessionArchiveService?: SessionArchiveService;
   /** Claude projects directory, used to synthesize file-change invalidation events after moves. */
   claudeProjectsDir?: string;
 }
 
-interface StartSessionBody {
-  message: string;
-  images?: string[];
-  documents?: string[];
-  attachments?: UploadedFile[];
-  mode?: PermissionMode;
-  model?: ModelOption;
-  thinking?: ThinkingOption;
-  provider?: ProviderName;
-  /** Codex MCP profile. Only used when provider resolves to Codex. */
-  codexMcpMode?: CodexMcpMode;
-  /** Client-generated temp ID for optimistic UI tracking */
-  tempId?: string;
-  /** SSH host alias for remote execution (undefined = local) */
-  executor?: string;
-  /** Permission rules for tool filtering (deny/allow patterns) */
-  permissions?: PermissionRules;
-  /**
-   * Rewind/edit: resume the session only up to (and including) this message
-   * UUID, branching the conversation in place (same session id). Pass the
-   * edited message's parentUuid so that message and everything after it are
-   * dropped. Maps to the SDK `resumeSessionAt` option. Claude provider only.
-   */
-  resumeSessionAt?: string;
-  /**
-   * Rewind/edit for Codex app-server: drop this many trailing user turns via
-   * `thread/rollback` before sending the edited prompt in the same session.
-   */
-  rollbackNumTurns?: number;
+function getSessionPermissionModeState(
+  deps: SessionsDeps,
+  sessionId: string,
+  process:
+    | {
+        permissionMode?: PermissionMode;
+        modeVersion?: number;
+      }
+    | null
+    | undefined,
+): { permissionMode?: PermissionMode; modeVersion?: number } {
+  const processMode = process?.permissionMode;
+  const permissionMode =
+    processMode ?? deps.sessionMetadataService?.getPermissionMode?.(sessionId);
+  if (!permissionMode) return {};
+
+  return {
+    permissionMode,
+    modeVersion: processMode ? (process?.modeVersion ?? 0) : 0,
+  };
 }
 
-interface CreateSessionBody {
-  mode?: PermissionMode;
-  model?: ModelOption;
-  thinking?: ThinkingOption;
-  provider?: ProviderName;
-  /** Codex MCP profile. Only used when provider resolves to Codex. */
-  codexMcpMode?: CodexMcpMode;
-  /** SSH host alias for remote execution (undefined = local) */
-  executor?: string;
-  /** Permission rules for tool filtering (deny/allow patterns) */
-  permissions?: PermissionRules;
+function isPermissionMode(value: unknown): value is PermissionMode {
+  return (
+    typeof value === "string" &&
+    ALL_PERMISSION_MODES.includes(value as PermissionMode)
+  );
 }
 
-interface InputResponseBody {
-  requestId: string;
-  response: "approve" | "approve_accept_edits" | "deny" | string;
-  answers?: Record<string, string>;
-  feedback?: string;
+type BridgeSessionView = Awaited<
+  ReturnType<CodexBridgeController["getSessionView"]>
+>;
+
+function bridgeControllers(
+  deps: Pick<SessionsDeps, "codexBridgeService">,
+): BridgeControllers {
+  return [deps.codexBridgeService];
 }
 
-/**
- * Convert SDK messages to client Message format.
- * Used for mock SDK sessions where messages aren't persisted to disk.
- */
+async function getBridgeSessionView(
+  deps: Pick<SessionsDeps, "codexBridgeService">,
+  sessionId: string,
+): Promise<NonNullable<BridgeSessionView> | null> {
+  return getAnyBridgeSessionView(bridgeControllers(deps), sessionId);
+}
+
+function isLiveAnyBridgeSessionView(
+  view: NonNullable<BridgeSessionView>,
+): boolean {
+  return isLiveBridgeSessionView(view);
+}
+
+function deferPiProcessContent(
+  content: string | ContentBlock[],
+  options: { deferMedia?: boolean; deferThinking?: boolean },
+): string | ContentBlock[] {
+  if (
+    typeof content === "string" ||
+    (!options.deferMedia && !options.deferThinking)
+  ) {
+    return content;
+  }
+
+  return content.flatMap((block) => {
+    if (!block || typeof block !== "object") return [block];
+    if (options.deferThinking && block.type === "thinking") {
+      // Mirror the persisted read: keep a bounded preview so the reasoning row
+      // still exists and can be expanded through an explicit detail request.
+      const thinking = typeof block.thinking === "string" ? block.thinking : "";
+      if (thinking.length <= PI_THINKING_PREVIEW_MAX_LENGTH) return [block];
+      return [
+        {
+          ...block,
+          thinking: thinking.slice(0, PI_THINKING_PREVIEW_MAX_LENGTH),
+          deferred: true,
+          thinkingLength: thinking.length,
+        },
+      ];
+    }
+    if (
+      options.deferMedia &&
+      (block.type === "image" || block.type === "input_image")
+    ) {
+      const {
+        data: _data,
+        image_url: _imageUrl,
+        imageUrl: _imageUrlCamel,
+        ...withoutInlineMedia
+      } = block;
+      return [{ ...withoutInlineMedia, deferred: true }];
+    }
+    return [block];
+  });
+}
+
 function sdkMessagesToClientMessages(
   sdkMessages: SDKMessage[],
-  options: { model?: string; provider?: ProviderName } = {},
+  options: {
+    model?: string;
+    provider?: ProviderName;
+    deferMedia?: boolean;
+    deferThinking?: boolean;
+  } = {},
 ): Message[] {
   const messages: Message[] = [];
   let pendingUserMessage: Message | null = null;
@@ -280,6 +356,9 @@ function sdkMessagesToClientMessages(
       } else if (Array.isArray(rawContent)) {
         // Array content: pass through as ContentBlock[] for both user and assistant
         content = rawContent as ContentBlock[];
+        if (options.provider === "pi") {
+          content = deferPiProcessContent(content, options);
+        }
       } else {
         // Unknown content type - skip this message
         continue;
@@ -303,23 +382,25 @@ function sdkMessagesToClientMessages(
       continue;
     }
 
-    const contextUsage = extractCodexTurnCompleteContextUsage(msg, options);
+    const contextUsage = extractCodexTurnContextUsage(msg, options);
     if (contextUsage && pendingUserMessage) {
       pendingUserMessage.contextBefore = contextUsage;
-      pendingUserMessage = null;
+      if (msg.subtype === "turn_complete") {
+        pendingUserMessage = null;
+      }
     }
   }
   return messages;
 }
 
-function extractCodexTurnCompleteContextUsage(
+function extractCodexTurnContextUsage(
   msg: SDKMessage,
   options: { model?: string; provider?: ProviderName },
 ): ContextUsage | undefined {
   if (
     (options.provider !== "codex" && options.provider !== "codex-oss") ||
     msg.type !== "system" ||
-    msg.subtype !== "turn_complete"
+    (msg.subtype !== "turn_usage" && msg.subtype !== "turn_complete")
   ) {
     return undefined;
   }
@@ -412,7 +493,9 @@ function computeSDKCompactionOverhead(sdkMessages: SDKMessage[]): number {
 
 /**
  * Extract context usage from SDK messages.
- * Finds the last assistant message with usage data.
+ * Finds the last assistant message with usage data; for Codex providers the
+ * usage lives on live `system/turn_usage` and final `system/turn_complete`
+ * messages instead.
  *
  * @param sdkMessages - SDK messages to search
  * @param model - Model ID for determining context window size
@@ -438,20 +521,29 @@ function extractContextUsageFromSDKMessages(
     ? 0
     : computeSDKCompactionOverhead(sdkMessages);
 
-  // Find the last assistant message with usage data (iterate backwards)
+  // Find the last message with usage data (iterate backwards)
   for (let i = sdkMessages.length - 1; i >= 0; i--) {
     const msg = sdkMessages[i];
-    if (msg && msg.type === "assistant" && msg.usage) {
+    if (!msg) continue;
+    // Codex attaches usage to system lifecycle messages, not assistant messages.
+    const carriesUsage =
+      msg.type === "assistant" ||
+      (isCodexProvider &&
+        msg.type === "system" &&
+        ((msg as { subtype?: string }).subtype === "turn_usage" ||
+          (msg as { subtype?: string }).subtype === "turn_complete"));
+    if (carriesUsage && msg.usage) {
       const usage = msg.usage as {
         input_tokens?: number;
         output_tokens?: number;
         cached_input_tokens?: number;
         cache_read_input_tokens?: number;
         cache_creation_input_tokens?: number;
+        model_context_window?: number;
       };
 
       // Codex context meter is based on fresh input tokens from the latest turn.
-      // Claude/OpenCode/Gemini paths continue to include cached+creation tokens.
+      // Legacy non-Codex paths continue to include cached+creation tokens.
       const rawInputTokens = isCodexProvider
         ? (usage.input_tokens ?? 0)
         : (usage.input_tokens ?? 0) +
@@ -466,12 +558,21 @@ function extractContextUsageFromSDKMessages(
       // Apply compaction overhead correction
       const inputTokens = rawInputTokens + overhead;
 
-      const percentage = Math.round((inputTokens / contextWindowSize) * 100);
+      // Codex lifecycle usage carries the SDK-reported context window; prefer
+      // it over the model-table fallback.
+      const effectiveContextWindow =
+        usage.model_context_window && usage.model_context_window > 0
+          ? usage.model_context_window
+          : contextWindowSize;
+
+      const percentage = Math.round(
+        (inputTokens / effectiveContextWindow) * 100,
+      );
 
       const result: ContextUsage = {
         inputTokens,
         percentage,
-        contextWindow: contextWindowSize,
+        contextWindow: effectiveContextWindow,
       };
 
       // Add optional fields if available
@@ -511,6 +612,52 @@ interface ArchiveTarget {
   sessionFilePath: string;
 }
 
+/**
+ * Resolve the reader that actually owns `sessionId`.
+ *
+ * A project id is derived purely from the working directory, so a single path
+ * can host sessions from several providers (e.g. Claude + Codex + Kimi under
+ * the same repo). `readerFactory(project)` only yields the project's primary
+ * provider reader, which returns nothing for a session owned by a different
+ * provider — this is why the subagent (Agent/AgentSwarm) endpoints returned an
+ * empty result for Kimi sessions living under a Claude-primary project. Resolve
+ * the owning provider's reader by session instead, falling back to the primary.
+ */
+async function resolveReaderForSession(
+  deps: SessionsDeps,
+  project: Project,
+  sessionId: string,
+): Promise<ISessionReader> {
+  const preferredProvider = deps.sessionMetadataService?.getProvider(sessionId);
+  const resolved = await findSessionSummaryAcrossProviders(
+    project,
+    sessionId,
+    project.id,
+    toProviderResolutionDeps(deps),
+    preferredProvider,
+  );
+  return resolved?.source.reader ?? deps.readerFactory(project);
+}
+
+function toProviderResolutionDeps(deps: SessionsDeps): ProviderResolutionDeps {
+  return {
+    readerFactory: deps.readerFactory,
+    sessionIndexService: deps.sessionIndexService,
+    sessionMetadataService: deps.sessionMetadataService,
+    codexSessionsDir: deps.codexSessionsDir,
+    codexReaderFactory: deps.codexReaderFactory,
+    geminiSessionsDir: deps.geminiSessionsDir,
+    geminiReaderFactory: deps.geminiReaderFactory,
+    geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
+    piSessionsDir: deps.piSessionsDir,
+    piReaderFactory: deps.piReaderFactory,
+    kimiSessionsDir: deps.kimiSessionsDir,
+    kimiReaderFactory: deps.kimiReaderFactory,
+    zcodeDbPath: deps.zcodeDbPath,
+    zcodeReaderFactory: deps.zcodeReaderFactory,
+  };
+}
+
 async function resolveArchiveTarget(
   deps: SessionsDeps,
   sessionId: string,
@@ -523,14 +670,7 @@ async function resolveArchiveTarget(
       project,
       sessionId,
       project.id,
-      {
-        readerFactory: deps.readerFactory,
-        codexSessionsDir: deps.codexSessionsDir,
-        codexReaderFactory: deps.codexReaderFactory,
-        geminiSessionsDir: deps.geminiSessionsDir,
-        geminiReaderFactory: deps.geminiReaderFactory,
-        geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
-      },
+      toProviderResolutionDeps(deps),
       preferredProvider,
     );
     if (!resolved) continue;
@@ -610,7 +750,11 @@ function emitArchiveFileEvents(
   const providerRoot =
     record.provider === "codex"
       ? deps.codexSessionsDir
-      : deps.claudeProjectsDir;
+      : record.provider === "pi"
+        ? deps.piSessionsDir
+        : record.provider === "kimi"
+          ? deps.kimiSessionsDir
+          : deps.claudeProjectsDir;
   if (!providerRoot) return;
 
   for (const file of record.files) {
@@ -627,48 +771,88 @@ function emitArchiveFileEvents(
   }
 }
 
-async function markSessionCreatedByYep(
+/**
+ * Record that Yep started this session, and where.
+ *
+ * The project is persisted as the reverse index behind
+ * `GET /api/sessions/:sessionId/locate`: without it, resolving a bare session
+ * id means scanning every project with every provider reader. This is the only
+ * point in the request where the session id and its project are both known for
+ * certain, and `project` is already post-recovery, so a stale projectId from
+ * the URL never gets persisted.
+ */
+async function recordYepSessionOrigin(
   deps: SessionsDeps,
   sessionId: string,
-  projectId: string,
+  project: Project,
 ): Promise<void> {
   if (!deps.sessionMetadataService) return;
 
   await deps.sessionMetadataService.setCreatedBy(sessionId, "yep");
+  await deps.sessionMetadataService.setProjectLocation(
+    sessionId,
+    project.id,
+    project.path,
+  );
   deps.eventBus?.emit({
     type: "session-metadata-changed",
     sessionId,
-    projectId: projectId as UrlProjectId,
+    projectId: project.id,
     timestamp: new Date().toISOString(),
   });
 }
 
 export function createSessionsRoutes(deps: SessionsDeps): Hono {
   const routes = new Hono();
-  const sessionDetailPath = "/projects/:projectId/sessions/:sessionId";
-  const jsonContentType = /^application\/json\b/i;
-  const compressSessionJson = compress({
-    threshold: 1024,
-    contentTypeFilter: jsonContentType,
-  });
-  routes.use(sessionDetailPath, async (c, next) => {
-    if (c.req.method !== "GET") {
-      await next();
-      return;
-    }
-    await compressSessionJson(c, next);
-  });
-  routes.use(sessionDetailPath, async (c, next) => {
-    await next();
-    if (c.req.method !== "GET") return;
-
-    const contentType = c.res.headers.get("Content-Type");
-    if (!contentType || !jsonContentType.test(contentType)) return;
-
-    const body = await c.res.arrayBuffer();
-    c.res = new Response(body, c.res);
-    c.res.headers.set("Content-Length", String(body.byteLength));
-  });
+  const codexEventStoreSources = normalizeCodexEventStoreSources(
+    deps.codexEventStoreSources ?? [],
+  );
+  const codexProjectionCache =
+    deps.codexProjectionCache ?? new CodexProjectionCache();
+  /**
+   * Bounds the canonical overlay's own work. Deliberately not a bound on the
+   * whole canonical phase: journal replay precedes it and cannot be interrupted,
+   * so charging replay here only ever converted a slow load into no canonical
+   * view at all.
+   */
+  const canonicalOverlayBudgetMs = Math.max(
+    1,
+    deps.canonicalOverlayBudgetMs ?? 2_000,
+  );
+  const generatedArtifactUploadManager =
+    deps.generatedArtifactUploadManager ?? new UploadManager();
+  const runtimeController =
+    deps.runtimeController ?? new EmbeddedRuntimeController(deps.supervisor);
+  const sessionInteractionService =
+    deps.sessionInteractionService ??
+    new SessionInteractionService({
+      runtimeController,
+      codexBridgeService: deps.codexBridgeService,
+      sessionMetadataService: deps.sessionMetadataService,
+      eventBus: deps.eventBus,
+    });
+  const sessionCommandService =
+    deps.sessionCommandService ??
+    new SessionCommandService({
+      runtimeController,
+      scanner: deps.scanner,
+      readerFactory: deps.readerFactory,
+      sessionInteractionService,
+      sessionMetadataService: deps.sessionMetadataService,
+      eventBus: deps.eventBus,
+      serverSettingsService: deps.serverSettingsService,
+      modelInfoService: deps.modelInfoService,
+      recentsService: deps.recentsService,
+      codexSessionsDir: deps.codexSessionsDir,
+      codexReaderFactory: deps.codexReaderFactory,
+      geminiScanner: deps.geminiScanner,
+      geminiSessionsDir: deps.geminiSessionsDir,
+      geminiReaderFactory: deps.geminiReaderFactory,
+      piSessionsDir: deps.piSessionsDir,
+      piReaderFactory: deps.piReaderFactory,
+      kimiSessionsDir: deps.kimiSessionsDir,
+      kimiReaderFactory: deps.kimiReaderFactory,
+    });
   const getCodexReader = (projectPath: string): CodexSessionReader | null =>
     deps.codexReaderFactory?.(projectPath) ??
     (deps.codexSessionsDir
@@ -677,7 +861,114 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           projectPath,
         })
       : null);
+  const getCodexForkBranchState = async (
+    project: Project,
+    sessionId: string,
+    currentSummary: SessionSummary,
+    selectedBranchId?: string,
+  ): Promise<SessionBranchState | undefined> => {
+    const historyReader = deps.codexAppServerHistoryReader;
+    const catalog = deps.codexSessionCatalog;
+    if (
+      !historyReader ||
+      typeof historyReader.getForkBranchState !== "function" ||
+      !catalog ||
+      typeof catalog.getSnapshot !== "function" ||
+      !isCodexProviderName(currentSummary.provider)
+    ) {
+      return undefined;
+    }
 
+    const projectPath = canonicalizeProjectPath(project.path);
+    const candidates = new Map<string, CodexForkBranchCandidate>();
+    const snapshot = await catalog.getSnapshot().catch(() => null);
+    for (const summary of snapshot?.byProjectPath.get(projectPath) ?? []) {
+      if (!isCodexProviderName(summary.provider)) continue;
+      candidates.set(summary.id, {
+        id: summary.id,
+        forkParentSessionId: summary.forkParentSessionId,
+        createdAt: summary.createdAt,
+        provider: summary.provider,
+      });
+    }
+
+    // Native `forkedFromId` wins. The sidecar supplies first-prompt forks,
+    // where Codex must use thread/start and therefore has no native parent.
+    for (const [candidateId, metadata] of Object.entries(
+      deps.sessionMetadataService?.getAllMetadata() ?? {},
+    )) {
+      if (
+        !metadata.forkParentSessionId ||
+        !isCodexProviderName(metadata.provider) ||
+        !metadata.projectPath ||
+        canonicalizeProjectPath(metadata.projectPath) !== projectPath
+      ) {
+        continue;
+      }
+      const existing = candidates.get(candidateId);
+      candidates.set(candidateId, {
+        id: candidateId,
+        forkParentSessionId:
+          existing?.forkParentSessionId ?? metadata.forkParentSessionId,
+        forkTargetMessageId:
+          existing?.forkTargetMessageId ?? metadata.forkTargetMessageId,
+        createdAt: existing?.createdAt,
+        provider: existing?.provider ?? metadata.provider,
+      });
+    }
+
+    const currentMetadata = deps.sessionMetadataService?.getMetadata(sessionId);
+    const current = candidates.get(sessionId);
+    candidates.set(sessionId, {
+      id: sessionId,
+      forkParentSessionId:
+        current?.forkParentSessionId ??
+        currentMetadata?.forkParentSessionId ??
+        currentSummary.forkParentSessionId,
+      forkTargetMessageId:
+        current?.forkTargetMessageId ?? currentMetadata?.forkTargetMessageId,
+      createdAt: current?.createdAt ?? currentSummary.createdAt,
+      provider: current?.provider ?? currentSummary.provider,
+    });
+    return historyReader.getForkBranchState(
+      sessionId,
+      [...candidates.values()],
+      selectedBranchId,
+    );
+  };
+  registerSessionDisplayRoutes(routes, {
+    scanner: deps.scanner,
+    providerResolution: toProviderResolutionDeps(deps),
+    codexAppServerHistoryReader: deps.codexAppServerHistoryReader,
+    getCanonicalSessionId: (sessionId) =>
+      deps.sessionMetadataService?.getCanonicalSessionId?.(sessionId) ??
+      sessionId,
+    getPersistedProvider: (sessionId) =>
+      deps.sessionMetadataService?.getProvider(sessionId),
+    getBranchState: getCodexForkBranchState,
+    getRuntimeState: async (sessionId) => {
+      const [process, bridgeView] = await Promise.all([
+        runtimeController.getProcessSnapshotForSession(sessionId),
+        getBridgeSessionView(deps, sessionId),
+      ]);
+      const pendingInputRequest = await sessionCommandService.getPendingInput(
+        sessionId,
+        { processSnapshot: process },
+      );
+      const externalActive =
+        (deps.externalTracker?.isExternal(sessionId) ?? false) ||
+        (bridgeView !== null && isActiveBridgeSessionView(bridgeView));
+      return {
+        provider: process?.provider ?? bridgeView?.session.provider,
+        toolsMayBeActive:
+          process?.state === "in-turn" ||
+          process?.state === "waiting-input" ||
+          pendingInputRequest !== null ||
+          externalActive,
+        pendingInputRequest,
+      };
+    },
+  });
   // GET /api/archive/sessions - List physically archived sessions.
   routes.get("/archive/sessions", (c) => {
     if (!deps.sessionArchiveService) {
@@ -703,6 +994,37 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     return c.json({ session: record });
   });
 
+  // GET /api/sessions/:sessionId/locate - Resolve a bare session id to its
+  // owning project.
+  //
+  // Every other read path is keyed by projectId + sessionId, so an id on its
+  // own (copied from the UI, pasted into an agent running elsewhere, quoted in
+  // a bug report) is not addressable. This is the one route that turns one
+  // back into a location.
+  routes.get("/sessions/:sessionId/locate", async (c) => {
+    const requestedSessionId = c.req.param("sessionId");
+    const opaqueFeishuReference = /^feishu-[a-f0-9]{32}$/.test(
+      requestedSessionId,
+    );
+    const inboxRecord = opaqueFeishuReference
+      ? deps.feishuInbox?.findByTempId(requestedSessionId)
+      : undefined;
+    if (opaqueFeishuReference && !inboxRecord?.sessionId) {
+      return c.json({ error: "Session not found" }, 404);
+    }
+    const sessionId = inboxRecord?.sessionId ?? requestedSessionId;
+    const location = await locateSession(deps, sessionId);
+    if (!location) {
+      return c.json({ error: "Session not found" }, 404);
+    }
+    return c.json({
+      session: {
+        ...location,
+        requestedSessionId,
+      },
+    });
+  });
+
   // GET /api/projects/:projectId/sessions/:sessionId/agents - Get agent mappings
   // Used to find agent sessions for pending Tasks on page reload
   routes.get("/projects/:projectId/sessions/:sessionId/agents", async (c) => {
@@ -718,8 +1040,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       return c.json({ error: "Project not found" }, 404);
     }
 
-    const reader = deps.readerFactory(project);
-    const mappings = await reader.getAgentMappings();
+    const sessionId = c.req.param("sessionId");
+    const reader = await resolveReaderForSession(deps, project, sessionId);
+    const mappings = await reader.getAgentMappings(sessionId);
 
     return c.json({ mappings });
   });
@@ -731,6 +1054,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     async (c) => {
       const projectId = c.req.param("projectId");
       const agentId = c.req.param("agentId");
+      const sessionId = c.req.param("sessionId");
 
       // Validate projectId format at API boundary
       if (!isUrlProjectId(projectId)) {
@@ -742,15 +1066,16 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         return c.json({ error: "Project not found" }, 404);
       }
 
-      const reader = deps.readerFactory(project);
-      const agentSession = await reader.getAgentSession(agentId);
+      const reader = await resolveReaderForSession(deps, project, sessionId);
+      const agentSession = await reader.getAgentSession(agentId, sessionId);
 
       if (!agentSession) {
         return c.json({ error: "Agent session not found" }, 404);
       }
 
-      // Add server-rendered HTML to text blocks for markdown display
-      await augmentTextBlocks(agentSession.messages);
+      // Agent transcripts use the same renderers as the parent session, so
+      // apply the complete persisted augmentation pipeline, not Markdown only.
+      await augmentPersistedSessionMessages(agentSession.messages);
 
       return c.json(agentSession);
     },
@@ -773,26 +1098,27 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     }
 
     // Check if session is actively owned by a process
-    const process = deps.supervisor.getProcessForSession(sessionId);
-    const bridgeView =
-      (await deps.codexBridgeService?.getSessionView(sessionId)) ?? null;
+    const process =
+      await runtimeController.getProcessSnapshotForSession(sessionId);
+    const bridgeView = await getBridgeSessionView(deps, sessionId);
     const bridgedSession =
       bridgeView?.session.projectId === projectId ? bridgeView : null;
-    const isBridgeSessionActive = bridgedSession
-      ? ((await deps.codexBridgeService?.isSessionActive(sessionId)) ?? false)
-      : false;
+    // The view already carries the sidecar's liveness verdict, so no extra
+    // `/sessions/:id/active` round-trip is needed on every session open.
     const isBridgeSessionLive =
-      bridgedSession !== null && isLiveBridgeSessionView(bridgedSession);
+      bridgedSession !== null && isActiveBridgeSessionView(bridgedSession);
 
     // Check if session is being controlled by an external program
     const isExternal =
       (deps.externalTracker?.isExternal(sessionId) ?? false) ||
-      (isBridgeSessionLive && isBridgeSessionActive);
+      isBridgeSessionLive;
 
     const runtime = deriveSessionRuntime({
       process,
       externalActive: isExternal,
-      externalActivity: bridgedSession?.activity,
+      externalActivity:
+        bridgedSession?.activity ??
+        deps.externalTracker?.getExternalActivity?.(sessionId),
     });
     const ownership = runtime.ownership;
 
@@ -805,10 +1131,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Get pending input request from active process
     const activePendingInputRequest =
-      process?.state.type === "waiting-input"
-        ? process.state.request
-        : ((await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
-          null);
+      await sessionCommandService.getPendingInput(sessionId, {
+        processSnapshot: process,
+      });
     const pendingInputType =
       pendingInputTypeFromProcess(process) ??
       bridgedSession?.pendingInputType ??
@@ -820,29 +1145,39 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Get available slash commands from active process
     const slashCommands = process?.supportsDynamicCommands
-      ? await process.supportedCommands()
+      ? await runtimeController.getSupportedCommands(process.id)
       : null;
 
     // Read minimal session info from disk (just for title/timestamps, no messages)
     const metadataProvider = deps.sessionMetadataService?.getProvider(
       sessionId,
     ) as ProviderName | undefined;
-    const sessionSummaryResult = await findSessionSummaryAcrossProviders(
-      project,
-      sessionId,
-      projectId as UrlProjectId,
-      {
-        readerFactory: deps.readerFactory,
-        codexSessionsDir: deps.codexSessionsDir,
-        codexReaderFactory: deps.codexReaderFactory,
-        geminiSessionsDir: deps.geminiSessionsDir,
-        geminiReaderFactory: deps.geminiReaderFactory,
-        geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
-      },
-      metadataProvider ?? process?.provider,
-    );
+    const catalogSummary = await deps.codexSessionCatalog
+      ?.getSessionSummary(sessionId, project.path)
+      .catch(() => null);
+    const providerResolutionDeps = toProviderResolutionDeps(deps);
+    const cheapResolutionDeps = deps.codexSessionCatalog
+      ? (({
+          codexSessionsDir: _codexSessionsDir,
+          codexReaderFactory: _codexReaderFactory,
+          ...remaining
+        }) => remaining)(providerResolutionDeps)
+      : providerResolutionDeps;
+    const sessionSummaryResult =
+      bridgedSession || catalogSummary
+        ? null
+        : await findSessionSummaryAcrossProviders(
+            project,
+            sessionId,
+            projectId as UrlProjectId,
+            cheapResolutionDeps,
+            metadataProvider ?? process?.provider,
+          );
     const sessionSummary =
-      sessionSummaryResult?.summary ?? bridgedSession?.session ?? null;
+      bridgedSession?.session ??
+      catalogSummary ??
+      sessionSummaryResult?.summary ??
+      null;
 
     if (!sessionSummary && !process) {
       return c.json({ error: "Session not found" }, 404);
@@ -856,34 +1191,83 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             sessionSummary.updatedAt,
           )
         : undefined;
+    const resolvedProvider =
+      sessionSummary?.provider ??
+      metadataProvider ??
+      process?.provider ??
+      project.provider;
+    const forkBranchState =
+      sessionSummary && isCodexProviderName(resolvedProvider)
+        ? await getCodexForkBranchState(project, sessionId, {
+            ...sessionSummary,
+            provider: resolvedProvider,
+            forkParentSessionId:
+              metadata?.forkParentSessionId ??
+              sessionSummary.forkParentSessionId,
+          })
+        : undefined;
+    const forkFamilyRootId = forkBranchState?.branches[0]?.sessionId;
+    const forkFamilyRootSummary = forkFamilyRootId
+      ? await deps.codexSessionCatalog
+          ?.getSessionSummary(forkFamilyRootId, project.path)
+          .catch(() => null)
+      : null;
 
     return c.json({
       session: {
         id: sessionId,
         projectId,
-        title: sessionSummary?.title ?? null,
-        fullTitle: sessionSummary?.fullTitle ?? null,
+        title:
+          metadata?.forkFamilyTitle ??
+          forkFamilyRootSummary?.title ??
+          sessionSummary?.title ??
+          null,
+        fullTitle:
+          metadata?.forkFamilyFullTitle ??
+          metadata?.forkFamilyTitle ??
+          forkFamilyRootSummary?.fullTitle ??
+          forkFamilyRootSummary?.title ??
+          sessionSummary?.fullTitle ??
+          null,
         createdAt: sessionSummary?.createdAt ?? new Date().toISOString(),
         updatedAt: sessionSummary?.updatedAt ?? new Date().toISOString(),
-        messageCount: sessionSummary?.messageCount ?? 0,
+        ...(catalogSummary && !bridgedSession
+          ? {}
+          : { messageCount: sessionSummary?.messageCount ?? 0 }),
         userQuestions: sessionSummary?.userQuestions,
         ownership,
-        provider:
-          sessionSummary?.provider ??
-          metadataProvider ??
-          process?.provider ??
-          project.provider,
+        provider: resolvedProvider,
+        parentSessionId: sessionSummary?.parentSessionId,
+        forkParentSessionId:
+          metadata?.forkParentSessionId ?? sessionSummary?.forkParentSessionId,
         model: sessionSummary?.model,
         reasoningEffort:
-          sessionSummary?.reasoningEffort ?? process?.resolvedReasoningEffort,
+          sessionSummary?.reasoningEffort ?? process?.reasoningEffort,
         serviceTier: sessionSummary?.serviceTier ?? process?.serviceTier,
         originator: sessionSummary?.originator,
         createdBy: metadata?.createdBy ?? sessionSummary?.createdBy,
+        originChannel: metadata?.originChannel ?? sessionSummary?.originChannel,
         cliVersion: sessionSummary?.cliVersion,
         source: sessionSummary?.source,
         approvalPolicy: sessionSummary?.approvalPolicy,
         sandboxPolicy: sessionSummary?.sandboxPolicy,
+        branchState: forkBranchState ?? sessionSummary?.branchState,
+        codexBranchState: forkBranchState ?? sessionSummary?.codexBranchState,
         contextUsage: sessionSummary?.contextUsage,
+        cumulativeUsage: sessionSummary?.cumulativeUsage,
+        compactCount: sessionSummary?.compactCount,
+        compactEvents: sessionSummary?.compactEvents,
+        lastTurnStatus: bridgedSession
+          ? bridgedSession.session.lastTurnStatus
+          : sessionSummary?.lastTurnStatus,
+        lastErrorMessage: bridgedSession
+          ? bridgedSession.session.lastErrorMessage
+          : sessionSummary?.lastErrorMessage,
+        retryStatus: process
+          ? process.retryStatus
+          : bridgedSession
+            ? bridgedSession.session.retryStatus
+            : sessionSummary?.retryStatus,
         customTitle: metadata?.customTitle,
         aiTitle: metadata?.aiTitle ?? sessionSummary?.aiTitle,
         isArchived: metadata?.isArchived,
@@ -898,6 +1282,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       runtime,
       pendingInputRequest: activePendingInputRequest,
       slashCommands,
+      ...getSessionPermissionModeState(deps, sessionId, process),
     });
   });
 
@@ -920,18 +1305,19 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         return c.json({ error: "Project not found" }, 404);
       }
 
-      const process = deps.supervisor.getProcessForSession(sessionId);
+      const process =
+        await runtimeController.getProcessSnapshotForSession(sessionId);
 
       // Live path — SDK-backed breakdown.
       if (process) {
         // Opportunistically probe initializationResult() once per process so
         // ModelInfoService learns the real context window (and persists it),
         // even if the user never opens this modal again.
-        if (!process.initializationResultProbed && deps.modelInfoService) {
-          // Fire and forget; failures are already swallowed inside Process.
-          process.markInitializationResultProbed();
-          void process
-            .initializationResult()
+        if (deps.modelInfoService) {
+          // Fire and forget; the runtime guarantees this probe only runs once
+          // for each live process.
+          void runtimeController
+            .probeInitializationResult(sessionId)
             .then((init) => {
               if (!init || !init.models) return;
               for (const m of init.models) {
@@ -950,7 +1336,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         }
 
         try {
-          const usage = await process.getContextUsage();
+          const usage = await runtimeController.getContextUsage(sessionId);
           // Validate shape: an empty {} from a not-yet-initialized SDK is
           // truthy but would crash the client when it iterates over
           // `categories`. Only accept fully-formed SDK payloads; otherwise
@@ -958,8 +1344,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           if (usage && Array.isArray(usage.categories)) {
             // Persist the live max-tokens against the resolved model so the
             // fallback path stays accurate after this process exits.
-            const modelForCache =
-              process.resolvedModel ?? process.model ?? usage.model;
+            const modelForCache = process.model ?? usage.model;
             if (modelForCache && usage.rawMaxTokens > 0) {
               deps.modelInfoService?.recordContextWindow(
                 modelForCache,
@@ -982,22 +1367,17 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             // modal can show Claude Code's `/status`-style numbers even
             // while the agent is live.
             let cumulativeUsage: ContextCumulativeUsage | undefined;
+            let compactEvents: ContextCompactEvent[] | undefined;
             try {
               const summaryResult = await findSessionSummaryAcrossProviders(
                 project,
                 sessionId,
                 projectId as UrlProjectId,
-                {
-                  readerFactory: deps.readerFactory,
-                  codexSessionsDir: deps.codexSessionsDir,
-                  codexReaderFactory: deps.codexReaderFactory,
-                  geminiSessionsDir: deps.geminiSessionsDir,
-                  geminiReaderFactory: deps.geminiReaderFactory,
-                  geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
-                },
+                toProviderResolutionDeps(deps),
                 process.provider,
               );
               cumulativeUsage = summaryResult?.summary?.cumulativeUsage;
+              compactEvents = summaryResult?.summary?.compactEvents;
             } catch {
               // Cumulative is best-effort; never block the SDK breakdown.
             }
@@ -1005,6 +1385,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             const payload: ContextStatusResponse = {
               ...usage,
               cumulativeUsage,
+              compactEvents,
             };
             return c.json(payload);
           }
@@ -1021,14 +1402,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         project,
         sessionId,
         projectId as UrlProjectId,
-        {
-          readerFactory: deps.readerFactory,
-          codexSessionsDir: deps.codexSessionsDir,
-          codexReaderFactory: deps.codexReaderFactory,
-          geminiSessionsDir: deps.geminiSessionsDir,
-          geminiReaderFactory: deps.geminiReaderFactory,
-          geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
-        },
+        toProviderResolutionDeps(deps),
         metadataProvider ?? process?.provider,
       );
       const sessionSummary = sessionSummaryResult?.summary ?? null;
@@ -1039,12 +1413,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         project.provider;
       const model = sessionSummary?.model;
 
+      const summaryWindow = sessionSummary?.contextUsage?.contextWindow;
       const cachedWindow = deps.modelInfoService?.getCachedContextWindow(
         model,
         providerName,
         sessionId,
       );
       const baseContextWindow =
+        summaryWindow ??
         cachedWindow ??
         deps.modelInfoService?.getContextWindow(
           model,
@@ -1081,9 +1457,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         source: "jsonl",
         model,
         contextWindow: escalatedWindow,
-        contextWindowFromCache: cachedWindow !== undefined,
+        contextWindowFromCache:
+          summaryWindow !== undefined || cachedWindow !== undefined,
         contextUsage,
         cumulativeUsage: sessionSummary?.cumulativeUsage,
+        compactEvents: sessionSummary?.compactEvents,
       };
       return c.json(payload);
     },
@@ -1096,17 +1474,37 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   //   ?beforeMessageId=<id> - cursor for loading older chunks (used with tailCompactions)
   //   ?aroundMessageId=<id> - return a bounded window centered on a target message
   //   ?afterWindowMessageId=<id> - return the next bounded window after a cursor
+  //   ?rolloutRevision=<revision> - reject a cursor from a different file snapshot
   //   ?branchId=<id> - derived branch id to render
-  routes.get(sessionDetailPath, async (c) => {
+  //   ?deferMedia=1 - omit inline Pi image payloads from the first response
+  //   ?deferThinking=1 - omit Pi thinking blocks from the first response
+  //   ?view=canonical - explicitly request canonical overlay; default is legacy
+  //   ?projection=inspector - return only body-free Inspector index messages
+  routes.get("/projects/:projectId/sessions/:sessionId", async (c) => {
+    const serverTiming = new ServerTimingRecorder(SESSION_DETAIL_TIMING_NAMES);
+    const applyServerTiming = () => {
+      c.header("Server-Timing", serverTiming.headerValue());
+    };
     const projectId = c.req.param("projectId");
-    const sessionId = c.req.param("sessionId");
+    const requestedSessionId = c.req.param("sessionId");
     const afterMessageId = c.req.query("afterMessageId");
     const tailCompactionsParam = c.req.query("tailCompactions");
     const beforeMessageId = c.req.query("beforeMessageId");
     const aroundMessageId = c.req.query("aroundMessageId");
     const afterWindowMessageId = c.req.query("afterWindowMessageId");
+    const rolloutRevision = c.req.query("rolloutRevision");
     const branchId = c.req.query("branchId");
+    const deferMedia = ["1", "true"].includes(
+      c.req.query("deferMedia")?.toLowerCase() ?? "",
+    );
+    const deferThinking = ["1", "true"].includes(
+      c.req.query("deferThinking")?.toLowerCase() ?? "",
+    );
     const maxMessagesParam = c.req.query("maxMessages");
+    const viewParam = c.req.query("view");
+    const canonicalViewRequested = viewParam === "canonical";
+    const inspectorProjectionRequested =
+      c.req.query("projection") === "inspector";
     const tailCompactions =
       tailCompactionsParam !== undefined
         ? Number.parseInt(tailCompactionsParam, 10)
@@ -1118,114 +1516,562 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
     // Validate projectId format at API boundary
     if (!isUrlProjectId(projectId)) {
+      applyServerTiming();
       return c.json({ error: "Invalid project ID format" }, 400);
     }
 
     // Use getOrCreateProject to support Codex projects that may not be in the scan cache yet
-    const project = await deps.scanner.getOrCreateProject(projectId);
+    const project = await serverTiming.measure("projectLookup", () =>
+      deps.scanner.getOrCreateProject(projectId),
+    );
     if (!project) {
+      applyServerTiming();
       return c.json({ error: "Project not found" }, 404);
     }
 
     // Check if session is actively owned by a process
-    const process = deps.supervisor.getProcessForSession(sessionId);
-    const bridgeView =
-      (await deps.codexBridgeService?.getSessionView(sessionId)) ?? null;
+    let process =
+      await runtimeController.getProcessSnapshotForSession(requestedSessionId);
+    const sessionId =
+      process?.sessionId ??
+      deps.sessionMetadataService?.getCanonicalSessionId?.(
+        requestedSessionId,
+      ) ??
+      requestedSessionId;
+    if (!process && sessionId !== requestedSessionId) {
+      process = await runtimeController.getProcessSnapshotForSession(sessionId);
+    }
+    const bridgeView = await serverTiming.measure("bridgeView", () =>
+      getBridgeSessionView(deps, sessionId),
+    );
     const bridgedSession =
       bridgeView?.session.projectId === projectId ? bridgeView : null;
-    const isBridgeSessionActive = bridgedSession
-      ? ((await deps.codexBridgeService?.isSessionActive(sessionId)) ?? false)
-      : false;
+    // The view already carries the sidecar's liveness verdict, so no extra
+    // `/sessions/:id/active` round-trip is needed on every session open.
     const isBridgeSessionLive =
-      bridgedSession !== null && isLiveBridgeSessionView(bridgedSession);
+      bridgedSession !== null && isActiveBridgeSessionView(bridgedSession);
 
     // Check if session is being controlled by an external program
     const isExternal =
       (deps.externalTracker?.isExternal(sessionId) ?? false) ||
-      (isBridgeSessionLive && isBridgeSessionActive);
+      isBridgeSessionLive;
 
     // Check if we've ever owned this session (for orphan detection)
     // Only mark tools as "aborted" if we owned the session and know it terminated
-    const wasEverOwned = deps.supervisor.wasEverOwned(sessionId);
+    const wasEverOwned = await runtimeController.wasEverOwned(sessionId);
 
     // Always try to read from disk first (even for owned sessions)
     const reader = deps.readerFactory(project);
+    const boundedMaxMessages =
+      maxMessages !== undefined && !Number.isNaN(maxMessages) && maxMessages > 0
+        ? maxMessages
+        : undefined;
+    const boundedTailCompactions =
+      tailCompactions !== undefined &&
+      !Number.isNaN(tailCompactions) &&
+      tailCompactions > 0
+        ? tailCompactions
+        : undefined;
     const usesWindowPagination =
       !afterMessageId && Boolean(aroundMessageId || afterWindowMessageId);
     const readerAfterMessageId = usesWindowPagination
       ? undefined
       : afterMessageId;
-    let loadedSession = await reader.getSession(
-      sessionId,
-      project.id,
-      readerAfterMessageId,
-      {
-        // Only include orphaned tool info if:
-        // 1. We previously owned this session (not external)
-        // 2. No active process (tools aren't potentially in progress)
-        // When we own the session, tools without results might be pending approval
-        includeOrphans: wasEverOwned && !process,
-        branchId,
-      },
+    const readerOptions = {
+      // Only include orphaned tool info if:
+      // 1. We previously owned the session (not external)
+      // 2. No active process (tools aren't potentially in progress)
+      // When we own the session, tools without results might be pending approval
+      includeOrphans: wasEverOwned && !process,
+      branchId,
+      deferMedia,
+      deferThinking,
+      inspectorProjection: inspectorProjectionRequested,
+      maxMessages: boundedMaxMessages,
+      tailCompactions: boundedTailCompactions,
+      beforeMessageId,
+      aroundMessageId,
+      afterWindowMessageId,
+      rolloutRevision: rolloutRevision ?? undefined,
+    };
+    let loadedSession: Awaited<ReturnType<ISessionReader["getSession"]>>;
+    let historyFallbackReason: CodexHistoryFallbackReason | undefined;
+    let fallbackHistoryCapabilityMs: number | undefined;
+    const pageReadStartedAt = performance.now();
+    try {
+      const persistedProvider =
+        deps.sessionMetadataService?.getProvider(sessionId);
+      const catalogSummary =
+        !process && !persistedProvider && !isCodexProviderName(project.provider)
+          ? await deps.codexSessionCatalog
+              ?.getSessionSummary(sessionId, project.path)
+              .catch(() => null)
+          : null;
+      const preferredProvider =
+        process?.provider ??
+        persistedProvider ??
+        catalogSummary?.provider ??
+        project.provider;
+      if (
+        deps.codexAppServerHistoryReader &&
+        isCodexProviderName(preferredProvider)
+      ) {
+        const appServerHistory =
+          await deps.codexAppServerHistoryReader.getSession(
+            sessionId,
+            project.id,
+            project.path,
+            readerAfterMessageId,
+            readerOptions,
+          );
+        if (appServerHistory.kind === "loaded") {
+          loadedSession = appServerHistory.session;
+        } else {
+          historyFallbackReason = appServerHistory.reason;
+          fallbackHistoryCapabilityMs = appServerHistory.historyCapabilityMs;
+          loadedSession = await reader.getSession(
+            sessionId,
+            project.id,
+            readerAfterMessageId,
+            readerOptions,
+          );
+        }
+      } else {
+        loadedSession = await reader.getSession(
+          sessionId,
+          project.id,
+          readerAfterMessageId,
+          readerOptions,
+        );
+      }
+
+      // For mixed projects, fall back to the other providers' session stores if
+      // the primary reader didn't find the session. Candidate ordering and
+      // reader construction are shared with findSessionSummaryAcrossProviders.
+      if (!loadedSession) {
+        const projectGroup = normalizeProviderGroup(project.provider);
+        for (const source of resolveSessionSources(
+          project,
+          toProviderResolutionDeps(deps),
+        )) {
+          if (normalizeProviderGroup(source.provider) === projectGroup)
+            continue;
+          loadedSession = await source.reader.getSession(
+            sessionId,
+            project.id,
+            readerAfterMessageId,
+            readerOptions,
+          );
+          if (loadedSession) break;
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === "ROLLOUT_CURSOR_STALE") {
+        serverTiming.set("pageRead", performance.now() - pageReadStartedAt);
+        applyServerTiming();
+        return c.json(
+          {
+            error: "Codex session cursor belongs to an older file revision",
+            code: "SESSION_HISTORY_CURSOR_STALE",
+          },
+          409,
+        );
+      }
+      if (message === "ROLLOUT_CHANGED_DURING_SCAN") {
+        serverTiming.set("pageRead", performance.now() - pageReadStartedAt);
+        applyServerTiming();
+        return c.json(
+          {
+            error: "Codex session changed while it was being loaded",
+            code: "SESSION_HISTORY_CHANGED",
+          },
+          409,
+        );
+      }
+      if (
+        message.includes("SESSION_HISTORY_UNAVAILABLE") ||
+        (error instanceof Error &&
+          error.name === "CodexHistoryUnavailableError")
+      ) {
+        serverTiming.set("pageRead", performance.now() - pageReadStartedAt);
+        applyServerTiming();
+        return c.json(
+          {
+            error:
+              "Codex rollback history is unavailable within the safe load budget",
+            code: "SESSION_HISTORY_UNAVAILABLE",
+          },
+          503,
+        );
+      }
+      if (
+        message.includes("admission budget") ||
+        message.includes("scan exceeds") ||
+        (error instanceof Error && error.name === "CodexRolloutScanError")
+      ) {
+        serverTiming.set("pageRead", performance.now() - pageReadStartedAt);
+        applyServerTiming();
+        return c.json(
+          {
+            error: "Codex session history exceeds the configured load budget",
+            code: "SESSION_HISTORY_BUDGET_EXCEEDED",
+          },
+          413,
+        );
+      }
+      throw error;
+    }
+
+    const historyReadTimings = loadedSession?.historyReadTimings;
+    serverTiming.set(
+      "historyCapability",
+      historyReadTimings?.historyCapabilityMs ?? fallbackHistoryCapabilityMs,
     );
+    serverTiming.set("summaryScan", historyReadTimings?.summaryScanMs);
+    serverTiming.set(
+      "pageRead",
+      historyReadTimings?.pageReadMs ?? performance.now() - pageReadStartedAt,
+    );
+    serverTiming.add("normalize", historyReadTimings?.normalizeMs);
 
-    // For Claude projects, also check for Codex sessions if primary reader didn't find it
-    // This handles mixed projects that have sessions from multiple providers
+    const readerPagination = loadedSession?.pagination;
+    const readerPaginationApplied = loadedSession?.paginationApplied === true;
+    const appServerHistorySelected =
+      loadedSession?.historySource === "codex-app-server";
+    const codexRolloutBytes = loadedSession?.codexRolloutBytes;
+    const codexCanonicalAdmissionAllowed =
+      codexRolloutBytes === undefined ||
+      codexRolloutBytes <= CODEX_CANONICAL_MAX_ROLLOUT_BYTES;
+    let session = serverTiming.measureSync("normalize", () =>
+      loadedSession
+        ? normalizeSession(loadedSession, { deferMedia, deferThinking })
+        : null,
+    );
+    let codexCanonicalView:
+      | {
+          requested: true;
+          source: string;
+          sourceKind: "provider" | "legacy-bridge-full" | "custom" | "rollout";
+          coverage:
+            | "retained-complete-prefix"
+            | "retained-partial-leading-gap"
+            | "rollout-only";
+          fallback: "rollout";
+          fallbackReason?: string;
+          firstAvailableSequence?: number;
+          lastSequence?: number;
+        }
+      | undefined =
+      canonicalViewRequested && !appServerHistorySelected
+        ? {
+            requested: true,
+            source: "rollout",
+            sourceKind: "rollout",
+            coverage: "rollout-only",
+            fallback: "rollout",
+            fallbackReason: "canonical_source_not_selected",
+          }
+        : undefined;
+
+    // The Codex reader applies bounded windows before normalization. Keep the
+    // parsed bound for canonical overlay admission, but do not slice the page
+    // a second time below.
     if (
-      !loadedSession &&
-      project.provider === "claude" &&
-      (deps.codexReaderFactory || deps.codexSessionsDir)
+      session &&
+      !appServerHistorySelected &&
+      canonicalViewRequested &&
+      isCodexProviderName(session.provider) &&
+      !codexCanonicalAdmissionAllowed
     ) {
-      const codexReader =
-        deps.codexReaderFactory?.(project.path) ??
-        (deps.codexSessionsDir
-          ? new CodexSessionReader({
-              sessionsDir: deps.codexSessionsDir,
-              projectPath: project.path,
-            })
-          : null);
-      if (codexReader) {
-        loadedSession = await codexReader.getSession(
+      codexCanonicalView = {
+        requested: true,
+        source: "rollout",
+        sourceKind: "rollout",
+        coverage: "rollout-only",
+        fallback: "rollout",
+        fallbackReason: "rollout_budget_exceeded",
+      };
+      getLogger().debug(
+        {
           sessionId,
-          project.id,
-          readerAfterMessageId,
-          { includeOrphans: wasEverOwned && !process, branchId },
+          rolloutBytes: codexRolloutBytes,
+          maxRolloutBytes: CODEX_CANONICAL_MAX_ROLLOUT_BYTES,
+          reason: "rollout_budget_exceeded",
+        },
+        "Canonical Codex overlay skipped for large rollout",
+      );
+    }
+
+    if (
+      session &&
+      !appServerHistorySelected &&
+      canonicalViewRequested &&
+      codexCanonicalAdmissionAllowed &&
+      isCodexProviderName(session.provider) &&
+      codexEventStoreSources.length > 0
+    ) {
+      const canonicalStartedMs = Date.now();
+      // Declared outside the try so a failure log can say which phase consumed
+      // the budget. A cold journal replay that eats all 2 s is indistinguishable
+      // from a slow overlay without it.
+      let journalReplayMs: number | undefined;
+      try {
+        const selectStartedAt = performance.now();
+        const selected = await serverTiming.measure("canonicalSelect", () =>
+          selectCodexEventSourceWithCache(
+            codexEventStoreSources,
+            sessionId,
+            codexProjectionCache,
+          ),
+        );
+        journalReplayMs = performance.now() - selectStartedAt;
+        // The budget starts here, after the journal is in memory. Selection and
+        // replay are an uninterruptible cold-load cost that no amount of budget
+        // can shorten, and including them meant the overlay was skipped because
+        // *loading* was slow rather than because projecting was. Everything from
+        // this point on -- the artifact scan and the overlay itself -- is work
+        // this budget can actually bound.
+        const budgetStartedMs = Date.now();
+        if (selected) {
+          codexCanonicalView = {
+            requested: true,
+            source: selected.sourceId,
+            sourceKind: selected.sourceKind,
+            coverage: selected.coverage.completePrefix
+              ? "retained-complete-prefix"
+              : "retained-partial-leading-gap",
+            fallback: "rollout",
+            ...(!selected.coverage.completePrefix
+              ? { fallbackReason: "journal_leading_gap" }
+              : {}),
+            firstAvailableSequence: selected.coverage.firstAvailableSequence,
+            lastSequence: selected.coverage.lastSequence,
+          };
+          // A windowed request only builds and matches the recent candidate
+          // tail, which is what makes long sessions affordable, so viability
+          // depends on it. Computed here rather than just before the overlay
+          // because the decision has to precede the artifact scan below.
+          const canWindowCanonicalTail =
+            boundedMaxMessages !== undefined &&
+            afterMessageId === undefined &&
+            beforeMessageId === undefined &&
+            aroundMessageId === undefined &&
+            afterWindowMessageId === undefined &&
+            branchId === undefined;
+          const candidateWindow = canWindowCanonicalTail
+            ? boundedMaxMessages
+            : undefined;
+          const viability = assessCanonicalOverlayViability({
+            eventCount: selected.events.length,
+            ...(candidateWindow === undefined
+              ? {}
+              : { maxCandidateCount: candidateWindow }),
+          });
+          if (!viability.viable) {
+            // Bail before the generated-artifact scan: it walks every replayed
+            // event, and an out-of-bounds session used to pay for that scan only
+            // to have the result discarded by the very next statement.
+            throw new CodexOverlayNotViableError(viability);
+          }
+          let generatedArtifacts: GeneratedArtifactManifest[] = [];
+          try {
+            generatedArtifacts =
+              await generatedArtifactUploadManager.listReplayableGeneratedArtifacts(
+                { projectId: project.id, sessionId },
+                selected.events,
+              );
+          } catch {
+            // Artifact recovery is fail-closed and must not suppress the rest
+            // of the canonical refresh projection.
+            getLogger().warn(
+              { sessionId },
+              "Canonical Codex generated artifacts unavailable on refresh",
+            );
+          }
+          const overlayStartedMs = Date.now();
+          const sessionMessages = session.messages;
+          const overlay = serverTiming.measureSync("canonicalOverlay", () =>
+            overlayCanonicalCodexSessionMessages(
+              sessionId,
+              sessionMessages,
+              selected.events,
+              {
+                appendUnmatched: afterMessageId === undefined,
+                ...(afterMessageId === undefined ? {} : { afterMessageId }),
+                generatedArtifacts,
+                sourceId: selected.sourceId,
+                projectionCache: codexProjectionCache,
+                startedMs: budgetStartedMs,
+                budgetMs: canonicalOverlayBudgetMs,
+                ...(candidateWindow === undefined
+                  ? {}
+                  : { maxCandidateCount: candidateWindow }),
+              },
+            ),
+          );
+          session = {
+            ...session,
+            messages: overlay.messages,
+            ...(overlay.turnHealth ?? {}),
+          };
+          getLogger().debug(
+            {
+              sessionId,
+              sourceId: selected.sourceId,
+              warm: selected.warm,
+              eventCount: overlay.eventCount,
+              projectedMessageCount: overlay.projectedMessageCount,
+              journalReplayMs,
+              overlayMs: Date.now() - overlayStartedMs,
+              totalMs: Date.now() - canonicalStartedMs,
+              cacheSize: codexProjectionCache.size,
+            },
+            "Canonical Codex overlay completed",
+          );
+        }
+      } catch (error) {
+        // Refresh remains available from the provider rollout if a canonical
+        // journal is temporarily unreadable, is known to be out of bounds, or
+        // blows the soft time budget. Those are three different situations and
+        // the log has to say which one happened: this line previously recorded
+        // neither the error name nor its message, so a hard event-limit
+        // rejection appeared as `budgetExceeded: false` with an unexplained
+        // duration, and 98% of these entries were misread as budget timeouts.
+        const notViable = error instanceof CodexOverlayNotViableError;
+        const budgetExceeded = error instanceof CodexOverlayBudgetExceededError;
+        const details = {
+          sessionId,
+          outcome: notViable
+            ? ("skipped" as const)
+            : budgetExceeded
+              ? ("budget_exceeded" as const)
+              : ("failed" as const),
+          ...(notViable ? { reason: error.reason } : {}),
+          eventCount:
+            error instanceof CodexOverlayBudgetExceededError ||
+            error instanceof CodexOverlayNotViableError
+              ? error.eventCount
+              : undefined,
+          ...(notViable ? { maxEvents: error.maxEvents } : {}),
+          budgetExceeded,
+          budgetMs: canonicalOverlayBudgetMs,
+          errorName: error instanceof Error ? error.name : typeof error,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          journalReplayMs,
+          totalMs: Date.now() - canonicalStartedMs,
+        };
+        codexCanonicalView = {
+          requested: true,
+          source: "rollout",
+          sourceKind: "rollout",
+          coverage: "rollout-only",
+          fallback: "rollout",
+          fallbackReason:
+            error instanceof CodexEventSourceAdmissionError
+              ? "canonical_source_budget_exceeded"
+              : notViable
+                ? `canonical_${error.reason}`
+                : budgetExceeded
+                  ? "canonical_budget_exceeded"
+                  : "canonical_read_failed",
+        };
+        if (notViable) {
+          // A known bound, not a fault: every request for this session takes
+          // this path, so warning on each one is pure noise.
+          getLogger().debug(
+            details,
+            "Canonical Codex overlay skipped; using legacy normalization",
+          );
+        } else {
+          getLogger().warn(
+            details,
+            "Canonical Codex session overlay unavailable; using legacy normalization",
+          );
+        }
+      }
+    }
+
+    if (
+      session &&
+      !appServerHistorySelected &&
+      !canonicalViewRequested &&
+      afterMessageId === undefined &&
+      codexCanonicalAdmissionAllowed &&
+      isCodexProviderName(session.provider) &&
+      codexEventStoreSources.length > 0
+    ) {
+      const errorOverlayStartedMs = Date.now();
+      try {
+        const selected = await serverTiming.measure("canonicalSelect", () =>
+          selectCodexProviderErrorEventSource(
+            codexEventStoreSources,
+            sessionId,
+          ),
+        );
+        if (selected) {
+          const sessionMessages = session.messages;
+          const overlay = serverTiming.measureSync("canonicalOverlay", () =>
+            overlayCodexProviderErrorMessages(
+              sessionId,
+              sessionMessages,
+              selected.events,
+            ),
+          );
+          session = {
+            ...session,
+            messages: overlay.messages,
+            ...(overlay.turnHealth ?? {}),
+          };
+          getLogger().debug(
+            {
+              sessionId,
+              sourceId: selected.sourceId,
+              eventCount: overlay.eventCount,
+              projectedMessageCount: overlay.projectedMessageCount,
+              totalMs: Date.now() - errorOverlayStartedMs,
+            },
+            "Codex provider error overlay completed",
+          );
+        }
+      } catch {
+        // The rollout remains the compatibility baseline. A journal read or
+        // validation failure must not make the normal session endpoint fail.
+        getLogger().warn(
+          {
+            sessionId,
+            totalMs: Date.now() - errorOverlayStartedMs,
+          },
+          "Codex provider error overlay unavailable; using legacy normalization",
         );
       }
     }
 
-    // For Claude/Codex projects, also check for Gemini sessions if still not found
-    // This handles mixed projects that have sessions from multiple providers
-    if (
-      !loadedSession &&
-      (project.provider === "claude" || project.provider === "codex") &&
-      (deps.geminiReaderFactory || deps.geminiSessionsDir)
-    ) {
-      const geminiReader =
-        deps.geminiReaderFactory?.(project.path) ??
-        (deps.geminiSessionsDir
-          ? new GeminiSessionReader({
-              sessionsDir: deps.geminiSessionsDir,
-              projectPath: project.path,
-              hashToCwd: deps.geminiScanner?.getHashToCwd(),
-            })
-          : null);
-      if (geminiReader) {
-        loadedSession = await geminiReader.getSession(
-          sessionId,
-          project.id,
-          readerAfterMessageId,
-          { includeOrphans: wasEverOwned && !process, branchId },
-        );
+    if (session && isCodexProviderName(session.provider)) {
+      const forkBranchState = await getCodexForkBranchState(
+        project,
+        sessionId,
+        session,
+        branchId,
+      );
+      if (forkBranchState) {
+        session = {
+          ...session,
+          branchState: forkBranchState,
+          codexBranchState: forkBranchState,
+          messages: annotateBranchMessages(session.messages, forkBranchState, {
+            includeCodexAlias: true,
+          }),
+        };
       }
     }
-
-    let session = loadedSession ? normalizeSession(loadedSession) : null;
 
     const runtime = deriveSessionRuntime({
       process,
       externalActive: isExternal,
-      externalActivity: bridgedSession?.activity,
+      externalActivity:
+        bridgedSession?.activity ??
+        deps.externalTracker?.getExternalActivity?.(sessionId),
       fallbackOwnership: session?.ownership,
     });
     const ownership = runtime.ownership;
@@ -1233,10 +2079,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     // Get pending input request from active process (for tool approval prompts)
     // This ensures clients get pending requests immediately without waiting for SSE
     const activePendingInputRequest =
-      process?.state.type === "waiting-input"
-        ? process.state.request
-        : ((await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
-          null);
+      await sessionCommandService.getPendingInput(sessionId, {
+        processSnapshot: process,
+      });
     const livePendingInputType =
       pendingInputTypeFromProcess(process) ??
       bridgedSession?.pendingInputType ??
@@ -1250,26 +2095,29 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     // The init message that normally carries these gets discarded from the SSE buffer
     // after ~30s, so we attach them to the REST response for reliable delivery.
     const slashCommands = process?.supportsDynamicCommands
-      ? await process.supportedCommands()
+      ? await runtimeController.getSupportedCommands(process.id)
       : null;
 
     if (!session) {
       // Session file doesn't exist yet - only valid if we own the process
       if (process) {
         // Get raw messages from process memory
-        const sdkMessages = process.getMessageHistory();
+        const sdkMessages = process.messageHistory;
         // Convert to client format
         const processMessages = sdkMessagesToClientMessages(sdkMessages, {
-          model: process.resolvedModel,
+          model: process.model,
           provider: process.provider,
+          deferMedia,
+          deferThinking,
         });
+        await augmentPersistedSessionMessages(processMessages);
         // Extract context usage from raw SDK messages (has usage field)
         // Use process.contextWindow (captured from result messages) as primary source
         const mis = deps.modelInfoService;
         const sdkContextWindow = process.contextWindow;
         const contextUsage = extractContextUsageFromSDKMessages(
           sdkMessages,
-          process.resolvedModel,
+          process.model,
           process.provider,
           sdkContextWindow
             ? () => sdkContextWindow
@@ -1278,9 +2126,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
               : undefined,
         );
         // Cache SDK-reported context window for future JSONL reads
-        if (mis && sdkContextWindow && process.resolvedModel) {
+        if (mis && sdkContextWindow && process.model) {
           mis.recordContextWindow(
-            process.resolvedModel,
+            process.model,
             sdkContextWindow,
             process.provider,
           );
@@ -1300,41 +2148,42 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         const hasUnread = deps.notificationService
           ? deps.notificationService.hasUnread(sessionId, newSessionUpdatedAt)
           : undefined;
-        const sessionMetadata = {
-          id: sessionId,
-          projectId,
-          title: null,
-          createdAt: new Date().toISOString(),
-          updatedAt: newSessionUpdatedAt,
-          messageCount: processMessages.length,
-          ownership,
-          pendingInputType: livePendingInputType,
-          activity: runtime.activity,
-          runtime,
-          messages: processMessages,
-          customTitle: metadata?.customTitle,
-          aiTitle: metadata?.aiTitle,
-          isArchived: metadata?.isArchived,
-          isStarred: metadata?.isStarred,
-          createdBy: metadata?.createdBy,
-          lastSeenAt: lastSeenEntry?.timestamp,
-          hasUnread,
-          provider: process.provider,
-          model: process.resolvedModel,
-          reasoningEffort: process.resolvedReasoningEffort,
-          serviceTier: process.serviceTier,
-          contextUsage,
-        };
-        const projection = createBrowserSessionProjection(
-          sessionMetadata,
-          processMessages,
-        );
+        applyServerTiming();
         return c.json({
-          ...projection,
+          session: {
+            id: sessionId,
+            projectId,
+            title: null,
+            createdAt: new Date().toISOString(),
+            updatedAt: newSessionUpdatedAt,
+            messageCount: processMessages.length,
+            ownership,
+            pendingInputType: livePendingInputType,
+            activity: runtime.activity,
+            runtime,
+            messages: processMessages,
+            customTitle: metadata?.customTitle,
+            aiTitle: metadata?.aiTitle,
+            isArchived: metadata?.isArchived,
+            isStarred: metadata?.isStarred,
+            createdBy: metadata?.createdBy,
+            originChannel: metadata?.originChannel,
+            lastSeenAt: lastSeenEntry?.timestamp,
+            hasUnread,
+            provider: process.provider,
+            model: process.model,
+            reasoningEffort: process.reasoningEffort,
+            serviceTier: process.serviceTier,
+            retryStatus: process.retryStatus,
+            contextUsage,
+          },
+          messages: processMessages,
           ownership,
           runtime,
           pendingInputRequest: activePendingInputRequest,
           slashCommands,
+          ...(codexCanonicalView && { codexCanonicalView }),
+          ...getSessionPermissionModeState(deps, sessionId, process),
         });
       }
       if (bridgedSession) {
@@ -1346,35 +2195,55 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
               bridgedSession.session.updatedAt,
             )
           : undefined;
-        const sessionMetadata = {
-          ...bridgedSession.session,
-          messages: [],
-          customTitle: metadata?.customTitle,
-          aiTitle: metadata?.aiTitle ?? bridgedSession.session.aiTitle,
-          isArchived: metadata?.isArchived,
-          isStarred: metadata?.isStarred,
-          createdBy: metadata?.createdBy ?? bridgedSession.session.createdBy,
-          ownership,
-          pendingInputType: livePendingInputType,
-          activity: runtime.activity,
-          runtime,
-          lastSeenAt: lastSeenEntry?.timestamp,
-          hasUnread,
-        };
-        const projection = createBrowserSessionProjection(sessionMetadata, []);
+        applyServerTiming();
         return c.json({
-          ...projection,
+          session: {
+            ...bridgedSession.session,
+            messages: [],
+            customTitle: metadata?.customTitle,
+            aiTitle: metadata?.aiTitle ?? bridgedSession.session.aiTitle,
+            isArchived: metadata?.isArchived,
+            isStarred: metadata?.isStarred,
+            createdBy: metadata?.createdBy ?? bridgedSession.session.createdBy,
+            originChannel:
+              metadata?.originChannel ?? bridgedSession.session.originChannel,
+            ownership,
+            pendingInputType: livePendingInputType,
+            activity: runtime.activity,
+            runtime,
+            lastSeenAt: lastSeenEntry?.timestamp,
+            hasUnread,
+          },
+          messages: [],
           ownership,
           runtime,
           pendingInputRequest: activePendingInputRequest,
           slashCommands,
+          ...(codexCanonicalView && { codexCanonicalView }),
+          ...getSessionPermissionModeState(deps, sessionId, process),
         });
       }
+      applyServerTiming();
       return c.json({ error: "Session not found" }, 404);
     }
 
     // Get session metadata (custom title, archived, starred)
     const metadata = deps.sessionMetadataService?.getMetadata(sessionId);
+    if (metadata?.forkFamilyTitle) {
+      session = {
+        ...session,
+        title: metadata.forkFamilyTitle,
+        fullTitle: metadata.forkFamilyFullTitle ?? metadata.forkFamilyTitle,
+      };
+    }
+    if (loadedSession?.historySource === "codex-app-server" && metadata) {
+      session = {
+        ...session,
+        model: session.model ?? metadata.model,
+        codexModelProvider:
+          session.codexModelProvider ?? metadata.codexModelProvider,
+      };
+    }
 
     // Get notification data (lastSeenAt, hasUnread)
     const lastSeenEntry = deps.notificationService?.getLastSeen(sessionId);
@@ -1383,15 +2252,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       ? deps.notificationService.hasUnread(sessionId, session.updatedAt)
       : undefined;
 
-    // Apply compact-boundary pagination if requested (BEFORE expensive augmentation)
-    // tailCompactions slices to last N compact boundaries; skip when afterMessageId is
-    // present since that's a different use case (incremental forward-fetch)
-    let paginationInfo: PaginationInfo | undefined;
-    const boundedMaxMessages =
-      maxMessages !== undefined && !Number.isNaN(maxMessages) && maxMessages > 0
-        ? maxMessages
-        : undefined;
-    if (aroundMessageId && !afterMessageId) {
+    // Codex applies bounded windows in the reader, before normalization. Legacy
+    // providers (and small rollback rollouts) keep the route-level slicer.
+    let paginationInfo: PaginationInfo | undefined = readerPagination;
+    if (!readerPaginationApplied && aroundMessageId && !afterMessageId) {
       const sliced = sliceAroundMessage(
         session.messages,
         aroundMessageId,
@@ -1399,7 +2263,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       );
       session = { ...session, messages: sliced.messages };
       paginationInfo = sliced.pagination;
-    } else if (afterWindowMessageId && !afterMessageId) {
+    } else if (
+      !readerPaginationApplied &&
+      afterWindowMessageId &&
+      !afterMessageId
+    ) {
       const sliced = sliceAfterMessage(
         session.messages,
         afterWindowMessageId,
@@ -1408,6 +2276,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       session = { ...session, messages: sliced.messages };
       paginationInfo = sliced.pagination;
     } else if (
+      !readerPaginationApplied &&
       tailCompactions !== undefined &&
       !Number.isNaN(tailCompactions) &&
       tailCompactions > 0 &&
@@ -1423,8 +2292,18 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       paginationInfo = sliced.pagination;
     }
 
-    // Keep persisted rendering in lockstep with stream augmentation behavior.
-    await augmentPersistedSessionMessages(session.messages);
+    // Inspector reads keep only safe, body-free index metadata. Do this before
+    // renderer augmentation so hidden tools never pay diff/Markdown work and
+    // no augment field can accidentally widen the public projection.
+    const responseMessages = inspectorProjectionRequested
+      ? projectSessionInspectorMessages(session.messages)
+      : session.messages;
+    if (!inspectorProjectionRequested) {
+      // Keep persisted rendering in lockstep with stream augmentation behavior.
+      await serverTiming.measure("augment", () =>
+        augmentPersistedSessionMessages(responseMessages),
+      );
+    }
 
     const persistedPendingInputRequest =
       activePendingInputRequest === null &&
@@ -1451,7 +2330,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       };
       // Cache for future reads without a live process
       deps.modelInfoService?.recordContextWindow(
-        process.resolvedModel ?? session.model ?? "",
+        process.model ?? session.model ?? "",
         cw,
         process.provider,
       );
@@ -1462,93 +2341,68 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       );
     }
 
-    // Record session visit with the REAL projectId from the session data.
-    // The session.projectId comes from the session file's cwd field (source of truth),
-    // not from the URL parameter. This ensures recents.json always has the correct
-    // project association, even if the user navigated with a stale/incorrect projectId.
-    if (deps.recentsService) {
-      await deps.recentsService.recordVisit(sessionId, session.projectId);
-    }
+    // `messages` is returned once at the top level. Spreading `session` here
+    // used to emit a byte-identical second copy that no client ever read, which
+    // doubled the serialized message payload on every session open.
+    const {
+      messages: _sessionMessages,
+      messageCount: normalizedMessageCount,
+      ...sessionWithoutMessages
+    } = session;
 
-    const sessionMetadata = {
-      ...session,
-      ownership,
-      pendingInputType,
-      activity: runtime.activity,
-      runtime,
-      contextUsage,
-      customTitle: metadata?.customTitle,
-      aiTitle: metadata?.aiTitle ?? session.aiTitle,
-      isArchived: metadata?.isArchived,
-      isStarred: metadata?.isStarred,
-      createdBy: metadata?.createdBy ?? session.createdBy,
-      // Model: prefer explicit user preset from metadata, fall back to
-      // the model recorded in the session JSONL (from last run).
-      model: metadata?.model ?? session.model,
-      lastSeenAt,
-      hasUnread,
-    };
-    const projection = createBrowserSessionProjection(
-      sessionMetadata,
-      session.messages,
-    );
-    return c.json({
-      ...projection,
+    applyServerTiming();
+    return conditionalJson(c, {
+      session: {
+        ...sessionWithoutMessages,
+        ...(bridgedSession
+          ? { messageCount: bridgedSession.session.messageCount }
+          : appServerHistorySelected
+            ? {}
+            : { messageCount: normalizedMessageCount }),
+        ownership,
+        pendingInputType,
+        activity: runtime.activity,
+        runtime,
+        contextUsage,
+        customTitle: metadata?.customTitle,
+        aiTitle: metadata?.aiTitle ?? session.aiTitle,
+        isArchived: metadata?.isArchived,
+        isStarred: metadata?.isStarred,
+        createdBy: metadata?.createdBy ?? session.createdBy,
+        originChannel: metadata?.originChannel ?? session.originChannel,
+        // Model comes from the session reader (extracted from JSONL)
+        model: session.model,
+        lastTurnStatus: bridgedSession
+          ? bridgedSession.session.lastTurnStatus
+          : session.lastTurnStatus,
+        lastErrorMessage: bridgedSession
+          ? bridgedSession.session.lastErrorMessage
+          : session.lastErrorMessage,
+        retryStatus: process
+          ? process.retryStatus
+          : bridgedSession
+            ? bridgedSession.session.retryStatus
+            : session.retryStatus,
+        lastSeenAt,
+        hasUnread,
+      },
+      messages: responseMessages,
       ownership,
       runtime,
       pendingInputRequest,
       slashCommands,
+      ...getSessionPermissionModeState(deps, sessionId, process),
       ...(paginationInfo && { pagination: paginationInfo }),
+      ...(loadedSession?.historySource && {
+        historySource: loadedSession.historySource,
+      }),
+      ...(historyFallbackReason && { historyFallbackReason }),
+      ...(codexCanonicalView && { codexCanonicalView }),
     });
   });
 
   // POST /api/projects/:projectId/sessions - Start new session
   routes.post("/projects/:projectId/sessions", async (c) => {
-    const projectId = c.req.param("projectId");
-
-    // Validate projectId format at API boundary
-    if (!isUrlProjectId(projectId)) {
-      return c.json({ error: "Invalid project ID format" }, 400);
-    }
-
-    // Use getOrCreateProject to allow starting sessions in new directories
-    let project = await deps.scanner.getOrCreateProject(projectId);
-    if (!project) {
-      return c.json({ error: "Project not found or path does not exist" }, 404);
-    }
-
-    // Self-heal stale projectId: same problem as resume, but for a new
-    // session we can't read the named session's jsonl (it doesn't exist
-    // yet) — scan the project's session directory instead. Any existing
-    // jsonl carries the SDK-written cwd, which is the source of truth.
-    const cwdResolution = await resolveStartCwd(
-      project.path,
-      project.sessionDir,
-    );
-    if (cwdResolution.status === "missing") {
-      return c.json(
-        { error: `Project directory ${project.path} no longer exists` },
-        404,
-      );
-    }
-    if (cwdResolution.status === "recovered") {
-      const recoveredCwd = cwdResolution.cwd;
-      const recoveredId = encodeProjectId(recoveredCwd);
-      const fresh = await deps.scanner.getOrCreateProject(recoveredId);
-      if (!fresh) {
-        return c.json(
-          {
-            error: `Project directory ${project.path} no longer exists and recovered path ${recoveredCwd} is also invalid`,
-          },
-          404,
-        );
-      }
-      console.warn(
-        `[startSession] Stale projectId: ${project.path} no longer exists; recovered cwd=${recoveredCwd}`,
-      );
-      project = fresh;
-    }
-
     let body: StartSessionBody;
     try {
       body = await c.req.json<StartSessionBody>();
@@ -1556,261 +2410,32 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       return c.json({ error: "Invalid JSON body" }, 400);
     }
 
-    if (!body.message) {
-      return c.json({ error: "Message is required" }, 400);
-    }
-    const { executor, error: executorError } = parseOptionalExecutor(
-      body.executor,
-    );
-    if (executorError) {
-      return c.json({ error: executorError }, 400);
-    }
-    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
-    if (parsedCodexMcpMode.error) {
-      return c.json({ error: parsedCodexMcpMode.error }, 400);
-    }
-
-    const userMessage: UserMessage = {
-      text: body.message,
-      images: body.images,
-      documents: body.documents,
-      attachments: body.attachments,
-      mode: body.mode,
-      tempId: body.tempId,
-    };
-
-    // Convert thinking option to SDK config
-    const { thinking, effort } = body.thinking
-      ? thinkingOptionToConfig(body.thinking)
-      : { thinking: undefined, effort: undefined };
-
-    // Convert model option (undefined or "default" means use CLI default)
-    const model =
-      body.model && body.model !== "default" ? body.model : undefined;
-
-    // Debug: log what we received
-    console.log("[startSession] Request body:", {
-      provider: body.provider,
-      executor,
-      model: body.model,
+    const result = await sessionCommandService.start({
+      projectId: c.req.param("projectId"),
+      body,
     });
-
-    const globalInstructions =
-      deps.serverSettingsService?.getSetting("globalInstructions") || undefined;
-
-    const result = await deps.supervisor.startSession(
-      project.path,
-      userMessage,
-      body.mode,
-      {
-        model,
-        thinking,
-        effort,
-        providerName: body.provider,
-        codexMcpMode: parsedCodexMcpMode.codexMcpMode,
-        executor,
-        globalInstructions,
-        permissions: body.permissions,
-      },
-    );
-
-    // Check if queue is full
-    if (isQueueFullResponse(result)) {
-      return c.json(
-        { error: "Queue is full", maxQueueSize: result.maxQueueSize },
-        503,
-      );
-    }
-
-    // Check if request was queued
-    if (isQueuedResponse(result)) {
-      return c.json(result, 202); // 202 Accepted - queued for processing
-    }
-
-    // Save provider and executor to session metadata for resume
-    if (deps.sessionMetadataService) {
-      if (body.provider) {
-        await deps.sessionMetadataService.setProvider(
-          result.sessionId,
-          body.provider,
-        );
-      }
-      if (executor) {
-        await deps.sessionMetadataService.setExecutor(
-          result.sessionId,
-          executor,
-        );
-      }
-      if (result.provider === "codex" && parsedCodexMcpMode.codexMcpMode) {
-        await deps.sessionMetadataService.setCodexMcpMode?.(
-          result.sessionId,
-          parsedCodexMcpMode.codexMcpMode,
-        );
-      }
-    }
-    await markSessionCreatedByYep(deps, result.sessionId, project.id);
-
-    return c.json({
-      sessionId: result.sessionId,
-      processId: result.id,
-      permissionMode: result.permissionMode,
-      modeVersion: result.modeVersion,
-    });
+    return c.json(result.body, result.status);
   });
 
-  // POST /api/projects/:projectId/sessions/create - Create session without starting agent
-  // Used for two-phase flow: create session first, upload files, then send first message
+  // POST /api/projects/:projectId/sessions/create - Create session without
+  // starting the agent. This supports the upload-first two-phase flow.
   routes.post("/projects/:projectId/sessions/create", async (c) => {
-    const projectId = c.req.param("projectId");
-
-    // Validate projectId format at API boundary
-    if (!isUrlProjectId(projectId)) {
-      return c.json({ error: "Invalid project ID format" }, 400);
-    }
-
-    // Use getOrCreateProject to allow starting sessions in new directories
-    const project = await deps.scanner.getOrCreateProject(projectId);
-    if (!project) {
-      return c.json({ error: "Project not found or path does not exist" }, 404);
-    }
-
     let body: CreateSessionBody = {};
     try {
       body = await c.req.json<CreateSessionBody>();
     } catch {
-      // Body is optional for this endpoint
+      // Body is optional for this endpoint.
     }
 
-    const { executor, error: executorError } = parseOptionalExecutor(
-      body.executor,
-    );
-    if (executorError) {
-      return c.json({ error: executorError }, 400);
-    }
-    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
-    if (parsedCodexMcpMode.error) {
-      return c.json({ error: parsedCodexMcpMode.error }, 400);
-    }
-
-    // Convert thinking option to SDK config
-    const { thinking, effort } = body.thinking
-      ? thinkingOptionToConfig(body.thinking)
-      : { thinking: undefined, effort: undefined };
-
-    // Convert model option (undefined or "default" means use CLI default)
-    const model =
-      body.model && body.model !== "default" ? body.model : undefined;
-
-    const globalInstructions =
-      deps.serverSettingsService?.getSetting("globalInstructions") || undefined;
-
-    const result = await deps.supervisor.createSession(
-      project.path,
-      body.mode,
-      {
-        model,
-        thinking,
-        effort,
-        providerName: body.provider,
-        codexMcpMode: parsedCodexMcpMode.codexMcpMode,
-        executor,
-        globalInstructions,
-        permissions: body.permissions,
-      },
-    );
-
-    // Check if queue is full
-    if (isQueueFullResponse(result)) {
-      return c.json(
-        { error: "Queue is full", maxQueueSize: result.maxQueueSize },
-        503,
-      );
-    }
-
-    // Check if request was queued
-    if (isQueuedResponse(result)) {
-      return c.json(result, 202); // 202 Accepted - queued for processing
-    }
-
-    // Save provider and executor to session metadata for resume
-    if (deps.sessionMetadataService) {
-      if (body.provider) {
-        await deps.sessionMetadataService.setProvider(
-          result.sessionId,
-          body.provider,
-        );
-      }
-      if (executor) {
-        await deps.sessionMetadataService.setExecutor(
-          result.sessionId,
-          executor,
-        );
-      }
-      if (result.provider === "codex" && parsedCodexMcpMode.codexMcpMode) {
-        await deps.sessionMetadataService.setCodexMcpMode?.(
-          result.sessionId,
-          parsedCodexMcpMode.codexMcpMode,
-        );
-      }
-    }
-    await markSessionCreatedByYep(deps, result.sessionId, project.id);
-
-    return c.json({
-      sessionId: result.sessionId,
-      processId: result.id,
-      permissionMode: result.permissionMode,
-      modeVersion: result.modeVersion,
+    const result = await sessionCommandService.create({
+      projectId: c.req.param("projectId"),
+      body,
     });
+    return c.json(result.body, result.status);
   });
 
   // POST /api/projects/:projectId/sessions/:sessionId/resume - Resume session
   routes.post("/projects/:projectId/sessions/:sessionId/resume", async (c) => {
-    const projectId = c.req.param("projectId");
-    const sessionId = c.req.param("sessionId");
-
-    // Validate projectId format at API boundary
-    if (!isUrlProjectId(projectId)) {
-      return c.json({ error: "Invalid project ID format" }, 400);
-    }
-
-    // Use getOrCreateProject to allow resuming in directories that may have been moved
-    let project = await deps.scanner.getOrCreateProject(projectId);
-    if (!project) {
-      return c.json({ error: "Project not found or path does not exist" }, 404);
-    }
-    let resolvedProjectId: UrlProjectId = projectId as UrlProjectId;
-
-    // Self-heal stale projectId: cached projectId may encode an old absolute
-    // path if the user moved or deleted the project directory. spawn() would
-    // then fail with ENOENT, which the SDK mis-renders as "binary exists but
-    // failed to launch". Recover the real cwd from the session's jsonl (the
-    // SDK rewrites it on every turn) and re-resolve the project.
-    const recoveredCwd = await resolveResumeCwd(
-      project.path,
-      project.sessionDir,
-      sessionId,
-    );
-    if (recoveredCwd) {
-      const recoveredId = encodeProjectId(recoveredCwd);
-      const fresh = await deps.scanner.getOrCreateProject(recoveredId);
-      if (!fresh) {
-        return c.json(
-          {
-            error: `Project directory ${project.path} no longer exists and recovered path ${recoveredCwd} is also invalid`,
-          },
-          404,
-        );
-      }
-      console.warn(
-        `[resume] Stale projectId for session ${sessionId}: ${project.path} no longer exists; recovered cwd=${recoveredCwd}`,
-      );
-      project = fresh;
-      resolvedProjectId = recoveredId;
-      if (deps.recentsService) {
-        await deps.recentsService.recordVisit(sessionId, recoveredId);
-      }
-    }
-
     let body: StartSessionBody;
     try {
       body = await c.req.json<StartSessionBody>();
@@ -1818,441 +2443,130 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       return c.json({ error: "Invalid JSON body" }, 400);
     }
 
-    if (!body.message) {
-      return c.json({ error: "Message is required" }, 400);
-    }
-    const parsedBodyExecutor = parseOptionalExecutor(body.executor);
-    if (parsedBodyExecutor.error) {
-      return c.json({ error: parsedBodyExecutor.error }, 400);
-    }
-    const parsedRollbackNumTurns = parseOptionalPositiveInteger(
-      body.rollbackNumTurns,
-      "rollbackNumTurns",
-    );
-    if (parsedRollbackNumTurns.error) {
-      return c.json({ error: parsedRollbackNumTurns.error }, 400);
-    }
-    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
-    if (parsedCodexMcpMode.error) {
-      return c.json({ error: parsedCodexMcpMode.error }, 400);
-    }
-
-    const userMessage: UserMessage = {
-      text: body.message,
-      images: body.images,
-      documents: body.documents,
-      attachments: body.attachments,
-      mode: body.mode,
-      tempId: body.tempId,
-    };
-
-    // Convert thinking option to SDK config
-    const { thinking, effort } = body.thinking
-      ? thinkingOptionToConfig(body.thinking)
-      : { thinking: undefined, effort: undefined };
-
-    // Convert model option (undefined or "default" means use CLI default)
-    const model =
-      body.model && body.model !== "default" ? body.model : undefined;
-
-    // Use client-provided executor, falling back to saved executor from metadata.
-    let executor = parsedBodyExecutor.executor;
-    if (!executor) {
-      const parsedSavedExecutor = parseOptionalExecutor(
-        deps.sessionMetadataService?.getExecutor(sessionId),
-      );
-      if (parsedSavedExecutor.error) {
-        return c.json({ error: parsedSavedExecutor.error }, 400);
-      }
-      executor = parsedSavedExecutor.executor;
-    }
-
-    // For remote sessions, sync local files TO remote before resuming
-    // This ensures the remote has the latest session state
-    if (executor) {
-      const projectDir = getProjectDirFromCwd(project.path);
-      const syncResult = await syncSessions({
-        host: executor,
-        projectDir,
-        direction: "to-remote",
-      });
-      if (!syncResult.success) {
-        console.warn(
-          `[resume] Failed to pre-sync session to ${executor}: ${syncResult.error}`,
-        );
-        // Continue anyway - remote may have the files from before
-      }
-
-      // Save executor to metadata if not already saved (e.g. client provided it)
-      if (deps.sessionMetadataService) {
-        await deps.sessionMetadataService.setExecutor(sessionId, executor);
-      }
-    }
-
-    const globalInstructions =
-      deps.serverSettingsService?.getSetting("globalInstructions") || undefined;
-
-    // Look up the session's original provider so we resume with the correct one
-    // (e.g., claude-ollama sessions need the Ollama provider, not default Claude).
-    // Check metadata first (explicitly saved on creation), then fall back to reader.
-    const metadataProvider = deps.sessionMetadataService?.getProvider(
-      sessionId,
-    ) as ProviderName | undefined;
-
-    let providerName = metadataProvider ?? body.provider;
-    if (!providerName) {
-      const sessionSummaryResult = await findSessionSummaryAcrossProviders(
-        project,
-        sessionId,
-        resolvedProjectId,
-        {
-          readerFactory: deps.readerFactory,
-          codexSessionsDir: deps.codexSessionsDir,
-          codexReaderFactory: deps.codexReaderFactory,
-          geminiSessionsDir: deps.geminiSessionsDir,
-          geminiReaderFactory: deps.geminiReaderFactory,
-          geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
-        },
-        metadataProvider ?? body.provider,
-      );
-      const sessionSummary = sessionSummaryResult?.summary ?? null;
-      providerName =
-        sessionSummary?.provider ??
-        metadataProvider ??
-        body.provider ??
-        project.provider;
-    }
-
-    getLogger().info(
-      {
-        event: "session_resume_requested",
-        sessionId,
-        projectId: resolvedProjectId,
-        projectPath: project.path,
-        providerName,
-        bodyProvider: body.provider ?? null,
-        metadataProvider: metadataProvider ?? null,
-        executor: executor ?? null,
-        codexMcpMode:
-          parsedCodexMcpMode.codexMcpMode ??
-          deps.sessionMetadataService?.getCodexMcpMode?.(sessionId) ??
-          null,
-        resumeSessionAt:
-          providerName === "claude" ? (body.resumeSessionAt ?? null) : null,
-        rollbackNumTurns:
-          providerName === "codex"
-            ? (parsedRollbackNumTurns.value ?? null)
-            : null,
-        ignoredResumeSessionAt:
-          providerName !== "claude" ? (body.resumeSessionAt ?? null) : null,
-        ignoredRollbackNumTurns:
-          providerName !== "codex"
-            ? (parsedRollbackNumTurns.value ?? null)
-            : null,
-        tempId: body.tempId ?? null,
-        messageLength: body.message.length,
-      },
-      "Session resume requested",
-    );
-
-    const result = await deps.supervisor.resumeSession(
-      sessionId,
-      project.path,
-      userMessage,
-      body.mode,
-      {
-        model,
-        thinking,
-        effort,
-        providerName,
-        codexMcpMode:
-          providerName === "codex"
-            ? (parsedCodexMcpMode.codexMcpMode ??
-              deps.sessionMetadataService?.getCodexMcpMode?.(sessionId))
-            : undefined,
-        executor,
-        globalInstructions,
-        permissions: body.permissions,
-        // Rewind/edit: resume the SAME session but only up to (and including)
-        // this message UUID, branching the conversation in place. The old tail
-        // becomes a dead branch the reader filters out by timestamp. Pass the
-        // edited message's parentUuid so that message and everything after it
-        // are dropped. Claude provider only (SDK feature).
-        resumeSessionAt:
-          providerName === "claude" ? body.resumeSessionAt : undefined,
-        // Codex app-server models Codex CLI Esc Esc backtrack as a
-        // same-thread rollback count, not as a message UUID.
-        rollbackNumTurns:
-          providerName === "codex" ? parsedRollbackNumTurns.value : undefined,
-      },
-    );
-
-    if (
-      deps.sessionMetadataService &&
-      providerName === "codex" &&
-      parsedCodexMcpMode.codexMcpMode
-    ) {
-      await deps.sessionMetadataService.setCodexMcpMode?.(
-        sessionId,
-        parsedCodexMcpMode.codexMcpMode,
-      );
-    }
-
-    // Check if queue is full
-    if (isQueueFullResponse(result)) {
-      return c.json(
-        { error: "Queue is full", maxQueueSize: result.maxQueueSize },
-        503,
-      );
-    }
-
-    // Check if request was queued
-    if (isQueuedResponse(result)) {
-      getLogger().info(
-        {
-          event: "session_resume_queued",
-          sessionId,
-          projectId: resolvedProjectId,
-          providerName,
-          queueId: result.queueId,
-          position: result.position,
-        },
-        "Session resume queued",
-      );
-      return c.json(result, 202); // 202 Accepted - queued for processing
-    }
-
-    getLogger().info(
-      {
-        event: "session_resume_process_started",
-        sessionId,
-        projectId: resolvedProjectId,
-        providerName,
-        processId: result.id,
-        permissionMode: result.permissionMode,
-        modeVersion: result.modeVersion,
-      },
-      "Session resume process started",
-    );
-
-    return c.json({
-      processId: result.id,
-      permissionMode: result.permissionMode,
-      modeVersion: result.modeVersion,
+    const result = await sessionCommandService.resume({
+      projectId: c.req.param("projectId"),
+      sessionId: c.req.param("sessionId"),
+      body,
     });
+    return c.json(result.body, result.status);
   });
 
   // POST /api/sessions/:sessionId/messages - Queue message
   routes.post("/sessions/:sessionId/messages", async (c) => {
-    const sessionId = c.req.param("sessionId");
-
-    const process = deps.supervisor.getProcessForSession(sessionId);
-    if (!process) {
-      getLogger().warn(
-        {
-          event: "session_queue_rejected",
-          sessionId,
-          reason: "no_active_process",
-        },
-        "Session queue rejected",
-      );
-      return c.json({ error: "No active process for session" }, 404);
-    }
-
-    let body: StartSessionBody & { deferred?: boolean };
+    let body: QueueSessionMessageBody;
     try {
-      body = await c.req.json<StartSessionBody & { deferred?: boolean }>();
+      body = await c.req.json<QueueSessionMessageBody>();
     } catch {
       return c.json({ error: "Invalid JSON body" }, 400);
     }
 
-    if (!body.message) {
-      return c.json({ error: "Message is required" }, 400);
-    }
-
-    const queueLogContext = {
-      sessionId,
-      tempId: body.tempId,
-      messageLength: body.message.length,
-      processState: process.state?.type,
-    };
-    getLogger().info(
-      {
-        event: "session_queue_requested",
-        ...queueLogContext,
-      },
-      "Session queue requested",
-    );
-
-    const parsedCodexMcpMode = parseOptionalCodexMcpMode(body.codexMcpMode);
-    if (parsedCodexMcpMode.error) {
-      getLogger().warn(
-        {
-          event: "session_queue_rejected",
-          ...queueLogContext,
-          reason: "invalid_codex_mcp_mode",
-        },
-        "Session queue rejected",
-      );
-      return c.json({ error: parsedCodexMcpMode.error }, 400);
-    }
-
-    const userMessage: UserMessage = {
-      text: body.message,
-      images: body.images,
-      documents: body.documents,
-      attachments: body.attachments,
-      mode: body.mode,
-      tempId: body.tempId,
-    };
-
-    // Check if process is terminated
-    if (process.isTerminated) {
-      getLogger().warn(
-        {
-          event: "session_queue_rejected",
-          ...queueLogContext,
-          reason: "process_terminated",
-        },
-        "Session queue rejected",
-      );
-      return c.json(
-        {
-          error: "Process terminated",
-          reason: process.terminationReason,
-        },
-        410,
-      ); // 410 Gone
-    }
-
-    // Deferred messages are held server-side and auto-sent when the agent finishes
-    if (body.deferred) {
-      process.deferMessage(userMessage);
-      getLogger().info(
-        {
-          event: "session_queue_accepted",
-          ...queueLogContext,
-        },
-        "Session queue accepted",
-      );
-      return c.json({ queued: true, deferred: true });
-    }
-
-    // Convert thinking option to SDK config
-    const { thinking, effort } = body.thinking
-      ? thinkingOptionToConfig(body.thinking)
-      : { thinking: undefined, effort: undefined };
-
-    const metadataProvider = deps.sessionMetadataService?.getProvider(
-      sessionId,
-    ) as ProviderName | undefined;
-    const metadataExecutor = parseOptionalExecutor(
-      deps.sessionMetadataService?.getExecutor(sessionId),
-    );
-    if (metadataExecutor.error) {
-      getLogger().warn(
-        {
-          event: "session_queue_rejected",
-          ...queueLogContext,
-          reason: "invalid_metadata_executor",
-        },
-        "Session queue rejected",
-      );
-      return c.json({ error: metadataExecutor.error }, 400);
-    }
-    const { executor, error: executorError } = parseOptionalExecutor(
-      body.executor,
-    );
-    if (executorError) {
-      getLogger().warn(
-        {
-          event: "session_queue_rejected",
-          ...queueLogContext,
-          reason: "invalid_executor",
-        },
-        "Session queue rejected",
-      );
-      return c.json({ error: executorError }, 400);
-    }
-
-    const model =
-      body.model && body.model !== "default"
-        ? body.model
-        : (process.resolvedModel ?? process.model);
-    const providerName = metadataProvider ?? body.provider ?? process.provider;
-
-    // Use queueMessageToSession which handles thinking mode changes
-    // If thinking mode changed, it will restart the process automatically
-    const queueGlobalInstructions =
-      deps.serverSettingsService?.getSetting("globalInstructions") || undefined;
-    const result = await deps.supervisor.queueMessageToSession(
-      sessionId,
-      process.projectPath,
-      userMessage,
-      body.mode,
-      {
-        model,
-        thinking,
-        effort,
-        providerName,
-        codexMcpMode:
-          providerName === "codex"
-            ? (parsedCodexMcpMode.codexMcpMode ??
-              deps.sessionMetadataService?.getCodexMcpMode?.(sessionId))
-            : undefined,
-        executor:
-          executor ??
-          metadataExecutor.executor ??
-          process.executor ??
-          undefined,
-        globalInstructions: queueGlobalInstructions,
-        permissions: body.permissions,
-      },
-    );
-
-    if (!result.success) {
-      getLogger().warn(
-        {
-          event: "session_queue_rejected",
-          ...queueLogContext,
-          reason: "queue_failed",
-        },
-        "Session queue rejected",
-      );
-      return c.json(
-        {
-          error: "Failed to queue message",
-          reason: result.error,
-        },
-        410,
-      ); // 410 Gone - process is no longer available
-    }
-
-    getLogger().info(
-      {
-        event: "session_queue_accepted",
-        ...queueLogContext,
-      },
-      "Session queue accepted",
-    );
-    return c.json({
-      queued: true,
-      restarted: result.restarted,
-      processId: result.process.id,
+    const result = await sessionCommandService.queue({
+      sessionId: c.req.param("sessionId"),
+      body,
     });
+    return c.json(result.body, result.status);
+  });
+
+  // POST /api/projects/:projectId/sessions/:sessionId/codex-control - Resume
+  // an inactive Codex session without a model turn, then start compaction.
+  routes.post(
+    "/projects/:projectId/sessions/:sessionId/codex-control",
+    async (c) => {
+      let body: {
+        request?: CodexNativeControlRequest;
+        resume?: CreateSessionBody;
+      };
+      try {
+        body = await c.req.json<{
+          request?: CodexNativeControlRequest;
+          resume?: CreateSessionBody;
+        }>();
+      } catch {
+        return c.json({ error: "Invalid JSON body" }, 400);
+      }
+      const request = body?.request;
+      if (
+        !request ||
+        typeof request !== "object" ||
+        !isCodexNativeControlMethod((request as { control?: unknown }).control)
+      ) {
+        return c.json({ error: "Supported Codex control is required" }, 400);
+      }
+      if (request.control !== "thread/compact/start") {
+        return c.json(
+          { error: "Only Codex compaction can auto-resume a session" },
+          400,
+        );
+      }
+      if (
+        body.resume !== undefined &&
+        (body.resume === null ||
+          typeof body.resume !== "object" ||
+          Array.isArray(body.resume))
+      ) {
+        return c.json({ error: "resume must be an object" }, 400);
+      }
+
+      const sessionId = c.req.param("sessionId");
+      if (deps.externalTracker?.isExternal(sessionId)) {
+        return c.json(
+          {
+            error: "Codex session is controlled by an external process",
+            code: "session_external",
+          },
+          409,
+        );
+      }
+
+      const result = await sessionCommandService.resumeCodexControl({
+        projectId: c.req.param("projectId"),
+        sessionId,
+        request,
+        body: body.resume,
+      });
+      return c.json(result.body, result.status);
+    },
+  );
+
+  // POST /api/sessions/:sessionId/codex-control - Execute a bounded,
+  // capability-gated control against an already-active Codex app-server.
+  routes.post("/sessions/:sessionId/codex-control", async (c) => {
+    let request: CodexNativeControlRequest;
+    try {
+      request = await c.req.json<CodexNativeControlRequest>();
+    } catch {
+      return c.json({ error: "Invalid JSON body" }, 400);
+    }
+    if (
+      !request ||
+      typeof request !== "object" ||
+      !isCodexNativeControlMethod((request as { control?: unknown }).control)
+    ) {
+      return c.json({ error: "Supported Codex control is required" }, 400);
+    }
+
+    const result = await sessionCommandService.executeCodexControl({
+      sessionId: c.req.param("sessionId"),
+      request,
+    });
+    return c.json(result.body, result.status);
   });
 
   // DELETE /api/sessions/:sessionId/deferred/:tempId - Cancel a deferred message
-  routes.delete("/sessions/:sessionId/deferred/:tempId", (c) => {
+  routes.delete("/sessions/:sessionId/deferred/:tempId", async (c) => {
     const sessionId = c.req.param("sessionId");
     const tempId = c.req.param("tempId");
 
-    const process = deps.supervisor.getProcessForSession(sessionId);
+    const process =
+      await runtimeController.getProcessSnapshotForSession(sessionId);
     if (!process) {
       return c.json({ error: "No active process for session" }, 404);
     }
 
-    const cancelled = process.cancelDeferredMessage(tempId);
+    const { cancelled } = await runtimeController.cancelDeferredMessage(
+      sessionId,
+      tempId,
+    );
     if (!cancelled) {
       return c.json({ error: "Deferred message not found" }, 404);
     }
@@ -2265,21 +2579,15 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     const sessionId = c.req.param("sessionId");
     const body = await c.req.json<{ mode: PermissionMode }>();
 
-    if (!body.mode) {
-      return c.json({ error: "mode is required" }, 400);
+    if (!isPermissionMode(body.mode)) {
+      return c.json({ error: "Invalid or missing permission mode" }, 400);
     }
 
-    const process = deps.supervisor.getProcessForSession(sessionId);
-    if (!process) {
-      return c.json({ error: "No active process for session" }, 404);
-    }
-
-    process.setPermissionMode(body.mode);
-
-    return c.json({
-      permissionMode: process.permissionMode,
-      modeVersion: process.modeVersion,
-    });
+    const result = await sessionCommandService.setPermissionMode(
+      sessionId,
+      body.mode,
+    );
+    return c.json(result.body, result.status);
   });
 
   // PUT /api/sessions/:sessionId/hold - Set hold (soft pause) mode
@@ -2291,17 +2599,18 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       return c.json({ error: "hold is required (boolean)" }, 400);
     }
 
-    const process = deps.supervisor.getProcessForSession(sessionId);
-    if (!process) {
+    const holdResult = await runtimeController.setHold({
+      sessionId,
+      hold: body.hold,
+    });
+    if (!holdResult.ok) {
       return c.json({ error: "No active process for session" }, 404);
     }
 
-    process.setHold(body.hold);
-
     return c.json({
-      isHeld: process.isHeld,
-      holdSince: process.holdSince?.toISOString() ?? null,
-      state: process.state.type,
+      isHeld: holdResult.isHeld,
+      holdSince: holdResult.holdSince,
+      state: holdResult.state,
     });
   });
 
@@ -2309,17 +2618,18 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   routes.get("/sessions/:sessionId/pending-input", async (c) => {
     const sessionId = c.req.param("sessionId");
 
-    const process = deps.supervisor.getProcessForSession(sessionId);
-    if (!process) {
-      return c.json({
-        request:
-          (await deps.codexBridgeService?.getPendingInputRequest(sessionId)) ??
-          null,
-      });
-    }
+    // Same owner priority as session detail and POST /input: an owned process
+    // that reports no pending request must still surface a bridge-held one,
+    // otherwise the client polls a null it can never resolve.
+    // The snapshot's pendingInputRequest is Process.getPendingInputRequest()
+    // (queue head, mock `waiting-input` state included), so no second runtime
+    // round-trip is needed here.
+    const process =
+      await runtimeController.getProcessSnapshotForSession(sessionId);
+    const request = await sessionCommandService.getPendingInput(sessionId, {
+      processSnapshot: process,
+    });
 
-    // Use getPendingInputRequest which works for both mock and real SDK
-    const request = process.getPendingInputRequest();
     return c.json({ request });
   });
 
@@ -2327,95 +2637,28 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   routes.get("/sessions/:sessionId/process", async (c) => {
     const sessionId = c.req.param("sessionId");
 
-    const process = deps.supervisor.getProcessForSession(sessionId);
+    const process = await runtimeController.getProcessForSession(sessionId);
     if (!process) {
       return c.json({ process: null });
     }
 
-    return c.json({ process: process.getInfo() });
+    return c.json({ process });
   });
 
   // POST /api/sessions/:sessionId/input - Respond to input request
   routes.post("/sessions/:sessionId/input", async (c) => {
     const sessionId = c.req.param("sessionId");
 
-    const process = deps.supervisor.getProcessForSession(sessionId);
-    if (!process) {
-      let bridgeBody: InputResponseBody;
-      try {
-        bridgeBody = await c.req.json<InputResponseBody>();
-      } catch {
-        return c.json({ error: "Invalid JSON body" }, 400);
-      }
-
-      if (!bridgeBody.requestId || !bridgeBody.response) {
-        return c.json({ error: "requestId and response are required" }, 400);
-      }
-      const bridgeResponse =
-        bridgeBody.response === "approve" ||
-        bridgeBody.response === "approve_accept_edits" ||
-        bridgeBody.response === "approve_for_session" ||
-        bridgeBody.response === "approve_always"
-          ? bridgeBody.response
-          : "deny";
-
-      const accepted =
-        (await deps.codexBridgeService?.respondToInput(
-          sessionId,
-          bridgeBody.requestId,
-          bridgeResponse,
-          bridgeBody.answers,
-        )) ?? false;
-      if (!accepted) {
-        return c.json({ error: "No active process for session" }, 404);
-      }
-      return c.json({ accepted: true });
-    }
-
-    if (process.state.type !== "waiting-input") {
-      return c.json({ error: "No pending input request" }, 400);
-    }
-
-    let body: InputResponseBody;
+    // Parse and validate the body exactly once, before any owner lookup, so
+    // the two paths cannot diverge on validation order or error wording.
+    let body: SessionInputResponseBody;
     try {
-      body = await c.req.json<InputResponseBody>();
+      body = await c.req.json<SessionInputResponseBody>();
     } catch {
       return c.json({ error: "Invalid JSON body" }, 400);
     }
-
-    if (!body.requestId || !body.response) {
-      return c.json({ error: "requestId and response are required" }, 400);
-    }
-
-    // Handle approve_accept_edits: approve and switch permission mode
-    const isApproveAcceptEdits = body.response === "approve_accept_edits";
-
-    // Normalize response to approve/deny
-    const normalizedResponse =
-      body.response === "approve" ||
-      body.response === "allow" ||
-      body.response === "approve_accept_edits"
-        ? "approve"
-        : "deny";
-
-    // Call respondToInput which resolves the SDK's canUseTool promise
-    const accepted = process.respondToInput(
-      body.requestId,
-      normalizedResponse,
-      body.answers,
-      body.feedback,
-    );
-
-    if (!accepted) {
-      return c.json({ error: "Invalid request ID or no pending request" }, 400);
-    }
-
-    // If approve_accept_edits, switch the permission mode
-    if (isApproveAcceptEdits) {
-      process.setPermissionMode("acceptEdits");
-    }
-
-    return c.json({ accepted: true });
+    const result = await sessionCommandService.respondToInput(sessionId, body);
+    return c.json(result.body, result.status);
   });
 
   // POST /api/sessions/:sessionId/mark-seen - Mark session as seen (read)
@@ -2501,7 +2744,56 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     });
   });
 
-  // PUT /api/sessions/:sessionId/metadata - Update session metadata (title, archived, starred)
+  // POST /api/projects/:projectId/sessions/:sessionId/title - Explicitly generate a title
+  routes.post("/projects/:projectId/sessions/:sessionId/title", async (c) => {
+    const projectId = c.req.param("projectId");
+    const sessionId = c.req.param("sessionId");
+    if (!isUrlProjectId(projectId)) {
+      return c.json({ error: "Invalid project ID format" }, 400);
+    }
+    if (!deps.sessionTitleService) {
+      return c.json(
+        {
+          error: "Session title generation is not configured",
+          code: "not_configured",
+        },
+        503,
+      );
+    }
+
+    try {
+      const title = await deps.sessionTitleService.generateTitleManually(
+        sessionId,
+        projectId,
+      );
+      return c.json({ title });
+    } catch (error) {
+      if (error instanceof ManualSessionTitleError) {
+        const body = { error: error.message, code: error.code };
+        switch (error.code) {
+          case "not_configured":
+          case "service_stopped":
+            return c.json(body, 503);
+          case "already_in_flight":
+            return c.json(body, 409);
+          case "session_not_found":
+            return c.json(body, 404);
+          case "insufficient_context":
+            return c.json(body, 422);
+          case "model_failed":
+            return c.json(body, 502);
+        }
+      }
+
+      getLogger().warn(
+        { err: error, sessionId, projectId },
+        "Failed to generate session title",
+      );
+      return c.json({ error: "Failed to generate session title" }, 500);
+    }
+  });
+
+  // PUT /api/sessions/:sessionId/metadata - Update session metadata (title, archived, pinned)
   routes.put("/sessions/:sessionId/metadata", async (c) => {
     const sessionId = c.req.param("sessionId");
 
@@ -2512,8 +2804,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     let body: {
       title?: string;
       archived?: boolean;
+      pinned?: boolean;
+      /** Legacy request field accepted during the pin migration. */
       starred?: boolean;
-      model?: string;
     } = {};
     try {
       body = await c.req.json();
@@ -2525,13 +2818,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     if (
       body.title === undefined &&
       body.archived === undefined &&
-      body.starred === undefined &&
-      body.model === undefined
+      body.pinned === undefined &&
+      body.starred === undefined
     ) {
       return c.json(
-        {
-          error: "At least title, archived, starred, or model must be provided",
-        },
+        { error: "At least title, archived, or pinned must be provided" },
         400,
       );
     }
@@ -2545,20 +2836,19 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       | undefined;
 
     if (body.archived === true && deps.sessionArchiveService) {
-      const activeProcess = deps.supervisor.getProcessForSession(sessionId);
-      const bridgeView =
-        (await deps.codexBridgeService?.getSessionView(sessionId)) ?? null;
-      const isBridgeSessionActive = bridgeView
-        ? ((await deps.codexBridgeService?.isSessionActive(sessionId)) ?? false)
-        : false;
+      const activeProcess =
+        await runtimeController.getProcessSnapshotForSession(sessionId);
+      const bridgeView = await getBridgeSessionView(deps, sessionId);
       const isBridgeSessionLive =
-        bridgeView !== null && isLiveBridgeSessionView(bridgeView);
+        bridgeView !== null && isActiveBridgeSessionView(bridgeView);
       const runtime = deriveSessionRuntime({
         process: activeProcess,
         externalActive:
           (deps.externalTracker?.isExternal(sessionId) ?? false) ||
-          (isBridgeSessionLive && isBridgeSessionActive),
-        externalActivity: bridgeView?.activity,
+          isBridgeSessionLive,
+        externalActivity:
+          bridgeView?.activity ??
+          deps.externalTracker?.getExternalActivity?.(sessionId),
       });
 
       if (!runtime.canArchive) {
@@ -2575,7 +2865,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       }
 
       if (activeProcess) {
-        await deps.supervisor.abortProcess(activeProcess.id);
+        await runtimeController.abortProcess(activeProcess.id);
       }
 
       const target = await resolveArchiveTarget(deps, sessionId);
@@ -2639,11 +2929,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       }
     }
 
+    const pinned = body.pinned ?? body.starred;
     await deps.sessionMetadataService.updateMetadata(sessionId, {
       title: body.title,
       archived: body.archived,
-      starred: body.starred,
-      model: body.model,
+      // `isStarred` remains the on-disk compatibility key. There is only one
+      // durable bit; existing favorites immediately become pins.
+      starred: pinned,
     });
 
     // Emit SSE event so sidebar and other clients can update
@@ -2653,8 +2945,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         sessionId,
         title: body.title,
         archived: body.archived,
-        starred: body.starred,
-        model: body.model,
+        pinned,
+        starred: pinned,
         timestamp: new Date().toISOString(),
       });
     }
@@ -2779,22 +3071,21 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   // ============ Worker Queue Endpoints ============
 
   // GET /api/status/workers - Get worker activity for safe restart indicator
-  routes.get("/status/workers", (c) => {
-    const activity = deps.supervisor.getWorkerActivity();
-    return c.json(activity);
+  routes.get("/status/workers", async (c) => {
+    const activity = await runtimeController.getWorkerActivity();
+    return c.json({ ...activity, runtimeMode: runtimeController.mode });
   });
 
   // GET /api/queue - Get all queued requests
-  routes.get("/queue", (c) => {
-    const queue = deps.supervisor.getQueueInfo();
-    const poolStatus = deps.supervisor.getWorkerPoolStatus();
-    return c.json({ queue, ...poolStatus });
+  routes.get("/queue", async (c) => {
+    const queueStatus = await runtimeController.getQueueStatus();
+    return c.json(queueStatus);
   });
 
   // GET /api/queue/:queueId - Get specific queue entry position
-  routes.get("/queue/:queueId", (c) => {
+  routes.get("/queue/:queueId", async (c) => {
     const queueId = c.req.param("queueId");
-    const position = deps.supervisor.getQueuePosition(queueId);
+    const position = await runtimeController.getQueuePosition(queueId);
 
     if (position === undefined) {
       return c.json({ error: "Queue entry not found" }, 404);
@@ -2804,10 +3095,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   });
 
   // DELETE /api/queue/:queueId - Cancel a queued request
-  routes.delete("/queue/:queueId", (c) => {
+  routes.delete("/queue/:queueId", async (c) => {
     const queueId = c.req.param("queueId");
 
-    const cancelled = deps.supervisor.cancelQueuedRequest(queueId);
+    const { cancelled } = await runtimeController.cancelQueuedRequest(queueId);
     if (!cancelled) {
       return c.json(
         { error: "Queue entry not found or already processed" },

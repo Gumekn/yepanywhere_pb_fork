@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, fetchJSON } from "./client";
+import { api, fetchJSON, isQueuedResumeSessionResponse } from "./client";
 
 describe("api.updateServerSettings", () => {
   const fetchMock = vi.fn<typeof fetch>();
@@ -79,33 +79,12 @@ describe("fetchJSON errors", () => {
       },
     });
   });
-
-  it("does not read or attach the removed setup-required header", async () => {
-    const removedHeader = ["X", "Setup", "Required"].join("-");
-    const removedProperty = ["setup", "Required"].join("");
-    fetchMock.mockResolvedValue({
-      ok: false,
-      status: 401,
-      statusText: "Unauthorized",
-      headers: new Headers({ [removedHeader]: "true" }),
-      json: async () => ({ error: "Authentication required" }),
-    } as Response);
-
-    const error = await fetchJSON("/auth/login").catch((cause) => cause);
-
-    expect(error).toMatchObject({ status: 401 });
-    expect(error).not.toHaveProperty(removedProperty);
-  });
 });
 
-describe("authentication API", () => {
+describe("queued session API responses", () => {
   const fetchMock = vi.fn<typeof fetch>();
 
   beforeEach(() => {
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ success: true }),
-    } as Response);
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState({}, "", "/");
   });
@@ -115,30 +94,421 @@ describe("authentication API", () => {
     fetchMock.mockReset();
   });
 
+  it("preserves the server's queued response instead of treating it as a started process", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: async () => ({
+        queued: true,
+        queueId: "queue-1",
+        position: 2,
+      }),
+    } as Response);
+
+    const result = await api.resumeSession(
+      "project-1",
+      "session-1",
+      "continue",
+    );
+
+    expect(isQueuedResumeSessionResponse(result)).toBe(true);
+    expect(result).toEqual({
+      queued: true,
+      queueId: "queue-1",
+      position: 2,
+    });
+  });
+
+  it("distinguishes a started process from a queued response", () => {
+    expect(
+      isQueuedResumeSessionResponse({
+        sessionId: "session-1",
+        processId: "process-1",
+        permissionMode: "default",
+        modeVersion: 1,
+      }),
+    ).toBe(false);
+  });
+
   it.each([
     [
-      () => api.enableAuth("admin-password", "login-password"),
-      "/auth/enable",
-      { adminPassword: "admin-password", newPassword: "login-password" },
+      "startSession",
+      () => api.startSession("project-1", "start"),
+      "/api/projects/project-1/sessions",
     ],
     [
-      () => api.changePassword("admin-password", "next-password"),
-      "/auth/change-password",
-      { adminPassword: "admin-password", newPassword: "next-password" },
+      "createSession",
+      () => api.createSession("project-1"),
+      "/api/projects/project-1/sessions/create",
     ],
-    [
-      () => api.disableAuth("admin-password"),
-      "/auth/disable",
-      { adminPassword: "admin-password" },
-    ],
-  ])(
-    "sends only approved password fields to %s",
-    async (invoke, routePath, body) => {
-      await invoke();
+  ] as const)(
+    "preserves a queued response from %s",
+    async (_name, request, expectedPath) => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 202,
+        json: async () => ({
+          queued: true,
+          queueId: "queue-new",
+          position: 3,
+        }),
+      } as Response);
 
-      const [url, options] = fetchMock.mock.calls[0] ?? [];
-      expect(String(url)).toContain(routePath);
-      expect(JSON.parse(String(options?.body))).toEqual(body);
+      await expect(request()).resolves.toEqual({
+        queued: true,
+        queueId: "queue-new",
+        position: 3,
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        expectedPath,
+        expect.objectContaining({ method: "POST" }),
+      );
+    },
+  );
+
+  it("cancels a queued request through the queue endpoint", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ cancelled: true }),
+    } as Response);
+
+    await expect(api.cancelQueuedRequest("queue/1")).resolves.toEqual({
+      cancelled: true,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/queue/queue%2F1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+});
+
+describe("Codex structured input API", () => {
+  const fetchMock = vi.fn<typeof fetch>();
+  const skillInput = {
+    type: "skill" as const,
+    name: "release-check",
+    path: "/test-fixtures/skills/release-check/SKILL.md",
+  };
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", "/");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    fetchMock.mockReset();
+  });
+
+  it("serializes selected skills for start, resume, queue, and deferred queue", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        sessionId: "session-1",
+        processId: "process-1",
+        permissionMode: "default",
+        modeVersion: 1,
+        queued: true,
+      }),
+    } as Response);
+
+    await api.startSession("project-1", "start", {
+      provider: "codex",
+      codexInputs: [skillInput],
+    });
+    await api.resumeSession("project-1", "session-1", "resume", {
+      provider: "codex",
+      codexInputs: [skillInput],
+    });
+    await api.queueMessage(
+      "session-1",
+      "queue",
+      undefined,
+      undefined,
+      "temp-queue",
+      undefined,
+      undefined,
+      undefined,
+      [skillInput],
+    );
+    await api.queueMessage(
+      "session-1",
+      "defer",
+      undefined,
+      undefined,
+      "temp-defer",
+      undefined,
+      undefined,
+      true,
+      [skillInput],
+    );
+
+    const bodies = fetchMock.mock.calls.map(([, request]) =>
+      JSON.parse(String(request?.body)),
+    );
+    expect(bodies).toEqual([
+      expect.objectContaining({
+        message: "start",
+        codexInputs: [skillInput],
+      }),
+      expect.objectContaining({
+        message: "resume",
+        codexInputs: [skillInput],
+      }),
+      expect.objectContaining({
+        message: "queue",
+        codexInputs: [skillInput],
+      }),
+      expect.objectContaining({
+        message: "defer",
+        deferred: true,
+        codexInputs: [skillInput],
+      }),
+    ]);
+  });
+});
+
+describe("Codex transcript export", () => {
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", "/");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    fetchMock.mockReset();
+  });
+
+  it("downloads the authenticated canonical Markdown transcript", async () => {
+    const blob = new Blob(["# Transcript\n"], { type: "text/markdown" });
+    fetchMock.mockResolvedValue({
+      ok: true,
+      headers: new Headers({
+        "Content-Disposition":
+          'attachment; filename="codex-transcript-session-1.md"',
+      }),
+      blob: async () => blob,
+    } as Response);
+
+    await expect(
+      api.downloadCodexTranscript("session/1"),
+    ).resolves.toMatchObject({
+      blob,
+      fileName: "codex-transcript-session-1.md",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/session%2F1/codex-transcript?format=markdown",
+      expect.objectContaining({
+        cache: "no-store",
+        credentials: "include",
+        headers: expect.objectContaining({ "X-Yep-Anywhere": "true" }),
+      }),
+    );
+  });
+});
+
+describe("session detail view", () => {
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", "/");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    fetchMock.mockReset();
+  });
+
+  it("opts the web transcript into the canonical Codex overlay", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        session: { id: "session-1", provider: "codex", messages: [] },
+        messages: [],
+        ownership: { owner: "none" },
+      }),
+    } as Response);
+
+    await api.getSession("project-1", "session-1", undefined, {
+      view: "canonical",
+      maxMessages: 100,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/project-1/sessions/session-1?view=canonical&maxMessages=100&deferMedia=1",
+      expect.any(Object),
+    );
+  });
+
+  it("builds display, question, and tool-detail URLs with opaque cursors", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({}),
+    } as Response);
+
+    await api.getSessionDisplay("project-1", "session-1", {
+      cursor: "display.cursor",
+      branchId: "branch-1",
+      limit: 20,
+    });
+    await api.getSessionQuestions("project-1", "session-1", {
+      cursor: "question.cursor",
+      branchId: "branch-1",
+    });
+    await api.getSessionToolGroupDetails(
+      "project-1",
+      "session-1",
+      "detail/ref",
+      {
+        revision: "revision 1",
+        cursor: "detail.cursor",
+        branchId: "branch-1",
+      },
+    );
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/projects/project-1/sessions/session-1/display?cursor=display.cursor&branchId=branch-1&limit=20",
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/projects/project-1/sessions/session-1/display/questions?cursor=question.cursor&branchId=branch-1",
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/api/projects/project-1/sessions/session-1/display/tool-groups/detail%2Fref?revision=revision+1&cursor=detail.cursor&branchId=branch-1",
+      expect.any(Object),
+    );
+  });
+
+  it("requests the body-free Inspector projection explicitly", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({}),
+    } as Response);
+
+    await api.getSession("project-1", "session-1", undefined, {
+      view: "canonical",
+      inspectorProjection: true,
+      maxMessages: 100,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/project-1/sessions/session-1?view=canonical&projection=inspector&maxMessages=100&deferMedia=1",
+      expect.any(Object),
+    );
+  });
+});
+
+describe("Codex native controls", () => {
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", "/");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    fetchMock.mockReset();
+  });
+
+  it("uses the authenticated bounded control endpoint", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ control: "skills/list", data: { data: [] } }),
+    } as Response);
+
+    await api.executeCodexControl("session/1", { control: "skills/list" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/session%2F1/codex-control",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ control: "skills/list" }),
+      }),
+    );
+  });
+
+  it("uses the project-scoped endpoint to resume before compaction", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        sessionId: "session-1",
+        processId: "process-1",
+        permissionMode: "default",
+        modeVersion: 0,
+        control: "thread/compact/start",
+        data: {},
+      }),
+    } as Response);
+
+    await api.resumeAndExecuteCodexControl(
+      "project-1",
+      "session-1",
+      { control: "thread/compact/start" },
+      {
+        mode: "default",
+        model: "gpt-5.6-sol",
+        reasoningEffort: "xhigh",
+        provider: "codex",
+      },
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/project-1/sessions/session-1/codex-control",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          request: { control: "thread/compact/start" },
+          resume: {
+            mode: "default",
+            model: "gpt-5.6-sol",
+            thinking: undefined,
+            reasoningEffort: "xhigh",
+            provider: "codex",
+            codexMcpMode: undefined,
+            codexModelProvider: undefined,
+            llmGatewayConfig: undefined,
+            executor: undefined,
+          },
+        }),
+      }),
+    );
+  });
+});
+
+describe("Codex new-session service tier", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it.each(["priority", "default"] as const)(
+    "sends %s in both creation flows",
+    async (serviceTier) => {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValue({ ok: true, json: async () => ({}) });
+      vi.stubGlobal("fetch", fetchMock);
+      window.history.replaceState({}, "", "/");
+      const options = {
+        provider: "codex" as const,
+        model: "gpt-6-astra",
+        reasoningEffort: "high",
+        serviceTier,
+      };
+      await api.startSession("project-1", "hello", options);
+      await api.createSession("project-1", options);
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+        "/api/projects/project-1/sessions",
+        "/api/projects/project-1/sessions/create",
+      ]);
+      for (const [, request] of fetchMock.mock.calls) {
+        expect(JSON.parse(request.body)).toMatchObject(options);
+      }
     },
   );
 });

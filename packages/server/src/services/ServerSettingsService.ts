@@ -7,28 +7,34 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { NewSessionDefaults } from "@yep-anywhere/shared";
+import {
+  type NewSessionDefaults,
+  type RemoteExecutorConfig,
+  normalizeNewSessionDefaults,
+} from "@yep-anywhere/shared";
+import { parseRemoteExecutorConfigs } from "../sdk/remote-executor-config.js";
+import type { OhMyRouterThroughputBenchmark } from "./OhMyRouterBenchmarkService.js";
 
-const CURRENT_VERSION = 1;
+const CURRENT_VERSION = 5;
+
+const LEGACY_CLAUDE_SETTING_KEYS = [
+  "ollamaUrl",
+  "ollamaSystemPrompt",
+  "ollamaUseFullSystemPrompt",
+] as const;
 
 /** Server-wide settings */
 export interface ServerSettings {
   /** Whether clients should register the service worker (for push notifications) */
   serviceWorkerEnabled: boolean;
-  /** SSH host aliases for remote executors (from ~/.ssh/config) */
-  remoteExecutors?: string[];
   /** SSH host aliases for ChromeOS device-bridge targets */
   chromeOsHosts?: string[];
+  /** Remote-only Claude Code executors and shared-directory path mappings. */
+  remoteExecutors?: RemoteExecutorConfig[];
   /** Allowed hostnames for host/origin validation. "*" = allow all, comma-separated = specific hosts. */
   allowedHosts?: string;
   /** Free-form instructions appended to the system prompt for all sessions */
   globalInstructions?: string;
-  /** Ollama server URL for claude-ollama provider (default: http://localhost:11434) */
-  ollamaUrl?: string;
-  /** Custom system prompt for Ollama provider (overrides the default minimal prompt) */
-  ollamaSystemPrompt?: string;
-  /** Whether to use the full Claude system prompt for Ollama (for large-context models like Qwen3) */
-  ollamaUseFullSystemPrompt?: boolean;
   /** Whether the device bridge (emulator/device streaming) feature is enabled */
   deviceBridgeEnabled?: boolean;
   /** Defaults applied when opening the new session form */
@@ -41,6 +47,8 @@ export interface ServerSettings {
   lifecycleWebhookToken?: string;
   /** When true, include dryRun=true in lifecycle webhook payloads */
   lifecycleWebhookDryRun?: boolean;
+  /** Most recent OhMyRouter model throughput benchmark run. */
+  ohmyrouterThroughputBenchmark?: OhMyRouterThroughputBenchmark;
 }
 
 /** Default settings */
@@ -54,6 +62,68 @@ export const DEFAULT_SERVER_SETTINGS: ServerSettings = {
 interface SettingsState {
   version: number;
   settings: ServerSettings;
+}
+
+function migrateSettings(settings: unknown): {
+  settings: ServerSettings;
+  changed: boolean;
+} {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    return { settings: { ...DEFAULT_SERVER_SETTINGS }, changed: true };
+  }
+
+  const source = settings as Record<string, unknown>;
+  const cleaned = { ...source };
+  let changed = false;
+
+  for (const key of LEGACY_CLAUDE_SETTING_KEYS) {
+    if (key in cleaned) {
+      delete cleaned[key];
+      changed = true;
+    }
+  }
+
+  if ("remoteExecutors" in cleaned) {
+    const parsed = parseRemoteExecutorConfigs(cleaned.remoteExecutors);
+    if (parsed.executors) {
+      if (
+        JSON.stringify(cleaned.remoteExecutors) !==
+        JSON.stringify(parsed.executors)
+      ) {
+        changed = true;
+      }
+      cleaned.remoteExecutors = parsed.executors;
+    } else {
+      Reflect.deleteProperty(cleaned, "remoteExecutors");
+      changed = true;
+    }
+  }
+
+  if ("newSessionDefaults" in cleaned) {
+    const rawDefaults = cleaned.newSessionDefaults;
+    if (
+      typeof rawDefaults !== "object" ||
+      rawDefaults === null ||
+      Array.isArray(rawDefaults)
+    ) {
+      Reflect.deleteProperty(cleaned, "newSessionDefaults");
+      changed = true;
+    } else {
+      const normalizedDefaults = normalizeNewSessionDefaults(
+        rawDefaults as NewSessionDefaults,
+      );
+      if (JSON.stringify(rawDefaults) !== JSON.stringify(normalizedDefaults)) {
+        changed = true;
+      }
+      if (normalizedDefaults) {
+        cleaned.newSessionDefaults = normalizedDefaults;
+      } else {
+        Reflect.deleteProperty(cleaned, "newSessionDefaults");
+      }
+    }
+  }
+
+  return { settings: cleaned as unknown as ServerSettings, changed };
 }
 
 export interface ServerSettingsServiceOptions {
@@ -89,18 +159,13 @@ export class ServerSettingsService {
       const content = await fs.readFile(this.filePath, "utf-8");
       const parsed = JSON.parse(content) as SettingsState;
 
-      if (parsed.version === CURRENT_VERSION) {
-        // Merge with defaults in case new settings were added
-        this.state = {
-          version: CURRENT_VERSION,
-          settings: { ...DEFAULT_SERVER_SETTINGS, ...parsed.settings },
-        };
-      } else {
-        // Future: handle migrations
-        this.state = {
-          version: CURRENT_VERSION,
-          settings: { ...DEFAULT_SERVER_SETTINGS, ...parsed.settings },
-        };
+      const { settings, changed } = migrateSettings(parsed.settings);
+      this.state = {
+        version: CURRENT_VERSION,
+        settings: { ...DEFAULT_SERVER_SETTINGS, ...settings },
+      };
+
+      if (parsed.version !== CURRENT_VERSION || changed) {
         await this.save();
       }
     } catch (error) {
@@ -112,7 +177,7 @@ export class ServerSettingsService {
       }
       this.state = {
         version: CURRENT_VERSION,
-        settings: DEFAULT_SERVER_SETTINGS,
+        settings: { ...DEFAULT_SERVER_SETTINGS },
       };
     }
 

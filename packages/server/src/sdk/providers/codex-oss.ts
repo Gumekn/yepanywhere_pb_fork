@@ -11,11 +11,12 @@
  * See docs/research/codex-local-models.md for background.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, exec, execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { promisify } from "node:util";
 import type { ModelInfo } from "@yep-anywhere/shared";
 import {
   type CodexToolCallContext,
@@ -24,9 +25,8 @@ import {
 } from "../../codex/normalization.js";
 import { getLogger } from "../../logging/logger.js";
 import { findCodexCliPath, whichCommand } from "../cli-detection.js";
-import { MessageQueue } from "../messageQueue.js";
+import { MessageQueue, getUserPromptProjection } from "../messageQueue.js";
 import type { SDKMessage } from "../types.js";
-import { OllamaClient, getOllamaUrl } from "./ollama-client.js";
 import type {
   AgentProvider,
   AgentSession,
@@ -35,6 +35,8 @@ import type {
 } from "./types.js";
 
 const log = getLogger().child({ component: "codex-oss-provider" });
+const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 /**
  * Configuration for CodexOSS provider.
@@ -196,7 +198,12 @@ export class CodexOSSProvider implements AgentProvider {
   async isAuthenticated(): Promise<boolean> {
     // For OSS mode, we just need Ollama running
     if (this.localProvider === "ollama") {
-      return new OllamaClient(getOllamaUrl()).isReachable();
+      try {
+        await execAsync("ollama list", { timeout: 5000 });
+        return true;
+      } catch {
+        return false;
+      }
     }
     // TODO: LMStudio check
     return false;
@@ -228,7 +235,40 @@ export class CodexOSSProvider implements AgentProvider {
     }
 
     try {
-      return await new OllamaClient(getOllamaUrl()).listModels();
+      const { stdout } = await execAsync("ollama list", { timeout: 5000 });
+      const lines = stdout.trim().split("\n");
+
+      if (lines.length < 2) {
+        return [];
+      }
+
+      const models: ModelInfo[] = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line) continue;
+
+        // Parse: NAME ID SIZE MODIFIED
+        const parts = line.split(/\s+/);
+        if (parts.length >= 3) {
+          const name = parts[0] ?? "";
+          const sizeNum = Number.parseFloat(parts[2] ?? "0");
+          const sizeUnit = parts[3]?.toUpperCase() ?? "";
+          let sizeBytes: number | undefined;
+          if (sizeUnit === "GB") {
+            sizeBytes = Math.round(sizeNum * 1024 * 1024 * 1024);
+          } else if (sizeUnit === "MB") {
+            sizeBytes = Math.round(sizeNum * 1024 * 1024);
+          }
+
+          models.push({
+            id: name,
+            name: name,
+            size: sizeBytes,
+          });
+        }
+      }
+
+      return models;
     } catch (error) {
       log.debug({ error }, "Failed to get Ollama models");
       return [];
@@ -318,12 +358,14 @@ export class CodexOSSProvider implements AgentProvider {
     for await (const message of messageGen) {
       if (signal.aborted) break;
 
-      let userPrompt = this.extractTextFromMessage(message);
-      if (!userPrompt) continue;
+      let { internalPrompt, publicPrompt } = getUserPromptProjection(message);
+      if (!internalPrompt) continue;
 
       // Prepend global instructions to the first message of new sessions
       if (isFirstNewMessage && options.globalInstructions) {
-        userPrompt = `[Global context]\n${options.globalInstructions}\n\n---\n\n${userPrompt}`;
+        const prefix = `[Global context]\n${options.globalInstructions}\n\n---\n\n`;
+        internalPrompt = `${prefix}${internalPrompt}`;
+        publicPrompt = `${prefix}${publicPrompt}`;
       }
       isFirstNewMessage = false;
 
@@ -333,7 +375,7 @@ export class CodexOSSProvider implements AgentProvider {
         type: "user",
         uuid: message.uuid,
         session_id: currentSessionId || `pending-${Date.now()}`,
-        message: { role: "user", content: userPrompt },
+        message: { role: "user", content: publicPrompt },
       } as SDKMessage;
 
       // Increment turn number and reset accumulators for this new turn
@@ -345,7 +387,7 @@ export class CodexOSSProvider implements AgentProvider {
       const isFirstTurn = turnNumber === 1 && !options.resumeSessionId;
       const args = isFirstTurn
         ? this.buildFirstTurnArgs(options)
-        : this.buildResumeTurnArgs(options, currentSessionId, userPrompt);
+        : this.buildResumeTurnArgs(options, currentSessionId, internalPrompt);
 
       // Spawn codex process
       let codexProcess: ChildProcess;
@@ -373,7 +415,7 @@ export class CodexOSSProvider implements AgentProvider {
         // For first turn, send prompt via stdin
         // For resume, prompt is passed as argument
         if (isFirstTurn && codexProcess.stdin) {
-          codexProcess.stdin.write(userPrompt);
+          codexProcess.stdin.write(internalPrompt);
           codexProcess.stdin.end();
         } else if (codexProcess.stdin) {
           codexProcess.stdin.end();
@@ -586,8 +628,6 @@ export class CodexOSSProvider implements AgentProvider {
       "--oss",
       "--local-provider",
       this.localProvider,
-      "-c",
-      `model_providers.${this.localProvider}.base_url=${JSON.stringify(getOllamaUrl())}`,
       "--json",
     ];
 
@@ -623,8 +663,6 @@ export class CodexOSSProvider implements AgentProvider {
       prompt,
       "-c",
       `model_provider="${this.localProvider}"`,
-      "-c",
-      `model_providers.${this.localProvider}.base_url=${JSON.stringify(getOllamaUrl())}`,
     ];
 
     if (options.model) {
@@ -660,6 +698,16 @@ export class CodexOSSProvider implements AgentProvider {
   ): SDKMessage[] {
     switch (event.type) {
       case "turn.started":
+        // Lifecycle-only signal; runSession owns the visible turn state.
+        return [];
+
+      case "thread.started":
+      case "item.started":
+      case "item.updated":
+      case "item.completed":
+        // These variants are consumed before this compatibility projection:
+        // thread.started establishes the session and item events are accumulated
+        // with stable UUIDs in runSession.
         return [];
 
       case "turn.completed":
@@ -685,9 +733,6 @@ export class CodexOSSProvider implements AgentProvider {
           } as SDKMessage,
         ];
 
-      // item.started, item.updated, item.completed are handled in runSession
-      // to support token accumulation with stable UUIDs
-
       case "error":
         return [
           {
@@ -696,10 +741,10 @@ export class CodexOSSProvider implements AgentProvider {
             error: event.message,
           } as SDKMessage,
         ];
-
-      default:
-        return [];
     }
+
+    const exhaustiveEvent: never = event;
+    return exhaustiveEvent;
   }
 
   /**
@@ -941,46 +986,10 @@ export class CodexOSSProvider implements AgentProvider {
             error: item.message,
           } as SDKMessage,
         ];
-
-      default:
-        return [];
-    }
-  }
-
-  /**
-   * Extract text from user message.
-   */
-  private extractTextFromMessage(message: unknown): string {
-    if (!message || typeof message !== "object") return "";
-
-    const userMsg = message as { text?: string };
-    if (typeof userMsg.text === "string") return userMsg.text;
-
-    const sdkMsg = message as { message?: { content?: string | unknown[] } };
-    const content = sdkMsg.message?.content;
-
-    if (typeof content === "string") return content;
-
-    if (Array.isArray(content)) {
-      return content
-        .map((block: unknown) => {
-          if (typeof block === "string") return block;
-          if (
-            typeof block === "object" &&
-            block !== null &&
-            "type" in block &&
-            (block as { type: string }).type === "text" &&
-            "text" in block
-          ) {
-            return (block as { text: string }).text;
-          }
-          return "";
-        })
-        .filter(Boolean)
-        .join("\n");
     }
 
-    return "";
+    const exhaustiveItem: never = item;
+    return exhaustiveItem;
   }
 
   /**

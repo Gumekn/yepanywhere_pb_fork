@@ -30,30 +30,34 @@ import type { Hono } from "hono";
 import type { DeviceBridgeService } from "../device/DeviceBridgeService.js";
 import { getLogger } from "../logging/logger.js";
 import { WS_INTERNAL_AUTHENTICATED } from "../middleware/internal-auth.js";
+import type { RuntimeController } from "../runtime/types.js";
 import type {
   BrowserProfileService,
   ConnectedBrowsersService,
 } from "../services/index.js";
-import {
-  createActivitySubscription,
-  createSessionSubscription,
-} from "../subscriptions.js";
-import type { Supervisor } from "../supervisor/Supervisor.js";
+import { createActivitySubscription } from "../subscriptions.js";
 import type { TerminalService } from "../terminal/TerminalService.js";
 import type { UploadManager } from "../uploads/manager.js";
-import type {
-  EventBus,
-  FocusedSessionWatchManager,
-  ProjectFileWatchManager,
-} from "../watcher/index.js";
+import type { EventBus, FocusedSessionWatchManager } from "../watcher/index.js";
 import {
   decodeFrameToParsedMessage,
   routeClientMessageSafely,
 } from "./ws-message-router.js";
+import { createSendQueue } from "./ws-send-queue.js";
 
 /** Progress report interval in bytes (64KB) */
 export const PROGRESS_INTERVAL = 64 * 1024;
-export const WS_JSON_COMPRESSION_THRESHOLD_BYTES = 16 * 1024;
+/**
+ * Smallest JSON frame worth gzipping before it goes out on the socket.
+ *
+ * Aligned with the `/api/*` HTTP threshold in `app.ts`. The previous 16 KB bar
+ * left the bulk of remote traffic uncompressed: session-list refreshes,
+ * activity events and `markdown-augment` payloads (server-rendered shiki HTML)
+ * cluster in the 2–16 KB range and compress 5–8:1. Compression runs on zlib's
+ * threadpool via `gzipAsync`, so the extra frames cost a tick rather than
+ * event-loop time.
+ */
+export const WS_JSON_COMPRESSION_THRESHOLD_BYTES = 4 * 1024;
 
 const textEncoder = new TextEncoder();
 const gzipAsync = promisify(gzip);
@@ -90,6 +94,11 @@ export interface WsUploadState {
 export interface WSAdapter {
   send(data: string | ArrayBuffer | Uint8Array<ArrayBuffer>): void;
   close(code?: number, reason?: string): void;
+  /**
+   * Bytes queued in the socket's own send buffer, when the transport exposes
+   * it. Drives outbound backpressure; absent means "never congested".
+   */
+  bufferedAmount?(): number;
 }
 
 /**
@@ -113,8 +122,8 @@ export interface WsHandlerDeps {
    * prefix here so the wrapped Hono routes (`${basePath}/api/foo`) match.
    */
   basePath?: string;
-  /** Supervisor for subscribing to session events */
-  supervisor: Supervisor;
+  /** Runtime facade for subscribing to session events */
+  runtimeController: RuntimeController;
   /** Event bus for subscribing to activity events */
   eventBus: EventBus;
   /** Upload manager for handling file uploads */
@@ -125,8 +134,6 @@ export interface WsHandlerDeps {
   browserProfileService?: BrowserProfileService;
   /** Focused session watch manager for per-session targeted file watching (optional) */
   focusedSessionWatchManager?: FocusedSessionWatchManager;
-  /** Per-project repository file watcher for real-time repo tree updates (optional) */
-  projectFileWatchManager?: ProjectFileWatchManager;
   /** Emulator bridge service for Android emulator streaming (optional) */
   deviceBridgeService?: DeviceBridgeService;
   /** Terminal service for remote shell sessions (optional) */
@@ -151,43 +158,25 @@ export function cleanupConnectionState(_connState: ConnectionState): void {
 
 /**
  * Create a send function for a connection.
+ *
  * Uses binary JSON frames by default while preserving text-frame input support.
+ * Delivery goes through `createSendQueue`, which applies outbound backpressure
+ * and collapses superseded streaming state when the socket cannot keep up; see
+ * `ws-send-queue.ts` for why that is safe and which events qualify.
  */
 export function createSendFn(
   ws: WSAdapter,
   connState: ConnectionState,
 ): SendFn {
-  let sendQueue = Promise.resolve();
-  let sendFailed = false;
+  const queue = createSendQueue({
+    transport: ws,
+    encode: async (msg) =>
+      connState.useBinaryFrames
+        ? await encodeJsonMessageFrame(msg, connState.useCompressedJsonFrames)
+        : JSON.stringify(msg),
+  });
 
-  const sendOne = async (msg: YepMessage): Promise<void> => {
-    if (sendFailed) return;
-
-    try {
-      if (connState.useBinaryFrames) {
-        ws.send(
-          await encodeJsonMessageFrame(msg, connState.useCompressedJsonFrames),
-        );
-      } else {
-        ws.send(JSON.stringify(msg));
-      }
-    } catch (err) {
-      sendFailed = true;
-      console.warn("[WS] Failed to send message, closing socket:", err);
-      try {
-        ws.close(1011, "Send failed");
-      } catch {
-        // Socket already closing/closed
-      }
-    }
-  };
-
-  return (msg: YepMessage) => {
-    sendQueue = sendQueue.then(
-      () => sendOne(msg),
-      () => sendOne(msg),
-    );
-  };
+  return (msg: YepMessage) => queue.enqueue(msg);
 }
 
 async function encodeJsonMessageFrame(
@@ -323,8 +312,8 @@ export function handleSessionSubscribe(
   subscriptions: Map<string, () => void>,
   msg: WireSubscribe,
   send: SendFn,
-  supervisor: Supervisor,
-): void {
+  runtimeController: RuntimeController,
+): Promise<void> {
   const { subscriptionId, sessionId } = msg;
 
   if (!sessionId) {
@@ -334,18 +323,7 @@ export function handleSessionSubscribe(
       status: 400,
       body: { error: "sessionId required for session channel" },
     });
-    return;
-  }
-
-  const process = supervisor.getProcessForSession(sessionId);
-  if (!process) {
-    send({
-      type: "response",
-      id: subscriptionId,
-      status: 404,
-      body: { error: "No active process for session" },
-    });
-    return;
+    return Promise.resolve();
   }
 
   let eventId = 0;
@@ -359,16 +337,39 @@ export function handleSessionSubscribe(
     });
   };
 
-  const { cleanup } = createSessionSubscription(process, sendEvent, {
-    replayAfterMessageId: msg.lastMessageId,
-    onError: (err) => {
-      console.error("[WS] Error in session subscription:", err);
-    },
-  });
+  const pendingController = new AbortController();
+  const pendingCleanup = () => pendingController.abort();
+  subscriptions.set(subscriptionId, pendingCleanup);
 
-  subscriptions.set(subscriptionId, cleanup);
+  return runtimeController
+    .subscribeSession(sessionId, sendEvent, {
+      replayAfterMessageId: msg.lastMessageId,
+      signal: pendingController.signal,
+      onError: (err) => {
+        console.error("[WS] Error in session subscription:", err);
+      },
+    })
+    .then((subscription) => {
+      if (subscriptions.get(subscriptionId) !== pendingCleanup) {
+        subscription?.cleanup();
+        return;
+      }
+      if (!subscription) {
+        subscriptions.delete(subscriptionId);
+        send({
+          type: "response",
+          id: subscriptionId,
+          status: 404,
+          body: { error: "No active process for session" },
+        });
+        return;
+      }
 
-  console.log(`[WS] Subscribed to session ${sessionId} (${subscriptionId})`);
+      subscriptions.set(subscriptionId, () => subscription.cleanup());
+      console.log(
+        `[WS] Subscribed to session ${sessionId} (${subscriptionId})`,
+      );
+    });
 }
 
 /**
@@ -501,86 +502,18 @@ export function handleSessionWatchSubscribe(
 }
 
 /**
- * Handle a project-repo file-change subscription.
- * Subscribes to recursive file-change events for a project's working
- * directory so the client can refresh its repository file tree in real time.
- */
-export function handleProjectFilesSubscribe(
-  subscriptions: Map<string, () => void>,
-  msg: WireSubscribe,
-  send: SendFn,
-  projectFileWatchManager?: ProjectFileWatchManager,
-): void {
-  const { subscriptionId, projectId } = msg;
-
-  if (!projectFileWatchManager) {
-    send({
-      type: "response",
-      id: subscriptionId,
-      status: 503,
-      body: { error: "Project file watch service unavailable" },
-    });
-    return;
-  }
-
-  if (!projectId) {
-    send({
-      type: "response",
-      id: subscriptionId,
-      status: 400,
-      body: { error: "projectId required for project-files channel" },
-    });
-    return;
-  }
-
-  let eventId = 0;
-  const sendEvent = (eventType: string, data: unknown) => {
-    send({
-      type: "event",
-      subscriptionId,
-      eventType,
-      eventId: String(eventId++),
-      data,
-    });
-  };
-
-  sendEvent("connected", { timestamp: new Date().toISOString() });
-
-  const heartbeatInterval = setInterval(() => {
-    sendEvent("heartbeat", { timestamp: new Date().toISOString() });
-  }, 30_000);
-
-  const cleanupWatch = projectFileWatchManager.subscribe(
-    projectId as UrlProjectId,
-    (event) => {
-      sendEvent("project-files-changed", event);
-    },
-  );
-
-  subscriptions.set(subscriptionId, () => {
-    clearInterval(heartbeatInterval);
-    cleanupWatch();
-  });
-
-  getLogger().debug(
-    `[WS] Subscribed to project-files ${projectId} (${subscriptionId})`,
-  );
-}
-
-/**
  * Handle a subscribe message.
  */
 export function handleSubscribe(
   subscriptions: Map<string, () => void>,
   msg: WireSubscribe,
   send: SendFn,
-  supervisor: Supervisor,
+  runtimeController: RuntimeController,
   eventBus: EventBus,
   focusedSessionWatchManager?: FocusedSessionWatchManager,
   connectedBrowsers?: ConnectedBrowsersService,
   browserProfileService?: BrowserProfileService,
-  projectFileWatchManager?: ProjectFileWatchManager,
-): void {
+): Promise<void> | void {
   const { subscriptionId, channel } = msg;
 
   if (subscriptions.has(subscriptionId)) {
@@ -595,8 +528,12 @@ export function handleSubscribe(
 
   switch (channel) {
     case "session":
-      handleSessionSubscribe(subscriptions, msg, send, supervisor);
-      break;
+      return handleSessionSubscribe(
+        subscriptions,
+        msg,
+        send,
+        runtimeController,
+      );
 
     case "activity":
       handleActivitySubscribe(
@@ -615,15 +552,6 @@ export function handleSubscribe(
         msg,
         send,
         focusedSessionWatchManager,
-      );
-      break;
-
-    case "project-files":
-      handleProjectFilesSubscribe(
-        subscriptions,
-        msg,
-        send,
-        projectFileWatchManager,
       );
       break;
 
@@ -933,7 +861,7 @@ export async function handleMessage(
   deviceSessions?: Set<string>,
   terminalAttachId?: string,
 ): Promise<void> {
-  const { app, baseUrl, supervisor, eventBus, uploadManager } = deps;
+  const { app, baseUrl, runtimeController, eventBus, uploadManager } = deps;
 
   // Debug: log incoming data type and preview
   // Check Buffer BEFORE Uint8Array since Buffer extends Uint8Array
@@ -972,12 +900,11 @@ export async function handleMessage(
           subscriptions,
           subscribeMsg,
           send,
-          supervisor,
+          runtimeController,
           eventBus,
           deps.focusedSessionWatchManager,
           deps.connectedBrowsers,
           deps.browserProfileService,
-          deps.projectFileWatchManager,
         ),
       onUnsubscribe: async (unsubscribeMsg) =>
         handleUnsubscribe(subscriptions, unsubscribeMsg),

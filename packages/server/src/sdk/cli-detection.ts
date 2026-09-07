@@ -1,5 +1,5 @@
 import { exec, execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import * as os from "node:os";
 import { promisify } from "node:util";
 
@@ -13,34 +13,6 @@ const execFileAsync = promisify(execFile);
  */
 export function whichCommand(name: string): string {
   return isWindows ? `where ${name}` : `which ${name}`;
-}
-
-/**
- * Information about the Claude CLI installation.
- */
-export interface ClaudeCliInfo {
-  /** Whether the CLI was found */
-  found: boolean;
-  /** Path to the CLI executable */
-  path?: string;
-  /** CLI version string */
-  version?: string;
-  /** Error message if not found */
-  error?: string;
-}
-
-/**
- * Detect the Claude CLI installation.
- *
- * Checks:
- * 1. PATH via `which claude`
- * 2. Common installation locations
- *
- * @returns Information about the CLI installation
- */
-export function detectClaudeCli(): ClaudeCliInfo {
-  // Short-circuit: let the SDK handle CLI spawning and errors
-  return { found: true, path: "claude", version: "(SDK-managed)" };
 }
 
 /**
@@ -61,8 +33,9 @@ export interface CodexCliInfo {
  * Detect the Codex CLI installation.
  *
  * Checks:
- * 1. PATH via `which codex`
- * 2. Common installation locations (cargo, local bin, etc.)
+ * 1. Explicit YEP_CODEX_PATH/CODEX_PATH overrides
+ * 2. PATH via `which codex`
+ * 3. Common installation locations (NVM, cargo, local bin, etc.)
  *
  * @returns Information about the CLI installation
  */
@@ -85,8 +58,7 @@ export async function detectCodexCli(): Promise<CodexCliInfo> {
  * Common Codex CLI installation paths (checked after PATH lookup).
  * Includes the Codex desktop app's sandbox-bin location.
  */
-export function getCodexCommonPaths(): string[] {
-  const home = os.homedir();
+export function getCodexCommonPaths(home = os.homedir()): string[] {
   const ext = isWindows ? ".exe" : "";
   const sep = isWindows ? "\\" : "/";
   return isWindows
@@ -99,22 +71,39 @@ export function getCodexCommonPaths(): string[] {
     : [
         `${home}/.codex/.sandbox-bin/codex`,
         `${home}/.local/bin/codex`,
+        ...getNvmCodexPaths(home),
         "/usr/local/bin/codex",
         `${home}/.cargo/bin/codex`,
         `${home}/.codex/bin/codex`,
       ];
 }
 
+function getNvmCodexPaths(home: string): string[] {
+  const versionsRoot = `${home}/.nvm/versions/node`;
+  try {
+    return readdirSync(versionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort((left, right) =>
+        right.localeCompare(left, undefined, { numeric: true }),
+      )
+      .map((version) => `${versionsRoot}/${version}/bin/codex`);
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Find the Codex CLI path by checking PATH first, then common locations.
+ * Find the Codex CLI path from an explicit override, PATH, or common locations.
  * Returns the path if found, null otherwise.
  */
 export async function findCodexCliPath(): Promise<string | null> {
-  // Allow operators to pin a specific codex binary (e.g. the ChatGPT-app
-  // bundled codex at /Applications/ChatGPT.app/Contents/Resources/codex).
-  const envPath =
-    process.env.YEP_CODEX_PATH?.trim() || process.env.CODEX_CLI_PATH?.trim();
-  if (envPath && existsSync(envPath)) return envPath;
+  for (const explicitPath of [
+    process.env.YEP_CODEX_PATH,
+    process.env.CODEX_PATH,
+  ]) {
+    if (explicitPath && existsSync(explicitPath)) return explicitPath;
+  }
 
   try {
     const { stdout } = await execAsync(whichCommand("codex"), {

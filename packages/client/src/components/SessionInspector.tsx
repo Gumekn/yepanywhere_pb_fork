@@ -1,20 +1,14 @@
-import type {
-  MarkdownAugment,
-  ProviderInfo,
-  SessionQuestion,
-  ThinkingOption,
-} from "@yep-anywhere/shared";
-import type React from "react";
+import type { MarkdownAugment, SessionQuestion } from "@yep-anywhere/shared";
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api/client";
 import { useGitStatus } from "../hooks/useGitStatus";
-import { useModelSettings } from "../hooks/useModelSettings";
 import { useI18n } from "../i18n";
 import { formatSmartTime } from "../lib/datetime";
 import {
   type ActiveToolApproval,
+  isNativeGoalStateItem,
+  isNativePlanProgressItem,
   isPlanProgressItem,
   preprocessMessages,
 } from "../lib/preprocessMessages";
@@ -24,8 +18,13 @@ import type {
   ProviderName,
   SessionStatus,
 } from "../types";
-import type { RenderItem, ToolCallItem } from "../types/renderItems";
-import { RepoTree } from "./RepoTree";
+import type {
+  CodexNativeItem,
+  RenderItem,
+  ToolCallItem,
+} from "../types/renderItems";
+import { ProviderBadge } from "./ProviderBadge";
+import { CodexNativeGoalBlock } from "./blocks/codex/CodexNativeGoalBlock";
 import {
   type ChecklistItem,
   normalizeChecklistStatus,
@@ -42,16 +41,13 @@ interface SessionInspectorProps {
   presentation: InspectorPresentation;
   isOpen?: boolean;
   onClose?: () => void;
-  /** Desktop sidebar mode: current inspector width in pixels */
-  inspectorWidth?: number;
-  /** Desktop sidebar mode: called when resize starts */
-  onResizeStart?: () => void;
-  /** Desktop sidebar mode: called during resize with new width */
-  onResize?: (width: number) => void;
-  /** Desktop sidebar mode: called when resize ends */
-  onResizeEnd?: () => void;
   messages: Message[];
   userQuestions?: SessionQuestion[];
+  questionCoverage?: "complete" | "partial" | "unavailable";
+  hasLegacyDetails?: boolean;
+  legacyDetailsLoading?: boolean;
+  legacyDetailsError?: boolean;
+  onLoadLegacyDetails?: () => void | Promise<void>;
   markdownAugments?: Record<string, MarkdownAugment>;
   activeToolApproval?: ActiveToolApproval;
   projectId: string;
@@ -64,18 +60,14 @@ interface SessionInspectorProps {
   status: SessionStatus;
   processState?: string;
   onSelectMessage: (messageId: string) => void;
-  /** Open a repository file (relative path) in a page tab. */
-  onOpenFile?: (filePath: string) => void;
-  /** Active process id, when the session is running (enables live model switch). */
-  processId?: string;
-  /** Provider info list (for model list + codex reasoning-effort levels). */
-  providers?: ProviderInfo[];
 }
 
 interface QuestionItem {
   id: string;
   text: string;
   timestamp?: string;
+  clientUserMessageId?: string;
+  codexCorrelationKey?: string;
 }
 
 interface FileActivity {
@@ -105,6 +97,23 @@ interface PlanProgress {
   note?: string;
 }
 
+interface CodexGoalState {
+  objective: string;
+  status: string | undefined;
+  tokenBudget: number | null | undefined;
+  tokensUsed: number | undefined;
+  timeUsedSeconds: number | undefined;
+}
+
+/** A provider-native subagent session spawned from this session's task tool. */
+interface SubagentItem {
+  /** Child session id (target of the navigation link). */
+  sessionId: string;
+  description: string;
+  agent?: string;
+  status: ToolCallItem["status"];
+}
+
 interface CodexChannelSummary {
   phase: CodexMessagePhase;
   count: number;
@@ -129,12 +138,13 @@ export function SessionInspector({
   presentation,
   isOpen = true,
   onClose,
-  inspectorWidth,
-  onResizeStart,
-  onResize,
-  onResizeEnd,
   messages,
   userQuestions,
+  questionCoverage = "complete",
+  hasLegacyDetails = true,
+  legacyDetailsLoading = false,
+  legacyDetailsError = false,
+  onLoadLegacyDetails,
   markdownAugments,
   activeToolApproval,
   projectId,
@@ -147,163 +157,16 @@ export function SessionInspector({
   status,
   processState,
   onSelectMessage,
-  onOpenFile,
-  processId,
-  providers,
 }: SessionInspectorProps) {
   const { t, locale } = useI18n();
   const [activeTab, setActiveTab] = useState<InspectorTab>("questions");
   const [copiedSessionId, setCopiedSessionId] = useState(false);
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  // Desktop sidebar resize state (right panel: dragging the left edge)
-  const [isResizing, setIsResizing] = useState(false);
-  const resizeStartX = useRef<number | null>(null);
-  const resizeStartWidth = useRef<number | null>(null);
-
-  const handleResizeMouseDown = (e: React.MouseEvent) => {
-    if (presentation !== "sidebar" || !inspectorWidth) return;
-    e.preventDefault();
-    resizeStartX.current = e.clientX;
-    resizeStartWidth.current = inspectorWidth;
-    setIsResizing(true);
-    onResizeStart?.();
-  };
-
-  useEffect(() => {
-    if (!isResizing) return;
-
-    const handleMouseMove = (e: MouseEvent) => {
-      if (resizeStartX.current === null || resizeStartWidth.current === null)
-        return;
-      // Left edge dragged left (negative diff) => panel gets wider.
-      const diff = e.clientX - resizeStartX.current;
-      const newWidth = resizeStartWidth.current - diff;
-      onResize?.(newWidth);
-    };
-
-    const handleMouseUp = () => {
-      resizeStartX.current = null;
-      resizeStartWidth.current = null;
-      setIsResizing(false);
-      onResizeEnd?.();
-    };
-
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-
-    return () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [isResizing, onResize, onResizeEnd]);
-  // Optimistic local state for model select (prop may lag after API call).
-  const [selectedModel, setSelectedModel] = useState(model ?? "default");
-  // Sync optimistic state when prop changes externally (SSE, re-fetch, etc.).
-  const prevModelRef = useRef(model);
-  useEffect(() => {
-    if (model !== prevModelRef.current) {
-      setSelectedModel(model ?? "default");
-      prevModelRef.current = model;
-    }
-  }, [model]);
   const {
     gitStatus,
     loading: gitLoading,
     error: gitError,
   } = useGitStatus(projectId);
   const isCodexProvider = provider === "codex" || provider === "codex-oss";
-  const { thinkingOption, setThinkingOption } = useModelSettings();
-
-  const providerInfo = useMemo(
-    () => providers?.find((p) => p.name === provider) ?? null,
-    [providers, provider],
-  );
-
-  // --- Live model switch (Codex-native model list) ---
-  const modelOptions = useMemo(
-    () => providerInfo?.models ?? [],
-    [providerInfo],
-  );
-
-  // --- Model switch (live process or preset for next start) ---
-  const handleModelChange = useCallback(
-    (nextModel: string) => {
-      const resolvedModel = nextModel === "default" ? undefined : nextModel;
-      // Optimistic UI update
-      setSelectedModel(nextModel);
-      if (processId) {
-        // Live session: switch model on the running process immediately.
-        api.setProcessModel(processId, resolvedModel).catch((err) => {
-          console.error("Failed to switch model:", err);
-          // Revert on error
-          setSelectedModel(model ?? "default");
-        });
-      } else {
-        // Stopped/idle session: store as preset default for next start.
-        api
-          .updateSessionMetadata(sessionId, { model: resolvedModel })
-          .catch((err) => {
-            console.error("Failed to save preset model:", err);
-            // Revert on error
-            setSelectedModel(model ?? "default");
-          });
-      }
-    },
-    [processId, sessionId, model],
-  );
-
-  // --- Thinking / reasoning-effort switch (matches local provider) ---
-  // Render the provider's native levels verbatim — no cross-provider remapping.
-  const thinkingOptions = useMemo(() => {
-    const nativeLevels = providerInfo?.reasoningEffortLevels;
-    if (nativeLevels && nativeLevels.length > 0) {
-      return [
-        { value: "off", label: t("inspectorThinkingOff") },
-        ...nativeLevels.map((level) => ({
-          value: `on:${level}` as ThinkingOption,
-          label: getReasoningLevelLabel(t, level),
-        })),
-      ];
-    }
-    // Fallback for providers that don't expose discrete effort levels.
-    return [
-      { value: "off", label: t("inspectorThinkingOff") },
-      { value: "auto", label: t("inspectorThinkingAuto") },
-      { value: "on:low", label: t("inspectorThinkingLow") },
-      { value: "on:medium", label: t("inspectorThinkingMedium") },
-      { value: "on:high", label: t("inspectorThinkingHigh") },
-      { value: "on:max", label: t("inspectorThinkingMax") },
-    ];
-  }, [providerInfo, t]);
-
-  // Map the stored option to the option list.
-  const selectedThinking = useMemo(() => {
-    if (thinkingOption === "off") return "off";
-    if (thinkingOption === "auto") return "auto";
-    if (thinkingOption.startsWith("on:")) {
-      const match = thinkingOptions.find((o) => o.value === thinkingOption);
-      if (match) return match.value;
-      // Stored level not in current provider's set — fall back to last option.
-      return thinkingOptions[thinkingOptions.length - 1]?.value;
-    }
-    return thinkingOptions[thinkingOptions.length - 1]?.value;
-  }, [thinkingOption, thinkingOptions]);
-
-  const handleThinkingChange = useCallback(
-    (next: string) => {
-      setThinkingOption(next as ThinkingOption);
-    },
-    [setThinkingOption],
-  );
-
-  const toggleSection = useCallback((key: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  }, []);
 
   const renderItems = useMemo(
     () =>
@@ -327,23 +190,43 @@ export function SessionInspector({
     [renderItems],
   );
   const checks = useMemo(() => buildCheckItems(renderItems), [renderItems]);
+  const subagents = useMemo(
+    () => buildSubagentItems(renderItems),
+    [renderItems],
+  );
   const planProgress = useMemo(
     () => buildPlanProgress(renderItems, t),
     [renderItems, t],
+  );
+  const currentCodexGoal = useMemo(
+    () => (isCodexProvider ? buildCurrentCodexGoal(renderItems) : null),
+    [isCodexProvider, renderItems],
   );
   const codexChannelSummaries = useMemo(
     () => (isCodexProvider ? buildCodexChannelSummaries(messages) : []),
     [isCodexProvider, messages],
   );
+  const legacyDetailsDeferred = !hasLegacyDetails && processState === "in-turn";
 
-  const gitStatusHasChanges = useMemo(
-    () =>
-      !!gitStatus &&
-      gitStatus.isGitRepo &&
-      !gitStatus.isClean &&
-      (gitStatus.files?.length ?? 0) > 0,
-    [gitStatus],
-  );
+  useEffect(() => {
+    if (
+      !isOpen ||
+      hasLegacyDetails ||
+      legacyDetailsDeferred ||
+      legacyDetailsLoading ||
+      legacyDetailsError
+    ) {
+      return;
+    }
+    void onLoadLegacyDetails?.();
+  }, [
+    hasLegacyDetails,
+    isOpen,
+    legacyDetailsDeferred,
+    legacyDetailsError,
+    legacyDetailsLoading,
+    onLoadLegacyDetails,
+  ]);
 
   const handleSelect = (messageId: string) => {
     onSelectMessage(messageId);
@@ -376,16 +259,38 @@ export function SessionInspector({
           </h2>
           <div className="session-inspector-subtitle">
             {questions.length} {t("sessionInspectorQuestions").toLowerCase()}
+            {questionCoverage !== "complete"
+              ? ` · ${t(
+                  questionCoverage === "partial"
+                    ? "sessionInspectorQuestionsPartial"
+                    : "sessionInspectorQuestionsUnavailable",
+                )}`
+              : ""}
           </div>
         </div>
-        {presentation === "drawer" && (
+        {onClose && (
           <button
             type="button"
             className="session-inspector-close"
             onClick={onClose}
-            aria-label={t("sessionInspectorClose")}
+            title={
+              presentation === "sidebar"
+                ? t("sessionInspectorCollapse")
+                : t("sessionInspectorClose")
+            }
+            aria-label={
+              presentation === "sidebar"
+                ? t("sessionInspectorCollapse")
+                : t("sessionInspectorClose")
+            }
+            aria-controls="session-inspector-panel"
+            aria-expanded="true"
           >
-            <CloseIcon />
+            {presentation === "sidebar" ? (
+              <CollapseRightPanelIcon />
+            ) : (
+              <CloseIcon />
+            )}
           </button>
         )}
       </div>
@@ -401,40 +306,12 @@ export function SessionInspector({
         </div>
         {provider && (
           <div className="session-inspector-provider-row">
-            <label className="session-inspector-field">
-              <span className="session-inspector-field-label">
-                {t("inspectorModel")}
-              </span>
-              <select
-                className="session-inspector-select"
-                value={selectedModel}
-                onChange={(e) => handleModelChange(e.target.value)}
-                disabled={modelOptions.length === 0}
-              >
-                <option value="default">{t("inspectorModelDefault")}</option>
-                {modelOptions.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name || m.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="session-inspector-field">
-              <span className="session-inspector-field-label">
-                {t("inspectorThinking")}
-              </span>
-              <select
-                className="session-inspector-select"
-                value={selectedThinking}
-                onChange={(e) => handleThinkingChange(e.target.value)}
-              >
-                {thinkingOptions.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <ProviderBadge
+              provider={provider}
+              model={model}
+              reasoningEffort={reasoningEffort}
+              serviceTier={serviceTier}
+            />
           </div>
         )}
         {codexChannelSummaries.length > 0 && (
@@ -489,48 +366,84 @@ export function SessionInspector({
             {copiedSessionId ? <CopiedIcon /> : <CopyIcon />}
           </button>
         </div>
+        {!hasLegacyDetails &&
+          !legacyDetailsDeferred &&
+          legacyDetailsError &&
+          onLoadLegacyDetails && (
+            <button
+              type="button"
+              className="session-inspector-section-link"
+              onClick={() => void onLoadLegacyDetails()}
+              disabled={legacyDetailsLoading}
+            >
+              {t("sessionInspectorRetryDetails")}
+            </button>
+          )}
       </div>
 
-      {planProgress && <InspectorPlanProgress progress={planProgress} t={t} />}
-
-      {presentation === "drawer" && (
-        <div className="session-inspector-tabs" role="tablist">
-          {BASE_TAB_KEYS.map((tab) => (
-            <button
-              key={tab}
-              type="button"
-              className={`session-inspector-tab ${activeTab === tab ? "active" : ""}`}
-              onClick={() => setActiveTab(tab)}
-              role="tab"
-              aria-selected={activeTab === tab}
-            >
-              {getTabLabel(t, tab)}
-            </button>
-          ))}
+      {currentCodexGoal && (
+        <div className="session-inspector-goal-card">
+          <CodexNativeGoalBlock {...currentCodexGoal} />
         </div>
       )}
 
-      <div className="session-inspector-content">
-        {presentation === "sidebar" && onOpenFile && (
-          <CollapsibleSection
-            title={t("inspectorRepo")}
-            sectionKey="repo"
-            collapsed={collapsed}
-            onToggle={toggleSection}
+      {planProgress && <InspectorPlanProgress progress={planProgress} t={t} />}
+
+      <div className="session-inspector-tabs" role="tablist">
+        {BASE_TAB_KEYS.map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            className={`session-inspector-tab ${activeTab === tab ? "active" : ""}`}
+            onClick={() => setActiveTab(tab)}
+            role="tab"
+            aria-selected={activeTab === tab}
           >
-            <RepoTree projectId={projectId} onOpenFile={onOpenFile} />
-          </CollapsibleSection>
+            {getTabLabel(t, tab)}
+          </button>
+        ))}
+      </div>
+
+      <div className="session-inspector-content">
+        {subagents.length > 0 && (
+          <InspectorSection
+            title={t("sessionInspectorSubagents")}
+            count={subagents.length}
+          >
+            <ul className="session-inspector-list">
+              {subagents.map((subagent) => (
+                <li key={subagent.sessionId}>
+                  <Link
+                    className="session-inspector-row"
+                    to={`${basePath}/projects/${projectId}/sessions/${subagent.sessionId}`}
+                    title={subagent.description || subagent.sessionId}
+                  >
+                    <span
+                      className={`session-inspector-check-dot status-${getSubagentDotStatus(subagent.status)}`}
+                      aria-hidden="true"
+                    />
+                    <span className="session-inspector-row-main">
+                      <span className="session-inspector-row-title">
+                        {subagent.description || subagent.sessionId}
+                      </span>
+                      <span className="session-inspector-row-meta">
+                        {subagent.agent ? `${subagent.agent} · ` : ""}
+                        {getSubagentStatusLabel(t, subagent.status)}
+                      </span>
+                    </span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </InspectorSection>
         )}
 
-        {(presentation === "sidebar" || activeTab === "questions") &&
-          questions.length > 0 && (
-            <CollapsibleSection
-              title={t("sessionInspectorQuestions")}
-              count={questions.length}
-              sectionKey="questions"
-              collapsed={collapsed}
-              onToggle={toggleSection}
-            >
+        {activeTab === "questions" ? (
+          <InspectorSection
+            title={t("sessionInspectorQuestions")}
+            count={questions.length}
+          >
+            {questions.length > 0 ? (
               <ol className="session-inspector-list">
                 {questions.map((question, index) => (
                   <li key={question.id}>
@@ -557,18 +470,27 @@ export function SessionInspector({
                   </li>
                 ))}
               </ol>
-            </CollapsibleSection>
-          )}
+            ) : (
+              <EmptyState text={t("sessionInspectorNoQuestions")} />
+            )}
+          </InspectorSection>
+        ) : null}
 
-        {(presentation === "sidebar" || activeTab === "files") &&
-          fileActivities.length > 0 && (
-            <CollapsibleSection
-              title={t("sessionInspectorFiles")}
-              count={fileActivities.length}
-              sectionKey="files"
-              collapsed={collapsed}
-              onToggle={toggleSection}
-            >
+        {activeTab === "files" ? (
+          <InspectorSection
+            title={t("sessionInspectorFiles")}
+            count={fileActivities.length}
+          >
+            {(legacyDetailsLoading || legacyDetailsDeferred) &&
+            !hasLegacyDetails ? (
+              <EmptyState
+                text={t(
+                  legacyDetailsDeferred
+                    ? "sessionInspectorDetailsDeferred"
+                    : "sessionInspectorLoadingDetails",
+                )}
+              />
+            ) : fileActivities.length > 0 ? (
               <ul className="session-inspector-list">
                 {fileActivities.slice(0, 10).map((activity) => (
                   <li key={activity.path}>
@@ -595,18 +517,27 @@ export function SessionInspector({
                   </li>
                 ))}
               </ul>
-            </CollapsibleSection>
-          )}
+            ) : (
+              <EmptyState text={t("sessionInspectorNoFiles")} />
+            )}
+          </InspectorSection>
+        ) : null}
 
-        {(presentation === "sidebar" || activeTab === "checks") &&
-          checks.length > 0 && (
-            <CollapsibleSection
-              title={t("sessionInspectorChecks")}
-              count={checks.length}
-              sectionKey="checks"
-              collapsed={collapsed}
-              onToggle={toggleSection}
-            >
+        {activeTab === "checks" ? (
+          <InspectorSection
+            title={t("sessionInspectorChecks")}
+            count={checks.length}
+          >
+            {(legacyDetailsLoading || legacyDetailsDeferred) &&
+            !hasLegacyDetails ? (
+              <EmptyState
+                text={t(
+                  legacyDetailsDeferred
+                    ? "sessionInspectorDetailsDeferred"
+                    : "sessionInspectorLoadingDetails",
+                )}
+              />
+            ) : checks.length > 0 ? (
               <ul className="session-inspector-list">
                 {checks.slice(0, 8).map((check) => (
                   <li key={check.id}>
@@ -634,45 +565,52 @@ export function SessionInspector({
                   </li>
                 ))}
               </ul>
-            </CollapsibleSection>
-          )}
+            ) : (
+              <EmptyState text={t("sessionInspectorNoChecks")} />
+            )}
+          </InspectorSection>
+        ) : null}
 
-        {(presentation === "sidebar" || activeTab === "git") &&
-          gitStatusHasChanges && (
-            <CollapsibleSection
-              title={t("sessionInspectorGit")}
-              count={gitStatus?.files.length}
-              sectionKey="git"
-              collapsed={collapsed}
-              onToggle={toggleSection}
-              action={
-                <Link
-                  className="session-inspector-section-link"
-                  to={`${basePath}/settings/source-control?projectId=${encodeURIComponent(projectId)}`}
-                >
-                  {t("gitStatusTitle")}
-                </Link>
-              }
-            >
-              {gitLoading ? (
-                <EmptyState text={t("sessionInspectorGitLoading")} />
-              ) : gitError ? (
-                <EmptyState text={t("sessionInspectorGitUnavailable")} />
-              ) : gitStatus && !gitStatus.isGitRepo ? (
-                <EmptyState text={t("sessionInspectorGitNotRepo")} />
-              ) : gitStatus?.isClean ? (
-                <EmptyState text={t("sessionInspectorGitClean")} />
-              ) : gitStatus ? (
-                <div className="session-inspector-git">
-                  <div className="session-inspector-git-branch">
-                    <span>{gitStatus.branch ?? "HEAD"}</span>
-                    {(gitStatus.ahead > 0 || gitStatus.behind > 0) && (
-                      <span className="session-inspector-row-meta">
-                        {gitStatus.ahead > 0 ? `+${gitStatus.ahead}` : ""}
-                        {gitStatus.behind > 0 ? ` -${gitStatus.behind}` : ""}
-                      </span>
-                    )}
-                  </div>
+        {activeTab === "git" ? (
+          <InspectorSection
+            title={t("sessionInspectorGit")}
+            count={gitStatus?.files.length}
+            action={
+              <Link
+                className="session-inspector-section-link"
+                to={`${basePath}/settings/source-control?projectId=${encodeURIComponent(projectId)}`}
+              >
+                {t("gitStatusTitle")}
+              </Link>
+            }
+          >
+            {gitLoading ? (
+              <EmptyState text={t("sessionInspectorGitLoading")} />
+            ) : gitError ? (
+              <EmptyState text={t("sessionInspectorGitUnavailable")} />
+            ) : gitStatus && !gitStatus.isGitRepo ? (
+              <EmptyState text={t("sessionInspectorGitNotRepo")} />
+            ) : gitStatus ? (
+              <div className="session-inspector-git">
+                <div className="session-inspector-git-branch">
+                  <span className="session-inspector-git-branch-main">
+                    <span className="session-inspector-git-scope">
+                      {t("sessionInspectorGitCurrentProject")}
+                    </span>
+                    <code title={gitStatus.branch ?? "HEAD"}>
+                      {gitStatus.branch ?? "HEAD"}
+                    </code>
+                  </span>
+                  {(gitStatus.ahead > 0 || gitStatus.behind > 0) && (
+                    <span className="session-inspector-row-meta">
+                      {gitStatus.ahead > 0 ? `+${gitStatus.ahead}` : ""}
+                      {gitStatus.behind > 0 ? ` -${gitStatus.behind}` : ""}
+                    </span>
+                  )}
+                </div>
+                {gitStatus.isClean ? (
+                  <EmptyState text={t("sessionInspectorGitClean")} />
+                ) : (
                   <ul className="session-inspector-list">
                     {gitStatus.files.slice(0, 8).map((file) => (
                       <li key={`${file.path}-${file.staged}`}>
@@ -697,10 +635,11 @@ export function SessionInspector({
                       </li>
                     ))}
                   </ul>
-                </div>
-              ) : null}
-            </CollapsibleSection>
-          )}
+                )}
+              </div>
+            ) : null}
+          </InspectorSection>
+        ) : null}
       </div>
     </>
   );
@@ -719,6 +658,7 @@ export function SessionInspector({
         }}
       >
         <aside
+          id="session-inspector-panel"
           className="session-inspector session-inspector--drawer"
           aria-label={t("sessionInspectorTitle")}
           onClick={(event) => event.stopPropagation()}
@@ -732,113 +672,44 @@ export function SessionInspector({
 
   return (
     <aside
-      className={`session-inspector session-inspector--sidebar${isResizing ? " is-resizing" : ""}`}
+      id="session-inspector-panel"
+      className="session-inspector session-inspector--sidebar"
       aria-label={t("sessionInspectorTitle")}
-      style={inspectorWidth ? { width: inspectorWidth } : undefined}
     >
-      {/* Resize handle - sidebar mode only, on the left edge */}
-      {presentation === "sidebar" && (
-        <div
-          className={`session-inspector-resize-handle ${isResizing ? "active" : ""}`}
-          onMouseDown={handleResizeMouseDown}
-          role="separator"
-          aria-orientation="vertical"
-          aria-label={t("actionResizeInspector")}
-          tabIndex={0}
-        />
-      )}
       {body}
     </aside>
   );
 }
 
-function EmptyState({ text }: { text: string }) {
-  return <div className="session-inspector-empty">{text}</div>;
-}
-
-/**
- * Collapsible inspector section. The header is a toggle button; the body is
- * hidden when collapsed. Rendered only when the caller decides there is
- * content (non-empty) to show.
- */
-function CollapsibleSection({
+function InspectorSection({
   title,
   count,
-  sectionKey,
-  collapsed,
-  onToggle,
   action,
   children,
 }: {
   title: string;
   count?: number;
-  sectionKey: string;
-  collapsed: Set<string>;
-  onToggle: (key: string) => void;
   action?: ReactNode;
   children: ReactNode;
 }) {
-  const isCollapsed = collapsed.has(sectionKey);
   return (
-    <section
-      className={`session-inspector-section${isCollapsed ? " is-collapsed" : ""}`}
-    >
+    <section className="session-inspector-section">
       <div className="session-inspector-section-header">
-        <button
-          type="button"
-          className="session-inspector-section-toggle"
-          onClick={() => onToggle(sectionKey)}
-          aria-expanded={!isCollapsed}
-        >
-          <ChevronIcon open={!isCollapsed} />
-          <h3>
-            {title}
-            {count !== undefined && (
-              <span className="session-inspector-count">{count}</span>
-            )}
-          </h3>
-        </button>
+        <h3>
+          {title}
+          {count !== undefined && (
+            <span className="session-inspector-count">{count}</span>
+          )}
+        </h3>
         {action}
       </div>
-      {!isCollapsed && children}
+      {children}
     </section>
   );
 }
 
-/** Localized label for a Codex reasoning-effort level keyword. */
-function getReasoningLevelLabel(t: TFunction, level: string): string {
-  switch (level) {
-    case "low":
-      return t("inspectorThinkingLow");
-    case "medium":
-      return t("inspectorThinkingMedium");
-    case "high":
-      return t("inspectorThinkingHigh");
-    case "xhigh":
-    case "max":
-      return t("inspectorThinkingMax");
-    default:
-      return level;
-  }
-}
-
-function ChevronIcon({ open }: { open: boolean }) {
-  return (
-    <svg
-      width="12"
-      height="12"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      className={`session-inspector-chevron${open ? " is-open" : ""}`}
-    >
-      <polyline points="6 9 12 15 18 9" />
-    </svg>
-  );
+function EmptyState({ text }: { text: string }) {
+  return <div className="session-inspector-empty">{text}</div>;
 }
 
 function InspectorPlanProgress({
@@ -884,17 +755,64 @@ function getPlanStatusClassName(status: ChecklistItem["status"]): string {
   return status === "in_progress" ? "in-progress" : status;
 }
 
+/**
+ * Read the latest canonical thread-goal snapshot. Its objective comes from
+ * `thread/goal/updated`, never from the first or latest user prompt.
+ */
+function buildCurrentCodexGoal(items: RenderItem[]): CodexGoalState | null {
+  for (let index = items.length - 1; index >= 0; index--) {
+    const item = items[index];
+    if (!item || !isNativeGoalStateItem(item)) continue;
+
+    const objective = readNonEmptyString(item.threadItem.objective);
+    if (!objective) continue;
+
+    const status = readNonEmptyString(item.threadItem.status);
+    const tokenBudget =
+      item.threadItem.tokenBudget === null
+        ? null
+        : readFiniteNumber(item.threadItem.tokenBudget);
+    const tokensUsed = readFiniteNumber(item.threadItem.tokensUsed);
+    const timeUsedSeconds = readFiniteNumber(item.threadItem.timeUsedSeconds);
+    return {
+      objective,
+      status,
+      tokenBudget,
+      tokensUsed,
+      timeUsedSeconds,
+    };
+  }
+
+  return null;
+}
+
+function readNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== ""
+    ? value.trim()
+    : undefined;
+}
+
+function readFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
 function buildPlanProgress(
   items: RenderItem[],
   t: TFunction,
 ): PlanProgress | null {
-  const planItems = items.filter(isPlanProgressItem);
+  const planItems = items.filter(
+    (item) => isPlanProgressItem(item) || isNativePlanProgressItem(item),
+  );
   const latest = planItems[planItems.length - 1];
   if (!latest) {
     return null;
   }
 
-  const extracted = extractPlanProgress(latest);
+  const extracted = isNativePlanProgressItem(latest)
+    ? extractNativeTurnPlanProgress(latest)
+    : extractPlanProgress(latest);
   if (!extracted || extracted.items.length === 0) {
     return null;
   }
@@ -912,6 +830,33 @@ function buildPlanProgress(
   };
 }
 
+function extractNativeTurnPlanProgress(item: CodexNativeItem): {
+  items: ChecklistItem[];
+  note?: string;
+} {
+  const steps = Array.isArray(item.threadItem.steps)
+    ? item.threadItem.steps
+    : [];
+  const items = steps
+    .filter(
+      (entry): entry is Record<string, unknown> =>
+        isRecord(entry) &&
+        typeof entry.step === "string" &&
+        entry.step.trim() !== "",
+    )
+    .map((entry) => ({
+      label: (entry.step as string).trim(),
+      status: normalizeChecklistStatus(entry.status),
+    }));
+  const explanation = item.threadItem.explanation;
+  const note =
+    typeof explanation === "string" && explanation.trim()
+      ? explanation.trim()
+      : undefined;
+
+  return { items, note };
+}
+
 function extractPlanProgress(
   item: ToolCallItem,
 ): { items: ChecklistItem[]; note?: string } | null {
@@ -924,8 +869,8 @@ function extractPlanProgress(
     return extractUpdatePlanProgress(item.toolInput);
   }
 
-  if (normalizedToolName === "todowrite") {
-    return extractTodoWriteProgress(item);
+  if (normalizedToolName === "todowrite" || normalizedToolName === "todolist") {
+    return extractTodoProgress(item);
   }
 
   return null;
@@ -956,7 +901,7 @@ function extractUpdatePlanProgress(
   return { items, note };
 }
 
-function extractTodoWriteProgress(
+function extractTodoProgress(
   item: ToolCallItem,
 ): { items: ChecklistItem[] } | null {
   const structured = item.toolResult?.structured;
@@ -975,11 +920,14 @@ function extractTodoWriteProgress(
     .filter(
       (entry): entry is Record<string, unknown> =>
         isRecord(entry) &&
-        typeof entry.content === "string" &&
-        entry.content !== "",
+        ((typeof entry.content === "string" && entry.content !== "") ||
+          (typeof entry.title === "string" && entry.title !== "")),
     )
     .map((entry) => ({
-      label: entry.content as string,
+      label:
+        typeof entry.content === "string"
+          ? entry.content
+          : (entry.title as string),
       status: normalizeChecklistStatus(entry.status),
     }));
 
@@ -995,6 +943,12 @@ function buildQuestionItems(items: RenderItem[]): QuestionItem[] {
       id: item.id,
       text: compactText(contentToText(item.content), 140) || "Untitled",
       timestamp: item.sourceMessages[0]?.timestamp,
+      clientUserMessageId: readNonEmptyString(
+        item.sourceMessages[0]?.clientUserMessageId,
+      ),
+      codexCorrelationKey: readNonEmptyString(
+        item.sourceMessages[0]?.codexCorrelationKey,
+      ),
     }));
 }
 
@@ -1005,22 +959,42 @@ function mergeQuestionItems(
   const merged: QuestionItem[] = [];
   const seenIds = new Set<string>();
   const seenSemanticKeys = new Set<string>();
+  const seenIdentityKeys = new Set<string>();
 
   const append = (question: QuestionItem) => {
     const text = compactText(question.text, 140) || "Untitled";
     const id = question.id || `${question.timestamp ?? ""}:${text}`;
     const semanticKey = `${question.timestamp ?? ""}\n${text}`;
+    const identityKeys = [
+      ...(question.clientUserMessageId
+        ? [`client:${question.clientUserMessageId}`]
+        : []),
+      ...(question.codexCorrelationKey
+        ? [`correlation:${question.codexCorrelationKey}`]
+        : []),
+    ];
 
-    if (seenIds.has(id) || seenSemanticKeys.has(semanticKey)) {
+    if (
+      seenIds.has(id) ||
+      seenSemanticKeys.has(semanticKey) ||
+      identityKeys.some((key) => seenIdentityKeys.has(key))
+    ) {
       return;
     }
 
     seenIds.add(id);
     seenSemanticKeys.add(semanticKey);
+    for (const key of identityKeys) seenIdentityKeys.add(key);
     merged.push({
       id,
       text,
       timestamp: question.timestamp,
+      ...(question.clientUserMessageId
+        ? { clientUserMessageId: question.clientUserMessageId }
+        : {}),
+      ...(question.codexCorrelationKey
+        ? { codexCorrelationKey: question.codexCorrelationKey }
+        : {}),
     });
   };
 
@@ -1084,7 +1058,7 @@ function buildFileActivities(items: RenderItem[]): FileActivity[] {
     if (paths.length === 0) return;
     const kind = getFileActivityKind(item.toolName);
     const messageId = item.sourceMessages[0]
-      ? getMessageIdLike(item.sourceMessages[0])
+      ? getInspectorNavigationMessageId(item.sourceMessages[0])
       : item.id;
 
     for (const path of paths) {
@@ -1120,7 +1094,7 @@ function buildCheckItems(items: RenderItem[]): CheckItem[] {
       const command = extractCommand(item.toolInput);
       if (!command || !CHECK_COMMAND_RE.test(command)) return [];
       const messageId = item.sourceMessages[0]
-        ? getMessageIdLike(item.sourceMessages[0])
+        ? getInspectorNavigationMessageId(item.sourceMessages[0])
         : item.id;
       return [
         {
@@ -1139,6 +1113,149 @@ function buildCheckItems(items: RenderItem[]): CheckItem[] {
 
 function getMessageIdLike(message: Message): string {
   return message.uuid ?? message.id ?? "";
+}
+
+function getInspectorNavigationMessageId(message: Message): string {
+  return message.inspectorNavigationMessageId ?? getMessageIdLike(message);
+}
+
+/**
+ * Collect subagent sessions from the render items.
+ *
+ * Codex native `subAgentActivity` and `collabAgentToolCall` ThreadItems
+ *   (agentThreadId / receiverThreadIds), projected as `codex_native_item`
+ *   render items by the canonical overlay.
+ */
+function buildSubagentItems(items: RenderItem[]): SubagentItem[] {
+  const result: SubagentItem[] = [];
+  const resultIndexBySessionId = new Map<string, number>();
+
+  for (const item of items) {
+    // Codex native sub-agent ThreadItems.
+    if (item.type !== "codex_native_item") continue;
+    const threadItem = item.threadItem;
+
+    if (threadItem.type === "subAgentActivity") {
+      const sessionId =
+        typeof threadItem.agentThreadId === "string"
+          ? threadItem.agentThreadId
+          : undefined;
+      if (!sessionId) continue;
+      const agentPath =
+        typeof threadItem.agentPath === "string"
+          ? threadItem.agentPath
+          : undefined;
+      const kind =
+        typeof threadItem.kind === "string" ? threadItem.kind : undefined;
+      const description = agentPath ?? sessionId;
+      const status: ToolCallItem["status"] =
+        kind?.toLowerCase() === "interrupted" ? "aborted" : "pending";
+      const existingIndex = resultIndexBySessionId.get(sessionId);
+      if (existingIndex === undefined) {
+        resultIndexBySessionId.set(sessionId, result.length);
+        result.push({ sessionId, description, status });
+      } else {
+        const existing = result[existingIndex];
+        if (existing) {
+          result[existingIndex] = {
+            ...existing,
+            description,
+            status,
+          };
+        }
+      }
+      continue;
+    }
+
+    if (threadItem.type === "collabAgentToolCall") {
+      const agentsStates = threadItem.agentsStates;
+      if (!isRecord(agentsStates)) continue;
+      for (const [threadId, stateRaw] of Object.entries(agentsStates)) {
+        if (!isRecord(stateRaw)) continue;
+        const nickname =
+          typeof stateRaw.nickname === "string" ? stateRaw.nickname : undefined;
+        const role =
+          typeof stateRaw.role === "string"
+            ? stateRaw.role
+            : typeof stateRaw.agent_type === "string"
+              ? stateRaw.agent_type
+              : undefined;
+        const agentStatus =
+          typeof stateRaw.status === "string" ? stateRaw.status : "unknown";
+        const existingIndex = resultIndexBySessionId.get(threadId);
+        const next: SubagentItem = {
+          sessionId: threadId,
+          description: nickname ?? threadId,
+          ...(role && role !== "default" ? { agent: role } : {}),
+          status: collabAgentStatusToItemStatus(agentStatus),
+        };
+        if (existingIndex === undefined) {
+          resultIndexBySessionId.set(threadId, result.length);
+          result.push(next);
+        } else {
+          const existing = result[existingIndex];
+          if (existing) {
+            result[existingIndex] = {
+              ...existing,
+              ...next,
+              description: nickname ?? existing.description,
+              agent: role && role !== "default" ? role : existing.agent,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+function collabAgentStatusToItemStatus(status: string): ToolCallItem["status"] {
+  switch (status) {
+    case "running":
+    case "in_progress":
+    case "inProgress":
+      return "pending";
+    case "completed":
+    case "complete":
+      return "complete";
+    case "errored":
+    case "error":
+    case "failed":
+      return "error";
+    case "interrupted":
+      return "aborted";
+    default:
+      return "pending";
+  }
+}
+
+function getSubagentStatusLabel(
+  t: TFunction,
+  status: ToolCallItem["status"],
+): string {
+  switch (status) {
+    case "pending":
+      return t("subagentStatusRunning");
+    case "error":
+      return t("subagentStatusFailed");
+    case "aborted":
+      return t("subagentStatusInterrupted");
+    default:
+      return t("subagentStatusCompleted");
+  }
+}
+
+function getSubagentDotStatus(status: ToolCallItem["status"]): CheckStatus {
+  switch (status) {
+    case "pending":
+      return "running";
+    case "error":
+    case "aborted":
+      return "failed";
+    default:
+      return "passed";
+  }
 }
 
 function contentToText(content: string | ContentBlock[]): string {
@@ -1180,6 +1297,13 @@ function extractToolPaths(item: ToolCallItem): string[] {
     input.oldPath,
     input.new_path,
     input.newPath,
+    // Codex apply_patch can update several files in one Edit. Such inputs
+    // intentionally have no top-level file_path.
+    ...(Array.isArray(input.changes)
+      ? input.changes.flatMap((change) =>
+          isRecord(change) ? [change.path] : [],
+        )
+      : []),
   ];
   return uniqueStrings(candidates).filter(
     (path) => !looksLikeShellCommand(path),
@@ -1357,6 +1481,26 @@ function CloseIcon() {
     >
       <line x1="18" y1="6" x2="6" y2="18" />
       <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function CollapseRightPanelIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <line x1="15" y1="3" x2="15" y2="21" />
+      <polyline points="10 9 13 12 10 15" />
     </svg>
   );
 }

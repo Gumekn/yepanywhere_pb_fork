@@ -1,10 +1,16 @@
+import type { ContextUsage, InputRequest } from "@yep-anywhere/shared";
 import type {
-  AgentActivity,
-  InputRequest,
-  PendingInputType,
-  UrlProjectId,
-} from "@yep-anywhere/shared";
-import type { SessionSummary } from "../supervisor/types.js";
+  BridgeController,
+  BridgeInputResponse,
+  BridgeSessionBase,
+  BridgeSessionView,
+  BridgeStatusBase,
+  MaybePromise,
+} from "../bridge-common/types.js";
+import type { CodexBridgeJournalMode } from "./journal-policy.js";
+import type { CodexBridgeMetricsSnapshot } from "./metrics.js";
+
+export type { MaybePromise };
 
 export type JsonRpcId = string | number;
 export type CodexBridgeUpstreamProfile = "clear" | "light" | "full";
@@ -22,23 +28,21 @@ export interface JsonRpcMessage {
   params?: unknown;
   result?: unknown;
   error?: JsonRpcError;
+  /** Top-level app-server notification timestamp (Codex 0.147+). */
+  emittedAtMs?: number;
 }
 
-export interface CodexBridgeStatus {
-  enabled: boolean;
-  listening: boolean;
-  host: string;
-  port: number;
-  url: string;
+export interface CodexBridgeStatus extends BridgeStatusBase {
+  journalMode: CodexBridgeJournalMode;
   upstreamUrl: string | null;
   upstreamRunning: boolean;
   upstreamMode: "managed" | "external";
   upstreams: Record<CodexBridgeUpstreamProfile, CodexBridgeUpstreamStatus>;
   connectionCount: number;
-  sessionCount: number;
-  pendingInputCount: number;
+  attachedClientCount: number;
+  detachedConnectionCount: number;
   recentMcpStartupEvents: CodexBridgeMcpStartupEvent[];
-  lastError: string | null;
+  metrics: CodexBridgeMetricsSnapshot;
 }
 
 export interface CodexBridgeUpstreamStatus {
@@ -60,67 +64,62 @@ export interface CodexBridgeMcpStartupEvent {
   error: string | null;
 }
 
-export interface CodexBridgeSession {
+export interface CodexUsageWindow {
+  usedPercent: number;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+
+export interface CodexUsageBucket {
   id: string;
-  projectId: UrlProjectId;
-  projectPath: string;
-  projectName: string;
-  title: string | null;
-  fullTitle: string | null;
-  createdAt: string;
+  name: string | null;
+  primary: CodexUsageWindow | null;
+  secondary: CodexUsageWindow | null;
+  planType: string | null;
+}
+
+export interface CodexUsageResetCredits {
+  availableCount: number;
+}
+
+export interface CodexUsageSnapshot {
+  primary: CodexUsageWindow | null;
+  secondary: CodexUsageWindow | null;
+  planType: string | null;
+  resetCredits: CodexUsageResetCredits | null;
+  additionalBuckets: CodexUsageBucket[];
   updatedAt: string;
-  messageCount: number;
+}
+
+export interface CodexUsageResponse {
+  usage: CodexUsageSnapshot | null;
+  error: string | null;
+}
+
+export interface CodexUsageRequestOptions {
+  fresh?: boolean;
+}
+
+export interface CodexBridgeSession extends BridgeSessionBase {
   provider: "codex";
-  model?: string;
-  reasoningEffort?: string;
   serviceTier?: string;
-  activity?: AgentActivity;
-  pendingInputType?: PendingInputType;
+  /** Context window fill reported by the app-server, when observed. */
+  contextUsage?: ContextUsage;
   connectionIds: number[];
 }
 
-export interface CodexBridgeSessionView {
-  session: SessionSummary;
-  projectName: string;
-  activity?: AgentActivity;
-  pendingInputType?: PendingInputType;
-}
+export type CodexBridgeSessionView = BridgeSessionView;
 
 export interface CodexBridgePendingInput {
   request: InputRequest;
-  method: string;
-  threadId: string;
-  turnId?: string;
-  itemId?: string;
   createdAt: string;
 }
 
-export type CodexBridgeInputResponse =
-  | "approve"
-  | "approve_accept_edits"
-  | "approve_for_session"
-  | "approve_always"
-  | "deny";
+export type CodexBridgeInputResponse = BridgeInputResponse;
 
-export type MaybePromise<T> = T | Promise<T>;
-
-export interface CodexBridgeController {
-  start?(): MaybePromise<void>;
-  shutdown?(): MaybePromise<void>;
-  getStatus(): MaybePromise<CodexBridgeStatus>;
-  listSessions(): MaybePromise<CodexBridgeSession[]>;
-  listSessionViews(): MaybePromise<CodexBridgeSessionView[]>;
-  getSessionView(
-    sessionId: string,
-  ): MaybePromise<CodexBridgeSessionView | null>;
-  isSessionActive(sessionId: string): MaybePromise<boolean>;
-  getPendingInputRequest(
-    sessionId: string,
-  ): MaybePromise<CodexBridgePendingInput["request"] | null>;
-  respondToInput(
-    sessionId: string,
-    requestId: string,
-    response: CodexBridgeInputResponse,
-    answers?: Record<string, string>,
-  ): MaybePromise<boolean>;
+export interface CodexBridgeController
+  extends BridgeController<CodexBridgeStatus, CodexBridgeSession> {
+  getUsage?(
+    options?: CodexUsageRequestOptions,
+  ): MaybePromise<CodexUsageResponse>;
 }

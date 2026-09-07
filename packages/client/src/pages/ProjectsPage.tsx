@@ -5,9 +5,9 @@ import {
   FilterDropdown,
   type FilterOption,
 } from "../components/FilterDropdown";
-import { FolderBrowserModal } from "../components/FolderBrowserModal";
 import { PageHeader } from "../components/PageHeader";
 import { ProjectCard } from "../components/ProjectCard";
+import { ProjectPathPicker } from "../components/ProjectPathPicker";
 import { ProjectListSkeleton } from "../components/Skeleton";
 import { useInboxContext } from "../contexts/InboxContext";
 import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
@@ -43,8 +43,7 @@ export function ProjectsPage() {
   const navigate = useNavigate();
   const basePath = useRemoteBasePath();
 
-  const { openSidebar, isWideScreen, toggleSidebar, isSidebarCollapsed } =
-    useNavigationLayout();
+  const { openSidebar, isWideScreen } = useNavigationLayout();
 
   // Count needs-attention items per project (client-side filter - free)
   const attentionByProject = useMemo(() => {
@@ -151,17 +150,15 @@ export function ProjectsPage() {
     setAgeFilter([]);
   };
 
-  // Core "add this path as a project" flow. Reused by both the manual form
-  // submit and the native folder picker (which auto-submits the picked path).
-  const submitAddProject = async (rawPath: string) => {
-    const path = rawPath.trim();
-    if (!path) return;
+  const handleAddProject = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newProjectPath.trim()) return;
 
     setAdding(true);
     setAddError(null);
 
     try {
-      const { project } = await api.addProject(path);
+      const { project } = await api.addProject(newProjectPath.trim());
       await refetch();
       setNewProjectPath("");
       setShowAddForm(false);
@@ -172,22 +169,6 @@ export function ProjectsPage() {
     } finally {
       setAdding(false);
     }
-  };
-
-  const handleAddProject = (e: React.FormEvent) => {
-    e.preventDefault();
-    void submitAddProject(newProjectPath);
-  };
-
-  // Server-side folder picker. Opens a modal that browses the filesystem of
-  // the machine running the Yep Anywhere server, so it works from any client
-  // (desktop browser, phone, tablet) and selects a directory on the *server*
-  // device. The chosen path goes through the identical server pipeline as a
-  // hand-typed one (POST /api/projects -> canonicalize -> stat -> cwd).
-  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
-  const handleBrowseFolder = () => {
-    if (adding) return;
-    setShowFolderBrowser(true);
   };
 
   // NOTE: we intentionally do NOT early-return on `loading`. Returning a bare
@@ -218,9 +199,7 @@ export function ProjectsPage() {
         <PageHeader
           title={t("pageTitleProjects")}
           onOpenSidebar={openSidebar}
-          onToggleSidebar={toggleSidebar}
           isWideScreen={isWideScreen}
-          isSidebarCollapsed={isSidebarCollapsed}
         />
 
         <main className="page-scroll-container">
@@ -315,37 +294,15 @@ export function ProjectsPage() {
             {showAddForm && (
               <div className="inbox-toolbar">
                 <form onSubmit={handleAddProject} className="add-project-form">
-                  <div className="add-project-input-row">
-                    <input
-                      type="text"
-                      value={newProjectPath}
-                      onChange={(e) => setNewProjectPath(e.target.value)}
-                      placeholder={t("projectsAddPlaceholder")}
-                      disabled={adding}
-                    />
-                    <button
-                      type="button"
-                      className="add-project-browse"
-                      onClick={handleBrowseFolder}
-                      disabled={adding}
-                      aria-label={t("projectsBrowse")}
-                    >
-                      <svg
-                        width="14"
-                        height="14"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
-                      >
-                        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-                      </svg>
-                      {t("projectsBrowse")}
-                    </button>
-                  </div>
+                  <ProjectPathPicker
+                    value={newProjectPath}
+                    onChange={(path) => {
+                      setNewProjectPath(path);
+                      setAddError(null);
+                    }}
+                    disabled={adding}
+                    autoFocus
+                  />
                   <div className="add-project-actions">
                     <button
                       type="submit"
@@ -370,16 +327,6 @@ export function ProjectsPage() {
                   )}
                 </form>
               </div>
-            )}
-
-            {showFolderBrowser && (
-              <FolderBrowserModal
-                onClose={() => setShowFolderBrowser(false)}
-                onSelect={(absolutePath) => {
-                  setShowFolderBrowser(false);
-                  void submitAddProject(absolutePath);
-                }}
-              />
             )}
 
             {loading ? (

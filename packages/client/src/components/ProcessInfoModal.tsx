@@ -34,7 +34,7 @@ interface ProcessInfo {
 
 interface ProcessInfoModalProps {
   sessionId: string;
-  provider: ProviderName | undefined;
+  provider: ProviderName;
   model?: string;
   status: SessionStatus;
   processState: ProcessState;
@@ -220,16 +220,13 @@ export function ProcessInfoModal({
   }, [sessionId, status.owner, t]);
 
   // Format kebab-case to Title Case (e.g., "in-turn" -> "In Turn")
-  const formatKebab = (s: string | undefined) => {
-    if (!s || typeof s !== "string") return "";
-    return s
+  const formatKebab = (s: string) =>
+    s
       .split("-")
       .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
       .join(" ");
-  };
 
-  const getProviderDisplay = (p: string | undefined) => {
-    if (!p) return "Unknown";
+  const getProviderDisplay = (p: string) => {
     switch (p) {
       case "claude":
         return "Claude (Anthropic)";
@@ -239,8 +236,8 @@ export function ProcessInfoModal({
         return "Codex OSS (Local)";
       case "gemini":
         return "Gemini (Google)";
-      case "opencode":
-        return "OpenCode";
+      case "pi":
+        return "Pi";
       default:
         return p;
     }
@@ -287,9 +284,7 @@ export function ProcessInfoModal({
           />
           <InfoRow
             label={t("processInfoLabelSessionSource")}
-            value={
-              typeof sessionSource === "string" ? sessionSource : undefined
-            }
+            value={sessionSource}
           />
           <InfoRow
             label={t("processInfoLabelApprovalPolicy")}

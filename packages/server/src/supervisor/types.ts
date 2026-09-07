@@ -1,6 +1,7 @@
 import type {
   AgentActivity,
   CodexBranchState,
+  ContextCompactEvent,
   ContextCumulativeUsage,
   ContextUsage,
   EffortLevel,
@@ -10,7 +11,10 @@ import type {
   ProviderName,
   SessionBranchState,
   SessionCreatedBy,
+  SessionLastTurnStatus,
+  SessionOriginChannel,
   SessionQuestion,
+  SessionRetryStatus,
   SessionRuntime,
   ThinkingConfig,
   UrlProjectId,
@@ -31,6 +35,8 @@ export type {
   ContextUsage,
   InputRequest,
   PendingInputType,
+  SessionLastTurnStatus,
+  SessionRetryStatus,
 } from "@yep-anywhere/shared";
 
 // Project discovery
@@ -43,10 +49,15 @@ export interface Project {
   mergedSessionDirs?: string[]; // additional session dirs from cross-machine duplicates
   hasCodexSessions?: boolean; // whether this project also has Codex sessions
   hasGeminiSessions?: boolean; // whether this project also has Gemini sessions
+  hasPiSessions?: boolean; // whether this project also has Pi sessions
+  hasKimiSessions?: boolean; // whether this project also has Kimi sessions
+  hasZCodeSessions?: boolean; // whether this project also has ZCode sessions
   activeOwnedCount: number; // sessions owned by this server
   activeExternalCount: number; // sessions controlled by external processes
   lastActivity: string | null; // ISO timestamp of most recent session update
   provider: ProviderName; // which provider's sessions are in this project
+  /** Project lives under a configured remote executor's shared projects root. */
+  isRemoteProject?: boolean;
 }
 
 // Session ownership - who controls the session
@@ -80,6 +91,8 @@ export interface SessionSummary {
   updatedAt: string;
   messageCount: number;
   userQuestions?: SessionQuestion[];
+  /** Whether userQuestions covers the complete provider history. */
+  userQuestionCoverage?: "complete" | "partial";
   ownership: SessionOwnership;
   // Notification fields (added by enrichSessionsWithNotifications)
   /** Type of pending input if session needs user action */
@@ -97,7 +110,7 @@ export interface SessionSummary {
   aiTitle?: string;
   /** Whether the session is archived (hidden from default list) */
   isArchived?: boolean;
-  /** Whether the session is starred/favorited */
+  /** Whether the session is pinned (legacy field name) */
   isStarred?: boolean;
   /** Context usage from the last assistant message */
   contextUsage?: ContextUsage;
@@ -106,18 +119,38 @@ export interface SessionSummary {
    *  "how much has this session cost in total" rather than "how full is
    *  the context window right now". */
   cumulativeUsage?: ContextCumulativeUsage;
+  /** Number of context compactions recorded in the active session history. */
+  compactCount?: number;
+  /** Best-effort details for each recorded context compaction. */
+  compactEvents?: ContextCompactEvent[];
   /** AI provider used for this session */
   provider: ProviderName;
+  /**
+   * For provider-native subagent sessions, the id of the session that spawned
+   * this one. Populated on the
+   * session detail but not on list summaries — subagent children are excluded
+   * from session lists and surfaced inline under their parent instead.
+   */
+  parentSessionId?: string;
+  /**
+   * Source session for a provider-native edit fork. Codex persists this as
+   * `forked_from_id`; other providers may use Yep metadata.
+   */
+  forkParentSessionId?: string;
   /** Model used for this session (extracted from JSONL, e.g. "claude-opus-4-5-20251101") */
   model?: string;
-  /** Provider-specific reasoning effort (e.g. "xhigh") */
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
   reasoningEffort?: string;
+  /** Codex model source (Codex `model_provider`) for this session, when known. */
+  codexModelProvider?: string;
   /** Provider-specific service tier / speed label (e.g. "fast") */
   serviceTier?: string;
   /** Launcher identifier from session metadata (e.g. "Codex Desktop", "yep-anywhere") */
   originator?: string;
   /** Explicit creation owner recorded by Yep metadata. */
   createdBy?: SessionCreatedBy;
+  /** Non-identifying inbound channel recorded by Yep metadata. */
+  originChannel?: SessionOriginChannel;
   /** CLI version from session metadata (e.g. "0.101.0") */
   cliVersion?: string;
   /** Session source from session metadata (e.g. "vscode", "exec") */
@@ -137,6 +170,12 @@ export interface SessionSummary {
    * session is not externally active.
    */
   interrupted?: boolean;
+  /** Terminal status of the most recent turn (bridge-reported). */
+  lastTurnStatus?: SessionLastTurnStatus;
+  /** Most recent provider error message, if the last turn failed. */
+  lastErrorMessage?: string;
+  /** Present while the provider is retrying a failed request. */
+  retryStatus?: SessionRetryStatus;
 }
 
 /**
@@ -233,10 +272,14 @@ export interface ProcessInfo {
   effort?: EffortLevel;
   /** Model used for this session (e.g., "claude-opus-4-5-20251101") */
   model?: string;
-  /** Provider-specific reasoning effort (e.g. "xhigh") */
+  /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */
   reasoningEffort?: string;
+  /** Exact reasoning effort requested when this process was started. */
+  requestedReasoningEffort?: string;
   /** Provider-specific service tier / speed label (e.g. "fast") */
   serviceTier?: string;
+  /** Present while the provider is retrying a failed request. */
+  retryStatus?: SessionRetryStatus;
   /** Context window usage from the last assistant message */
   contextUsage?: ContextUsage;
   /** SSH host for remote execution (undefined = local) */
@@ -254,6 +297,7 @@ export type ProcessEvent =
   | { type: "error"; error: Error }
   | { type: "complete" }
   | { type: "terminated"; reason: string; error?: Error }
+  | { type: "retry-status"; retryStatus?: SessionRetryStatus }
   | {
       type: "deferred-queue";
       messages: { tempId?: string; content: string; timestamp: string }[];
@@ -273,6 +317,8 @@ export interface ProcessOptions {
   effort?: EffortLevel;
   /** Model used for this session (e.g., "claude-opus-4-5-20251101") */
   model?: string;
+  /** Exact provider reasoning effort requested for this process. */
+  reasoningEffort?: string;
   /** SSH host for remote execution (undefined = local) */
   executor?: string;
   /** Permission rules for tool filtering (deny/allow patterns) */

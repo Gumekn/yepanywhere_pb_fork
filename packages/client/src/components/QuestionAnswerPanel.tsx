@@ -1,13 +1,63 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  UserQuestionAnswer,
+  UserQuestionAnswers,
+} from "@yep-anywhere/shared";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuestionOtherDrafts } from "../hooks/useDrafts";
 import { useI18n } from "../i18n";
 import type { InputRequest } from "../types";
 import type { AskUserQuestionInput, Question } from "./renderers/tools/types";
 
+const OTHER_ANSWER = "__other__";
+
+function getQuestionAnswerKey(question: Question): string {
+  return question.id || question.question;
+}
+
+function getOptionValue(option: Question["options"][number]): string {
+  return option.value ?? option.label;
+}
+
+function getDefaultAnswers(questions: Question[]): UserQuestionAnswers {
+  const answers: UserQuestionAnswers = {};
+  for (const question of questions) {
+    if (question.defaultValue === undefined) continue;
+    answers[getQuestionAnswerKey(question)] = question.defaultValue;
+  }
+  return answers;
+}
+
+function includesAnswer(
+  answer: UserQuestionAnswer | undefined,
+  value: string,
+): boolean {
+  return Array.isArray(answer) ? answer.includes(value) : answer === value;
+}
+
+function hasAnswer(
+  answer: UserQuestionAnswer | undefined,
+  otherText: string | undefined,
+): boolean {
+  if (Array.isArray(answer)) {
+    if (answer.length === 0) return false;
+    return !answer.includes(OTHER_ANSWER) || Boolean(otherText?.trim());
+  }
+  if (!answer) return false;
+  return answer !== OTHER_ANSWER || Boolean(otherText?.trim());
+}
+
+function canLeaveQuestion(
+  question: Question,
+  answer: UserQuestionAnswer | undefined,
+  otherText: string | undefined,
+): boolean {
+  return question.required === false || hasAnswer(answer, otherText);
+}
+
 interface Props {
   request: InputRequest;
   sessionId: string;
-  onSubmit: (answers: Record<string, string>) => Promise<void>;
+  onSubmit: (answers: UserQuestionAnswers) => Promise<void>;
   onDeny: () => Promise<void>;
   readOnly?: boolean;
   readOnlyNotice?: string;
@@ -28,56 +78,131 @@ export function QuestionAnswerPanel({
   const { t } = useI18n();
   const input = request.toolInput as AskUserQuestionInput;
   const questions = input?.questions || [];
+  const originRecord =
+    input && typeof input === "object"
+      ? (input as unknown as Record<string, unknown>)
+      : undefined;
+  const subagentOriginTitle =
+    originRecord && typeof originRecord.originSessionId === "string"
+      ? typeof originRecord.originSessionTitle === "string"
+        ? originRecord.originSessionTitle
+        : typeof originRecord.originAgent === "string"
+          ? originRecord.originAgent
+          : undefined
+      : undefined;
 
   const [currentTab, setCurrentTab] = useState(0);
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  // Persist "Other" text inputs to localStorage keyed by sessionId
-  const [otherTexts, setOtherText, clearOtherTexts] =
-    useQuestionOtherDrafts(sessionId);
+  const [answers, setAnswers] = useState<UserQuestionAnswers>(() =>
+    getDefaultAnswers(questions),
+  );
+  // Persist ordinary "Other" drafts, but keep secret values in memory only.
+  const [persistedOtherTexts, setPersistedOtherText, clearPersistedOtherTexts] =
+    useQuestionOtherDrafts(sessionId, request.id);
+  const [secretOtherTexts, setSecretOtherTexts] = useState<
+    Record<string, string>
+  >({});
+  const otherTexts = useMemo(() => {
+    const next = { ...persistedOtherTexts, ...secretOtherTexts };
+    for (const question of questions) {
+      if (question.inputType === "password") {
+        const key = getQuestionAnswerKey(question);
+        if (!(key in secretOtherTexts)) delete next[key];
+      }
+    }
+    return next;
+  }, [persistedOtherTexts, questions, secretOtherTexts]);
   const [submitting, setSubmitting] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
 
-  const otherInputRef = useRef<HTMLInputElement>(null);
+  const otherTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const otherPasswordInputRef = useRef<HTMLInputElement>(null);
 
   const currentQuestion = questions[currentTab];
   const isLastQuestion = currentTab === questions.length - 1;
+  const currentQuestionKey = currentQuestion
+    ? getQuestionAnswerKey(currentQuestion)
+    : "";
   const currentAnswer = currentQuestion
-    ? answers[currentQuestion.question]
+    ? answers[currentQuestionKey]
     : undefined;
-  const isOtherSelected = currentAnswer === "__other__";
+  const isDirectInput = currentQuestion?.options.length === 0;
+  const isOtherSelected = includesAnswer(currentAnswer, OTHER_ANSWER);
+  const canAdvance = currentQuestion
+    ? canLeaveQuestion(
+        currentQuestion,
+        currentAnswer,
+        otherTexts[currentQuestionKey],
+      )
+    : false;
 
-  // Check if all questions are answered
-  const allAnswered = questions.every((q) => {
-    const answer = answers[q.question];
-    if (!answer) return false;
-    if (answer === "__other__") {
-      return (otherTexts[q.question] || "").trim().length > 0;
-    }
-    return true;
+  const allRequiredAnswered = questions.every((q) => {
+    const key = getQuestionAnswerKey(q);
+    return canLeaveQuestion(q, answers[key], otherTexts[key]);
   });
+  const canSubmit =
+    input?.allowPartialSubmission === true || allRequiredAnswered;
+
+  // A new provider request can reuse the mounted panel; reset provider defaults.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: request.id identifies the request lifecycle
+  useEffect(() => {
+    setCurrentTab(0);
+    setAnswers(getDefaultAnswers(questions));
+    setSecretOtherTexts({});
+    for (const question of questions) {
+      if (question.inputType === "password") {
+        setPersistedOtherText(getQuestionAnswerKey(question), "");
+      }
+    }
+    setCollapsed(false);
+  }, [request.id]);
 
   // Focus the "other" input when it's selected and scroll it into view
   useEffect(() => {
-    if (isOtherSelected && otherInputRef.current) {
-      otherInputRef.current.focus();
+    const otherInput =
+      otherTextareaRef.current ?? otherPasswordInputRef.current;
+    if (!isDirectInput && isOtherSelected && otherInput) {
+      otherInput.focus();
       // Scroll input into view after a short delay to allow keyboard to open
-      setTimeout(() => {
-        otherInputRef.current?.scrollIntoView({
+      const timeout = setTimeout(() => {
+        const currentOtherInput =
+          otherTextareaRef.current ?? otherPasswordInputRef.current;
+        currentOtherInput?.scrollIntoView?.({
           behavior: "smooth",
           block: "center",
         });
       }, 100);
+
+      return () => clearTimeout(timeout);
     }
-  }, [isOtherSelected]);
+  }, [isDirectInput, isOtherSelected]);
 
   const handleSelectOption = useCallback(
     (optionLabel: string) => {
       if (readOnly) return;
       if (!currentQuestion) return;
-      setAnswers((prev) => ({
-        ...prev,
-        [currentQuestion.question]: optionLabel,
-      }));
+      const key = getQuestionAnswerKey(currentQuestion);
+      setAnswers((prev) => {
+        if (!currentQuestion.multiSelect) {
+          return { ...prev, [key]: optionLabel };
+        }
+
+        const previousAnswer = prev[key];
+        const selected = Array.isArray(previousAnswer)
+          ? previousAnswer
+          : previousAnswer
+            ? [previousAnswer]
+            : [];
+        const nextAnswer = selected.includes(optionLabel)
+          ? selected.filter((value) => value !== optionLabel)
+          : [...selected, optionLabel];
+
+        if (nextAnswer.length === 0) {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        }
+        return { ...prev, [key]: nextAnswer };
+      });
     },
     [currentQuestion, readOnly],
   );
@@ -85,9 +210,33 @@ export function QuestionAnswerPanel({
   const handleOtherTextChange = useCallback(
     (text: string) => {
       if (!currentQuestion) return;
-      setOtherText(currentQuestion.question, text);
+      const key = getQuestionAnswerKey(currentQuestion);
+      if (currentQuestion.inputType === "password") {
+        setSecretOtherTexts((previous) => {
+          const next = { ...previous };
+          if (text) next[key] = text;
+          else delete next[key];
+          return next;
+        });
+        return;
+      }
+      setPersistedOtherText(key, text);
     },
-    [currentQuestion, setOtherText],
+    [currentQuestion, setPersistedOtherText],
+  );
+
+  const handleDirectInputChange = useCallback(
+    (text: string) => {
+      if (readOnly || !currentQuestion) return;
+      const key = getQuestionAnswerKey(currentQuestion);
+      setAnswers((previous) => {
+        if (text.length > 0) return { ...previous, [key]: text };
+        const next = { ...previous };
+        delete next[key];
+        return next;
+      });
+    },
+    [currentQuestion, readOnly],
   );
 
   const advanceToNext = useCallback(() => {
@@ -97,16 +246,21 @@ export function QuestionAnswerPanel({
   }, [isLastQuestion]);
 
   const handleSubmit = useCallback(async () => {
-    if (readOnly || !allAnswered || submitting) return;
+    if (readOnly || !canSubmit || submitting) return;
 
     // Build final answers, replacing __other__ with actual text
-    const finalAnswers: Record<string, string> = {};
+    const finalAnswers: UserQuestionAnswers = {};
     for (const q of questions) {
-      const answer = answers[q.question];
-      if (answer === "__other__") {
-        finalAnswers[q.question] = otherTexts[q.question] || "";
+      const key = getQuestionAnswerKey(q);
+      const answer = answers[key];
+      if (Array.isArray(answer)) {
+        finalAnswers[key] = answer.map((value) =>
+          value === OTHER_ANSWER ? otherTexts[key] || "" : value,
+        );
+      } else if (answer === OTHER_ANSWER) {
+        finalAnswers[key] = otherTexts[key] || "";
       } else if (answer) {
-        finalAnswers[q.question] = answer;
+        finalAnswers[key] = answer;
       }
     }
 
@@ -114,18 +268,19 @@ export function QuestionAnswerPanel({
     try {
       await onSubmit(finalAnswers);
       // Clear "Other" drafts from localStorage on successful submit
-      clearOtherTexts();
+      clearPersistedOtherTexts();
+      setSecretOtherTexts({});
     } finally {
       setSubmitting(false);
     }
   }, [
-    allAnswered,
+    canSubmit,
     submitting,
     questions,
     answers,
     otherTexts,
     onSubmit,
-    clearOtherTexts,
+    clearPersistedOtherTexts,
     readOnly,
   ]);
 
@@ -154,15 +309,17 @@ export function QuestionAnswerPanel({
 
       // Enter behavior depends on context
       if (e.key === "Enter" && !e.shiftKey) {
-        // If "other" is selected and has text, or a regular option is selected
-        const hasCurrentAnswer = currentAnswer && currentAnswer !== "__other__";
-        const hasOtherAnswer =
-          currentAnswer === "__other__" &&
-          (otherTexts[currentQuestion?.question || ""] || "").trim().length > 0;
-
-        if (hasCurrentAnswer || hasOtherAnswer) {
+        // Confirming a CJK IME candidate also emits Enter. Android/WebKit may
+        // expose that only as legacy keyCode 229, so guard both signals.
+        if (e.isComposing || e.keyCode === 229) return;
+        // The "Other" free-text area is a multiline textarea: Enter there only
+        // inserts a newline and never submits. Free answers are submitted by
+        // clicking the submit button, so IME word-picking can never trigger
+        // an accidental submission while typing.
+        if (e.target === otherTextareaRef.current) return;
+        if ((isLastQuestion && canSubmit) || (!isLastQuestion && canAdvance)) {
           e.preventDefault();
-          if (isLastQuestion && allAnswered) {
+          if (isLastQuestion && canSubmit) {
             handleSubmit();
           } else {
             advanceToNext();
@@ -171,7 +328,7 @@ export function QuestionAnswerPanel({
       }
 
       // Tab/Shift+Tab to navigate between question tabs (when not in input)
-      if (e.key === "Tab" && !isOtherSelected) {
+      if (e.key === "Tab" && !isOtherSelected && !isDirectInput) {
         e.preventDefault();
         if (e.shiftKey) {
           setCurrentTab((prev) => Math.max(0, prev - 1));
@@ -185,12 +342,11 @@ export function QuestionAnswerPanel({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     submitting,
-    currentAnswer,
-    currentQuestion,
-    otherTexts,
+    canAdvance,
     isLastQuestion,
-    allAnswered,
+    canSubmit,
     isOtherSelected,
+    isDirectInput,
     questions.length,
     handleDeny,
     handleSubmit,
@@ -240,14 +396,20 @@ export function QuestionAnswerPanel({
 
       {!collapsed && (
         <div className="question-panel">
+          {subagentOriginTitle && (
+            <div className="question-panel-subagent-origin">
+              {t("subagentQuestionOrigin", { title: subagentOriginTitle })}
+            </div>
+          )}
           {/* Tab bar */}
           <div className="question-tabs">
             {questions.map((q, idx) => {
               const isActive = idx === currentTab;
-              const isAnswered = !!answers[q.question];
+              const key = getQuestionAnswerKey(q);
+              const isAnswered = hasAnswer(answers[key], otherTexts[key]);
               return (
                 <button
-                  key={q.question}
+                  key={q.id || `${q.question}-${idx}`}
                   type="button"
                   className={`question-tab ${isActive ? "active" : ""} ${isAnswered ? "answered" : ""}`}
                   onClick={() => setCurrentTab(idx)}
@@ -265,67 +427,110 @@ export function QuestionAnswerPanel({
               <div className="question-text">{currentQuestion.question}</div>
 
               <div className="question-options-list">
-                {currentQuestion.options.map((option) => {
-                  const isSelected = currentAnswer === option.label;
-                  return (
-                    <button
-                      key={option.label}
-                      type="button"
-                      className={`question-option-btn ${isSelected ? "selected" : ""}`}
-                      onClick={() => handleSelectOption(option.label)}
+                {isDirectInput ? (
+                  <div className="question-other-input question-direct-input">
+                    <input
+                      type={
+                        currentQuestion.inputType === "password"
+                          ? "text"
+                          : (currentQuestion.inputType ?? "text")
+                      }
+                      placeholder={t("questionPanelTypeAnswer")}
+                      value={
+                        typeof currentAnswer === "string" ? currentAnswer : ""
+                      }
+                      onChange={(event) =>
+                        handleDirectInputChange(event.target.value)
+                      }
+                      required={currentQuestion.required !== false}
                       disabled={readOnly}
+                    />
+                  </div>
+                ) : (
+                  currentQuestion.options.map((option) => {
+                    const optionValue = getOptionValue(option);
+                    const isSelected = includesAnswer(
+                      currentAnswer,
+                      optionValue,
+                    );
+                    return (
+                      <button
+                        key={optionValue}
+                        type="button"
+                        className={`question-option-btn ${isSelected ? "selected" : ""}`}
+                        onClick={() => handleSelectOption(optionValue)}
+                        disabled={readOnly}
+                      >
+                        <span className="question-option-radio">
+                          {currentQuestion.multiSelect
+                            ? isSelected
+                              ? "☑"
+                              : "☐"
+                            : isSelected
+                              ? "●"
+                              : "○"}
+                        </span>
+                        <div className="question-option-text">
+                          <span className="question-option-label">
+                            {option.label}
+                          </span>
+                          {option.description && (
+                            <span className="question-option-desc">
+                              {option.description}
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+
+                {/* Other option */}
+                {!isDirectInput &&
+                  !readOnly &&
+                  currentQuestion.custom !== false && (
+                    <button
+                      type="button"
+                      className={`question-option-btn other ${isOtherSelected ? "selected" : ""}`}
+                      onClick={() => handleSelectOption(OTHER_ANSWER)}
                     >
                       <span className="question-option-radio">
                         {currentQuestion.multiSelect
-                          ? isSelected
+                          ? isOtherSelected
                             ? "☑"
                             : "☐"
-                          : isSelected
+                          : isOtherSelected
                             ? "●"
                             : "○"}
                       </span>
                       <div className="question-option-text">
                         <span className="question-option-label">
-                          {option.label}
+                          {t("questionPanelOther")}
                         </span>
-                        {option.description && (
-                          <span className="question-option-desc">
-                            {option.description}
-                          </span>
-                        )}
                       </div>
                     </button>
-                  );
-                })}
-
-                {/* Other option */}
-                {!readOnly && (
-                  <button
-                    type="button"
-                    className={`question-option-btn other ${isOtherSelected ? "selected" : ""}`}
-                    onClick={() => handleSelectOption("__other__")}
-                  >
-                    <span className="question-option-radio">
-                      {isOtherSelected ? "●" : "○"}
-                    </span>
-                    <div className="question-option-text">
-                      <span className="question-option-label">
-                        {t("questionPanelOther")}
-                      </span>
-                    </div>
-                  </button>
-                )}
+                  )}
 
                 {/* Other text input */}
-                {isOtherSelected && (
+                {!isDirectInput && isOtherSelected && (
                   <div className="question-other-input">
-                    <input
-                      ref={otherInputRef}
-                      type="text"
-                      placeholder={t("questionPanelTypeAnswer")}
-                      value={otherTexts[currentQuestion.question] || ""}
-                      onChange={(e) => handleOtherTextChange(e.target.value)}
-                    />
+                    {currentQuestion.inputType === "password" ? (
+                      <input
+                        ref={otherPasswordInputRef}
+                        type="text"
+                        placeholder={t("questionPanelTypeAnswer")}
+                        value={otherTexts[currentQuestionKey] || ""}
+                        onChange={(e) => handleOtherTextChange(e.target.value)}
+                      />
+                    ) : (
+                      <textarea
+                        ref={otherTextareaRef}
+                        rows={3}
+                        placeholder={t("questionPanelTypeAnswer")}
+                        value={otherTexts[currentQuestionKey] || ""}
+                        onChange={(e) => handleOtherTextChange(e.target.value)}
+                      />
+                    )}
                   </div>
                 )}
               </div>
@@ -354,7 +559,7 @@ export function QuestionAnswerPanel({
                   type="button"
                   className="question-btn submit"
                   onClick={handleSubmit}
-                  disabled={!allAnswered || submitting}
+                  disabled={!canSubmit || submitting}
                 >
                   {t("questionPanelSubmit")}
                   <kbd>↵</kbd>
@@ -364,7 +569,7 @@ export function QuestionAnswerPanel({
                   type="button"
                   className="question-btn next"
                   onClick={advanceToNext}
-                  disabled={!currentAnswer || submitting}
+                  disabled={!canAdvance || submitting}
                 >
                   {t("questionPanelNext")}
                   <kbd>↵</kbd>

@@ -1,3 +1,4 @@
+import type { UserQuestionAnswers } from "@yep-anywhere/shared";
 import type { ReactNode } from "react";
 import type { ContentBlock, RenderContext } from "../types";
 
@@ -188,10 +189,15 @@ export interface WebSearchInput {
 
 export interface WebSearchResult {
   query?: string;
-  results?: Array<{ content?: Array<{ title: string; url: string }> }>;
+  results?: Array<
+    string | { content?: Array<{ title?: string; url?: string }> }
+  >;
   durationSeconds?: number;
   codexActionLabel?: string;
   codexAction?: unknown;
+  content?: string;
+  output?: string;
+  text?: string;
 }
 
 /**
@@ -216,18 +222,38 @@ export interface WebFetchResult {
  */
 export interface AskUserQuestionInput {
   questions: Question[];
+  /** Codex request_user_input permits submitting only the questions answered. */
+  allowPartialSubmission?: boolean;
+  /** Provider hint for an eventual automatic resolution. */
+  autoResolutionMs?: number | null;
 }
 
 export interface Question {
+  /** Stable provider-supplied identifier used as the answer key when present. */
+  id?: string;
   question: string;
   header: string;
-  options: Array<{ label: string; description: string }>;
+  options: Array<{ label: string; description: string; value?: string }>;
   multiSelect: boolean;
+  /** Whether the user may provide an answer outside the listed options. */
+  custom?: boolean;
+  /** Optional MCP form fields may be submitted without a value. */
+  required?: boolean;
+  /** Native input type used for free-form Codex/MCP fields. */
+  inputType?:
+    | "text"
+    | "password"
+    | "number"
+    | "email"
+    | "url"
+    | "date"
+    | "datetime-local";
+  defaultValue?: string | string[];
 }
 
 export interface AskUserQuestionResult {
   questions: Question[];
-  answers: Record<string, string>;
+  answers: UserQuestionAnswers;
 }
 
 /**
@@ -339,6 +365,8 @@ export interface ToolRenderer<TInput = unknown, TResult = unknown> {
   tool: string;
   /** Display name shown in UI (defaults to tool name) */
   displayName?: string;
+  /** Input-aware display name for multiplexed tools such as Codex code mode. */
+  getDisplayName?(input: TInput): string;
   /** Render the tool_use block (what Claude wants to do) */
   renderToolUse(input: TInput, context: RenderContext): ReactNode;
   /** Render the tool_result block (what happened) */

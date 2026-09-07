@@ -13,23 +13,27 @@ export interface PendingTask {
 }
 
 /**
- * Find pending Tasks in a list of messages.
- *
- * A pending Task is a Task tool_use block that doesn't have a matching tool_result.
- * This happens when:
- * - Task is currently running (no result yet)
- * - Page was reloaded mid-task
- * - Process was interrupted
- *
- * @param messages - Array of messages from the session
- * @returns Array of pending Task info
+ * A Task/Agent tool call together with the number of persisted results seen
+ * for it. Kimi mappings only become authoritative after a tool_result lands,
+ * while other providers still need the pending-only view used historically.
  */
-export function findPendingTasks(messages: Message[]): PendingTask[] {
+export interface AgentTask extends PendingTask {
+  resultCount: number;
+  /** Number of child sessions declared by the spawning call, when knowable. */
+  expectedAgentCount?: number;
+}
+
+/** Find every Task/Agent tool call and count its matching tool results. */
+export function findAgentTasks(messages: Message[]): AgentTask[] {
   const taskToolUses = new Map<
     string,
-    { description: string; subagentType: string }
+    {
+      description: string;
+      subagentType: string;
+      expectedAgentCount?: number;
+    }
   >();
-  const completedIds = new Set<string>();
+  const resultCounts = new Map<string, number>();
 
   for (const msg of messages) {
     // Get content from nested message object (SDK structure) first, fall back to top-level
@@ -44,18 +48,38 @@ export function findPendingTasks(messages: Message[]): PendingTask[] {
       // Find Task tool_use blocks
       if (
         block.type === "tool_use" &&
-        (block.name === "Task" || block.name === "Agent") &&
+        (block.name === "Task" ||
+          block.name === "Agent" ||
+          block.name === "AgentSwarm") &&
         typeof block.id === "string"
       ) {
         const input = block.input as
           | {
               description?: string;
               subagent_type?: string;
+              items?: unknown[];
+              resume_agent_ids?: Record<string, unknown>;
             }
           | undefined;
+        const swarmAgentCount =
+          block.name === "AgentSwarm"
+            ? (Array.isArray(input?.items) ? input.items.length : 0) +
+              (input?.resume_agent_ids &&
+              typeof input.resume_agent_ids === "object" &&
+              !Array.isArray(input.resume_agent_ids)
+                ? Object.keys(input.resume_agent_ids).filter((agentId) =>
+                    /^agent-\d+$/.test(agentId),
+                  ).length
+                : 0)
+            : undefined;
         taskToolUses.set(block.id, {
           description: input?.description ?? "Unknown task",
           subagentType: input?.subagent_type ?? "unknown",
+          ...(block.name === "AgentSwarm"
+            ? swarmAgentCount && swarmAgentCount > 0
+              ? { expectedAgentCount: swarmAgentCount }
+              : {}
+            : { expectedAgentCount: 1 }),
         });
       }
 
@@ -64,15 +88,30 @@ export function findPendingTasks(messages: Message[]): PendingTask[] {
         block.type === "tool_result" &&
         typeof block.tool_use_id === "string"
       ) {
-        completedIds.add(block.tool_use_id);
+        resultCounts.set(
+          block.tool_use_id,
+          (resultCounts.get(block.tool_use_id) ?? 0) + 1,
+        );
       }
     }
   }
 
-  // Return tasks that don't have a matching result
-  return [...taskToolUses.entries()]
-    .filter(([id]) => !completedIds.has(id))
-    .map(([toolUseId, { description, subagentType }]) => ({
+  return [...taskToolUses.entries()].map(
+    ([toolUseId, { description, subagentType, expectedAgentCount }]) => ({
+      toolUseId,
+      description,
+      subagentType,
+      resultCount: resultCounts.get(toolUseId) ?? 0,
+      ...(expectedAgentCount !== undefined ? { expectedAgentCount } : {}),
+    }),
+  );
+}
+
+/** Find Task/Agent tool calls that do not yet have a matching tool result. */
+export function findPendingTasks(messages: Message[]): PendingTask[] {
+  return findAgentTasks(messages)
+    .filter((task) => task.resultCount === 0)
+    .map(({ toolUseId, description, subagentType }) => ({
       toolUseId,
       description,
       subagentType,

@@ -10,12 +10,12 @@ import {
 } from "../../../lib/classifyToolError";
 import { validateToolResult } from "../../../lib/validateToolResult";
 import { SchemaWarning } from "../../SchemaWarning";
-import { Modal } from "../../ui/Modal";
+import { DetailPanel } from "../../ui/DetailPanel";
 import type { EditInput, EditResult, PatchHunk, ToolRenderer } from "./types";
 
 /**
- * Compact icon button used in collapsed diff/patch previews to open the
- * full-content modal. Replaces the previous bulky text buttons
+ * Compact icon button used in diff/patch previews to open the full content in
+ * the detail panel. Replaces the previous bulky text buttons
  * ("Show full diff", "Show full patch", "Click to expand"). The descriptive
  * label is preserved via aria-label / title so screen readers and
  * hover-tooltips still surface intent.
@@ -451,8 +451,7 @@ function DiffModalContent({
 }
 
 /**
- * Collapsed preview showing diff with expand button
- * Clicking opens a modal with the full diff.
+ * Collapsed preview showing diff with a detail-panel button.
  * Reads augment data directly from input._structuredPatch and input._diffHtml.
  */
 function EditCollapsedPreview({
@@ -587,7 +586,7 @@ function EditCollapsedPreview({
               {proposedDiffTruncated && <div className="diff-fade-overlay" />}
             </div>
           )}
-          {hasProposedDiff && proposedDiffTruncated && (
+          {hasProposedDiff && (
             <DiffExpandButton
               label="Show full diff"
               onClick={(e) => {
@@ -598,7 +597,7 @@ function EditCollapsedPreview({
           )}
         </div>
         {isModalOpen && hasProposedDiff && (
-          <Modal
+          <DetailPanel
             title={<span className="file-path">{fileName}</span>}
             onClose={handleClose}
           >
@@ -609,7 +608,7 @@ function EditCollapsedPreview({
               oldString={oldString}
               newString={newString}
             />
-          </Modal>
+          </DetailPanel>
         )}
       </>
     );
@@ -626,7 +625,6 @@ function EditCollapsedPreview({
     }
 
     if (rawPatch) {
-      const rawPatchPreview = truncateByLines(rawPatch, MAX_VISIBLE_LINES);
       return (
         <>
           <div className="edit-collapsed-preview">
@@ -637,23 +635,21 @@ function EditCollapsedPreview({
               rawPatch={rawPatch}
               truncateLines={MAX_VISIBLE_LINES}
             />
-            {rawPatchPreview.truncated && (
-              <DiffExpandButton
-                label="Show full patch"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setIsModalOpen(true);
-                }}
-              />
-            )}
+            <DiffExpandButton
+              label="Show full patch"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsModalOpen(true);
+              }}
+            />
           </div>
           {isModalOpen && (
-            <Modal
+            <DetailPanel
               title={<span className="file-path">{fileName}</span>}
               onClose={handleClose}
             >
               <RawPatchModalContent rawPatch={rawPatch} />
-            </Modal>
+            </DetailPanel>
           )}
         </>
       );
@@ -693,12 +689,10 @@ function EditCollapsedPreview({
           </div>
           {isTruncated && <div className="diff-fade-overlay" />}
         </div>
-        {isTruncated && (
-          <DiffExpandButton label="Show full diff" onClick={handleClick} />
-        )}
+        <DiffExpandButton label="Show full diff" onClick={handleClick} />
       </div>
       {isModalOpen && (
-        <Modal
+        <DetailPanel
           title={<span className="file-path">{fileName}</span>}
           onClose={handleClose}
         >
@@ -710,7 +704,7 @@ function EditCollapsedPreview({
             newString={newString}
             originalFile={originalFile}
           />
-        </Modal>
+        </DetailPanel>
       )}
     </>
   );
@@ -776,7 +770,7 @@ function EditInteractiveSummary({
 
   // Show loading state if no patch yet
   if (structuredPatch.length === 0) {
-    return <span>{fileName}</span>;
+    return <span title={filePath}>{fileName}</span>;
   }
 
   return (
@@ -784,6 +778,7 @@ function EditInteractiveSummary({
       <button
         type="button"
         className="file-link-inline"
+        title={filePath}
         onClick={(e) => {
           e.stopPropagation();
           setShowModal(true);
@@ -798,7 +793,7 @@ function EditInteractiveSummary({
         )}
       </button>
       {showModal && (
-        <Modal
+        <DetailPanel
           title={<span className="file-path">{fileName}</span>}
           onClose={() => setShowModal(false)}
         >
@@ -810,7 +805,7 @@ function EditInteractiveSummary({
             newString={newString}
             originalFile={originalFile}
           />
-        </Modal>
+        </DetailPanel>
       )}
     </>
   );
@@ -850,24 +845,47 @@ function EditToolResult({
   const showValidationWarning =
     enabled && validationErrors && !isToolIgnored("Edit");
 
+  const inputWithAugment = input as EditInputWithAugment | undefined;
+  const filePath = getEditFilePath(inputWithAugment, result);
+  const fileName = getFileName(filePath);
+  const structuredPatch =
+    result?.structuredPatch ?? inputWithAugment?._structuredPatch ?? [];
+  const diffHtml = inputWithAugment?._diffHtml;
+  const rawPatch = inputWithAugment?._rawPatch;
+  const inputRecord = inputWithAugment as
+    | (EditInputWithAugment & Record<string, unknown>)
+    | undefined;
+  const oldString =
+    result?.oldString ??
+    inputWithAugment?.old_string ??
+    (typeof inputRecord?.oldString === "string"
+      ? inputRecord.oldString
+      : undefined);
+  const newString =
+    result?.newString ??
+    inputWithAugment?.new_string ??
+    (typeof inputRecord?.newString === "string"
+      ? inputRecord.newString
+      : undefined);
+  const originalFile = result?.originalFile;
+
   // Count total lines in all hunks
   const totalLines = useMemo(() => {
-    if (!result?.structuredPatch) return 0;
-    return result.structuredPatch.reduce(
+    return structuredPatch.reduce(
       (sum, hunk) => sum + hunk.lines.length + 1, // +1 for hunk header
       0,
     );
-  }, [result?.structuredPatch]);
+  }, [structuredPatch]);
 
   const isTruncated = totalLines > MAX_VISIBLE_LINES;
 
   // Compute change summary
   const changeSummary = useMemo(() => {
-    if (!result?.structuredPatch) return null;
-    const additions = result.structuredPatch
+    if (structuredPatch.length === 0) return null;
+    const additions = structuredPatch
       .flatMap((h) => h.lines)
       .filter((l) => l.startsWith("+")).length;
-    const deletions = result.structuredPatch
+    const deletions = structuredPatch
       .flatMap((h) => h.lines)
       .filter((l) => l.startsWith("-")).length;
 
@@ -881,7 +899,7 @@ function EditToolResult({
       return `Removed ${deletions} line${deletions !== 1 ? "s" : ""}`;
     }
     return null;
-  }, [result?.structuredPatch]);
+  }, [structuredPatch]);
 
   if (isError) {
     // Extract error message - can be a string or object with content
@@ -907,7 +925,6 @@ function EditToolResult({
     const isRejection = isUserRejection(classification.classification);
 
     // For user rejections, show the proposed diff alongside the declined badge
-    const inputWithAugment = input as EditInputWithAugment | undefined;
     const hasProposedDiff =
       isRejection &&
       inputWithAugment?._structuredPatch &&
@@ -916,9 +933,6 @@ function EditToolResult({
       ? (inputWithAugment._structuredPatch?.flatMap((hunk) => hunk.lines) ?? [])
       : [];
     const proposedDiffTruncated = proposedDiffLines.length > MAX_VISIBLE_LINES;
-
-    const filePath = getEditFilePath(inputWithAugment);
-    const fileName = getFileName(filePath);
 
     return (
       <>
@@ -956,34 +970,30 @@ function EditToolResult({
                   <DiffLines lines={proposedDiffLines} />
                 )}
               </div>
-              {proposedDiffTruncated && (
-                <>
-                  <div className="diff-fade-overlay" />
-                  <DiffExpandButton
-                    label="Show full diff"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setShowModal(true);
-                    }}
-                  />
-                </>
-              )}
+              {proposedDiffTruncated && <div className="diff-fade-overlay" />}
+              <DiffExpandButton
+                label="Show full diff"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowModal(true);
+                }}
+              />
             </div>
           )}
         </div>
         {showModal && hasProposedDiff && inputWithAugment && (
-          <Modal
+          <DetailPanel
             title={<span className="file-path">{fileName}</span>}
             onClose={() => setShowModal(false)}
           >
             <DiffModalContent
               diffHtml={inputWithAugment._diffHtml}
-              structuredPatch={inputWithAugment._structuredPatch ?? []}
+              structuredPatch={structuredPatch}
               filePath={filePath}
-              oldString={inputWithAugment.old_string}
-              newString={inputWithAugment.new_string}
+              oldString={oldString}
+              newString={newString}
             />
-          </Modal>
+          </DetailPanel>
         )}
       </>
     );
@@ -991,10 +1001,43 @@ function EditToolResult({
 
   // Handle case where result doesn't have structuredPatch
   // Use input data as fallback when result data is missing
-  if (!result?.structuredPatch || result.structuredPatch.length === 0) {
-    const filePath = getEditFilePath(input, result);
-    const oldString = result?.oldString || input?.old_string || "";
-    const newString = result?.newString || input?.new_string || "";
+  if (structuredPatch.length === 0) {
+    if (rawPatch) {
+      return (
+        <>
+          <div className="edit-result">
+            <div className="edit-header">
+              <span className="file-path">
+                {filePath ? getFileName(filePath) : "Patch"}
+              </span>
+              {showValidationWarning && validationErrors && (
+                <SchemaWarning toolName="Edit" errors={validationErrors} />
+              )}
+            </div>
+            <RawPatchPreview
+              rawPatch={rawPatch}
+              truncateLines={MAX_VISIBLE_LINES}
+            />
+            <DiffExpandButton
+              label="Show full patch"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowModal(true);
+              }}
+            />
+          </div>
+          {showModal && (
+            <DetailPanel
+              title={<span className="file-path">{fileName}</span>}
+              onClose={() => setShowModal(false)}
+            >
+              <RawPatchModalContent rawPatch={rawPatch} />
+            </DetailPanel>
+          )}
+        </>
+      );
+    }
+
     const isPlan = filePath ? isPlanFile(filePath) : false;
 
     return (
@@ -1045,39 +1088,33 @@ function EditToolResult({
           className={`diff-view-container ${isTruncated ? "truncated" : ""}`}
         >
           <div className="diff-view">
-            {result.structuredPatch.map((hunk, i) => (
+            {structuredPatch.map((hunk, i) => (
               <DiffHunk key={`hunk-${hunk.oldStart}-${i}`} hunk={hunk} />
             ))}
           </div>
-          {isTruncated && (
-            <>
-              <div className="diff-fade-overlay" />
-              <DiffExpandButton
-                label="Click to expand"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setShowModal(true);
-                }}
-              />
-            </>
-          )}
+          {isTruncated && <div className="diff-fade-overlay" />}
+          <DiffExpandButton
+            label="Show full diff"
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowModal(true);
+            }}
+          />
         </div>
       </div>
       {showModal && (
-        <Modal
-          title={
-            <span className="file-path">{getFileName(result.filePath)}</span>
-          }
+        <DetailPanel
+          title={<span className="file-path">{fileName}</span>}
           onClose={() => setShowModal(false)}
         >
           <DiffModalContent
-            structuredPatch={result.structuredPatch}
-            filePath={result.filePath}
-            oldString={result.oldString ?? input?.old_string ?? ""}
-            newString={result.newString ?? input?.new_string ?? ""}
-            originalFile={result.originalFile}
+            structuredPatch={structuredPatch}
+            filePath={filePath}
+            oldString={oldString ?? ""}
+            newString={newString ?? ""}
+            originalFile={originalFile}
           />
-        </Modal>
+        </DetailPanel>
       )}
     </>
   );

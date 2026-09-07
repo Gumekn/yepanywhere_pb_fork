@@ -86,6 +86,8 @@ function getProviderLabel(
       return "Codex";
     case "gemini":
       return "Gemini";
+    case "pi":
+      return "Pi";
     case "local":
       return t("agentsProviderLocal" as never);
     default:
@@ -102,6 +104,8 @@ function getProviderBadgeClass(provider: string | undefined): string {
       return "agent-provider-codex";
     case "gemini":
       return "agent-provider-gemini";
+    case "pi":
+      return "agent-provider-pi";
     case "local":
       return "agent-provider-local";
     default:
@@ -199,8 +203,7 @@ export function AgentsPage() {
   const { t } = useI18n();
   const { processes, terminatedProcesses, loading, error } = useProcesses();
 
-  const { openSidebar, isWideScreen, toggleSidebar, isSidebarCollapsed } =
-    useNavigationLayout();
+  const { openSidebar, isWideScreen } = useNavigationLayout();
 
   // Split processes into active/busy and idle
   const activeProcesses = processes.filter(
@@ -225,9 +228,7 @@ export function AgentsPage() {
         <PageHeader
           title={t("agentsTitle" as never)}
           onOpenSidebar={openSidebar}
-          onToggleSidebar={toggleSidebar}
           isWideScreen={isWideScreen}
-          isSidebarCollapsed={isSidebarCollapsed}
         />
 
         <main className="page-scroll-container">

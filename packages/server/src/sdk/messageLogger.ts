@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadConfig } from "../config.js";
-
 /**
  * Simple JSONL logger for raw SDK messages.
  * Captures exact message shapes for analysis.
@@ -55,19 +54,33 @@ export function logSDKMessage(
     _sid: sessionId,
     ...(options?.provider ? { _provider: options.provider } : {}),
   };
+  const safeMessage = sanitizeSDKMessageForLog(message);
 
-  if (message && typeof message === "object" && !Array.isArray(message)) {
+  if (
+    safeMessage &&
+    typeof safeMessage === "object" &&
+    !Array.isArray(safeMessage)
+  ) {
     logRaw({
       ...base,
-      ...(message as Record<string, unknown>),
+      ...(safeMessage as Record<string, unknown>),
     });
     return;
   }
 
   logRaw({
     ...base,
-    _message: message,
+    _message: safeMessage,
   });
+}
+
+/** Plaintext projection for the owner's private instance. */
+export function sanitizeSDKMessageForPublic(message: unknown): unknown {
+  return message;
+}
+
+export function sanitizeSDKMessageForLog(message: unknown): unknown {
+  return message;
 }
 
 /**

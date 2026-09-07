@@ -1,4 +1,9 @@
-import type { SessionCreatedBy, UrlProjectId } from "@yep-anywhere/shared";
+import type {
+  SessionCreatedBy,
+  SessionOriginChannel,
+  SessionRetryStatus,
+  UrlProjectId,
+} from "@yep-anywhere/shared";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexBridgeController } from "../../src/codex-bridge/types.js";
 import type { SessionIndexService } from "../../src/indexes/index.js";
@@ -79,6 +84,7 @@ describe("Global Sessions Routes", () => {
       state: { type: string };
       permissionMode: string;
       modeVersion: number;
+      retryStatus?: SessionRetryStatus;
     }
   >;
   let unreadMap: Map<string, boolean>;
@@ -90,6 +96,7 @@ describe("Global Sessions Routes", () => {
       isArchived?: boolean;
       isStarred?: boolean;
       createdBy?: SessionCreatedBy;
+      originChannel?: SessionOriginChannel;
     }
   >;
   let externalSessions: Set<string>;
@@ -197,6 +204,25 @@ describe("Global Sessions Routes", () => {
       expect(result.hasMore).toBe(false);
     });
 
+    it("reports bounded list stages through Server-Timing", async () => {
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([]);
+      const routes = createGlobalSessionsRoutes(getDeps());
+
+      const response = await routes.request("/");
+
+      expect(response.status).toBe(200);
+      const timing = response.headers.get("server-timing");
+      for (const stage of [
+        "projectLookup",
+        "bridgeView",
+        "catalog",
+        "sessionScan",
+        "total",
+      ]) {
+        expect(timing).toContain(`${stage};dur=`);
+      }
+    });
+
     it("returns sessions from multiple projects", async () => {
       const project1 = createProject("proj1", "project-one", "/sessions/proj1");
       const project2 = createProject("proj2", "project-two", "/sessions/proj2");
@@ -229,13 +255,17 @@ describe("Global Sessions Routes", () => {
 
       vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
       sessionsByDir.set("/sessions/proj1", [session]);
-      metadataMap.set("sess1", { createdBy: "yep" });
+      metadataMap.set("sess1", {
+        createdBy: "channel",
+        originChannel: "feishu",
+      });
 
       const result = await makeRequest();
 
       expect(result.sessions[0]).toMatchObject({
         id: "sess1",
-        createdBy: "yep",
+        createdBy: "channel",
+        originChannel: "feishu",
         originator: "Codex Desktop",
         source: "appServer",
       });
@@ -412,12 +442,20 @@ describe("Global Sessions Routes", () => {
             "<command-message>kb-map-repo-capabilities</command-message> done",
         },
       );
-      const dollarCommandSession = createSession(
-        "sess-dollar-command",
+      const dollarSkillSession = createSession(
+        "sess-dollar-skill",
         "proj1",
         minutesAgo(7),
         {
-          title: "$git commit push",
+          title: "$imagegen",
+        },
+      );
+      const gitCommitPushSession = createSession(
+        "sess-git-commit-push",
+        "proj1",
+        minutesAgo(8),
+        {
+          title: "$git-commit-push",
         },
       );
       const normalSession = createSession(
@@ -432,7 +470,8 @@ describe("Global Sessions Routes", () => {
       vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
       sessionsByDir.set("/sessions/proj1", [
         commandSession,
-        dollarCommandSession,
+        dollarSkillSession,
+        gitCommitPushSession,
         normalSession,
       ]);
 
@@ -440,7 +479,7 @@ describe("Global Sessions Routes", () => {
 
       expect(result.sessions.map((session) => session.id)).toEqual([
         "sess-command",
-        "sess-dollar-command",
+        "sess-dollar-skill",
       ]);
     });
 
@@ -455,10 +494,18 @@ describe("Global Sessions Routes", () => {
             "<command-message>kb-map-repo-capabilities</command-message> done",
         },
       );
-      const dollarCommandSession = createSession(
-        "sess-dollar-command",
+      const dollarSkillSession = createSession(
+        "sess-dollar-skill",
         "proj1",
         minutesAgo(7),
+        {
+          title: "$imagegen",
+        },
+      );
+      const gitCommitPushSession = createSession(
+        "sess-git-commit-push",
+        "proj1",
+        minutesAgo(8),
         {
           title: "$git commit push",
         },
@@ -475,13 +522,15 @@ describe("Global Sessions Routes", () => {
       vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
       sessionsByDir.set("/sessions/proj1", [
         commandSession,
-        dollarCommandSession,
+        dollarSkillSession,
+        gitCommitPushSession,
         normalSession,
       ]);
 
       const result = await makeRequest("?excludeKind=slash-command");
 
       expect(result.sessions.map((session) => session.id)).toEqual([
+        "sess-git-commit-push",
         "sess-normal",
       ]);
     });
@@ -631,6 +680,130 @@ describe("Global Sessions Routes", () => {
       expect(result.sessions[0].id).toBe("sess3");
       expect(result.sessions[1].id).toBe("sess4");
       expect(result.hasMore).toBe(true);
+    });
+  });
+
+  describe("project coverage", () => {
+    it("keeps one session per in-window project beyond the limit", async () => {
+      const busy = {
+        ...createProject("busy", "busy", "/sessions/busy"),
+        lastActivity: minutesAgo(1),
+      };
+      const quiet = {
+        ...createProject("quiet", "quiet", "/sessions/quiet"),
+        lastActivity: hoursAgo(48),
+      };
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([busy, quiet]);
+      sessionsByDir.set(
+        "/sessions/busy",
+        Array.from({ length: 3 }, (_, i) =>
+          createSession(`busy${i}`, "busy", minutesAgo(i + 1)),
+        ),
+      );
+      sessionsByDir.set("/sessions/quiet", [
+        createSession("quiet-new", "quiet", hoursAgo(48)),
+        createSession("quiet-old", "quiet", hoursAgo(72)),
+      ]);
+
+      const withoutCoverage = await makeRequest("?limit=2");
+      expect(withoutCoverage.sessions.map((s) => s.id)).toEqual([
+        "busy0",
+        "busy1",
+      ]);
+
+      const withCoverage = await makeRequest("?limit=2&projectCoverageDays=7");
+      expect(withCoverage.sessions.map((s) => s.id)).toEqual([
+        "busy0",
+        "busy1",
+        "quiet-new",
+      ]);
+      expect(withCoverage.hasMore).toBe(true);
+    });
+
+    it("ignores projects whose last session is outside the window", async () => {
+      const busy = {
+        ...createProject("busy", "busy", "/sessions/busy"),
+        lastActivity: minutesAgo(1),
+      };
+      const stale = {
+        ...createProject("stale", "stale", "/sessions/stale"),
+        lastActivity: hoursAgo(24 * 30),
+      };
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([busy, stale]);
+      sessionsByDir.set("/sessions/busy", [
+        createSession("busy0", "busy", minutesAgo(1)),
+        createSession("busy1", "busy", minutesAgo(2)),
+      ]);
+      sessionsByDir.set("/sessions/stale", [
+        createSession("stale0", "stale", hoursAgo(24 * 30)),
+      ]);
+
+      const result = await makeRequest("?limit=1&projectCoverageDays=7");
+
+      expect(result.sessions.map((s) => s.id)).toEqual(["busy0"]);
+    });
+
+    it("does not duplicate projects already present in the top results", async () => {
+      const project = {
+        ...createProject("proj1", "project", "/sessions/proj1"),
+        lastActivity: minutesAgo(1),
+      };
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set(
+        "/sessions/proj1",
+        Array.from({ length: 4 }, (_, i) =>
+          createSession(`sess${i}`, "proj1", minutesAgo(i + 1)),
+        ),
+      );
+
+      const result = await makeRequest("?limit=2&projectCoverageDays=7");
+
+      expect(result.sessions.map((s) => s.id)).toEqual(["sess0", "sess1"]);
+    });
+  });
+
+  describe("pin coverage", () => {
+    it("appends an old pinned session to the ordinary limited result", async () => {
+      const recentProject = {
+        ...createProject("recent", "recent", "/sessions/recent"),
+        lastActivity: minutesAgo(1),
+      };
+      const oldProject = {
+        ...createProject("old", "old", "/sessions/old"),
+        lastActivity: hoursAgo(24 * 30),
+      };
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([
+        recentProject,
+        oldProject,
+      ]);
+      sessionsByDir.set("/sessions/recent", [
+        createSession("recent-session", "recent", minutesAgo(1)),
+      ]);
+      sessionsByDir.set("/sessions/old", [
+        createSession("old-pinned", "old", hoursAgo(24 * 30)),
+        createSession("old-unpinned", "old", hoursAgo(24 * 31)),
+      ]);
+      metadataMap.set("old-pinned", { isStarred: true });
+
+      const result = await makeRequest("?limit=1&includePinned=true");
+
+      expect(result.sessions.map((session) => session.id)).toEqual([
+        "recent-session",
+        "old-pinned",
+      ]);
+      expect(result.hasMore).toBe(true);
+      expect(result.nextCursor).toBe(
+        result.sessions.find((session) => session.id === "recent-session")
+          ?.updatedAt,
+      );
+      expect(
+        vi
+          .mocked(mockSessionIndexService.getSessionsWithCache)
+          .mock.calls.map((call) => call[0]),
+      ).toEqual(["/sessions/recent", "/sessions/old"]);
     });
   });
 
@@ -886,17 +1059,21 @@ describe("Global Sessions Routes", () => {
       expect(result.sessions[0].activity).toBe("in-turn");
     });
 
-    it("enriches with external ownership", async () => {
+    it("surfaces session-specific activity for an external Pi turn", async () => {
       const project = createProject("proj1", "project", "/sessions/proj1");
-      const session = createSession("sess1", "proj1", minutesAgo(5));
+      const session = createSession("sess1", "proj1", minutesAgo(5), {
+        provider: "pi",
+      });
 
       vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
       sessionsByDir.set("/sessions/proj1", [session]);
       externalSessions.add("sess1");
+      mockExternalTracker.getExternalActivity = vi.fn(() => "in-turn");
 
       const result = await makeRequest();
 
       expect(result.sessions[0].ownership).toEqual({ owner: "external" });
+      expect(result.sessions[0].activity).toBe("in-turn");
     });
 
     it("marks idle bridged sessions with open connections as external", async () => {
@@ -904,17 +1081,21 @@ describe("Global Sessions Routes", () => {
       const session = createSession("sess1", "proj1", minutesAgo(5), {
         provider: "codex",
       });
+      // A real sidecar always lists the session in its bulk snapshot too, and
+      // ships its own liveness verdict with it.
+      const bridgeView = {
+        session: {
+          ...session,
+          ownership: { owner: "external" },
+          source: "codex-bridge",
+        },
+        projectName: "project",
+        activity: "idle",
+        active: true,
+      };
       const codexBridgeService = {
-        listSessionViews: vi.fn(async () => []),
-        getSessionView: vi.fn(async () => ({
-          session: {
-            ...session,
-            ownership: { owner: "external" },
-            source: "codex-bridge",
-          },
-          projectName: "project",
-          activity: "idle",
-        })),
+        listSessionViews: vi.fn(async () => [bridgeView]),
+        getSessionView: vi.fn(async () => bridgeView),
         isSessionActive: vi.fn(async () => true),
       } as unknown as CodexBridgeController;
 
@@ -930,6 +1111,48 @@ describe("Global Sessions Routes", () => {
 
       expect(result.sessions[0].ownership).toEqual({ owner: "external" });
       expect(result.sessions[0].activity).toBe("idle");
+    });
+
+    it("uses bridge turn health as authoritative over stale persisted state", async () => {
+      const project = createProject("proj1", "project", "/sessions/proj1");
+      const session = createSession("sess1", "proj1", minutesAgo(5), {
+        provider: "codex",
+        lastTurnStatus: "failed",
+        lastErrorMessage: "stale persisted error",
+        retryStatus: { attempt: 2, message: "stale retry" },
+      });
+      const bridgeView = {
+        session: {
+          ...session,
+          ownership: { owner: "external" },
+          source: "codex-bridge",
+          lastTurnStatus: undefined,
+          lastErrorMessage: undefined,
+          retryStatus: undefined,
+        },
+        projectName: "project",
+        activity: "idle",
+        active: true,
+      };
+      const codexBridgeService = {
+        listSessionViews: vi.fn(async () => [bridgeView]),
+        getSessionView: vi.fn(async () => bridgeView),
+        isSessionActive: vi.fn(async () => true),
+      } as unknown as CodexBridgeController;
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+
+      const routes = createGlobalSessionsRoutes(
+        getDeps({ codexBridgeService }),
+      );
+      const response = await routes.request("/");
+      expect(response.status).toBe(200);
+      const result = (await response.json()) as GlobalSessionsResponse;
+
+      expect(result.sessions[0].lastTurnStatus).toBeUndefined();
+      expect(result.sessions[0].lastErrorMessage).toBeUndefined();
+      expect(result.sessions[0].retryStatus).toBeUndefined();
     });
 
     it("enriches with pendingInputType", async () => {
@@ -949,6 +1172,31 @@ describe("Global Sessions Routes", () => {
       const result = await makeRequest();
 
       expect(result.sessions[0].pendingInputType).toBe("tool-approval");
+    });
+
+    it("overlays live process retry status on the session list", async () => {
+      const project = createProject("proj1", "project", "/sessions/proj1");
+      const session = createSession("sess1", "proj1", minutesAgo(5));
+      const retryStatus = {
+        attempt: 3,
+        message: "provider rate limited",
+        next: 1_789_000_000_000,
+      };
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+      processMap.set("sess1", {
+        id: "proc-1",
+        getPendingInputRequest: () => null,
+        state: { type: "in-turn" },
+        permissionMode: "default",
+        modeVersion: 1,
+        retryStatus,
+      });
+
+      const result = await makeRequest();
+
+      expect(result.sessions[0].retryStatus).toEqual(retryStatus);
     });
 
     it("enriches with hasUnread from notification service", async () => {

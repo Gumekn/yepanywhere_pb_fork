@@ -1,22 +1,37 @@
 import type { ContextUsage } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { getSelectionAwareCopyText } from "../lib/clipboard";
+import {
+  type ClipboardImageSource,
+  getSelectionAwareCopyText,
+  writeClipboardText,
+  writeClipboardUserInput,
+} from "../lib/clipboard";
 import { formatTokenCount } from "../lib/tokens";
 
 interface MessageActionsProps {
   /** ISO timestamp string from the source message; shown on hover. */
   timestamp?: string;
+  /** Whether the timestamp represents live turn activity instead of turn start. */
+  timestampIsLastUpdate?: boolean;
   /** Context-window usage snapshot associated with this message. */
   contextBefore?: ContextUsage;
   /** Plain-text payload to copy. When omitted, the copy button is hidden. */
   copyText?: string;
+  /** Images belonging to the same user input. */
+  copyImages?: ClipboardImageSource[];
+  /** Place a copy-only action inside a message bubble and keep it visible. */
+  placement?: "row" | "bubble";
   /**
    * When provided, show an "edit" button. Used on user messages to rewind the
    * conversation: forks the session up to this message and prefills the input.
    */
   onEdit?: () => void;
 }
+
+type CopyFeedback = {
+  status: "copied" | "copied-images" | "partial" | "failed";
+} | null;
 
 /**
  * Hover-revealed action row for a chat bubble or assistant turn:
@@ -29,50 +44,66 @@ interface MessageActionsProps {
  */
 export function MessageActions({
   timestamp,
+  timestampIsLastUpdate = false,
   contextBefore,
   copyText,
+  copyImages = [],
+  placement = "row",
   onEdit,
 }: MessageActionsProps) {
   const { t } = useI18n();
-  const [copied, setCopied] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState<CopyFeedback>(null);
   const actionsRef = useRef<HTMLSpanElement | null>(null);
 
-  // Reset the "Copied!" pulse after a short window.
+  // Reset copy success/failure feedback after a short window. A new object is
+  // stored for every attempt so repeated failures restart this timer.
   useEffect(() => {
-    if (!copied) return;
-    const handle = setTimeout(() => setCopied(false), 1500);
+    if (!copyFeedback) return;
+    const handle = setTimeout(() => setCopyFeedback(null), 1500);
     return () => clearTimeout(handle);
-  }, [copied]);
+  }, [copyFeedback]);
 
   const handleCopy = useCallback(async () => {
-    if (!copyText) return;
+    if (copyText === undefined) return;
 
     const selectionRoot =
       actionsRef.current?.closest(".assistant-turn, .user-prompt-container") ??
       actionsRef.current;
     const textToCopy = getSelectionAwareCopyText(copyText, selectionRoot);
+    const shouldCopyImages = copyImages.length > 0 && textToCopy === copyText;
 
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(textToCopy);
+      if (shouldCopyImages) {
+        const result = await writeClipboardUserInput(textToCopy, copyImages);
+        setCopyFeedback({
+          status:
+            result.copiedImageCount === result.requestedImageCount
+              ? "copied-images"
+              : "partial",
+        });
       } else {
-        // Legacy fallback for non-secure contexts (HTTP without TLS).
-        const textarea = document.createElement("textarea");
-        textarea.value = textToCopy;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.left = "-9999px";
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand("copy");
-        document.body.removeChild(textarea);
+        await writeClipboardText(textToCopy);
+        setCopyFeedback({ status: "copied" });
       }
-      setCopied(true);
-    } catch {
-      // Ignore — failures here are typically permissions-related and we
-      // don't want to surface them noisily inside a chat bubble.
+    } catch (error) {
+      console.error("Failed to copy message:", error);
+      setCopyFeedback({ status: "failed" });
     }
-  }, [copyText]);
+  }, [copyImages, copyText]);
+
+  const copyStatus = copyFeedback?.status;
+  const copyLabel =
+    copyStatus === "copied-images"
+      ? t("messageActionCopiedWithImages")
+      : copyStatus === "copied"
+        ? t("messageActionCopied")
+        : copyStatus === "partial"
+          ? t("messageActionCopiedWithoutAllImages")
+          : copyStatus === "failed"
+            ? t("messageActionCopyFailed")
+            : copyImages.length > 0
+              ? t("messageActionCopyWithImages")
+              : t("messageActionCopy");
 
   const contextTokenLabel =
     contextBefore && contextBefore.inputTokens > 0
@@ -83,12 +114,16 @@ export function MessageActions({
       ? `${contextBefore.inputTokens.toLocaleString()} context tokens`
       : undefined;
 
-  if (!timestamp && !contextTokenLabel && !copyText && !onEdit) return null;
+  const hasCopyPayload =
+    copyText !== undefined && (copyText.length > 0 || copyImages.length > 0);
+
+  if (!timestamp && !contextTokenLabel && !hasCopyPayload && !onEdit)
+    return null;
 
   return (
     <span
       ref={actionsRef}
-      className={`message-actions${copied ? " is-active" : ""}`}
+      className={`message-actions${placement === "bubble" ? " message-actions-bubble" : ""}${copyFeedback ? " is-active" : ""}`}
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => e.stopPropagation()}
     >
@@ -96,7 +131,20 @@ export function MessageActions({
         <time
           className="message-actions-time"
           dateTime={timestamp}
-          title={formatFullTimestamp(timestamp)}
+          title={
+            timestampIsLastUpdate
+              ? t("messageActionLastUpdated", {
+                  time: formatFullTimestamp(timestamp),
+                })
+              : formatFullTimestamp(timestamp)
+          }
+          aria-label={
+            timestampIsLastUpdate
+              ? t("messageActionLastUpdated", {
+                  time: formatFullTimestamp(timestamp),
+                })
+              : undefined
+          }
         >
           {formatShortTime(timestamp)}
         </time>
@@ -117,17 +165,32 @@ export function MessageActions({
           <EditIcon />
         </button>
       )}
-      {copyText && (
+      {hasCopyPayload && (
         <button
           type="button"
-          className={`message-actions-copy${copied ? " is-copied" : ""}`}
+          className={`message-actions-copy${
+            copyStatus === "copied" || copyStatus === "copied-images"
+              ? " is-copied"
+              : copyStatus === "partial"
+                ? " is-partial"
+                : copyStatus === "failed"
+                  ? " is-failed"
+                  : ""
+          }`}
           onClick={handleCopy}
-          aria-label={
-            copied ? t("messageActionCopied") : t("messageActionCopy")
-          }
-          title={copied ? t("messageActionCopied") : t("messageActionCopy")}
+          aria-label={copyLabel}
+          aria-live="polite"
+          title={copyLabel}
         >
-          {copied ? <CopiedIcon /> : <CopyIcon />}
+          {copyStatus === "copied" || copyStatus === "copied-images" ? (
+            <CopiedIcon />
+          ) : copyStatus === "partial" ? (
+            <CopyPartialIcon />
+          ) : copyStatus === "failed" ? (
+            <CopyFailedIcon />
+          ) : (
+            <CopyIcon />
+          )}
         </button>
       )}
     </span>
@@ -186,6 +249,42 @@ function CopiedIcon() {
       aria-hidden="true"
     >
       <polyline points="20 6 9 17 4 12" />
+    </svg>
+  );
+}
+
+function CopyFailedIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      aria-hidden="true"
+    >
+      <path d="M6 6l12 12M18 6 6 18" />
+    </svg>
+  );
+}
+
+function CopyPartialIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M10.3 2.9 1.8 17a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 2.9a2 2 0 0 0-3.4 0Z" />
+      <path d="M12 9v4M12 17h.01" />
     </svg>
   );
 }

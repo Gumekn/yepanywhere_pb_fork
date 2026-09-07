@@ -1,531 +1,731 @@
 /**
- * Remote spawn implementation for SSH-based Claude execution.
+ * SSH transport for running the Claude Code CLI on a remote machine.
  *
- * Uses SSH to spawn Claude on a remote machine while communicating
- * via stdin/stdout over the SSH tunnel.
+ * The Claude Agent SDK remains in the Yep server process and speaks its normal
+ * stdio control protocol through SSH. The actual `claude` executable, auth,
+ * tools, and shell commands all live in the remote machine.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { homedir } from "node:os";
-import type { Readable, Writable } from "node:stream";
+import { constants, access, stat } from "node:fs/promises";
+import path, { posix } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import type {
+  SpawnOptions,
+  SpawnedProcess,
+} from "@anthropic-ai/claude-agent-sdk";
+import type { RemoteExecutorConfig } from "@yep-anywhere/shared";
 import { getLogger } from "../logging/logger.js";
+import { getRemoteSessionStorageMode } from "./remote-executor-config.js";
+import { mapLocalPathToRemote } from "./remote-path-mapping.js";
 
-/**
- * Options passed to the spawn function (from SDK).
- */
-export interface SpawnOptions {
-  command: string;
-  args: string[];
-  cwd?: string;
-  env: Record<string, string | undefined>;
-  signal: AbortSignal;
-}
+const DEFAULT_CONNECT_TIMEOUT_MS = 8_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 12_000;
+const MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024;
+const REMOTE_STARTUP_STALL_THRESHOLDS_MS = [10_000, 30_000, 120_000] as const;
 
-/**
- * Represents a spawned process with stdin/stdout streams (from SDK).
- */
-export interface SpawnedProcess {
-  stdin: Writable;
-  stdout: Readable;
-  readonly killed: boolean;
-  readonly exitCode: number | null;
-  kill(signal: NodeJS.Signals): boolean;
-  on(
-    event: "exit",
-    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
-  ): void;
-  on(event: "error", listener: (error: Error) => void): void;
-  once(
-    event: "exit",
-    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
-  ): void;
-  once(event: "error", listener: (error: Error) => void): void;
-  off(
-    event: "exit",
-    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
-  ): void;
-  off(event: "error", listener: (error: Error) => void): void;
-}
+// These values describe the Agent SDK transport itself. Authentication,
+// provider selection, proxy settings, and every other machine-specific value
+// intentionally come from the VM instead of the Yep/macOS process.
+const REMOTE_SDK_ENV_KEYS = [
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_AGENT_SDK_VERSION",
+  "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+] as const;
 
-/**
- * Options for creating a remote spawn function.
- */
-export interface RemoteSpawnOptions {
-  /** SSH host alias (from ~/.ssh/config) */
-  host: string;
-  /** Environment variables to set on remote (e.g., CLAUDE_SESSIONS_DIR for testing) */
-  remoteEnv?: Record<string, string>;
-}
+// A Yep-owned SDK process should not block session initialization on CLI
+// updates, plugin marketplace refreshes, or UI-only background prefetches.
+// These values apply only to the spawned process and do not change the VM's
+// persistent Claude configuration or interactive terminal sessions.
+const REMOTE_RUNTIME_ENV = {
+  DISABLE_AUTOUPDATER: "1",
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+} as const;
 
-/**
- * Result of SSH connection test.
- */
-export interface SSHTestResult {
+export interface RemoteExecutorTestResult {
   success: boolean;
-  /** Whether Claude CLI is available on the remote */
+  host: string;
+  homeDir?: string;
   claudeAvailable?: boolean;
-  /** Claude version if available */
   claudeVersion?: string;
-  /** Error message if failed */
+  localRootAvailable?: boolean;
+  sharedRootAvailable?: boolean;
+  sessionStorageMode?: "shared" | "ssh-replica";
+  localProjectsDirAvailable?: boolean;
+  localProjectsDirPermissionsSecure?: boolean;
+  remoteProjectsDirAvailable?: boolean;
+  remoteProjectsDirPermissionsSecure?: boolean;
+  remoteSessionStoreLinked?: boolean;
+  credentialStoragePrivate?: boolean;
+  remoteClaudeConfigDirUnset?: boolean;
   error?: string;
-  /** SSH connection time in ms */
   connectionTimeMs?: number;
 }
 
-/**
- * Result of remote path check.
- */
-export interface RemotePathCheckResult {
-  exists: boolean;
+export interface RemoteCommandResult {
+  success: boolean;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
   error?: string;
 }
 
-/**
- * Get the home directory on a remote host.
- * Caches results per host to avoid repeated SSH calls.
- */
-const remoteHomeCache = new Map<string, string>();
+export interface RemoteSpawnOptions {
+  executor: RemoteExecutorConfig;
+  /** Override SSH connection timeout without changing session startup policy. */
+  connectTimeoutMs?: number;
+  /** Correlates SSH transport logs with the provider/session startup attempt. */
+  startupId?: string;
+  /** Called with the local SSH child, primarily for liveness/PID reporting. */
+  onSpawn?: (process: ChildProcess) => void;
+}
 
-export async function getRemoteHome(host: string): Promise<string | null> {
-  // Check cache first
-  const cached = remoteHomeCache.get(host);
-  if (cached) {
-    return cached;
-  }
+/** Quote one value for a POSIX shell without allowing interpolation. */
+export function quoteShell(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
 
-  try {
-    const result = await runSSHCommand(host, "echo $HOME", 5000);
-    if (result.success && result.stdout) {
-      const remoteHome = result.stdout.trim();
-      remoteHomeCache.set(host, remoteHome);
-      return remoteHome;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+export function executorLabel(executor: RemoteExecutorConfig): string {
+  const userPrefix = executor.user ? `${executor.user}@` : "";
+  const portSuffix =
+    executor.port && executor.port !== 22 ? `:${executor.port}` : "";
+  return `${userPrefix}${executor.host}${portSuffix}`;
 }
 
 /**
- * Translate a local path to a remote path by replacing the home directory.
- *
- * For example:
- * - Local: /home/kgraehl/code/project, localHome: /home/kgraehl, remoteHome: /Users/kgraehl
- * - Result: /Users/kgraehl/code/project
+ * Translate a local path beneath the shared root to the corresponding remote
+ * path. Paths outside the configured root are rejected instead of silently
+ * pointing Claude at a different checkout.
  */
-export function translateHomePath(
+export function translateSharedPath(
   localPath: string,
-  localHome: string,
-  remoteHome: string,
+  executor: Pick<RemoteExecutorConfig, "localRoot" | "remoteRoot">,
 ): string {
-  // If the path starts with the local home directory, replace it with remote home
-  if (localPath.startsWith(localHome)) {
-    return remoteHome + localPath.slice(localHome.length);
-  }
-  // Otherwise return the path unchanged
-  return localPath;
+  return mapLocalPathToRemote(localPath, executor);
 }
 
-/**
- * Check if a directory exists on a remote host.
- */
-export async function checkRemotePath(
-  host: string,
-  path: string,
-): Promise<RemotePathCheckResult> {
-  const log = getLogger();
+/** Build SSH argv without involving a local shell. */
+export function buildSshArgs(
+  executor: Pick<RemoteExecutorConfig, "host" | "user" | "port">,
+  remoteCommand: string,
+  connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS,
+): string[] {
+  const args = [
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    `ConnectTimeout=${Math.max(1, Math.ceil(connectTimeoutMs / 1000))}`,
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=3",
+  ];
 
-  try {
-    // Use test -d to check if directory exists
-    const result = await runSSHCommand(
-      host,
-      `test -d '${escapeShell(path)}'`,
-      5000,
-    );
-
-    if (result.success) {
-      return { exists: true };
-    }
-
-    log.info(
-      { event: "remote_path_check_failed", host, path },
-      `Remote path does not exist: ${path} on ${host}`,
-    );
-
-    return {
-      exists: false,
-      error: `Directory does not exist on ${host}: ${path}`,
-    };
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    return {
-      exists: false,
-      error: `Failed to check path on ${host}: ${errorMsg}`,
-    };
-  }
+  if (executor.port) args.push("-p", String(executor.port));
+  if (executor.user) args.push("-l", executor.user);
+  args.push("--", executor.host, remoteCommand);
+  return args;
 }
 
-/**
- * Test SSH connection to a remote host.
- * Checks:
- * 1. SSH connectivity (with timeout)
- * 2. Claude CLI availability
- */
-export async function testSSHConnection(host: string): Promise<SSHTestResult> {
-  const log = getLogger();
-  const startTime = Date.now();
-
-  try {
-    // Test basic SSH connectivity with 5 second timeout
-    const connectResult = await runSSHCommand(host, "true", 5000);
-    if (!connectResult.success) {
-      return {
-        success: false,
-        error: connectResult.error ?? "SSH connection failed",
-        connectionTimeMs: Date.now() - startTime,
-      };
-    }
-
-    const connectionTimeMs = Date.now() - startTime;
-
-    // Test Claude CLI availability (use login shell to get user's PATH)
-    const claudeResult = await runSSHCommand(
-      host,
-      "bash -l -c 'claude --version'",
-      10000,
-    );
-    if (!claudeResult.success) {
-      return {
-        success: true,
-        claudeAvailable: false,
-        error: "Claude CLI not found on remote",
-        connectionTimeMs,
-      };
-    }
-
-    // Parse Claude version from output
-    const versionMatch = claudeResult.stdout?.match(/claude\s+(\S+)/i);
-    const claudeVersion = versionMatch?.[1];
-
-    log.info(
-      {
-        event: "ssh_test_success",
-        host,
-        claudeVersion,
-        connectionTimeMs,
-      },
-      `SSH test successful: ${host} (Claude ${claudeVersion ?? "unknown"})`,
-    );
-
-    return {
-      success: true,
-      claudeAvailable: true,
-      claudeVersion,
-      connectionTimeMs,
-    };
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    log.warn(
-      { event: "ssh_test_failed", host, error: errorMsg },
-      `SSH test failed: ${host} - ${errorMsg}`,
-    );
-    return {
-      success: false,
-      error: errorMsg,
-      connectionTimeMs: Date.now() - startTime,
-    };
-  }
+export function inLoginShell(command: string): string {
+  return `bash -lc ${quoteShell(command)}`;
 }
 
-/**
- * Run a simple SSH command and return the result.
- */
-async function runSSHCommand(
-  host: string,
+/** Execute a bounded, non-interactive command over SSH. */
+export function runRemoteCommand(
+  executor: Pick<RemoteExecutorConfig, "host" | "user" | "port">,
   command: string,
-  timeoutMs: number,
-): Promise<{ success: boolean; stdout?: string; error?: string }> {
+  timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS,
+  maxOutputBytes = MAX_COMMAND_OUTPUT_BYTES,
+): Promise<RemoteCommandResult> {
   return new Promise((resolve) => {
-    const sshProcess = spawn(
+    const child = spawn(
       "ssh",
-      [
-        "-o",
-        `ConnectTimeout=${Math.ceil(timeoutMs / 1000)}`,
-        "-o",
-        "BatchMode=yes", // Don't prompt for password
-        "--", // End option parsing before host
-        host,
-        command,
-      ],
+      buildSshArgs(executor, command, Math.min(timeoutMs, 10_000)),
       { stdio: ["ignore", "pipe", "pipe"] },
     );
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let terminationTimer: NodeJS.Timeout | null = null;
 
-    let stdout = "";
-    let stderr = "";
+    const decode = (chunks: Buffer[]): string =>
+      Buffer.concat(chunks).toString("utf8");
 
-    sshProcess.stdout.on("data", (data: Buffer) => {
-      stdout += data.toString();
+    const finish = (result: RemoteCommandResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    const terminate = () => {
+      child.kill("SIGTERM");
+      terminationTimer = setTimeout(() => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+      }, 1_000);
+      terminationTimer.unref();
+    };
+
+    const failForLimit = (stream: "stdout" | "stderr") => {
+      terminate();
+      finish({
+        success: false,
+        stdout: decode(stdoutChunks),
+        stderr: decode(stderrChunks),
+        exitCode: null,
+        error: `Remote command ${stream} exceeded ${maxOutputBytes} bytes`,
+      });
+    };
+
+    const appendBounded = (
+      chunks: Buffer[],
+      chunk: Buffer,
+      currentBytes: number,
+      stream: "stdout" | "stderr",
+    ): number => {
+      if (currentBytes + chunk.byteLength > maxOutputBytes) {
+        failForLimit(stream);
+        return currentBytes;
+      }
+      chunks.push(Buffer.from(chunk));
+      return currentBytes + chunk.byteLength;
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (!settled) {
+        stdoutBytes = appendBounded(stdoutChunks, chunk, stdoutBytes, "stdout");
+      }
     });
-
-    sshProcess.stderr.on("data", (data: Buffer) => {
-      stderr += data.toString();
-    });
-
-    const timeout = setTimeout(() => {
-      sshProcess.kill("SIGTERM");
-      resolve({ success: false, error: "Connection timeout" });
-    }, timeoutMs);
-
-    sshProcess.on("exit", (code) => {
-      clearTimeout(timeout);
-      if (code === 0) {
-        resolve({ success: true, stdout: stdout.trim() });
-      } else {
-        resolve({
-          success: false,
-          error: stderr.trim() || `Exit code ${code}`,
-        });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (!settled) {
+        stderrBytes = appendBounded(stderrChunks, chunk, stderrBytes, "stderr");
       }
     });
 
-    sshProcess.on("error", (error) => {
-      clearTimeout(timeout);
-      resolve({ success: false, error: error.message });
+    const timer = setTimeout(() => {
+      terminate();
+      finish({
+        success: false,
+        stdout: decode(stdoutChunks),
+        stderr: decode(stderrChunks),
+        exitCode: null,
+        error: `Remote command timed out after ${timeoutMs}ms`,
+      });
+    }, timeoutMs);
+    timer.unref();
+
+    child.once("error", (error) => {
+      finish({
+        success: false,
+        stdout: decode(stdoutChunks),
+        stderr: decode(stderrChunks),
+        exitCode: null,
+        error: error.message,
+      });
+    });
+    child.once("exit", (code) => {
+      if (terminationTimer) {
+        clearTimeout(terminationTimer);
+        terminationTimer = null;
+      }
+      const stdout = decode(stdoutChunks);
+      const stderr = decode(stderrChunks);
+      const cleanStderr = stderr.trim();
+      finish({
+        success: code === 0,
+        stdout,
+        stderr,
+        exitCode: code,
+        error:
+          code === 0
+            ? undefined
+            : cleanStderr || `SSH exited with code ${code}`,
+      });
     });
   });
 }
 
-/**
- * Convert a local path to a remote-compatible path.
- *
- * Replaces the local home directory with $HOME so the remote shell
- * expands it to the correct path on the remote machine.
- *
- * This handles Mac (/Users/username) to Linux (/home/username) differences.
- *
- * Examples:
- *   /Users/kgraehl/code/project -> $HOME/code/project
- *   /home/kgraehl/code/project -> $HOME/code/project
- *   /var/www/project -> /var/www/project (unchanged)
- */
-function toRemotePath(localPath: string): string {
-  const home = homedir();
-
-  if (localPath.startsWith(home)) {
-    // Replace home directory with $HOME for remote expansion
-    return `$HOME${localPath.slice(home.length)}`;
+/** Check SSH, Claude, and the configured shared-directory mount. */
+export async function testRemoteExecutor(
+  executor: RemoteExecutorConfig,
+): Promise<RemoteExecutorTestResult> {
+  const startedAt = Date.now();
+  const host = executorLabel(executor);
+  const sessionStorageMode = getRemoteSessionStorageMode(executor);
+  let localRootAvailable = false;
+  try {
+    await access(executor.localRoot, constants.R_OK | constants.W_OK);
+    localRootAvailable = (await stat(executor.localRoot)).isDirectory();
+  } catch {
+    localRootAvailable = false;
+  }
+  const connection = await runRemoteCommand(executor, "true", 8_000);
+  if (!connection.success) {
+    return {
+      success: false,
+      host,
+      localRootAvailable,
+      sessionStorageMode,
+      error: connection.error ?? "SSH connection failed",
+      connectionTimeMs: Date.now() - startedAt,
+    };
   }
 
-  return localPath;
+  const homeResult = await runRemoteCommand(
+    executor,
+    inLoginShell('printf "%s" "$HOME"'),
+  );
+  const claudeCommand = executor.claudePath ?? "claude";
+  const claudeResult = await runRemoteCommand(
+    executor,
+    inLoginShell(`${quoteShell(claudeCommand)} --version`),
+  );
+  const sharedRootResult = await runRemoteCommand(
+    executor,
+    inLoginShell(
+      `test -d ${quoteShell(executor.remoteRoot)} && test -r ${quoteShell(executor.remoteRoot)} && test -w ${quoteShell(executor.remoteRoot)}`,
+    ),
+  );
+
+  let localProjectsDirAvailable: boolean | undefined;
+  let localProjectsDirPermissionsSecure: boolean | undefined;
+  let remoteProjectsDirAvailable: boolean | undefined;
+  let remoteProjectsDirPermissionsSecure: boolean | undefined;
+  let remoteSessionStoreLinked: boolean | undefined;
+  let credentialStoragePrivate: boolean | undefined;
+  let remoteClaudeConfigDirUnset: boolean | undefined;
+  const storage = executor.sessionStorage;
+  if (
+    sessionStorageMode === "shared" &&
+    storage?.localProjectsDir &&
+    storage.remoteProjectsDir
+  ) {
+    try {
+      await access(storage.localProjectsDir, constants.R_OK);
+      const projectsStat = await stat(storage.localProjectsDir);
+      localProjectsDirAvailable = projectsStat.isDirectory();
+      localProjectsDirPermissionsSecure =
+        process.platform === "win32" || (projectsStat.mode & 0o027) === 0;
+    } catch {
+      localProjectsDirAvailable = false;
+      localProjectsDirPermissionsSecure = false;
+    }
+
+    const remoteProjectsResult = await runRemoteCommand(
+      executor,
+      inLoginShell(
+        `test -d ${quoteShell(storage.remoteProjectsDir)} && test -r ${quoteShell(storage.remoteProjectsDir)} && test -w ${quoteShell(storage.remoteProjectsDir)}`,
+      ),
+    );
+    remoteProjectsDirAvailable = remoteProjectsResult.success;
+    const remoteProjectsModeResult = await runRemoteCommand(
+      executor,
+      inLoginShell(`stat -c '%a' -- ${quoteShell(storage.remoteProjectsDir)}`),
+    );
+    if (remoteProjectsModeResult.success) {
+      const remoteMode = Number.parseInt(
+        remoteProjectsModeResult.stdout.trim(),
+        8,
+      );
+      remoteProjectsDirPermissionsSecure =
+        Number.isFinite(remoteMode) && (remoteMode & 0o027) === 0;
+    } else {
+      remoteProjectsDirPermissionsSecure = false;
+    }
+
+    const linkedResult = await runRemoteCommand(
+      executor,
+      inLoginShell(
+        `test -d "$HOME/.claude/projects" && test "$HOME/.claude/projects" -ef ${quoteShell(storage.remoteProjectsDir)}`,
+      ),
+    );
+    remoteSessionStoreLinked = linkedResult.success;
+
+    const privateProfileResult = await runRemoteCommand(
+      executor,
+      inLoginShell(
+        `case "$HOME/.claude" in ${quoteShell(posix.resolve(executor.remoteRoot))}|${quoteShell(`${posix.resolve(executor.remoteRoot)}/`)}*) exit 1 ;; *) exit 0 ;; esac`,
+      ),
+    );
+    credentialStoragePrivate = privateProfileResult.success;
+    const configDirResult = await runRemoteCommand(
+      executor,
+      inLoginShell('test -z "${CLAUDE_CONFIG_DIR:-}"'),
+    );
+    remoteClaudeConfigDirUnset = configDirResult.success;
+  }
+
+  const claudeAvailable = claudeResult.success;
+  const sharedRootAvailable = sharedRootResult.success;
+  const errors: string[] = [];
+  if (!localRootAvailable) {
+    errors.push(`Shared root is unavailable locally: ${executor.localRoot}`);
+  }
+  if (!claudeAvailable) {
+    errors.push(
+      claudeResult.error ?? `Claude CLI is unavailable: ${claudeCommand}`,
+    );
+  }
+  if (!sharedRootAvailable) {
+    errors.push(
+      `Shared root is not mounted read/write on the remote: ${executor.remoteRoot}`,
+    );
+  }
+  if (localProjectsDirAvailable === false) {
+    errors.push("Shared Claude projects directory is unreadable locally");
+  }
+  if (localProjectsDirPermissionsSecure === false) {
+    errors.push(
+      "Shared Claude projects directory permissions are too broad (expected 0700 or 0750)",
+    );
+  }
+  if (remoteProjectsDirAvailable === false) {
+    errors.push("Shared Claude projects directory is not read/write remotely");
+  }
+  // Do not reject a shared store based on the mode reported by the remote
+  // mount. Filesystems such as bindfs can intentionally expose synthetic
+  // permissions (for example 0777) even when the authoritative directory on
+  // the Yep host is 0700. The local mode check above protects the persisted
+  // transcript, while the remote checks still require a read/write directory,
+  // a linked ~/.claude/projects, and credentials outside the shared root.
+  if (remoteSessionStoreLinked === false) {
+    errors.push(
+      "Remote ~/.claude/projects does not point at the configured shared projects directory",
+    );
+  }
+  if (credentialStoragePrivate === false) {
+    errors.push(
+      "Remote Claude credentials would reside inside the shared root",
+    );
+  }
+  if (remoteClaudeConfigDirUnset === false) {
+    errors.push("Remote CLAUDE_CONFIG_DIR must be unset for shared storage");
+  }
+
+  return {
+    success: true,
+    host,
+    homeDir: homeResult.success ? homeResult.stdout.trim() : undefined,
+    claudeAvailable,
+    claudeVersion: claudeAvailable ? claudeResult.stdout.trim() : undefined,
+    localRootAvailable,
+    sharedRootAvailable,
+    sessionStorageMode,
+    localProjectsDirAvailable,
+    localProjectsDirPermissionsSecure,
+    remoteProjectsDirAvailable,
+    remoteProjectsDirPermissionsSecure,
+    remoteSessionStoreLinked,
+    credentialStoragePrivate,
+    remoteClaudeConfigDirUnset,
+    error: errors.length > 0 ? errors.join("; ") : undefined,
+    connectionTimeMs: Date.now() - startedAt,
+  };
+}
+
+function remoteClaudeArgs(command: string, args: string[]): string[] {
+  const firstArg = args[0];
+  const commandName = path.basename(command).toLowerCase();
+  const sdkCliScript =
+    firstArg &&
+    (firstArg.endsWith("cli.js") || firstArg.endsWith("cli.mjs")) &&
+    firstArg.includes("claude-agent-sdk");
+
+  return sdkCliScript || commandName === "node" || commandName === "node.exe"
+    ? args.slice(1)
+    : args;
+}
+
+export interface RemoteClaudeCommand {
+  cli: string;
+  args: string[];
+  remoteCommand: string;
+}
+
+/** Build the remote command separately so path/env isolation can be tested. */
+export function buildRemoteClaudeCommand(
+  executor: RemoteExecutorConfig,
+  spawnOptions: SpawnOptions,
+): RemoteClaudeCommand {
+  const cli = executor.claudePath ?? "claude";
+  const args = remoteClaudeArgs(spawnOptions.command, spawnOptions.args);
+  const envParts = Object.entries(REMOTE_RUNTIME_ENV).map(
+    ([key, value]) => `${key}=${quoteShell(value)}`,
+  );
+  envParts.push(
+    ...REMOTE_SDK_ENV_KEYS.flatMap((key) => {
+      const value = spawnOptions.env[key];
+      return value === undefined ? [] : [`${key}=${quoteShell(value)}`];
+    }),
+  );
+  if (
+    executor.remoteClaudeConfigDir &&
+    getRemoteSessionStorageMode(executor) !== "shared"
+  ) {
+    envParts.push(
+      `CLAUDE_CONFIG_DIR=${quoteShell(executor.remoteClaudeConfigDir)}`,
+    );
+  }
+  const commandParts = [
+    `cd ${quoteShell(spawnOptions.cwd ?? executor.remoteRoot)}`,
+    "exec",
+    ...(envParts.length > 0 ? ["env"] : []),
+    ...envParts,
+    quoteShell(cli),
+    ...args.map(quoteShell),
+  ];
+  return {
+    cli,
+    args,
+    remoteCommand: inLoginShell(
+      `${commandParts[0]} && ${commandParts.slice(1).join(" ")}`,
+    ),
+  };
+}
+
+function wrapChildProcess(child: ChildProcess): SpawnedProcess {
+  const { stdin, stdout } = child;
+  if (!stdin || !stdout) {
+    throw new Error("Remote Claude process requires piped stdin and stdout.");
+  }
+
+  return {
+    stdin,
+    stdout,
+    get killed() {
+      return child.killed;
+    },
+    get exitCode() {
+      return child.exitCode;
+    },
+    kill(signal: NodeJS.Signals): boolean {
+      return child.kill(signal);
+    },
+    on(event, listener) {
+      child.on(event, listener as (...args: unknown[]) => void);
+    },
+    once(event, listener) {
+      child.once(event, listener as (...args: unknown[]) => void);
+    },
+    off(event, listener) {
+      child.off(event, listener as (...args: unknown[]) => void);
+    },
+  } as SpawnedProcess;
 }
 
 /**
- * Create a spawn function that runs Claude on a remote machine via SSH.
- *
- * The returned function satisfies the SDK's spawnClaudeCodeProcess interface.
- * It spawns an SSH process that runs Claude on the remote machine,
- * piping stdin/stdout over the SSH tunnel.
+ * Create the Agent SDK spawn hook. The hook deliberately does not forward the
+ * Mac's Anthropic credentials; the VM's official Claude CLI owns auth.
  */
 export function createRemoteSpawn(
   options: RemoteSpawnOptions,
 ): (spawnOptions: SpawnOptions) => SpawnedProcess {
-  const { host, remoteEnv } = options;
-
-  return (spawnOptions: SpawnOptions): SpawnedProcess => {
-    const log = getLogger();
-    const { command, args, cwd, env, signal } = spawnOptions;
-
-    // Build the remote command
-    // We need to:
-    // 1. Set environment variables
-    // 2. Change to the working directory (with path mapping)
-    // 3. Run the claude command with args
-
-    // The SDK passes "node /local/path/to/cli.js --flags..." but that local path
-    // doesn't exist on the remote machine. We need to use "claude" directly since
-    // the remote should have Claude installed (verified by testSSHConnection).
-    // NOTE: The SDK bundles its own claude binary (cli.js) for local sessions, so
-    // the local SDK version and remote system-installed `claude` CLI can diverge.
-    // If the SDK uses features newer than the remote CLI, things may break.
-    let remoteCommand = command;
-    let remoteArgs = args;
-    const firstArg = args[0];
-    if (
-      command === "node" &&
-      firstArg &&
-      firstArg.includes("claude-agent-sdk") &&
-      firstArg.endsWith("cli.js")
-    ) {
-      // Replace "node /path/to/cli.js --flags" with "claude --flags"
-      remoteCommand = "claude";
-      remoteArgs = args.slice(1); // Skip the cli.js path
-      log.debug(
-        {
-          event: "remote_spawn_rewrite",
-          from: { command, args },
-          to: { remoteCommand, remoteArgs },
-        },
-        "Rewrote SDK spawn to use remote claude CLI",
-      );
-    }
-
-    const envParts: string[] = [];
-
-    // Forward ANTHROPIC_API_KEY if set locally and not overridden
-    if (env.ANTHROPIC_API_KEY && !remoteEnv?.ANTHROPIC_API_KEY) {
-      envParts.push(
-        `ANTHROPIC_API_KEY='${escapeShell(env.ANTHROPIC_API_KEY)}'`,
-      );
-    }
-
-    // Add any remote-specific env vars (for testing)
-    if (remoteEnv) {
-      for (const [key, value] of Object.entries(remoteEnv)) {
-        if (value !== undefined) {
-          envParts.push(`${key}='${escapeShell(value)}'`);
-        }
-      }
-    }
-
-    // Convert local path to remote path (handles Mac/Linux home directory differences)
-    const remoteCwd = cwd ? toRemotePath(cwd) : undefined;
-
-    // Build the full command
-    // Use bash -il (interactive login shell) to get user's full PATH
-    // Interactive (-i) sources .bashrc which is needed for NVM/node
-    // Login (-l) sources .bash_profile/.profile
-    // Use double quotes for cd path to allow $HOME expansion
-    const escapedArgs = remoteArgs
-      .map((arg) => `'${escapeShell(arg)}'`)
-      .join(" ");
-    const innerCmd = remoteCwd
-      ? `cd "${remoteCwd}" && ${envParts.join(" ")} ${remoteCommand} ${escapedArgs}`
-      : `${envParts.join(" ")} ${remoteCommand} ${escapedArgs}`;
-    // Wrap in interactive login shell - escape single quotes for the outer bash -il -c '...'
-    const remoteCmd = `bash -il -c '${innerCmd.replace(/'/g, "'\\''")}'`;
-
-    log.info(
-      {
-        event: "remote_spawn_start",
-        host,
-        remoteCommand,
-        remoteArgs,
-        cwd,
-        remoteCwd,
-        remoteEnvKeys: remoteEnv ? Object.keys(remoteEnv) : [],
-      },
-      `Starting remote Claude on ${host}: ${remoteCommand} (cwd: ${remoteCwd ?? "none"})`,
+  return (spawnOptions) => {
+    const { executor } = options;
+    const startedAt = Date.now();
+    let sshProcessSpawnedAt: number | null = null;
+    let firstStdoutAt: number | null = null;
+    let firstStderrAt: number | null = null;
+    const { cli, args, remoteCommand } = buildRemoteClaudeCommand(
+      executor,
+      spawnOptions,
     );
 
-    // Spawn SSH with PTY allocation (-t) so SIGHUP propagates when SSH terminates
-    // This ensures the remote Claude process is killed if SSH disconnects
-    const sshProcess = spawn(
+    getLogger().info(
+      {
+        event: "claude_remote_spawn_start",
+        startupId: options.startupId,
+        executor: executorLabel(executor),
+        cwd: spawnOptions.cwd,
+        cli,
+        argCount: args.length,
+      },
+      `Starting Claude Code through SSH on ${executorLabel(executor)}`,
+    );
+
+    const child = spawn(
       "ssh",
-      [
-        "-t", // PTY allocation for signal propagation
-        "-o",
-        "BatchMode=yes", // Don't prompt for password
-        "--", // End option parsing before host
-        host,
-        remoteCmd,
-      ],
+      buildSshArgs(executor, remoteCommand, options.connectTimeoutMs),
       {
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
+    options.onSpawn?.(child);
 
-    // Handle stderr - log it but don't mix with SDK stdout
-    sshProcess.stderr?.on("data", (data: Buffer) => {
-      const stderr = data.toString();
-      // Filter out PTY-related messages
-      if (!stderr.includes("Pseudo-terminal") && stderr.trim()) {
-        log.debug(
-          { event: "remote_stderr", host, stderr: stderr.trim() },
-          `Remote stderr: ${stderr.trim()}`,
+    const stallTimers = REMOTE_STARTUP_STALL_THRESHOLDS_MS.map(
+      (thresholdMs) => {
+        const timer = setTimeout(() => {
+          if (firstStdoutAt !== null || child.exitCode !== null) return;
+          getLogger().warn(
+            {
+              event: "claude_remote_startup_stalled",
+              startupId: options.startupId,
+              executor: executorLabel(executor),
+              cwd: spawnOptions.cwd,
+              phase:
+                sshProcessSpawnedAt === null
+                  ? "starting_ssh_process"
+                  : "awaiting_claude_stdout",
+              elapsedMs: Date.now() - startedAt,
+              thresholdMs,
+              hasStderr: firstStderrAt !== null,
+            },
+            "Remote Claude startup has not produced stdout",
+          );
+        }, thresholdMs);
+        timer.unref();
+        return timer;
+      },
+    );
+    const clearStallTimers = () => {
+      for (const timer of stallTimers) clearTimeout(timer);
+    };
+
+    child.once("spawn", () => {
+      sshProcessSpawnedAt = Date.now();
+      getLogger().info(
+        {
+          event: "claude_remote_ssh_process_spawned",
+          startupId: options.startupId,
+          executor: executorLabel(executor),
+          cwd: spawnOptions.cwd,
+          elapsedMs: sshProcessSpawnedAt - startedAt,
+        },
+        "SSH process spawned for remote Claude",
+      );
+    });
+
+    // Adding our own "data" listener would switch stdout into flowing mode and
+    // could race the SDK listener. Observe the first emitted chunk without
+    // consuming it or changing stream backpressure.
+    const stdout = child.stdout;
+    let restoreStdoutObserver = () => {};
+    if (stdout) {
+      const originalEmit = stdout.emit;
+      const observedEmit = ((
+        event: string | symbol,
+        ...eventArgs: unknown[]
+      ) => {
+        if (event === "data" && firstStdoutAt === null) {
+          firstStdoutAt = Date.now();
+          clearStallTimers();
+          stdout.emit = originalEmit;
+          const chunk = eventArgs[0];
+          const firstChunkBytes =
+            typeof chunk === "string"
+              ? Buffer.byteLength(chunk)
+              : ArrayBuffer.isView(chunk)
+                ? chunk.byteLength
+                : undefined;
+          getLogger().info(
+            {
+              event: "claude_remote_first_stdout",
+              startupId: options.startupId,
+              executor: executorLabel(executor),
+              cwd: spawnOptions.cwd,
+              elapsedMs: firstStdoutAt - startedAt,
+              firstChunkBytes,
+              hadPriorStderr: firstStderrAt !== null,
+            },
+            "Remote Claude produced first stdout",
+          );
+        }
+        return Reflect.apply(originalEmit, stdout, [event, ...eventArgs]);
+      }) as typeof stdout.emit;
+      stdout.emit = observedEmit;
+      restoreStdoutObserver = () => {
+        if (stdout.emit === observedEmit) stdout.emit = originalEmit;
+      };
+    }
+
+    const stderrDecoder = new StringDecoder("utf8");
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (firstStderrAt === null) {
+        firstStderrAt = Date.now();
+        getLogger().info(
+          {
+            event: "claude_remote_first_stderr",
+            startupId: options.startupId,
+            executor: executorLabel(executor),
+            cwd: spawnOptions.cwd,
+            elapsedMs: firstStderrAt - startedAt,
+            firstChunkBytes: chunk.byteLength,
+          },
+          "Remote Claude produced first stderr",
         );
       }
-    });
-
-    // Handle abort signal
-    const abortHandler = () => {
-      log.info(
-        { event: "remote_spawn_abort", host },
-        `Aborting remote Claude on ${host}`,
+      const stderr = stderrDecoder.write(chunk).trim();
+      if (!stderr) return;
+      getLogger().debug(
+        {
+          event: "claude_remote_stderr",
+          startupId: options.startupId,
+          executor: executorLabel(executor),
+          stderr,
+        },
+        "Remote Claude stderr",
       );
-      sshProcess.kill("SIGTERM");
-    };
-    signal.addEventListener("abort", abortHandler);
-
-    // Clean up abort listener when process exits
-    sshProcess.on("exit", () => {
-      signal.removeEventListener("abort", abortHandler);
     });
 
-    // Return SpawnedProcess interface wrapping the SSH process
-    return wrapChildProcess(sshProcess);
+    const abort = () => child.kill("SIGTERM");
+    if (spawnOptions.signal.aborted) {
+      abort();
+    } else {
+      spawnOptions.signal.addEventListener("abort", abort, { once: true });
+    }
+    child.once("error", (error) => {
+      clearStallTimers();
+      restoreStdoutObserver();
+      getLogger().error(
+        {
+          event: "claude_remote_transport_error",
+          startupId: options.startupId,
+          executor: executorLabel(executor),
+          cwd: spawnOptions.cwd,
+          elapsedMs: Date.now() - startedAt,
+          err: error,
+        },
+        "Remote Claude SSH transport failed",
+      );
+    });
+    child.once("exit", (code, signal) => {
+      clearStallTimers();
+      restoreStdoutObserver();
+      const trailingStderr = stderrDecoder.end().trim();
+      if (trailingStderr) {
+        getLogger().debug(
+          {
+            event: "claude_remote_stderr",
+            startupId: options.startupId,
+            executor: executorLabel(executor),
+            stderr: trailingStderr,
+          },
+          "Remote Claude stderr",
+        );
+      }
+      getLogger().info(
+        {
+          event: "claude_remote_exit",
+          startupId: options.startupId,
+          executor: executorLabel(executor),
+          cwd: spawnOptions.cwd,
+          code,
+          signal,
+          elapsedMs: Date.now() - startedAt,
+          firstStdoutElapsedMs:
+            firstStdoutAt === null ? undefined : firstStdoutAt - startedAt,
+          firstStderrElapsedMs:
+            firstStderrAt === null ? undefined : firstStderrAt - startedAt,
+        },
+        "Remote Claude SSH process exited",
+      );
+      spawnOptions.signal.removeEventListener("abort", abort);
+    });
+
+    return wrapChildProcess(child);
   };
-}
-
-/**
- * Wrap a ChildProcess to satisfy SpawnedProcess interface.
- */
-function wrapChildProcess(childProcess: ChildProcess): SpawnedProcess {
-  // Type-safe wrapper functions with overloads matching SDK interface
-  function onWrapper(
-    event: "exit",
-    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
-  ): void;
-  function onWrapper(event: "error", listener: (error: Error) => void): void;
-  // biome-ignore lint/suspicious/noExplicitAny: ChildProcess.on requires any[] for listener args
-  function onWrapper(event: string, listener: (...args: any[]) => void): void {
-    childProcess.on(event, listener);
-  }
-
-  function onceWrapper(
-    event: "exit",
-    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
-  ): void;
-  function onceWrapper(event: "error", listener: (error: Error) => void): void;
-  function onceWrapper(
-    event: string,
-    // biome-ignore lint/suspicious/noExplicitAny: ChildProcess.once requires any[] for listener args
-    listener: (...args: any[]) => void,
-  ): void {
-    childProcess.once(event, listener);
-  }
-
-  function offWrapper(
-    event: "exit",
-    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
-  ): void;
-  function offWrapper(event: "error", listener: (error: Error) => void): void;
-  // biome-ignore lint/suspicious/noExplicitAny: ChildProcess.off requires any[] for listener args
-  function offWrapper(event: string, listener: (...args: any[]) => void): void {
-    childProcess.off(event, listener);
-  }
-
-  return {
-    stdin: childProcess.stdin as Writable,
-    stdout: childProcess.stdout as Readable,
-    get killed() {
-      return childProcess.killed;
-    },
-    get exitCode() {
-      return childProcess.exitCode;
-    },
-    kill(signal: NodeJS.Signals): boolean {
-      return childProcess.kill(signal);
-    },
-    on: onWrapper,
-    once: onceWrapper,
-    off: offWrapper,
-  };
-}
-
-/**
- * Escape a string for use in a shell command.
- */
-function escapeShell(str: string): string {
-  // Replace single quotes with escaped version
-  return str.replace(/'/g, "'\\''");
 }

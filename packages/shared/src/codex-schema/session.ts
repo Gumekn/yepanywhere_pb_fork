@@ -23,17 +23,27 @@ import { z } from "zod";
 /**
  * Session metadata payload - first entry in session file.
  */
-export const CodexSessionMetaPayloadSchema = z.object({
-  id: z.string(),
-  timestamp: z.string(),
-  cwd: z.string(),
-  originator: z.string().optional(), // e.g. "codex_exec"
-  cli_version: z.string().optional(),
-  instructions: z.string().optional(),
-  source: z.unknown().optional(), // e.g. "exec" or a provider-defined descriptor
-  forked_from_id: z.string().optional(),
-  model_provider: z.string().optional(), // e.g. "openai"
-});
+export const CodexSessionMetaPayloadSchema = z
+  .object({
+    session_id: z.string().optional(),
+    id: z.string(),
+    forked_from_id: z.string().nullable().optional(),
+    parent_thread_id: z.string().nullable().optional(),
+    timestamp: z.string(),
+    cwd: z.string(),
+    originator: z.string().optional(), // e.g. "codex_exec"
+    cli_version: z.string().optional(),
+    instructions: z.string().optional(),
+    // Root sessions use scalar values such as "exec"/"vscode". Subagents use
+    // a structured `source.subagent.thread_spawn` payload.
+    source: z.unknown().optional(),
+    thread_source: z.string().optional(),
+    agent_nickname: z.string().nullable().optional(),
+    agent_role: z.string().nullable().optional(),
+    agent_path: z.string().nullable().optional(),
+    model_provider: z.string().optional(), // e.g. "openai"
+  })
+  .passthrough();
 
 export type CodexSessionMetaPayload = z.infer<
   typeof CodexSessionMetaPayloadSchema
@@ -80,6 +90,20 @@ export const CodexInputImageContentSchema = z
   })
   .passthrough();
 
+/**
+ * Input audio content block in user messages.
+ * Local audio is persisted as a data URL with an adjacent provider-generated
+ * label, while rollout variants may carry additional metadata.
+ */
+export const CodexInputAudioContentSchema = z
+  .object({
+    type: z.literal("input_audio"),
+    audio_url: z.string().optional(),
+    file_path: z.string().optional(),
+    mime_type: z.string().optional(),
+  })
+  .passthrough();
+
 export const CodexMessagePhaseSchema = z
   .enum(["commentary", "final_answer"])
   .nullable()
@@ -87,11 +111,22 @@ export const CodexMessagePhaseSchema = z
 
 export type CodexMessagePhase = z.infer<typeof CodexMessagePhaseSchema>;
 
+const CodexResponseItemIdentityFields = {
+  id: z.string().optional(),
+  internal_chat_message_metadata_passthrough: z
+    .object({
+      turn_id: z.string().optional(),
+    })
+    .passthrough()
+    .optional(),
+};
+
 /**
  * User or assistant message payload.
  */
 export const CodexMessagePayloadSchema = z.object({
   type: z.literal("message"),
+  ...CodexResponseItemIdentityFields,
   role: z.enum(["user", "assistant", "developer"]),
   phase: CodexMessagePhaseSchema,
   content: z.array(
@@ -99,6 +134,7 @@ export const CodexMessagePayloadSchema = z.object({
       CodexInputTextContentSchema,
       CodexOutputTextContentSchema,
       CodexInputImageContentSchema,
+      CodexInputAudioContentSchema,
     ]),
   ),
 });
@@ -118,6 +154,7 @@ export const CodexSummaryTextSchema = z.object({
  */
 export const CodexReasoningPayloadSchema = z.object({
   type: z.literal("reasoning"),
+  ...CodexResponseItemIdentityFields,
   summary: z.array(CodexSummaryTextSchema).optional(),
   content: z.unknown().nullable().optional(), // Raw content if available
   encrypted_content: z.string().optional(), // Encrypted reasoning
@@ -133,6 +170,8 @@ export const CodexFunctionCallPayloadSchema = z.object({
   name: z.string(),
   arguments: z.string(), // JSON string
   call_id: z.string(),
+  // Namespaced tools (e.g. web.run) carry a namespace; used to detect web.run.
+  namespace: z.string().nullish(),
 });
 
 export type CodexFunctionCallPayload = z.infer<
@@ -173,6 +212,7 @@ export const CodexCustomToolCallPayloadSchema = z
     call_id: z.string().optional(),
     id: z.string().optional(),
     name: z.string().optional(),
+    namespace: z.string().optional(),
     arguments: z.string().optional(),
     input: z.unknown().optional(),
   })
@@ -372,6 +412,8 @@ export const CodexTokenUsageInfoSchema = z.object({
  */
 export const CodexUserMessageEventSchema = z.object({
   type: z.literal("user_message"),
+  /** Echo of turn/start.clientUserMessageId / turn/steer.clientUserMessageId. */
+  client_id: z.string().nullable().optional(),
   message: z.string(),
   images: z.array(z.unknown()).optional(),
 });
@@ -407,6 +449,99 @@ export const CodexTokenCountEventSchema = z.object({
 export const CodexContextCompactedEventSchema = z.object({
   type: z.literal("context_compacted"),
 });
+
+/**
+ * Structured file change emitted by Codex for apply_patch lifecycle events.
+ * Mirrors codex_protocol::protocol::FileChange.
+ */
+export const CodexFileChangeSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("add"),
+      content: z.string(),
+    })
+    .passthrough(),
+  z
+    .object({
+      type: z.literal("delete"),
+      content: z.string(),
+    })
+    .passthrough(),
+  z
+    .object({
+      type: z.literal("update"),
+      unified_diff: z.string(),
+      move_path: z.string().nullable().optional(),
+    })
+    .passthrough(),
+]);
+
+export type CodexFileChange = z.infer<typeof CodexFileChangeSchema>;
+
+export const CodexPatchChangesSchema = z.record(
+  z.string(),
+  CodexFileChangeSchema,
+);
+
+export const CodexPatchApplyStatusSchema = z.enum([
+  "completed",
+  "failed",
+  "declined",
+]);
+
+export type CodexPatchApplyStatus = z.infer<typeof CodexPatchApplyStatusSchema>;
+
+/** Patch application started. Usually streamed, but accepted in JSONL too. */
+export const CodexPatchApplyBeginEventSchema = z
+  .object({
+    type: z.literal("patch_apply_begin"),
+    call_id: z.string(),
+    turn_id: z.string().optional(),
+    auto_approved: z.boolean().optional(),
+    changes: CodexPatchChangesSchema,
+  })
+  .passthrough();
+
+export type CodexPatchApplyBeginEvent = z.infer<
+  typeof CodexPatchApplyBeginEventSchema
+>;
+
+/** Latest structured patch while apply_patch arguments are still streaming. */
+export const CodexPatchApplyUpdatedEventSchema = z
+  .object({
+    type: z.literal("patch_apply_updated"),
+    call_id: z.string(),
+    changes: CodexPatchChangesSchema,
+  })
+  .passthrough();
+
+export type CodexPatchApplyUpdatedEvent = z.infer<
+  typeof CodexPatchApplyUpdatedEventSchema
+>;
+
+/**
+ * Completed patch application.
+ *
+ * Yep keeps completion fields optional at the ingestion boundary so an older
+ * or partially written rollout remains readable. Normalization prefers
+ * `status`, then falls back to `success`.
+ */
+export const CodexPatchApplyEndEventSchema = z
+  .object({
+    type: z.literal("patch_apply_end"),
+    call_id: z.string(),
+    turn_id: z.string().optional(),
+    stdout: z.string().optional(),
+    stderr: z.string().optional(),
+    success: z.boolean().optional(),
+    changes: CodexPatchChangesSchema.optional(),
+    status: CodexPatchApplyStatusSchema.optional(),
+  })
+  .passthrough();
+
+export type CodexPatchApplyEndEvent = z.infer<
+  typeof CodexPatchApplyEndEventSchema
+>;
 
 /**
  * Generic item completion event.
@@ -471,11 +606,15 @@ export const CodexTaskStartedEventSchema = z.object({
 /**
  * Task complete event - emitted when an agent turn finishes.
  */
-export const CodexTaskCompleteEventSchema = z.object({
-  type: z.literal("task_complete"),
-  turn_id: z.string(),
-  last_agent_message: z.string().nullable(),
-});
+export const CodexTaskCompleteEventSchema = z
+  .object({
+    type: z.literal("task_complete"),
+    turn_id: z.string(),
+    last_agent_message: z.string().nullable(),
+    /** Present when the turn completed unsuccessfully. */
+    error: z.unknown().optional(),
+  })
+  .passthrough();
 
 /**
  * Union of event message types.
@@ -486,6 +625,9 @@ export const CodexEventMsgPayloadSchema = z.discriminatedUnion("type", [
   CodexAgentReasoningEventSchema,
   CodexTokenCountEventSchema,
   CodexContextCompactedEventSchema,
+  CodexPatchApplyBeginEventSchema,
+  CodexPatchApplyUpdatedEventSchema,
+  CodexPatchApplyEndEventSchema,
   CodexItemCompletedEventSchema,
   CodexImageGenerationEndEventSchema,
   CodexTurnAbortedEventSchema,

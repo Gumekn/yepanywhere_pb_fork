@@ -8,11 +8,6 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
-import {
-  type GitPullMode,
-  cleanEnv,
-  startGitPullAndDeploy,
-} from "./git-pull-deploy.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,17 +16,18 @@ const __dirname = path.dirname(__filename);
 
 const MAX_LOG_BYTES = 96 * 1024;
 const MAX_JOBS = 20;
+let deploymentStartInFlight = false;
 
 export type DeploymentActionId =
   | "full"
   | "server"
+  | "server-dev"
   | "server-restart"
   | "services-restart"
   | "server-build"
   | "apk"
   | "apk-build"
-  | "apk-install-existing"
-  | "git-pull-update";
+  | "apk-install-existing";
 
 export type DeploymentJobStatus = "running" | "succeeded" | "failed";
 
@@ -76,19 +72,18 @@ export interface DeploymentJob {
   exitCode?: number | null;
   signal?: string | null;
   log?: string;
-  errorReason?: string;
 }
 
 interface DeploymentJobRecord extends Omit<DeploymentJob, "log"> {
   logPath: string;
+  resultPath?: string;
 }
 
-export interface GitVersionInfo {
-  commitHash: string;
-  commitHashFull: string;
-  commitDate: string;
-  branch: string;
-  version: string;
+interface DeploymentJobResult {
+  finishedAt: string;
+  exitCode: number | null;
+  signal: string | null;
+  error?: string;
 }
 
 export interface DeploymentStatusResponse {
@@ -113,11 +108,6 @@ export interface DeploymentStatusResponse {
     artifacts: DeploymentApkInfo[];
   };
   currentJob: DeploymentJob | null;
-  localGitVersion?: GitVersionInfo | null;
-  githubVersion?: GitVersionInfo | null;
-  stableVersion?: GitVersionInfo | null;
-  hasLocalUpdate?: boolean;
-  hasGithubUpdate?: boolean;
 }
 
 export interface StartDeploymentRequest {
@@ -126,13 +116,13 @@ export interface StartDeploymentRequest {
   install?: boolean;
   deviceId?: string;
   skipChecks?: boolean;
+  allowSessionInterrupt?: boolean;
   restartTargets?: DeploymentRestartTargets;
 }
 
 export interface DeploymentRestartTargets {
   server?: boolean;
   codexBridge?: boolean;
-  claudeBridge?: boolean;
 }
 
 export interface DeployRoutesOptions {
@@ -142,15 +132,6 @@ export interface DeployRoutesOptions {
 
 const DEPLOYMENT_ACTIONS: DeploymentAction[] = [
   {
-    id: "git-pull-update",
-    args: ["--git-pull", "--server-only"],
-    requiresDevice: false,
-    supportsBuildType: false,
-    supportsInstall: false,
-    supportsSkipChecks: false,
-    supportsRestartTargets: true,
-  },
-  {
     id: "server",
     args: ["--server-only"],
     requiresDevice: false,
@@ -158,6 +139,14 @@ const DEPLOYMENT_ACTIONS: DeploymentAction[] = [
     supportsInstall: false,
     supportsSkipChecks: true,
     supportsRestartTargets: true,
+  },
+  {
+    id: "server-dev",
+    args: ["--dev-server"],
+    requiresDevice: false,
+    supportsBuildType: false,
+    supportsInstall: false,
+    supportsSkipChecks: false,
   },
   {
     id: "server-restart",
@@ -240,16 +229,6 @@ function getCandidateRepoRoots(explicit?: string): string[] {
   ]);
 }
 
-/**
- * The deploy entrypoint differs per platform:
- *   - macOS / Linux: the bash script `scripts/deploy.sh`
- *   - Windows: the PowerShell script `scripts/deploy.ps1`
- * Both expose the same CLI flags so the API contract is unchanged.
- */
-function deployScriptName(): string {
-  return process.platform === "win32" ? "deploy.ps1" : "deploy.sh";
-}
-
 export function getDeploymentAvailability(options?: DeployRoutesOptions): {
   available: boolean;
   reason?: string;
@@ -257,26 +236,23 @@ export function getDeploymentAvailability(options?: DeployRoutesOptions): {
   scriptPath?: string;
 } {
   for (const repoRoot of getCandidateRepoRoots(options?.repoRoot)) {
-    if (!repoRoot) continue;
-    const scriptPath = path.join(repoRoot, "scripts", deployScriptName());
-    const gitDir = path.join(repoRoot, ".git");
-    // Require both the deploy script and a .git directory so deployment is only
-    // advertised when the server runs inside an actual git checkout — not a
-    // stray scripts/ folder copied elsewhere (e.g. an out-of-repo npm install,
-    // which cannot git pull). Works on Windows (.git may be a dir or file) and
-    // macOS/Linux alike.
-    if (fs.existsSync(scriptPath) && fs.existsSync(gitDir)) {
+    const scriptPath = path.join(repoRoot, "scripts", "deploy.sh");
+    try {
+      fs.accessSync(scriptPath, fs.constants.X_OK);
       return {
         available: true,
         repoRoot,
         scriptPath,
       };
+    } catch {
+      // Try the next candidate root.
     }
   }
 
   return {
     available: false,
-    reason: `scripts/${deployScriptName()} was not found inside a git repository. Run the server from the repository root, or set YEP_DEPLOY_REPO_ROOT to the repository root to enable remote deploy actions.`,
+    reason:
+      "scripts/deploy.sh was not found. Set YEP_DEPLOY_REPO_ROOT to the repository root to enable remote deploy actions.",
   };
 }
 
@@ -313,18 +289,11 @@ function parseRestartTargets(value: unknown): DeploymentRestartTargets {
   if ("codexBridge" in input) {
     targets.codexBridge = input.codexBridge === true;
   }
-  if ("claudeBridge" in input) {
-    targets.claudeBridge = input.claudeBridge === true;
-  }
   return targets;
 }
 
 function hasRestartTargets(targets: DeploymentRestartTargets): boolean {
-  return (
-    targets.server === true ||
-    targets.codexBridge === true ||
-    targets.claudeBridge === true
-  );
+  return targets.server === true || targets.codexBridge === true;
 }
 
 function buildServicesRestartArgs(targets: DeploymentRestartTargets): string[] {
@@ -341,9 +310,6 @@ function buildServicesRestartArgs(targets: DeploymentRestartTargets): string[] {
   if (targets.codexBridge) {
     args.push("--restart-codex-bridge");
   }
-  if (targets.claudeBridge) {
-    args.push("--restart-claude-bridge");
-  }
   return args;
 }
 
@@ -352,6 +318,11 @@ function appendOptionalRestartTargetArgs(
   args: string[],
   targets: DeploymentRestartTargets,
 ): void {
+  if (targets.server === false && action.supportsRestartTargets) {
+    throw new Error(
+      "Use the services-restart action to restart sidecars without the web/API server.",
+    );
+  }
   if (!hasRestartTargets(targets)) return;
   if (!action.supportsRestartTargets) {
     throw new Error(
@@ -359,16 +330,8 @@ function appendOptionalRestartTargetArgs(
     );
   }
 
-  if (targets.server === false) {
-    throw new Error(
-      "Use the services-restart action to restart sidecars without the web/API server.",
-    );
-  }
   if (targets.codexBridge) {
     args.push("--restart-codex-bridge");
-  }
-  if (targets.claudeBridge) {
-    args.push("--restart-claude-bridge");
   }
 }
 
@@ -386,11 +349,21 @@ export function buildDeployArgs(input: StartDeploymentRequest): {
   }
 
   const args = [...action.args];
-  const buildType = input.buildType === "debug" ? "debug" : "release";
+  const parsedBuildType = parseApkBuildType(input.buildType);
+  const buildType = parsedBuildType ?? "release";
   const deviceId = validateDeviceId(input.deviceId);
 
   if (action.supportsSkipChecks && input.skipChecks) {
     args.push("--skip-checks");
+  }
+
+  if (input.allowSessionInterrupt) {
+    if (action.id !== "server-dev") {
+      throw new Error(
+        "allowSessionInterrupt is only supported for the server-dev action.",
+      );
+    }
+    args.push("--allow-yep-session-interrupt");
   }
 
   if (action.supportsBuildType || action.id === "apk-install-existing") {
@@ -402,6 +375,9 @@ export function buildDeployArgs(input: StartDeploymentRequest): {
   }
 
   if (deviceId) {
+    if (!action.supportsInstall && action.id !== "apk-install-existing") {
+      throw new Error("deviceId is not supported for this action.");
+    }
     args.push("--device", deviceId);
   }
 
@@ -546,9 +522,15 @@ function getLogsDir(dataDir?: string): string {
 }
 
 async function ensureDeployDirs(dataDir?: string): Promise<void> {
-  await Promise.all([
-    fsp.mkdir(getJobsDir(dataDir), { recursive: true }),
-    fsp.mkdir(getLogsDir(dataDir), { recursive: true }),
+  const deployDir = getDeployDir(dataDir);
+  const jobsDir = getJobsDir(dataDir);
+  const logsDir = getLogsDir(dataDir);
+  await fsp.mkdir(jobsDir, { recursive: true, mode: 0o700 });
+  await fsp.mkdir(logsDir, { recursive: true, mode: 0o700 });
+  await Promise.allSettled([
+    fsp.chmod(deployDir, 0o700),
+    fsp.chmod(jobsDir, 0o700),
+    fsp.chmod(logsDir, 0o700),
   ]);
 }
 
@@ -560,6 +542,7 @@ async function readJobRecord(
   dataDir: string | undefined,
   id: string,
 ): Promise<DeploymentJobRecord | null> {
+  if (!/^[A-Za-z0-9_-]{1,80}$/u.test(id)) return null;
   try {
     const raw = await fsp.readFile(getJobPath(dataDir, id), "utf-8");
     return JSON.parse(raw) as DeploymentJobRecord;
@@ -573,10 +556,14 @@ async function writeJobRecord(
   record: DeploymentJobRecord,
 ): Promise<void> {
   await ensureDeployDirs(dataDir);
-  await fsp.writeFile(
-    getJobPath(dataDir, record.id),
-    JSON.stringify(record, null, 2),
-  );
+  const jobPath = getJobPath(dataDir, record.id);
+  const tempPath = `${jobPath}.tmp-${process.pid}-${randomUUID()}`;
+  await fsp.writeFile(tempPath, `${JSON.stringify(record, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  await fsp.chmod(tempPath, 0o600).catch(() => undefined);
+  await fsp.rename(tempPath, jobPath);
+  await fsp.chmod(jobPath, 0o600).catch(() => undefined);
 }
 
 function isProcessRunning(pid: number | undefined): boolean {
@@ -607,14 +594,45 @@ async function readLogTail(logPath: string): Promise<string> {
   }
 }
 
+async function readJobResult(
+  resultPath: string | undefined,
+): Promise<DeploymentJobResult | null> {
+  if (!resultPath) return null;
+  try {
+    const raw = await fsp.readFile(resultPath, "utf-8");
+    const result = JSON.parse(raw) as Partial<DeploymentJobResult>;
+    if (
+      typeof result.finishedAt !== "string" ||
+      (typeof result.exitCode !== "number" && result.exitCode !== null) ||
+      (typeof result.signal !== "string" && result.signal !== null)
+    ) {
+      return null;
+    }
+    return result as DeploymentJobResult;
+  } catch {
+    return null;
+  }
+}
+
 async function hydrateJob(
   dataDir: string | undefined,
   record: DeploymentJobRecord,
 ): Promise<DeploymentJob> {
   let current = record;
   const log = await readLogTail(record.logPath);
+  const result = await readJobResult(record.resultPath);
 
-  if (record.status === "running" && !isProcessRunning(record.pid)) {
+  if (record.status === "running" && result) {
+    current = {
+      ...record,
+      status: result.exitCode === 0 ? "succeeded" : "failed",
+      updatedAt: result.finishedAt,
+      finishedAt: result.finishedAt,
+      exitCode: result.exitCode,
+      signal: result.signal,
+    };
+    await writeJobRecord(dataDir, current);
+  } else if (record.status === "running" && !isProcessRunning(record.pid)) {
     const now = new Date().toISOString();
     current = {
       ...record,
@@ -627,7 +645,7 @@ async function hydrateJob(
     await writeJobRecord(dataDir, current);
   }
 
-  const { logPath: _logPath, ...job } = current;
+  const { logPath: _logPath, resultPath: _resultPath, ...job } = current;
   return { ...job, log };
 }
 
@@ -667,6 +685,7 @@ async function pruneOldJobs(dataDir: string | undefined): Promise<void> {
     await Promise.allSettled([
       fsp.unlink(getJobPath(dataDir, stale.id)),
       fsp.unlink(stale.logPath),
+      ...(stale.resultPath ? [fsp.unlink(stale.resultPath)] : []),
     ]);
   }
 }
@@ -704,132 +723,6 @@ async function readStagedBuildInfo(
       version: info.version,
       buildId: info.buildId,
       builtAt: info.builtAt,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function getGitVersionInfo(
-  repoRoot: string,
-  ref: string,
-): Promise<GitVersionInfo | null> {
-  try {
-    // Get commit hash
-    const { stdout: commitHashFull } = await execFileAsync(
-      "git",
-      ["rev-parse", ref],
-      { cwd: repoRoot, encoding: "utf-8" },
-    );
-    const fullHash = commitHashFull.trim();
-
-    // Get commit date
-    const { stdout: commitDate } = await execFileAsync(
-      "git",
-      ["log", "-1", "--format=%ci", ref],
-      { cwd: repoRoot, encoding: "utf-8" },
-    );
-
-    // Get branch name (only for HEAD)
-    let branch = "unknown";
-    if (ref === "HEAD") {
-      try {
-        const { stdout: branchOutput } = await execFileAsync(
-          "git",
-          ["rev-parse", "--abbrev-ref", "HEAD"],
-          { cwd: repoRoot, encoding: "utf-8" },
-        );
-        branch = branchOutput.trim();
-      } catch {
-        // Branch name is optional
-      }
-    } else {
-      branch = ref;
-    }
-
-    // Get version from package.json
-    const version = await readPackageVersion(repoRoot);
-
-    return {
-      commitHash: fullHash.slice(0, 8),
-      commitHashFull: fullHash,
-      commitDate: commitDate.trim(),
-      branch,
-      version: version ?? "unknown",
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function getLocalGitVersion(
-  repoRoot?: string,
-): Promise<GitVersionInfo | null> {
-  if (!repoRoot) return null;
-  return getGitVersionInfo(repoRoot, "HEAD");
-}
-
-async function getGithubVersion(
-  repoRoot?: string,
-  fresh = false,
-): Promise<GitVersionInfo | null> {
-  if (!repoRoot) return null;
-  if (fresh) {
-    // Best-effort refresh of the local remote-tracking ref so that an
-    // explicit "Check Updates" reflects a push made from another machine.
-    // Any failure (offline, auth, no remote) falls back to the cached
-    // origin/main so the call never hard-fails.
-    await execFileAsync("git", ["fetch", "origin"], {
-      cwd: repoRoot,
-      encoding: "utf-8",
-      timeout: 15000,
-    }).catch(() => undefined);
-  }
-  try {
-    // Reads the (now possibly updated) local git cache for origin/main
-    return getGitVersionInfo(repoRoot, "origin/main");
-  } catch {
-    return null;
-  }
-}
-
-async function getStableVersion(
-  repoRoot?: string,
-): Promise<GitVersionInfo | null> {
-  if (!repoRoot) return null;
-  try {
-    const raw = await fsp.readFile(
-      path.join(repoRoot, "dist", "npm-package", "build-info.json"),
-      "utf-8",
-    );
-    const info = JSON.parse(raw) as {
-      version?: string;
-      gitCommit?: string;
-      builtAt?: string;
-      gitBranch?: string;
-    };
-
-    if (!info.gitCommit || !info.builtAt) return null;
-
-    // Get commit date from git
-    let commitDate = info.builtAt;
-    try {
-      const { stdout } = await execFileAsync(
-        "git",
-        ["log", "-1", "--format=%ci", info.gitCommit],
-        { cwd: repoRoot, encoding: "utf-8" },
-      );
-      commitDate = stdout.trim();
-    } catch {
-      // Use builtAt as fallback
-    }
-
-    return {
-      commitHash: info.gitCommit.slice(0, 8),
-      commitHashFull: info.gitCommit,
-      commitDate,
-      branch: info.gitBranch ?? "unknown",
-      version: info.version ?? "unknown",
     };
   } catch {
     return null;
@@ -889,7 +782,6 @@ async function getAdbStatus(): Promise<DeploymentStatusResponse["adb"]> {
 
 async function buildStatus(
   options?: DeployRoutesOptions,
-  fresh = false,
 ): Promise<DeploymentStatusResponse> {
   const availability = getDeploymentAvailability(options);
   const [adb, packageVersion, stagedBuild] = await Promise.all([
@@ -906,31 +798,6 @@ async function buildStatus(
     successfulApkBuildTimes,
   );
 
-  // Get Git version information
-  const [localGitVersion, githubVersion, stableVersion] = await Promise.all([
-    getLocalGitVersion(availability.repoRoot),
-    getGithubVersion(availability.repoRoot, fresh),
-    getStableVersion(availability.repoRoot),
-  ]);
-
-  // Check if updates are available.
-  // Compare commit hashes (not dates) against the deployed build baseline
-  // (stableVersion = dist/npm-package/build-info.json). Date comparison was
-  // fragile (rebases/amended commits, clock skew) and could never reflect a
-  // push from another machine because origin/main was never fetched.
-  let hasLocalUpdate = false;
-  let hasGithubUpdate = false;
-
-  if (stableVersion && localGitVersion) {
-    hasLocalUpdate =
-      localGitVersion.commitHashFull !== stableVersion.commitHashFull;
-  }
-
-  if (stableVersion && githubVersion) {
-    hasGithubUpdate =
-      githubVersion.commitHashFull !== stableVersion.commitHashFull;
-  }
-
   return {
     ...availability,
     packageVersion,
@@ -942,11 +809,6 @@ async function buildStatus(
       artifacts: apkArtifacts.map(toPublicApkInfo),
     },
     currentJob,
-    localGitVersion,
-    githubVersion,
-    stableVersion,
-    hasLocalUpdate,
-    hasGithubUpdate,
   };
 }
 
@@ -954,174 +816,125 @@ export async function startDeploymentJob(
   options: DeployRoutesOptions | undefined,
   input: StartDeploymentRequest,
 ): Promise<DeploymentJob> {
-  const availability = getDeploymentAvailability(options);
-  if (
-    !availability.available ||
-    !availability.repoRoot ||
-    !availability.scriptPath
-  ) {
-    throw new Error(availability.reason ?? "Remote deploy is not available.");
-  }
-
-  const currentJob = await findCurrentJob(options?.dataDir);
-  if (currentJob) {
-    const error = new Error("A deploy job is already running.") as Error & {
+  if (deploymentStartInFlight) {
+    const error = new Error("A deploy job is already starting.") as Error & {
       status?: number;
     };
     error.status = 409;
     throw error;
   }
+  deploymentStartInFlight = true;
 
-  // In-process update actions. These run entirely inside the server (Node)
-  // process via `startGitPullAndDeploy` and never spawn scripts/deploy.{sh,ps1}
-  // or PowerShell — that path was unreliable on Windows (the spawned
-  // powershell.exe would exit 0 within ~0.6s without actually running the
-  // 450-line deploy.ps1, marking the job as "succeeded" while
-  // dist/npm-package/build-info.json stayed at the old commit). Routing
-  // "server" (update to local) and "server-restart" through the same
-  // in-process runner keeps Windows / macOS behaviour identical and
-  // eliminates the false-success bug.
-  if (input.action === "git-pull-update") {
-    return await startGitPullAndDeploy(
-      options,
-      availability.repoRoot,
-      "github",
-      input.action,
-    );
-  }
-  if (input.action === "server" || input.action === "server-restart") {
-    const mode: GitPullMode = "local";
-    // "server" and "server-restart" both go through the local-build path:
-    //  - server: full build + restart, intended for "update to local latest".
-    //  - server-restart: build is redundant but idempotent; avoids depending
-    //    on the legacy PowerShell spawn for the UI's "restart" button.
-    return await startGitPullAndDeploy(
-      options,
-      availability.repoRoot,
-      mode,
-      input.action,
-    );
-  }
-
-  const { action, args } = buildDeployArgs(input);
-
-  // 开发模式（pnpm dev / NODE_ENV !== "production"）：生产重启依赖 launchd / 8022，
-  // 在 dev 下既无意义又会在 launchd 用户域损坏时令更新失败。其它 dev 模式下的
-  // action（server-build / full / apk*）仍走 shell 脚本路径，但 dev 下要把
-  // build-only 路径与"什么也不做"对齐。
-  const isProduction = process.env.NODE_ENV === "production";
-  if (!isProduction) {
-    if (action.id === "server-restart") {
-      // 已在上方被 in-process 路径拦截；这里只是兜底，实际不可达。
-      throw new Error(
-        "重启生产服务仅在生产模式可用（当前为开发模式 pnpm dev）。" +
-          "开发模式由 tsx watch 自动重载，无需手动重启生产服务。",
-      );
+  try {
+    const availability = getDeploymentAvailability(options);
+    if (
+      !availability.available ||
+      !availability.repoRoot ||
+      !availability.scriptPath
+    ) {
+      throw new Error(availability.reason ?? "Remote deploy is not available.");
     }
+
+    const currentJob = await findCurrentJob(options?.dataDir);
+    if (currentJob) {
+      const error = new Error("A deploy job is already running.") as Error & {
+        status?: number;
+      };
+      error.status = 409;
+      throw error;
+    }
+
+    const { action, args } = buildDeployArgs(input);
+    await ensureDeployDirs(options?.dataDir);
+
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const logPath = path.join(getLogsDir(options?.dataDir), `${id}.log`);
+    const resultPath = path.join(getJobsDir(options?.dataDir), `${id}.result`);
+    const runnerPath = path.join(
+      availability.repoRoot,
+      "scripts",
+      "run-deploy-job.mjs",
+    );
+    if (!fs.existsSync(runnerPath)) {
+      throw new Error(`Deploy job runner was not found: ${runnerPath}`);
+    }
+    const command = ["scripts/deploy.sh", ...args]
+      .map(quoteCommandArg)
+      .join(" ");
+    await fsp.writeFile(
+      logPath,
+      `$ ${command}\nstartedAt=${now}\nrepoRoot=${availability.repoRoot}\n\n`,
+      { mode: 0o600 },
+    );
+    await fsp.chmod(logPath, 0o600).catch(() => undefined);
+
+    const record: DeploymentJobRecord = {
+      id,
+      action: action.id,
+      args,
+      command,
+      status: "running",
+      startedAt: now,
+      updatedAt: now,
+      logPath,
+      resultPath,
+    };
+    await writeJobRecord(options?.dataDir, record);
+
+    const logFd = fs.openSync(logPath, "a");
+    const child = spawn(
+      process.execPath,
+      [runnerPath, resultPath, availability.scriptPath, ...args],
+      {
+        cwd: availability.repoRoot,
+        detached: true,
+        env: {
+          ...process.env,
+          YEP_DEPLOY_ENV_FILE_PRECEDENCE: "true",
+        },
+        stdio: ["ignore", logFd, logFd],
+      },
+    );
+    fs.closeSync(logFd);
+
+    const spawnedRecord: DeploymentJobRecord = {
+      ...record,
+      pid: child.pid,
+      updatedAt: new Date().toISOString(),
+    };
+    child.once("error", (err) => {
+      const finishedAt = new Date().toISOString();
+      fs.appendFileSync(
+        logPath,
+        `\n[deploy-api] spawn error: ${err.message}\n`,
+      );
+      void writeJobRecord(options?.dataDir, {
+        ...spawnedRecord,
+        status: "failed",
+        exitCode: null,
+        signal: null,
+        updatedAt: finishedAt,
+        finishedAt,
+      });
+    });
+
+    await writeJobRecord(options?.dataDir, spawnedRecord);
+    await pruneOldJobs(options?.dataDir);
+
+    child.unref();
+
+    return hydrateJob(options?.dataDir, spawnedRecord);
+  } finally {
+    deploymentStartInFlight = false;
   }
-
-  await ensureDeployDirs(options?.dataDir);
-
-  const id = randomUUID();
-  const now = new Date().toISOString();
-  const logPath = path.join(getLogsDir(options?.dataDir), `${id}.log`);
-  const command = [
-    process.platform === "win32"
-      ? `powershell -File scripts/${deployScriptName()}`
-      : `scripts/${deployScriptName()}`,
-    ...args,
-  ]
-    .map(quoteCommandArg)
-    .join(" ");
-  await fsp.writeFile(
-    logPath,
-    `$ ${command}\nstartedAt=${now}\nrepoRoot=${availability.repoRoot}\n\n`,
-  );
-
-  const record: DeploymentJobRecord = {
-    id,
-    action: action.id,
-    args,
-    command,
-    status: "running",
-    startedAt: now,
-    updatedAt: now,
-    logPath,
-  };
-  await writeJobRecord(options?.dataDir, record);
-
-  const logFd = fs.openSync(logPath, "a");
-
-  // On Windows the deploy entrypoint is a PowerShell script, so we must invoke
-  // powershell explicitly. On POSIX we exec the script directly.
-  const spawnCommand =
-    process.platform === "win32" ? "powershell" : availability.scriptPath;
-  const spawnArgs =
-    process.platform === "win32"
-      ? [
-          "-NoProfile",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-File",
-          availability.scriptPath,
-          ...args,
-        ]
-      : args;
-
-  const child = spawn(spawnCommand, spawnArgs, {
-    cwd: availability.repoRoot,
-    detached: true,
-    // 剥离 WorkBuddy 安全删除守卫，避免 vite build 在 emptyDir 时卡在 trash 确认。
-    env: cleanEnv(),
-    stdio: ["ignore", logFd, logFd],
-  });
-  fs.closeSync(logFd);
-
-  const spawnedRecord: DeploymentJobRecord = {
-    ...record,
-    pid: child.pid,
-    updatedAt: new Date().toISOString(),
-  };
-  await writeJobRecord(options?.dataDir, spawnedRecord);
-  await pruneOldJobs(options?.dataDir);
-
-  child.on("exit", (exitCode, signal) => {
-    const finishedAt = new Date().toISOString();
-    void writeJobRecord(options?.dataDir, {
-      ...spawnedRecord,
-      status: exitCode === 0 ? "succeeded" : "failed",
-      exitCode,
-      signal,
-      updatedAt: finishedAt,
-      finishedAt,
-    });
-  });
-
-  child.on("error", (err) => {
-    const finishedAt = new Date().toISOString();
-    fs.appendFileSync(logPath, `\n[deploy-api] spawn error: ${err.message}\n`);
-    void writeJobRecord(options?.dataDir, {
-      ...spawnedRecord,
-      status: "failed",
-      exitCode: null,
-      signal: null,
-      updatedAt: finishedAt,
-      finishedAt,
-    });
-  });
-
-  child.unref();
-
-  return hydrateJob(options?.dataDir, spawnedRecord);
 }
 
 export function createDeployRoutes(options?: DeployRoutesOptions): Hono {
   const routes = new Hono();
 
   routes.get("/status", async (c) => {
-    const fresh =
-      c.req.query("fresh") === "1" || c.req.query("fresh") === "true";
-    return c.json(await buildStatus(options, fresh));
+    return c.json(await buildStatus(options));
   });
 
   routes.get("/jobs/:id", async (c) => {

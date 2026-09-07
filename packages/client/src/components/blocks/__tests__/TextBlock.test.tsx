@@ -5,12 +5,16 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../../../api/client";
 import { SessionMetadataProvider } from "../../../contexts/SessionMetadataContext";
 import { I18nProvider } from "../../../i18n";
-import { UI_KEYS } from "../../../lib/storageKeys";
 import { TextBlock } from "../TextBlock";
+
+const originalClipboardDescriptor = Object.getOwnPropertyDescriptor(
+  navigator,
+  "clipboard",
+);
 
 vi.mock("../../../api/client", () => ({
   api: {
@@ -35,39 +39,8 @@ function renderWithSessionMetadata(ui: React.ReactNode) {
   );
 }
 
-function selectTextInElement(element: HTMLElement, selectedText: string): void {
-  const textNode = Array.from(element.childNodes).find(
-    (node) => node.nodeType === Node.TEXT_NODE,
-  );
-  if (!textNode) throw new Error("No text node found");
-
-  const text = textNode.textContent ?? "";
-  const start = text.indexOf(selectedText);
-  if (start === -1) throw new Error(`Text not found: ${selectedText}`);
-
-  const range = document.createRange();
-  range.setStart(textNode, start);
-  range.setEnd(textNode, start + selectedText.length);
-
-  const selection = window.getSelection();
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-}
-
 describe("TextBlock", () => {
-  let writeText: ReturnType<typeof vi.fn>;
-
-  beforeEach(() => {
-    localStorage.setItem(UI_KEYS.locale, "en");
-    writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
-  });
-
   afterEach(() => {
-    window.getSelection()?.removeAllRanges();
     cleanup();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
@@ -188,14 +161,139 @@ describe("TextBlock", () => {
     expect(paragraph?.textContent).toBe(text);
   });
 
-  it("copies active text selection instead of the whole block", async () => {
+  it("highlights Codex commentary as a visible progress update", () => {
+    const { container } = renderWithSessionMetadata(
+      <TextBlock
+        text="I am checking the official integration status."
+        phase="commentary"
+      />,
+    );
+
+    expect(screen.getByText("Progress")).toBeDefined();
+    expect(container.querySelector(".text-block-commentary")).not.toBeNull();
+    expect(
+      screen.getByText("I am checking the official integration status."),
+    ).toBeDefined();
+  });
+
+  it("does not render a block-level copy button", () => {
     renderWithSessionMetadata(<TextBlock text="alpha beta gamma" />);
 
-    selectTextInElement(screen.getByText("alpha beta gamma"), "beta");
-    fireEvent.click(screen.getByRole("button", { name: "Copy markdown" }));
+    expect(screen.queryByRole("button", { name: "Copy markdown" })).toBeNull();
+  });
+});
+
+describe("TextBlock server-rendered markdown", () => {
+  afterEach(() => {
+    cleanup();
+    if (originalClipboardDescriptor) {
+      Object.defineProperty(
+        navigator,
+        "clipboard",
+        originalClipboardDescriptor,
+      );
+    } else {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  it("copies the exact plain text from a fenced code block", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    renderWithSessionMetadata(
+      <TextBlock
+        text={"```text\nfirst line\nsecond <tag>\n```"}
+        augmentHtml={
+          '<pre class="shiki"><code><span class="line">first line</span>\n<span class="line">second &lt;tag&gt;</span></code></pre>'
+        }
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Copy code block" }),
+    );
 
     await waitFor(() => {
-      expect(writeText).toHaveBeenCalledWith("beta");
+      expect(writeText).toHaveBeenCalledWith("first line\nsecond <tag>");
     });
+    expect(screen.getByRole("button", { name: "Copied!" })).toBeTruthy();
+  });
+
+  it("keeps the rendered nodes when the same HTML is applied again", () => {
+    const html = "<p>stable paragraph</p>";
+    const { rerender } = renderWithSessionMetadata(
+      <TextBlock text="stable paragraph" augmentHtml={html} />,
+    );
+    const paragraph = screen.getByText("stable paragraph");
+
+    // React re-applies this prop on some commits (a load-older prepend applies
+    // the identical string twice); recreating the nodes would drop any live
+    // text selection inside them.
+    rerender(
+      <I18nProvider>
+        <SessionMetadataProvider
+          projectId="proj-1"
+          projectPath="/Users/yueyuan/project"
+          sessionId="session-1"
+        >
+          <TextBlock text="stable paragraph" augmentHtml={`${html}`} />
+        </SessionMetadataProvider>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText("stable paragraph")).toBe(paragraph);
+  });
+
+  it("replaces the rendered nodes when the HTML actually changes", () => {
+    const { rerender } = renderWithSessionMetadata(
+      <TextBlock text="first" augmentHtml="<p>first</p>" />,
+    );
+    expect(screen.getByText("first")).toBeTruthy();
+
+    rerender(
+      <I18nProvider>
+        <SessionMetadataProvider
+          projectId="proj-1"
+          projectPath="/Users/yueyuan/project"
+          sessionId="session-1"
+        >
+          <TextBlock text="second" augmentHtml="<p>second</p>" />
+        </SessionMetadataProvider>
+      </I18nProvider>,
+    );
+    expect(screen.getByText("second")).toBeTruthy();
+    expect(screen.queryByText("first")).toBeNull();
+  });
+
+  it("adds a copy button when a streamed code block replaces other HTML", async () => {
+    const { rerender } = renderWithSessionMetadata(
+      <TextBlock text="first" augmentHtml="<p>first</p>" />,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Copy code block" }),
+    ).toBeNull();
+
+    rerender(
+      <I18nProvider>
+        <SessionMetadataProvider
+          projectId="proj-1"
+          projectPath="/Users/yueyuan/project"
+          sessionId="session-1"
+        >
+          <TextBlock
+            text="```text\nlate code\n```"
+            augmentHtml={'<pre class="shiki"><code>late code</code></pre>'}
+          />
+        </SessionMetadataProvider>
+      </I18nProvider>,
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Copy code block" }),
+    ).toBeTruthy();
   });
 });

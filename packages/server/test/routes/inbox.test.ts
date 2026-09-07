@@ -232,15 +232,19 @@ describe("Inbox Routes", () => {
       const session = createSession("bridge-sess", "proj1", hoursAgo(2), {
         provider: "codex",
       });
+      // Shape a real codex sidecar emits for a session whose TUI died
+      // mid-turn: no connection left (active: false, ownership none) while the
+      // last observed activity is still "in-turn".
       const codexBridgeService = {
         listSessionViews: vi.fn(async () => [
           {
             session: {
               ...session,
-              ownership: { owner: "external" },
+              ownership: { owner: "none" },
             },
             projectName: project.name,
             activity: "in-turn" as const,
+            active: false,
           },
         ]),
         isSessionActive: vi.fn(async () => false),
@@ -260,9 +264,9 @@ describe("Inbox Routes", () => {
 
       expect(result.active).toHaveLength(0);
       expect(result.needsAttention).toHaveLength(0);
-      expect(codexBridgeService.isSessionActive).toHaveBeenCalledWith(
-        "bridge-sess",
-      );
+      // The verdict comes from the bulk snapshot: no per-session probe at all,
+      // which is what kept /api/inbox O(1) in bridge requests.
+      expect(codexBridgeService.isSessionActive).not.toHaveBeenCalled();
     });
 
     it("categorizes session updated in last hour into recentActivity", async () => {
@@ -400,6 +404,60 @@ describe("Inbox Routes", () => {
       expect(result.active).toHaveLength(0);
       expect(result.recentActivity).toHaveLength(0);
       expect(result.unread8h).toHaveLength(0);
+    });
+
+    it("surfaces a bridge-held approval on a session Yep still owns", async () => {
+      // The owned Codex process missed its approval across a reconnect,
+      // reconnect, so only the bridge holds the request. The inbox used to
+      // consult the bridge only when no process existed, which hid the blocker
+      // from needs-attention entirely.
+      const project = createProject("proj1", "myproject", "/sessions/proj1");
+      const session = createSession("sess-owned", "proj1", minutesAgo(2), {
+        provider: "codex",
+      });
+      const codexBridgeService = {
+        listSessionViews: vi.fn(async () => [
+          {
+            session: { ...session, ownership: { owner: "external" as const } },
+            projectName: project.name,
+            activity: "waiting-input" as const,
+            pendingInputType: "tool-approval" as const,
+            active: true,
+          },
+        ]),
+        isSessionActive: vi.fn(async () => true),
+        getPendingInputRequest: vi.fn(async () => ({
+          id: "per_bridge_only",
+          type: "tool-approval",
+          prompt: "Allow external_directory?",
+        })),
+      } as unknown as CodexBridgeController;
+
+      vi.mocked(mockScanner.listProjects).mockResolvedValue([project]);
+      sessionsByDir.set("/sessions/proj1", [session]);
+      processMap.set("sess-owned", {
+        getPendingInputRequest: () => null,
+        state: { type: "in-turn" },
+      });
+
+      const result = await makeRequest({
+        scanner: mockScanner,
+        readerFactory: mockReaderFactory,
+        supervisor: mockSupervisor,
+        notificationService: mockNotificationService,
+        sessionIndexService: mockSessionIndexService,
+        codexBridgeService,
+      });
+
+      expect(result.needsAttention).toHaveLength(1);
+      expect(result.needsAttention[0]?.sessionId).toBe("sess-owned");
+      expect(result.needsAttention[0]?.pendingRequestId).toBe(
+        "per_bridge_only",
+      );
+      // One lookup for the one waiting session, not a serialized sweep.
+      expect(codexBridgeService.getPendingInputRequest).toHaveBeenCalledTimes(
+        1,
+      );
     });
 
     it("session in active tier does not appear in lower tiers", async () => {

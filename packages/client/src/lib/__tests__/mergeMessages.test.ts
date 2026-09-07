@@ -82,6 +82,39 @@ describe("getMessageContent", () => {
 });
 
 describe("mergeMessage", () => {
+  it("clears pending state when the persisted prompt omits transient flags", () => {
+    const pending: Message = {
+      uuid: "queued-user",
+      type: "user",
+      isOptimistic: true,
+      _source: "sdk",
+      message: { role: "user", content: "follow up" },
+    };
+    const persisted = mergeMessage(
+      pending,
+      { uuid: pending.uuid, type: "user", message: pending.message },
+      "jsonl",
+    );
+    expect(persisted.isOptimistic).toBe(false);
+    expect(mergeMessage(persisted, pending, "sdk").isOptimistic).toBe(false);
+  });
+
+  it("does not regress adoption when an optimistic echo arrives late", () => {
+    const adopted: Message = {
+      uuid: "steered-user",
+      type: "user",
+      isOptimistic: false,
+      _source: "sdk",
+      message: { role: "user", content: "follow up" },
+    };
+    const result = mergeMessage(
+      adopted,
+      { ...adopted, isOptimistic: true },
+      "sdk",
+    );
+    expect(result.isOptimistic).toBe(false);
+  });
+
   it("returns incoming with source tag when no existing", () => {
     const incoming: Message = { id: "1", content: "hello" };
     const result = mergeMessage(undefined, incoming, "sdk");
@@ -110,6 +143,52 @@ describe("mergeMessage", () => {
     const result = mergeMessage(existing, incoming, "sdk");
     expect(result.content).toBe("jsonl content");
     expect(result._source).toBe("jsonl");
+  });
+
+  it("keeps SDK-only tool output while retaining a JSONL message envelope", () => {
+    const existing: Message = {
+      uuid: "jsonl-tool-message",
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "call-1",
+            name: "Bash",
+            input: { command: "pnpm test" },
+          },
+        ],
+      },
+      _source: "jsonl",
+    };
+    const incoming: Message = {
+      uuid: "sdk-tool-message",
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "call-1",
+            partialOutput: "tests still running",
+          },
+        ],
+      },
+    };
+
+    const result = mergeMessage(existing, incoming, "sdk");
+
+    expect(result.uuid).toBe("jsonl-tool-message");
+    expect(result._source).toBe("jsonl");
+    expect(result.message?.content).toMatchObject([
+      {
+        type: "tool_use",
+        id: "call-1",
+        name: "Bash",
+        partialOutput: "tests still running",
+      },
+    ]);
   });
 
   it("SDK overwrites existing SDK", () => {
@@ -167,6 +246,56 @@ describe("mergeJSONLMessages", () => {
       expect(result.messages[0]?._source).toBe("jsonl");
     });
 
+    it("retains the existing object when an authoritative snapshot is unchanged", () => {
+      const existingMessage: Message = {
+        id: "msg-1",
+        type: "assistant",
+        content: "same",
+        _source: "jsonl",
+      };
+
+      const result = mergeJSONLMessages(
+        [existingMessage],
+        [{ id: "msg-1", type: "assistant", content: "same" }],
+        { skipDagOrdering: true },
+      );
+
+      expect(result.messages[0]).toBe(existingMessage);
+    });
+
+    it("keeps a near-limit unchanged payload by reference without stringify allocations", () => {
+      const existingPayload = "x".repeat(5_500_000);
+      const independentlyLoadedPayload = [
+        "x".repeat(2_750_000),
+        "x".repeat(2_750_000),
+      ].join("");
+      const existingMessage: Message = {
+        id: "large-message",
+        type: "assistant",
+        message: { role: "assistant", content: existingPayload },
+        _source: "jsonl",
+      };
+      const startedAt = performance.now();
+      const result = mergeJSONLMessages(
+        [existingMessage],
+        [
+          {
+            id: "large-message",
+            type: "assistant",
+            message: {
+              role: "assistant",
+              content: independentlyLoadedPayload,
+            },
+          },
+        ],
+        { skipDagOrdering: true },
+      );
+      const durationMs = performance.now() - startedAt;
+
+      expect(durationMs).toBeLessThan(100);
+      expect(result.messages[0]).toBe(existingMessage);
+    });
+
     it("preserves SDK-only fields when merging with JSONL", () => {
       const existing: Message[] = [
         {
@@ -192,6 +321,59 @@ describe("mergeJSONLMessages", () => {
       expect((result.messages[0] as Record<string, unknown>).session_id).toBe(
         "session-123",
       );
+    });
+
+    it("preserves live Codex tool output missing from a lagging JSONL block", () => {
+      const existing: Message[] = [
+        {
+          uuid: "tool-message-1",
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "call-1",
+                name: "Bash",
+                input: { command: "pnpm test" },
+                partialOutput: "three suites passed",
+              },
+            ],
+          },
+          _source: "sdk",
+        },
+      ];
+      const incoming: Message[] = [
+        {
+          uuid: "tool-message-1",
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "call-1",
+                name: "Bash",
+                input: { command: "pnpm test" },
+              },
+            ],
+          },
+        },
+      ];
+
+      const result = mergeJSONLMessages(existing, incoming, {
+        skipDagOrdering: true,
+      });
+
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]?._source).toBe("jsonl");
+      expect(result.messages[0]?.message?.content).toMatchObject([
+        {
+          type: "tool_use",
+          id: "call-1",
+          partialOutput: "three suites passed",
+        },
+      ]);
     });
   });
 
@@ -401,6 +583,87 @@ describe("mergeJSONLMessages", () => {
 });
 
 describe("mergeStreamMessage", () => {
+  describe("superseded optimistic row", () => {
+    it("replaces the optimistic prompt in place when the persisted-id echo arrives", () => {
+      const existing: Message[] = [
+        { uuid: "a-0", type: "assistant", _source: "jsonl" },
+        {
+          uuid: "client-1",
+          type: "user",
+          isOptimistic: true,
+          message: { role: "user", content: "hello" },
+          _source: "sdk",
+        },
+        { uuid: "pi-assistant-1", type: "assistant", _source: "sdk" },
+      ];
+      const incoming: Message = {
+        uuid: "entry-1",
+        type: "user",
+        clientUserMessageId: "client-1",
+        supersedesMessageId: "client-1",
+        timestamp: "2026-09-02T07:59:17.393Z",
+        message: { role: "user", content: "hello" },
+      };
+
+      const result = mergeStreamMessage(existing, incoming);
+
+      expect(result.index).toBe(1);
+      expect(result.messages.map((m) => m.uuid)).toEqual([
+        "a-0",
+        "entry-1",
+        "pi-assistant-1",
+      ]);
+      expect(result.messages[1]).toMatchObject({
+        isOptimistic: false,
+        clientUserMessageId: "client-1",
+        _source: "sdk",
+      });
+    });
+
+    it("drops the optimistic row when the persisted copy is already loaded", () => {
+      const existing: Message[] = [
+        {
+          uuid: "entry-1",
+          type: "user",
+          message: { role: "user", content: "hello" },
+          _source: "jsonl",
+        },
+        {
+          uuid: "client-1",
+          type: "user",
+          isOptimistic: true,
+          message: { role: "user", content: "hello" },
+          _source: "sdk",
+        },
+      ];
+      const incoming: Message = {
+        uuid: "entry-1",
+        type: "user",
+        supersedesMessageId: "client-1",
+        message: { role: "user", content: "hello" },
+      };
+
+      const result = mergeStreamMessage(existing, incoming);
+
+      expect(result.messages.map((m) => m.uuid)).toEqual(["entry-1"]);
+      expect(result.messages[0]?._source).toBe("jsonl");
+    });
+
+    it("appends normally when the superseded row is not present", () => {
+      const incoming: Message = {
+        uuid: "entry-1",
+        type: "user",
+        supersedesMessageId: "client-1",
+        message: { role: "user", content: "hello" },
+      };
+
+      const result = mergeStreamMessage([], incoming);
+
+      expect(result.messages.map((m) => m.uuid)).toEqual(["entry-1"]);
+      expect(result.index).toBe(0);
+    });
+  });
+
   describe("same ID merge", () => {
     it("merges with existing message by ID", () => {
       const existing: Message[] = [
@@ -413,6 +676,157 @@ describe("mergeStreamMessage", () => {
       expect(result.messages).toHaveLength(1);
       expect(result.messages[0]?.content).toBe("new");
       expect(result.index).toBe(0);
+    });
+
+    it("updates one thinking block from cumulative snapshots with the same ID", () => {
+      const existing: Message[] = [
+        {
+          uuid: "thinking-1",
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "User" }],
+          },
+          _source: "sdk",
+        },
+      ];
+      const incoming: Message = {
+        uuid: "thinking-1",
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "User wants help" }],
+        },
+      };
+
+      const result = mergeStreamMessage(existing, incoming);
+
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]?.message?.content).toEqual([
+        { type: "thinking", thinking: "User wants help" },
+      ]);
+    });
+
+    it("preserves existing thinking blocks when a later SDK snapshot adds a tool call", () => {
+      const existing: Message[] = [
+        {
+          id: "assistant-1",
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "I should inspect files." },
+            ],
+          },
+          _source: "sdk",
+        },
+      ];
+      const incoming: Message = {
+        id: "assistant-1",
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-1",
+              name: "Read",
+              input: { file_path: "src/app.ts" },
+            },
+          ],
+        },
+      };
+
+      const result = mergeStreamMessage(existing, incoming);
+      const content = result.messages[0]?.message?.content;
+
+      expect(Array.isArray(content)).toBe(true);
+      expect(content).toMatchObject([
+        { type: "thinking", thinking: "I should inspect files." },
+        { type: "tool_use", id: "tool-1", name: "Read" },
+      ]);
+    });
+
+    it("keeps the richer tool_result content when a partial snapshot arrives later", () => {
+      const existing: Message[] = [
+        {
+          id: "user-1",
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "tool-1",
+                content: "complete tool output with details",
+              },
+            ],
+          },
+          _source: "sdk",
+        },
+      ];
+      const incoming: Message = {
+        id: "user-1",
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "tool-1", content: "comp" },
+          ],
+        },
+      };
+
+      const result = mergeStreamMessage(existing, incoming);
+      const content = result.messages[0]?.message?.content;
+
+      expect(content).toMatchObject([
+        {
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          content: "complete tool output with details",
+        },
+      ]);
+    });
+
+    it("lets a longer tool_result snapshot replace a shorter one", () => {
+      const existing: Message[] = [
+        {
+          id: "user-1",
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "tool-1", content: "comp" },
+            ],
+          },
+          _source: "sdk",
+        },
+      ];
+      const incoming: Message = {
+        id: "user-1",
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-1",
+              content: "complete tool output with details",
+            },
+          ],
+        },
+      };
+
+      const result = mergeStreamMessage(existing, incoming);
+      const content = result.messages[0]?.message?.content;
+
+      expect(content).toMatchObject([
+        {
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          content: "complete tool output with details",
+        },
+      ]);
     });
 
     it("returns same array if no change", () => {

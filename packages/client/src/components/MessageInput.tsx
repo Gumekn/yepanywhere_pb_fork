@@ -1,4 +1,4 @@
-import type { UploadedFile } from "@yep-anywhere/shared";
+import type { ProviderName, UploadedFile } from "@yep-anywhere/shared";
 import {
   type ClipboardEvent,
   type KeyboardEvent,
@@ -15,6 +15,7 @@ import {
 } from "../hooks/useDraftPersistence";
 import { useI18n } from "../i18n";
 import type { AgentCommandConfig } from "../lib/agentCommands";
+import { readClipboardUserInput } from "../lib/clipboard";
 import { hasCoarsePointer } from "../lib/deviceDetection";
 import type { ContextUsage, PermissionMode } from "../types";
 import { MessageInputToolbar } from "./MessageInputToolbar";
@@ -122,6 +123,9 @@ interface Props {
   uploadProgress?: UploadProgress[];
   /** Whether the provider supports permission modes (default: true) */
   supportsPermissionMode?: boolean;
+  /** Provider-native permission modes and labels. */
+  provider?: ProviderName;
+  permissionModes?: readonly PermissionMode[];
   /** Whether the provider supports thinking toggle (default: true) */
   supportsThinkingToggle?: boolean;
   /** Active command prefix for this provider */
@@ -161,6 +165,8 @@ export function MessageInput({
   onRemoveAttachment,
   uploadProgress = [],
   supportsPermissionMode = true,
+  provider,
+  permissionModes,
   supportsThinkingToggle = true,
   commandPrefix = "/",
   commands = [],
@@ -209,22 +215,43 @@ export function MessageInput({
     setCursorPosition(textarea?.selectionStart ?? text.length);
   }, [text.length]);
 
-  const activeCommandToken = useMemo(() => {
-    if (commands.length === 0) return null;
-    return findActiveCommandToken(text, cursorPosition, commandPrefix);
-  }, [commands.length, commandPrefix, cursorPosition, text]);
+  const completionConfigs = useMemo<AgentCommandConfig[]>(
+    () =>
+      commandButtons ?? [
+        {
+          prefix: commandPrefix,
+          label: commandLabel,
+          showButton: showCommandButton,
+          commands,
+        },
+      ],
+    [commandButtons, commandLabel, commandPrefix, commands, showCommandButton],
+  );
+
+  const activeCompletion = useMemo(() => {
+    for (const config of completionConfigs) {
+      if (config.commands.length === 0) continue;
+      const token = findActiveCommandToken(text, cursorPosition, config.prefix);
+      if (token) return { config, token };
+    }
+    return null;
+  }, [completionConfigs, cursorPosition, text]);
+
+  const activeCommandToken = activeCompletion?.token ?? null;
+  const activeCommandConfig = activeCompletion?.config ?? null;
 
   const filteredCommands = useMemo(
     () =>
-      activeCommandToken
-        ? filterCommands(commands, activeCommandToken.query)
+      activeCommandToken && activeCommandConfig
+        ? filterCommands(activeCommandConfig.commands, activeCommandToken.query)
         : [],
-    [activeCommandToken, commands],
+    [activeCommandConfig, activeCommandToken],
   );
 
-  const completionKey = activeCommandToken
-    ? `${commandPrefix}:${activeCommandToken.start}:${activeCommandToken.end}:${activeCommandToken.query}`
-    : null;
+  const completionKey =
+    activeCommandToken && activeCommandConfig
+      ? `${activeCommandConfig.prefix}:${activeCommandToken.start}:${activeCommandToken.end}:${activeCommandToken.query}`
+      : null;
   const isCommandCompletionOpen =
     !!completionKey &&
     dismissedCompletionKey !== completionKey &&
@@ -242,7 +269,11 @@ export function MessageInput({
         command.startsWith("/") || command.startsWith("$")
           ? command.slice(1)
           : command;
-      const activeToken = prefix === commandPrefix ? activeCommandToken : null;
+      const activeToken = findActiveCommandToken(
+        text,
+        textareaRef.current?.selectionStart ?? cursorPosition,
+        prefix,
+      );
 
       if (prefix === "/" && onCustomCommand?.(bare)) {
         if (activeToken) {
@@ -292,7 +323,7 @@ export function MessageInput({
         textarea?.setSelectionRange(nextCursor, nextCursor);
       }, 0);
     },
-    [activeCommandToken, commandPrefix, onCustomCommand, setText, text],
+    [cursorPosition, onCustomCommand, setText, text],
   );
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -385,7 +416,9 @@ export function MessageInput({
 
       if (e.key === "Tab" && selectedCommand) {
         e.preventDefault();
-        insertCommand(`${commandPrefix}${selectedCommand}`);
+        insertCommand(
+          `${activeCommandConfig?.prefix ?? commandPrefix}${selectedCommand}`,
+        );
         return;
       }
 
@@ -397,7 +430,9 @@ export function MessageInput({
         selectedCommand
       ) {
         e.preventDefault();
-        insertCommand(`${commandPrefix}${selectedCommand}`);
+        insertCommand(
+          `${activeCommandConfig?.prefix ?? commandPrefix}${selectedCommand}`,
+        );
         return;
       }
 
@@ -456,6 +491,31 @@ export function MessageInput({
 
   const handlePaste = (e: ClipboardEvent) => {
     if (!canAttach || !onAttach) return;
+
+    const copiedInput = readClipboardUserInput(e.clipboardData);
+    if (copiedInput && copiedInput.images.length > 0) {
+      e.preventDefault();
+
+      if (copiedInput.text) {
+        const textarea = textareaRef.current;
+        const currentValue = textarea?.value ?? text;
+        const start = textarea?.selectionStart ?? currentValue.length;
+        const end = textarea?.selectionEnd ?? start;
+        const nextText = `${currentValue.slice(0, start)}${copiedInput.text}${currentValue.slice(end)}`;
+        const nextCursor = start + copiedInput.text.length;
+
+        setInterimTranscript("");
+        setDismissedCompletionKey(null);
+        setText(nextText);
+        setCursorPosition(nextCursor);
+        setTimeout(() => {
+          textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
+        }, 0);
+      }
+
+      onAttach(copiedInput.images);
+      return;
+    }
 
     const items = e.clipboardData?.items;
     if (!items) return;
@@ -554,7 +614,7 @@ export function MessageInput({
             className="command-completion-menu"
             role="listbox"
             tabIndex={-1}
-            aria-label={commandLabel}
+            aria-label={activeCommandConfig?.label ?? commandLabel}
           >
             {filteredCommands.map((command, index) => (
               <button
@@ -562,12 +622,16 @@ export function MessageInput({
                 type="button"
                 className={`command-completion-item ${index === activeCommandIndex ? "active" : ""}`}
                 onMouseDown={(event) => event.preventDefault()}
-                onClick={() => insertCommand(`${commandPrefix}${command}`)}
+                onClick={() =>
+                  insertCommand(
+                    `${activeCommandConfig?.prefix ?? commandPrefix}${command}`,
+                  )
+                }
                 role="option"
                 aria-selected={index === activeCommandIndex}
               >
                 <span className="command-completion-name">
-                  {commandPrefix}
+                  {activeCommandConfig?.prefix ?? commandPrefix}
                   {command}
                 </span>
               </button>
@@ -651,6 +715,8 @@ export function MessageInput({
             isHeld={isHeld}
             onHoldChange={onHoldChange}
             supportsPermissionMode={supportsPermissionMode}
+            provider={provider}
+            permissionModes={permissionModes}
             supportsThinkingToggle={supportsThinkingToggle}
             canAttach={canAttach}
             attachmentCount={attachments.length}

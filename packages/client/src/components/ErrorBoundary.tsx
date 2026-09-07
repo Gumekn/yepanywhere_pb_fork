@@ -1,6 +1,10 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { useI18n } from "../i18n";
 import { apiPath } from "../lib/apiPath";
-import { CLIENT_BUILD_ID } from "../lib/buildRecovery";
+
+const CLIENT_BUILD_ID = typeof __BUILD_ID__ === "undefined" ? "" : __BUILD_ID__;
+const CLIENT_BUILD_PROFILE =
+  typeof __BUILD_PROFILE__ === "undefined" ? "dev" : __BUILD_PROFILE__;
 
 interface Props {
   children: ReactNode;
@@ -10,9 +14,22 @@ interface State {
   hasError: boolean;
   error: Error | null;
   errorInfo: ErrorInfo | null;
-  serverBuildId: string | null;
   serverVersion: string | null;
+  serverBuildId: string | null;
   versionLoading: boolean;
+}
+
+export function isConfirmedBuildMismatch(
+  clientBuildId: string,
+  serverBuildId: string | null,
+  buildProfile: string,
+): boolean {
+  return (
+    buildProfile !== "dev" &&
+    clientBuildId.length > 0 &&
+    !!serverBuildId &&
+    serverBuildId !== clientBuildId
+  );
 }
 
 /**
@@ -26,8 +43,8 @@ export class ErrorBoundary extends Component<Props, State> {
       hasError: false,
       error: null,
       errorInfo: null,
-      serverBuildId: null,
       serverVersion: null,
+      serverBuildId: null,
       versionLoading: false,
     };
   }
@@ -51,13 +68,11 @@ export class ErrorBoundary extends Component<Props, State> {
     try {
       const res = await fetch(apiPath("/version"));
       if (res.ok) {
-        const data = (await res.json()) as {
-          current?: string;
-          build?: { buildId?: string };
-        };
+        const data = await res.json();
         this.setState({
-          serverVersion: data.current ?? null,
-          serverBuildId: data.build?.buildId ?? null,
+          serverVersion: typeof data.current === "string" ? data.current : null,
+          serverBuildId:
+            typeof data.build?.buildId === "string" ? data.build.buildId : null,
         });
       }
     } catch {
@@ -71,99 +86,116 @@ export class ErrorBoundary extends Component<Props, State> {
     window.location.reload();
   };
 
-  // Check if the error looks like a property access error (common in version mismatches)
-  isLikelyVersionMismatch(): boolean {
-    const { error } = this.state;
-    if (!error) return false;
-
-    const msg = error.message.toLowerCase();
-    return (
-      msg.includes("cannot read properties of undefined") ||
-      msg.includes("cannot read property") ||
-      msg.includes("is not a function") ||
-      msg.includes("is undefined")
+  hasConfirmedBuildMismatch(): boolean {
+    return isConfirmedBuildMismatch(
+      CLIENT_BUILD_ID,
+      this.state.serverBuildId,
+      CLIENT_BUILD_PROFILE,
     );
   }
 
   render() {
     if (this.state.hasError) {
-      const { error, serverBuildId, serverVersion, versionLoading } =
-        this.state;
-      const isVersionMismatch = this.isLikelyVersionMismatch();
-
       return (
-        <div style={styles.container}>
-          <div style={styles.card}>
-            <h1 style={styles.title}>Something went wrong</h1>
-
-            {isVersionMismatch && (
-              <div style={styles.versionWarning}>
-                <strong>Possible version mismatch detected.</strong>
-                <p style={styles.versionHint}>
-                  The frontend and yepanywhere server may be running different
-                  versions. Try refreshing or updating your yepanywhere
-                  installation.
-                </p>
-              </div>
-            )}
-
-            <div style={styles.errorBox}>
-              <code style={styles.errorText}>
-                {error?.message || "Unknown error"}
-              </code>
-            </div>
-
-            <div style={styles.versionInfo}>
-              <div style={styles.versionRow}>
-                <span style={styles.versionLabel}>Client build:</span>
-                <span style={styles.versionValue}>
-                  {CLIENT_BUILD_ID || "Unknown"}
-                </span>
-              </div>
-              <div style={styles.versionRow}>
-                <span style={styles.versionLabel}>Server build:</span>
-                <span style={styles.versionValue}>
-                  {versionLoading ? "Loading..." : serverBuildId || "Unknown"}
-                </span>
-              </div>
-              <div style={styles.versionRow}>
-                <span style={styles.versionLabel}>Server version:</span>
-                <span style={styles.versionValue}>
-                  {versionLoading ? "Loading..." : serverVersion || "Unknown"}
-                </span>
-              </div>
-              {isVersionMismatch && (
-                <p style={styles.updateHint}>
-                  To update: <code>pnpm dev</code> or{" "}
-                  <code>scripts/deploy.sh</code>
-                </p>
-              )}
-            </div>
-
-            <div style={styles.actions}>
-              <button
-                type="button"
-                onClick={this.handleReload}
-                style={styles.reloadButton}
-              >
-                Reload Page
-              </button>
-              <a
-                href="https://github.com/Gumekn/yepanywhere_pb_fork/issues"
-                target="_blank"
-                rel="noopener noreferrer"
-                style={styles.issueLink}
-              >
-                Report Issue
-              </a>
-            </div>
-          </div>
-        </div>
+        <ErrorBoundaryFallback
+          error={this.state.error}
+          serverVersion={this.state.serverVersion}
+          serverBuildId={this.state.serverBuildId}
+          versionLoading={this.state.versionLoading}
+          buildMismatch={this.hasConfirmedBuildMismatch()}
+          onReload={this.handleReload}
+        />
       );
     }
 
     return this.props.children;
   }
+}
+
+function ErrorBoundaryFallback({
+  error,
+  serverVersion,
+  serverBuildId,
+  versionLoading,
+  buildMismatch,
+  onReload,
+}: {
+  error: Error | null;
+  serverVersion: string | null;
+  serverBuildId: string | null;
+  versionLoading: boolean;
+  buildMismatch: boolean;
+  onReload: () => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div style={styles.container}>
+      <div style={styles.card}>
+        <h1 style={styles.title}>{t("errorBoundaryTitle")}</h1>
+
+        {buildMismatch && (
+          <div style={styles.versionWarning}>
+            <strong>{t("errorBoundaryBuildMismatchTitle")}</strong>
+            <p style={styles.versionHint}>
+              {t("errorBoundaryBuildMismatchHint")}
+            </p>
+          </div>
+        )}
+
+        <div style={styles.errorBox}>
+          <code style={styles.errorText}>
+            {error?.message || t("errorBoundaryUnknownError")}
+          </code>
+        </div>
+
+        <div style={styles.versionInfo}>
+          <div style={styles.versionRow}>
+            <span style={styles.versionLabel}>
+              {t("errorBoundaryServerVersion")}
+            </span>
+            <span style={styles.versionValue}>
+              {versionLoading
+                ? t("errorBoundaryLoading")
+                : serverVersion || t("errorBoundaryUnknown")}
+            </span>
+          </div>
+          <div style={styles.versionRow}>
+            <span style={styles.versionLabel}>
+              {t("errorBoundaryClientBuild")}
+            </span>
+            <span style={styles.versionValue}>{CLIENT_BUILD_ID || "dev"}</span>
+          </div>
+          <div style={styles.versionRow}>
+            <span style={styles.versionLabel}>
+              {t("errorBoundaryServerBuild")}
+            </span>
+            <span style={styles.versionValue}>
+              {serverBuildId || t("errorBoundaryUnknown")}
+            </span>
+          </div>
+          {buildMismatch && (
+            <p style={styles.updateHint}>
+              {t("errorBoundaryBuildMismatchAction")}
+            </p>
+          )}
+        </div>
+
+        <div style={styles.actions}>
+          <button type="button" onClick={onReload} style={styles.reloadButton}>
+            {t("errorBoundaryReload")}
+          </button>
+          <a
+            href="https://github.com/hustc5622/yepanywhere/issues"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={styles.issueLink}
+          >
+            {t("errorBoundaryReportIssue")}
+          </a>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // Inline styles to ensure they work even if CSS fails to load

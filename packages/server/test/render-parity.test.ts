@@ -190,25 +190,23 @@ function codexPersistedEntries(): CodexSessionEntry[] {
       },
     },
     {
-      type: "response_item",
+      type: "event_msg",
       timestamp: "2026-03-05T12:00:07.000Z",
       payload: {
-        type: "custom_tool_call",
+        type: "patch_apply_end",
         call_id: "call-edit",
-        name: "apply_patch",
-        input: {
-          file_path: "src/readme.md",
-          changes: [{ path: "src/readme.md", kind: "update", diff: EDIT_DIFF }],
+        turn_id: "turn-parity-1",
+        stdout: "File changes applied:\nupdate: src/readme.md",
+        stderr: "",
+        success: true,
+        status: "completed",
+        changes: {
+          "src/readme.md": {
+            type: "update",
+            unified_diff: EDIT_DIFF,
+            move_path: null,
+          },
         },
-      },
-    },
-    {
-      type: "response_item",
-      timestamp: "2026-03-05T12:00:08.000Z",
-      payload: {
-        type: "custom_tool_call_output",
-        call_id: "call-edit",
-        output: "File changes applied:\nupdate: src/readme.md",
       },
     },
     {
@@ -482,7 +480,7 @@ const CLAUDE_SESSION_2E582BFB_FIXTURE: ClaudeSessionEntry[] = [
   },
   {
     type: "assistant",
-    uuid: "8a1ddf40-3ab7-4520-b1ab-3c0bc3447028",
+    uuid: "8a1ddf40-3ab7-4620-b1ab-3c0bc3447028",
     parentUuid: "e416e5ea-2d96-46eb-836a-e7e0f8c79f00",
     message: {
       role: "assistant",

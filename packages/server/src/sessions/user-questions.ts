@@ -1,10 +1,10 @@
 import {
   type SessionQuestion,
   isIdeMetadata,
-  parseUserPromptMetadata,
   stripBridgeMetadata,
   stripIdeMetadata,
 } from "@yep-anywhere/shared";
+import { sanitizeManagedAttachmentPrompt } from "../sdk/messageQueue.js";
 import {
   isSessionSetupText,
   isSyntheticUserPromptText,
@@ -16,14 +16,16 @@ export function compactQuestionText(
   text: string,
   maxLength = SESSION_QUESTION_MAX_LENGTH,
 ): string {
-  const parsed = parseUserPromptMetadata(text);
-  const visibleText =
-    parsed.text || parsed.mentionedFiles.map((file) => file.name).join(", ");
-  const normalized = stripBridgeMetadata(stripIdeMetadata(visibleText))
+  const normalized = sanitizeManagedAttachmentPrompt(
+    stripBridgeMetadata(stripIdeMetadata(text)),
+  )
     .replace(/\s+/g, " ")
     .trim();
   if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, maxLength - 1)}...`;
+  if (maxLength <= 0) return "";
+  const ellipsis = "...";
+  if (maxLength <= ellipsis.length) return ellipsis.slice(0, maxLength);
+  return `${normalized.slice(0, maxLength - ellipsis.length)}${ellipsis}`;
 }
 
 export function isSessionSetupQuestionText(text: string): boolean {
@@ -33,6 +35,9 @@ export function isSessionSetupQuestionText(text: string): boolean {
 export function createSessionQuestion(
   params: {
     id: string | undefined;
+    turnId?: string;
+    clientUserMessageId?: string;
+    codexCorrelationKey?: string;
     text: string;
     timestamp?: string;
   },
@@ -46,6 +51,13 @@ export function createSessionQuestion(
 
   return {
     id: params.id || fallbackId,
+    ...(params.turnId ? { turnId: params.turnId } : {}),
+    ...(params.clientUserMessageId
+      ? { clientUserMessageId: params.clientUserMessageId }
+      : {}),
+    ...(params.codexCorrelationKey
+      ? { codexCorrelationKey: params.codexCorrelationKey }
+      : {}),
     text: compact,
     ...(params.timestamp ? { timestamp: params.timestamp } : {}),
   };

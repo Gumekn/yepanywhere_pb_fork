@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionMetadataService } from "../../src/metadata/SessionMetadataService.js";
+import { encodeProjectId } from "../../src/projects/paths.js";
 
 describe("SessionMetadataService", () => {
   let testDir: string;
@@ -35,7 +36,7 @@ describe("SessionMetadataService", () => {
         "utf-8",
       );
       const state = JSON.parse(content);
-      expect(state.version).toBe(1);
+      expect(state.version).toBe(2);
       expect(state.sessions["session-1"]).toBeDefined();
       expect(state.sessions["session-1"].customTitle).toBe("My Custom Title");
     });
@@ -64,6 +65,29 @@ describe("SessionMetadataService", () => {
         customTitle: "Archived One",
         isArchived: true,
       });
+    });
+
+    it("retains but does not reactivate a retired persisted provider", async () => {
+      await writeFile(
+        join(testDir, "session-metadata.json"),
+        JSON.stringify({
+          version: 2,
+          sessions: {
+            legacy: { provider: "opencode", customTitle: "Keep this" },
+            current: { provider: "codex" },
+          },
+        }),
+      );
+
+      await service.initialize();
+
+      expect(service.getMetadata("legacy")).toMatchObject({
+        provider: "opencode",
+        customTitle: "Keep this",
+      });
+      expect(service.getPersistedProvider("legacy")).toBe("opencode");
+      expect(service.getProvider("legacy")).toBeUndefined();
+      expect(service.getProvider("current")).toBe("codex");
     });
 
     it("handles corrupted JSON gracefully", async () => {
@@ -186,6 +210,30 @@ describe("SessionMetadataService", () => {
     });
   });
 
+  describe("setPermissionMode", () => {
+    it("persists a session mode across service restarts", async () => {
+      await service.initialize();
+      await service.setPermissionMode("session-1", "bypassPermissions");
+
+      const reloaded = new SessionMetadataService({ dataDir: testDir });
+      await reloaded.initialize();
+
+      expect(reloaded.getPermissionMode("session-1")).toBe("bypassPermissions");
+    });
+
+    it("clears the mode without removing other metadata", async () => {
+      await service.initialize();
+      await service.setTitle("session-1", "Keep me");
+      await service.setPermissionMode("session-1", "plan");
+
+      await service.setPermissionMode("session-1", undefined);
+
+      expect(service.getMetadata("session-1")).toEqual({
+        customTitle: "Keep me",
+      });
+    });
+  });
+
   describe("setAiTitle", () => {
     it("sets AI title for a session", async () => {
       await service.initialize();
@@ -248,6 +296,207 @@ describe("SessionMetadataService", () => {
       await service.setCreatedBy("session-1", undefined);
 
       expect(service.getMetadata("session-1")).toBeUndefined();
+    });
+  });
+
+  describe("setOrigin", () => {
+    it("persists channel ownership without chat or user identity", async () => {
+      await service.initialize();
+      await service.setOrigin("session-1", {
+        createdBy: "channel",
+        originChannel: "feishu",
+      });
+
+      const reloaded = new SessionMetadataService({ dataDir: testDir });
+      await reloaded.initialize();
+      expect(reloaded.getMetadata("session-1")).toMatchObject({
+        createdBy: "channel",
+        originChannel: "feishu",
+      });
+      const serialized = JSON.stringify(reloaded.getMetadata("session-1"));
+      expect(serialized).not.toContain("chat_fixture");
+      expect(serialized).not.toContain("user_fixture");
+    });
+  });
+
+  describe("fork lineage", () => {
+    it("persists a child-to-source relationship without aliasing the source", async () => {
+      await service.initialize();
+      await service.setProvider("source-session", "codex");
+      await service.setForkParentSessionId("child-session", "source-session");
+
+      const reloaded = new SessionMetadataService({ dataDir: testDir });
+      await reloaded.initialize();
+
+      expect(reloaded.getForkParentSessionId("child-session")).toBe(
+        "source-session",
+      );
+      expect(reloaded.getCanonicalSessionId("source-session")).toBe(
+        "source-session",
+      );
+      expect(reloaded.getMetadata("source-session")).toEqual({
+        provider: "codex",
+      });
+    });
+
+    it("persists the exact edit boundary and stable family title", async () => {
+      await service.initialize();
+      await service.setEditForkMetadata("child-session", {
+        forkParentSessionId: "source-session",
+        forkTargetMessageId: "user-b-turn-shared",
+        forkFamilyTitle: "Stable family",
+        forkFamilyFullTitle: "Stable family full title",
+      });
+
+      const reloaded = new SessionMetadataService({ dataDir: testDir });
+      await reloaded.initialize();
+
+      expect(reloaded.getForkTargetMessageId("child-session")).toBe(
+        "user-b-turn-shared",
+      );
+      expect(reloaded.getForkFamilyTitle("child-session")).toEqual({
+        title: "Stable family",
+        fullTitle: "Stable family full title",
+      });
+      expect(reloaded.getForkParentSessionId("child-session")).toBe(
+        "source-session",
+      );
+    });
+  });
+
+  describe("setProjectLocation", () => {
+    it("persists the owning project so a bare session id stays resolvable", async () => {
+      await service.initialize();
+      await service.setProjectLocation(
+        "session-1",
+        encodeProjectId("/Users/someone/work/alpha"),
+        "/Users/someone/work/alpha",
+      );
+
+      const newService = new SessionMetadataService({ dataDir: testDir });
+      await newService.initialize();
+
+      expect(newService.getProjectLocation("session-1")).toEqual({
+        projectId: encodeProjectId("/Users/someone/work/alpha"),
+        projectPath: "/Users/someone/work/alpha",
+      });
+    });
+
+    it("reports unknown when only half the location was recorded", async () => {
+      await service.initialize();
+      await service.setProjectLocation(
+        "session-1",
+        encodeProjectId("/Users/someone/work/alpha"),
+        undefined,
+      );
+
+      expect(service.getProjectLocation("session-1")).toBeUndefined();
+    });
+
+    it("reports unknown for sessions Yep never started", async () => {
+      await service.initialize();
+
+      expect(service.getProjectLocation("session-unknown")).toBeUndefined();
+    });
+
+    it("preserves the recorded location when other fields change", async () => {
+      await service.initialize();
+      await service.setProjectLocation(
+        "session-1",
+        encodeProjectId("/Users/someone/work/alpha"),
+        "/Users/someone/work/alpha",
+      );
+      await service.setProvider("session-1", "codex");
+      await service.setTitle("session-1", "Renamed");
+
+      expect(service.getProjectLocation("session-1")).toEqual({
+        projectId: encodeProjectId("/Users/someone/work/alpha"),
+        projectPath: "/Users/someone/work/alpha",
+      });
+    });
+
+    it("follows a durable id remap", async () => {
+      await service.initialize();
+      await service.setProjectLocation(
+        "temporary-id",
+        encodeProjectId("/Users/someone/work/alpha"),
+        "/Users/someone/work/alpha",
+      );
+
+      await service.remapSessionId("temporary-id", "durable-id");
+
+      expect(service.getProjectLocation("durable-id")?.projectPath).toBe(
+        "/Users/someone/work/alpha",
+      );
+      expect(service.getProjectLocation("temporary-id")?.projectPath).toBe(
+        "/Users/someone/work/alpha",
+      );
+    });
+  });
+
+  describe("remapSessionId", () => {
+    it("moves temporary session metadata to the durable provider ID", async () => {
+      await service.initialize();
+      await service.setProvider("temporary-id", "codex");
+      await service.setCodexMcpMode("temporary-id", "standard");
+      await service.setPermissionMode("temporary-id", "bypassPermissions");
+      await service.setCreatedBy("temporary-id", "yep");
+
+      await service.remapSessionId("temporary-id", "durable-id");
+
+      expect(service.getMetadata("durable-id")).toEqual({
+        provider: "codex",
+        codexMcpMode: "standard",
+        permissionMode: "bypassPermissions",
+        createdBy: "yep",
+      });
+      expect(service.getMetadata("temporary-id")).toEqual(
+        service.getMetadata("durable-id"),
+      );
+
+      const reloaded = new SessionMetadataService({ dataDir: testDir });
+      await reloaded.initialize();
+      expect(reloaded.getCanonicalSessionId("temporary-id")).toBe("durable-id");
+      expect(reloaded.getMetadata("temporary-id")).toEqual(
+        reloaded.getMetadata("durable-id"),
+      );
+      expect(reloaded.getMetadata("durable-id")?.createdBy).toBe("yep");
+    });
+
+    it("persists an ID alias even when no metadata exists yet", async () => {
+      await service.initialize();
+      await service.remapSessionId("temporary-id", "durable-id");
+
+      const reloaded = new SessionMetadataService({ dataDir: testDir });
+      await reloaded.initialize();
+
+      expect(reloaded.getCanonicalSessionId("temporary-id")).toBe("durable-id");
+    });
+
+    it("redirects metadata writes that race after the ID change", async () => {
+      await service.initialize();
+
+      await service.remapSessionId("temporary-id", "durable-id");
+      await service.setCreatedBy("temporary-id", "yep");
+
+      expect(service.getMetadata("durable-id")?.createdBy).toBe("yep");
+      const allMetadata = service.getAllMetadata();
+      expect(allMetadata["temporary-id"]).toBeUndefined();
+      expect(allMetadata["durable-id"]?.createdBy).toBe("yep");
+    });
+
+    it("preserves metadata already written under the durable ID", async () => {
+      await service.initialize();
+      await service.setProvider("temporary-id", "codex");
+      await service.setTitle("temporary-id", "Temporary title");
+      await service.setTitle("durable-id", "Durable title");
+
+      await service.remapSessionId("temporary-id", "durable-id");
+
+      expect(service.getMetadata("durable-id")).toEqual({
+        provider: "codex",
+        customTitle: "Durable title",
+      });
     });
   });
 
@@ -440,6 +689,27 @@ describe("SessionMetadataService", () => {
       expect(service.getFilePath()).toBe(
         join(testDir, "session-metadata.json"),
       );
+    });
+  });
+
+  describe("LLM gateway session configuration", () => {
+    it("persists the request protocol and model configuration for resume", async () => {
+      await service.initialize();
+      const config = {
+        model: "glm-5.2",
+        requestProtocol: "anthropic" as const,
+        limits: { context: 1_000_000, output: 65_536 },
+        capabilities: { reasoning: true, toolCall: true },
+        advanced: {
+          model: { options: { thinking: { type: "enabled" } } },
+        },
+      };
+
+      await service.setLlmGatewayConfig("session-1", config);
+
+      const reloaded = new SessionMetadataService({ dataDir: testDir });
+      await reloaded.initialize();
+      expect(reloaded.getLlmGatewayConfig("session-1")).toEqual(config);
     });
   });
 

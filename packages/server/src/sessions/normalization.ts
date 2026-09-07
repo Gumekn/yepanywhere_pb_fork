@@ -1,3 +1,4 @@
+import { basename, join } from "node:path";
 import type {
   ClaudeSessionEntry,
   CodexCompactedEntry,
@@ -8,31 +9,62 @@ import type {
   CodexImageGenerationPayload,
   CodexMessagePayload,
   CodexMessagePhase,
+  CodexPatchApplyEndEvent,
   CodexReasoningPayload,
   CodexResponseItemEntry,
   CodexSessionEntry,
   CodexWebSearchCallPayload,
+  ContextCompactEvent,
+  ContextCumulativeUsage,
   ContextUsage,
   GeminiAssistantMessage,
   GeminiSessionMessage,
   GeminiUserMessage,
-  OpenCodeSessionEntry,
-  OpenCodeStoredPart,
+  KimiContentPartEvent,
+  KimiSessionContent,
+  KimiStepEndEvent,
+  KimiToolCallEvent,
+  KimiToolResultEvent,
+  KimiTurnEndedRecord,
+  PiAgentMessage,
+  PiAssistantMessage,
+  PiSessionContent,
+  PiSessionEntry,
+  PiToolResultMessage,
+  PiUsage,
+  ProviderName,
   SessionBranchOption,
   SessionBranchState,
   UnifiedSession,
+  ZCodeSessionContent,
+  ZCodeStoredMessage,
 } from "@yep-anywhere/shared";
 import {
   getGeminiUserMessageText,
+  getKimiGoalTimeline,
+  getKimiPromptImages,
+  getKimiPromptText,
   getMessageContent,
   getModelContextWindow,
+  getPiMessageText,
   isConversationEntry,
+  isKimiLoopEventRecord,
+  isKimiTurnEndedRecord,
+  isKimiTurnPromptRecord,
+  parseKimiReadMediaOutput,
 } from "@yep-anywhere/shared";
 import {
   isCodexCorrelationDebugEnabled,
   logCodexCorrelationDebug,
   summarizeCodexNormalizedMessage,
 } from "../codex/correlationDebugLogger.js";
+import {
+  buildCodexEditInput,
+  formatCodexFileChangeResult,
+  isCodexFileChangeError,
+  normalizeCodexFileChangeStatus,
+  publicCodexFileChanges,
+} from "../codex/file-change.js";
 import {
   buildCodexImageGenerationResultText,
   isCodexImageGenerationRecord,
@@ -42,19 +74,40 @@ import {
 import {
   type CodexToolCallContext,
   canonicalizeCodexToolName,
+  deriveCodexWebRunInvocation,
+  extractCodexExecUpdatePlan,
   normalizeCodexToolInvocation,
   normalizeCodexToolOutputWithContext,
   parseCodexToolArguments,
 } from "../codex/normalization.js";
-import type { ContentBlock, Message, Session } from "../supervisor/types.js";
+import { publicCodexTextPaths } from "../codex/path-projection.js";
+import {
+  codexUserMessageIdentity,
+  collectCodexResponseUserClientIds,
+} from "../codex/user-message-identity.js";
+import { normalizeKimiToolInput } from "../kimi/tool-input.js";
+import type {
+  ContentBlock,
+  Message,
+  Session,
+  SessionSummary,
+} from "../supervisor/types.js";
 import { collectVisibleClaudeEntries } from "./claude-messages.js";
+import { codexEntryAnchor } from "./codex-entry-anchor.js";
 import { applyCodexRollbackMarkers } from "./codex-rollback.js";
 import {
   CODEX_TURN_ABORTED_DISPLAY_TEXT,
   isCodexTurnAbortedNoticeText,
 } from "./codex-turn-aborted.js";
+import { parsePiProviderId } from "./pi-model-refs.js";
+import { canonicalizePiToolName, normalizePiToolInput } from "./pi-tools.js";
+import {
+  MANAGED_ATTACHMENT_MARKER,
+  sanitizePublicUserPrompt,
+} from "./public-user-prompt.js";
 import type { LoadedSession } from "./types.js";
 import { isUserPromptMessage } from "./user-prompt-message.js";
+import { createSessionQuestion } from "./user-questions.js";
 
 interface CodexToolUseConversion {
   callId: string;
@@ -65,6 +118,24 @@ interface CodexToolUseConversion {
 interface PendingExternalCodexToolCall {
   callId: string;
   context: CodexToolCallContext;
+}
+
+function appendNestedCodexPlanBlock(
+  content: ContentBlock[],
+  callId: string,
+  context: CodexToolCallContext,
+): void {
+  if (context.toolName !== "CodexExec") return;
+  const nestedPlan = extractCodexExecUpdatePlan(context.input);
+  if (!nestedPlan) return;
+
+  content.push({
+    type: "tool_use",
+    id: `${callId}-update-plan`,
+    name: "UpdatePlan",
+    input: nestedPlan,
+    status: "completed",
+  });
 }
 
 function normalizeClaudeQueueOperationContent(content: unknown): string {
@@ -104,10 +175,235 @@ function normalizeClaudeQueueOperationContent(content: unknown): string {
     .join("\n");
 }
 
+function sanitizePublicMimeType(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const safe = value
+    .replace(/[^A-Za-z0-9!#$&^_.+/-]+/g, "_")
+    .trim()
+    .slice(0, 120);
+  return safe || undefined;
+}
+
+function safePublicMediaUrl(
+  value: unknown,
+  kind: "image" | "audio",
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const url = value.trim();
+  if (!url) return undefined;
+
+  const dataPrefix = kind === "image" ? /^data:image\//iu : /^data:audio\//iu;
+  if (dataPrefix.test(url) && /;base64,/iu.test(url.slice(0, 256))) {
+    return url;
+  }
+
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" || parsed.protocol === "http:"
+      ? url
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizePublicMediaBlock(block: ContentBlock): ContentBlock {
+  if (block.type !== "input_image" && block.type !== "input_audio") {
+    return block;
+  }
+
+  const kind = block.type === "input_image" ? "image" : "audio";
+  const urlKey = kind === "image" ? "image_url" : "audio_url";
+  const rawUrl = block[urlKey];
+  const publicUrl = safePublicMediaUrl(rawUrl, kind);
+  const mimeType = sanitizePublicMimeType(block.mime_type);
+  if (publicUrl === rawUrl && mimeType === block.mime_type) return block;
+  const projected = { ...block };
+  if (publicUrl) projected[urlKey] = publicUrl;
+  else Reflect.deleteProperty(projected, urlKey);
+  if (mimeType) projected.mime_type = mimeType;
+  else Reflect.deleteProperty(projected, "mime_type");
+  return projected;
+}
+
+function sanitizePublicUserContent(
+  content: string | ContentBlock[] | undefined,
+  codex: boolean,
+): string | ContentBlock[] | undefined {
+  if (typeof content === "string") {
+    return sanitizePublicUserPrompt(content, { codex });
+  }
+  if (!Array.isArray(content)) return content;
+
+  let changed = false;
+  const projected = content.map((block) => {
+    if (!block || typeof block !== "object") return block;
+    if (block.type === "text" && typeof block.text === "string") {
+      const text = sanitizePublicUserPrompt(block.text, { codex });
+      if (text !== block.text) {
+        changed = true;
+        return { ...block, text };
+      }
+    }
+    const media = sanitizePublicMediaBlock(block);
+    if (media !== block) changed = true;
+    return media;
+  });
+  return changed ? projected : content;
+}
+
+function truncatePublicBranchTitle(prompt: string, maxLength: number): string {
+  const firstLine = prompt
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean);
+  const text = firstLine || prompt.trim() || MANAGED_ATTACHMENT_MARKER;
+  if (maxLength < 4 || text.length <= maxLength) {
+    return text.slice(0, maxLength);
+  }
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function sanitizePublicBranchOption(
+  branch: SessionBranchOption,
+  codex: boolean,
+): SessionBranchOption {
+  const prompt = sanitizePublicUserPrompt(branch.prompt, { codex });
+  const sanitizedTitle = sanitizePublicUserPrompt(branch.title, { codex });
+  const title =
+    prompt === branch.prompt
+      ? sanitizedTitle
+      : truncatePublicBranchTitle(prompt, Math.max(branch.title.length, 1));
+  return prompt === branch.prompt && title === branch.title
+    ? branch
+    : { ...branch, prompt, title };
+}
+
+function sanitizePublicBranchState(
+  branchState: SessionBranchState | undefined,
+  codex: boolean,
+): SessionBranchState | undefined {
+  if (!branchState) return undefined;
+  const branches = branchState.branches.map((branch) =>
+    sanitizePublicBranchOption(branch, codex),
+  );
+  return branches.every(
+    (branch, index) => branch === branchState.branches[index],
+  )
+    ? branchState
+    : { ...branchState, branches };
+}
+
+function sanitizeMessageBranchMetadata(
+  value: unknown,
+  codex: boolean,
+): unknown {
+  if (!isRecord(value) || !Array.isArray(value.alternatives)) return value;
+  const currentAlternatives = value.alternatives as unknown[];
+  const alternatives = currentAlternatives.map((branch) =>
+    isRecord(branch) &&
+    typeof branch.prompt === "string" &&
+    typeof branch.title === "string"
+      ? sanitizePublicBranchOption(
+          branch as unknown as SessionBranchOption,
+          codex,
+        )
+      : branch,
+  );
+  return alternatives.every(
+    (branch, index) => branch === currentAlternatives[index],
+  )
+    ? value
+    : { ...value, alternatives };
+}
+
+function sanitizePublicNormalizedMessage(
+  message: Message,
+  codex: boolean,
+): Message {
+  let projected = message;
+
+  if (isUserPromptMessage(message)) {
+    const nestedContent = sanitizePublicUserContent(
+      message.message?.content,
+      codex,
+    );
+    const directContent = sanitizePublicUserContent(
+      message.content as string | ContentBlock[] | undefined,
+      codex,
+    );
+    if (
+      nestedContent !== message.message?.content ||
+      directContent !== message.content
+    ) {
+      projected = {
+        ...projected,
+        ...(message.message
+          ? { message: { ...message.message, content: nestedContent } }
+          : {}),
+        ...(message.content !== undefined ? { content: directContent } : {}),
+      };
+    }
+  }
+
+  const branch = sanitizeMessageBranchMetadata(projected.branch, codex);
+  const codexBranch = sanitizeMessageBranchMetadata(
+    projected.codexBranch,
+    codex,
+  );
+  if (branch !== projected.branch || codexBranch !== projected.codexBranch) {
+    projected = { ...projected, branch, codexBranch };
+  }
+  return projected;
+}
+
+function sanitizePublicNormalizedSession(session: Session): Session {
+  const codex =
+    session.provider === "codex" || session.provider === "codex-oss";
+  const messages = session.messages.map((message) =>
+    sanitizePublicNormalizedMessage(message, codex),
+  );
+  const branchState = sanitizePublicBranchState(session.branchState, codex);
+  const codexBranchState = sanitizePublicBranchState(
+    session.codexBranchState,
+    codex,
+  );
+  const title = session.title
+    ? sanitizePublicUserPrompt(session.title, { codex })
+    : session.title;
+  const fullTitle = session.fullTitle
+    ? sanitizePublicUserPrompt(session.fullTitle, { codex })
+    : session.fullTitle;
+  const userQuestions = session.userQuestions?.map((question) => ({
+    ...question,
+    text: sanitizePublicUserPrompt(question.text, { codex }),
+  }));
+
+  return {
+    ...session,
+    title,
+    fullTitle,
+    userQuestions,
+    branchState,
+    codexBranchState,
+    messages,
+  };
+}
+
+export interface NormalizeSessionOptions {
+  /** Omit inline image payloads from Pi messages. */
+  deferMedia?: boolean;
+  /** Omit Pi thinking blocks from messages. */
+  deferThinking?: boolean;
+}
+
 /**
  * Normalize a UnifiedSession into the generic Session format expected by the frontend.
  */
-export function normalizeSession(loaded: LoadedSession): Session {
+export function normalizeSession(
+  loaded: LoadedSession,
+  options?: NormalizeSessionOptions,
+): Session {
   const { summary, data } = loaded;
 
   switch (data.provider) {
@@ -127,43 +423,670 @@ export function normalizeSession(loaded: LoadedSession): Session {
         convertClaudeMessage(raw, index, orphanedToolUses),
       );
 
-      return {
+      return sanitizePublicNormalizedSession({
         ...summary,
         branchState: loaded.branchState,
         messages: loaded.branchState
           ? annotateBranchMessages(messages, loaded.branchState)
           : messages,
-      };
+      });
     }
     case "codex":
     case "codex-oss": {
       const branchState = loaded.codexBranchState ?? loaded.branchState;
-      return {
+      const messages = loaded.projectedMessages
+        ? loaded.projectedMessages
+        : convertCodexEntries(
+            applyCodexRollbackMarkers(data.session.entries),
+            summary.id,
+            branchState,
+            {
+              model: summary.model,
+              provider: data.provider,
+            },
+          );
+      return sanitizePublicNormalizedSession({
         ...summary,
         branchState,
         codexBranchState: loaded.codexBranchState,
-        messages: convertCodexEntries(
-          applyCodexRollbackMarkers(data.session.entries),
-          summary.id,
-          branchState,
-          {
-            model: summary.model,
-            provider: data.provider,
-          },
-        ),
-      };
+        messages,
+      });
     }
     case "gemini":
-      return {
+      return sanitizePublicNormalizedSession({
         ...summary,
         messages: convertGeminiMessages(data.session.messages),
-      };
-    case "opencode":
-      return {
+      });
+    case "pi": {
+      const precomputed = loaded.precomputedPiMessages;
+      const deferMedia =
+        options?.deferMedia ?? precomputed?.deferMedia ?? false;
+      const deferThinking =
+        options?.deferThinking ?? precomputed?.deferThinking ?? false;
+      const messages =
+        precomputed &&
+        precomputed.deferMedia === deferMedia &&
+        precomputed.deferThinking === deferThinking
+          ? precomputed.messages
+          : convertPiSession(data.session, {
+              deferMedia,
+              deferThinking,
+            }).messages;
+      return sanitizePublicNormalizedSession({
         ...summary,
-        messages: convertOpenCodeEntries(data.session.messages),
-      };
+        branchState: loaded.branchState,
+        messages: loaded.branchState
+          ? annotateBranchMessages(messages, loaded.branchState)
+          : messages,
+      });
+    }
+    case "kimi":
+      return sanitizePublicNormalizedSession({
+        ...summary,
+        messages: convertKimiMessages(data.session),
+      });
+    case "zcode": {
+      const messages = convertZCodeMessages(data.session);
+      return sanitizePublicNormalizedSession({
+        ...summary,
+        branchState: loaded.branchState,
+        messages: loaded.branchState
+          ? annotateBranchMessages(messages, loaded.branchState)
+          : messages,
+      });
+    }
   }
+}
+
+// --- Pi Conversion Logic ---
+
+export interface PiDerivedSession {
+  model?: string;
+  reasoningEffort?: string;
+  titleText: string;
+  messageCount: number;
+  userQuestions: NonNullable<SessionSummary["userQuestions"]>;
+  contextUsage?: ContextUsage;
+  cumulativeUsage?: ContextCumulativeUsage;
+  compactEvents?: ContextCompactEvent[];
+  lastTurnStatus?: SessionSummary["lastTurnStatus"];
+  lastErrorMessage?: string;
+}
+
+export interface PiSessionConversionOptions {
+  /** Omit inline image payloads from the normalized message blocks. */
+  deferMedia?: boolean;
+  /**
+   * Records that the parsed session was read with preview-only thinking.
+   *
+   * Reasoning blocks are always converted; the flag only participates in
+   * precomputed-message cache matching so a preview read is never reused for a
+   * caller that asked for full reasoning bodies.
+   */
+  deferThinking?: boolean;
+  /** Resolve provider-specific context windows while deriving the summary. */
+  getContextWindow?: (
+    model: string | undefined,
+    provider?: ProviderName,
+    sessionId?: string,
+  ) => number | undefined;
+}
+
+export interface PiSessionConversion {
+  messages: Message[];
+  derived: PiDerivedSession;
+}
+
+function isPiSessionMessageEntry(
+  entry: PiSessionEntry,
+): entry is PiSessionEntry & { type: "message"; message: PiAgentMessage } {
+  return (
+    entry.type === "message" && "message" in entry && isRecord(entry.message)
+  );
+}
+
+function qualifyPiSessionModel(
+  modelId: string,
+  providerId: string | undefined,
+): string {
+  const { channelId } = parsePiProviderId(providerId);
+  if (!channelId || modelId.startsWith(`${channelId}/`)) return modelId;
+  return `${channelId}/${modelId}`;
+}
+
+/**
+ * Context-window fill reported by one Pi assistant turn.
+ *
+ * Mirrors `calculateContextTokens()` in Pi itself
+ * (`references/pi/packages/ai/src/utils/estimate.ts`): the provider-reported
+ * `totalTokens` is authoritative, and the component sum — which **includes**
+ * `output` — is only the fallback for older logs that omitted it.
+ */
+function piContextTokens(usage: PiUsage): number {
+  return (
+    usage.totalTokens ||
+    (usage.input ?? 0) +
+      (usage.output ?? 0) +
+      (usage.cacheRead ?? 0) +
+      (usage.cacheWrite ?? 0)
+  );
+}
+
+/**
+ * Whether an assistant turn's `usage` describes the current context window.
+ *
+ * Pi persists an assistant entry even when the request never produced a
+ * response (`aborted`, `error`), and those entries carry an all-zero `usage`.
+ * Reading the newest assistant unconditionally therefore reported a 0% context
+ * meter right after any interrupt, which read as "empty session" in the
+ * composer ring until the next successful turn. Pi's own
+ * `getLastAssistantUsageInfo()` applies the same filter, and Codex's reader
+ * already guards with `inputTokens > 0` — this keeps Pi consistent with both.
+ */
+function isPiUsageBearingAssistant(message: PiAssistantMessage): boolean {
+  if (!message.usage) return false;
+  if (message.stopReason === "aborted" || message.stopReason === "error") {
+    return false;
+  }
+  return piContextTokens(message.usage) > 0;
+}
+
+interface PiDerivationAccumulator {
+  model?: string;
+  reasoningEffort?: string;
+  explicitName?: string;
+  firstUserText: string;
+  messageCount: number;
+  lastConversationRole?: string;
+  lastAssistant?: PiAssistantMessage;
+  /**
+   * Newest assistant turn whose `usage` can be trusted as a context-window
+   * snapshot. Tracked separately from `lastAssistant`, which still has to be
+   * the literal last entry so `lastTurnStatus`/`lastErrorMessage` keep
+   * reporting the interrupt.
+   */
+  lastUsageAssistant?: PiAssistantMessage;
+  userQuestions: NonNullable<SessionSummary["userQuestions"]>;
+  compactEvents: ContextCompactEvent[];
+  cumulative: ContextCumulativeUsage;
+}
+
+function createPiDerivationAccumulator(): PiDerivationAccumulator {
+  return {
+    firstUserText: "",
+    messageCount: 0,
+    userQuestions: [],
+    compactEvents: [],
+    cumulative: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      totalTokens: 0,
+      turnCount: 0,
+    },
+  };
+}
+
+function consumePiDerivation(
+  accumulator: PiDerivationAccumulator,
+  entry: PiSessionEntry,
+): void {
+  if (entry.type === "session_info" && "name" in entry) {
+    const name = entry.name;
+    if (typeof name === "string" && name.trim()) {
+      accumulator.explicitName = name;
+    }
+  } else if (entry.type === "model_change" && "modelId" in entry) {
+    if (typeof entry.modelId === "string") {
+      accumulator.model = qualifyPiSessionModel(
+        entry.modelId,
+        "provider" in entry && typeof entry.provider === "string"
+          ? entry.provider
+          : undefined,
+      );
+    }
+  } else if (
+    entry.type === "thinking_level_change" &&
+    "thinkingLevel" in entry &&
+    typeof entry.thinkingLevel === "string"
+  ) {
+    accumulator.reasoningEffort = entry.thinkingLevel;
+  } else if (entry.type === "compaction" && "summary" in entry) {
+    const beforeTokens =
+      "tokensBefore" in entry && typeof entry.tokensBefore === "number"
+        ? entry.tokensBefore
+        : undefined;
+    accumulator.compactEvents.push({
+      timestamp: entry.timestamp,
+      beforeTokens,
+      trigger: "pi",
+    });
+  }
+
+  if (!isPiSessionMessageEntry(entry)) return;
+  const message = entry.message;
+  if (message.role === "user") {
+    accumulator.messageCount += 1;
+    accumulator.lastConversationRole = "user";
+    const text = getPiMessageText(message);
+    if (!accumulator.firstUserText && text.trim()) {
+      accumulator.firstUserText = text;
+    }
+    const question = createSessionQuestion(
+      { id: entry.id, text, timestamp: entry.timestamp },
+      `pi-user-${accumulator.userQuestions.length}`,
+    );
+    if (question) accumulator.userQuestions.push(question);
+  } else if (message.role === "assistant") {
+    accumulator.messageCount += 1;
+    accumulator.lastConversationRole = "assistant";
+    accumulator.lastAssistant = message;
+    if (isPiUsageBearingAssistant(message)) {
+      accumulator.lastUsageAssistant = message;
+    }
+    accumulator.model = message.model
+      ? qualifyPiSessionModel(message.model, message.provider)
+      : accumulator.model;
+    if (message.usage && piContextTokens(message.usage) > 0) {
+      // Aborted/errored turns log an all-zero usage block. Counting them
+      // inflated the "N turns" label without adding any spend.
+      accumulator.cumulative.inputTokens += message.usage.input ?? 0;
+      accumulator.cumulative.outputTokens += message.usage.output ?? 0;
+      accumulator.cumulative.cacheReadTokens += message.usage.cacheRead ?? 0;
+      accumulator.cumulative.cacheCreationTokens +=
+        message.usage.cacheWrite ?? 0;
+      accumulator.cumulative.totalTokens =
+        (accumulator.cumulative.totalTokens ?? 0) +
+        (message.usage.totalTokens ?? 0);
+      accumulator.cumulative.turnCount += 1;
+    }
+  } else if (message.role === "toolResult") {
+    // A trailing tool result means the assistant still owes a reply. Tool
+    // results are not conversation turns, so only the tail marker moves.
+    accumulator.lastConversationRole = "toolResult";
+  }
+}
+
+function finishPiDerivation(
+  session: PiSessionContent,
+  accumulator: PiDerivationAccumulator,
+  options: PiSessionConversionOptions,
+): PiDerivedSession {
+  const usage = accumulator.lastUsageAssistant?.usage;
+  const contextWindow =
+    options.getContextWindow?.(accumulator.model, "pi", session.header.id) ??
+    (accumulator.model
+      ? getModelContextWindow(accumulator.model, "pi")
+      : undefined);
+  const inputTokens = usage ? piContextTokens(usage) : 0;
+  // Leaving `contextUsage` undefined (rather than emitting a zeroed record) is
+  // load-bearing: the client only falls back to the live `context-status`
+  // endpoint when the field is absent, and `mergeSameSessionMetadata()` only
+  // preserves the previous good value for an undefined incoming one.
+  const contextUsage =
+    usage && contextWindow && inputTokens > 0
+      ? {
+          inputTokens,
+          outputTokens: usage.output ?? 0,
+          cacheReadTokens: usage.cacheRead ?? 0,
+          cacheCreationTokens: usage.cacheWrite ?? 0,
+          contextWindow,
+          // Round like the Codex/Kimi/Gemini readers do. Pi's raw ratio is a
+          // float, and the meter label rendered it verbatim ("55.3906%").
+          percentage: Math.min(
+            100,
+            Math.round((inputTokens / contextWindow) * 100),
+          ),
+        }
+      : undefined;
+  const stopReason = accumulator.lastAssistant?.stopReason;
+  // Only these stop reasons hand control back to the user. `toolUse` (and the
+  // non-final `pending`/`deferred`) mean the agent was still mid-turn, so a
+  // persisted session ending there was cut short rather than completed — it
+  // used to be reported as "completed" because any last assistant message
+  // counted as one.
+  const settledStopReason =
+    stopReason === "stop" || stopReason === "length" || stopReason === "error";
+  const lastTurnStatus =
+    accumulator.lastConversationRole === "user" ||
+    accumulator.lastConversationRole === "toolResult"
+      ? ("interrupted" as const)
+      : stopReason === "error"
+        ? ("failed" as const)
+        : !accumulator.lastAssistant
+          ? undefined
+          : settledStopReason
+            ? ("completed" as const)
+            : ("interrupted" as const);
+
+  return {
+    model: accumulator.model,
+    reasoningEffort: accumulator.reasoningEffort,
+    titleText: accumulator.explicitName ?? accumulator.firstUserText,
+    messageCount: accumulator.messageCount,
+    userQuestions: accumulator.userQuestions,
+    contextUsage,
+    cumulativeUsage:
+      accumulator.cumulative.turnCount > 0 ? accumulator.cumulative : undefined,
+    compactEvents:
+      accumulator.compactEvents.length > 0
+        ? accumulator.compactEvents
+        : undefined,
+    lastTurnStatus,
+    lastErrorMessage:
+      stopReason === "error"
+        ? accumulator.lastAssistant?.errorMessage
+        : undefined,
+  };
+}
+
+export function derivePiSession(
+  session: PiSessionContent,
+  options: PiSessionConversionOptions = {},
+): PiDerivedSession {
+  const accumulator = createPiDerivationAccumulator();
+  for (const entry of session.activeEntries) {
+    consumePiDerivation(accumulator, entry);
+  }
+  return finishPiDerivation(session, accumulator, options);
+}
+
+function piInputContent(
+  message: Extract<PiAgentMessage, { role: "user" | "custom" }>,
+  options: PiSessionConversionOptions,
+): string | ContentBlock[] {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  const blocks: ContentBlock[] = [];
+  for (const block of message.content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text") {
+      blocks.push({ type: "text", text: block.text });
+    } else if (block.type === "image") {
+      blocks.push(
+        options.deferMedia || block.deferred
+          ? {
+              type: "input_image",
+              mime_type: block.mimeType,
+              deferred: true,
+            }
+          : {
+              type: "input_image",
+              mime_type: block.mimeType,
+              image_url: `data:${block.mimeType};base64,${block.data}`,
+            },
+      );
+    }
+  }
+  return blocks;
+}
+
+interface PiToolCallRegistration {
+  id: string;
+  nativeName: string;
+  nativeInput: unknown;
+  block: ContentBlock;
+}
+
+function piAssistantContent(
+  message: PiAssistantMessage,
+  resultDetailsByCallId: ReadonlyMap<string, unknown>,
+  options: PiSessionConversionOptions,
+  onToolCall?: (registration: PiToolCallRegistration) => void,
+): ContentBlock[] {
+  if (!Array.isArray(message.content)) return [];
+  const blocks: ContentBlock[] = [];
+  for (const block of message.content) {
+    if (!block || typeof block !== "object") continue;
+    switch (block.type) {
+      case "text":
+        blocks.push({ type: "text", text: block.text });
+        break;
+      case "thinking": {
+        // Reasoning is a visible timeline row and a tool-group boundary, so the
+        // block is always emitted. Deferred loads carry a bounded preview plus
+        // the original length so the display layer can offer the full body
+        // behind an explicit detail request.
+        const thinking = block.thinking;
+        if (typeof thinking !== "string" || !thinking.trim()) break;
+        blocks.push({
+          type: "thinking",
+          thinking,
+          ...(block.deferred ? { deferred: true } : {}),
+          ...(typeof block.thinkingLength === "number"
+            ? { thinkingLength: block.thinkingLength }
+            : {}),
+          ...((block.thinkingSignature ?? block.signature)
+            ? { signature: block.thinkingSignature ?? block.signature }
+            : {}),
+        });
+        break;
+      }
+      case "toolCall": {
+        const toolBlock: ContentBlock = {
+          type: "tool_use",
+          id: block.id,
+          name: canonicalizePiToolName(block.name),
+          input: normalizePiToolInput(
+            block.name,
+            block.arguments,
+            resultDetailsByCallId.get(block.id),
+          ),
+        };
+        blocks.push(toolBlock);
+        onToolCall?.({
+          id: block.id,
+          nativeName: block.name,
+          nativeInput: block.arguments,
+          block: toolBlock,
+        });
+        break;
+      }
+      case "image":
+        blocks.push(
+          options.deferMedia || block.deferred
+            ? { type: "image", mime_type: block.mimeType, deferred: true }
+            : {
+                type: "image",
+                mime_type: block.mimeType,
+                image_url: `data:${block.mimeType};base64,${block.data}`,
+              },
+        );
+        break;
+    }
+  }
+  return blocks;
+}
+
+function piToolResultContent(message: PiToolResultMessage): string {
+  if (!Array.isArray(message.content)) return "";
+  const parts: string[] = [];
+  for (const block of message.content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text") parts.push(block.text);
+    else if (block.type === "image") parts.push("[Image]");
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Convert Pi's active JSONL branch and derive its summary in one traversal.
+ * Tool-result details are applied retroactively to the corresponding tool-use
+ * block, so the old details pre-scan is no longer needed.
+ */
+export function convertPiSession(
+  session: PiSessionContent,
+  options: PiSessionConversionOptions = {},
+): PiSessionConversion {
+  const messages: Message[] = [];
+  const accumulator = createPiDerivationAccumulator();
+  const resultDetailsByCallId = new Map<string, unknown>();
+  const toolCallsById = new Map<string, PiToolCallRegistration[]>();
+
+  const registerToolCall = (registration: PiToolCallRegistration): void => {
+    const registrations = toolCallsById.get(registration.id) ?? [];
+    registrations.push(registration);
+    toolCallsById.set(registration.id, registrations);
+    const details = resultDetailsByCallId.get(registration.id);
+    if (details !== undefined) {
+      registration.block.input = normalizePiToolInput(
+        registration.nativeName,
+        registration.nativeInput,
+        details,
+      );
+    }
+  };
+
+  for (const entry of session.activeEntries) {
+    consumePiDerivation(accumulator, entry);
+
+    if (entry.type === "compaction" && "summary" in entry) {
+      messages.push({
+        uuid: entry.id,
+        parentUuid: entry.parentId,
+        type: "system",
+        subtype: "compact_boundary",
+        content:
+          typeof entry.summary === "string"
+            ? entry.summary
+            : "Context compacted",
+        timestamp: entry.timestamp,
+      });
+      continue;
+    }
+    if (entry.type === "branch_summary" && "summary" in entry) {
+      messages.push({
+        uuid: entry.id,
+        parentUuid: entry.parentId,
+        type: "summary",
+        message: {
+          role: "assistant",
+          content: typeof entry.summary === "string" ? entry.summary : "",
+        },
+        timestamp: entry.timestamp,
+      });
+      continue;
+    }
+    if (!isPiSessionMessageEntry(entry)) continue;
+
+    const message = entry.message;
+    switch (message.role) {
+      case "user":
+        messages.push({
+          uuid: entry.id,
+          parentUuid: entry.parentId,
+          type: "user",
+          message: {
+            role: "user",
+            content: piInputContent(message, options),
+          },
+          timestamp: entry.timestamp,
+        });
+        break;
+      case "assistant":
+        messages.push({
+          uuid: entry.id,
+          parentUuid: entry.parentId,
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: piAssistantContent(
+              message,
+              resultDetailsByCallId,
+              options,
+              registerToolCall,
+            ),
+            ...(message.model ? { model: message.model } : {}),
+          },
+          usage: message.usage,
+          stopReason: message.stopReason,
+          ...(message.errorMessage ? { error: message.errorMessage } : {}),
+          timestamp: entry.timestamp,
+        });
+        break;
+      case "toolResult": {
+        resultDetailsByCallId.set(message.toolCallId, message.details);
+        for (const registration of toolCallsById.get(message.toolCallId) ??
+          []) {
+          registration.block.input = normalizePiToolInput(
+            registration.nativeName,
+            registration.nativeInput,
+            message.details,
+          );
+        }
+        const content = piToolResultContent(message);
+        messages.push({
+          uuid: entry.id,
+          parentUuid: entry.parentId,
+          type: "user",
+          tool_use_id: message.toolCallId,
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: message.toolCallId,
+                content,
+                ...(message.isError ? { is_error: true } : {}),
+              },
+            ],
+          },
+          timestamp: entry.timestamp,
+        });
+        break;
+      }
+      case "bashExecution":
+        messages.push({
+          uuid: entry.id,
+          parentUuid: entry.parentId,
+          type: "system",
+          subtype: "bash_execution",
+          content: `Ran \`${message.command}\`\n\n${message.output}`,
+          exitCode: message.exitCode,
+          timestamp: entry.timestamp,
+        });
+        break;
+      case "custom":
+        if (message.display) {
+          messages.push({
+            uuid: entry.id,
+            parentUuid: entry.parentId,
+            type: "system",
+            subtype: message.customType,
+            message: {
+              role: "user",
+              content: piInputContent(message, options),
+            },
+            timestamp: entry.timestamp,
+          });
+        }
+        break;
+      case "branchSummary":
+      case "compactionSummary":
+        messages.push({
+          uuid: entry.id,
+          parentUuid: entry.parentId,
+          type: "summary",
+          message: { role: "assistant", content: message.summary },
+          timestamp: entry.timestamp,
+        });
+        break;
+    }
+  }
+
+  return {
+    messages,
+    derived: finishPiDerivation(session, accumulator, options),
+  };
+}
+
+/** Convert Pi's active JSONL branch into Yep's provider-neutral transcript. */
+export function convertPiMessages(
+  session: PiSessionContent,
+  options: PiSessionConversionOptions = {},
+): Message[] {
+  return convertPiSession(session, options).messages;
 }
 
 // --- Claude Conversion Logic ---
@@ -267,10 +1190,19 @@ function hasNearbyCodexCompactedEntry(
 interface CodexContextSnapshotOptions {
   model?: string;
   provider: "codex" | "codex-oss";
+  /** Trusted session cwd used to publish workspace-relative file changes. */
+  workspaceRoot?: string;
+  /** Global rollout fact used when the supplied page starts mid-file. */
+  hasResponseItemUser?: boolean;
+  /** Global semantic facts collected by the bounded Codex page scanner. */
+  patchApplyCallIds?: ReadonlySet<string>;
+  directEditCallIds?: ReadonlySet<string>;
+  responseImageGenerationIds?: ReadonlySet<string>;
+  imageGenerationEndIds?: ReadonlySet<string>;
 }
 
 function isCodexTokenCountImmediatelyAfterCompaction(
-  entries: CodexSessionEntry[],
+  entries: readonly CodexSessionEntry[],
   tokenCountIndex: number,
 ): boolean {
   for (let i = tokenCountIndex - 1; i >= 0; i--) {
@@ -292,7 +1224,7 @@ function isCodexTokenCountImmediatelyAfterCompaction(
 }
 
 function extractCodexTokenCountContextUsage(
-  entries: CodexSessionEntry[],
+  entries: readonly CodexSessionEntry[],
   tokenCountIndex: number,
   options: CodexContextSnapshotOptions,
 ): ContextUsage | undefined {
@@ -340,8 +1272,21 @@ function extractCodexTokenCountContextUsage(
   return result;
 }
 
-function convertCodexEntries(
-  entries: CodexSessionEntry[],
+function findCodexWorkspaceRoot(
+  entries: readonly CodexSessionEntry[],
+): string | undefined {
+  const sessionMeta = entries.find((entry) => entry.type === "session_meta");
+  if (sessionMeta?.type === "session_meta") return sessionMeta.payload.cwd;
+
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry?.type === "turn_context") return entry.payload.cwd;
+  }
+  return undefined;
+}
+
+export function convertCodexEntries(
+  entries: readonly CodexSessionEntry[],
   sessionId: string,
   branchState?: SessionBranchState,
   contextOptions: CodexContextSnapshotOptions = { provider: "codex" },
@@ -349,7 +1294,12 @@ function convertCodexEntries(
   const messages: Message[] = [];
   let messageIndex = 0;
   let pendingContextMessage: Message | null = null;
-  const hasResponseItemUser = hasCodexResponseItemUserMessages(entries);
+  const workspaceRoot =
+    contextOptions.workspaceRoot ?? findCodexWorkspaceRoot(entries);
+  const hasResponseItemUser =
+    contextOptions.hasResponseItemUser ??
+    hasCodexResponseItemUserMessages(entries);
+  const responseUserClientIds = collectCodexResponseUserClientIds(entries);
   const compactedTimestamps = entries
     .filter((entry) => entry.type === "compacted")
     .map((entry) => timestampToMs(entry.timestamp))
@@ -357,27 +1307,62 @@ function convertCodexEntries(
   const toolCallContexts = new Map<string, CodexToolCallContext>();
   const externalToolCalls: PendingExternalCodexToolCall[] = [];
   const responseItemImageGenerationIds =
+    contextOptions.responseImageGenerationIds ??
     collectResponseItemImageGenerationIds(entries);
-  const imageGenerationEndKeys = collectCodexImageGenerationEndKeys(entries);
+  const imageGenerationEndKeys =
+    contextOptions.imageGenerationEndIds ??
+    collectCodexImageGenerationEndKeys(entries);
+  const patchApplyEndByCallId = collectCodexPatchApplyEndEvents(entries);
+  const patchApplySkipCallIds =
+    contextOptions.patchApplyCallIds ?? new Set(patchApplyEndByCallId.keys());
+  const directEditCallIds =
+    contextOptions.directEditCallIds ?? collectCodexDirectEditCallIds(entries);
 
   for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
     const entry = entries[entryIndex];
     if (!entry) continue;
 
+    // Identity is anchored to the entry, not to how far into this array we are,
+    // so a tail read of the same rollout produces the same ids.
+    const anchor = codexEntryAnchor(
+      entry,
+      `${messageIndex}-${entry.timestamp}`,
+    );
+
     if (entry.type === "response_item") {
+      messageIndex++;
       const converted = convertCodexResponseItem(
         entry,
-        messageIndex++,
+        anchor,
         toolCallContexts,
         externalToolCalls,
-        { skippedImageGenerationCallKeys: imageGenerationEndKeys },
+        {
+          skippedImageGenerationCallKeys: imageGenerationEndKeys,
+          patchApplyEndByCallId,
+          skippedPatchApplyCallIds: patchApplySkipCallIds,
+          workspaceRoot,
+        },
       );
       const convertedMessages = Array.isArray(converted)
         ? converted
         : converted
           ? [converted]
           : [];
+      const correlationKey = getCodexResponseCorrelationKey(entry.payload);
+      const responseTurnId = getCodexResponsePayloadTurnId(entry.payload);
+      const responseUserIdentity = codexUserMessageIdentity(
+        responseUserClientIds.get(entry),
+      );
       for (const msg of convertedMessages) {
+        if (correlationKey) {
+          msg.codexCorrelationKey = correlationKey;
+        }
+        if (responseTurnId) {
+          msg.codexTurnId = responseTurnId;
+        }
+        if (responseUserIdentity) {
+          Object.assign(msg, responseUserIdentity);
+        }
         if (isCodexCorrelationDebugEnabled()) {
           logCodexCorrelationDebug({
             sessionId,
@@ -398,7 +1383,8 @@ function convertCodexEntries(
       }
     } else if (entry.type === "compacted") {
       pendingContextMessage = null;
-      const msg = convertCodexCompactedEntry(entry, messageIndex++);
+      messageIndex++;
+      const msg = convertCodexCompactedEntry(entry, anchor);
       if (msg) {
         if (isCodexCorrelationDebugEnabled()) {
           logCodexCorrelationDebug({
@@ -439,15 +1425,47 @@ function convertCodexEntries(
         entry.payload.type === "item_completed"
           ? convertCodexItemCompletedImageGeneration(
               entry,
-              messageIndex,
+              anchor,
               responseItemImageGenerationIds,
             )
           : entry.payload.type === "image_generation_end"
-            ? convertCodexImageGenerationEndEvent(entry, messageIndex)
+            ? convertCodexImageGenerationEndEvent(entry, anchor)
             : null;
+      const patchApplyPayload =
+        entry.payload.type === "patch_apply_end" ? entry.payload : null;
+      const patchApplyMessages = patchApplyPayload
+        ? convertCodexPatchApplyEndEvent(
+            entry,
+            anchor,
+            !directEditCallIds.has(patchApplyPayload.call_id),
+            workspaceRoot,
+          )
+        : null;
       // Skip agent_message and agent_reasoning events when response_item exists;
       // those are streaming artifacts that duplicate full response data.
-      if (imageGenerationMessages) {
+      if (patchApplyMessages && patchApplyPayload) {
+        messageIndex++;
+        for (const msg of patchApplyMessages) {
+          if (isCodexCorrelationDebugEnabled()) {
+            logCodexCorrelationDebug({
+              sessionId,
+              channel: "jsonl",
+              authority: "durable",
+              entryType: entry.type,
+              payloadType: entry.payload.type,
+              eventKind: "file_change",
+              turnId: getCodexEventPayloadTurnId(entry.payload),
+              callId: patchApplyPayload.call_id,
+              status: normalizeCodexFileChangeStatus(
+                patchApplyPayload.status,
+                patchApplyPayload.success,
+              ),
+              ...summarizeCodexNormalizedMessage(msg),
+            });
+          }
+          messages.push(msg);
+        }
+      } else if (imageGenerationMessages) {
         messageIndex++;
         for (const msg of imageGenerationMessages) {
           if (isCodexCorrelationDebugEnabled()) {
@@ -470,7 +1488,8 @@ function convertCodexEntries(
         shouldIncludeTurnAborted ||
         shouldIncludeContextCompacted
       ) {
-        const msg = convertCodexEventMsg(entry, messageIndex++);
+        messageIndex++;
+        const msg = convertCodexEventMsg(entry, anchor);
         if (msg) {
           if (isCodexCorrelationDebugEnabled()) {
             logCodexCorrelationDebug({
@@ -524,7 +1543,7 @@ function branchMessageKey(timestamp: string | undefined, prompt: string) {
   return `${timestamp ?? ""}\n${prompt}`;
 }
 
-function annotateBranchMessages(
+export function annotateBranchMessages(
   messages: Message[],
   branchState: SessionBranchState,
   options: { includeCodexAlias?: boolean } = {},
@@ -569,7 +1588,8 @@ function annotateBranchMessages(
     const parentKey = branch.parentId ?? "<root>";
     const alternatives = branchesByParent.get(parentKey) ?? [branch];
     const branchMetadata = {
-      sessionId: branchState.sessionId,
+      // Cross-session edit alternatives carry the branch's native session id.
+      sessionId: branch.sessionId,
       branchId: branch.id,
       activeBranchId: branchState.activeBranchId,
       selectedBranchId: branchState.selectedBranchId,
@@ -620,6 +1640,9 @@ function getCodexResponsePayloadItemId(
   payload: CodexResponseItemEntry["payload"],
 ): string | undefined {
   switch (payload.type) {
+    case "message":
+    case "reasoning":
+      return payload.id;
     case "function_call":
     case "function_call_output":
       return payload.call_id;
@@ -634,6 +1657,31 @@ function getCodexResponsePayloadItemId(
     default:
       return undefined;
   }
+}
+
+function getCodexResponsePayloadTurnId(
+  payload: CodexResponseItemEntry["payload"],
+): string | undefined {
+  if (payload.type !== "message" && payload.type !== "reasoning") {
+    return undefined;
+  }
+  return payload.internal_chat_message_metadata_passthrough?.turn_id;
+}
+
+function getCodexResponseCorrelationKey(
+  payload: CodexResponseItemEntry["payload"],
+): string | undefined {
+  const itemId = getCodexResponsePayloadItemId(payload);
+  const turnId = getCodexResponsePayloadTurnId(payload);
+  if (!itemId || !turnId) return undefined;
+
+  if (payload.type === "message" && payload.role === "assistant") {
+    return `codex:${turnId}:agent-message:${itemId}`;
+  }
+  if (payload.type === "reasoning") {
+    return `codex:${turnId}:reasoning:${itemId}`;
+  }
+  return undefined;
 }
 
 function getCodexEventPayloadTurnId(
@@ -660,7 +1708,7 @@ function getCodexEventPayloadItemId(
 }
 
 function hasCodexResponseItemUserMessages(
-  entries: CodexSessionEntry[],
+  entries: readonly CodexSessionEntry[],
 ): boolean {
   return entries.some(
     (entry) =>
@@ -671,7 +1719,7 @@ function hasCodexResponseItemUserMessages(
 }
 
 function collectResponseItemImageGenerationIds(
-  entries: CodexSessionEntry[],
+  entries: readonly CodexSessionEntry[],
 ): Set<string> {
   const ids = new Set<string>();
   for (const entry of entries) {
@@ -686,8 +1734,49 @@ function collectResponseItemImageGenerationIds(
   return ids;
 }
 
+function collectCodexPatchApplyEndEvents(
+  entries: readonly CodexSessionEntry[],
+): Map<string, CodexPatchApplyEndEvent> {
+  const events = new Map<string, CodexPatchApplyEndEvent>();
+  for (const entry of entries) {
+    if (
+      entry.type === "event_msg" &&
+      entry.payload.type === "patch_apply_end"
+    ) {
+      events.set(entry.payload.call_id, entry.payload);
+    }
+  }
+  return events;
+}
+
+function collectCodexDirectEditCallIds(
+  entries: readonly CodexSessionEntry[],
+): Set<string> {
+  const callIds = new Set<string>();
+  for (const entry of entries) {
+    if (entry.type !== "response_item") continue;
+    const payload = entry.payload;
+    if (
+      payload.type !== "function_call" &&
+      payload.type !== "custom_tool_call"
+    ) {
+      continue;
+    }
+    const rawName = payload.name;
+    if (
+      typeof rawName === "string" &&
+      canonicalizeCodexToolName(rawName, payload.namespace ?? undefined) ===
+        "Edit"
+    ) {
+      const callId = getCodexResponsePayloadCallId(payload);
+      if (callId) callIds.add(callId);
+    }
+  }
+  return callIds;
+}
+
 function collectCodexImageGenerationEndKeys(
-  entries: CodexSessionEntry[],
+  entries: readonly CodexSessionEntry[],
 ): Set<string> {
   const keys = new Set<string>();
   for (const entry of entries) {
@@ -721,7 +1810,7 @@ function collectCodexImageGenerationRecordKeys(
 
 function hasMatchingCodexImageGenerationRecordKey(
   record: Record<string, unknown>,
-  keys?: Set<string>,
+  keys?: ReadonlySet<string>,
 ): boolean {
   if (!keys?.size) return false;
   return collectCodexImageGenerationRecordKeys(record).some((key) =>
@@ -731,8 +1820,8 @@ function hasMatchingCodexImageGenerationRecordKey(
 
 function convertCodexItemCompletedImageGeneration(
   entry: CodexEventMsgEntry,
-  index: number,
-  responseItemImageGenerationIds: Set<string>,
+  anchor: string,
+  responseItemImageGenerationIds: ReadonlySet<string>,
 ): Message[] | null {
   if (entry.payload.type !== "item_completed") {
     return null;
@@ -750,14 +1839,14 @@ function convertCodexItemCompletedImageGeneration(
 
   return convertCodexImageGenerationRecord(
     item,
-    `codex-event-${index}-${entry.timestamp}`,
+    `codex-event-${anchor}`,
     entry.timestamp,
   );
 }
 
 function convertCodexImageGenerationEndEvent(
   entry: CodexEventMsgEntry,
-  index: number,
+  anchor: string,
 ): Message[] | null {
   if (entry.payload.type !== "image_generation_end") {
     return null;
@@ -765,20 +1854,96 @@ function convertCodexImageGenerationEndEvent(
 
   return convertCodexImageGenerationRecord(
     entry.payload as Record<string, unknown>,
-    `codex-event-${index}-${entry.timestamp}`,
+    `codex-event-${anchor}`,
     entry.timestamp,
   );
 }
 
+function convertCodexPatchApplyEndEvent(
+  entry: CodexEventMsgEntry,
+  anchor: string,
+  includeToolUse = true,
+  workspaceRoot?: string,
+): Message[] | null {
+  if (entry.payload.type !== "patch_apply_end") {
+    return null;
+  }
+
+  const payload = entry.payload;
+  const changes = publicCodexFileChanges(payload.changes, { workspaceRoot });
+  const status = normalizeCodexFileChangeStatus(
+    payload.status,
+    payload.success,
+  );
+  const isError = isCodexFileChangeError(status);
+  const stdout = publicCodexTextPaths(payload.stdout?.trim() ?? "", {
+    workspaceRoot,
+    fileChangePaths: true,
+  });
+  const stderr = publicCodexTextPaths(payload.stderr?.trim() ?? "", {
+    workspaceRoot,
+    fileChangePaths: true,
+  });
+  const fallbackResult = formatCodexFileChangeResult(changes, status);
+  const resultText = isError
+    ? [stderr, stdout].filter(Boolean).join("\n") || fallbackResult
+    : stdout || stderr || fallbackResult;
+  const uuid = `codex-${anchor}-patch`;
+
+  const toolUseMessage: Message = {
+    uuid,
+    type: "assistant",
+    message: {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: payload.call_id,
+          name: "Edit",
+          input: buildCodexEditInput(changes),
+          status: isError ? "error" : "completed",
+        },
+      ],
+    },
+    codexToolName: "apply_patch",
+    timestamp: entry.timestamp,
+  };
+  const toolResultMessage: Message = {
+    uuid: `${uuid}-result`,
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: payload.call_id,
+          content: resultText,
+          ...(isError && { is_error: true }),
+        },
+      ],
+    },
+    timestamp: entry.timestamp,
+  };
+
+  return includeToolUse
+    ? [toolUseMessage, toolResultMessage]
+    : [toolResultMessage];
+}
+
 function convertCodexResponseItem(
   entry: CodexResponseItemEntry,
-  index: number,
+  anchor: string,
   toolCallContexts: Map<string, CodexToolCallContext>,
   externalToolCalls: PendingExternalCodexToolCall[],
-  options: { skippedImageGenerationCallKeys?: Set<string> } = {},
+  options: {
+    skippedImageGenerationCallKeys?: ReadonlySet<string>;
+    patchApplyEndByCallId?: ReadonlyMap<string, CodexPatchApplyEndEvent>;
+    skippedPatchApplyCallIds?: ReadonlySet<string>;
+    workspaceRoot?: string;
+  } = {},
 ): Message | Message[] | null {
   const payload = entry.payload;
-  const uuid = `codex-${index}-${entry.timestamp}`;
+  const uuid = `codex-${anchor}`;
 
   switch (payload.type) {
     case "message":
@@ -801,11 +1966,22 @@ function convertCodexResponseItem(
         uuid,
         entry.timestamp,
       );
+      enrichCodexEditConversionWithPatchEvent(
+        converted,
+        options.patchApplyEndByCallId?.get(converted.callId),
+        options.workspaceRoot,
+      );
       toolCallContexts.set(converted.callId, converted.context);
       return converted.message;
     }
 
     case "function_call_output":
+      if (
+        options.patchApplyEndByCallId?.has(payload.call_id) ||
+        options.skippedPatchApplyCallIds?.has(payload.call_id)
+      ) {
+        return null;
+      }
       return convertCodexToolCallOutputPayload(
         payload.call_id,
         payload.output,
@@ -820,12 +1996,23 @@ function convertCodexResponseItem(
         uuid,
         entry.timestamp,
       );
+      enrichCodexEditConversionWithPatchEvent(
+        converted,
+        options.patchApplyEndByCallId?.get(converted.callId),
+        options.workspaceRoot,
+      );
       toolCallContexts.set(converted.callId, converted.context);
       return converted.message;
     }
 
     case "custom_tool_call_output": {
       const customCallId = payload.call_id ?? `${uuid}-custom-tool-result`;
+      if (
+        options.patchApplyEndByCallId?.has(customCallId) ||
+        options.skippedPatchApplyCallIds?.has(customCallId)
+      ) {
+        return null;
+      }
       return convertCodexToolCallOutputPayload(
         customCallId,
         payload.output,
@@ -857,6 +2044,39 @@ function convertCodexResponseItem(
 
     default:
       return null;
+  }
+}
+
+function enrichCodexEditConversionWithPatchEvent(
+  conversion: CodexToolUseConversion,
+  event: CodexPatchApplyEndEvent | undefined,
+  workspaceRoot?: string,
+): void {
+  if (!event || conversion.context.toolName !== "Edit") return;
+
+  const changes = publicCodexFileChanges(event.changes, { workspaceRoot });
+  if (changes.length === 0) return;
+
+  const editInput = buildCodexEditInput(changes);
+  const currentInput = conversion.context.input;
+  const mergedInput = isRecord(currentInput)
+    ? { ...currentInput, ...editInput }
+    : {
+        ...(currentInput !== undefined ? { input: currentInput } : {}),
+        ...editInput,
+      };
+  conversion.context.input = mergedInput;
+
+  const content = conversion.message.message?.content;
+  if (!Array.isArray(content)) return;
+  const toolUse = content.find(
+    (block) =>
+      block.type === "tool_use" &&
+      block.id === conversion.callId &&
+      block.name === "Edit",
+  );
+  if (toolUse) {
+    toolUse.input = mergedInput;
   }
 }
 
@@ -970,7 +2190,12 @@ function convertCodexMessagePayload(
     .map((block) =>
       "text" in block && typeof block.text === "string" ? block.text : "",
     )
-    .join("");
+    // Codex emits local-media labels as separate input_text items around the
+    // input_image/input_audio item. Keep those user-input boundaries so a
+    // preceding managed-upload line cannot absorb the next media marker into
+    // its private path during public projection. Assistant output fragments
+    // remain byte-for-byte concatenated.
+    .join(payload.role === "user" ? "\n" : "");
 
   if (
     payload.role === "user" &&
@@ -988,8 +2213,11 @@ function convertCodexMessagePayload(
   }
 
   for (const block of payload.content) {
-    if (block.type !== "input_image") continue;
-    content.push(normalizeCodexInputImageBlock(block));
+    if (block.type === "input_image") {
+      content.push(normalizeCodexInputImageBlock(block));
+    } else if (block.type === "input_audio") {
+      content.push(normalizeCodexInputAudioBlock(block));
+    }
   }
 
   if (content.length === 0) {
@@ -1058,6 +2286,11 @@ type CodexInputImageBlock = Extract<
   { type: "input_image" }
 >;
 
+type CodexInputAudioBlock = Extract<
+  CodexMessagePayload["content"][number],
+  { type: "input_audio" }
+>;
+
 function normalizeCodexInputImageBlock(
   block: CodexInputImageBlock,
 ): ContentBlock {
@@ -1080,6 +2313,31 @@ function normalizeCodexInputImageBlock(
     normalized.image_url = imageUrl;
   }
 
+  return normalized;
+}
+
+function normalizeCodexInputAudioBlock(
+  block: CodexInputAudioBlock,
+): ContentBlock {
+  const normalized: ContentBlock = { type: "input_audio" };
+  const filePath =
+    typeof block.file_path === "string" ? block.file_path.trim() : "";
+  if (filePath) {
+    normalized.file_path = filePath;
+  }
+
+  const audioUrl =
+    typeof block.audio_url === "string" ? block.audio_url.trim() : "";
+  if (audioUrl) {
+    normalized.audio_url = audioUrl;
+  }
+
+  const mimeType =
+    sanitizePublicMimeType(block.mime_type) ??
+    (audioUrl ? parseDataUrlMimeType(audioUrl) : undefined);
+  if (mimeType) {
+    normalized.mime_type = mimeType;
+  }
   return normalized;
 }
 
@@ -1264,6 +2522,10 @@ function convertExternalAgentToolCall(
       input: normalizedInvocation.input,
     },
   ];
+  appendNestedCodexPlanBlock(content, callId, {
+    toolName: normalizedInvocation.toolName,
+    input: normalizedInvocation.input,
+  });
 
   const message: Message = {
     uuid,
@@ -1294,12 +2556,17 @@ function convertCodexFunctionCallPayload(
   timestamp: string,
 ): CodexToolUseConversion {
   const rawToolName = payload.name;
-  const canonicalToolName = canonicalizeCodexToolName(rawToolName);
   const parsedInput = parseCodexToolArguments(payload.arguments);
-  const normalizedInvocation = normalizeCodexToolInvocation(
-    canonicalToolName,
-    parsedInput,
-  );
+  const normalizedInvocation =
+    deriveCodexWebRunInvocation(
+      rawToolName,
+      payload.namespace ?? undefined,
+      parsedInput,
+    ) ??
+    normalizeCodexToolInvocation(
+      canonicalizeCodexToolName(rawToolName),
+      parsedInput,
+    );
 
   const content: ContentBlock[] = [
     {
@@ -1309,6 +2576,10 @@ function convertCodexFunctionCallPayload(
       input: normalizedInvocation.input,
     },
   ];
+  appendNestedCodexPlanBlock(content, payload.call_id, {
+    toolName: normalizedInvocation.toolName,
+    input: normalizedInvocation.input,
+  });
 
   const message: Message = {
     uuid,
@@ -1340,7 +2611,10 @@ function convertCodexCustomToolCallPayload(
 ): CodexToolUseConversion {
   const callId = payload.call_id ?? payload.id ?? `${uuid}-custom-tool`;
   const rawToolName = payload.name ?? "custom_tool_call";
-  const canonicalToolName = canonicalizeCodexToolName(rawToolName);
+  const canonicalToolName = canonicalizeCodexToolName(
+    rawToolName,
+    payload.namespace,
+  );
   const rawInput =
     payload.input !== undefined
       ? payload.input
@@ -1358,6 +2632,10 @@ function convertCodexCustomToolCallPayload(
       input: normalizedInvocation.input,
     },
   ];
+  appendNestedCodexPlanBlock(content, callId, {
+    toolName: normalizedInvocation.toolName,
+    input: normalizedInvocation.input,
+  });
 
   const message: Message = {
     uuid,
@@ -1367,6 +2645,7 @@ function convertCodexCustomToolCallPayload(
       content,
     },
     codexToolName: rawToolName,
+    ...(payload.namespace ? { codexToolNamespace: payload.namespace } : {}),
     timestamp,
   };
 
@@ -1573,9 +2852,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function convertCodexCompactedEntry(
   entry: CodexCompactedEntry,
-  index: number,
+  anchor: string,
 ): Message {
-  const uuid = `codex-compacted-${index}-${entry.timestamp}`;
+  const uuid = `codex-compacted-${anchor}`;
   return {
     uuid,
     type: "system",
@@ -1587,16 +2866,17 @@ function convertCodexCompactedEntry(
 
 function convertCodexEventMsg(
   entry: CodexEventMsgEntry,
-  index: number,
+  anchor: string,
 ): Message | null {
   const payload = entry.payload;
-  const uuid = `codex-event-${index}-${entry.timestamp}`;
+  const uuid = `codex-event-${anchor}`;
 
   switch (payload.type) {
     case "user_message":
       return {
         uuid,
         type: "user",
+        ...codexUserMessageIdentity(payload.client_id),
         message: {
           role: "user",
           content: payload.message,
@@ -1733,99 +3013,503 @@ function convertGeminiMessages(
   return messages;
 }
 
-// --- OpenCode Conversion Logic ---
+/**
+ * Build the normalized content for one Kimi user turn.
+ *
+ * Text-only turns stay a plain string (the common case, and what the client's
+ * prompt parser expects). When the turn carried images, they are emitted as
+ * `input_image` blocks — the same shape Codex uses, so the client renders them
+ * as attachment chips with an inline preview without provider-specific code.
+ *
+ * `blobref:` parts are served through `/api/local-image`; the blobs directory
+ * is allow-listed alongside yep's own uploads. `data:` urls are passed straight
+ * through as the preview source.
+ */
+function buildKimiUserContent(
+  input: readonly unknown[],
+  blobsDir: string | undefined,
+): string | ContentBlock[] {
+  const text = getKimiPromptText(input);
+  const images = getKimiPromptImages(input);
+  if (images.length === 0) return text;
 
-function convertOpenCodeEntries(entries: OpenCodeSessionEntry[]): Message[] {
-  const messages: Message[] = [];
+  const blocks: ContentBlock[] = [];
+  if (text) blocks.push({ type: "text", text } as ContentBlock);
 
-  for (const entry of entries) {
-    const { message, parts } = entry;
-    const uuid = message.id;
-    const timestamp = message.time?.created
-      ? new Date(message.time.created).toISOString()
+  for (const image of images) {
+    const block: Record<string, unknown> = {
+      type: "input_image",
+      mime_type: image.mimeType,
+    };
+    if (image.blobHash && blobsDir) {
+      const path = join(blobsDir, image.blobHash);
+      block.file_path = path;
+      block.image_url = `/api/local-image?path=${encodeURIComponent(path)}`;
+    } else if (!image.blobHash) {
+      block.image_url = image.url;
+    }
+    blocks.push(block as ContentBlock);
+  }
+
+  return blocks;
+}
+
+function buildKimiMediaToolResult(
+  output: unknown,
+  blobsDir: string | undefined,
+): { content: string; structured: Record<string, unknown> } | null {
+  const summary = parseKimiReadMediaOutput(output);
+  if (!summary) return null;
+
+  const filePath =
+    summary.kind === "image" && summary.blobRef && blobsDir
+      ? join(blobsDir, summary.blobRef.hash)
       : undefined;
+  const previewUrl = filePath
+    ? `/api/local-image?path=${encodeURIComponent(filePath)}`
+    : summary.mediaUrl;
+  const label = summary.path ? basename(summary.path) : summary.kind;
 
-    const content = convertOpenCodeParts(parts);
+  return {
+    content: `${summary.kind} loaded: ${label}`,
+    structured: {
+      type: "media",
+      kind: summary.kind,
+      ...(summary.path ? { path: summary.path } : {}),
+      ...(summary.mimeType ? { mimeType: summary.mimeType } : {}),
+      ...(summary.bytes !== undefined ? { bytes: summary.bytes } : {}),
+      ...(filePath ? { filePath } : {}),
+      ...(previewUrl ? { previewUrl } : {}),
+    },
+  };
+}
 
+function getKimiToolResultText(
+  output: unknown,
+  note: string | undefined,
+): string {
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) {
+    const text = output
+      .flatMap((part) => {
+        if (
+          typeof part === "object" &&
+          part !== null &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string"
+        ) {
+          return [(part as { text: string }).text];
+        }
+        return [];
+      })
+      .join("\n");
+    if (text) return text;
+  }
+  return note ?? "";
+}
+
+// --- Kimi Conversion Logic ---
+
+/**
+ * Convert a parsed Kimi session (wire.jsonl records) into normalized messages.
+ *
+ * Reconstruction uses `turn.prompt` for user turns and `context.append_loop_event`
+ * for the assistant stream (content.part think/text, tool.call, tool.result).
+ * `context.append_message` records are ignored — they are the post-compaction
+ * context-memory projection and would double-count tool results as user turns.
+ */
+export function convertKimiMessages(session: KimiSessionContent): Message[] {
+  const messages: Message[] = [];
+  const sid = session.sessionId;
+
+  let assistantBlocks: ContentBlock[] = [];
+  let assistantTs: number | undefined;
+  let assistantSeq = 0;
+  let userSeq = 0;
+  let lastStepEnd: KimiStepEndEvent | undefined;
+
+  const appendAssistantPart = (
+    part:
+      | { type: "thinking"; thinking: string }
+      | { type: "text"; text: string },
+  ) => {
+    const previous = assistantBlocks[assistantBlocks.length - 1];
+    if (
+      part.type === "thinking" &&
+      previous?.type === "thinking" &&
+      typeof previous.thinking === "string"
+    ) {
+      previous.thinking += part.thinking;
+      return;
+    }
+    if (
+      part.type === "text" &&
+      previous?.type === "text" &&
+      typeof previous.text === "string"
+    ) {
+      previous.text += part.text;
+      return;
+    }
+    assistantBlocks.push(part);
+  };
+
+  const toIso = (ms: number | undefined): string | undefined =>
+    typeof ms === "number" ? new Date(ms).toISOString() : session.createdAt;
+
+  const flushAssistant = () => {
+    if (assistantBlocks.length === 0) return;
     messages.push({
-      uuid,
-      type: message.role,
-      message: {
-        role: message.role,
-        content,
-        model: message.modelID,
-        usage: message.tokens
-          ? {
-              input_tokens: message.tokens.input,
-              output_tokens: message.tokens.output,
-              cache_read_input_tokens: message.tokens.cache?.read,
-            }
-          : undefined,
-      },
-      timestamp,
-      // Include OpenCode-specific fields
-      ...(message.parentID && { parentId: message.parentID }),
-      ...(message.mode && { mode: message.mode }),
-      ...(message.agent && { agent: message.agent }),
-      ...(message.finish && { finish: message.finish }),
+      uuid: `${sid}-assistant-${assistantSeq++}`,
+      type: "assistant",
+      message: { role: "assistant", content: assistantBlocks },
+      timestamp: toIso(assistantTs),
     });
+    assistantBlocks = [];
+    assistantTs = undefined;
+  };
+
+  const appendTurnError = (record: KimiTurnEndedRecord) => {
+    const error = record.error;
+    if (!error) return;
+    const errorText =
+      error.message?.trim() ||
+      (error.code === "provider.filtered"
+        ? "Provider safety policy blocked the response."
+        : error.name || error.code);
+    if (!errorText) return;
+
+    flushAssistant();
+    const turnKey =
+      record.turnId === undefined
+        ? `${userSeq}-${messages.length}`
+        : String(record.turnId);
+    messages.push({
+      uuid: `${sid}-turn-${turnKey}-error`,
+      type: "error",
+      error: errorText,
+      content: errorText,
+      errorCode: error.code,
+      retryable: error.retryable,
+      finishReason: lastStepEnd?.finishReason,
+      providerFinishReason: lastStepEnd?.providerFinishReason,
+      rawFinishReason: lastStepEnd?.rawFinishReason,
+      timestamp: toIso(record.time),
+    });
+  };
+
+  for (const record of session.records) {
+    if (isKimiTurnPromptRecord(record)) {
+      flushAssistant();
+      lastStepEnd = undefined;
+      messages.push({
+        uuid: `${sid}-user-${userSeq++}`,
+        type: "user",
+        message: {
+          role: "user",
+          content: buildKimiUserContent(record.input, session.blobsDir),
+        },
+        timestamp: toIso(record.time),
+      });
+      continue;
+    }
+
+    if (isKimiTurnEndedRecord(record)) {
+      appendTurnError(record);
+      continue;
+    }
+
+    if (!isKimiLoopEventRecord(record)) continue;
+
+    const event = record.event;
+    switch (event.type) {
+      case "content.part": {
+        const part = (event as KimiContentPartEvent).part;
+        if (part.type === "think") {
+          appendAssistantPart({ type: "thinking", thinking: part.think });
+        } else if (part.type === "text") {
+          appendAssistantPart({ type: "text", text: part.text });
+        }
+        assistantTs ??= record.time;
+        break;
+      }
+      case "tool.call": {
+        const toolCall = event as KimiToolCallEvent;
+        assistantBlocks.push({
+          type: "tool_use",
+          id: toolCall.toolCallId,
+          name: toolCall.name,
+          input: normalizeKimiToolInput(toolCall.name, toolCall.args),
+        });
+        assistantTs ??= record.time;
+        break;
+      }
+      case "tool.result": {
+        // Flush the assistant message (carrying the tool_use blocks) before
+        // emitting the corresponding tool results.
+        flushAssistant();
+        const toolResult = event as KimiToolResultEvent;
+        const output =
+          toolResult.result?.output ?? toolResult.result?.note ?? "";
+        const mediaResult = buildKimiMediaToolResult(output, session.blobsDir);
+        const toolUseId = toolResult.toolCallId ?? "";
+        messages.push({
+          uuid: `${sid}-result-${toolResult.toolCallId ?? `${assistantSeq}-${messages.length}`}`,
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: toolUseId,
+                content:
+                  mediaResult?.content ??
+                  getKimiToolResultText(output, toolResult.result?.note),
+                ...(toolResult.result?.isError === true && { is_error: true }),
+              },
+            ],
+          },
+          ...(mediaResult ? { toolUseResult: mediaResult.structured } : {}),
+          timestamp: toIso(record.time),
+        });
+        break;
+      }
+      case "step.end": {
+        lastStepEnd = event as KimiStepEndEvent;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  flushAssistant();
+
+  // Replay the main-agent goal lifecycle (goal.create / goal.update /
+  // goal.clear / forked) and merge the snapshots into the transcript as
+  // inline `type: "kimi_goal"` messages, placed at their record timestamps.
+  // Goals are main-agent autonomous targets with budgets; surfacing them
+  // inline lets the UI show what the agent was pursuing (and how much budget
+  // it consumed) at each point in the transcript. Child-agent wires typically
+  // have no goal.* records, so this is a no-op there.
+  return mergeKimiGoalSnapshots(
+    messages,
+    getKimiGoalTimeline(session.records),
+    sid,
+  );
+}
+
+/**
+ * Merge goal snapshots into a transcript as inline `type: "kimi_goal"` messages.
+ *
+ * Each snapshot becomes a message whose `goal` payload (objective, status,
+ * budget consumption, actor, change kind) is read by the client
+ * `GoalInlineRenderer`. Snapshots are placed by their `time` field: a snapshot
+ * lands after the last existing message with a timestamp ≤ the snapshot's
+ * time. Snapshots without a time are appended in order. This keeps the goal
+ * markers interleaved with the turns that produced them, so the UI can show
+ * "goal created → assistant worked → goal blocked → …" in context.
+ */
+function mergeKimiGoalSnapshots(
+  messages: Message[],
+  snapshots: readonly import("@yep-anywhere/shared").KimiGoalSnapshot[],
+  sessionId: string,
+): Message[] {
+  if (snapshots.length === 0) return messages;
+
+  const goalMessages: Message[] = snapshots.map((snapshot, index) => {
+    const message: Message = {
+      type: "kimi_goal",
+      uuid: `${sessionId}-goal-${index}`,
+      goal: snapshot,
+      ...(snapshot.time !== undefined
+        ? { timestamp: new Date(snapshot.time).toISOString() }
+        : {}),
+    };
+    return message;
+  });
+
+  // Stable merge by timestamp: existing messages keep their order, goal
+  // messages slot in by time. Messages without timestamps go to the end.
+  const result: Message[] = [];
+  let gi = 0;
+  const messageTime = (message: Message | undefined): number => {
+    if (!message?.timestamp) return Number.POSITIVE_INFINITY;
+    const parsed = Date.parse(message.timestamp);
+    return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+  };
+  const goalTime = (message: Message): number => {
+    const snapshot = message.goal as { time?: number };
+    return snapshot.time ?? Number.POSITIVE_INFINITY;
+  };
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const msg = messages[index];
+    if (!msg) continue;
+    const msgTime = messageTime(msg);
+    while (gi < goalMessages.length) {
+      const goal = goalMessages[gi];
+      if (!goal) break;
+      if (goalTime(goal) < msgTime) {
+        result.push(goal);
+        gi += 1;
+      } else {
+        break;
+      }
+    }
+    result.push(msg);
+
+    // Equal timestamps stay stable: every existing transcript message at the
+    // timestamp is emitted before goal markers at that same timestamp.
+    if (messageTime(messages[index + 1]) !== msgTime) {
+      while (gi < goalMessages.length) {
+        const goal = goalMessages[gi];
+        if (!goal || goalTime(goal) > msgTime) break;
+        result.push(goal);
+        gi += 1;
+      }
+    }
+  }
+  // Append any remaining goal snapshots.
+  while (gi < goalMessages.length) {
+    const goal = goalMessages[gi];
+    if (goal) result.push(goal);
+    gi += 1;
+  }
+  return result;
+}
+
+// --- ZCode Conversion Logic ---
+
+/**
+ * Convert a persisted ZCode session into normalized Messages.
+ * Full implementation: maps stored messages to Message objects with text,
+ * reasoning (thinking), and tool (tool_use + tool_result) parts.
+ * Unknown part types are safely ignored.
+ */
+export function convertZCodeMessages(session: ZCodeSessionContent): Message[] {
+  const messages: Message[] = [];
+  const sid = session.sessionId;
+
+  for (const stored of session.messages) {
+    const role = stored.role === "user" ? "user" : "assistant";
+    const blocks: ContentBlock[] = [];
+    const toolResults: Array<{
+      toolUseId: string;
+      content: string;
+      isError: boolean;
+    }> = [];
+
+    for (const part of stored.parts) {
+      const partType = part?.type;
+      if (typeof partType !== "string") continue;
+
+      switch (partType) {
+        case "text": {
+          const text = typeof part.text === "string" ? part.text : "";
+          if (text) {
+            blocks.push({ type: "text", text });
+          }
+          break;
+        }
+        case "reasoning": {
+          const thinking = typeof part.text === "string" ? part.text : "";
+          if (thinking) {
+            blocks.push({ type: "thinking", thinking });
+          }
+          break;
+        }
+        case "tool": {
+          const callId =
+            typeof part.callID === "string" ? part.callID : part.id;
+          const toolName =
+            typeof part.tool === "string" ? part.tool : "Unknown";
+          const state = part.state as Record<string, unknown> | undefined;
+          const status =
+            typeof state?.status === "string" ? state.status : "pending";
+          const input = state?.input;
+          const output = state?.output;
+          const isError = status === "error";
+
+          // Emit tool_use block.
+          blocks.push({
+            type: "tool_use",
+            id: callId,
+            name: toolName,
+            input: input ?? {},
+            status,
+          });
+
+          // Emit tool_result if completed or error.
+          if (status === "completed" || status === "error") {
+            toolResults.push({
+              toolUseId: callId,
+              content:
+                typeof output === "string"
+                  ? output
+                  : JSON.stringify(output ?? ""),
+              isError,
+            });
+          }
+          break;
+        }
+        case "step-start":
+        case "step-finish":
+        case "timeline":
+        case "file":
+        case "snapshot":
+        case "patch":
+        case "compaction":
+        case "retry":
+        case "agent":
+        case "subagent":
+          // Metadata-only parts — no transcript content in P2.
+          break;
+        default:
+          // Unknown part type — safely ignored.
+          break;
+      }
+    }
+
+    // Emit assistant message with content blocks.
+    if (blocks.length > 0) {
+      messages.push({
+        type: role,
+        uuid: stored.id,
+        session_id: sid,
+        ...(typeof stored.createdAt === "number"
+          ? { timestamp: new Date(stored.createdAt).toISOString() }
+          : {}),
+        message: {
+          role,
+          content: blocks,
+          ...(stored.model ? { model: stored.model } : {}),
+        },
+      });
+    }
+
+    // Emit tool results as separate user messages.
+    for (const tr of toolResults) {
+      messages.push({
+        type: "user",
+        session_id: sid,
+        tool_use_id: tr.toolUseId,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: tr.toolUseId,
+              content: tr.content,
+              ...(tr.isError ? { status: "error" } : {}),
+            },
+          ],
+        },
+      });
+    }
   }
 
   return messages;
 }
 
-function convertOpenCodeParts(parts: OpenCodeStoredPart[]): ContentBlock[] {
-  const blocks: ContentBlock[] = [];
-
-  for (const part of parts) {
-    switch (part.type) {
-      case "text":
-        if (part.text) {
-          blocks.push({
-            type: "text",
-            text: part.text,
-          });
-        }
-        break;
-
-      case "tool":
-        if (part.tool && part.callID) {
-          // Tool use block
-          blocks.push({
-            type: "tool_use",
-            id: part.callID,
-            name: part.tool,
-            input: part.state?.input ?? {},
-          });
-
-          // If tool has completed, add tool result block
-          if (part.state?.status === "completed") {
-            const resultContent = part.state.error
-              ? part.state.error
-              : typeof part.state.output === "string"
-                ? part.state.output
-                : JSON.stringify(part.state.output ?? "");
-
-            blocks.push({
-              type: "tool_result",
-              tool_use_id: part.callID,
-              content: resultContent,
-              is_error: !!part.state.error,
-            });
-          }
-        }
-        break;
-
-      // Skip step-start and step-finish (metadata, not content)
-      case "step-start":
-      case "step-finish":
-        break;
-
-      default:
-        // Unknown part type - skip
-        break;
-    }
-  }
-
-  return blocks;
-}
+// Suppress unused import — ZCodeStoredMessage is used for type safety.
+void (null as unknown as ZCodeStoredMessage);
