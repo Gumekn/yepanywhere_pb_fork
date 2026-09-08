@@ -21,6 +21,7 @@ const productionRuntimeScript = path.join(
   "production-runtime.ps1",
 );
 const deployScript = path.join(repoRoot, "scripts", "deploy.ps1");
+const cliScript = path.join(repoRoot, "packages", "server", "src", "cli.ts");
 const tempDirs: string[] = [];
 
 type CommandResult = {
@@ -208,6 +209,16 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "win32")("Windows 服务脚本", () => {
+  it("不启动上游已移除的 Claude bridge sidecar", async () => {
+    const [supervisor, cli] = await Promise.all([
+      readFile(runProdScript, "utf8"),
+      readFile(cliScript, "utf8"),
+    ]);
+
+    expect(cli).not.toContain("--claude-bridge-only");
+    expect(supervisor).not.toContain("--claude-bridge-only");
+  });
+
   it("help 使用中文列出统一命令", async () => {
     const result = await runPowerShellCommand(`& ${psLiteral(yepScript)} help`);
 
@@ -1987,13 +1998,12 @@ function Get-Content {
 }
 function Get-Command { param($Name) return [pscustomobject]@{ Source = 'C:\\Program Files\\nodejs\\node.exe' } }
 function Get-TestRole([int]$ProcessId) {
-  switch ($ProcessId) { 100 { 'server' } 101 { 'failed-bridge' } 102 { 'remaining-bridge' } default { 'supervisor' } }
+  switch ($ProcessId) { 100 { 'server' } 101 { 'failed-bridge' } default { 'supervisor' } }
 }
 function Get-TestCommand([int]$ProcessId) {
   switch ($ProcessId) {
     100 { return 'node.exe "${path.join(repoRoot, "dist", "npm-package", "dist", "cli.js").replaceAll("'", "''")}" --port 8022' }
     101 { return 'node.exe "${path.join(repoRoot, "dist", "npm-package", "dist", "cli.js").replaceAll("'", "''")}" --codex-bridge-only' }
-    102 { return 'node.exe "${path.join(repoRoot, "dist", "npm-package", "dist", "cli.js").replaceAll("'", "''")}" --claude-bridge-only' }
     default { return 'powershell.exe -File "${runProdScript.replaceAll("'", "''")}" -ConfigPath "${configPath.replaceAll("'", "''")}"' }
   }
 }
@@ -2020,7 +2030,6 @@ function Get-NetTCPConnection {
     8022 { 100 }
     8023 { 100 }
     4510 { 101 }
-    4520 { 102 }
     default { 0 }
   }
   $process = @($global:started | Where-Object { [int]$_.Id -eq $owner -and -not $_.HasExited }) | Select-Object -First 1
@@ -2060,7 +2069,6 @@ function taskkill.exe {
     expect(result.code).toBe(1);
     expect(result.stdout).toContain("关键进程");
     expect(result.stdout).toContain("__STOPPED__server");
-    expect(result.stdout).toContain("__STOPPED__remaining-bridge");
     expect(result.stdout).not.toContain("__UNEXPECTED_STOP_PROCESS__");
   });
 

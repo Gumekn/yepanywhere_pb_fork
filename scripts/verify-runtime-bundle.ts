@@ -70,7 +70,12 @@ assertEqual(
   "Bundle npm-shrinkwrap.json 的直接依赖与 package.json 不一致",
 );
 
-for (const [name, expectedVersion] of Object.entries(expectedDependencies)) {
+for (const name of Object.keys(expectedDependencies)) {
+  const expectedVersion =
+    shrinkwrap.packages?.[`node_modules/${name}`]?.version;
+  if (!expectedVersion) {
+    throw new Error(`Bundle npm-shrinkwrap.json 缺少 ${name} 的精确版本`);
+  }
   const installedPackagePath = path.join(
     bundleDir,
     "node_modules",

@@ -18,6 +18,12 @@ const runtimeLock = JSON.parse(
 const dependencies = runtimeLock.packages[""].dependencies;
 const bundleDir = fs.mkdtempSync(path.join(os.tmpdir(), "yep-runtime-bundle-"));
 
+function lockedVersion(name) {
+  const version = runtimeLock.packages[`node_modules/${name}`]?.version;
+  assert.ok(version, `运行时锁缺少 ${name} 的精确版本`);
+  return version;
+}
+
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(value));
@@ -25,15 +31,12 @@ function writeJson(filePath, value) {
 
 try {
   writeJson(path.join(bundleDir, "package.json"), { dependencies });
-  writeJson(path.join(bundleDir, "npm-shrinkwrap.json"), {
-    lockfileVersion: 3,
-    packages: { "": { dependencies } },
-  });
+  writeJson(path.join(bundleDir, "npm-shrinkwrap.json"), runtimeLock);
 
-  for (const [name, version] of Object.entries(dependencies)) {
+  for (const name of Object.keys(dependencies)) {
     writeJson(path.join(bundleDir, "node_modules", name, "package.json"), {
       name,
-      version,
+      version: lockedVersion(name),
     });
   }
 
@@ -45,7 +48,7 @@ try {
     ),
     {
       name: "@anthropic-ai/claude-agent-sdk",
-      version: dependencies["@anthropic-ai/claude-agent-sdk"],
+      version: lockedVersion("@anthropic-ai/claude-agent-sdk"),
       optionalDependencies: { [nativePackage]: "0.0.0" },
     },
   );
@@ -68,13 +71,13 @@ try {
 
   writeJson(path.join(bundleDir, "node_modules/hono/package.json"), {
     name: "hono",
-    version: dependencies.hono,
+    version: lockedVersion("hono"),
     type: "module",
     exports: { "./ws": "./dist/helper/websocket/index.js" },
   });
   writeJson(path.join(bundleDir, "node_modules/@hono/node-ws/package.json"), {
     name: "@hono/node-ws",
-    version: dependencies["@hono/node-ws"],
+    version: lockedVersion("@hono/node-ws"),
     type: "module",
   });
   fs.mkdirSync(path.join(bundleDir, "node_modules/@hono/node-ws/dist"), {

@@ -888,7 +888,7 @@ function Start-Process {
   }
   $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { }
   $global:processes[$processId] = $process
-  if ($global:scenario -eq 'partial-first-manifest' -and $role -eq 'claude-bridge') {
+  if ($global:scenario -eq 'partial-first-manifest' -and $role -eq 'codex-bridge') {
     Remove-Item -LiteralPath $env:YEP_LAUNCHD_LOG_DIR -Force
     [IO.File]::WriteAllText($env:YEP_LAUNCHD_LOG_DIR, 'block manifest parent')
   }
@@ -2009,11 +2009,7 @@ describe.skipIf(process.platform !== "win32")(
         },
         {
           scenario: "partial-first-manifest" as const,
-          killed: [
-            "__KILL_EXACT__1301",
-            "__KILL_EXACT__1302",
-            "__KILL_EXACT__1303",
-          ],
+          killed: ["__KILL_EXACT__1301", "__KILL_EXACT__1302"],
         },
       ];
 

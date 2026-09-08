@@ -326,7 +326,6 @@ try {
 
   if ($inspection.State -ne "degraded-adoptable") {
     $BridgeModes.Codex = Resolve-BridgeMode "Codex" ([int]$CodexPort) $env:YEP_CODEX_BRIDGE_CONTROL_URL
-    $BridgeModes.Claude = Resolve-BridgeMode "Claude" ([int]$ClaudePort) $env:YEP_CLAUDE_BRIDGE_CONTROL_URL
     Add-ManagedProcess "server" @("--port", [string]$ServerPort) `
       (Join-Path $LogDir "server.out.log") `
       (Join-Path $LogDir "server.err.log")
@@ -334,11 +333,6 @@ try {
       Add-ManagedProcess "codex-bridge" @("--codex-bridge-only") `
         (Join-Path $LogDir "codex-bridge.out.log") `
         (Join-Path $LogDir "codex-bridge.err.log")
-    }
-    if ($BridgeModes.Claude -eq "managed") {
-      Add-ManagedProcess "claude-bridge" @("--claude-bridge-only") `
-        (Join-Path $LogDir "claude-bridge.out.log") `
-        (Join-Path $LogDir "claude-bridge.err.log")
     }
     Write-ProductionManifest
     $OwnsManagedGroup = $true
