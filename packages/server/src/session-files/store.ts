@@ -31,9 +31,11 @@ export class SessionFileStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    await atomicWriteJson(this.path("blobs", id), {
-      base64: bytes.toString("base64"),
-    });
+    await publishImmutable(
+      this.path("blobs", id),
+      { base64: bytes.toString("base64") },
+      () => this.readBlob(id),
+    );
     return id;
   }
 
@@ -97,7 +99,9 @@ export class SessionFileStore {
 
   private async putObject(bucket: string, value: unknown): Promise<string> {
     const id = contentId(JSON.stringify(value));
-    await atomicWriteJson(this.path(bucket, id), value);
+    await publishImmutable(this.path(bucket, id), value, () =>
+      this.readObject(bucket, id),
+    );
     return id;
   }
 
@@ -108,5 +112,23 @@ export class SessionFileStore {
     if (contentId(JSON.stringify(value)) !== id)
       throw new Error("File record integrity check failed");
     return value;
+  }
+}
+
+async function publishImmutable(
+  path: string,
+  value: unknown,
+  verifyExisting: () => Promise<unknown>,
+): Promise<void> {
+  try {
+    await atomicWriteJson(path, value);
+  } catch (error) {
+    // Windows may reject a concurrent rename after another writer publishes
+    // the same content. Only accept an existing, hash-verified object.
+    try {
+      await verifyExisting();
+    } catch {
+      throw error;
+    }
   }
 }

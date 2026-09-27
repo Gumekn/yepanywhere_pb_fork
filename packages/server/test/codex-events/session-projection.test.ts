@@ -805,6 +805,31 @@ describe("canonical Codex persisted session projection", () => {
     ]);
   });
 
+  it("keeps only the latest retry warning for the same Codex turn", () => {
+    const retries = [2, 3].map((attempt, index) =>
+      testEvent(index + 1, "error", {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        willRetry: true,
+        error: {
+          message: `Reconnecting... ${attempt}/5`,
+          codexErrorInfo: "responseStreamDisconnected",
+        },
+      }),
+    );
+
+    const warnings = overlayCanonicalCodexSessionMessages(
+      "session-1",
+      [],
+      retries,
+    ).messages.filter(
+      (message) => message.warningKind === "codex_provider_retry",
+    );
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.content).toContain("Reconnecting... 3/5");
+  });
+
   it("does not leave stale failed turn health after a later successful turn", () => {
     const failed = testEvent(1, "error", {
       threadId: "thread-1",

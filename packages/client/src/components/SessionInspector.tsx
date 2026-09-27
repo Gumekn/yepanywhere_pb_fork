@@ -1,17 +1,22 @@
 import type {
+  EffortLevel,
   MarkdownAugment,
+  ProviderInfo,
   SessionFileActivity,
   SessionFileActivityKind,
   SessionFileCoverageReason,
   SessionQuestion,
 } from "@yep-anywhere/shared";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { api } from "../api/client";
 import { useDocumentVisibility } from "../hooks/useDocumentVisibility";
 import { useGitStatus } from "../hooks/useGitStatus";
+import { useModelSettings } from "../hooks/useModelSettings";
 import { useSessionFileIndex } from "../hooks/useSessionFileIndex";
 import { useI18n } from "../i18n";
+import { getModelReasoningEfforts } from "../lib/codexReasoning";
 import { formatSmartTime } from "../lib/datetime";
 import {
   type ActiveToolApproval,
@@ -33,6 +38,7 @@ import type {
 } from "../types/renderItems";
 import { FileViewerModal } from "./FilePathLink";
 import { ProviderBadge } from "./ProviderBadge";
+import { RepoTree } from "./RepoTree";
 import { SessionFileDiffPanel } from "./SessionFileDiffPanel";
 import { SessionSavedFilePanel } from "./SessionSavedFilePanel";
 import { CodexNativeGoalBlock } from "./blocks/codex/CodexNativeGoalBlock";
@@ -71,6 +77,7 @@ interface SessionInspectorProps {
   legacyDetailsLoading?: boolean;
   legacyDetailsError?: boolean;
   onLoadLegacyDetails?: () => void | Promise<void>;
+  onOpenFile?: (path: string) => void;
   markdownAugments?: Record<string, MarkdownAugment>;
   activeToolApproval?: ActiveToolApproval;
   projectId: string;
@@ -84,6 +91,10 @@ interface SessionInspectorProps {
   status: SessionStatus;
   processState?: string;
   onSelectMessage: (messageId: string) => void;
+  processId?: string;
+  providers?: ProviderInfo[];
+  onModelChanged?: (model?: string, reasoningEffort?: string) => void;
+  onReasoningEffortChanged?: (effort: string | null) => void;
 }
 
 interface QuestionItem {
@@ -148,6 +159,13 @@ const READ_FILE_TOOLS = new Set(["Read"]);
 const SEARCH_FILE_TOOLS = new Set(["Glob", "Grep"]);
 const CHECK_COMMAND_RE =
   /\b((pnpm|npm|yarn|bun)\s+(--filter\s+\S+\s+)?(run\s+)?(lint|typecheck|test(?::e2e)?|build)\b|tsc\b|vitest\b|playwright\s+test\b|biome\s+check\b)/i;
+const EFFORT_LEVELS = new Set<EffortLevel>([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 
 export function SessionInspector({
   presentation,
@@ -160,6 +178,7 @@ export function SessionInspector({
   legacyDetailsLoading = false,
   legacyDetailsError = false,
   onLoadLegacyDetails,
+  onOpenFile,
   markdownAugments,
   activeToolApproval,
   projectId,
@@ -168,23 +187,120 @@ export function SessionInspector({
   provider,
   model,
   reasoningEffort,
-  serviceTier,
   basePath = "",
   status,
   processState,
   onSelectMessage,
+  processId,
+  providers,
+  onModelChanged,
+  onReasoningEffortChanged,
 }: SessionInspectorProps) {
   const { t, locale } = useI18n();
   const [activeTab, setActiveTab] = useState<InspectorTab>("questions");
   const [copiedSessionId, setCopiedSessionId] = useState(false);
   const pageVisible = useDocumentVisibility();
   const isVisible = isOpen && pageVisible;
+  const [selectedModel, setSelectedModel] = useState(model ?? "default");
+  const previousModelRef = useRef(model);
+  const { effortLevel, thinkingMode, setEffortLevel, setThinkingMode } =
+    useModelSettings();
+  const [selectedThinking, setSelectedThinking] = useState(
+    reasoningEffort
+      ? `on:${reasoningEffort}`
+      : getThinkingValue(thinkingMode, effortLevel),
+  );
   const {
     gitStatus,
     loading: gitLoading,
     error: gitError,
   } = useGitStatus(isVisible && activeTab === "git" ? projectId : undefined);
   const isCodexProvider = provider === "codex" || provider === "codex-oss";
+  const providerInfo = useMemo(
+    () => providers?.find((item) => item.name === provider),
+    [provider, providers],
+  );
+  const modelOptions = useMemo(
+    () => providerInfo?.models ?? [],
+    [providerInfo],
+  );
+  const selectedModelInfo = useMemo(
+    () => modelOptions.find((item) => modelIdsMatch(selectedModel, item.id)),
+    [modelOptions, selectedModel],
+  );
+  const nativeEfforts = useMemo(
+    () => getModelReasoningEfforts(selectedModelInfo),
+    [selectedModelInfo],
+  );
+  const thinkingOptions = useMemo(() => {
+    const efforts =
+      nativeEfforts.length > 0
+        ? nativeEfforts.map((item) => item.reasoningEffort)
+        : ["low", "medium", "high", "max"];
+    return [
+      { value: "off", label: t("inspectorThinkingOff") },
+      { value: "auto", label: t("inspectorThinkingAuto") },
+      ...efforts.map((effort) => ({
+        value: `on:${effort}`,
+        label: getReasoningLevelLabel(t, effort),
+      })),
+    ];
+  }, [nativeEfforts, t]);
+
+  useEffect(() => {
+    if (model === previousModelRef.current) return;
+    setSelectedModel(model ?? "default");
+    previousModelRef.current = model;
+  }, [model]);
+
+  useEffect(() => {
+    setSelectedThinking(
+      reasoningEffort
+        ? `on:${reasoningEffort}`
+        : getThinkingValue(thinkingMode, effortLevel),
+    );
+  }, [effortLevel, reasoningEffort, thinkingMode]);
+
+  const handleModelChange = useCallback(
+    async (nextModel: string) => {
+      const previousModel = selectedModel;
+      const resolvedModel = nextModel === "default" ? undefined : nextModel;
+      setSelectedModel(nextModel);
+      try {
+        if (processId) {
+          const result = await api.setProcessModel(processId, resolvedModel);
+          onModelChanged?.(resolvedModel, result.reasoningEffort);
+        } else {
+          await api.updateSessionMetadata(sessionId, {
+            model: resolvedModel ?? "",
+          });
+          onModelChanged?.(resolvedModel);
+        }
+      } catch (error) {
+        console.error("Failed to switch model:", error);
+        setSelectedModel(previousModel);
+      }
+    },
+    [onModelChanged, processId, selectedModel, sessionId],
+  );
+
+  const handleThinkingChange = useCallback(
+    (next: string) => {
+      setSelectedThinking(next);
+      if (next === "off" || next === "auto") {
+        setThinkingMode(next);
+        onReasoningEffortChanged?.(null);
+        return;
+      }
+      const effort = next.slice(3);
+      setThinkingMode("on");
+      if (EFFORT_LEVELS.has(effort as EffortLevel)) {
+        setEffortLevel(effort as EffortLevel);
+      }
+      onReasoningEffortChanged?.(effort);
+    },
+    [onReasoningEffortChanged, setEffortLevel, setThinkingMode],
+  );
 
   const renderItems = useMemo(
     () =>
@@ -355,12 +471,43 @@ export function SessionInspector({
         </div>
         {provider && (
           <div className="session-inspector-provider-row">
-            <ProviderBadge
-              provider={provider}
-              model={model}
-              reasoningEffort={reasoningEffort}
-              serviceTier={serviceTier}
-            />
+            <label className="session-inspector-field">
+              <span className="session-inspector-field-label">
+                {t("inspectorModel")}
+              </span>
+              <select
+                className="session-inspector-select"
+                value={selectedModelInfo?.id ?? selectedModel}
+                onChange={(event) => void handleModelChange(event.target.value)}
+                disabled={modelOptions.length === 0}
+              >
+                <option value="default">{t("inspectorModelDefault")}</option>
+                {selectedModel !== "default" && !selectedModelInfo && (
+                  <option value={selectedModel}>{selectedModel}</option>
+                )}
+                {modelOptions.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name || item.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="session-inspector-field">
+              <span className="session-inspector-field-label">
+                {t("inspectorThinking")}
+              </span>
+              <select
+                className="session-inspector-select"
+                value={selectedThinking}
+                onChange={(event) => handleThinkingChange(event.target.value)}
+              >
+                {thinkingOptions.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
         )}
         {codexChannelSummaries.length > 0 && (
@@ -437,6 +584,13 @@ export function SessionInspector({
       )}
 
       {planProgress && <InspectorPlanProgress progress={planProgress} t={t} />}
+
+      {presentation === "sidebar" && onOpenFile && (
+        <details className="session-inspector-repo" open>
+          <summary>{t("inspectorRepo")}</summary>
+          <RepoTree projectId={projectId} onOpenFile={onOpenFile} />
+        </details>
+      )}
 
       <div className="session-inspector-tabs" role="tablist">
         {BASE_TAB_KEYS.map((tab) => (
@@ -1760,6 +1914,41 @@ function getCheckStatusLabel(t: TFunction, status: CheckStatus): string {
       return t("sessionInspectorRunning");
     case "pending":
       return t("sessionInspectorPending");
+  }
+}
+
+function modelIdsMatch(currentModel: string | undefined, modelId: string) {
+  if (!currentModel) return false;
+  return (
+    currentModel === modelId ||
+    currentModel.endsWith(`/${modelId}`) ||
+    modelId.endsWith(`/${currentModel}`)
+  );
+}
+
+function getThinkingValue(
+  mode: "off" | "auto" | "on",
+  effort: EffortLevel,
+): string {
+  return mode === "on" ? `on:${effort}` : mode;
+}
+
+function getReasoningLevelLabel(t: TFunction, level: string): string {
+  switch (level) {
+    case "low":
+      return t("inspectorThinkingLow");
+    case "medium":
+      return t("inspectorThinkingMedium");
+    case "high":
+      return t("inspectorThinkingHigh");
+    case "xhigh":
+      return t("inspectorThinkingXHigh");
+    case "max":
+      return t("inspectorThinkingMax");
+    case "ultra":
+      return t("inspectorThinkingUltra");
+    default:
+      return level;
   }
 }
 

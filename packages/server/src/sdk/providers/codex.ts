@@ -4791,6 +4791,7 @@ export class CodexProvider implements AgentProvider {
             {
               type: "system",
               subtype: "warning",
+              uuid: `codex-provider-retry-${params.turnId}`,
               session_id: sessionId,
               content: warning,
               warning,

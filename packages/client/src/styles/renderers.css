@@ -5111,6 +5111,109 @@ pre.code-highlighter-plain code {
   border-radius: 4px;
 }
 
+.file-viewer-pdf,
+.file-viewer-docx,
+.file-viewer-table-wrap {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.file-viewer-pdf iframe {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  background: #fff;
+}
+
+.file-viewer-docx {
+  position: relative;
+  overflow: auto;
+  padding: 1rem;
+  background: #e8e8e8;
+}
+
+.file-viewer-docx .docx-body {
+  width: 100%;
+  max-width: 820px;
+  margin: 0 auto;
+  color: #1a1a1a;
+}
+
+.file-viewer-table-wrap {
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.sheet-tabs {
+  display: flex;
+  flex-shrink: 0;
+  gap: 0.25rem;
+  overflow-x: auto;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.sheet-tab {
+  padding: 0.3rem 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.sheet-tab.active {
+  background: var(--bg-input);
+  color: var(--text-primary);
+}
+
+.table-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.preview-table {
+  min-width: 100%;
+  border-collapse: collapse;
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+}
+
+.preview-table td {
+  min-width: 80px;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border-color);
+  white-space: pre-wrap;
+}
+
+.preview-table tr:first-child td {
+  position: sticky;
+  top: 0;
+  background: var(--bg-secondary);
+  font-weight: 600;
+}
+
+.table-truncated-note {
+  flex-shrink: 0;
+  padding: 0.45rem 0.75rem;
+  border-top: 1px solid var(--border-color);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.file-viewer-loading-inline {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  min-height: 8rem;
+  color: var(--text-muted);
+}
+
 /* Binary file display */
 .file-viewer-binary {
   display: flex;
@@ -5410,6 +5513,47 @@ pre.code-highlighter-plain code {
   margin-top: 0;
 }
 
+.markdown-preview .markdown-rendered .md-heading {
+  position: relative;
+}
+
+.markdown-preview .markdown-rendered .md-heading-anchor {
+  position: absolute;
+  left: -1.1em;
+  width: 1em;
+  color: var(--text-muted);
+  font-weight: 400;
+  text-align: center;
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.markdown-preview .markdown-rendered .md-heading:hover .md-heading-anchor,
+.markdown-preview .markdown-rendered .md-heading-anchor:focus-visible {
+  opacity: 0.7;
+}
+
+.markdown-preview .markdown-rendered .md-heading-anchor:hover {
+  color: var(--primary-color);
+  opacity: 1;
+}
+
+@keyframes md-heading-flash {
+  from {
+    background-color: color-mix(in srgb, var(--primary-color) 22%, transparent);
+  }
+
+  to {
+    background-color: transparent;
+  }
+}
+
+.markdown-preview .markdown-rendered .md-heading-flash {
+  border-radius: 4px;
+  animation: md-heading-flash 1.2s ease-out;
+}
+
 .markdown-preview .markdown-rendered p {
   margin: 0.75rem 0;
 }
@@ -5480,6 +5624,74 @@ pre.code-highlighter-plain code {
 .markdown-preview .markdown-rendered img {
   max-width: 100%;
   height: auto;
+}
+
+.markdown-preview .markdown-rendered .mermaid {
+  overflow-x: auto;
+  text-align: center;
+}
+
+.markdown-preview .markdown-rendered .mermaid svg {
+  max-width: 100%;
+}
+
+.markdown-toc {
+  flex-shrink: 0;
+  margin: 0.5rem 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+}
+
+.markdown-toc summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.markdown-toc > ul {
+  margin: 0.4rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.markdown-toc-link {
+  display: block;
+  width: 100%;
+  padding: 0.2rem 0.35rem;
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.markdown-toc-link:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.markdown-toc-level-1 .markdown-toc-link {
+  font-weight: 600;
+}
+
+.markdown-toc-level-2 .markdown-toc-link {
+  padding-left: 1rem;
+}
+
+.markdown-toc-level-3 .markdown-toc-link {
+  padding-left: 1.75rem;
+}
+
+.markdown-toc-level-4 .markdown-toc-link,
+.markdown-toc-level-5 .markdown-toc-link,
+.markdown-toc-level-6 .markdown-toc-link {
+  padding-left: 2.5rem;
 }
 
 /* Note: When "Show full context" is clicked in the diff modal, JS automatically

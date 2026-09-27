@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { constants, type Stats } from "node:fs";
 import { lstat, open, opendir, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import type { SessionFileStore } from "./store.js";
 import {
@@ -58,7 +58,7 @@ function within(root: string, path: string): boolean {
   const value = relative(root, path);
   return (
     value === "" ||
-    (!isAbsolute(value) && value !== ".." && !value.startsWith("../"))
+    (!isAbsolute(value) && value !== ".." && !value.startsWith(`..${sep}`))
   );
 }
 

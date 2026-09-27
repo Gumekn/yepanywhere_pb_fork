@@ -299,7 +299,13 @@ export class CodexModelSourceRegistry {
 
   /** Resolve a source id (defaulting to `openai`), throwing when unknown. */
   require(id: string | undefined): CodexModelSourceDefinition {
-    const resolved = id?.trim() || DEFAULT_CODEX_MODEL_SOURCE;
+    const requested = id?.trim();
+    // Older OpenAI sessions inherit the conventional user-configured
+    // `model_provider = "custom"`; Yep now owns that config and pins OpenAI.
+    const resolved =
+      requested === "custom"
+        ? DEFAULT_CODEX_MODEL_SOURCE
+        : requested || DEFAULT_CODEX_MODEL_SOURCE;
     const definition = CODEX_MODEL_SOURCE_DEFINITIONS[resolved];
     if (!definition) {
       throw new CodexModelSourceError(

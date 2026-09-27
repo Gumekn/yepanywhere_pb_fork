@@ -304,6 +304,42 @@ describe("Sessions metadata route", () => {
     );
   });
 
+  it("accepts a model preset for the next session start", async () => {
+    const updateMetadata = vi.fn(async () => undefined);
+    const eventBus = new EventBus();
+    const emit = vi.spyOn(eventBus, "emit");
+    const routes = createSessionsRoutes({
+      supervisor: {} as SessionsDeps["supervisor"],
+      scanner: {} as SessionsDeps["scanner"],
+      readerFactory: vi.fn() as unknown as SessionsDeps["readerFactory"],
+      sessionMetadataService: {
+        updateMetadata,
+      } as unknown as NonNullable<SessionsDeps["sessionMetadataService"]>,
+      eventBus,
+    });
+
+    const response = await routes.request("/sessions/session-1/metadata", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(updateMetadata).toHaveBeenCalledWith("session-1", {
+      title: undefined,
+      archived: undefined,
+      starred: undefined,
+      model: "gpt-5.6-sol",
+    });
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "session-metadata-changed",
+        sessionId: "session-1",
+        model: "gpt-5.6-sol",
+      }),
+    );
+  });
+
   it("returns live usage and retry status before the session file exists", async () => {
     const project = createProject();
     const process = {

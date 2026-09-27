@@ -124,3 +124,17 @@ describe("renderMarkdownDocumentToHtml", () => {
     expect(await renderMarkdownToHtml(markdown)).toBe(transcript);
   });
 });
+
+describe("document preview rendering", () => {
+  it("adds heading anchors and promotes Mermaid fences", async () => {
+    const html = await renderMarkdownToHtml(
+      ["# Overview", "", "```mermaid", "graph TD; A-->B;", "```"].join("\n"),
+      { headingAnchors: true, renderMermaid: true },
+    );
+
+    expect(html).toContain('<h1 id="overview" class="md-heading">');
+    expect(html).toContain('class="md-heading-anchor" href="#overview"');
+    expect(html).toContain('<div class="mermaid">graph TD; A--&gt;B;');
+    expect(html).not.toContain("language-mermaid");
+  });
+});

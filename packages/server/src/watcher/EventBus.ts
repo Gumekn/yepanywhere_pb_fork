@@ -161,7 +161,7 @@ export interface WorkerActivityEvent {
   timestamp: string;
 }
 
-/** Event emitted when session metadata changes (title, AI title, archived, pinned) */
+/** Event emitted when session metadata changes. */
 export interface SessionMetadataChangedEvent {
   type: "session-metadata-changed";
   sessionId: string;
@@ -171,6 +171,8 @@ export interface SessionMetadataChangedEvent {
   title?: string;
   /** Updated AI-generated title (if changed) */
   aiTitle?: string;
+  /** Preset model for the next session start (if changed) */
+  model?: string;
   /** Updated archived status (if changed) */
   archived?: boolean;
   /** Updated pin status (if changed) */

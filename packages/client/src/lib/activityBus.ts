@@ -85,6 +85,8 @@ export interface SessionMetadataChangedEvent {
   projectId?: UrlProjectId;
   title?: string;
   aiTitle?: string;
+  /** Preset model for the next session start. */
+  model?: string;
   archived?: boolean;
   pinned?: boolean;
   /** @deprecated Compatibility alias sent by older servers. */

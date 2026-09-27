@@ -600,12 +600,15 @@ export class SessionMetadataService {
     await this.save();
   }
 
-  /**
-   * Update metadata for a session (title, archived, pinned compatibility bit).
-   */
+  /** Update user-controlled session metadata. */
   async updateMetadata(
     sessionId: string,
-    updates: { title?: string; archived?: boolean; starred?: boolean },
+    updates: {
+      title?: string;
+      archived?: boolean;
+      starred?: boolean;
+      model?: string;
+    },
   ): Promise<void> {
     this.updateSessionMetadata(sessionId, (metadata) => {
       const result = { ...metadata };
@@ -624,6 +627,10 @@ export class SessionMetadataService {
       // Handle starred
       if (updates.starred !== undefined) {
         result.isStarred = updates.starred || undefined;
+      }
+
+      if (updates.model !== undefined) {
+        result.model = updates.model.trim() || undefined;
       }
 
       return result;

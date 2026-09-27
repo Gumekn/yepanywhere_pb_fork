@@ -13,6 +13,11 @@ const installTaskScript = path.join(
   "scripts",
   "install-task-scheduler.ps1",
 );
+const serviceConfigScript = path.join(
+  repoRoot,
+  "scripts",
+  "service-config.ps1",
+);
 const runProdScript = path.join(repoRoot, "scripts", "run-yepanywhere.ps1");
 const watchdogScript = path.join(repoRoot, "scripts", "watch-yepanywhere.ps1");
 const productionRuntimeScript = path.join(
@@ -209,6 +214,36 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "win32")("Windows 服务脚本", () => {
+  it("生产服务继承当前 Windows HTTP 代理并保留显式配置", async () => {
+    const marker = "__PROXY_ENV__";
+    const result = await runPowerShellCommand(`
+. ${psLiteral(serviceConfigScript)}
+Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:NO_PROXY -ErrorAction SilentlyContinue
+$env:HTTPS_PROXY = 'http://explicit-proxy:8080'
+$changed = Set-ServiceProxyEnvironment ([pscustomobject]@{ ProxyEnable = 1; ProxyServer = '127.0.0.1:7892' })
+$result = [ordered]@{
+  Changed = $changed
+  HttpProxy = $env:HTTP_PROXY
+  HttpsProxy = $env:HTTPS_PROXY
+  AllProxy = $env:ALL_PROXY
+  NoProxy = $env:NO_PROXY
+}
+Write-Output ('${marker}' + ($result | ConvertTo-Json -Compress))
+`);
+    const line = result.stdout
+      .split(/\r?\n/)
+      .find((candidate) => candidate.startsWith(marker));
+
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(line?.slice(marker.length) ?? "{}")).toEqual({
+      Changed: true,
+      HttpProxy: "http://127.0.0.1:7892/",
+      HttpsProxy: "http://explicit-proxy:8080",
+      AllProxy: "http://127.0.0.1:7892/",
+      NoProxy: "127.0.0.1,localhost,::1",
+    });
+  });
+
   it("不启动上游已移除的 Claude bridge sidecar", async () => {
     const [supervisor, cli] = await Promise.all([
       readFile(runProdScript, "utf8"),

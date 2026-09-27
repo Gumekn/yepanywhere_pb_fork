@@ -60,6 +60,9 @@ export default defineConfig({
   clearScreen: false,
   base: basePath,
   build: {
+    // Mermaid and document previews are lazy-loaded, but a few of their
+    // minified chunks legitimately exceed Vite's generic 500 kB default.
+    chunkSizeWarningLimit: 750,
     rollupOptions: {
       output: {
         manualChunks(id) {
@@ -79,7 +82,16 @@ export default defineConfig({
             return "vendor-router";
           }
           if (id.includes("/zod/")) return "vendor-zod";
-          return "vendor";
+          if (
+            id.includes("/xlsx/") ||
+            id.includes("/docx-preview/") ||
+            id.includes("/papaparse/")
+          ) {
+            return "preview-libs";
+          }
+          // Let Rollup keep dependencies that are only reached through a
+          // dynamic import out of the eager application vendor graph.
+          return;
         },
       },
     },

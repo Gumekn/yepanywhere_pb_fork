@@ -61,6 +61,10 @@ if (-not $env:ALLOWED_IMAGE_PATHS) {
   $configuredAllowedPaths = Get-ServiceConfigValue $null "AllowedImagePaths" $null
   if ($configuredAllowedPaths) { $env:ALLOWED_IMAGE_PATHS = $configuredAllowedPaths }
 }
+if (-not $env:YEP_REPORTS_DIR) {
+  $configuredReportsDir = Get-ServiceConfigValue $null "ReportsDir" $null
+  if ($configuredReportsDir) { $env:YEP_REPORTS_DIR = $configuredReportsDir }
+}
 if ($ServerBasePath -eq "/") {
   $ServerBasePath = ""
 } else {
@@ -126,6 +130,7 @@ function Assert-BundleReady {
 function Set-ProductionEnvironment {
   $env:NODE_ENV = "production"
   $env:MAINTENANCE_PORT = [string]$MaintenancePort
+  if (Set-ServiceProxyEnvironment) { Write-YepLog "已从 Windows 设置继承服务代理。" }
   if (-not $env:BASE_PATH) { $env:BASE_PATH = $ServerBasePath }
   if (-not $env:ALLOWED_IMAGE_PATHS) { $env:ALLOWED_IMAGE_PATHS = "$env:TEMP,$env:USERPROFILE\Downloads" }
   $env:YEP_DEPLOY_REPO_ROOT = $RepoRoot

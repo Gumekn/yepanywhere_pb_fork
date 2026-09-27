@@ -695,6 +695,19 @@ describe("SessionMetadataService", () => {
     });
   });
 
+  it("persists a model preset through metadata updates", async () => {
+    await service.initialize();
+
+    await service.updateMetadata("session-1", { model: "gpt-5.6-sol" });
+
+    const reloaded = new SessionMetadataService({ dataDir: testDir });
+    await reloaded.initialize();
+    expect(reloaded.getMetadata("session-1")?.model).toBe("gpt-5.6-sol");
+
+    await reloaded.updateMetadata("session-1", { model: "" });
+    expect(reloaded.getMetadata("session-1")).toBeUndefined();
+  });
+
   describe("LLM gateway session configuration", () => {
     it("persists the request protocol and model configuration for resume", async () => {
       await service.initialize();

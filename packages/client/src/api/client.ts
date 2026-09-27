@@ -250,6 +250,20 @@ export interface ProjectDirectoryBrowseResponse {
   truncated: boolean;
 }
 
+export interface ProjectBrowseEntry {
+  name: string;
+  path: string;
+  type: "dir" | "file";
+  size?: number;
+  isText?: boolean;
+}
+
+export interface ProjectBrowseResponse {
+  path: string;
+  parent: string | null;
+  entries: ProjectBrowseEntry[];
+}
+
 /**
  * Response from the global sessions API.
  */
@@ -1809,6 +1823,8 @@ export const api = {
       title?: string;
       archived?: boolean;
       pinned?: boolean;
+      /** Preset model for the next session start; empty string clears it. */
+      model?: string;
       /** @deprecated Use `pinned`; accepted for older callers. */
       starred?: boolean;
     },
@@ -2005,6 +2021,15 @@ export const api = {
     if (highlight) params.set("highlight", "true");
     return fetchJSON<FileContentResponse>(
       `/projects/${projectId}/files?${params.toString()}`,
+    );
+  },
+
+  browseProjectFiles: (projectId: string, path = "") => {
+    const params = new URLSearchParams();
+    if (path) params.set("path", path);
+    const query = params.toString();
+    return fetchJSON<ProjectBrowseResponse>(
+      `/projects/${projectId}/files/browse${query ? `?${query}` : ""}`,
     );
   },
 

@@ -90,6 +90,8 @@ pnpm yep status
 
 如需关闭下次登录自启动，运行 `pnpm yep disable-autostart`；它不会停止当前实例。
 
+Windows 生产服务的报告目录可在 `%USERPROFILE%\\.yep-anywhere\\service-config.json` 中通过可选的 `ReportsDir` 配置；也可用 `YEP_REPORTS_DIR` 环境变量覆盖。修改会在服务下次启动时生效。
+
 ## 远程访问
 
 服务器运行在你的机器上，客户端会直接连接服务器的 WebSocket。你可以从手机通过自己的网络访问它，例如 Tailscale、局域网 IP，或者带 SSL 终止的反向代理/隧道（如 Caddy）。

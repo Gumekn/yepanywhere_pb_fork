@@ -247,6 +247,22 @@ describe("mergeSessionMetadataChange", () => {
     expect(cleared?.title).toBe("Provider fallback");
     expect(getSessionDisplayTitle(cleared)).toBe("DeepSeek title");
   });
+
+  it("applies and clears a model preset event", () => {
+    const selected = mergeSessionMetadataChange(
+      session(),
+      metadataEvent({ model: "gpt-5.6-sol" }),
+      "ses-current",
+    );
+    expect(selected?.model).toBe("gpt-5.6-sol");
+
+    const cleared = mergeSessionMetadataChange(
+      selected,
+      metadataEvent({ model: "" }),
+      "ses-current",
+    );
+    expect(cleared?.model).toBeUndefined();
+  });
 });
 
 describe("shouldRefreshSettledAuthoritativeSnapshot", () => {

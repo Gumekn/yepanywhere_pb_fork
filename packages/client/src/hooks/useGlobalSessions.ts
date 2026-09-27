@@ -656,6 +656,9 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
             ...session,
             ...(event.title !== undefined && { customTitle: nextCustomTitle }),
             ...(event.aiTitle !== undefined && { aiTitle: nextAiTitle }),
+            ...(event.model !== undefined && {
+              model: event.model.trim() || undefined,
+            }),
             ...(event.archived !== undefined && { isArchived: event.archived }),
             ...(pinned !== undefined && { isStarred: pinned }),
           };

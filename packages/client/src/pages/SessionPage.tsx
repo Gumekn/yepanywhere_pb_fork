@@ -15,6 +15,7 @@ import {
 } from "react-router-dom";
 import { api, isQueuedResumeSessionResponse } from "../api/client";
 import { ExpandableSessionTitle } from "../components/ExpandableSessionTitle";
+import { FileViewer } from "../components/FileViewer";
 import { GoalModal } from "../components/GoalModal";
 import { MessageInput, type UploadProgress } from "../components/MessageInput";
 import { MessageInputToolbar } from "../components/MessageInputToolbar";
@@ -33,6 +34,7 @@ import { ToolApprovalPanel } from "../components/ToolApprovalPanel";
 import { TranscriptRendererProvider } from "../components/TranscriptRendererProvider";
 import { ProjectedToolStepRow } from "../components/blocks/ProjectedToolGroupRow";
 import { AgentContentProvider } from "../contexts/AgentContentContext";
+import { FileTabOpenerContext } from "../contexts/FileTabOpenerContext";
 import { SessionMetadataProvider } from "../contexts/SessionMetadataContext";
 import {
   StreamingMarkdownProvider,
@@ -435,6 +437,24 @@ function SessionPageContent({
     enabled: isInspectorVisible,
     onError: () => showToast(t("sessionInspectorDetailsLoadFailed"), "error"),
   });
+  const [openFileTabs, setOpenFileTabs] = useState<string[]>([]);
+  const [activeWorkbenchTab, setActiveWorkbenchTab] = useState("chat");
+  const openOrFocusFileTab = useCallback((path: string) => {
+    setOpenFileTabs((current) =>
+      current.includes(path) ? current : [...current, path],
+    );
+    setActiveWorkbenchTab(path);
+  }, []);
+  const closeFileTab = useCallback((path: string) => {
+    setOpenFileTabs((current) => {
+      const index = current.indexOf(path);
+      const next = current.filter((item) => item !== path);
+      setActiveWorkbenchTab((active) =>
+        active === path ? (next[Math.max(0, index - 1)] ?? "chat") : active,
+      );
+      return next;
+    });
+  }, []);
   const handleTargetFocused = useCallback(() => {
     setTargetMessageId(null);
   }, []);
@@ -1368,11 +1388,23 @@ function SessionPageContent({
   };
 
   const handleModelChanged = useCallback(
-    (model: string, reasoningEffort?: string) => {
+    (model?: string, reasoningEffort?: string) => {
       setSessionModel(model, reasoningEffort);
-      showToast(t("sessionSwitchedModel", { model }), "success");
+      showToast(
+        t("sessionSwitchedModel", {
+          model: model ?? t("inspectorModelDefault"),
+        }),
+        "success",
+      );
     },
     [setSessionModel, showToast, t],
+  );
+
+  const handleReasoningEffortChanged = useCallback(
+    (effort: string | null) => {
+      setSessionModel(session?.model, effort);
+    },
+    [session?.model, setSessionModel],
   );
 
   const handleCustomCommand = useCallback((command: string) => {
@@ -2335,7 +2367,57 @@ function SessionPageContent({
           </div>
         )}
 
-        <main className="session-messages">
+        <div
+          className="editor-tabbar"
+          role="tablist"
+          aria-label={t("editorTabs" as never)}
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeWorkbenchTab === "chat"}
+            className={`editor-tab${activeWorkbenchTab === "chat" ? " is-active" : ""}`}
+            onClick={() => setActiveWorkbenchTab("chat")}
+          >
+            <span className="editor-tab-label">
+              {t("editorTabChat" as never)}
+            </span>
+          </button>
+          {openFileTabs.map((path) => (
+            <div
+              key={path}
+              role="presentation"
+              className={`editor-tab editor-tab--file${activeWorkbenchTab === path ? " is-active" : ""}`}
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeWorkbenchTab === path}
+                className="editor-tab-main"
+                onClick={() => setActiveWorkbenchTab(path)}
+                title={path}
+              >
+                <TabFileIcon />
+                <span className="editor-tab-label">
+                  {path.split("/").pop() ?? path}
+                </span>
+              </button>
+              <button
+                type="button"
+                className="editor-tab-close"
+                onClick={() => closeFileTab(path)}
+                aria-label={t("editorClose" as never)}
+                title={t("editorClose" as never)}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <main
+          className={`session-messages${activeWorkbenchTab === "chat" ? "" : " workbench-hidden"}`}
+        >
           {loading ? (
             <SessionMessagesSkeleton />
           ) : (
@@ -2352,7 +2434,9 @@ function SessionPageContent({
                 projectId={projectId}
                 sessionId={sessionId}
               >
-                <>
+                <FileTabOpenerContext.Provider
+                  value={{ openFileTab: openOrFocusFileTab }}
+                >
                   <MessageList
                     messages={messages}
                     preprocessedItems={renderItems}
@@ -2429,13 +2513,15 @@ function SessionPageContent({
                       ))}
                     </div>
                   )}
-                </>
+                </FileTabOpenerContext.Provider>
               </AgentContentProvider>
             </SessionMetadataProvider>
           )}
         </main>
 
-        <footer className="session-input">
+        <footer
+          className={`session-input${activeWorkbenchTab === "chat" ? "" : " workbench-hidden"}`}
+        >
           <div
             className={`session-connection-bar session-connection-${sessionConnectionStatus}`}
           />
@@ -2644,6 +2730,18 @@ function SessionPageContent({
             )}
           </div>
         </footer>
+        {openFileTabs.map((path) => (
+          <div
+            key={path}
+            className={`file-panel${activeWorkbenchTab === path ? " is-active" : ""}`}
+          >
+            <FileViewer
+              projectId={projectId}
+              filePath={path}
+              onClose={() => closeFileTab(path)}
+            />
+          </div>
+        ))}
       </div>
       {isWideScreen ? (
         isInspectorExpanded ? (
@@ -2680,6 +2778,11 @@ function SessionPageContent({
             status={status}
             processState={processState}
             onSelectMessage={handleSelectMessage}
+            onOpenFile={openOrFocusFileTab}
+            processId={status.owner === "self" ? status.processId : undefined}
+            providers={providers}
+            onModelChanged={handleModelChanged}
+            onReasoningEffortChanged={handleReasoningEffortChanged}
           />
         ) : null
       ) : (
@@ -2715,8 +2818,32 @@ function SessionPageContent({
           status={status}
           processState={processState}
           onSelectMessage={handleSelectMessage}
+          onOpenFile={openOrFocusFileTab}
+          processId={status.owner === "self" ? status.processId : undefined}
+          providers={providers}
+          onModelChanged={handleModelChanged}
+          onReasoningEffortChanged={handleReasoningEffortChanged}
         />
       )}
     </div>
+  );
+}
+
+function TabFileIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M14 3v5h5" />
+      <path d="M6 3h8l5 5v13H6z" />
+    </svg>
   );
 }

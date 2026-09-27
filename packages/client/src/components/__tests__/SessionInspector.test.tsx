@@ -5,7 +5,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import type { SessionQuestion } from "@yep-anywhere/shared";
+import type { ProviderInfo, SessionQuestion } from "@yep-anywhere/shared";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as fileIndexHook from "../../hooks/useSessionFileIndex";
@@ -230,6 +230,61 @@ describe("SessionInspector", () => {
     fireEvent.click(collapseButton);
 
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows model and provider-native reasoning controls", () => {
+    const providers: ProviderInfo[] = [
+      {
+        name: "codex",
+        displayName: "Codex",
+        installed: true,
+        authenticated: true,
+        enabled: true,
+        models: [
+          {
+            id: "gpt-5.6-sol",
+            name: "GPT-5.6 Sol",
+            supportedReasoningEfforts: [
+              { reasoningEffort: "low" },
+              { reasoningEffort: "xhigh" },
+              { reasoningEffort: "ultra" },
+            ],
+          },
+        ],
+      },
+    ];
+    window.localStorage.setItem(UI_KEYS.locale, "en");
+    render(
+      <MemoryRouter>
+        <I18nProvider>
+          <SessionInspector
+            presentation="sidebar"
+            messages={[]}
+            projectId="project-1"
+            sessionId="session-1"
+            provider="codex"
+            model="gpt-5.6-sol"
+            reasoningEffort="xhigh"
+            status={{ owner: "self", processId: "process-1" }}
+            processId="process-1"
+            providers={providers}
+            onSelectMessage={vi.fn()}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+
+    const modelSelect = screen.getByRole("combobox", { name: "Model" });
+    const reasoningSelect = screen.getByRole("combobox", {
+      name: "Reasoning effort",
+    });
+
+    expect((modelSelect as HTMLSelectElement).value).toBe("gpt-5.6-sol");
+    expect(
+      Array.from((reasoningSelect as HTMLSelectElement).options).map(
+        (option) => option.value,
+      ),
+    ).toEqual(["off", "auto", "on:low", "on:xhigh", "on:ultra"]);
   });
 
   it("loads the complete session index as soon as the inspector is visible", async () => {

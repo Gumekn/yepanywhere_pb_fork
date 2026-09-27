@@ -1,6 +1,6 @@
 import type { Stats } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
-import { extname, normalize, resolve, sep } from "node:path";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { basename, extname, normalize, resolve, sep } from "node:path";
 import {
   type FileContentResponse,
   type FileMetadata,
@@ -15,6 +15,14 @@ import type { ProjectScanner } from "../projects/scanner.js";
 
 export interface FilesDeps {
   scanner: ProjectScanner;
+}
+
+interface ProjectBrowseEntry {
+  name: string;
+  path: string;
+  type: "dir" | "file";
+  size?: number;
+  isText?: boolean;
 }
 
 /** Maximum file size to include content inline (1MB) */
@@ -268,7 +276,7 @@ function isTextFile(filePath: string): boolean {
     return TEXT_EXTENSIONS.has(ext);
   }
   // Handle dotfiles (files with no extension but starting with .)
-  const fileName = filePath.split("/").pop() || filePath;
+  const fileName = basename(filePath);
   return TEXT_DOTFILES.has(fileName.toLowerCase());
 }
 
@@ -422,6 +430,71 @@ export function createFilesRoutes(deps: FilesDeps): Hono {
     }
 
     return c.json(response);
+  });
+
+  routes.get("/:projectId/files/browse", async (c) => {
+    const projectId = c.req.param("projectId");
+    const relativePath = c.req.query("path") ?? "";
+
+    if (!isUrlProjectId(projectId)) {
+      return c.json({ error: "Invalid project ID format" }, 400);
+    }
+
+    const project = await deps.scanner.getProject(projectId);
+    if (!project) {
+      return c.json({ error: "Project not found" }, 404);
+    }
+
+    const dirPath = resolveFilePath(project.path, relativePath);
+    if (!dirPath) {
+      return c.json({ error: "Invalid directory path" }, 400);
+    }
+
+    try {
+      if (!(await stat(dirPath)).isDirectory()) {
+        return c.json({ error: "Path is not a directory" }, 400);
+      }
+    } catch {
+      return c.json({ error: "Directory not found" }, 404);
+    }
+
+    const normalizedPath = relativePath.replace(/[\\/]+$/, "");
+    const parent = normalizedPath
+      ? normalizedPath.split(/[\\/]/).slice(0, -1).join("/")
+      : null;
+
+    try {
+      const dirents = await readdir(dirPath, { withFileTypes: true });
+      const entries = (
+        await Promise.all(
+          dirents
+            .filter((entry) => entry.isDirectory() || entry.isFile())
+            .map(async (entry): Promise<ProjectBrowseEntry> => {
+              const path = normalizedPath
+                ? `${normalizedPath.replace(/\\/g, "/")}/${entry.name}`
+                : entry.name;
+              if (entry.isDirectory()) {
+                return { name: entry.name, path, type: "dir" };
+              }
+              const absolutePath = resolve(dirPath, entry.name);
+              return {
+                name: entry.name,
+                path,
+                type: "file",
+                size: (await stat(absolutePath)).size,
+                isText: isTextFile(absolutePath),
+              };
+            }),
+        )
+      ).sort((a, b) => {
+        if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
+        return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+      });
+
+      return c.json({ path: normalizedPath, parent, entries });
+    } catch {
+      return c.json({ error: "Failed to read directory" }, 500);
+    }
   });
 
   /**

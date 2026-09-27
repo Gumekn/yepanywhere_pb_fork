@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useFileTabOpener } from "../../contexts/FileTabOpenerContext";
 import { useOptionalSessionMetadata } from "../../contexts/SessionMetadataContext";
 import { useStreamingMarkdownContext } from "../../contexts/StreamingMarkdownContext";
 import { useMarkdownCodeCopy } from "../../hooks/useMarkdownCodeCopy";
@@ -47,35 +48,43 @@ function getProjectRelativePath(
   filePath: string,
   projectPath: string | null | undefined,
 ): string | null {
-  if (!filePath.startsWith("/")) {
-    return filePath.startsWith("../") || filePath === ".." ? null : filePath;
+  const normalizedPath = filePath.replace(/\\/g, "/");
+  const root = projectPath?.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!normalizedPath.startsWith("/") && !/^[A-Za-z]:\//.test(normalizedPath)) {
+    return normalizedPath.startsWith("../") || normalizedPath === ".."
+      ? null
+      : normalizedPath;
   }
-  const root = projectPath?.replace(/\/+$/, "");
   if (!root) return null;
-  if (!filePath.startsWith(`${root}/`)) return null;
-  return filePath.slice(root.length + 1);
+  if (!normalizedPath.startsWith(`${root}/`)) return null;
+  return normalizedPath.slice(root.length + 1);
 }
 
 function resolveLocalFilePath(
   filePath: string,
   projectPath: string | null | undefined,
 ): string {
+  const normalizedFilePath = filePath.replace(/\\/g, "/");
   const path =
-    !filePath.startsWith("/") && projectPath
-      ? `${projectPath}/${filePath}`
-      : filePath;
-  const absolute = path.startsWith("/");
+    !normalizedFilePath.startsWith("/") &&
+    !/^[A-Za-z]:\//.test(normalizedFilePath) &&
+    projectPath
+      ? `${projectPath.replace(/\\/g, "/")}/${normalizedFilePath}`
+      : normalizedFilePath;
+  const windowsRoot = /^[A-Za-z]:\//.test(path) ? 1 : 0;
+  const absolute = path.startsWith("/") || windowsRoot > 0;
   const parts: string[] = [];
   for (const part of path.split("/")) {
     if (!part || part === ".") continue;
     if (part === "..") {
-      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      if (parts.length > windowsRoot && parts[parts.length - 1] !== "..")
+        parts.pop();
       else if (!absolute) parts.push(part);
     } else {
       parts.push(part);
     }
   }
-  return `${absolute ? "/" : ""}${parts.join("/")}`;
+  return `${path.startsWith("/") ? "/" : ""}${parts.join("/")}`;
 }
 
 function isModifiedClick(e: React.MouseEvent): boolean {
@@ -192,6 +201,7 @@ export const TextBlock = memo(function TextBlock({
   const blockRef = useRef<HTMLDivElement | null>(null);
   const handleCodeBlockCopyClick = useMarkdownCodeCopy(blockRef);
   const sessionMetadata = useOptionalSessionMetadata();
+  const fileTabOpener = useFileTabOpener();
   const benchmarkEval = useMemo(
     () => parseBenchmarkEvalResultBlock(text),
     [text],
@@ -281,12 +291,22 @@ export const TextBlock = memo(function TextBlock({
         return;
       }
 
+      if (fileTabOpener) {
+        fileTabOpener.openFileTab(relativePath);
+        return;
+      }
+
       setFileModal({
         filePath: relativePath,
         lineNumber: localFileTarget.lineNumber,
       });
     },
-    [handleCodeBlockCopyClick, handleLocalMediaClick, sessionMetadata],
+    [
+      fileTabOpener,
+      handleCodeBlockCopyClick,
+      handleLocalMediaClick,
+      sessionMetadata,
+    ],
   );
 
   const showStreamingContent = isStreaming && useStreamingContent;

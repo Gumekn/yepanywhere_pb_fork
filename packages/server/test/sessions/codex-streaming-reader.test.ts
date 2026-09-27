@@ -240,4 +240,42 @@ describe("Codex streaming reader windows", () => {
       returnedMessageCount: 3,
     });
   });
+
+  it("loads histories containing an inline image tool result larger than 8 MiB", async () => {
+    const rolloutPath = join(sessionsDir, `rollout-${sessionId}.jsonl`);
+    const entries = [
+      meta(sessionId),
+      message("user", "inspect the image", 1),
+      {
+        type: "response_item",
+        timestamp: "2026-08-18T00:00:02.000Z",
+        payload: {
+          type: "custom_tool_call_output",
+          call_id: "call-large-image",
+          output: [
+            {
+              type: "input_image",
+              image_url: `data:image/png;base64,${"A".repeat(8 * 1024 * 1024)}`,
+            },
+          ],
+        },
+      },
+      message("assistant", "image inspected", 3),
+    ];
+    await writeFile(
+      rolloutPath,
+      `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+      "utf8",
+    );
+
+    const reader = new CodexSessionReader({ sessionsDir });
+    const loaded = await reader.getSession(sessionId, projectId, undefined, {
+      inspectorProjection: true,
+      maxMessages: 1,
+    });
+
+    expect(
+      loaded ? normalizeSession(loaded).messages[0]?.message?.content : null,
+    ).toEqual([{ type: "text", text: "image inspected" }]);
+  });
 });

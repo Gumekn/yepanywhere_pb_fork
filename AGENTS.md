@@ -214,3 +214,13 @@ curl -X PUT http://localhost:3401/log/level -d '{"console": "debug"}'
 ## 会话完成
 
 会话结束时，如果有助于用户把握整体计划，简短提示下一个合理步骤。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in this repository’s GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+This is a multi-context repository: read `CONTEXT-MAP.md` and the relevant package context docs. See `docs/agents/domain.md`.

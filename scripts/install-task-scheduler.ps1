@@ -74,6 +74,7 @@ $serviceConfig = [pscustomobject][ordered]@{
   Profile = Get-ConfiguredValue $env:YEP_ANYWHERE_PROFILE "Profile" $null
   DataDir = Get-ConfiguredValue $env:YEP_ANYWHERE_DATA_DIR "DataDir" $null
   AllowedImagePaths = Get-ConfiguredValue $env:ALLOWED_IMAGE_PATHS "AllowedImagePaths" $null
+  ReportsDir = Get-ConfiguredValue $env:YEP_REPORTS_DIR "ReportsDir" $null
   CodexPort = Get-ConfiguredValue $env:YEP_CODEX_BRIDGE_PORT "CodexPort" "4510"
   ClaudePort = Get-ConfiguredValue $env:YEP_CLAUDE_BRIDGE_PORT "ClaudePort" "4520"
 }

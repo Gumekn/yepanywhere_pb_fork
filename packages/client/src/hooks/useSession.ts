@@ -271,7 +271,9 @@ export function mergeSessionMetadataChange(
   if (
     !session ||
     event.sessionId !== expectedSessionId ||
-    (event.title === undefined && event.aiTitle === undefined)
+    (event.title === undefined &&
+      event.aiTitle === undefined &&
+      event.model === undefined)
   ) {
     return session;
   }
@@ -283,6 +285,9 @@ export function mergeSessionMetadataChange(
     }),
     ...(event.aiTitle !== undefined && {
       aiTitle: normalizeMetadataTitle(event.aiTitle),
+    }),
+    ...(event.model !== undefined && {
+      model: normalizeMetadataTitle(event.model),
     }),
   };
 }
@@ -2285,13 +2290,15 @@ export function useSession(
 
   // Allow external model update (e.g., after /model command switches mid-session)
   const setSessionModel = useCallback(
-    (model: string, reasoningEffort?: string) => {
+    (model?: string, reasoningEffort?: string | null) => {
       setSession((prev) =>
         prev
           ? {
               ...prev,
               model,
-              ...(reasoningEffort !== undefined && { reasoningEffort }),
+              ...(reasoningEffort !== undefined && {
+                reasoningEffort: reasoningEffort ?? undefined,
+              }),
             }
           : prev,
       );

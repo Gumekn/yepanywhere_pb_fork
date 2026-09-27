@@ -19,9 +19,9 @@ describe("Files API", () => {
 
     // Create temp directory structure with a valid project
     testDir = join(tmpdir(), `claude-test-${randomUUID()}`);
-    projectPath = join(testDir, "myproject");
+    projectPath = join(testDir, "myproject").replace(/\\/g, "/");
     projectId = encodeProjectId(projectPath);
-    const encodedPath = projectPath.replaceAll("/", "-");
+    const encodedPath = projectPath.replace(/[/\\:]/g, "-");
 
     // Create project directory
     await mkdir(projectPath, { recursive: true });
@@ -33,7 +33,11 @@ describe("Files API", () => {
     // Session file must include cwd field for project path discovery
     await writeFile(
       join(sessionsDir, "sess-existing.jsonl"),
-      `{"type":"user","cwd":"${projectPath}","message":{"content":"Hello"}}\n`,
+      `${JSON.stringify({
+        type: "user",
+        cwd: projectPath,
+        message: { content: "Hello" },
+      })}\n`,
     );
 
     // Create test files in project
@@ -249,6 +253,51 @@ describe("Files API", () => {
       const json = (await res.json()) as FileContentResponse;
       expect(json.metadata.path).toBe(".env");
       expect(json.content).toBe("SECRET=value");
+    });
+  });
+
+  describe("GET /api/projects/:projectId/files/browse", () => {
+    it("lists project entries with directories first and browses nested paths", async () => {
+      const { app } = createApp({
+        sdk: mockSdk,
+        projectsDir: join(testDir, "sessions"),
+      });
+
+      const rootRes = await app.request(
+        `/api/projects/${projectId}/files/browse`,
+      );
+      expect(rootRes.status).toBe(200);
+      expect(await rootRes.json()).toMatchObject({
+        path: "",
+        parent: null,
+        entries: [
+          { name: "src", path: "src", type: "dir" },
+          { name: "data.json", path: "data.json", type: "file" },
+          { name: "image.png", path: "image.png", type: "file" },
+          { name: "README.md", path: "README.md", type: "file" },
+        ],
+      });
+
+      const nestedRes = await app.request(
+        `/api/projects/${projectId}/files/browse?path=src`,
+      );
+      expect(nestedRes.status).toBe(200);
+      expect(await nestedRes.json()).toMatchObject({
+        path: "src",
+        parent: "",
+        entries: [{ name: "index.ts", path: "src/index.ts", type: "file" }],
+      });
+    });
+
+    it("rejects directory traversal", async () => {
+      const { app } = createApp({
+        sdk: mockSdk,
+        projectsDir: join(testDir, "sessions"),
+      });
+      const res = await app.request(
+        `/api/projects/${projectId}/files/browse?path=../`,
+      );
+      expect(res.status).toBe(400);
     });
   });
 

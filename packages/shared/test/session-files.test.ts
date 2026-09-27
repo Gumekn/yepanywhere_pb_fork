@@ -102,6 +102,28 @@ describe("normalizeSessionFilePath", () => {
       "src/a.ts",
     );
   });
+
+  it("coalesces Windows absolute, relative, and file URL paths", () => {
+    expect(normalizeSessionFilePath("C:\\Repo\\src\\a.ts", "c:\\repo")).toEqual(
+      {
+        path: "src/a.ts",
+        outsideProject: false,
+      },
+    );
+    expect(normalizeSessionFilePath("src\\a.ts", "C:\\Repo")?.path).toBe(
+      "src/a.ts",
+    );
+    expect(
+      normalizeSessionFilePath("file:///C:/Repo/src/a.ts", "C:\\Repo")?.path,
+    ).toBe("src/a.ts");
+    expect(normalizeSessionFilePath("C:\\Other\\a.ts", "C:\\Repo")).toEqual({
+      path: "C:/Other/a.ts",
+      outsideProject: true,
+    });
+    expect(
+      normalizeSessionFilePath("C:\\Repo\\..\\Other\\a.ts", "C:\\Repo"),
+    ).toEqual({ path: "C:/Other/a.ts", outsideProject: true });
+  });
 });
 
 describe("classifyFileActivityKind", () => {

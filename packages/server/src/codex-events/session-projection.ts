@@ -825,6 +825,7 @@ function buildProviderErrorCandidates(
 ): CanonicalMessageCandidate[] {
   const candidates: CanonicalMessageCandidate[] = [];
   const retryableErrorsByTurn = new Map<string, CanonicalCodexError>();
+  const retryCandidateIndexByTurn = new Map<string, number>();
   const terminalTurns = new Map<
     string,
     {
@@ -858,13 +859,18 @@ function buildProviderErrorCandidates(
           minCandidateSequence === undefined ||
           event.sequence >= minCandidateSequence
         ) {
-          candidates.push(
-            providerErrorCandidate(event, classified, {
-              willRetry: true,
-              threadId,
-              turnId,
-            }),
-          );
+          const candidate = providerErrorCandidate(event, classified, {
+            willRetry: true,
+            threadId,
+            turnId,
+          });
+          const priorIndex = retryCandidateIndexByTurn.get(turnKey);
+          if (priorIndex === undefined) {
+            retryCandidateIndexByTurn.set(turnKey, candidates.length);
+            candidates.push(candidate);
+          } else {
+            candidates[priorIndex] = candidate;
+          }
         }
         continue;
       }

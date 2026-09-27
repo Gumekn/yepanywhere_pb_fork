@@ -32,6 +32,19 @@ describe("CodexModelSourceRegistry", () => {
     expect(registry.getAvailability("openai").available).toBe(true);
   });
 
+  it("resumes legacy custom OpenAI sessions through the built-in source", () => {
+    const registry = withoutKey();
+    const source = registry.require("custom");
+    expect(source.id).toBe("openai");
+    expect(registry.buildAppServerArgs(source)).toEqual([
+      "-c",
+      'model_provider="openai"',
+    ]);
+    expect(registry.getPublicSources().map(({ id }) => id)).not.toContain(
+      "custom",
+    );
+  });
+
   it("marks deepseek available only when its API key is present", () => {
     expect(withKey().getAvailability("deepseek").available).toBe(true);
     const missing = withoutKey().getAvailability("deepseek");

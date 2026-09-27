@@ -25,6 +25,8 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - 收紧新建会话页 Codex 用量卡片的留白：账号块、用量窗口、进度条、额外限额等区块的间距和内边距整体下调一档，多账号时卡片高度明显降低，信息密度更高，不影响布局结构与移动端单列回退。
 
 ### Added
+- 恢复会话索引中的模型与思考程度直接选择：模型列表和每个模型的原生思考档位来自当前 provider catalog，运行中继续使用现有即时切换接口，已停止会话可持久化下次启动模型预设。
+- 恢复会话索引中的项目仓库浏览与旧版会话内文件工作台：目录按需展开，文件点击会复用“对话 + 多文件标签页”而不覆盖会话页；文件预览支持源码、Markdown 目录与 Mermaid、PDF、DOCX、Excel、CSV/TSV，并保留独立新标签页入口。
 - 当前回复轮次的计时旁新增“LLM 思考中 / 工具执行中”状态，支持折叠工具组和并行工具调用，轮次结束后自动隐藏；同步提供中英文文案。
 - 会话菜单新增“复制项目目录”，可直接复制该会话所属项目的完整路径，并提供中英文成功与失败提示。
 - Codex 用量卡片展示每份重置额度的到期时间，并支持选择额度、确认账号后兑换重置；保留请求幂等键以防重试重复消耗，兑换后刷新用量，明确区分期限未知和长期有效。
@@ -46,6 +48,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - APK 侧边栏新增 Home、Mini 服务快捷切换，分别显示最近 24 小时已结束且未读的会话数；打开侧边栏时独立查询两端并每 15 秒刷新，区分离线与需要登录，切换服务不清除未读。Inbox 新增分页截断前的完整计数，兼容旧服务时对可能截断的计数显示 `+`。
 
 ### Fixed
+- 修复上游会话文件快照在 Windows 上误判存储目录位于工作区内、并发写入同一不可变记录时重命名失败，以及会话文件索引无法合并 Windows 绝对路径与项目相对路径的问题。
 - 修复 Codex 多账号会话正文缺失：历史读取按会话绑定账号选择独立 CODEX_HOME，并复用各账号自己的只读 app-server，避免默认账号的空历史库覆盖完整对话；不同账号的读取、并发请求和失败退避相互隔离。
 - 修复 Codex 多账号会话因默认账号索引标题为空而显示 New session／未命名：从共享 rollout 的首条真实用户输入补齐标题，跳过初始化指令并限制读取量；修复无消息 ID 的回合结束通知在历史刷新时丢失、最终答复后一直显示「正在收尾…」的问题，保留按回合关联的完成状态并隔离后续新回合。
 - 修复 Pi 会话正常结束后侧栏仍显示「Cont」（继续）标记的问题：Pi 会话文件的每次追加都把所有 Pi 索引作用域标成整目录脏，会话列表的 stale-while-revalidate 路径因此继续返回 turn 中途的快照（末尾是 toolResult，被判定为 interrupted），并覆盖掉客户端已收到的 completed 推送。现在对已索引会话的追加只增量刷新该会话，新建、删除或无法识别的文件仍走整目录校验。
@@ -149,6 +152,11 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - Speed up Pi session opens by reusing parsed JSONL snapshots, avoiding redundant reads and branch scans, deriving summary and messages together, and deferring inline media on the client fast path.
 
 ### Fixed
+- 修复 Windows 会话 Markdown 中项目内绝对路径被误拼接到项目根，导致文件标签页无法正确打开。
+- 修复旧 Codex 会话恢复后消息无响应：历史中沿用用户配置的 `model_provider = "custom"` 时，现在通过受控注册表兼容为内置 `openai`，仍拒绝其他未注册来源，避免 provider 启动前报 `Unknown Codex model source: custom` 并丢弃队列消息。
+- 修复 Windows 计划任务启动的 Yep/Codex 子进程无法使用当前系统代理：生产监督器启动时读取已启用的 WinINET HTTP 代理，并在未显式配置时补充 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与本地地址 bypass；更换代理或端口后重启生产服务即可生效。
+- 修复同一 Codex turn 的自动重试提示在转录中逐条累积：实时消息与持久化投影现在都按 turn 原地更新，仅保留最新尝试次数。
+- 修复含内嵌图片工具结果的 Codex 会话打开索引时误报 `Codex session history exceeds the configured load budget`：Codex 会把图片 base64 写进单条合法 JSONL 记录，旧的 8 MiB 行限制会在解析前拒绝它；读取器现在允许单条记录使用既有 64 MiB 页面预算，同时继续受 512 MiB 总扫描预算约束。
 - 修复 `pnpm yep rebuild` 与新上游的两处兼容问题：生产 Bundle 校验不再把依赖版本范围当成精确锁定版本，Windows 监督器也不再调用已移除的 `--claude-bridge-only` 参数。
 - 修复 Codex 异步提问被显示成最终回复的问题：实时消息与历史记录保留异步投递和问题信息，显示独立提问卡片及回复提示，不再因其 `final_answer` 标记误判任务正在收尾。
 - 修复统一会话展示中同一消息的多个文本块互相覆盖、工具前后回复顺序错乱的问题；重连时同步最新排队消息，避免待执行消息消失或已清空的队列重新出现。

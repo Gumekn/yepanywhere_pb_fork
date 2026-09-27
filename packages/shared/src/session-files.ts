@@ -356,14 +356,25 @@ export function normalizeSessionFilePath(
       value = value.slice("file://".length);
     }
   }
-  value = value.replace(/^['"]|['"]$/g, "").trim();
+  value = value
+    .replace(/^['"]|['"]$/g, "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/([A-Za-z]:\/)/, "$1");
   if (!value) return null;
 
-  const isAbsolute = value.startsWith("/");
-  const root = projectPath?.replace(/\/+$/, "");
+  value = collapse(value);
+  const isAbsolute = value.startsWith("/") || /^[A-Za-z]:\//.test(value);
+  const root = projectPath?.replace(/\\/g, "/").replace(/\/+$/, "");
   if (isAbsolute && root) {
-    if (value === root) return null;
-    if (value.startsWith(`${root}/`)) {
+    const comparableValue = /^[A-Za-z]:\//.test(value)
+      ? value.toLowerCase()
+      : value;
+    const comparableRoot = /^[A-Za-z]:(?:\/|$)/.test(root)
+      ? root.toLowerCase()
+      : root;
+    if (comparableValue === comparableRoot) return null;
+    if (comparableValue.startsWith(`${comparableRoot}/`)) {
       const relative = collapse(value.slice(root.length + 1));
       return relative ? { path: relative, outsideProject: false } : null;
     }
@@ -380,16 +391,23 @@ export function normalizeSessionFilePath(
 /** Collapse `./` and redundant slashes without touching `..` semantics. */
 function collapse(value: string): string {
   const absolute = value.startsWith("/");
+  const driveRoot = /^[A-Za-z]:\//.test(value);
   const parts: string[] = [];
   for (const part of value.split("/")) {
     if (!part || part === ".") continue;
-    if (part === ".." && parts.length > 0 && parts[parts.length - 1] !== "..") {
+    if (
+      part === ".." &&
+      parts.length > (driveRoot ? 1 : 0) &&
+      parts[parts.length - 1] !== ".."
+    ) {
       parts.pop();
       continue;
     }
+    if (part === ".." && driveRoot) continue;
     parts.push(part);
   }
   const joined = parts.join("/");
+  if (driveRoot && parts.length === 1) return `${joined}/`;
   return absolute ? `/${joined}` : joined;
 }
 

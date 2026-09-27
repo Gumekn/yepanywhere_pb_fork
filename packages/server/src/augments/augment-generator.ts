@@ -86,6 +86,17 @@ export async function createAugmentGenerator(
       markdownOptions?: SafeMarkdownOptions,
     ): Promise<Augment> {
       if (block.type === "code") {
+        if (
+          markdownOptions?.renderMermaid &&
+          block.lang?.toLowerCase() === "mermaid"
+        ) {
+          const code = extractCodeContent(block.content);
+          return {
+            blockIndex,
+            html: `<div class="mermaid">${escapeHtml(code)}</div>`,
+            type: block.type,
+          };
+        }
         const html = await renderCodeBlock(block, highlighter, loadedLanguages);
         return { blockIndex, html, type: block.type };
       }

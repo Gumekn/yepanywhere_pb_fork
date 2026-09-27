@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../../../api/client";
+import { FileTabOpenerContext } from "../../../contexts/FileTabOpenerContext";
 import { SessionMetadataProvider } from "../../../contexts/SessionMetadataContext";
 import { I18nProvider } from "../../../i18n";
 import { TextBlock } from "../TextBlock";
@@ -25,12 +26,15 @@ vi.mock("../../../api/client", () => ({
   },
 }));
 
-function renderWithSessionMetadata(ui: React.ReactNode) {
+function renderWithSessionMetadata(
+  ui: React.ReactNode,
+  projectPath = "/Users/yueyuan/project",
+) {
   return render(
     <I18nProvider>
       <SessionMetadataProvider
         projectId="proj-1"
-        projectPath="/Users/yueyuan/project"
+        projectPath={projectPath}
         sessionId="session-1"
       >
         {ui}
@@ -179,6 +183,43 @@ describe("TextBlock", () => {
     });
     expect(api.getFile).not.toHaveBeenCalled();
     expect(await screen.findByText("shared report")).toBeTruthy();
+  });
+
+  it("opens project-local links in the session workbench when available", () => {
+    const openFileTab = vi.fn();
+    renderWithSessionMetadata(
+      <FileTabOpenerContext.Provider value={{ openFileTab }}>
+        <TextBlock
+          text=""
+          augmentHtml={
+            '<p><a href="/api/local-image?path=%2FUsers%2Fyueyuan%2Fproject%2Fsrc%2FApp.tsx">App.tsx</a></p>'
+          }
+        />
+      </FileTabOpenerContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByText("App.tsx"));
+
+    expect(openFileTab).toHaveBeenCalledWith("src/App.tsx");
+    expect(api.getFile).not.toHaveBeenCalled();
+  });
+
+  it("opens Windows project-local links in the session workbench", () => {
+    const openFileTab = vi.fn();
+    renderWithSessionMetadata(
+      <FileTabOpenerContext.Provider value={{ openFileTab }}>
+        <TextBlock
+          text=""
+          augmentHtml={
+            '<a href="/api/local-file?path=C%3A%5Crepo%5Csrc%5CApp.tsx" data-file-path="C:\\repo\\src\\App.tsx">App.tsx</a>'
+          }
+        />
+      </FileTabOpenerContext.Provider>,
+      "C:\\repo",
+    );
+
+    fireEvent.click(screen.getByText("App.tsx"));
+    expect(openFileTab).toHaveBeenCalledWith("src/App.tsx");
   });
 
   it("opens project-external local markdown links in the local file modal", async () => {

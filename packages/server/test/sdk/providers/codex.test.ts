@@ -5862,6 +5862,8 @@ describe("CodexProvider Event Normalization", () => {
       }),
     ]);
     expect(JSON.stringify(messages)).toContain("/private/secret");
+
+    expect(messages[0]?.uuid).toBe("codex-provider-retry-turn-1");
   });
 
   it("preserves the retry cause when Codex reports an unknown terminal error", () => {

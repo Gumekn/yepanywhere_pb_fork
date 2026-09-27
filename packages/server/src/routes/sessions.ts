@@ -1246,7 +1246,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         parentSessionId: sessionSummary?.parentSessionId,
         forkParentSessionId:
           metadata?.forkParentSessionId ?? sessionSummary?.forkParentSessionId,
-        model: process?.model ?? sessionSummary?.model ?? metadata?.model,
+        model: process?.model ?? metadata?.model ?? sessionSummary?.model,
         reasoningEffort:
           process?.reasoningEffort ?? sessionSummary?.reasoningEffort,
         serviceTier:
@@ -2250,7 +2250,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     if (loadedSession?.historySource === "codex-app-server" && metadata) {
       session = {
         ...session,
-        model: session.model ?? metadata.model,
+        model: metadata.model ?? session.model,
         codexModelProvider:
           session.codexModelProvider ?? metadata.codexModelProvider,
       };
@@ -2820,7 +2820,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     }
   });
 
-  // PUT /api/sessions/:sessionId/metadata - Update session metadata (title, archived, pinned)
+  // PUT /api/sessions/:sessionId/metadata - Update session metadata
   routes.put("/sessions/:sessionId/metadata", async (c) => {
     const sessionId = c.req.param("sessionId");
 
@@ -2832,6 +2832,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       title?: string;
       archived?: boolean;
       pinned?: boolean;
+      /** Preset model for the next session start; empty string clears it. */
+      model?: string;
       /** Legacy request field accepted during the pin migration. */
       starred?: boolean;
     } = {};
@@ -2846,10 +2848,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       body.title === undefined &&
       body.archived === undefined &&
       body.pinned === undefined &&
-      body.starred === undefined
+      body.starred === undefined &&
+      body.model === undefined
     ) {
       return c.json(
-        { error: "At least title, archived, or pinned must be provided" },
+        {
+          error: "At least title, archived, pinned, or model must be provided",
+        },
         400,
       );
     }
@@ -2963,6 +2968,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       // `isStarred` remains the on-disk compatibility key. There is only one
       // durable bit; existing favorites immediately become pins.
       starred: pinned,
+      ...(body.model !== undefined && { model: body.model }),
     });
 
     // Emit SSE event so sidebar and other clients can update
@@ -2974,6 +2980,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         archived: body.archived,
         pinned,
         starred: pinned,
+        ...(body.model !== undefined && { model: body.model }),
         timestamp: new Date().toISOString(),
       });
     }

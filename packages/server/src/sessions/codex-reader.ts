@@ -117,17 +117,19 @@ const CODEX_COMPACTION_EVENT_DEDUPE_WINDOW_MS = 5_000;
 const LOCAL_CODEX_MODEL_PROVIDERS = new Set(["ollama", "lmstudio", "local"]);
 
 const CODEX_DEFAULT_PAGE_MESSAGES = 100;
+const CODEX_MAX_PAGE_BYTES = positiveEnvInt(
+  "YEP_CODEX_MAX_PAGE_BYTES",
+  64 * 1024 * 1024,
+);
 const CODEX_MAX_ROLLOUT_LINE_BYTES = positiveEnvInt(
   "YEP_CODEX_MAX_ROLLOUT_LINE_BYTES",
-  8 * 1024 * 1024,
+  // Codex embeds image tool output in one JSONL record. Accept any record that
+  // still fits the independently bounded page budget.
+  CODEX_MAX_PAGE_BYTES,
 );
 const CODEX_MAX_ROLLOUT_SCAN_BYTES = positiveEnvInt(
   "YEP_CODEX_MAX_ROLLOUT_SCAN_BYTES",
   512 * 1024 * 1024,
-);
-const CODEX_MAX_PAGE_BYTES = positiveEnvInt(
-  "YEP_CODEX_MAX_PAGE_BYTES",
-  64 * 1024 * 1024,
 );
 const CODEX_MAX_SUMMARY_ITEMS = positiveEnvInt(
   "YEP_CODEX_MAX_SUMMARY_ITEMS",

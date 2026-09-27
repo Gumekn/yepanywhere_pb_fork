@@ -74,7 +74,11 @@ export async function renderMarkdownToHtml(
     return "";
   }
   const normalized = normalizeWrappingTextFence(markdown);
-  if (options?.resolveImageUrl) {
+  if (
+    options?.resolveImageUrl ||
+    options?.renderMermaid ||
+    options?.headingAnchors
+  ) {
     return renderMarkdownToHtmlUncached(normalized, options);
   }
   return options?.linkStyle === "document"
@@ -86,7 +90,11 @@ export async function renderMarkdownToHtml(
 export function renderMarkdownDocumentToHtml(
   markdown: string,
 ): Promise<string> {
-  return renderMarkdownToHtml(markdown, { linkStyle: "document" });
+  return renderMarkdownToHtml(markdown, {
+    linkStyle: "document",
+    headingAnchors: true,
+    renderMermaid: true,
+  });
 }
 
 /**

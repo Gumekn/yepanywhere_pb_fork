@@ -44,6 +44,10 @@ export interface SafeMarkdownOptions {
    *   document's directory and no preview click handler resolves them.
    */
   linkStyle?: "message" | "document";
+  /** Preserve Mermaid fences as inert client-rendered diagram containers. */
+  renderMermaid?: boolean;
+  /** Add stable heading ids and anchors for document-preview navigation. */
+  headingAnchors?: boolean;
 }
 
 /**
@@ -173,6 +177,24 @@ function renderTextWithLocalMediaLinks(text: string): string {
     .join("");
 }
 
+const headingSlugs = new Map<string, number>();
+
+function slugifyHeading(text: string): string {
+  const cleaned = text
+    .replace(/[`*_~]/g, "")
+    .replace(/<[^>]+>/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w一-鿿\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return cleaned || "section";
+}
+
+const MERMAID_BLOCK_RE =
+  /<pre><code class="language-mermaid(?:\s[^"]*)?">([\s\S]*?)<\/code><\/pre>/g;
+
 const MARKDOWN_SANITIZE_OPTIONS = {
   allowedTags: [
     "a",
@@ -220,6 +242,12 @@ const MARKDOWN_SANITIZE_OPTIONS = {
     code: ["class"],
     details: ["class", "open"],
     div: ["class", "tabindex"],
+    h1: ["id", "class"],
+    h2: ["id", "class"],
+    h3: ["id", "class"],
+    h4: ["id", "class"],
+    h5: ["id", "class"],
+    h6: ["id", "class"],
     img: ["src", "alt", "title"],
     input: ["type", "checked", "disabled"],
     ol: ["start"],
@@ -355,6 +383,20 @@ function createRenderer(
       const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
       return `<img src="${escapedSrc}"${altAttr}${titleAttr}>`;
     },
+    heading(
+      this: RendererThis<string, string>,
+      { tokens, depth, text }: Tokens.Heading,
+    ) {
+      const inner = this.parser.parseInline(tokens);
+      if (!options.headingAnchors) {
+        return `<h${depth}>${inner}</h${depth}>\n`;
+      }
+      const base = slugifyHeading(text);
+      const count = headingSlugs.get(base) ?? 0;
+      const id = count === 0 ? base : `${base}-${count + 1}`;
+      headingSlugs.set(base, count + 1);
+      return `<h${depth} id="${escapeHtml(id)}" class="md-heading">${inner}<a class="md-heading-anchor" href="#${escapeHtml(id)}" aria-hidden="true" tabindex="-1">#</a></h${depth}>\n`;
+    },
   };
 }
 
@@ -389,7 +431,8 @@ const documentMarkdownRenderer = createMarkdownRenderer({
 });
 
 function rendererFor(options: SafeMarkdownOptions): Marked {
-  if (options.resolveImageUrl) return createMarkdownRenderer(options);
+  if (options.resolveImageUrl || options.headingAnchors)
+    return createMarkdownRenderer(options);
   return options.linkStyle === "document"
     ? documentMarkdownRenderer
     : messageMarkdownRenderer;
@@ -431,6 +474,7 @@ export function renderSafeMarkdown(
   markdown: string,
   options: SafeMarkdownOptions = {},
 ): string {
+  headingSlugs.clear();
   const renderer = rendererFor(options);
   const { markdown: markdownWithPlaceholders, replacements } =
     extractDetailsBlocks(markdown, 0, options);
@@ -439,7 +483,9 @@ export function renderSafeMarkdown(
   });
   const html = typeof rendered === "string" ? rendered : "";
   const sanitized = sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS);
-  return restoreDetailsBlocks(sanitized, replacements).trim();
+  return promoteMermaidBlocks(
+    restoreDetailsBlocks(sanitized, replacements),
+  ).trim();
 }
 
 function renderSafeMarkdownNested(
@@ -459,7 +505,9 @@ function renderSafeMarkdownNested(
   });
   const html = typeof rendered === "string" ? rendered : "";
   const sanitized = sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS);
-  return restoreDetailsBlocks(sanitized, replacements).trim();
+  return promoteMermaidBlocks(
+    restoreDetailsBlocks(sanitized, replacements),
+  ).trim();
 }
 
 function renderSafeMarkdownWithoutDetails(
@@ -469,7 +517,16 @@ function renderSafeMarkdownWithoutDetails(
   const renderer = rendererFor(options);
   const rendered = renderer.parse(markdown, { async: false });
   const html = typeof rendered === "string" ? rendered : "";
-  return sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS).trim();
+  return promoteMermaidBlocks(
+    sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS),
+  ).trim();
+}
+
+function promoteMermaidBlocks(html: string): string {
+  return html.replace(
+    MERMAID_BLOCK_RE,
+    (_match, code: string) => `<div class="mermaid">${code}</div>`,
+  );
 }
 
 export function renderSafeInlineMarkdown(
