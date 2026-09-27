@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { SessionInteractionService } from "../../src/interactions/SessionInteractionService.js";
-import type { SessionMetadataService } from "../../src/metadata/SessionMetadataService.js";
+import { SessionMetadataService } from "../../src/metadata/SessionMetadataService.js";
 import { encodeProjectId } from "../../src/projects/paths.js";
 import type { ProjectScanner } from "../../src/projects/scanner.js";
 import type {
@@ -12,6 +12,7 @@ import type {
   RuntimeSessionSubscription,
 } from "../../src/runtime/types.js";
 import { SessionCommandService } from "../../src/services/SessionCommandService.js";
+import type { CodexSessionReader } from "../../src/sessions/codex-reader.js";
 import type { ISessionReader } from "../../src/sessions/types.js";
 import type { Project } from "../../src/supervisor/types.js";
 
@@ -76,13 +77,176 @@ function createService(
 }
 
 describe("SessionCommandService runtime boundary", () => {
+  it("preserves trusted Feishu MCP configuration when sending into a resident process", async () => {
+    const queueMessage = vi.fn(async () => ({
+      success: true,
+      process: { id: "process-1" },
+      restarted: false,
+    }));
+    const service = createService({
+      getProcessSnapshotForSession: vi.fn(async () => processSnapshot()),
+      queueMessage,
+    });
+    const feishuMcpConfig = {
+      command: "node",
+      args: ["/server/resources/feishu/connector.mjs", "/private/client.json"],
+      env: {},
+      enabled: true,
+      tool_timeout_sec: 240,
+    };
+    const result = await service.send({
+      projectId: "project-1",
+      sessionId: "session-1",
+      body: { message: "Read the document" },
+      origin: {
+        originChannel: "feishu",
+        codexEventAccountId: "bot",
+        feishuMcpConfig,
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(queueMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelSettings: expect.objectContaining({ feishuMcpConfig }),
+      }),
+    );
+  });
+  it.each([
+    [undefined, undefined, "gpt-6-astra"],
+    [undefined, "high", "gpt-6-astra"],
+    ["default", "high", "gpt-6-astra"],
+    ["gpt-5.6-sol", "high", "gpt-5.6-sol"],
+  ] as const)(
+    "resumes Codex with model %s and effort %s as %s",
+    async (model, reasoningEffort, expectedModel) => {
+      const projectPath = mkdtempSync(join(tmpdir(), "session-resume-model-"));
+      try {
+        const projectId = encodeProjectId(projectPath);
+        const project = {
+          id: projectId,
+          path: projectPath,
+          provider: "codex",
+        } as Project;
+        const getSessionSummary = vi.fn(async () => ({
+          id: "thread-model",
+          provider: "codex",
+          model: "gpt-6-astra",
+          reasoningEffort: "xhigh",
+          codexModelProvider: "openai",
+        }));
+        const resumeSession = vi.fn(async () => ({
+          id: "process-model",
+          sessionId: "thread-model",
+          provider: "codex",
+          permissionMode: "default",
+          modeVersion: 0,
+        }));
+        const service = new SessionCommandService({
+          runtimeController: { resumeSession } as unknown as RuntimeController,
+          scanner: {
+            getOrCreateProject: vi.fn(async () => project),
+          } as unknown as ProjectScanner,
+          readerFactory: () => ({}) as ISessionReader,
+          codexReaderFactory: () =>
+            ({ getSessionSummary }) as unknown as CodexSessionReader,
+          sessionInteractionService: interactionService(),
+        });
+        await expect(
+          service.resume({
+            projectId,
+            sessionId: "thread-model",
+            body: {
+              message: "continue",
+              provider: "codex",
+              model,
+              reasoningEffort,
+            },
+          }),
+        ).resolves.toMatchObject({ ok: true });
+        expect(getSessionSummary).toHaveBeenCalledWith(
+          "thread-model",
+          projectId,
+        );
+        expect(resumeSession).toHaveBeenCalledWith(
+          expect.objectContaining({
+            modelSettings: expect.objectContaining({
+              model: expectedModel,
+              reasoningEffort: reasoningEffort ?? "xhigh",
+              codexModelProvider: "openai",
+            }),
+          }),
+        );
+      } finally {
+        rmSync(projectPath, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("keeps the Pi gateway key pinned when a queued message restarts the process", async () => {
+    const projectPath = mkdtempSync(join(tmpdir(), "session-command-pi-key-"));
+    try {
+      const projectId = encodeProjectId(projectPath);
+      const project = {
+        id: projectId,
+        path: projectPath,
+        provider: "pi",
+      } as Project;
+      const metadata = new SessionMetadataService({ dataDir: projectPath });
+      await metadata.initialize();
+      await metadata.setProvider("pi-thread", "pi");
+      await metadata.setLlmGatewayKeyId("pi-thread", "gwkey-pinned");
+      const queueMessage = vi.fn(async () => ({
+        success: true as const,
+        process: { id: "process-pi" },
+        restarted: true,
+      }));
+      const service = new SessionCommandService({
+        runtimeController: {
+          getProcessSnapshotForSession: vi.fn(async () =>
+            processSnapshot({
+              sessionId: "pi-thread",
+              projectPath,
+              provider: "pi",
+            }),
+          ),
+          queueMessage,
+        } as unknown as RuntimeController,
+        scanner: {
+          getOrCreateProject: vi.fn(async () => project),
+        } as unknown as ProjectScanner,
+        readerFactory: () => ({}) as ISessionReader,
+        sessionInteractionService: interactionService(),
+        sessionMetadataService: metadata,
+      });
+
+      // A thinking change on a follow-up restarts the provider process; the
+      // restart must not silently fall back to the environment gateway key.
+      await expect(
+        service.send({
+          projectId,
+          sessionId: "pi-thread",
+          body: { message: "continue", thinking: "on:high" },
+        }),
+      ).resolves.toMatchObject({ ok: true });
+      expect(queueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          modelSettings: expect.objectContaining({
+            llmGatewayKeyId: "gwkey-pinned",
+          }),
+        }),
+      );
+    } finally {
+      rmSync(projectPath, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ["start", "priority"],
     ["start", "default"],
     ["create", "priority"],
     ["create", "default"],
   ] as const)(
-    "passes %s service tier %s to runtime",
+    "retains %s service tier %s through follow-ups and cold resume",
     async (flow, serviceTier) => {
       const projectPath = mkdtempSync(join(tmpdir(), "session-command-tier-"));
       try {
@@ -99,16 +263,32 @@ describe("SessionCommandService runtime boundary", () => {
           permissionMode: "default",
           modeVersion: 0,
         }));
+        const metadata = new SessionMetadataService({ dataDir: projectPath });
+        await metadata.initialize();
+        const queueMessage = vi.fn(async () => ({
+          success: true as const,
+          process: { id: "process-tier" },
+          restarted: true,
+        }));
         const service = new SessionCommandService({
           runtimeController: {
             startSession: start,
             createSession: start,
+            getProcessSnapshotForSession: vi.fn(async () =>
+              processSnapshot({
+                sessionId: "thread-tier",
+                projectPath,
+                serviceTier: "priority",
+              }),
+            ),
+            queueMessage,
           } as unknown as RuntimeController,
           scanner: {
             getOrCreateProject: vi.fn(async () => project),
           } as unknown as ProjectScanner,
           readerFactory: () => ({}) as ISessionReader,
           sessionInteractionService: interactionService(),
+          sessionMetadataService: metadata,
         });
         const result = await service[flow]({
           projectId,
@@ -122,6 +302,53 @@ describe("SessionCommandService runtime boundary", () => {
               serviceTier,
               providerName: "codex",
             }),
+          }),
+        );
+        expect(metadata.getCodexServiceTier("thread-tier")).toBe(serviceTier);
+
+        // A changed effort can restart the native process. The follow-up has
+        // no Fast field; keep the saved selection even if runtime defaults differ.
+        await expect(
+          service.queue({
+            sessionId: "thread-tier",
+            body: { message: "continue", reasoningEffort: "xhigh" },
+          }),
+        ).resolves.toMatchObject({ ok: true });
+        expect(queueMessage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            modelSettings: expect.objectContaining({ serviceTier }),
+          }),
+        );
+
+        // Simulate a server restart and a native rollout without service_tier.
+        const reloaded = new SessionMetadataService({ dataDir: projectPath });
+        await reloaded.initialize();
+        const resumeSession = vi.fn(async () => ({
+          id: "process-resumed",
+          sessionId: "thread-tier",
+          provider: "codex" as const,
+          permissionMode: "default" as const,
+          modeVersion: 0,
+        }));
+        const resumedService = new SessionCommandService({
+          runtimeController: { resumeSession } as unknown as RuntimeController,
+          scanner: {
+            getOrCreateProject: vi.fn(async () => project),
+          } as unknown as ProjectScanner,
+          readerFactory: () => ({}) as ISessionReader,
+          sessionInteractionService: interactionService(),
+          sessionMetadataService: reloaded,
+        });
+        await expect(
+          resumedService.resume({
+            projectId,
+            sessionId: "thread-tier",
+            body: { message: "continue later", reasoningEffort: "xhigh" },
+          }),
+        ).resolves.toMatchObject({ ok: true });
+        expect(resumeSession).toHaveBeenCalledWith(
+          expect.objectContaining({
+            modelSettings: expect.objectContaining({ serviceTier }),
           }),
         );
 
@@ -146,6 +373,41 @@ describe("SessionCommandService runtime boundary", () => {
       } finally {
         rmSync(projectPath, { recursive: true, force: true });
       }
+    },
+  );
+
+  it.each([
+    ["codex", "default", "default"],
+    ["codex", "priority", "priority"],
+    ["codex", "fast", "priority"],
+    ["codex", undefined, undefined],
+    ["codex", "flex", undefined],
+    ["pi", "priority", undefined],
+  ] as const)(
+    "keeps an older %s session's live tier %s on a queued restart",
+    async (provider, liveTier, expectedTier) => {
+      const queueMessage = vi.fn(async () => ({
+        success: true as const,
+        process: { id: "process-1" },
+        restarted: true,
+      }));
+      const service = createService({
+        getProcessSnapshotForSession: vi.fn(async () =>
+          processSnapshot({ provider, serviceTier: liveTier }),
+        ),
+        queueMessage,
+      });
+      await expect(
+        service.queue({
+          sessionId: "session-1",
+          body: { message: "continue", reasoningEffort: "xhigh" },
+        }),
+      ).resolves.toMatchObject({ ok: true });
+      expect(queueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          modelSettings: expect.objectContaining({ serviceTier: expectedTier }),
+        }),
+      );
     },
   );
 
@@ -711,6 +973,91 @@ describe("SessionCommandService runtime boundary", () => {
     } finally {
       rmSync(projectPath, { recursive: true, force: true });
     }
+  });
+
+  it("forwards interrupt-and-send without interrupting deferred submissions", async () => {
+    const queueMessage = vi.fn(async () => ({
+      success: true as const,
+      restarted: false,
+      process: { id: "process-1" },
+    }));
+    const deferMessage = vi.fn(async () => ({ queued: true }));
+    const service = createService({
+      getProcessSnapshotForSession: vi.fn(async () => processSnapshot()),
+      queueMessage,
+      deferMessage,
+    });
+    await expect(
+      service.queue({
+        sessionId: "session-1",
+        body: { message: "Correction", interruptBeforeSend: true },
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(queueMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ interruptBeforeSend: true }),
+    );
+    await expect(
+      service.queue({
+        sessionId: "session-1",
+        body: { message: "Later", deferred: true },
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(queueMessage).toHaveBeenCalledTimes(1);
+    expect(deferMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects conflicting send modes before contacting the runtime", async () => {
+    const getProcessSnapshotForSession = vi.fn();
+    const service = createService({ getProcessSnapshotForSession });
+    await expect(
+      service.queue({
+        sessionId: "session-1",
+        body: {
+          message: "Correction",
+          deferred: true,
+          interruptBeforeSend: true,
+        },
+      }),
+    ).resolves.toMatchObject({ ok: false, status: 400 });
+    expect(getProcessSnapshotForSession).not.toHaveBeenCalled();
+  });
+
+  it("reports interruption failure as an unsent message rather than a dead process", async () => {
+    const service = createService({
+      getProcessSnapshotForSession: vi.fn(async () => processSnapshot()),
+      queueMessage: vi.fn(async () => ({
+        success: false,
+        error: "interrupt_send_failed",
+      })),
+    });
+    await expect(
+      service.queue({
+        sessionId: "session-1",
+        body: { message: "Correction", interruptBeforeSend: true },
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: 409,
+      body: { code: "interrupt_send_failed" },
+    });
+  });
+
+  it("exposes the runtime rejection instead of a generic queue failure", async () => {
+    const error = "Process provider is no longer accepting messages";
+    const service = createService({
+      getProcessSnapshotForSession: vi.fn(async () => processSnapshot()),
+      queueMessage: vi.fn(async () => ({ success: false, error })),
+    });
+    await expect(
+      service.queue({
+        sessionId: "session-1",
+        body: { message: "retry" },
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: 410,
+      body: { error, reason: error },
+    });
   });
 
   it("interrupts the active turn and closes interaction aliases", async () => {

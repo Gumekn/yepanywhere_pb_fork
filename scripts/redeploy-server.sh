@@ -10,6 +10,8 @@
 #                                      # explicit default: keep 4510 as sidecar
 #   scripts/redeploy-server.sh --restart-codex-bridge
 #                                      # restart the 4510 Codex bridge sidecar too
+#   scripts/redeploy-server.sh --restart-runtime
+#                                      # restart the agent runtime worker too; aborts live turns
 #   scripts/redeploy-server.sh --no-restart --restart-codex-bridge
 #                                      # rebuild + restart only the 4510 sidecar
 #   scripts/redeploy-server.sh --embedded-codex-bridge
@@ -23,7 +25,9 @@
 #
 # Side effects of restart:
 #   - APK / web clients disconnect for ~3-5s (auto-reconnect, no relogin).
-#   - In-progress SDK sessions (running claude subprocesses) are killed.
+#   - In-progress SDK sessions (running claude subprocesses) are killed, unless
+#     the agent runtime runs as its own worker (YEP_RUNTIME_MODE=external), in
+#     which case only the web/API shell is replaced and turns keep running.
 #   - 4510 Codex bridge sessions are preserved by default. If 4510 is still
 #     embedded in the 8022 process, preserving it while restarting 8022 is
 #     impossible; choose --restart-codex-bridge to migrate/restart it.
@@ -56,12 +60,15 @@ source "$SCRIPT_DIR/lib/pnpm.sh"
 source "$SCRIPT_DIR/lib/deploy-lock.sh"
 # shellcheck source=scripts/lib/deploy-npm.sh
 source "$SCRIPT_DIR/lib/deploy-npm.sh"
+# shellcheck source=scripts/lib/deploy-runtime.sh
+source "$SCRIPT_DIR/lib/deploy-runtime.sh"
 
 # ----- args -----
 DO_BUILD=true
 DO_RESTART=true
 USE_CODEX_BRIDGE_SIDECAR=true
 RESTART_CODEX_BRIDGE=false
+RESTART_RUNTIME=false
 ALLOW_YEP_SESSION_INTERRUPT=false
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
 SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
@@ -81,6 +88,9 @@ LAUNCHD_RUNTIME_DIR="${YEP_LAUNCHD_RUNTIME_DIR:-$HOME/.yep-anywhere/runtime/npm-
 LAUNCHD_SERVER_CLI_JS="$LAUNCHD_RUNTIME_DIR/dist/cli.js"
 CODEX_BRIDGE_LAUNCHD_LABEL="${YEP_LAUNCHD_BRIDGE_LABEL:-com.yueyuan.yepanywhere.codex-bridge}"
 CODEX_BRIDGE_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${CODEX_BRIDGE_LAUNCHD_LABEL}.plist"
+RUNTIME_LAUNCHD_LABEL="${YEP_LAUNCHD_RUNTIME_LABEL:-com.yueyuan.yepanywhere.runtime}"
+RUNTIME_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${RUNTIME_LAUNCHD_LABEL}.plist"
+RUNTIME_CONTROL_PORT="${YEP_RUNTIME_PORT:-$((SERVER_PORT + 3))}"
 for arg in "$@"; do
   case "$arg" in
     --restart)    DO_BUILD=false ;;
@@ -92,6 +102,9 @@ for arg in "$@"; do
     --restart-codex-bridge)
       USE_CODEX_BRIDGE_SIDECAR=true
       RESTART_CODEX_BRIDGE=true
+      ;;
+    --restart-runtime)
+      RESTART_RUNTIME=true
       ;;
     --allow-yep-session-interrupt)
       ALLOW_YEP_SESSION_INTERRUPT=true
@@ -291,12 +304,42 @@ reload_launchd_label_from_plist() {
   # the plist after the old process has been safely stopped so environment
   # changes written during deploy take effect without a start-stop-start race.
   if launchd_label_loaded "$label"; then
+    local old_pid
+    old_pid="$(launchctl print "$domain/$label" 2>/dev/null |
+      awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true)"
     if ! launchctl bootout "$domain/$label" >/dev/null 2>&1; then
       launchctl bootout "$domain" "$plist" >/dev/null 2>&1 || return 1
+    fi
+    # bootout is asynchronous: launchd keeps tearing the service down (and
+    # reaping its children) after it returns. Bootstrapping in that window
+    # fails with "Bootstrap failed: 5: Input/output error". Wait until the
+    # label is unloaded and the old process is gone before reloading.
+    local wait_i
+    for wait_i in $(seq 1 40); do
+      launchd_label_loaded "$label" || break
+      sleep 0.25
+    done
+    if [[ -n "$old_pid" ]]; then
+      for wait_i in $(seq 1 40); do
+        kill -0 "$old_pid" 2>/dev/null || break
+        sleep 0.25
+      done
     fi
   fi
 
   launchctl enable "$domain/$label" >/dev/null 2>&1 || true
+
+  # Even after the label is unloaded, launchd can transiently return EIO from
+  # bootstrap while the previous bootout is still settling in the domain.
+  # Retry briefly before giving up.
+  local try_i
+  for try_i in 1 2 3 4 5; do
+    if launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  # Final attempt without output suppression so the real error is surfaced.
   launchctl bootstrap "$domain" "$plist"
 }
 
@@ -343,7 +386,7 @@ server_node_bin() {
   printf '%s' "$node_bin"
 }
 
-start_server_fallback() {
+start_server_fallback() (
   local node_bin
   node_bin="$(server_node_bin)" || return 1
 
@@ -353,6 +396,15 @@ start_server_fallback() {
   fi
 
   log "Starting yepanywhere outside LaunchAgent (logs: /tmp/yep-server.log) ..."
+  # nohup does not inherit the LaunchAgent environment. Carry the same runtime
+  # wiring into both fallback paths so a shell restart cannot create a second
+  # supervisor competing with the still-running external worker.
+  export YEP_RUNTIME_MODE="$DEPLOY_RUNTIME_MODE"
+  export YEP_RUNTIME_PORT="$DEPLOY_RUNTIME_PORT"
+  export YEP_RUNTIME_CONTROL_URL="$DEPLOY_RUNTIME_URL"
+  if [[ -n "$DEPLOY_RUNTIME_TOKEN_FILE" ]]; then
+    export YEP_RUNTIME_TOKEN_FILE="$DEPLOY_RUNTIME_TOKEN_FILE"
+  fi
   if ! $USE_CODEX_BRIDGE_SIDECAR; then
     BASE_PATH="${SERVER_BASE_PATH:-/}" \
       ALLOWED_IMAGE_PATHS="$SERVER_ALLOWED_IMAGE_PATHS" \
@@ -368,7 +420,7 @@ start_server_fallback() {
     YEP_CODEX_BRIDGE_PORT="$CODEX_BRIDGE_PORT" \
     env -u YEP_DEPLOY_LOCK_HELD -u YEP_DEPLOY_LOCK_OWNED -u YEP_CLAUDE_BRIDGE_URL -u CLAUDE_BRIDGE_URL -u YEP_CLAUDE_SERVER_URL -u CLAUDE_SERVER_URL \
     nohup "$node_bin" "$SERVER_CLI_JS" --port "$SERVER_PORT" >/tmp/yep-server.log 2>&1 & disown
-}
+)
 
 stop_launchagent_server_for_fallback() {
   local pids
@@ -449,7 +501,8 @@ sync_launchd_runtime_if_installed() {
 
   local agents_dir="$HOME/Library/LaunchAgents"
   if [[ ! -f "$agents_dir/${SERVER_LAUNCHD_LABEL}.plist" &&
-    ! -f "$agents_dir/${CODEX_BRIDGE_LAUNCHD_LABEL}.plist" ]]; then
+    ! -f "$agents_dir/${CODEX_BRIDGE_LAUNCHD_LABEL}.plist" &&
+    ! -f "$agents_dir/${RUNTIME_LAUNCHD_LABEL}.plist" ]]; then
     return 0
   fi
 
@@ -466,6 +519,74 @@ refresh_installed_bridge_launchagents() {
 
   log "Refreshing the installed Codex bridge LaunchAgent definition without restarting it ..."
   "$SCRIPT_DIR/install-launchagents.sh" --bridge-only --no-start
+}
+
+# ----- external agent runtime -----
+#
+# When the runtime runs as its own worker it owns every provider child process.
+# Replacing the web/API shell then leaves live turns untouched, so the runtime
+# is preserved by default and only restarted on explicit request.
+
+runtime_worker_listening() {
+  lsof -iTCP:"${RUNTIME_CONTROL_PORT}" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+runtime_worker_pids() {
+  lsof -iTCP:"${RUNTIME_CONTROL_PORT}" -sTCP:LISTEN -t 2>/dev/null | sort -u || true
+}
+
+external_runtime_installed() {
+  [[ -f "$RUNTIME_LAUNCHD_PLIST" ]] || runtime_worker_listening
+}
+
+refresh_installed_runtime_launchagent() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+  [[ -f "$RUNTIME_LAUNCHD_PLIST" ]] || return 0
+
+  log "Refreshing the installed agent runtime LaunchAgent definition without restarting it ..."
+  YEP_RUNTIME_EXTERNAL=true "$SCRIPT_DIR/install-launchagents.sh" --runtime-only --no-start
+}
+
+restart_runtime_worker() {
+  local pids
+  pids="$(runtime_worker_pids)"
+
+  if [[ -n "$pids" ]]; then
+    warn "Restarting the agent runtime on port ${RUNTIME_CONTROL_PORT}; active turns will be aborted."
+  else
+    dim "agent runtime is not running; it will be started."
+  fi
+
+  if [[ "$(uname -s)" == "Darwin" && -f "$RUNTIME_LAUNCHD_PLIST" ]] &&
+    command -v launchctl >/dev/null 2>&1; then
+    if ! reload_launchd_label_from_plist "$RUNTIME_LAUNCHD_LABEL" "$RUNTIME_LAUNCHD_PLIST"; then
+      err "Could not reload the agent runtime LaunchAgent ${RUNTIME_LAUNCHD_LABEL}."
+      return 1
+    fi
+  else
+    local node_bin
+    node_bin="$(server_node_bin)" || return 1
+    if [[ -n "$pids" ]]; then
+      kill $pids 2>/dev/null || true
+      wait_port_released "$RUNTIME_CONTROL_PORT" || true
+    fi
+    log "Starting the agent runtime worker (logs: /tmp/yep-runtime.log) ..."
+    YEP_RUNTIME_PORT="$RUNTIME_CONTROL_PORT" \
+      env -u YEP_DEPLOY_LOCK_HELD -u YEP_DEPLOY_LOCK_OWNED \
+      nohup "$node_bin" "$SERVER_CLI_JS" --runtime-only --port "$SERVER_PORT" \
+      >/tmp/yep-runtime.log 2>&1 & disown
+  fi
+
+  for _ in $(seq 1 60); do
+    if runtime_worker_listening; then
+      log "Agent runtime worker is up on port ${RUNTIME_CONTROL_PORT}."
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  err "Agent runtime worker did not start listening on ${RUNTIME_CONTROL_PORT} within 15s."
+  return 1
 }
 
 ensure_bundle_ready() {
@@ -503,11 +624,12 @@ if $DO_BUILD; then
   sync_launchd_runtime_if_installed
 fi
 
-if $DO_RESTART || $RESTART_CODEX_BRIDGE; then
+if $DO_RESTART || $RESTART_CODEX_BRIDGE || $RESTART_RUNTIME; then
   ensure_bundle_ready
 fi
 if $DO_BUILD || $DO_RESTART || $RESTART_CODEX_BRIDGE; then
   refresh_installed_bridge_launchagents
+  refresh_installed_runtime_launchagent
 fi
 
 # ----- restart -----
@@ -533,6 +655,8 @@ fi
 
 if $DO_RESTART; then
   START_CODEX_BRIDGE_AFTER_STOP=false
+  resolve_deploy_runtime "$SERVER_LAUNCHD_PLIST" "$SERVER_PORT"
+  RUNTIME_CONTROL_PORT="$DEPLOY_RUNTIME_PORT"
 
   if $USE_CODEX_BRIDGE_SIDECAR; then
     if $RESTART_CODEX_BRIDGE; then
@@ -556,6 +680,20 @@ if $DO_RESTART; then
     fi
   elif [[ -n "$CODEX_BRIDGE_LISTEN_PIDS" ]]; then
     warn "Starting Codex bridge embedded in the web server; active cf / codex --remote sessions will disconnect."
+  fi
+
+  if external_runtime_installed; then
+    if $RESTART_RUNTIME; then
+      warn "The agent runtime will be restarted; every live turn it owns is aborted."
+    elif runtime_worker_listening; then
+      dim "preserving the agent runtime on port ${RUNTIME_CONTROL_PORT} (PID $(runtime_worker_pids | tr '\n' ',' | sed 's/,$//')); live turns survive this restart"
+    else
+      warn "An agent runtime LaunchAgent is installed but nothing is listening on ${RUNTIME_CONTROL_PORT}; it will be started."
+      RESTART_RUNTIME=true
+    fi
+  elif $RESTART_RUNTIME; then
+    warn "--restart-runtime was requested, but this deployment runs the runtime embedded in the web server."
+    RESTART_RUNTIME=false
   fi
 
   log "Stopping running yepanywhere ..."
@@ -637,6 +775,12 @@ if $DO_RESTART; then
     start_codex_bridge_sidecar "$CODEX_BRIDGE_PORT" "$CODEX_BRIDGE_HTTP_URL"
   fi
 
+  # Restarted while the shell is down so the shell's first control request
+  # already reaches the new runtime process.
+  if $RESTART_RUNTIME; then
+    restart_runtime_worker
+  fi
+
   log "Starting yepanywhere ..."
   # Mount under the configured base path so a reverse proxy can forward the
   # service cleanly. The Hono app + client bundle both pick up BASE_PATH.
@@ -697,6 +841,10 @@ if $DO_RESTART; then
   fi
 
   if $HEALTH_OK; then
+    # An HTTP listener alone is not enough: it must own sessions in the same
+    # way as the planned deployment. Do not report a silent topology change
+    # as a successful deploy, or attempt another restart to hide the mismatch.
+    verify_deploy_runtime "$SERVER_BASE_URL" "$DEPLOY_RUNTIME_MODE"
     log "Server is up."
     # Show what the freshly started server reports.
     SERVER_VERSION_LINE="$(curl -fsS "${SERVER_BASE_URL}/api/version" 2>/dev/null | node -e 'let raw=""; process.stdin.on("data", c => raw += c); process.stdin.on("end", () => { const d=JSON.parse(raw); console.log(`current=${d.current} protocol=${d.resumeProtocolVersion} buildId=${d.build?.buildId ?? "missing"}`); })' 2>/dev/null || true)"
@@ -724,6 +872,15 @@ if $DO_RESTART; then
       tail -80 /tmp/yep-server.log >&2 || true
     fi
     exit 1
+  fi
+fi
+
+if ! $DO_RESTART && $RESTART_RUNTIME; then
+  if external_runtime_installed; then
+    log "Restarting the agent runtime worker on port ${RUNTIME_CONTROL_PORT} ..."
+    restart_runtime_worker
+  else
+    warn "--restart-runtime was requested, but no external agent runtime is installed."
   fi
 fi
 

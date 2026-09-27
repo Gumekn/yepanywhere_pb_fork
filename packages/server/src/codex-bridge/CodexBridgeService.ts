@@ -31,10 +31,13 @@ import {
   resolveCodexMcpThreadProfile,
 } from "../codex/mcp-profile.js";
 import { getCodexSubagentMetadata } from "../codex/subagent.js";
+import { getDefaultCodexHomeDir } from "../projects/codex-scanner.js";
 import { encodeProjectId } from "../projects/paths.js";
 import { ensureRuntimeToken } from "../runtime/token.js";
 import { findCodexCliPath } from "../sdk/cli-detection.js";
 import { sanitizeManagedAttachmentPrompt } from "../sdk/messageQueue.js";
+import { observeCodexFileNotification } from "../session-files/codex-operations.js";
+import type { SessionFileOperationStore } from "../session-files/operation-store.js";
 import { validateQuestionAnswers } from "../sessions/question-answers.js";
 import type { SessionSummary } from "../supervisor/types.js";
 import type { EventBus } from "../watcher/index.js";
@@ -52,6 +55,10 @@ import {
   createCodexBridgeJournalRecord,
 } from "./CodexBridgeJournal.js";
 import { readCodexUsage } from "./CodexUsageService.js";
+import {
+  CODEX_ACCOUNT_MISMATCH_MESSAGE,
+  readCodexAuthIdentity,
+} from "./auth-identity.js";
 import {
   type CodexInteractiveMethod,
   buildCodexInteractiveResponse,
@@ -87,6 +94,8 @@ import type {
 } from "./types.js";
 
 export interface CodexBridgeServiceOptions {
+  /** Optional adapter for isolated lifecycle tests/custom storage. */
+  fileOperationStore?: SessionFileOperationStore;
   enabled: boolean;
   host: string;
   port: number;
@@ -97,6 +106,8 @@ export interface CodexBridgeServiceOptions {
   fullUpstreamArgs?: string[];
   upstreamArgs?: string[];
   codexPath?: string;
+  /** Credential directory inherited by managed app-servers. */
+  codexHome?: string;
   eventBus?: EventBus;
   startupTimeoutMs?: number;
   /**
@@ -129,6 +140,13 @@ export interface CodexBridgeServiceOptions {
 interface ClientRequestRecord {
   method: string;
   sessionId: string;
+  /** Thread targeted by lifecycle requests such as thread/unsubscribe. */
+  threadId?: string;
+  /** thread/start hint for older app-server responses without Thread.ephemeral. */
+  ephemeral?: boolean;
+  /** Environment hint when older thread responses omit environment metadata. */
+  fileEnvironmentRemote?: boolean;
+  resumeConfig?: Record<string, unknown>;
   eventScope?: CodexBridgeClientRequestScope;
   mcpStartupCompatibilityServerIds?: string[];
 }
@@ -143,6 +161,10 @@ interface BridgeConnection {
   profile: CodexBridgeUpstreamProfile;
   downstream: WebSocket;
   upstream: WebSocket | null;
+  upstreamState?: CodexBridgeUpstreamState;
+  authRestoreRequired?: boolean;
+  initializeParams?: Record<string, unknown>;
+  resumeConfigs: Map<string, Record<string, unknown>>;
   downstreamQueue: QueuedFrame[];
   pendingClientRequests: Map<string, ClientRequestRecord>;
   pendingInternalRequests: Map<string, PendingInternalRequest>;
@@ -195,6 +217,14 @@ interface PendingServerRequest {
 
 interface SessionRecord {
   id: string;
+  /** Routing survives unsubscribe: the upstream may still hold the writer lock. */
+  executionProfile?: CodexBridgeUpstreamProfile;
+  /**
+   * Whether Codex declared this thread ephemeral. Undefined is reserved for
+   * incomplete metadata and legacy persisted bridge state; neither is safe to
+   * expose as a user session until fresh thread metadata classifies it.
+   */
+  ephemeral?: boolean;
   isSubagent: boolean;
   threadMetadataKnown: boolean;
   parentThreadId?: string;
@@ -237,6 +267,9 @@ interface SessionRecord {
 /** JSON-serializable subset of SessionRecord persisted across bridge restarts. */
 interface PersistedSessionRecord {
   id: string;
+  executionProfile?: CodexBridgeUpstreamProfile;
+  /** Missing from version 1 state. Ephemeral records are never persisted. */
+  ephemeral?: boolean;
   isSubagent: boolean;
   threadMetadataKnown: boolean;
   parentThreadId?: string;
@@ -269,6 +302,7 @@ const MAX_COMPLETED_TURN_IDS = 256;
 const CODEX_USAGE_CACHE_TTL_MS = 30_000;
 const INTERNAL_REQUEST_TIMEOUT_MS = 10_000;
 const JOURNAL_SHUTDOWN_FLUSH_TIMEOUT_MS = 2_000;
+const PERSISTED_SESSION_STATE_VERSION = 2;
 
 function isMcpThreadLifecycleMethod(
   method: string | undefined,
@@ -284,6 +318,11 @@ interface CodexBridgeUpstreamState {
   process: ChildProcess | null;
   url: string | null;
   startPromise: Promise<string> | null;
+  authIdentity?: string | null;
+  authInvalidated?: boolean;
+  activeThreadIds?: Set<string>;
+  loadedThreadIds?: Set<string>;
+  stopPromise?: Promise<void>;
 }
 
 export class CodexBridgeService implements CodexBridgeController {
@@ -316,6 +355,12 @@ export class CodexBridgeService implements CodexBridgeController {
     CodexBridgeUpstreamState
   >();
   private reservedUpstreamPorts = new Set<number>();
+  private retiredUpstreams = new Set<CodexBridgeUpstreamState>();
+  private upstreamAuthChecks = new Map<
+    CodexBridgeUpstreamProfile,
+    Promise<string>
+  >();
+  private readonly codexHome: string;
   private cachedUsage: {
     response: CodexUsageResponse;
     expiresAt: number;
@@ -341,7 +386,11 @@ export class CodexBridgeService implements CodexBridgeController {
   private persistChain: Promise<void> = Promise.resolve();
   private readonly eventNotifier = new BridgeEventNotifier();
 
+  private readonly fileOperationStore?: SessionFileOperationStore;
+  private readonly remoteFileThreads = new Set<string>();
+
   constructor(options: CodexBridgeServiceOptions) {
+    this.fileOperationStore = options.fileOperationStore;
     this.enabled = options.enabled;
     this.host = options.host;
     this.port = options.port;
@@ -353,6 +402,7 @@ export class CodexBridgeService implements CodexBridgeController {
       full: options.fullUpstreamArgs ?? [],
     };
     this.codexPathOverride = options.codexPath;
+    this.codexHome = options.codexHome ?? getDefaultCodexHomeDir();
     this.eventBus = options.eventBus;
     this.startupTimeoutMs =
       options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
@@ -519,6 +569,7 @@ export class CodexBridgeService implements CodexBridgeController {
     this.connections.clear();
 
     await Promise.allSettled(Array.from(this.eventTasks));
+    await Promise.allSettled(Array.from(this.upstreamAuthChecks.values()));
 
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
@@ -672,7 +723,7 @@ export class CodexBridgeService implements CodexBridgeController {
     sessionId: string,
   ): CodexBridgeUpstreamProfile | null {
     const record = this.sessions.get(sessionId);
-    if (!record) return null;
+    if (!record || !this.isTopLevelSessionRecord(record)) return null;
     const candidates = Array.from(record.connectionIds)
       .map((connectionId) => this.connections.get(connectionId))
       .filter((connection): connection is BridgeConnection =>
@@ -681,6 +732,7 @@ export class CodexBridgeService implements CodexBridgeController {
     return (
       candidates.find((connection) => connection.downstreamAttached)?.profile ??
       candidates[0]?.profile ??
+      record.executionProfile ??
       null
     );
   }
@@ -954,11 +1006,12 @@ export class CodexBridgeService implements CodexBridgeController {
       }
       if (req.method === "GET" && pathParts[2] === "active") {
         const active = this.isSessionActive(sessionId);
+        const mcpProfile = this.getSessionExecutionProfile(sessionId);
         writeJson(res, 200, {
           active,
-          ...(active
-            ? { mcpProfile: this.getSessionExecutionProfile(sessionId) }
-            : {}),
+          // Subscription state does not say whether the upstream has unloaded
+          // the thread. Keep routing known threads through their original profile.
+          ...(mcpProfile ? { mcpProfile } : {}),
         });
         return;
       }
@@ -1139,6 +1192,7 @@ export class CodexBridgeService implements CodexBridgeController {
       profile,
       downstream,
       upstream: null,
+      resumeConfigs: new Map(),
       downstreamQueue: [],
       pendingClientRequests: new Map(),
       pendingInternalRequests: new Map(),
@@ -1245,9 +1299,17 @@ export class CodexBridgeService implements CodexBridgeController {
     }
   }
 
-  private async connectUpstream(connection: BridgeConnection): Promise<void> {
-    const upstreamUrl = await this.ensureUpstreamUrl(connection.profile);
+  private async connectUpstream(
+    connection: BridgeConnection,
+    selectedUrl?: string,
+  ): Promise<void> {
+    const upstreamUrl =
+      selectedUrl ?? (await this.ensureUpstreamUrl(connection.profile));
     if (connection.closed) return;
+    connection.upstreamState = [
+      ...this.upstreams.values(),
+      ...this.retiredUpstreams,
+    ].find((state) => state.url === upstreamUrl);
 
     await new Promise<void>((resolve, reject) => {
       const upstream = new WebSocket(upstreamUrl);
@@ -1271,34 +1333,23 @@ export class CodexBridgeService implements CodexBridgeController {
       });
 
       upstream.on("message", (data, isBinary) => {
-        if (connection.closed) return;
-        if (this.journalMode === "legacy-blocking") {
-          this.enqueueFrameTask(connection, "server", async () => {
-            if (connection.closed) return;
-            const forwardedFrames = await this.observeServerDataLegacy(
-              connection,
-              data,
-              isBinary,
-            );
-            this.sendServerFramesToDownstream(connection, forwardedFrames);
-            this.maybeCloseDetachedConnection(connection, "server-frame");
-          });
-          return;
-        }
-        try {
-          const forwardedFrames = this.observeServerDataLightweight(
-            connection,
-            data,
-            isBinary,
-          );
+        if (connection.closed || connection.upstream !== upstream) return;
+        this.enqueueFrameTask(connection, "server", async () => {
+          if (connection.closed || connection.upstream !== upstream) return;
+          await this.observeFileOperationFrame(connection, data);
+          const forwardedFrames =
+            this.journalMode === "legacy-blocking"
+              ? await this.observeServerDataLegacy(connection, data, isBinary)
+              : this.observeServerDataLightweight(connection, data, isBinary);
           this.sendServerFramesToDownstream(connection, forwardedFrames);
           this.maybeCloseDetachedConnection(connection, "server-frame");
-        } catch (error) {
-          this.handleFrameProcessingError(connection, "server", error);
-        }
+        });
       });
 
-      upstream.on("close", () => this.closeConnection(connection, "upstream"));
+      upstream.on("close", () => {
+        if (connection.upstream === upstream)
+          this.closeConnection(connection, "upstream");
+      });
       upstream.on("error", (error) => {
         this.lastError = projectBridgePublicDiagnostic(error).publicMessage;
         reject(error);
@@ -1325,6 +1376,9 @@ export class CodexBridgeService implements CodexBridgeController {
     connection: BridgeConnection,
   ): boolean {
     if (connection.downstreamAttached || connection.closed) return false;
+    // An unsubscribed active thread still owns its writer. Keep an observer
+    // until Codex broadcasts thread/closed after completion and idle unload.
+    if (connection.upstreamState?.activeThreadIds?.size) return true;
     if (
       connection.downstreamQueue.length > 0 ||
       connection.pendingClientRequests.size > 0 ||
@@ -1401,6 +1455,7 @@ export class CodexBridgeService implements CodexBridgeController {
       }
     }
     this.schedulePersist();
+    this.releaseRetiredUpstreams();
   }
 
   private enqueueFrameTask(
@@ -1451,6 +1506,57 @@ export class CodexBridgeService implements CodexBridgeController {
     this.closeConnection(connection, `${direction}-frame-error`);
   }
 
+  private canCaptureLocalFiles(
+    params?: Record<string, unknown> | null,
+  ): boolean {
+    if (this.fileEnvironmentRemote(params) === true) return false;
+    if (!this.upstreamUrlOverride) return true;
+    try {
+      return ["localhost", "127.0.0.1", "[::1]"].includes(
+        new URL(this.upstreamUrlOverride).hostname,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private fileEnvironmentRemote(
+    params?: Record<string, unknown> | null,
+  ): boolean | undefined {
+    if (params?.environmentId) return true;
+    if (Array.isArray(params?.environments))
+      return params.environments.length > 0;
+    return undefined;
+  }
+
+  private async observeFileOperationFrame(
+    _connection: BridgeConnection,
+    data: RawData,
+  ): Promise<void> {
+    for (const message of parseJsonRpcEnvelope(data)?.messages ?? []) {
+      const params = asRecord(message.params);
+      const threadId = getString(params?.threadId);
+      if (
+        threadId &&
+        !this.remoteFileThreads.has(threadId) &&
+        this.canCaptureLocalFiles(params)
+      ) {
+        const session = this.sessions.get(threadId);
+        if (
+          session?.projectPathKnown &&
+          !session.ephemeral &&
+          typeof message.method === "string"
+        ) {
+          await observeCodexFileNotification(
+            { sessionId: threadId, workspace: session.projectPath },
+            { method: message.method, params },
+            this.fileOperationStore,
+          );
+        }
+      }
+    }
+  }
+
   private async observeClientData(
     connection: BridgeConnection,
     data: RawData,
@@ -1467,7 +1573,9 @@ export class CodexBridgeService implements CodexBridgeController {
     let flushedPrefix = false;
     for (const originalMessage of envelope.messages) {
       if (
-        isMcpThreadLifecycleMethod(originalMessage.method) &&
+        (connection.authRestoreRequired ||
+          isMcpThreadLifecycleMethod(originalMessage.method) ||
+          originalMessage.method === "turn/start") &&
         messagesToForward.length > 0
       ) {
         // config/read must run after earlier protocol messages such as
@@ -1483,6 +1591,23 @@ export class CodexBridgeService implements CodexBridgeController {
         messagesToForward.length = 0;
         flushedPrefix = true;
       }
+      if (originalMessage.method === "initialize") {
+        connection.initializeParams = asRecord(originalMessage.params) ?? {};
+      }
+      if (
+        connection.authRestoreRequired ||
+        isMcpThreadLifecycleMethod(originalMessage.method) ||
+        originalMessage.method === "turn/start"
+      ) {
+        const ready = await this.prepareCurrentAuth(
+          connection,
+          originalMessage,
+        );
+        if (!ready) {
+          modified = true;
+          continue;
+        }
+      }
       const profileStartedAt = performance.now();
       const profiledMessage = await this.applyMcpProfileToClientMessage(
         connection,
@@ -1492,6 +1617,8 @@ export class CodexBridgeService implements CodexBridgeController {
       const message = profiledMessage.message;
       if (message !== originalMessage) modified = true;
       if (message.method && message.id !== undefined) {
+        const params = asRecord(message.params);
+        const threadId = getString(params?.threadId);
         const sessionId = this.resolveLightweightSessionId(
           connection,
           message.params,
@@ -1499,9 +1626,31 @@ export class CodexBridgeService implements CodexBridgeController {
         const eventScope = connection.legacyEventSpine
           ? await connection.legacyEventSpine.observeClientRequest(message)
           : undefined;
+        if (
+          message.method === "turn/start" &&
+          threadId &&
+          !this.canCaptureLocalFiles(params)
+        )
+          this.remoteFileThreads.add(threadId);
         connection.pendingClientRequests.set(idKey(message.id), {
           method: message.method,
           sessionId: eventScope?.sessionId ?? sessionId,
+          ...(isMcpThreadLifecycleMethod(message.method)
+            ? {
+                fileEnvironmentRemote:
+                  this.fileEnvironmentRemote(params) ??
+                  (threadId && this.remoteFileThreads.has(threadId)
+                    ? true
+                    : undefined),
+              }
+            : {}),
+          ...(threadId ? { threadId } : {}),
+          ...(message.method === "thread/start"
+            ? { ephemeral: params?.ephemeral === true }
+            : {}),
+          ...(isMcpThreadLifecycleMethod(message.method)
+            ? { resumeConfig: pickResumeConfig(params ?? {}) }
+            : {}),
           ...(eventScope ? { eventScope } : {}),
           ...(profiledMessage.mcpStartupCompatibilityServerIds?.length
             ? {
@@ -1561,6 +1710,178 @@ export class CodexBridgeService implements CodexBridgeController {
       return { data, isBinary };
     }
     return serializeJsonRpcEnvelope(envelope.isBatch, messagesToForward);
+  }
+
+  /** Switch only before admitting work; never replay an accepted turn. */
+  private async prepareCurrentAuth(
+    connection: BridgeConnection,
+    message: JsonRpcMessage,
+  ): Promise<boolean> {
+    if (this.upstreamUrlOverride) return true;
+    if (connection.upstreamReady) await connection.upstreamReady;
+    const url = await this.ensureUpstreamUrl(connection.profile);
+    const current = this.getUpstreamState(connection.profile);
+    const targetId = getString(asRecord(message.params)?.threadId);
+    const activeOnOldAccount =
+      targetId &&
+      [...this.connections.values()].some(
+        (other) =>
+          other.upstreamState !== current &&
+          (other.upstreamState?.authInvalidated ||
+            other.upstreamState?.authIdentity !== current.authIdentity) &&
+          other.threadIds.has(targetId) &&
+          this.connectionHasActiveThread(other, targetId),
+      );
+    const changing = connection.upstreamState !== current;
+    const busy =
+      changing &&
+      (connection.pendingClientRequests.size > 0 ||
+        connection.pendingInternalRequests.size > 0 ||
+        connection.pendingServerRequests.size > 0 ||
+        [...connection.threadIds].some((id) =>
+          this.connectionHasActiveThread(connection, id),
+        ));
+    const ephemeral =
+      changing &&
+      [...connection.resumeConfigs.keys()].some(
+        (id) => this.sessions.get(id)?.ephemeral,
+      );
+    const targetIds = new Set(connection.resumeConfigs.keys());
+    if (targetId) targetIds.add(targetId);
+    const writers = [...this.retiredUpstreams].filter(
+      (state) =>
+        state === connection.upstreamState ||
+        [...targetIds].some((id) => state.loadedThreadIds?.has(id)),
+    );
+    if (
+      activeOnOldAccount ||
+      busy ||
+      ephemeral ||
+      writers.some((state) => !this.canRetireUpstream(state))
+    ) {
+      if (message.id !== undefined) {
+        this.sendServerFramesToDownstream(connection, [
+          {
+            data: Buffer.from(
+              JSON.stringify({
+                id: message.id,
+                error: {
+                  code: -32000,
+                  message: ephemeral
+                    ? "Codex account changed. This temporary thread cannot be resumed; start a new session."
+                    : "Codex account changed. Wait for active work on the previous connection to finish and close any temporary sessions, then send again.",
+                },
+              }),
+            ),
+            isBinary: false,
+          },
+        ]);
+      }
+      return false;
+    }
+    // Unsubscribe only starts Codex's idle unload timer (60 seconds by default).
+    // A new process cannot resume the rollout until the old writer has exited.
+    // Detach idle peers without closing their downstream sockets; their next
+    // request restores their explicitly loaded threads on the new generation.
+    const exits: Promise<void>[] = [];
+    for (const state of writers) {
+      for (const peer of this.connections.values()) {
+        if (peer.upstreamState !== state) continue;
+        const upstream = peer.upstream;
+        peer.upstream = null;
+        peer.upstreamReady = null;
+        peer.authRestoreRequired = true;
+        upstream?.close();
+      }
+      exits.push(
+        this.stopManagedUpstreamState(state).then(() => {
+          this.retiredUpstreams.delete(state);
+        }),
+      );
+    }
+    await Promise.all(exits);
+    // A peer may already be retiring this connection's generation.
+    await connection.upstreamState?.stopPromise;
+    if (!changing) return true;
+    if (!connection.initializeParams) {
+      throw new Error(
+        "Cannot restore Codex connection without initialize parameters",
+      );
+    }
+    // Metadata reads and subagent notifications also populate threadIds. Only
+    // reconstruct threads explicitly started/resumed/forked by this client.
+    const threadIds = [...connection.resumeConfigs.keys()];
+    const oldUpstream = connection.upstream;
+    connection.upstream = null;
+    oldUpstream?.close();
+    const ready = this.connectUpstream(connection, url);
+    connection.upstreamReady = ready;
+    await ready;
+    await this.requestUpstream(
+      connection,
+      "initialize",
+      connection.initializeParams,
+    );
+    this.sendClientFrameToUpstream(connection, {
+      data: Buffer.from(JSON.stringify({ method: "initialized" })),
+      isBinary: false,
+    });
+    for (const threadId of threadIds) {
+      const result = asRecord(
+        await this.requestUpstream(connection, "thread/resume", {
+          ...connection.resumeConfigs.get(threadId),
+          threadId,
+          excludeTurns: true,
+        }),
+      );
+      const thread = asRecord(result?.thread);
+      if (thread?.id !== threadId)
+        throw new Error("Codex auth recovery resumed an unexpected thread");
+      this.upsertThread(connection, thread, {
+        cwd: getString(result?.cwd) ?? getString(thread.cwd),
+        model: getString(result?.model),
+      });
+      current.loadedThreadIds?.add(threadId);
+    }
+    connection.authRestoreRequired = false;
+    this.cachedUsage = null;
+    this.releaseRetiredUpstreams();
+    console.log(
+      `[CodexBridge] Restored connection ${connection.id} after account change`,
+    );
+    return true;
+  }
+
+  private canRetireUpstream(state: CodexBridgeUpstreamState): boolean {
+    if (state.stopPromise) return true;
+    if (state.activeThreadIds?.size) return false;
+    return ![...this.connections.values()].some(
+      (peer) =>
+        peer.upstreamState === state &&
+        (peer.downstreamQueue.length > 0 ||
+          peer.pendingClientRequests.size > 0 ||
+          peer.pendingInternalRequests.size > 0 ||
+          peer.pendingServerRequests.size > 0 ||
+          [...peer.resumeConfigs.keys()].some(
+            (id) => this.sessions.get(id)?.ephemeral,
+          )),
+    );
+  }
+
+  private connectionHasActiveThread(
+    connection: BridgeConnection,
+    threadId: string,
+  ): boolean {
+    return (
+      connection.upstreamState?.activeThreadIds?.has(threadId) === true ||
+      [...connection.pendingClientRequests.values()].some(
+        (request) =>
+          request.method === "turn/start" && request.threadId === threadId,
+      ) ||
+      [...connection.pendingServerRequests.values()].some(
+        (request) => request.threadId === threadId,
+      )
+    );
   }
 
   private async applyMcpProfileToClientMessage(
@@ -1973,7 +2294,7 @@ export class CodexBridgeService implements CodexBridgeController {
           rawMethod === "thread/name/updated" ||
           rawMethod === "thread/goal/updated"
         ? [
-            connection.id,
+            String(connection.id),
             sessionId ?? "connection",
             safeCodexBridgeMethod(rawMethod),
             itemId ?? "",
@@ -2022,6 +2343,25 @@ export class CodexBridgeService implements CodexBridgeController {
     response: JsonRpcMessage,
   ): JsonRpcMessage[] {
     if (
+      asRecord(response.error)?.message === CODEX_ACCOUNT_MISMATCH_MESSAGE &&
+      connection.upstreamState
+    ) {
+      connection.upstreamState.authInvalidated = true;
+    }
+    if (request.method === "thread/unsubscribe") {
+      const status = getString(asRecord(response.result)?.status);
+      if (
+        request.threadId &&
+        (status === "unsubscribed" ||
+          status === "notSubscribed" ||
+          status === "notLoaded")
+      ) {
+        this.detachThreadConnection(connection, request.threadId);
+      }
+      return [];
+    }
+
+    if (
       request.method !== "thread/start" &&
       request.method !== "thread/resume" &&
       request.method !== "thread/fork" &&
@@ -2037,12 +2377,29 @@ export class CodexBridgeService implements CodexBridgeController {
 
     this.upsertThread(connection, thread, {
       cwd: getString(result.cwd) ?? getString(thread.cwd),
+      fileEnvironmentRemote: request.fileEnvironmentRemote,
       model: getString(result.model),
       reasoningEffort: getString(result.reasoningEffort),
       serviceTier: getString(result.serviceTier),
+      ephemeral:
+        typeof thread.ephemeral === "boolean"
+          ? thread.ephemeral
+          : (request.ephemeral ?? false),
     });
 
     const threadId = getString(thread.id);
+    if (threadId && request.resumeConfig) {
+      connection.resumeConfigs.set(threadId, request.resumeConfig);
+      const state = connection.upstreamState;
+      state?.loadedThreadIds?.add(threadId);
+      if (thread.status !== undefined && state) {
+        if (this.activityFromThreadStatus(thread.status) === "idle") {
+          state.activeThreadIds?.delete(threadId);
+        } else {
+          state.activeThreadIds?.add(threadId);
+        }
+      }
+    }
     if (!threadId || !request.mcpStartupCompatibilityServerIds?.length) {
       return [];
     }
@@ -2070,6 +2427,36 @@ export class CodexBridgeService implements CodexBridgeController {
     params: unknown,
   ): void {
     const p = asRecord(params);
+    const threadId = getString(p?.threadId);
+    const state = connection.upstreamState;
+    if (state && threadId) {
+      state.activeThreadIds ??= new Set();
+      if (
+        method === "turn/started" ||
+        (method === "thread/status/changed" &&
+          this.activityFromThreadStatus(p?.status) !== "idle")
+      ) {
+        state.activeThreadIds.add(threadId);
+      } else if (
+        method === "turn/completed" ||
+        (method === "error" && p?.willRetry !== true) ||
+        method === "thread/status/changed"
+      ) {
+        state.activeThreadIds.delete(threadId);
+      }
+    }
+    const authError =
+      method === "error"
+        ? asRecord(p?.error)
+        : method === "turn/completed"
+          ? asRecord(asRecord(p?.turn)?.error)
+          : undefined;
+    if (
+      authError?.message === CODEX_ACCOUNT_MISMATCH_MESSAGE &&
+      connection.upstreamState
+    ) {
+      connection.upstreamState.authInvalidated = true;
+    }
     switch (method) {
       case "item/started":
       case "item/completed": {
@@ -2079,9 +2466,15 @@ export class CodexBridgeService implements CodexBridgeController {
       case "thread/started": {
         const thread = asRecord(p?.thread);
         if (thread) {
+          const id = getString(thread.id);
+          if (id) state?.loadedThreadIds?.add(id);
           this.upsertThread(connection, thread, {
             cwd: getString(thread.cwd),
             model: getString(thread.model),
+            // Missing means a compatible older app-server, whose default was
+            // a durable thread.
+            ephemeral:
+              typeof thread.ephemeral === "boolean" ? thread.ephemeral : false,
           });
         }
         break;
@@ -2283,6 +2676,8 @@ export class CodexBridgeService implements CodexBridgeController {
       case "thread/closed": {
         const threadId = getString(p?.threadId);
         if (!threadId) break;
+        state?.loadedThreadIds?.delete(threadId);
+        state?.activeThreadIds?.delete(threadId);
         this.resolvePendingForThread(threadId, "thread-closed");
         connection.threadIds.delete(threadId);
         const record = this.sessions.get(threadId);
@@ -2695,15 +3090,29 @@ export class CodexBridgeService implements CodexBridgeController {
       model?: string;
       reasoningEffort?: string;
       serviceTier?: string;
+      ephemeral?: boolean;
+      fileEnvironmentRemote?: boolean;
     },
   ): void {
     const id = getString(thread.id);
     if (!id) return;
 
+    // Environment selection is sticky: turn/start may omit it entirely.
+    // Prefer actual thread metadata, including an explicit empty selection;
+    // absent metadata must not erase a previously observed remote environment.
+    const remote =
+      this.fileEnvironmentRemote(thread) ?? extra.fileEnvironmentRemote;
+    if (remote === true) this.remoteFileThreads.add(id);
+    else if (remote === false) this.remoteFileThreads.delete(id);
+
     const cwd = extra.cwd ?? getString(thread.cwd);
     const subagent = getCodexSubagentMetadata(thread);
     const record = this.ensureSessionRecord(id, {
       cwd,
+      ephemeral:
+        typeof thread.ephemeral === "boolean"
+          ? thread.ephemeral
+          : (extra.ephemeral ?? false),
       isSubagent: subagent.isSubagent,
       parentThreadId: subagent.parentThreadId,
       agentPath: subagent.agentPath,
@@ -2753,6 +3162,7 @@ export class CodexBridgeService implements CodexBridgeController {
     threadId: string,
     values: {
       cwd?: string;
+      ephemeral?: boolean;
       isSubagent?: boolean;
       threadMetadataKnown?: boolean;
       parentThreadId?: string;
@@ -2773,6 +3183,7 @@ export class CodexBridgeService implements CodexBridgeController {
     const projectPath = values.cwd ?? existing?.projectPath ?? process.cwd();
     const record: SessionRecord = existing ?? {
       id: threadId,
+      ephemeral: values.ephemeral,
       isSubagent: values.isSubagent ?? false,
       threadMetadataKnown:
         values.threadMetadataKnown ?? values.isSubagent !== undefined,
@@ -2802,6 +3213,14 @@ export class CodexBridgeService implements CodexBridgeController {
     }
     if (values.cwd) {
       record.projectPathKnown = true;
+    }
+    // Classification is monotonic. A later partial payload must never expose
+    // an ephemeral helper thread as a durable user session.
+    if (values.ephemeral === true) {
+      record.ephemeral = true;
+      this.emittedSessionIds.delete(threadId);
+    } else if (values.ephemeral === false && record.ephemeral === undefined) {
+      record.ephemeral = false;
     }
     // Classification is monotonic: once Codex identifies a child thread, a
     // later partial notification must not promote it back to a root session.
@@ -2843,7 +3262,31 @@ export class CodexBridgeService implements CodexBridgeController {
   ): void {
     connection.threadIds.add(threadId);
     const record = this.ensureSessionRecord(threadId, {});
+    record.executionProfile = connection.profile;
     record.connectionIds.add(connection.id);
+  }
+
+  private detachThreadConnection(
+    connection: BridgeConnection,
+    threadId: string,
+  ): void {
+    connection.threadIds.delete(threadId);
+    connection.resumeConfigs.delete(threadId);
+    const record = this.sessions.get(threadId);
+    if (!record) return;
+
+    record.connectionIds.delete(connection.id);
+    record.updatedAt = new Date().toISOString();
+    if (record.connectionIds.size === 0) {
+      this.resolvePendingForThread(threadId, "thread-unsubscribed");
+      record.activity = "idle";
+      record.turnActive = false;
+      record.activityBeforePending = undefined;
+      record.pendingInputType = undefined;
+      this.emitSessionStatus(record, { owner: "none" });
+      this.emitProcessState(record, "idle");
+    }
+    this.schedulePersist();
   }
 
   /**
@@ -2864,9 +3307,16 @@ export class CodexBridgeService implements CodexBridgeController {
     const statePath = this.statePath;
     if (!statePath) return Promise.resolve();
     const records: PersistedSessionRecord[] = Array.from(this.sessions.values())
-      .filter((record) => !record.isSubagent && record.projectPathKnown)
+      .filter(
+        (record) =>
+          record.ephemeral === false &&
+          !record.isSubagent &&
+          record.projectPathKnown,
+      )
       .map((record) => ({
         id: record.id,
+        executionProfile: record.executionProfile,
+        ephemeral: false,
         isSubagent: record.isSubagent,
         threadMetadataKnown: record.threadMetadataKnown,
         parentThreadId: record.parentThreadId,
@@ -2886,7 +3336,10 @@ export class CodexBridgeService implements CodexBridgeController {
         completedTurnIds: Array.from(record.completedTurnIds),
         emitted: this.emittedSessionIds.has(record.id),
       }));
-    const payload = JSON.stringify({ version: 1, sessions: records });
+    const payload = JSON.stringify({
+      version: PERSISTED_SESSION_STATE_VERSION,
+      sessions: records,
+    });
     const writeSnapshot = async (): Promise<void> => {
       try {
         await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
@@ -2913,9 +3366,17 @@ export class CodexBridgeService implements CodexBridgeController {
       return; // No state file yet, or unreadable - start fresh.
     }
     if (!Array.isArray(parsed.sessions)) return;
-    let needsSafeRewrite = false;
+    // Version 1 did not retain Thread.ephemeral, so its bridge-only records
+    // cannot be distinguished safely from structured-output helper threads.
+    // This file is only a projection cache; durable Codex sessions remain in
+    // the provider store and live clients repopulate their bridge records.
+    let needsSafeRewrite = parsed.version !== PERSISTED_SESSION_STATE_VERSION;
     for (const stored of parsed.sessions) {
       if (!stored || typeof stored.id !== "string" || !stored.projectPath) {
+        continue;
+      }
+      if (stored.ephemeral !== false) {
+        needsSafeRewrite = true;
         continue;
       }
       if (this.sessions.has(stored.id)) continue;
@@ -2934,6 +3395,13 @@ export class CodexBridgeService implements CodexBridgeController {
       }
       const record: SessionRecord = {
         id: stored.id,
+        executionProfile:
+          stored.executionProfile === "light" ||
+          stored.executionProfile === "clear" ||
+          stored.executionProfile === "full"
+            ? stored.executionProfile
+            : undefined,
+        ephemeral: false,
         isSubagent: stored.isSubagent === true,
         threadMetadataKnown: stored.threadMetadataKnown === true,
         parentThreadId: stored.parentThreadId,
@@ -2999,6 +3467,7 @@ export class CodexBridgeService implements CodexBridgeController {
     // the wrong project, so they stay hidden until thread metadata arrives
     // (thread/start response or thread/started notification carries cwd).
     return (
+      record.ephemeral === false &&
       record.threadMetadataKnown &&
       !record.isSubagent &&
       record.projectPathKnown
@@ -3140,18 +3609,39 @@ export class CodexBridgeService implements CodexBridgeController {
     profile: CodexBridgeUpstreamProfile,
   ): Promise<string> {
     if (this.upstreamUrlOverride) return this.upstreamUrlOverride;
-    const state = this.getUpstreamState(profile);
-    if (state.url && this.isManagedUpstreamRunning(profile)) {
-      return state.url;
-    }
-    if (state.startPromise) {
-      return state.startPromise;
-    }
-
-    state.startPromise = this.startManagedUpstream(profile).finally(() => {
-      state.startPromise = null;
-    });
-    return state.startPromise;
+    const existing = this.upstreamAuthChecks.get(profile);
+    if (existing) return existing;
+    const check = (async () => {
+      const identity = await readCodexAuthIdentity(this.codexHome);
+      let state = this.getUpstreamState(profile);
+      if (state.url && isChildRunning(state.process)) {
+        if (
+          !state.authInvalidated &&
+          (identity === null || identity === state.authIdentity)
+        ) {
+          return state.url;
+        }
+        this.retiredUpstreams.add(state);
+        state = { process: null, url: null, startPromise: null };
+        this.upstreams.set(profile, state);
+        console.log(
+          `[CodexBridge] Login identity changed; creating app-server profile=${profile}`,
+        );
+      }
+      state.authIdentity = identity;
+      state.authInvalidated = false;
+      state.activeThreadIds = new Set();
+      state.loadedThreadIds = new Set();
+      state.stopPromise = undefined;
+      state.startPromise = this.startManagedUpstream(profile);
+      try {
+        return await state.startPromise;
+      } finally {
+        state.startPromise = null;
+      }
+    })().finally(() => this.upstreamAuthChecks.delete(profile));
+    this.upstreamAuthChecks.set(profile, check);
+    return check;
   }
 
   private async startManagedUpstream(
@@ -3178,7 +3668,7 @@ export class CodexBridgeService implements CodexBridgeController {
     const child = spawn(codexPath, spawnArgs, {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
-      env: process.env,
+      env: { ...process.env, CODEX_HOME: this.codexHome },
     });
     let rejectChildError: (error: Error) => void = () => undefined;
     const childError = new Promise<never>((_resolve, reject) => {
@@ -3251,22 +3741,59 @@ export class CodexBridgeService implements CodexBridgeController {
 
   private async stopManagedUpstream(): Promise<void> {
     await Promise.all(
-      Array.from(this.upstreams.values()).map((state) =>
+      [...this.upstreams.values(), ...this.retiredUpstreams].map((state) =>
         this.stopManagedUpstreamState(state),
       ),
     );
     this.reservedUpstreamPorts.clear();
+    this.retiredUpstreams.clear();
+  }
+
+  private releaseRetiredUpstreams(): void {
+    for (const state of this.retiredUpstreams) {
+      if (state.stopPromise || !this.canRetireUpstream(state)) continue;
+      if (
+        [...this.connections.values()].some(
+          (connection) => connection.upstreamState === state,
+        )
+      )
+        continue;
+      const task = this.stopManagedUpstreamState(state).then(() => {
+        this.retiredUpstreams.delete(state);
+      });
+      this.eventTasks.add(task);
+      void task.finally(() => this.eventTasks.delete(task));
+    }
   }
 
   private async stopManagedUpstreamState(
     state: CodexBridgeUpstreamState,
   ): Promise<void> {
-    const child = state.process;
-    state.process = null;
-    state.url = null;
-    state.startPromise = null;
-    if (!child) return;
-    await terminateProcessGroup(child);
+    if (state.stopPromise) return state.stopPromise;
+    state.stopPromise = (async () => {
+      const child = state.process;
+      state.url = null;
+      state.startPromise = null;
+      if (!child) return;
+      await terminateProcessGroup(child);
+      // terminateProcessGroup can resolve just after SIGKILL was sent. Wait
+      // for exit, since the OS releases the rollout lock only at that point.
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>((resolve, reject) => {
+          const onExit = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          const timer = setTimeout(() => {
+            child.off("exit", onExit);
+            reject(new Error("Codex app-server did not release its writer"));
+          }, 5000);
+          child.once("exit", onExit);
+        });
+      }
+      state.process = null;
+    })();
+    return state.stopPromise;
   }
 
   private getUpstreamState(
@@ -3693,4 +4220,25 @@ async function openAndCloseWebSocket(url: string): Promise<void> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Only replay resume-compatible settings, never history/path/fork inputs. */
+function pickResumeConfig(
+  params: Record<string, unknown>,
+): Record<string, unknown> {
+  const config: Record<string, unknown> = {};
+  for (const key of [
+    "config",
+    "approvalPolicy",
+    "approvalsReviewer",
+    "sandbox",
+    "permissions",
+    "baseInstructions",
+    "developerInstructions",
+    "personality",
+    "runtimeWorkspaceRoots",
+  ]) {
+    if (params[key] !== undefined) config[key] = params[key];
+  }
+  return config;
 }

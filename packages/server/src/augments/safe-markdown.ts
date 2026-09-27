@@ -1,6 +1,11 @@
-import { parseLineColumn, splitTextWithFilePaths } from "@yep-anywhere/shared";
+import {
+  isLikelyFilePath,
+  parseLineColumn,
+  splitTextWithFilePaths,
+} from "@yep-anywhere/shared";
 import {
   Marked,
+  Renderer,
   type RendererObject,
   type RendererThis,
   type Tokens,
@@ -29,6 +34,16 @@ const MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
 export interface SafeMarkdownOptions {
   /** Resolve a non-HTTP image reference in a trusted, caller-specific scope. */
   resolveImageUrl?: (href: string) => string | null;
+  /**
+   * How links are rendered.
+   * - `message` (default): chat transcripts keep the original link source
+   *   visible and turn relative file paths into links that the transcript
+   *   click handler resolves against the session project.
+   * - `document`: file previews render standard Markdown link labels. Relative
+   *   destinations stay inert text because they belong to the previewed
+   *   document's directory and no preview click handler resolves them.
+   */
+  linkStyle?: "message" | "document";
 }
 
 /**
@@ -41,6 +56,26 @@ function isLocalFilePath(href: string): boolean {
   // Must have a file extension after the last /
   const basename = trimmed.split("/").pop() ?? "";
   return basename.includes(".");
+}
+
+/** Relative file links are resolved against the session project by the client. */
+function getRelativeFilePath(href: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(href.trim());
+  } catch {
+    return null;
+  }
+  const { path } = parseLineColumn(decoded);
+  if (
+    !path ||
+    /^[a-z][a-z\d+.-]*:/i.test(path) ||
+    /^[\/~]/.test(path) ||
+    /[?#\\\p{C}]/u.test(path)
+  ) {
+    return null;
+  }
+  return isLikelyFilePath(path) ? decoded : null;
 }
 
 /**
@@ -93,8 +128,8 @@ function renderLocalMediaLink(
 
 /**
  * Render a local text file link without routing it through the media endpoint.
- * The client maps project-local paths to FileViewer and can fetch configured
- * local text files through /api/local-file.
+ * The client maps project-local paths to FileViewer and can fetch other
+ * local text files through /api/local-file without a project or session scope.
  */
 function renderLocalTextFileLink(
   rawPath: string,
@@ -112,7 +147,7 @@ function renderLocalTextFileLink(
   ]
     .filter(Boolean)
     .join(" ");
-  const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+  const titleAttr = ` title="${escapeHtml(title || rawPath)}"`;
   return `<a href="${apiUrl}" class="local-file-link" ${dataAttrs}${titleAttr}>${renderedText}</a>`;
 }
 
@@ -184,7 +219,7 @@ const MARKDOWN_SANITIZE_OPTIONS = {
     ],
     code: ["class"],
     details: ["class", "open"],
-    div: ["class"],
+    div: ["class", "tabindex"],
     img: ["src", "alt", "title"],
     input: ["type", "checked", "disabled"],
     ol: ["start"],
@@ -223,33 +258,54 @@ function createRenderer(
   options: SafeMarkdownOptions = {},
 ): RendererObject<string, string> {
   return {
+    table(this: RendererThis<string, string>, token: Tokens.Table) {
+      // Preserve GFM cells/alignment and isolate wide tables from page scrolling.
+      const renderer = new Renderer();
+      renderer.parser = this.parser;
+      return `<div class="markdown-table-wrapper" tabindex="0">${renderer.table(token)}</div>\n`;
+    },
     html({ text }) {
       // Disable raw HTML passthrough from markdown by escaping it.
       return escapeHtml(text);
     },
-    text({ text }: Tokens.Text | Tokens.Escape) {
-      return renderTextWithLocalMediaLinks(text);
-    },
-    link(
+    text(
       this: RendererThis<string, string>,
-      { href, title, tokens }: Tokens.Link,
+      token: Tokens.Text | Tokens.Escape,
     ) {
+      // Tight list items contain a text token with already-parsed inline
+      // children. Preserve those links/emphasis instead of escaping raw syntax.
+      if ("tokens" in token && token.tokens) {
+        return this.parser.parseInline(token.tokens);
+      }
+      return renderTextWithLocalMediaLinks(token.text);
+    },
+    link(this: RendererThis<string, string>, token: Tokens.Link) {
+      const { href, title } = token;
+      if (options.linkStyle === "document") {
+        return renderDocumentLink(this.parser.parseInline(token.tokens), token);
+      }
+      // Add navigation to the original source instead of replacing it with
+      // the label: destinations, titles and inline syntax stay visible.
+      const source = getLinkSource(token);
+      const renderedText = escapeHtml(source);
       // Check for local file paths first — rewrite to clickable media placeholder
       if (isLocalFilePath(href)) {
         const ext = getExtension(href);
-        const renderedText = this.parser.parseInline(tokens);
-
         if (MEDIA_EXTENSIONS.has(ext)) {
-          return renderLocalMediaLink(href, renderedText, ext);
+          return renderLocalMediaLink(href, source, ext);
         }
         return renderLocalTextFileLink(href, renderedText, title);
       }
 
-      const safeHref = sanitizeUrl(href);
-      const renderedText = this.parser.parseInline(tokens);
+      const relativePath = getRelativeFilePath(href);
+      if (relativePath) {
+        return renderLocalTextFileLink(relativePath, renderedText, title);
+      }
 
+      const safeHref = sanitizeUrl(href);
       if (!safeHref) {
-        // Keep readable text when URL protocol is unsafe.
+        // An unsupported destination must not erase the original path/URL.
+        // Escape the entire token so unsafe protocols remain inert text.
         return renderedText;
       }
 
@@ -257,16 +313,23 @@ function createRenderer(
       const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
       return `<a href="${escapedHref}"${titleAttr}>${renderedText}</a>`;
     },
-    image({ href, title, text }: Tokens.Image) {
+    image(token: Tokens.Image) {
+      const { href, title, text } = token;
+      const documentStyle = options.linkStyle === "document";
       // Check for local file paths first — rewrite to clickable media placeholder
       if (isLocalFilePath(href)) {
         const ext = getExtension(href);
 
         if (MEDIA_EXTENSIONS.has(ext)) {
-          return renderLocalMediaLink(href, text, ext);
+          return renderLocalMediaLink(
+            href,
+            documentStyle ? text : getLinkSource(token),
+            ext,
+          );
         }
-        // Unrecognized extension — just show text
-        return escapeHtml(text || getFileName(href));
+        return escapeHtml(
+          documentStyle ? text || getFileName(href) : getLinkSource(token),
+        );
       }
 
       const safeSrc =
@@ -275,7 +338,16 @@ function createRenderer(
           ? sanitizeResolvedImageUrl(options.resolveImageUrl(href) ?? "")
           : null);
       if (!safeSrc) {
-        return escapeHtml(text);
+        if (documentStyle) return escapeHtml(text);
+        const relativePath = getRelativeFilePath(href);
+        if (relativePath) {
+          return renderLocalTextFileLink(
+            relativePath,
+            escapeHtml(getLinkSource(token)),
+            title,
+          );
+        }
+        return escapeHtml(getLinkSource(token));
       }
 
       const escapedSrc = escapeHtml(safeSrc);
@@ -284,6 +356,22 @@ function createRenderer(
       return `<img src="${escapedSrc}"${altAttr}${titleAttr}>`;
     },
   };
+}
+
+/** Standard Markdown link rendering for previewed documents. */
+function renderDocumentLink(renderedLabel: string, token: Tokens.Link): string {
+  const { href, title } = token;
+  if (isLocalFilePath(href)) {
+    const ext = getExtension(href);
+    if (MEDIA_EXTENSIONS.has(ext)) {
+      return renderLocalMediaLink(href, token.text, ext);
+    }
+    return renderLocalTextFileLink(href, renderedLabel, title);
+  }
+  const safeHref = sanitizeUrl(href);
+  if (!safeHref) return renderedLabel;
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+  return `<a href="${escapeHtml(safeHref)}"${titleAttr}>${renderedLabel}</a>`;
 }
 
 function createMarkdownRenderer(options: SafeMarkdownOptions = {}): Marked {
@@ -295,7 +383,17 @@ function createMarkdownRenderer(options: SafeMarkdownOptions = {}): Marked {
   return instance;
 }
 
-const markdownRenderer = createMarkdownRenderer();
+const messageMarkdownRenderer = createMarkdownRenderer();
+const documentMarkdownRenderer = createMarkdownRenderer({
+  linkStyle: "document",
+});
+
+function rendererFor(options: SafeMarkdownOptions): Marked {
+  if (options.resolveImageUrl) return createMarkdownRenderer(options);
+  return options.linkStyle === "document"
+    ? documentMarkdownRenderer
+    : messageMarkdownRenderer;
+}
 
 /**
  * Return a safe absolute URL for markdown links, or null for unsupported schemes.
@@ -333,9 +431,7 @@ export function renderSafeMarkdown(
   markdown: string,
   options: SafeMarkdownOptions = {},
 ): string {
-  const renderer = options.resolveImageUrl
-    ? createMarkdownRenderer(options)
-    : markdownRenderer;
+  const renderer = rendererFor(options);
   const { markdown: markdownWithPlaceholders, replacements } =
     extractDetailsBlocks(markdown, 0, options);
   const rendered = renderer.parse(markdownWithPlaceholders, {
@@ -355,9 +451,7 @@ function renderSafeMarkdownNested(
     return renderSafeMarkdownWithoutDetails(markdown, options);
   }
 
-  const renderer = options.resolveImageUrl
-    ? createMarkdownRenderer(options)
-    : markdownRenderer;
+  const renderer = rendererFor(options);
   const { markdown: markdownWithPlaceholders, replacements } =
     extractDetailsBlocks(markdown, depth, options);
   const rendered = renderer.parse(markdownWithPlaceholders, {
@@ -372,18 +466,21 @@ function renderSafeMarkdownWithoutDetails(
   markdown: string,
   options: SafeMarkdownOptions,
 ): string {
-  const renderer = options.resolveImageUrl
-    ? createMarkdownRenderer(options)
-    : markdownRenderer;
+  const renderer = rendererFor(options);
   const rendered = renderer.parse(markdown, { async: false });
   const html = typeof rendered === "string" ? rendered : "";
   return sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS).trim();
 }
 
-function renderSafeInlineMarkdown(markdown: string): string {
-  const rendered = markdownRenderer.parseInline(markdown, { async: false });
+export function renderSafeInlineMarkdown(
+  markdown: string,
+  options: SafeMarkdownOptions = {},
+): string {
+  const rendered = rendererFor(options).parseInline(markdown, {
+    async: false,
+  });
   const html = typeof rendered === "string" ? rendered : "";
-  return sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS).trim();
+  return sanitizeHtml(html, MARKDOWN_SANITIZE_OPTIONS);
 }
 
 function extractDetailsBlocks(
@@ -474,7 +571,7 @@ function renderDetailsBlock(
   const bodyMarkdown = summaryMatch
     ? inner.slice(summaryMatch[0].length).trim()
     : inner.trim();
-  const summaryHtml = renderSafeInlineMarkdown(summaryMarkdown);
+  const summaryHtml = renderSafeInlineMarkdown(summaryMarkdown, options);
   const bodyHtml = bodyMarkdown
     ? renderSafeMarkdownNested(bodyMarkdown, depth + 1, options)
     : "";
@@ -528,6 +625,15 @@ function isClosingFenceLine(
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getLinkSource(token: Tokens.Link | Tokens.Image): string {
+  // Reference-style links keep their destination in a separate definition,
+  // which Markdown otherwise omits from the rendered output.
+  const referenceDestination = token.raw.endsWith("]")
+    ? ` (${token.href}${token.title ? ` "${token.title}"` : ""})`
+    : "";
+  return token.raw + referenceDestination;
 }
 
 function escapeHtml(text: string): string {

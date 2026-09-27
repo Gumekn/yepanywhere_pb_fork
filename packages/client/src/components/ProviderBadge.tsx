@@ -85,12 +85,6 @@ export function ProviderBadge({
     ) {
       return null;
     }
-    if (
-      (provider === "codex" || provider === "codex-oss") &&
-      normalized === "max"
-    ) {
-      return "xhigh";
-    }
     return normalized;
   };
 
@@ -137,7 +131,7 @@ export function ProviderBadge({
 
   return (
     <span
-      className={`provider-badge ${className}`}
+      className={`provider-badge${configLabel ? " provider-badge--mobile-config-only" : ""} ${className}`}
       style={{ borderColor: color, color }}
     >
       <span className={dotClass} style={dotStyle} />

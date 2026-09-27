@@ -8,6 +8,7 @@ import {
 } from "../../src/codex-history/CodexAppServerHistoryReader.js";
 import { CodexHistoryClientError } from "../../src/codex-history/types.js";
 import type { Thread } from "../../src/sdk/providers/codex-protocol/generated/v2/Thread.js";
+import type { Turn } from "../../src/sdk/providers/codex-protocol/generated/v2/Turn.js";
 import { publicCodexThreadItem } from "../../src/sdk/providers/codex.js";
 
 function thread(historyMode: "legacy" | "paginated" = "paginated"): Thread {
@@ -118,6 +119,48 @@ function client(overrides: Record<string, unknown> = {}) {
 }
 
 describe("CodexAppServerHistoryReader", () => {
+  it("retains async question metadata in paginated history", async () => {
+    const questions = [
+      { title: "Which address?", options: ["Production", "Local"] },
+    ];
+    const fake = client({
+      listItems: vi.fn(async () => ({
+        data: [
+          {
+            turnId: "turn-1",
+            item: {
+              type: "agentMessage",
+              id: "question",
+              text: "Which address?",
+              phase: "final_answer",
+              delivery: "async",
+              questions,
+            },
+          },
+        ],
+        nextCursor: null,
+        backwardsCursor: null,
+      })),
+    });
+    const reader = new CodexAppServerHistoryReader({ client: fake });
+    const result = await reader.getSemanticTurnsPage(
+      thread().id,
+      "project" as UrlProjectId,
+      "/tmp/project",
+      { limit: 20, itemsView: "full" },
+    );
+    expect(result.kind).toBe("loaded");
+    if (result.kind !== "loaded") return;
+    expect(
+      result.messages.find(
+        (message) => message.codexThreadItemId === "question",
+      ),
+    ).toMatchObject({
+      codexMessagePhase: "final_answer",
+      codexAsyncMessage: { delivery: "async", questions },
+    });
+  });
+
   it("honors the rollout kill switch without starting app-server reads", async () => {
     const fake = client();
     const reader = new CodexAppServerHistoryReader({
@@ -215,6 +258,9 @@ describe("CodexAppServerHistoryReader", () => {
     if (result.kind !== "loaded") return;
     expect(result.nextCursor).toBe("older-turns");
     expect(result.revision).toBe(`cas1.${thread().updatedAt}.${thread().id}`);
+    expect(result.turnStatuses).toEqual({
+      "turn-semantic": "completed",
+    });
     expect(result.messages.map((message) => message.uuid)).toEqual([
       "summary-user-turn-semantic",
       "semantic-command-turn-semantic",
@@ -242,6 +288,111 @@ describe("CodexAppServerHistoryReader", () => {
       expect(exact.messages).toHaveLength(4);
     }
   });
+
+  it.each([
+    {
+      active: true,
+      status: "interrupted",
+      completedAt: null,
+      durationMs: null,
+      cursor: undefined,
+      expected: "running",
+    },
+    {
+      active: false,
+      status: "interrupted",
+      completedAt: null,
+      durationMs: null,
+      cursor: undefined,
+      expected: "interrupted",
+    },
+    {
+      active: true,
+      status: "interrupted",
+      completedAt: 1_777_000_020,
+      durationMs: null,
+      cursor: undefined,
+      expected: "interrupted",
+    },
+    {
+      active: true,
+      status: "interrupted",
+      completedAt: null,
+      durationMs: 10_000,
+      cursor: undefined,
+      expected: "interrupted",
+    },
+    {
+      active: true,
+      status: "interrupted",
+      completedAt: null,
+      durationMs: null,
+      cursor: "older-turns",
+      expected: "interrupted",
+    },
+    {
+      active: true,
+      status: "completed",
+      completedAt: null,
+      durationMs: null,
+      cursor: undefined,
+      expected: "completed",
+    },
+    {
+      active: true,
+      status: "failed",
+      completedAt: null,
+      durationMs: null,
+      cursor: undefined,
+      expected: "failed",
+    },
+  ] as const)(
+    "reconciles detached history status with runtime activity: %j",
+    async ({ active, status, completedAt, durationMs, cursor, expected }) => {
+      const latestTurn: Turn = {
+        id: "turn-live",
+        items: [],
+        itemsView: "summary",
+        status,
+        error: null,
+        startedAt: 1_777_000_010,
+        completedAt,
+        durationMs,
+      };
+      const fake = client({
+        listTurns: vi.fn(async () => ({
+          data: [
+            latestTurn,
+            { ...latestTurn, id: "turn-older", status: "interrupted" },
+          ],
+          nextCursor: null,
+          backwardsCursor: null,
+        })),
+        listItems: vi.fn(async () => ({
+          data: [],
+          nextCursor: null,
+          backwardsCursor: null,
+        })),
+      });
+      const reader = new CodexAppServerHistoryReader({ client: fake });
+      const result = await reader.getSemanticTurnsPage(
+        thread().id,
+        "project" as UrlProjectId,
+        "/tmp/project",
+        { limit: 20, itemsView: "full", cursor, toolsMayBeActive: active },
+      );
+
+      expect(result.kind).toBe("loaded");
+      if (result.kind !== "loaded") return;
+      expect(result.turnStatuses).toEqual({
+        "turn-live": expected,
+        "turn-older": "interrupted",
+      });
+      expect(result.summary.lastTurnStatus).toBe(
+        expected === "running" ? undefined : expected,
+      );
+    },
+  );
 
   it("completes hosted web search items that carry no structured results", async () => {
     const webSearchTurn = {
@@ -547,7 +698,10 @@ describe("CodexAppServerHistoryReader", () => {
         type: "tool_use",
         id: "image-view",
         name: "ViewImage",
-        input: { path: "/tmp/project/screenshot.png" },
+        input: {
+          path: "/tmp/project/screenshot.png",
+          snapshotUrl: `/api/sessions/${forkedThread.id}/codex-images/image-view`,
+        },
       },
     ]);
     expect(JSON.stringify(result.messages)).not.toContain("data:image");
@@ -1525,6 +1679,61 @@ describe("CodexAppServerHistoryReader", () => {
         deferred: true,
       },
     ]);
+  });
+
+  it("reads original title text and image placeholders beyond the recent turn metadata page", async () => {
+    const fake = client({
+      listItems: vi.fn(async () => ({
+        data: [
+          {
+            turnId: "inherited-turn-older-than-the-latest-100-turns",
+            item: {
+              type: "userMessage" as const,
+              id: "original-request",
+              clientId: null,
+              content: [
+                {
+                  type: "text" as const,
+                  text: "建立通用断言展示机制",
+                  text_elements: [],
+                },
+                {
+                  type: "localImage" as const,
+                  path: "/tmp/project/original.png",
+                },
+              ],
+            },
+          },
+        ],
+        nextCursor: null,
+        backwardsCursor: "newer-items",
+      })),
+    });
+    const reader = new CodexAppServerHistoryReader({ client: fake });
+    const result = await reader.getSession(
+      thread().id,
+      "project" as UrlProjectId,
+      "/tmp/project",
+      undefined,
+      {
+        titleProjection: true,
+        beforeMessageId: encodeCodexAppServerCursor("oldest-page", {
+          direction: "older",
+          sessionId: thread().id,
+        }),
+      },
+    );
+    expect(result.kind).toBe("loaded");
+    if (result.kind !== "loaded") throw new Error("Expected title history");
+    expect(result.session.projectedMessages?.[0]?.message?.content).toEqual([
+      { type: "text", text: "建立通用断言展示机制" },
+      {
+        type: "input_image",
+        file_path: "/tmp/project/original.png",
+        deferred: true,
+      },
+    ]);
+    expect(result.session.pagination?.hasOlderMessages).toBe(false);
   });
 
   it("keeps a source-locked Inspector page readable when it contains a body-only native item", async () => {

@@ -19,8 +19,8 @@ describe("computeReadAugment", () => {
     const rendered = result?.renderedMarkdownHtml ?? "";
     expect(rendered).not.toContain("<script>");
     expect(rendered).toContain("&lt;script&gt;");
+    // File previews use standard Markdown link labels, not transcript source.
     expect(rendered).toContain('<a href="https://example.com">good</a>');
     expect(rendered).not.toContain("javascript:");
-    expect(rendered).not.toContain('href="javascript:alert(1)"');
   });
 });

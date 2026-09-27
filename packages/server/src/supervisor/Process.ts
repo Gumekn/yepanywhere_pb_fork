@@ -58,6 +58,8 @@ export interface ProcessQueueMessageResult {
 export interface ProcessQueueMessageOptions {
   /** False preserves one queued provider turn for one external reply surface. */
   allowSteer?: boolean;
+  /** Finish interrupting the active turn before admitting this input. */
+  interruptBeforeSend?: boolean;
 }
 
 /**
@@ -322,6 +324,7 @@ export class Process {
 
   /** Deferred message queue — messages queued while agent is in-turn, auto-sent when turn ends */
   private deferredQueue: { message: UserMessage; timestamp: string }[] = [];
+  private interruptSendInProgress = false;
 
   /** Whether the process is held (soft pause) */
   private _isHeld = false;
@@ -1296,6 +1299,10 @@ export class Process {
       };
     }
 
+    if (options.interruptBeforeSend) {
+      return this.interruptAndQueueMessage(message);
+    }
+
     // Create user message with UUID - this UUID will be used by both SSE and SDK
     const uuid = randomUUID();
     const messageWithUuid = { ...message, uuid };
@@ -1377,6 +1384,78 @@ export class Process {
     return { success: true, position: this.legacyQueue.length };
   }
 
+  private async interruptAndQueueMessage(
+    message: UserMessage,
+  ): Promise<ProcessQueueMessageResult> {
+    if (this.interruptSendInProgress) {
+      return { success: false, error: "interrupt_send_in_progress" };
+    }
+    if (this.state.type === "idle") {
+      return this.queueMessage(message, { allowSteer: false });
+    }
+    if (!this.supportsInterrupt) {
+      return { success: false, error: "interrupt_not_supported" };
+    }
+
+    // Reserve the next turn before asking the provider to stop. Its result
+    // can arrive before the interrupt RPC resolves, and must not drain the
+    // deferred queue ahead of this message.
+    this.interruptSendInProgress = true;
+    let unsubscribe = () => {};
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const turnEnded = new Promise<void>((resolve) => {
+      unsubscribe = this.subscribe((event) => {
+        if (
+          event.type === "state-change" &&
+          (event.state.type === "idle" || event.state.type === "terminated")
+        ) {
+          resolve();
+        }
+      });
+    });
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(
+        () =>
+          reject(new Error("Timed out waiting for the active turn to stop")),
+        30_000,
+      );
+    });
+
+    try {
+      // A held iterator must consume the provider's terminal event as well.
+      if (this.isHeld) this.setHold(false);
+      await Promise.race([
+        Promise.all([
+          this.interrupt().catch((error) => {
+            // The turn may finish naturally while the interrupt is in flight.
+            if (this.state.type !== "idle") throw error;
+          }),
+          turnEnded,
+        ]),
+        deadline,
+      ]);
+      // Re-check transport/queue liveness and force a fresh provider turn.
+      // Never fall back to steer after an interrupt failure.
+      return await this.queueMessage(message, { allowSteer: false });
+    } catch (error) {
+      getLogger().warn(
+        {
+          event: "process_interrupt_send_failed",
+          sessionId: this._sessionId,
+          processId: this.id,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Could not interrupt the active turn; message was not sent",
+      );
+      return { success: false, error: "interrupt_send_failed" };
+    } finally {
+      clearTimeout(timeout);
+      unsubscribe();
+      this.interruptSendInProgress = false;
+      if (this._state.type === "idle") this.transitionToIdle();
+    }
+  }
+
   private publishOptimisticUserMessage(
     message: UserMessage & { uuid: string },
     turnId?: string,
@@ -1447,13 +1526,24 @@ export class Process {
    * Get a summary of the deferred queue for SSE events and client sync.
    */
   getDeferredQueueSummary(): {
+    attachments?: UserMessage["attachments"];
+    blocked?: boolean;
     tempId?: string;
     content: string;
     timestamp: string;
   }[] {
     return this.deferredQueue.map((entry) => ({
       tempId: entry.message.tempId,
+      ...(this.messageQueue &&
+      (!this.acceptingMessages ||
+        this.iteratorDone ||
+        this.messageQueue.isClosed)
+        ? { blocked: true }
+        : {}),
       content: entry.message.text,
+      ...(entry.message.attachments?.length
+        ? { attachments: entry.message.attachments }
+        : {}),
       timestamp: entry.timestamp,
     }));
   }
@@ -2017,6 +2107,21 @@ export class Process {
               new Error("Provider ended before returning a session ID"),
             );
           }
+          // Codex's resident iterator only ends when its transport is closed.
+          // Retain blocked drafts for recovery, but remove empty dead processes
+          // so a retry can resume the session instead of entering a closed queue.
+          if (
+            this.provider === "codex" &&
+            this.messageQueue &&
+            this.deferredQueue.length === 0
+          ) {
+            const error = this.getProviderInitializationError();
+            this.markTerminated(
+              error?.message ?? "Codex provider exited",
+              error ?? undefined,
+            );
+            break;
+          }
           // Don't transition to idle if we're waiting for input
           if (this._state.type !== "waiting-input") {
             this.transitionToIdle();
@@ -2236,6 +2341,16 @@ export class Process {
           }
         }
 
+        if (
+          this.provider === "codex" &&
+          message.type === "system" &&
+          message.subtype === "status" &&
+          message.status === "compacting" &&
+          this._state.type === "idle"
+        ) {
+          this.setState({ type: "in-turn" });
+        }
+
         // Handle special message types
         if (message.type === "system" && message.subtype === "input_request") {
           // Legacy mock SDK behavior - handle input_request message
@@ -2292,9 +2407,19 @@ export class Process {
 
       // Detect process termination errors - set flag synchronously BEFORE markTerminated
       // to prevent race where queueMessage is called before state changes to terminated
-      if (this.isProcessTerminationError(err)) {
+      if (
+        this.isProcessTerminationError(err) ||
+        (this.provider === "codex" &&
+          this.messageQueue &&
+          this.deferredQueue.length === 0)
+      ) {
         this.transportFailed = true;
-        this.markTerminated("underlying process terminated", err);
+        this.markTerminated(
+          this.provider === "codex"
+            ? err.message
+            : "underlying process terminated",
+          err,
+        );
         return;
       }
 
@@ -2353,11 +2478,29 @@ export class Process {
     options: { continueQueuedTurn?: boolean } = {},
   ): void {
     this.clearIdleTimer();
+    if (this.interruptSendInProgress) {
+      this.setState({ type: "idle", since: new Date() });
+      return;
+    }
+    // A final result can arrive after the resident provider has shut down.
+    // Keep deferred inputs visible instead of acknowledging an unconsumable
+    // message and then dropping it when the iterator returns done.
+    if (
+      this.messageQueue &&
+      (!this.acceptingMessages ||
+        this.iteratorDone ||
+        this.messageQueue.isClosed)
+    ) {
+      this.emitDeferredQueueChange();
+      this.setState({ type: "idle", since: new Date() });
+      this.startIdleTimer();
+      return;
+    }
     // Feed next deferred message before transitioning to idle
     const next = this.deferredQueue.shift();
     if (next) {
       this.emitDeferredQueueChange();
-      void this.queueMessage(next.message)
+      void this.queueMessage(next.message, { allowSteer: false })
         .then((result) => {
           if (result.success || this._state.type === "terminated") return;
           getLogger().warn(

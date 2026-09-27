@@ -1,15 +1,21 @@
 package com.yepanywhere.mobile.local
 
 import android.Manifest
+import android.app.DownloadManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.util.Log
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.URLUtil
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.core.app.NotificationManagerCompat
@@ -22,16 +28,37 @@ import com.google.firebase.messaging.FirebaseMessaging
 import org.json.JSONObject
 
 class MainActivity : TauriActivity() {
+  private data class PendingDownload(
+    val url: String,
+    val userAgent: String?,
+    val contentDisposition: String?,
+    val mimeType: String?,
+  )
+
   private var mainWebView: WebView? = null
   private var nativePushBridge: NativePushBridge? = null
   private var sessionWatcher: YepSessionWatcher? = null
+  private val nodeNotifications = YepNodeNotifications()
   private var pendingNotificationPath: String? = null
+  private var pendingDownload: PendingDownload? = null
   private val pendingPermissionCallbackIds = mutableListOf<String>()
 
   private val notificationPermissionLauncher =
     registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
       markNotificationPermissionRequested()
       resolvePermissionCallbacks(if (granted) "granted" else "denied")
+    }
+
+  private val storagePermissionLauncher =
+    registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+      val download = pendingDownload
+      pendingDownload = null
+      if (granted && download != null) {
+        enqueueDownload(download)
+      } else if (download != null) {
+        YepLog.w("download", "legacy storage permission denied")
+        showDownloadToast(R.string.download_storage_permission_denied)
+      }
     }
 
   override fun onWebViewCreate(webView: WebView) {
@@ -45,6 +72,9 @@ class MainActivity : TauriActivity() {
     nativePushBridge = bridge
     webView.addJavascriptInterface(bridge, "YepNativePush")
     webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+    webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+      handleDownload(url, userAgent, contentDisposition, mimeType)
+    }
     pendingNotificationPath?.let { injectNotificationPath(it) }
   }
 
@@ -63,21 +93,19 @@ class MainActivity : TauriActivity() {
     // the soft keyboard pans the whole window upward — which on edge-to-
     // edge looks like the page slides under the status bar.
     //
-    // Apply ONLY the keyboard (IME) inset as bottom padding on the root.
-    // Status-bar and gesture-nav insets are already handled in CSS via
-    // env(safe-area-inset-top / -bottom); doubling that up here would
-    // leave a visible gap.
+    // Native layout owns the bottom safe area; static-shim only pads the top
+    // and sides. The cross-origin app iframe cannot supply the missing bottom
+    // inset. IME already includes the navigation bar, so use the larger inset
+    // without subtracting or adding the navigation bar height.
     val rootView = findViewById<android.view.View>(android.R.id.content)
     ViewCompat.setOnApplyWindowInsetsListener(rootView) { view, insets ->
       val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
       val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-      // IME inset already includes the system bar height at the bottom
-      // when keyboard is up — subtract it so we don't double-pad against
-      // CSS's env(safe-area-inset-bottom).
-      val keyboardOnlyBottom = (ime.bottom - systemBars.bottom).coerceAtLeast(0)
-      view.setPadding(0, 0, 0, keyboardOnlyBottom)
+      val bottomInset = maxOf(ime.bottom, systemBars.bottom)
+      view.setPadding(0, 0, 0, bottomInset)
       insets
     }
+    ViewCompat.requestApplyInsets(rootView)
 
     handleNotificationIntent(intent)
   }
@@ -102,17 +130,113 @@ class MainActivity : TauriActivity() {
   }
 
   override fun onDestroy() {
+    nodeNotifications.close()
     sessionWatcher?.stop()
     sessionWatcher = null
     // Break the JavaScript-interface reference chain explicitly. WebView owns
     // the bridge, while the bridge owns both this Activity and the WebView.
     // Tauri/Wry still owns final WebView destruction in super.onDestroy().
+    mainWebView?.setDownloadListener(null)
     mainWebView?.removeJavascriptInterface("YepNativePush")
     nativePushBridge = null
     mainWebView = null
     pendingPermissionCallbackIds.clear()
     pendingNotificationPath = null
+    pendingDownload = null
     super.onDestroy()
+  }
+
+  private fun handleDownload(
+    url: String?,
+    userAgent: String?,
+    contentDisposition: String?,
+    mimeType: String?,
+  ) {
+    if (url.isNullOrBlank() || (!URLUtil.isHttpUrl(url) && !URLUtil.isHttpsUrl(url))) {
+      YepLog.w("download", "ignored unsupported URL scheme")
+      showDownloadToast(R.string.download_unsupported)
+      return
+    }
+
+    val download = PendingDownload(url, userAgent, contentDisposition, mimeType)
+    if (
+      Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+      ContextCompat.checkSelfPermission(
+        this,
+        Manifest.permission.WRITE_EXTERNAL_STORAGE,
+      ) != PackageManager.PERMISSION_GRANTED
+    ) {
+      pendingDownload = download
+      storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+      return
+    }
+
+    enqueueDownload(download)
+  }
+
+  private fun enqueueDownload(download: PendingDownload) {
+    val uri = Uri.parse(download.url)
+    val fileName = safeDownloadFileName(
+      URLUtil.guessFileName(
+        download.url,
+        download.contentDisposition,
+        download.mimeType,
+      ),
+    )
+
+    try {
+      val request = DownloadManager.Request(uri).apply {
+        setTitle(fileName)
+        setDescription(getString(R.string.download_description))
+        setNotificationVisibility(
+          DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED,
+        )
+        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+        download.mimeType?.takeIf { it.isNotBlank() }?.let { setMimeType(it) }
+        download.userAgent?.takeIf { it.isNotBlank() }
+          ?.let { addRequestHeader("User-Agent", it) }
+        CookieManager.getInstance().getCookie(download.url)
+          ?.takeIf { it.isNotBlank() }
+          ?.let { addRequestHeader("Cookie", it) }
+        mainWebView?.url
+          ?.takeIf { URLUtil.isHttpUrl(it) || URLUtil.isHttpsUrl(it) }
+          ?.let { addRequestHeader("Referer", it) }
+      }
+
+      val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+      val downloadId = manager.enqueue(request)
+      YepLog.i(
+        "download",
+        "enqueued id=$downloadId host=${uri.host ?: "unknown"} file=$fileName",
+      )
+      showDownloadToast(R.string.download_started, fileName)
+    } catch (error: Throwable) {
+      YepLog.e(
+        "download",
+        "enqueue failed host=${uri.host ?: "unknown"} file=$fileName",
+        error,
+      )
+      showDownloadToast(R.string.download_failed, fileName)
+    }
+  }
+
+  private fun safeDownloadFileName(fileName: String): String {
+    val sanitized = fileName
+      .substringAfterLast('/')
+      .substringAfterLast('\\')
+      .replace(Regex("[\\u0000-\\u001f\\u007f]"), "_")
+      .trim()
+    return if (sanitized.isBlank() || sanitized == "." || sanitized == "..") {
+      "download-${System.currentTimeMillis()}"
+    } else {
+      sanitized
+    }
+  }
+
+  private fun showDownloadToast(messageId: Int, vararg args: Any) {
+    runOnUiThread {
+      Toast.makeText(this, getString(messageId, *args), Toast.LENGTH_LONG).show()
+    }
   }
 
   override fun onNewIntent(intent: Intent) {
@@ -388,6 +512,13 @@ class MainActivity : TauriActivity() {
     fun getToken(callbackId: String) {
       Log.i(TAG, "bridge.getToken: callbackId=$callbackId")
       activity.getFcmToken(callbackId)
+    }
+
+    @JavascriptInterface
+    fun getNodeNotifications(callbackId: String) {
+      activity.nodeNotifications.read { result ->
+        respond(callbackId, true, result, null)
+      }
     }
 
     @JavascriptInterface

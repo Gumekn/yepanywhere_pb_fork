@@ -7,7 +7,96 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ## [Unreleased]
 
+### Changed
+- 输入框插入图片／附件标签时，前后与正文统一保留至少两个空格，避免标签紧贴前面的文字；保留已有换行、制表符和更宽间隔。
+- Codex 子智能体活动展示具体名称、中文／英文事件说明和子会话入口，便于查看任务、协作消息与结果；修复已完成子智能体仍显示「进行中」，发送消息不再被误判为重新运行。
+- Codex 用量卡片的重置额度统一为单行展示，多份额度可下拉选择，默认选中最早到期且未过期的一份；左右账号卡片等高、底部登录操作对齐，保留重置前的账号与到期时间确认。
+- Codex 当前用量按容器宽度自适应排列，宽屏一行展示两个账号，窄屏及单账号保留单列；账号内用量条铺满可用宽度，长邮箱与操作按钮自动换行，减少多账号占用的纵向空间。
+- Pi 的网关模型目录改为「返回旧缓存 + 后台异步刷新」：此前列表接口（`/api/providers`、`/api/providers/:name`）都以 `waitForRefresh: false` 调用，命中缓存时直接返回且不触发刷新，导致进程启动后抓到的第一份目录被长期钉死——网关新增的模型（如 `claude-opus-5-5`）要等重启或手动 `?fresh=1` 才出现。现在缓存过期后仍立即返回旧目录（不阻塞请求），同时在后台重新拉取全部 channel，下一次请求即可见；并发刷新共享同一次请求，刷新失败回退到上一次成功的目录并记 warn。
+- Codex／Pi 新执行的会话文件记录改为工具驱动，移除执行前后及每 15 秒的工作目录快照：Codex 保存原生成功 FileChange，并从 rollout 的 item_completed 恢复 code-mode 子工具；Pi 在原生 edit／write 的读写接口保存实际操作版本。文件列表展示当前分支内已确认操作的累计增删行数，支持只有 patch 的记录、内容按需读取及旧快照只读兼容；失败、未知和二进制统计不伪造零值。
+- 旧版会话快照索引显示最近一次保存执行的 `+新增 / -删除` 行数，统计使用持久化快照并复用索引缓存；覆盖不全提示说明总量、单文件大小等具体原因，区分工作区覆盖不足与单个文件差异的完整性。
+- 收敛会话检查器的按需工作：仅在可见 Git 标签轮询仓库状态，隔离关闭、切项目后的迟到响应；隐藏检查器或浏览器页面时停止详情翻页和派生计算，重新打开后按展示版本刷新。
+- 文件索引与会话快照选择合并同版本并发扫描，隔离项目、会话和分支；旧扫描不会覆盖新缓存，失败可重试，关闭面板后的迟到响应不再更新界面。
+- 展示快照缓存按条目记录大小，更新时不再序列化其他缓存会话，保留原有 5 条／32 MiB 估算上限和淘汰顺序，并提供可复现的合成成本基准。
+- 消息渲染通过会话层注入嵌套 renderer，解除运行时依赖环；纯摘要聚合与工具元信息不再依赖 JSX 注册表，并增加架构回归门禁。
+- 归档阻塞优先级和公开产物文件名校验收敛为前后端共享规则，保持既有边界行为。
+- 附件改为插入到输入框光标位置的内联 chip，而不是固定挂在输入框下方：在会话输入框和新建会话页选择 / 粘贴文件时，会在光标处写入 `@[文件名]` 标记（输入框内以高对比 chip 呈现，点击可直接预览图片），发送后用户气泡里也按同一位置内联渲染成可点击的附件 chip，从而保留“图片和文字的先后顺序”这一上下文信息。标记与服务端 prompt 清单（`User uploaded files:`）使用同一套文件名规范化规则，服务端行为不变；删除标记文本即移除对应附件，未被标记引用的附件（历史草稿、飞书等渠道消息）仍按原样显示在气泡下方，排队中的消息同样内联展示。会话列表和页面标题不再把 `@[文件名]` 当正文显示（只有图片、没有文字时回退到文件名）；从 Yep 复制消息再粘贴回输入框时复用文本里已有的标记，不再重复插入第二个。输入框里的标记按整体处理：Backspace / Delete 一次删掉整个 chip 并同步移除附件，插入后光标用 rAF 恢复（不再被受控 value 冲到末尾），镜像高亮层只改绘制、不改字形度量（此前 chip 加粗导致光标与文字逐渐错位），并跟随 IME 组合实时同步，拼音输入过程中不再闪烁。会话草稿里的附件元数据也随草稿文本一起持久化（`draft-attachments-<sessionId>`），切走会话再切回来时 chip 与附件都还在，不会退化成纯文本标记。
+- 新建会话页的 `网关 API Key` 选择器改为始终列出全部 gateway channel 的 Key（按网关分组），不再因为「还没选模型」而只显示默认网关的 Key——此前给非默认网关新增的 Key 在未选模型时会直接从列表消失。Key 与模型的关系也改为以 Key 为主导：选中某个 Key 后，下方模型下拉自动收敛到该 Key 所属网关且探测可达的模型，当前模型不匹配时自动切到第一个可用模型；Key 不再因为「覆盖不到当前模型」而置灰（只有探测不通的 Key 仍不可选），避免模型与 Key 互相锁死。UI 同步收拾：分组标题标注「当前模型」所属网关，卡片内右侧悬浮删除按钮（不再溢出到卡片外），新增/刷新按钮移到标题行，添加表单在多网关时可显式选择归属网关，状态与告警文案分行展示。
+- 收紧新建会话页 Codex 用量卡片的留白：账号块、用量窗口、进度条、额外限额等区块的间距和内边距整体下调一档，多账号时卡片高度明显降低，信息密度更高，不影响布局结构与移动端单列回退。
+
 ### Added
+- 当前回复轮次的计时旁新增“LLM 思考中 / 工具执行中”状态，支持折叠工具组和并行工具调用，轮次结束后自动隐藏；同步提供中英文文案。
+- 会话菜单新增“复制项目目录”，可直接复制该会话所属项目的完整路径，并提供中英文成功与失败提示。
+- Codex 用量卡片展示每份重置额度的到期时间，并支持选择额度、确认账号后兑换重置；保留请求幂等键以防重试重复消耗，兑换后刷新用量，明确区分期限未知和长期有效。
+- Codex／Pi 文件面板接入服务端快照记录：按当前分支筛选真实落盘变更，默认预览会话保存版本，可切换执行版本、查看对应 diff 或显式打开当前工作区文件；删除文件仍可查看保存的旧内容，Markdown 支持预览，二进制明确提示暂不支持预览。列表不再依赖客户端路径猜测，新记录到达后自动刷新；Pi 同步绑定原生用户 entry ID，避免分支筛选时丢失关联。
+- 文件快照接入本机 Codex（含 bridge）与 Yep 管理的 Pi 执行生命周期：请求放行前持久化基线，结束后保存文件变化与执行身份，失败／中断同样收尾；重复请求不重置基线，bridge 与 provider 不重复采集，中途接入和断线明确标为覆盖不完整；bridge 继承线程级远端环境配置，避免后续 turn 省略环境字段时误采本机文件。采集失败记录诊断而不打断 agent；不回填历史，也不改 ZCode／Kimi。
+- 新增供 Codex／Pi 后续接入的服务端文件快照基础层：有界采集 Git dirty/untracked 文件及普通目录，按内容哈希保存文件版本，并持久化带 session／分支／轮次身份的前后差异；显式记录忽略、超限及读取不完整，避免误报删除。不回填历史数据。
+- 会话右侧栏「文件」面板新增改动量与 diff 查看，全部由会话自身的编辑记录推导，不依赖 git：服务端解析每次编辑工具调用的实际载荷——Claude 的 `old_string/new_string`、MultiEdit / Pi 的 `edits[]`、Codex `apply_patch` 的 `changes[].diff`、`Write` 的整文件内容，以及 tool_result 里回传的 `originalFile`——按文件累加出 `+N/-M` 和编辑次数，失败的工具调用不计入。点击有改动的文件打开 diff 面板：会话起始内容优先取 tool_result 的 `originalFile`，否则从当前工作区内容倒推（逆向替换、按内容而非行号反向套用 patch hunk、最早的 `Write` 视为新建文件），倒推不完整时标注「基线不完整」而不是伪造结果。新增 `POST /api/projects/:projectId/sessions/:sessionId/files/diff`（只接受项目相对路径，拒绝绝对路径和 `..`；该文件没有编辑记录时返回 404）。因为完全基于 session transcript，会话开始前就存在的未提交改动、以及会话期间的 commit，都不会污染这份 diff。
+- 会话右侧栏「文件」面板改为服务端派生并可直接打开文件：新增 `GET /api/projects/:projectId/sessions/:sessionId/files`，由服务端扫描整个 session（不再只统计客户端当前已分页加载的那段 transcript）产出文件索引，因此长会话里早期轮次改过的文件不会再从列表中消失。索引来源是结构化的工具入参（`file_path`、`changes[].path` 等），并额外从 shell 命令中恢复 `sed -i`、重定向、`tee`、`mv/cp/rm` 这类没有任何工具字段暴露的写操作（标注为「可能改动（shell）」的低置信行）；绝对路径会相对化到项目根，项目外的文件单独标注。面板 UI 同步重做：按 修改 / 读取 / 搜索 分组（组标题带计数、每组超过 25 条可展开全部），行点击直接打开文件查看器而不是只滚回消息，悬停时出现独立的「跳到消息」按钮，服务端扫描被截断时给出提示。服务端结果按 session 文件 mtime/size 缓存，接口不可用时自动回退到原有的客户端派生逻辑。
+- 新增一次性热叠加命令 `pnpm hot-apply`：把当前工作树按“最小中断层级”叠加到正在运行的部署上，解决“8022 挂着不能打断的会话、但想立刻用上一波改动”的场景。档位由变更文件自动推导而非参数决定——`client` 档（`packages/client/src` 等）重建浏览器包并原子替换运行目录的 `client-dist`，不重启任何进程，已打开的页面靠 `useBuildRefresh()` 比对 `build-info.json` 的 `buildId` 自动刷新；`shell` 档（`packages/server/src` 非 runtime 部分）委托 `redeploy-server.sh` 重启 web/API；`runtime` 档（`supervisor/`、`runtime/`、`sdk/providers/`、`packages/shared/`、`packages/server/resources/`）会打断活跃 turn，必须显式 `--allow-runtime`，否则以退出码 2 拒绝。叠加只改运行目录产物、不改部署形态，下一次正常 deploy 自动回归，也可 `--revert` 提前撤销；状态与备份存放在 `<dataDir>/hot-apply/`。配套 `--check`、`--status` 和 `docs/project/hot-apply-and-external-runtime.md`。
+- 支持把 agent runtime 拆成独立进程部署（`YEP_RUNTIME_MODE=external`），使 8022 web/API 重启不再中断活跃会话。新增 CLI 入口 `yepanywhere --runtime-only [--runtime-port N]`（默认 `PORT + 3`，仅监听回环并用共享 bearer token 鉴权），新增 `com.yueyuan.yepanywhere.runtime` LaunchAgent，`scripts/deploy.sh --external-runtime` 一次性完成切换，`scripts/redeploy-server.sh --restart-runtime` 才会重启它。切换后普通 server 部署默认保留 runtime 与其持有的 provider 子进程，`/api/status/workers` 的 `runtimeMode` 变为 `external`；provider 相关环境变量由 `install-launchagents.sh` 的 `build_provider_env_args()` 统一写入 runtime 与 server 两个 plist。此前 external runtime 只在 `pnpm dev:8022` 可用。外置形态是 opt-in：命令行 flag、交互式向导的 `Agent runtime placement` 问题，或 `.env.deploy.local` 里的 `YEP_RUNTIME_EXTERNAL=true` 三选一，普通部署不会擅自改变部署形态。
+- 新建会话页可以选择本次 Pi 会话使用哪个网关 API Key：`网关 API Key` 选择器按当前所选模型所属的 gateway channel 列出全部可用 Key（服务端环境变量里的默认 Key + 用户自行添加的 Key），展示脱敏预览、可访问模型数和余额；网关只回无限哨兵值（`hard_limit_usd = 1e8`）时明确显示「网关未提供额度信息」而不伪造余额。Key 打不通或覆盖不到当前模型时置灰不可选，避免第一轮才失败。选择随新建会话默认值保存，会话启动时只对该 channel 覆盖 `YEP_PI_LLM_API_KEYS` 中的凭据，续聊、重启、fork 跟随创建时记录的 Key（`llmGatewayKeyId` 存入 session metadata），Key 被删除后自动回落环境 Key。卡片内可直接添加 / 删除 Key（添加前先向网关校验），存储在 `<dataDir>/llm-gateway-keys.json` 并在运行时热读取；新增 `/api/llm-gateway-keys` 系列接口，完整 Key 永不返回给客户端。
+- 新建会话页可以选择本次会话使用哪个 Codex 账号：`Codex 账号` 选择器列出全部已登录账号（邮箱、套餐、5 小时 / 每周用量），未登录的账号置灰，只有一个账号时自动隐藏；选择会随新建会话默认值一起保存，下次进入沿用。会话启动时按账号注入独立 `CODEX_HOME`，续聊、重启、fork 都跟随创建时记录的账号（`codexAccountId` 存入 session metadata，客户端无法把已有会话搬到别的账号），非默认账号的会话不再走 4510 bridge 复用路径。非默认账号的 `CODEX_HOME` 会把 `sessions/`、`archived_sessions/`、`session_index.jsonl`、`history.jsonl` 软链回 `~/.codex`，因此会话列表、展示、watcher 与 resume 全部照常；thread-history SQLite 保持各账号独立（避免跨路径 WAL 损坏），这类会话的原生分页历史会自动回退到 rollout JSONL 读取。
+- 新建会话页的 Codex 用量卡片支持多账号：每个账号独立 `CODEX_HOME`（默认账号仍是 `~/.codex`，新增账号落在 `<dataDir>/codex-homes/<id>`），并排展示邮箱、套餐、5 小时 / 每周窗口和额外限额，可区分「当前会话使用中」的账号。卡片内可直接添加账号并登录：默认使用设备码方式（移动端也能完成，显示 `auth.openai.com/codex/device` 链接与一次性验证码），也可在服务器本机浏览器走 OAuth 链接；登录状态自动轮询，支持取消、退出登录、移除账号，以及把某个账号一键切换为会话实际使用的凭据（切换前自动备份并回写原账号的 `auth.json`）。后端新增 `/api/codex-accounts` 系列接口和复用的 `codex app-server` JSON-RPC 客户端。新增 `scripts/codex-usage.ts` 可在命令行查询任意 `CODEX_HOME` 的额度。
+- 助手回复新增整轮耗时展示：在回复末尾的操作行显示从用户发话（或回答提问）到该轮内容结束经过了多久（如 `45s`、`3m12s`、`1h05m`），小于 1 秒不显示；进行中的那一轮复用工具步骤的共享一秒 ticker 实时跳动（标签页隐藏时暂停），不依赖消息事件，长时间无输出的 Bash 等调用期间也不会停止计时；适用于全部 provider。
+- 运行中的工具步骤展示实时计时：Bash/Shell 等长耗时调用在步骤行尾显示已运行时长（如 `4m00s`、`1h05m`），悬停显示开始时间，一秒一跳且标签页隐藏时暂停；适用于 Pi、Codex 等全部 provider。实时步骤缺少源时间戳时由服务端在创建步骤时补齐起始时间，历史回放不再伪造起始时间。
+- 飞书用户授权由 Yep 独立管理：新增 OAuth + PKCE 授权入口、后台续期、跨进程刷新锁、令牌失效分类、飞书授权卡片和中英文设置页。原生 Lark MCP 保留 38 个工具入口并随 Yep 打包，不再运行 MLB 或读取旧机器人 token 文件；渠道会话使用受管配置，Desktop/CLI 提供显式迁移工具。授权等待只发生在业务请求发送前，取消后不重放写操作。
+- Codex 的 DeepSeek 模型源新增 DeepSeek V4.1 Flash（`deepseek-flash`），支持图片输入、1M 上下文与 low/high/max 推理档位，并作为新建会话时的首选 DeepSeek 模型。已下线的 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` 从选择器移除，但仍保留在模型目录中，旧会话续聊仍能正确路由到 DeepSeek 而不是 OpenAI；`deepseek-v4-pro` 保留并标注将于 2026-09-14 起由 V4.1 Flash 承接。Pi 等走 LLM gateway 的 provider 在网关上架该模型后即可直接选用。
+- Codex 会话执行中新增“回复并继续”作为默认发送操作（桌面 Enter），通过现有 steering 通道提交异步问题的回答或补充；保留独立的“打断并发送”和“排队”（Ctrl+Enter），同步更新中英文提示及移动端按钮换行。
+- APK 侧边栏新增 Home、Mini 服务快捷切换，分别显示最近 24 小时已结束且未读的会话数；打开侧边栏时独立查询两端并每 15 秒刷新，区分离线与需要登录，切换服务不清除未读。Inbox 新增分页截断前的完整计数，兼容旧服务时对可能截断的计数显示 `+`。
+
+### Fixed
+- 修复 Codex 多账号会话正文缺失：历史读取按会话绑定账号选择独立 CODEX_HOME，并复用各账号自己的只读 app-server，避免默认账号的空历史库覆盖完整对话；不同账号的读取、并发请求和失败退避相互隔离。
+- 修复 Codex 多账号会话因默认账号索引标题为空而显示 New session／未命名：从共享 rollout 的首条真实用户输入补齐标题，跳过初始化指令并限制读取量；修复无消息 ID 的回合结束通知在历史刷新时丢失、最终答复后一直显示「正在收尾…」的问题，保留按回合关联的完成状态并隔离后续新回合。
+- 修复 Pi 会话正常结束后侧栏仍显示「Cont」（继续）标记的问题：Pi 会话文件的每次追加都把所有 Pi 索引作用域标成整目录脏，会话列表的 stale-while-revalidate 路径因此继续返回 turn 中途的快照（末尾是 toolResult，被判定为 interrupted），并覆盖掉客户端已收到的 completed 推送。现在对已索引会话的追加只增量刷新该会话，新建、删除或无法识别的文件仍走整目录校验。
+- 修复 Markdown 文件预览（文件查看器、本地文件弹窗、Read／Write 工具预览、Git 变更、会话文件记录及报告）受会话链接渲染改动波及的问题：预览恢复标准 Markdown 链接文字，不再显示 `[文字](地址)` 原文；相对路径链接不再被改写成缺少项目上下文、点击即跳到 400 错误页的 `/api/local-file` 链接，而是保留为普通文字。会话消息内的链接原文展示和项目相对路径打开行为保持不变。
+- 修复续聊初始化更换临时 session ID 后丢失旧 ID 映射和元数据迁移通知的问题，保留初始化失败及时返回和独立分支语义。
+- 修复只部署 8022 时外置 runtime 配置可能丢失：同步 LaunchAgent 配置保留已有运行形态，备用 nohup 启动继承 runtime 地址、端口和 token 文件，部署后核对实际形态；server-only 不再顺带安装或启动 runtime。Codex 续聊等待初始化成功后才确认发送，写入锁冲突直接返回失败并走客户端草稿恢复流程，避免永久停在“发送中”。
+- 修复会话 Markdown 相对文件链接被渲染成普通文字、丢失目标路径的问题：支持的链接保留完整原始 Markdown（标签、目标地址及标题）并标蓝可点击，文件链接按会话项目目录打开文件查看器，支持相对路径、行列号和修饰键新窗口；流式与完成后的链接共用解析器，无法识别或不支持的链接／图片保留原始 Markdown 文本，不再吞掉目标地址。
+- 修复同一次多文件操作在实时通知与历史记录中文件顺序不同而被误判为冲突的问题：去重时按路径规范化比较，避免已确认文件从列表消失，仍隔离内容不同的真实冲突。
+- 修复 bundle 构建把 Pi 扩展与文件操作模块的文件名拼成嵌套目录而失败：两个模块分别复制到产物的同一 resources 目录，并纳入产物完整性校验。
+- 修复 Codex 输出断线重试后，完整答复下方仍残留半截文字和流式光标的问题：持久化历史确认同一轮已完成且最终答复已保存后，清理被重试替代的流式草稿；历史同步滞后、新一轮输出及已完成的其他消息继续保留。
+- 修复 Codex 切换账号后原账号从列表消失、上下列表重复显示新账号：替换默认登录前将原凭据保存为可切回的独立账号，按认证身份匹配而非邮箱；合并默认登录与已保存账号的重复显示，并在账号操作后同步刷新会话账号选择器。
+- 修复已有 Pi 等会话的项目新建 Codex 会话后立即显示 `Session not found` 的问题：首批历史尚未落盘时，详情展示按运行中的 provider 选择读取源，不再遗漏项目原 provider 之外的会话，并兼容共享存储的 provider 别名。
+- 附件标签插入后默认预留两个空格，并将光标放到间距之后，避免继续输入的文字紧贴标签；新建会话和会话输入框统一生效，保留已有换行和更宽间距。
+- 修复长会话执行中文件面板一直为 0、且文档和测试被审计日志挤出快照配额的问题：绑定原生轮次后每 15 秒采集执行中检查点，列表只保留同一次执行的最新观测，结束后以最终记录替代；未变化时复用快照。默认优先采集源码、文档和配置，再分配日志、构建产物与二进制文件的配额，仍明确标记超限，不回填历史快照。
+- 移除 `$` 开头标题的命令会话分类规则，调用 `$impeccable` 等 skill 的会话正常显示在最近会话中；已有会话按新规则自动恢复展示。
+- 修复消息和新建会话输入框中附件标签遮挡输入光标的问题：原生输入层置于附件高亮之上，光标跟随主题保持清晰，保留附件点击预览与悬停反馈。
+- 修复新建会话输入框含附件时，滚动页面导致高亮文字脱离输入框并覆盖下方选项的问题：完整与紧凑表单统一为输入框和附件高亮层提供独立定位容器，账号卡片高度变化时也保持对齐。
+- 修复外置 agent runtime（`YEP_RUNTIME_MODE=external`）下 Codex bridge 把 runtime 持有的会话误报为「external session」。`createApp` 安装给 bridge 的 ownership resolver 直接查询本地 Supervisor，而 external 形态下进程由独立 runtime 进程持有、本地 Supervisor 始终为空，于是 resolver 恒返回 false：bridge 每次 poll 在会话 active 翻转时都会发出 `ownership: external`/`none`，客户端出现无法消除的「external session」横幅，同一个审批也可能既由 runtime 又由 bridge 提供。resolver 改为经 `runtimeController` 查询，因此 embedded 与 external 两种形态得到同一答案。ownership resolver 相应允许返回 Promise（外置形态下答案在另一个进程），`BridgeHttpClient` 在发出事件前先解析完 ownership，保证单个会话的 `session-created` → `session-status-changed` → `process-state-changed` 顺序不被 await 打断；resolver 抛错（runtime 不可达）按「非自有」处理，不再中断整个 poll 周期。embedded 形态行为不变。
+- 启动诊断不再把完整的 gateway API key 写进日志。`[LLM gateways] Active channels:` 这行此前把 `channel.apiKey` 原样拼进 `console.log`，经 console 拦截转发给 Pino 后落盘，并随日志导出 / 集中采集扩散；现在改为复用既有的 `maskApiKey()` 输出脱敏指纹（前 6 位 + `…` + 后 4 位），仍能回答「这台服务是否已经用上轮换后的 Key」，但完整凭据不再跨越日志边界。渠道 id、apiBase 和 overlay 路径的输出保持不变。
+- 修复部署脚本重载 LaunchAgent 时偶发 `Bootstrap failed: 5: Input/output error` 的问题：`launchctl bootout` 是异步的，返回后 launchd 仍在拆服务，此时立刻 `bootstrap` 会被拒绝。`scripts/redeploy-server.sh` 与 `scripts/install-launchagents.sh` 现在都会先等 label 卸载、旧进程退出，再带重试地 bootstrap，最后一次失败仍原样抛出真实错误。
+- 修复 Pi 会话跑着跑着就悄悄换回默认网关 Key 的问题（表现为一段时间后突然报 `403 budget_exceeded`，而会话选的其实是另一把有额度的 Key）。有两条路径会丢掉会话创建时记录的 `llmGatewayKeyId`：一是续聊消息触发的进程重启（切换 thinking / reasoning effort、变更飞书 MCP 授权都会重启 provider 进程），`queueMessage` 组装的 `modelSettings` 漏带凭据，重启后回落到环境默认 Key；二是编辑消息 / 回滚产生新 session id 时，只迁移了 provider、executor、gateway 配置，没有迁移凭据，分支会话之后每次续聊都用默认 Key。现在两条路径统一走同一份「线程固定凭据」逻辑，Codex 的 `codexAccountId` 同样受影响、一并修复（此前重启后会静默切回默认账号）。另外 Pi 启动时若 `llmGatewayKeyId` 无法解析到凭据（Key 被删或归属别的 channel），不再无声回落，会记录 `pi_gateway_key_unresolved` 警告。
+- 修复新建会话页点「保存为默认」时 Pi 的网关 API Key 选择不会被保存的问题：服务端 `PUT /api/settings` 的 `newSessionDefaults` 校验漏了 `llmGatewayKeyId` 字段，客户端正常上报但被静默丢弃，下次进入表单总是回落服务端默认 Key（Codex 账号 `codexAccountId` 不受影响，现已补上两者的回归测试）。该字段仅允许在 Pi 下保存，写到其他 provider 会被 400 拒绝。
+- 修复会话里被中断的工具调用永远卡在「此前仍在运行的步骤」并一直显示 `Computing diff...` 的问题。展示层只在收到工具结果或明确的轮次终态时才结束一个步骤，两者都缺失时步骤就会永远转圈：上游流在 `message_stop` 之前断开时，Pi 会落盘一条 `stopReason: "error"`、`arguments` 为空的残缺 `toolCall` 并在新消息上重试，Codex 则会在 app-server / bridge 在 `turn_complete` 前重启时丢掉整个轮次；没有原生 turn id 的 provider（Pi、Kimi）更严重，所有步骤归到同一个 run，只有整个会话空闲时才可能被关闭。现在分三层治理：展示层对所有 provider 统一做兵底——工具批次是严格顺序的，比最新已结束步骤更早的批次里仍在 running 的步骤会被判为 `unknown`（同一批次内的并行调用互不判定，真正在跑的并行批次不受影响，迟到的真实结果仍会覆盖回正确状态）；Pi 的实时 RPC 路径和持久化会话转换额外为被放弃的调用补一条失败的终态结果（日志里已有真实结果时不补）；Edit 渲染器把参数不完整、不可能生成 diff 的调用显示为终态文案而不是加载中。
+- 修复报告页图片在移动端加载失败后只剩一个裂图图标、且无法自行恢复的问题：所有环境下原生 `<img>` 加载失败都会自动改走带鉴权的 `fetch` 重试（失败原因如 `HTTP 404` 直接显示在图片位置，并提供「重试」按钮），此前只有桌面 iframe（带 desktop token）才有错误处理。图片 URL 附带资源 mtime 版本参数，避免报告先于图片资产生成时被 `Cache-Control: private, max-age=3600` 缓存住失败状态；图片 404 响应改为 `no-store`。失败提示与重试按钮全部用 CSS 伪元素绘制，不引入文本节点，保证报告评论的文本偏移锚点不偏移。
+- 移动外壳默认 TCP 节点从已停服的 `43.226.60.75:46789` 换为 `39.106.189.88:18022`（mini，同一台机器的当前 frps 入口），退役地址归入迁移列表，已保存该地址的客户端自动回落默认节点，不再在冷启动时先吃一次连接超时；连接面板节点列表、输入框占位和 DNS 预解析同步更新。此项需重新打包 APK 才生效。
+- 修复 Pi 会话被手动中断后在会话列表被标成红色「失败」的问题。UI 的停止按钮走 `interrupt`（RPC `abort`），但当取消发生在首个流事件之前时，Pi 记录的最后一条 assistant entry 是 `stopReason: "error"` + `errorMessage: "This operation was aborted"`（Node `AbortError` 原文）而不是它自己契约里的 `"aborted"`；`derivePiSession` 把所有 `error` 一律映射为 `lastTurnStatus: "failed"` 并回填 `lastErrorMessage`，而 `SessionStatusBadge` 中 failed 分支（含“有任何错误文案即失败”）优先于 interrupted 分支，于是中断显示为失败、且看不到「继续」入口。现在按已知取消文案的白名单把这类 `error` 判为 `interrupted`，并且不再把中断文案写入 `lastErrorMessage`；提到 abort 的真实 provider 报错仍报失败（本机 237 个 Pi session 命中 1 条，另外 27 条真实失败不受影响）。
+- 修复思考行折叠时把 `Thinking` 字面量拼在推理正文前、容易被误读成思维链内容的问题：折叠行只展示推理首行预览（斜体、弱化配色），标签只在展开或没有预览文本时出现，并改为随界面语言显示（英文 `Reasoning` / 中文 `思考过程`）。
+- 修复 Codex `/compact` 缺少会话内进度的问题：触发后立即展示压缩提示，空闲期间实时消费原生压缩通知，轻量会话流同步压缩状态，完成后保留时间线记录，失败或中断时清理进度。
+- 修复长会话生成标题时只读取尾部历史、遗漏最初用户需求而偏向提交和发布进度的问题：生成前补齐全部历史分页及 Codex 分支继承的原始需求，按时间顺序合并去重，并在标题上下文中明确保留首条用户输入；历史读取不完整时不再使用片段生成标题。
+- 修复排队消息同时残留“发送中”占位、切换会话后展示变化的问题：实时队列及重连快照按消息 tempId 清理已确认入队的本地占位，保留同文案的其他独立提交。
+- 修复 ZCode 长会话索引加载失败：为转换后的工具结果补齐稳定消息 ID，确保分页从工具结果开始时仍能生成游标并读取完整历史。
+- 修复终端取消订阅 Codex 会话后 Yep 续聊误启独立 app-server、触发 `already has an active writer`：保留并持久化原 bridge profile；Codex 执行流退出后立即清理无效进程，入队失败展示具体原因。
+- 修复展开已折叠工具组或翻页时出现“无法加载工具列表”：优先复用生成当前展示的轻量工具索引，避免长任务迟到完成后历史重建顺序变化导致原分组找不到；工具正文继续按需加载。
+- 修复切换 ChatGPT 账号后 Codex bridge 继续复用旧登录状态而无法续聊：检测登录身份变化，在接收新轮次前等待旧 writer 进程退出并恢复原本地 session；保留正在执行的旧连接，空闲连接后续请求自动恢复，普通 token 续期不触发切换，已提交轮次不自动重放。
+- 修复非 Codex provider（Pi、Kimi 等）点击“设为默认”时返回 `Invalid newSessionDefaults setting`：客户端会把未设置的字段序列化为 `null`，服务端 `serviceTier` 校验此前未容忍 `null`，导致整份 newSessionDefaults 被判定非法。
+- 修复 Codex 续聊携带 provider/推理强度时意外回退到全局默认模型：未指定模型时沿用最近一轮的模型，更新历史摘要及索引缓存；修复警告经轻量展示转换后只显示“Warning”，保留完整正文。
+- 修复 Codex 查看图片时多个历史工具调用显示同一张截图：实时与历史预览按调用 ID 按需读取 rollout 中当次返回的图片，不再读取被覆盖的源文件；无法确定对应图片时明确提示不可用。本地可变图片接口取消一小时缓存。
+- 修复移动端键盘弹出后外层框架可被拖动、发送按钮随之滑到键盘下方的问题：导航文档与 APK iframe 外壳锁定为可视视口，跟随键盘高度更新，清除外层文档滚动偏移；仅消息区、输入框等内部区域保留滚动，消息滚动不再传递到外框。APK 外壳部分需更新 APK。
+- 修复移动端终端页面高度约束与标题渐变遮挡状态栏，快捷键区在键盘弹出或横屏低高度时支持内部滚动；随页面尺寸变化重新适配终端。内置 JetBrains Mono Nerd Font Mono，字体加载后重新计算行列，补齐 Oh My Zsh / Powerline 提示符图标，无需在手机安装字体。
+- 修复 Android APK 键盘与底部发送按钮重叠：原生层完整避让 IME / 导航栏两者中的较大高度，不再错误扣除网页未补偿的导航栏高度；键盘收起后仍保留底部导航安全区。该修复需更新 APK。
+- 优化移动端会话输入区：缩短发送操作文案、将上下文状态移到工具行、增加停止按钮触控面积，并限制输入框高度与页面高度，为键盘弹出后的消息和操作区留出空间；缩小项目名占宽以优先展示会话标题。
+- Pi 运行中的 Bash 命令现在跟随明确重定向的日志文件（执行机器上有界读取，命令结束自动停止），预览同时保留终端输出和日志路径；补接原生 RPC 工具进度，修复等长或变短的滚动输出无法刷新。
+- 修复大尺寸生成图片的 Base64 正则校验触发服务端栈溢出、Codex 事件接收中断及排队续轮失败：事件摘要、附件落盘和飞书图片校验改为线性扫描；连接失效时排队消息明确显示未发送。新增 8 MB 图片后自动启动带附件的下一轮并返回回答、连接异常不误报发送的完整协议链路回归测试。
+- 修复 Codex 异常退出时把排队消息误当成已发送后丢弃的问题：关闭 provider 前停止接收新消息，退出后的队列消息保留待处理状态。
+- 排队消息现在展示图片预览和文件附件信息；服务端同步队列时保留附件元数据，重新连接后也可确认待发送附件。
+- 修复 Codex 子会话事件被误记为主会话输出、旧审阅结论在后续对话末尾反复出现的问题：按原始线程 ID 隔离实时事件，并依据已加载的原生历史范围清除缺失线程归属的旧展示缓存；保留尚未落盘的新一轮输出。
+
+## [2026.9.0] - 2026-09-08
+
+### Added
+- 执行中的 Bash/Shell 步骤展开后优先展示最近 12 行终端输出；完整详情首次展开加载，后续通过独立接口刷新最多 2,048 字符的内存尾部，版本未变化时不重复传输输出正文、不回读历史，不重置已打开的详情分页；收起或切到后台暂停刷新。无输出时明确提示可能正在缓冲或写日志。
 - 新建 Codex 会话的模型选择旁新增 Fast（优先）开关，按模型能力启用，可保存为默认；开启请求 `priority`，关闭显式请求 `default`，同时覆盖带附件的两阶段创建流程；会话状态和列表徽标将 `priority` 显示为 Fast（优先），与创建页保持一致。
 - Pi 会话的 thinking 现在是 display 时间线上的一等行，并承担工具合并的分割点。此前 Pi 的推理只存在于实时 WebSocket 流里：display 路径固定 `deferThinking: true`，normalization 直接丢弃 thinking 块（不留占位、也没有按需详情），所以刷新或重进会话后所有 thinking 行凭空消失。更严重的是结构塌陷——Pi 的叙事几乎全由 thinking 承担（实测一个会话 146 个 thinking / 329 个 toolCall，assistant text 只有 19 段），Codex 靠 commentary 分割工具组的机制在 Pi 上没有对应物，于是重进后整段历史被压成 18 个巨型工具组（最大一组 63 个工具）。现在 Pi 解析在 defer 模式下保留 240 字符预览（`deferred` + `thinkingLength`）而不是清空，display 协议新增 strict 的 `thinking` segment（预览 + `truncated` + `detailRef`），投影为每个推理行 flush 当前工具批次；同一会话变成 174 个推理行 / 182 个工具组（单组均值 2.3、最大 23）。预览只够折叠行的单行摘要，展开时通过新的 `display/thinking/:detailRef` 路由按需取全文；该路由用「完整推理」重读会话再重建同一份投影，因此推理行无论预览还是全文读取都必然存在并消耗 detail index，detail ref 在两种读取下逐字节一致（真实会话验证），既能解析推理全文，也不会让既有 tool-group ref 错位。行默认折叠、复用现有 ThinkingBlock，展开失败或 revision 过期会显式提示；实时流路径不变，raw 尾部与 display 的推理行按消息身份去重，避免同一段推理渲染两次。范围限定 Pi：其他 provider 的 reasoning 仍不进入轻量页，等这一版观察后再扩。
 - Pi 会话现在能在工具运行期间看到实时输出。Pi 的 RPC 事件流不含任何工具进度事件，一条跑几分钟的 `Bash` 只能显示 `IN` 命令行，要等到 `toolResult` 落地才一次性出现结果——同样的场景在 Codex 下早已有滚动的 exec 预览（`partialOutput`）。Pi 内核其实会把 `tool_execution_update`（携带累计快照 `partialResult`，bash 工具自身按 100ms 节流）发给扩展，只是 RPC 协议没有把它导出，所以 Yep 收不到。现在 `pi-yep-extension.mjs` 订阅该事件，并通过 Pi 既有的 fire-and-forget `ui.notify` 通道回传带 `__YEP_PI_TOOL_PARTIAL__` 前缀的快照（尾部 8000 字符、按 200ms 合并、内容未变则不发），provider 侧把它投影成所属 assistant 消息上同一个 `tool_use` 块的 `partialOutput`。快照复用该消息的 uuid 与全部块，因此客户端的块合并不会丢 `usage`/`stopReason`，也不会新增一行工具；客户端已有的 `LiveOutputPreview` 直接生效，无需改动。中转帧是累计快照而非增量，丢帧或乱序最多损失一帧预览（客户端只保留更长的快照），真实结果仍走正常 RPC 流；格式错误的中转、非本机制的 notify 和未知 tool id 一律忽略。
@@ -23,6 +112,10 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - Read LLM gateway credentials from a `llm-gateways.json` overlay in the data directory (path override: `YEP_LLM_GATEWAYS_FILE`), applied on top of the channels resolved from `YEP_LLM_GATEWAY_*`/`YEP_LLM_GATEWAYS`. Keys previously only came from the process environment, which for a launchd/systemd-managed server is frozen at launch: a key rotated anywhere else kept being used until someone edited the service definition and restarted Yep, and the only symptom was the provider's own rejection inside a session (`403 budget_exceeded` on a Pi turn, with nothing in the server log). The overlay is re-read while the server runs — a stat per resolve, revalidated at most once a second — so rotation is a file write. An entry whose `id` matches an environment channel overrides only the fields it sets and keeps `apiKeyEnv`, so provider processes still scrub the retired credential from the child environment; any other entry declares a new channel and needs `apiBase` plus a key. A malformed overlay is reported like any other rejected gateway entry instead of taking working channels down, the data-directory lookup is skipped for callers that pass a fabricated environment (tests, bridge sidecars), and startup now prints the active channels and their configured keys for the private instance so "which key is this server actually using" is answerable without restarting it.
 
 ### Changed
+- 本地 Markdown/文本预览默认允许读取服务端有权限访问的任意目录，不再要求文档属于当前项目或 session，也无需配置 `ALLOWED_LOCAL_FILE_PATHS`；保留现有文件类型和大小限制。
+- 优化模型回答中的 Markdown 表格：添加可键盘聚焦的独立横向滚动容器，调整表头、字号、单元格间距与隔行底色，保留 Markdown 指定的列对齐，长文本自动换行；补充历史页、翻页和实时输出的表格渲染回归覆盖。
+- 重构 session 默认展示为服务端统一投影：首开和重连接收轻量快照，持续连接按序应用增量；阶段回复提交后旧工具组只保留调用数、成功/失败数和文件/检查统计，最新步骤和跨阶段运行工具保持可见。展开工具组时才分页加载工具名、状态与单行命令摘要，点击具体工具后才加载并原位展开输入、结果和 diff；两层请求相互独立，工具组展开不会下载结果正文。工具行统一使用等宽字体、单行省略和独立边界，输出预览不再默认铺开。工具组身份不随整份 session 追加而变化，大结果继续分页，用户正在阅读的详情跨阶段保留。移除客户端历史/live 双时间线拼接与定时裁剪逻辑，保留显式 `?history=legacy` 原始转录路径。
+- 运行中的 Codex 会话将“直接插入”改为“打断并发送”：使用原生 turn interrupt，确认当前轮次结束后在同一会话发送新消息；原有“排队”消息保留到新轮次结束后执行。打断失败会明确报错并保留草稿，避免继续显示为已追加但等待采用。
 - 运行中输入区提供「排队」「直接插入」两个明确的发送按钮，分别对应本轮结束后发送和立即追加；窄屏下单独成行，停止按钮独立保留。追加消息在正式采用前显示为淡色、虚线气泡与「等待采用」状态；显式排队消息同步使用低强调样式，并注明本轮结束后发送。Codex 通过原生 userMessage 事件确认输入采用，确认后恢复普通气泡；历史刷新保留尚未采用的消息，迟到的预显示消息不会让已采用消息退回等待状态。
 - 静态前端资源现在支持内容协商压缩、构建期预压缩和条件请求，主要针对内网穿透/远程访问链路。此前 `compress()` 只挂在 `/api/*` 上，`createStaticRoutes()` 自己读文件直接返回，所以整个前端 bundle 一直以原始字节下发：实测渲染阻塞的首屏关键路径（entry + modulepreload + CSS）931 KB，到 session 视图累计 1.65 MB，其中 Tailwind CSS 单文件压缩比 6.9:1。在 frp 隧道上这不只是几秒白屏，它还会占满与实时 WebSocket 共享的那条复用 TCP 连接，把流式事件排到后面。构建期新增 `vite-plugin-precompress`，为每个可压缩产物生成最高质量的 `.br`/`.gz`（2.06 MB → gzip 0.55 MB / brotli 0.46 MB）；服务端按 `Accept-Encoding` 优选 brotli，命中预压缩文件时运行时 CPU 为零，缺失时用快速档（gzip 6 / brotli q5）即时压缩并按 `path+mtime+size+coding` 缓存（上限 48 MiB，同时省掉每请求一次 448 KB 的 `readFile`）。关键路径实测 931 KB → 196 KB（4.74x），首屏到 session 视图 1.65 MB → 362 KB（4.56x）。所有静态响应现在都带 ETag：hashed 资源的 validator 含内容编码，避免共享缓存把 brotli 响应交给只支持 gzip 的客户端；SPA shell 改用内容哈希，`public/sw.js` 早已按「navigation 用 `cache: "no-cache"` 换 304」编写，但服务端此前从不发 validator，所以每次导航都全量重传。`.webmanifest` 和 `.wasm` 补进 MIME 表，此前退化成 `application/octet-stream` 并因此被排除在压缩之外。`YEP_SKIP_PRECOMPRESS=true` 可跳过构建期压缩。
 - Session detail 响应改为条件请求（ETag + `Cache-Control: private, no-cache`）。这是最大的重复 API 载荷——实测一页 transcript 为 176 KB identity / 64 KB gzip——而客户端在每次 SWR revalidate 时都会重新拉取：重开读过的会话、从后台切回、来回切换分支都会触发。validator 由序列化后的响应体哈希得到，而不是文件 revision，因为 payload 混合了 `activity`、`hasUnread`、`lastSeenAt` 等实时字段，用 revision 会在实时状态已变化时错误地返回 304。该路由走浏览器原生 `fetch`，因此不需要任何客户端改动：浏览器自己发 `If-None-Match` 并把 304 透明地解析成缓存副本。`no-cache`（而非 `no-store`）是关键——它允许存储但强制 revalidate，正是把重新传输变成 304 的语义。
@@ -57,6 +150,18 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ### Fixed
 - 修复 `pnpm yep rebuild` 与新上游的两处兼容问题：生产 Bundle 校验不再把依赖版本范围当成精确锁定版本，Windows 监督器也不再调用已移除的 `--claude-bridge-only` 参数。
+- 修复 Codex 异步提问被显示成最终回复的问题：实时消息与历史记录保留异步投递和问题信息，显示独立提问卡片及回复提示，不再因其 `final_answer` 标记误判任务正在收尾。
+- 修复统一会话展示中同一消息的多个文本块互相覆盖、工具前后回复顺序错乱的问题；重连时同步最新排队消息，避免待执行消息消失或已清空的队列重新出现。
+- 修复统一会话投影遗漏 assistant Markdown HTML，导致绝对文件路径链接、加粗和列表显示为原始语法：首开、历史分页和实时增量现在统一生成安全 Markdown，保留文件预览所需的路径及行号，并按文本节点缓存渲染结果。
+- 修复 Codex 新会话所选思考强度与实际 CLI session 不一致的问题：完整表单和紧凑表单统一使用模型支持的原生档位，同步提交与保存的强度；在线程创建、恢复和分支时就应用所选强度，避免初始化返回 CLI 默认值并覆盖后续请求，同时保留 `max` 与 `xhigh` 的独立展示。
+- 修复 Codex 阶段性回复后最新工具流程消失的问题：独立历史读取进程会把仍在其他进程执行的轮次标成 `interrupted`，前端据此误丢弃后续实时消息。展示历史现在结合 Yep 的运行状态与原生结束时间校正最新未结束轮次，保留后续工具调用和结果，同时保持真实中断与旧轮次的去重行为。
+- 修复会话基础信息等待历史页和工具详情加载完才显示的问题：新建会话立即展示所选模型、推理强度与 Fast/Standard，基础信息返回后立即同步运行状态；提前到达的实时配置会保留，历史刷新不再清空已知配置。Codex 的基础信息与历史接口统一补齐运行中模型和服务档位，并在 rollout 未记录档位时读取已保存的 Fast 设置。
+- 修复 Codex 新建会话关闭 Fast 后，续聊、修改思考档位触发进程重建或恢复会话时丢失 `serviceTier`、重新继承 `priority` 的问题。Yep 现在持久化创建时的 Fast 选择，在续聊、恢复和编辑分支时重新传递；旧会话可沿用已知的运行中档位。
+- 修复 Codex Bridge 把自动标题等 structured-output 辅助线程显示成第二个 `Untitled session` 的问题：Bridge 现在遵循 app-server 的 `thread.ephemeral` 标记，不再发布或持久化临时线程，并在 `thread/unsubscribe` 成功后解除连接归属；升级时会丢弃缺少 ephemeral 分类的旧版 Bridge 投影缓存，真实 Codex session 数据不受影响。
+- 修复 Codex 活跃会话在中断一个以工具调用结尾的 turn、随后完成下一 turn 并重新连接后，旧 Bash 等工具被重复追加到最终回答下方的问题：轻量 display 现在保留 provider 原生 turn 状态，客户端以 completed、failed、interrupted 终态和跨 turn 顺序收口 replay，并让 `turn_complete` 参与持久化边界刷新，同时继续保留尚未落盘的 queued/steered 用户输入。
+- 修复“全部会话”的移动端列表在默认“近 7 天”筛选下丢失旧置顶会话的问题：置顶项现在绕过普通会话的时间窗口，服务端补齐的所有置顶会话都会稳定排在当前筛选结果顶部；同时修复会话缺少 model/config 元数据时 provider 徽标只剩空边框的问题，此时移动端保留 Codex 等 provider 名称，已有 Yep 创建来源徽标继续正常展示。
+- 修复 Android APK 无法下载会话生成文件的问题：文件查看器不再通过 WebView 不支持的弹窗发起下载，原生壳接管同一文档中的 HTTP(S) 下载，携带当前登录 Cookie 并保存到系统“下载”目录；Android 9 及以下按需申请旧版存储权限。
+- 统一表单控件与页面正文的字体，新建会话的 Fast 开关与模型、思考模式选择器共用字号和字重，并对齐同页选项的底色、圆角和选中状态；修复移动端模型与思考模式仍挤在两列的问题。
 - 修复 Yep 与飞书对 Codex 审批选项的语义不一致：`acceptForSession`、命令策略 amendment 和网络策略 amendment 现在共用同一判定，Yep 不再把“应用命令策略”误标为“本会话允许”并回传成可能退化为单次允许的 `approve_for_session`；飞书对 session grant 改用精确的 `approve_for_session`，策略 amendment 继续使用 `approve_always`。飞书审批卡同时补上“告诉 Codex 应该改做什么”表单，提交后通过中央 InteractionBroker 原子回传 `deny + feedback`，空反馈不会关闭审批；不具备后续消息队列的外部 bridge 请求不展示该入口。
 - 修复桌面端右侧文件详情面板的源码内容不会随面板宽度自动换行的问题；高亮源码和纯文本 fallback 现在都会在面板内软换行，拖动分隔线会触发内容重新排版，不再只是改变固定宽代码块的可视区域，独立文件页仍保留传统横向滚动。
 - 修复轻量 display 会话在运行中提问后，右侧「会话索引」的问题目录停在旧快照：新提问在 transcript 里可见，索引却仍只显示会话首个问题。问题目录只有两个来源——页面打开时拉取一次的 `display/questions` 快照，以及从当前实时消息实时推导的兜底；而 owned + live 的 display 会话在每个可读 assistant 边界都会跑一次「边界 flush」，重新拉取 display 页并把边界之前的实时消息裁掉（`setMessages(remaining)`），已落盘的提问就此从实时列表转移进投影。flush 只更新了 `displayPage`，没有同步问题索引，Inspector 又因为处于 `in-turn` 而推迟完整安全索引，于是新提问既不在实时消息里、也不在问题快照里，直到重开会话才出现。现在边界 flush 会把刷新后 display 页 turn 上的问题按 messageId 与 client/correlation 身份去重后并入问题索引（纯本地合并，不额外发请求）。

@@ -18,11 +18,20 @@ import {
   isUrlProjectId,
   thinkingOptionToConfig,
 } from "@yep-anywhere/shared";
+import type { FeishuMcpConfig } from "../channels/feishu/user-auth/mcp-gateway.js";
+import {
+  DEFAULT_CODEX_ACCOUNT_ID,
+  readCodexAccountProfiles,
+} from "../codex-bridge/codex-account-home.js";
 import type {
   RespondToInputOptions,
   SessionInputResponseBody,
   SessionInteractionService,
 } from "../interactions/SessionInteractionService.js";
+import {
+  channelIdFromEnvGatewayKeyId,
+  isKnownGatewayKeyId,
+} from "../llm-gateways/gateway-keys.js";
 import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/index.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
@@ -33,7 +42,6 @@ import {
 } from "../projects/paths.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
-import { resolveSessionModel } from "../routes/session-model.js";
 import type {
   RuntimeController,
   RuntimeProcessSnapshot,
@@ -69,6 +77,7 @@ import {
   type ProviderResolutionDeps,
   findSessionSummaryAcrossProviders,
 } from "../sessions/provider-resolution.js";
+import { resolveSessionModel } from "../sessions/session-model.js";
 import type { ISessionReader } from "../sessions/types.js";
 import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type {
@@ -160,6 +169,7 @@ export interface ResumeCodexControlCommandInput {
 }
 
 export interface QueueSessionMessageCommandInput {
+  origin?: SessionCommandOrigin;
   sessionId: string;
   body: QueueSessionMessageBody;
   /** Reject atomically if accepting this message requires a queued restart. */
@@ -188,6 +198,8 @@ export interface SessionCommandOrigin {
   originChannel?: SessionOriginChannel;
   /** Stable, non-secret channel account key used only for Codex event rollout. */
   codexEventAccountId?: string;
+  /** Trusted, channel-issued MCP configuration; never accepted from a request body. */
+  feishuMcpConfig?: FeishuMcpConfig;
 }
 
 export interface StartSessionBody {
@@ -206,6 +218,10 @@ export interface StartSessionBody {
   provider?: ProviderName;
   /** Codex MCP profile. Only used when provider resolves to Codex. */
   codexMcpMode?: CodexMcpMode;
+  /** Codex account id (isolated `CODEX_HOME`). Only used for Codex. */
+  codexAccountId?: string;
+  /** Gateway API key id. Only used for Pi. */
+  llmGatewayKeyId?: string;
   /** Codex model source (Codex `model_provider`). Only used for Codex. */
   codexModelProvider?: string;
   /** Managed gateway provider/model configuration. */
@@ -233,6 +249,8 @@ export interface CreateSessionBody {
   serviceTier?: CodexServiceTier;
   provider?: ProviderName;
   codexMcpMode?: CodexMcpMode;
+  codexAccountId?: string;
+  llmGatewayKeyId?: string;
   codexModelProvider?: string;
   llmGatewayConfig?: LlmGatewaySessionConfig;
   executor?: string;
@@ -241,6 +259,7 @@ export interface CreateSessionBody {
 
 export interface QueueSessionMessageBody extends StartSessionBody {
   deferred?: boolean;
+  interruptBeforeSend?: boolean;
 }
 
 export interface ExecuteCodexControlCommandInput {
@@ -341,6 +360,79 @@ function parseOptionalCodexMcpMode(rawMode: unknown): {
     return { codexMcpMode: rawMode as CodexMcpMode };
   }
   return { codexMcpMode: undefined, error: "codexMcpMode is invalid" };
+}
+
+/**
+ * Validate an optional Codex account id against the registered accounts.
+ *
+ * Unknown ids are rejected instead of silently falling back to the machine
+ * account: running a turn on the wrong credentials burns the wrong quota.
+ */
+function parseOptionalCodexAccountId(
+  provider: ProviderName | undefined,
+  rawAccountId: unknown,
+): { codexAccountId: string | undefined; error?: string } {
+  if (
+    rawAccountId === undefined ||
+    rawAccountId === null ||
+    rawAccountId === ""
+  ) {
+    return { codexAccountId: undefined };
+  }
+  if (typeof rawAccountId !== "string") {
+    return { codexAccountId: undefined, error: "codexAccountId is invalid" };
+  }
+  const accountId = rawAccountId.trim();
+  if (!accountId || accountId === DEFAULT_CODEX_ACCOUNT_ID) {
+    return { codexAccountId: undefined };
+  }
+  if (provider !== "codex") {
+    return {
+      codexAccountId: undefined,
+      error: "codexAccountId is only supported for Codex sessions",
+    };
+  }
+  const known = readCodexAccountProfiles().some(
+    (profile) => profile.id === accountId,
+  );
+  if (!known) {
+    return { codexAccountId: undefined, error: "codexAccountId is unknown" };
+  }
+  return { codexAccountId: accountId };
+}
+
+/**
+ * Validate an optional gateway key id against the configured gateway keys.
+ *
+ * An `env:<channelId>` id means "use the channel's environment credential",
+ * which is the default, so it normalizes to `undefined` instead of being
+ * persisted. Unknown ids are rejected rather than silently falling back: a
+ * session that quietly runs on another key burns the wrong quota.
+ */
+function parseOptionalLlmGatewayKeyId(
+  provider: ProviderName | undefined,
+  rawKeyId: unknown,
+): { llmGatewayKeyId: string | undefined; error?: string } {
+  if (rawKeyId === undefined || rawKeyId === null || rawKeyId === "") {
+    return { llmGatewayKeyId: undefined };
+  }
+  if (typeof rawKeyId !== "string") {
+    return { llmGatewayKeyId: undefined, error: "llmGatewayKeyId is invalid" };
+  }
+  const keyId = rawKeyId.trim();
+  if (!keyId || channelIdFromEnvGatewayKeyId(keyId) !== null) {
+    return { llmGatewayKeyId: undefined };
+  }
+  if (provider !== "pi") {
+    return {
+      llmGatewayKeyId: undefined,
+      error: "llmGatewayKeyId is only supported for Pi sessions",
+    };
+  }
+  if (!isKnownGatewayKeyId(keyId)) {
+    return { llmGatewayKeyId: undefined, error: "llmGatewayKeyId is unknown" };
+  }
+  return { llmGatewayKeyId: keyId };
 }
 
 function resolveCodexModelProviderForStart(
@@ -773,6 +865,7 @@ export class SessionCommandService {
       modelSettings: {
         ...prepared.modelSettings,
         codexEventAccountId: input.origin?.codexEventAccountId,
+        feishuMcpConfig: input.origin?.feishuMcpConfig,
       },
       requireImmediate: input.requireImmediate,
     });
@@ -827,6 +920,7 @@ export class SessionCommandService {
       modelSettings: {
         ...prepared.modelSettings,
         codexEventAccountId: input.origin?.codexEventAccountId,
+        feishuMcpConfig: input.origin?.feishuMcpConfig,
       },
       requireImmediate: input.requireImmediate,
     });
@@ -966,7 +1060,11 @@ export class SessionCommandService {
 
     let sessionSummary: SessionSummary | null = null;
     let providerName = metadataProvider ?? body.provider;
-    if (!providerName || !parsedReasoningEffort.reasoningEffort) {
+    if (
+      !providerName ||
+      providerName === "codex" ||
+      !parsedReasoningEffort.reasoningEffort
+    ) {
       const sessionSummaryResult = await findSessionSummaryAcrossProviders(
         project,
         sessionId,
@@ -990,7 +1088,13 @@ export class SessionCommandService {
       );
     }
 
-    const model = resolveSessionModel(body.model, providerName);
+    // Codex treats provider/effort overrides as model overrides too, disabling
+    // native history restoration. Pin the last recorded model on ordinary
+    // resume, while preserving an explicit model selection. The UI's "default"
+    // token means no named model was selected, not a switch to global defaults.
+    const model =
+      resolveSessionModel(body.model, providerName) ??
+      (providerName === "codex" ? sessionSummary?.model : undefined);
     let effectiveCodexForkExcludedTurns = parsedRollbackNumTurns.value;
     if (
       providerName === "codex" &&
@@ -1049,6 +1153,12 @@ export class SessionCommandService {
           parsedCodexMcpMode.codexMcpMode ??
           this.deps.sessionMetadataService?.getCodexMcpMode?.(sessionId) ??
           null,
+        codexAccountId:
+          this.deps.sessionMetadataService?.getCodexAccountId?.(sessionId) ??
+          null,
+        llmGatewayKeyId:
+          this.deps.sessionMetadataService?.getLlmGatewayKeyId?.(sessionId) ??
+          null,
         resumeSessionAt: supportsResumeSessionAt(providerName)
           ? (body.resumeSessionAt ?? null)
           : null,
@@ -1086,6 +1196,11 @@ export class SessionCommandService {
       (providerRestoresReasoningEffort
         ? sessionSummary?.reasoningEffort
         : undefined);
+    const resumeServiceTier = this.resolveCodexServiceTier(
+      sessionId,
+      providerName,
+      sessionSummary?.serviceTier,
+    );
     const resumeCodexModelProvider =
       providerName === "codex"
         ? (input.codexModelProviderOverride?.sourceId ??
@@ -1152,6 +1267,7 @@ export class SessionCommandService {
           providerName,
           resumeReasoningEffort,
         ),
+        serviceTier: resumeServiceTier,
         providerName,
         codexMcpMode:
           providerName === "codex"
@@ -1159,7 +1275,12 @@ export class SessionCommandService {
               this.deps.sessionMetadataService?.getCodexMcpMode?.(sessionId))
             : undefined,
         codexModelProvider: resumeCodexModelProvider,
+        // Resumes always follow the account / gateway key recorded when the
+        // thread was created; a client cannot move an existing thread onto
+        // another credential.
+        ...this.threadCredentialSettings(sessionId, providerName),
         codexEventAccountId: input.origin?.codexEventAccountId,
+        feishuMcpConfig: input.origin?.feishuMcpConfig,
         llmGatewayConfig,
         executor,
         globalInstructions:
@@ -1221,6 +1342,12 @@ export class SessionCommandService {
     }
 
     const actualSessionId = result.sessionId ?? sessionId;
+    if (resumeServiceTier !== undefined) {
+      await this.deps.sessionMetadataService?.setCodexServiceTier?.(
+        actualSessionId,
+        resumeServiceTier,
+      );
+    }
     if (providerName === "codex" && resumeCodexModelProvider) {
       await this.deps.sessionMetadataService?.setCodexModelProvider?.(
         actualSessionId,
@@ -1250,6 +1377,11 @@ export class SessionCommandService {
           llmGatewayConfig,
         );
       }
+      await this.inheritThreadCredentials(
+        sessionId,
+        actualSessionId,
+        providerName,
+      );
       if (
         providerName === "codex" &&
         effectiveCodexForkExcludedTurns !== undefined
@@ -1447,6 +1579,18 @@ export class SessionCommandService {
     input: QueueSessionMessageCommandInput,
   ): Promise<SessionCommandResult<Record<string, unknown>>> {
     const { sessionId, body } = input;
+    if (
+      body.interruptBeforeSend !== undefined &&
+      typeof body.interruptBeforeSend !== "boolean"
+    ) {
+      return commandFailure("Invalid interruptBeforeSend flag", 400);
+    }
+    if (body.deferred && body.interruptBeforeSend) {
+      return commandFailure(
+        "Deferred messages cannot interrupt the active turn",
+        400,
+      );
+    }
     const process =
       await this.deps.runtimeController.getProcessSnapshotForSession(sessionId);
     if (!process) {
@@ -1533,6 +1677,18 @@ export class SessionCommandService {
     const llmGatewayConfig =
       parsedGatewayConfig.llmGatewayConfig ??
       this.deps.sessionMetadataService?.getLlmGatewayConfig?.(sessionId);
+    const serviceTier = this.resolveCodexServiceTier(
+      sessionId,
+      providerName,
+      process.serviceTier,
+    );
+    // Save before queueMessage can restart the process for a settings change.
+    if (serviceTier !== undefined) {
+      await this.deps.sessionMetadataService?.setCodexServiceTier?.(
+        sessionId,
+        serviceTier,
+      );
+    }
     const result = await this.deps.runtimeController.queueMessage({
       sessionId,
       projectPath: process.projectPath,
@@ -1540,7 +1696,10 @@ export class SessionCommandService {
       permissionMode: effectivePermissionMode,
       requireImmediate: input.requireImmediate,
       allowSteer: input.allowSteer,
+      interruptBeforeSend: body.interruptBeforeSend,
       modelSettings: {
+        feishuMcpConfig: input.origin?.feishuMcpConfig,
+        codexEventAccountId: input.origin?.codexEventAccountId,
         model,
         thinking,
         effort,
@@ -1551,6 +1710,7 @@ export class SessionCommandService {
                 parsedReasoningEffort.reasoningEffort,
               )
             : process.requestedReasoningEffort,
+        serviceTier,
         providerName,
         codexMcpMode:
           providerName === "codex"
@@ -1563,6 +1723,10 @@ export class SessionCommandService {
                 sessionId,
               )
             : undefined,
+        // A queued message can still restart the process (thinking/effort or
+        // Feishu MCP changes). That restart goes through the same resume path,
+        // so the pinned credentials have to travel with it.
+        ...this.threadCredentialSettings(sessionId, providerName),
         llmGatewayConfig,
         executor:
           parsedBodyExecutor.executor ??
@@ -1576,12 +1740,25 @@ export class SessionCommandService {
       },
     });
     if (!result.success) {
+      if (
+        result.error === "interrupt_send_failed" ||
+        result.error === "interrupt_not_supported" ||
+        result.error === "interrupt_send_in_progress"
+      ) {
+        return commandFailure(
+          "Could not interrupt the active turn; message was not sent",
+          409,
+          {
+            code: result.error,
+          },
+        );
+      }
       if (result.error === "immediate_start_unavailable") {
         return commandFailure("Session could not restart immediately", 503, {
           code: result.error,
         });
       }
-      return commandFailure("Failed to queue message", 410, {
+      return commandFailure(result.error ?? "Failed to queue message", 410, {
         reason: result.error,
       });
     }
@@ -1610,6 +1787,7 @@ export class SessionCommandService {
       );
     if (process && process.state !== "terminated") {
       return this.queue({
+        origin: input.origin,
         sessionId: input.sessionId,
         body: input.body,
         requireImmediate: input.requireImmediate,
@@ -1938,6 +2116,8 @@ export class SessionCommandService {
         llmGatewayConfig?: LlmGatewaySessionConfig;
         codexMcpMode?: CodexMcpMode;
         codexModelProvider?: string;
+        codexAccountId?: string;
+        llmGatewayKeyId?: string;
         modelSettings: Parameters<
           RuntimeController["createSession"]
         >[0]["modelSettings"];
@@ -2012,6 +2192,26 @@ export class SessionCommandService {
         }),
       };
     }
+    const parsedCodexAccountId = parseOptionalCodexAccountId(
+      provider,
+      body.codexAccountId,
+    );
+    if (parsedCodexAccountId.error) {
+      return {
+        ok: false,
+        result: commandFailure(parsedCodexAccountId.error, 400),
+      };
+    }
+    const parsedLlmGatewayKeyId = parseOptionalLlmGatewayKeyId(
+      provider,
+      body.llmGatewayKeyId,
+    );
+    if (parsedLlmGatewayKeyId.error) {
+      return {
+        ok: false,
+        result: commandFailure(parsedLlmGatewayKeyId.error, 400),
+      };
+    }
 
     return {
       ok: true,
@@ -2020,6 +2220,8 @@ export class SessionCommandService {
       llmGatewayConfig: parsedGatewayConfig.llmGatewayConfig,
       codexMcpMode: parsedCodexMcpMode.codexMcpMode,
       codexModelProvider: parsedCodexModelProvider.value,
+      codexAccountId: parsedCodexAccountId.codexAccountId,
+      llmGatewayKeyId: parsedLlmGatewayKeyId.llmGatewayKeyId,
       modelSettings: {
         model,
         thinking,
@@ -2032,6 +2234,8 @@ export class SessionCommandService {
         providerName: provider,
         codexMcpMode: parsedCodexMcpMode.codexMcpMode,
         codexModelProvider: parsedCodexModelProvider.value,
+        codexAccountId: parsedCodexAccountId.codexAccountId,
+        llmGatewayKeyId: parsedLlmGatewayKeyId.llmGatewayKeyId,
         llmGatewayConfig: parsedGatewayConfig.llmGatewayConfig,
         executor: parsedExecutor.executor,
         globalInstructions:
@@ -2128,6 +2332,9 @@ export class SessionCommandService {
       llmGatewayConfig?: LlmGatewaySessionConfig;
       codexMcpMode?: CodexMcpMode;
       codexModelProvider?: string;
+      codexAccountId?: string;
+      llmGatewayKeyId?: string;
+      modelSettings?: { serviceTier?: CodexServiceTier };
     },
     requestedProvider: ProviderName | undefined,
     persistCodexModelProvider = false,
@@ -2149,6 +2356,27 @@ export class SessionCommandService {
     if (result.provider === "codex" && prepared.codexMcpMode) {
       await metadata.setCodexMcpMode?.(result.sessionId, prepared.codexMcpMode);
     }
+    if (result.provider === "codex" && prepared.codexAccountId) {
+      await metadata.setCodexAccountId?.(
+        result.sessionId,
+        prepared.codexAccountId,
+      );
+    }
+    if (result.provider === "pi" && prepared.llmGatewayKeyId) {
+      await metadata.setLlmGatewayKeyId?.(
+        result.sessionId,
+        prepared.llmGatewayKeyId,
+      );
+    }
+    if (
+      result.provider === "codex" &&
+      prepared.modelSettings?.serviceTier !== undefined
+    ) {
+      await metadata.setCodexServiceTier?.(
+        result.sessionId,
+        prepared.modelSettings.serviceTier,
+      );
+    }
     if (
       persistCodexModelProvider &&
       result.provider === "codex" &&
@@ -2165,6 +2393,77 @@ export class SessionCommandService {
         result.permissionMode,
       );
     }
+  }
+
+  /**
+   * Credentials a thread is pinned to for its whole life.
+   *
+   * A Codex thread stays on the account it was created with, and a Pi thread
+   * stays on the gateway key it was created with. Every path that can (re)start
+   * a provider process has to pass these along: a restart that omits them does
+   * not fail, it silently falls back to the default account / the channel's
+   * environment key and keeps running on the wrong credential.
+   */
+  private threadCredentialSettings(
+    sessionId: string,
+    provider: ProviderName | undefined,
+  ): { codexAccountId?: string; llmGatewayKeyId?: string } {
+    const metadata = this.deps.sessionMetadataService;
+    return {
+      codexAccountId:
+        provider === "codex"
+          ? metadata?.getCodexAccountId?.(sessionId)
+          : undefined,
+      llmGatewayKeyId:
+        provider === "pi"
+          ? metadata?.getLlmGatewayKeyId?.(sessionId)
+          : undefined,
+    };
+  }
+
+  /**
+   * Copy the pinned credentials onto a session id created by a fork/rewind.
+   *
+   * A native fork mints a new session id; without this the new branch has no
+   * recorded credential and its next resume falls back to the defaults.
+   */
+  private async inheritThreadCredentials(
+    sourceSessionId: string,
+    targetSessionId: string,
+    provider: ProviderName | undefined,
+  ): Promise<void> {
+    const metadata = this.deps.sessionMetadataService;
+    if (!metadata || sourceSessionId === targetSessionId) return;
+    const { codexAccountId, llmGatewayKeyId } = this.threadCredentialSettings(
+      sourceSessionId,
+      provider,
+    );
+    if (codexAccountId) {
+      await metadata.setCodexAccountId?.(targetSessionId, codexAccountId);
+    }
+    if (llmGatewayKeyId) {
+      await metadata.setLlmGatewayKeyId?.(targetSessionId, llmGatewayKeyId);
+    }
+  }
+
+  private resolveCodexServiceTier(
+    sessionId: string,
+    provider: ProviderName | undefined,
+    effectiveTier?: string,
+  ): CodexServiceTier | undefined {
+    if (provider !== "codex") return undefined;
+    const saved =
+      this.deps.sessionMetadataService?.getCodexServiceTier?.(sessionId);
+    if (saved !== undefined) return saved;
+    // Older Yep sessions may only have a live tier, or a native history tier.
+    // Unknown tiers remain inherited; never infer Fast from the model name.
+    if (effectiveTier === "default" || effectiveTier === "standard") {
+      return "default";
+    }
+    if (effectiveTier === "priority" || effectiveTier === "fast") {
+      return "priority";
+    }
+    return undefined;
   }
 
   private async recordSessionOrigin(

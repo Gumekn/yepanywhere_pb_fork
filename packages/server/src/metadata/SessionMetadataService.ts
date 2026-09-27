@@ -9,6 +9,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type {
   CodexMcpMode,
+  CodexServiceTier,
   LlmGatewaySessionConfig,
   PermissionMode,
   ProviderName,
@@ -45,8 +46,20 @@ export interface SessionMetadata {
   executor?: string;
   /** Codex MCP profile for app-server sessions. */
   codexMcpMode?: CodexMcpMode;
+  /** Explicit Fast preference, retained across native resumes and forks. */
+  codexServiceTier?: CodexServiceTier;
   /** Effective Codex model source (Codex `model_provider`) for this session. */
   codexModelProvider?: string;
+  /**
+   * Codex account (isolated `CODEX_HOME`) that owns this session's thread.
+   * Absent / "default" means the machine-wide `~/.codex` login.
+   */
+  codexAccountId?: string;
+  /**
+   * Gateway API key this session runs on. Absent means every channel uses its
+   * environment key, which is what sessions created before per-session keys do.
+   */
+  llmGatewayKeyId?: string;
   /** Managed LLM gateway settings used to resume the session. */
   llmGatewayConfig?: LlmGatewaySessionConfig;
   /** @deprecated Persisted compatibility; never written by the live runtime. */
@@ -307,6 +320,17 @@ export class SessionMetadataService {
     await this.save();
   }
 
+  async setCodexServiceTier(
+    sessionId: string,
+    codexServiceTier: CodexServiceTier | undefined,
+  ): Promise<void> {
+    this.updateSessionMetadata(sessionId, (metadata) => ({
+      ...metadata,
+      codexServiceTier,
+    }));
+    await this.save();
+  }
+
   /**
    * Persist the effective Codex model source (Codex `model_provider`) so
    * resumes/restarts start the app-server with the same provider and catalog.
@@ -318,6 +342,36 @@ export class SessionMetadataService {
     this.updateSessionMetadata(sessionId, (metadata) => ({
       ...metadata,
       codexModelProvider: codexModelProvider || undefined,
+    }));
+    await this.save();
+  }
+
+  /**
+   * Persist the Codex account (isolated `CODEX_HOME`) that owns this thread so
+   * resumes, restarts and forks keep using the same credentials.
+   */
+  async setCodexAccountId(
+    sessionId: string,
+    codexAccountId: string | undefined,
+  ): Promise<void> {
+    this.updateSessionMetadata(sessionId, (metadata) => ({
+      ...metadata,
+      codexAccountId: codexAccountId || undefined,
+    }));
+    await this.save();
+  }
+
+  /**
+   * Persist the gateway key a session runs on so resumes, restarts and forks
+   * keep burning the same credential the user picked.
+   */
+  async setLlmGatewayKeyId(
+    sessionId: string,
+    llmGatewayKeyId: string | undefined,
+  ): Promise<void> {
+    this.updateSessionMetadata(sessionId, (metadata) => ({
+      ...metadata,
+      llmGatewayKeyId: llmGatewayKeyId || undefined,
     }));
     await this.save();
   }
@@ -396,6 +450,18 @@ export class SessionMetadataService {
 
   getCodexModelProvider(sessionId: string): string | undefined {
     return this.getMetadata(sessionId)?.codexModelProvider;
+  }
+
+  getCodexAccountId(sessionId: string): string | undefined {
+    return this.getMetadata(sessionId)?.codexAccountId;
+  }
+
+  getLlmGatewayKeyId(sessionId: string): string | undefined {
+    return this.getMetadata(sessionId)?.llmGatewayKeyId;
+  }
+
+  getCodexServiceTier(sessionId: string): CodexServiceTier | undefined {
+    return this.getMetadata(sessionId)?.codexServiceTier;
   }
 
   getLlmGatewayConfig(sessionId: string): LlmGatewaySessionConfig | undefined {
@@ -586,8 +652,17 @@ export class SessionMetadataService {
     if (updated.provider) cleaned.provider = updated.provider;
     if (updated.executor) cleaned.executor = updated.executor;
     if (updated.codexMcpMode) cleaned.codexMcpMode = updated.codexMcpMode;
+    if (updated.codexServiceTier) {
+      cleaned.codexServiceTier = updated.codexServiceTier;
+    }
     if (updated.codexModelProvider) {
       cleaned.codexModelProvider = updated.codexModelProvider;
+    }
+    if (updated.codexAccountId) {
+      cleaned.codexAccountId = updated.codexAccountId;
+    }
+    if (updated.llmGatewayKeyId) {
+      cleaned.llmGatewayKeyId = updated.llmGatewayKeyId;
     }
     const llmGatewayConfig = updated.llmGatewayConfig ?? updated.opencodeConfig;
     if (llmGatewayConfig) {

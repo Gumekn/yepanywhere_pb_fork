@@ -9,6 +9,7 @@ import {
   SessionDisplayPageSchema,
   type SessionDisplayQuestion,
   type SessionDisplaySegment,
+  type SessionDisplayTurnStatus,
   type SessionDisplayUserContent,
   type SessionQuestionPage,
   SessionQuestionPageSchema,
@@ -68,6 +69,7 @@ interface ToolProjectionItem {
 
 interface TurnBuilder {
   id: string;
+  status?: SessionDisplayTurnStatus;
   question: SessionDisplayQuestion | null;
   segments: SessionDisplaySegment[];
 }
@@ -114,6 +116,8 @@ export interface BuildSessionDisplayProjectionParams {
   pendingInputRequest?: InputRequest | null;
   /** Suppress stale orphan classification while a provider turn may be active. */
   toolsMayBeActive?: boolean;
+  /** Provider-native lifecycle keyed by the provider's native turn id. */
+  turnStatuses?: Readonly<Record<string, SessionDisplayTurnStatus>>;
   /**
    * Session provider, used to enable provider-specific rows.
    *
@@ -345,8 +349,14 @@ export function buildSessionDisplayProjection(
       seenQuestionIds.add(messageId);
       for (const key of identityKeys) seenQuestionIdentityKeys.add(key);
       flushToolGroup();
+      const turnId = getTurnId(message, messageId);
+      const nativeTurnId = nonEmptyString(message.codexTurnId);
+      const turnStatus = nativeTurnId
+        ? params.turnStatuses?.[nativeTurnId]
+        : undefined;
       currentTurn = {
-        id: getTurnId(message, messageId),
+        id: turnId,
+        ...(turnStatus ? { status: turnStatus } : {}),
         question: {
           messageId,
           ...userIdentity,
@@ -373,6 +383,9 @@ export function buildSessionDisplayProjection(
           id: messageId,
           ...projectAssistantMessageIdentity(message),
           phase: projectAssistantPhase(message),
+          ...(message.codexAsyncMessage
+            ? { asyncMessage: message.codexAsyncMessage }
+            : {}),
           content,
           ...(timestamp ? { timestamp } : {}),
         });
@@ -392,6 +405,9 @@ export function buildSessionDisplayProjection(
           id: `${messageId}:${blockIndex}`,
           ...projectAssistantMessageIdentity(message),
           phase: projectAssistantPhase(message),
+          ...(message.codexAsyncMessage
+            ? { asyncMessage: message.codexAsyncMessage }
+            : {}),
           content: rawBlock.text,
           ...(timestamp ? { timestamp } : {}),
         });
@@ -768,6 +784,7 @@ function isAssistantLikeMessage(message: Message): boolean {
 function projectAssistantPhase(
   message: Message,
 ): "progress" | "final" | "text" {
+  if (message.codexAsyncMessage) return "text";
   return message.codexMessagePhase === "commentary"
     ? "progress"
     : message.codexMessagePhase === "final_answer"
@@ -977,7 +994,7 @@ function isPlanProgressTool(tool: ToolProjectionItem): boolean {
   );
 }
 
-function extractToolPaths(input: unknown): string[] {
+export function extractToolPaths(input: unknown): string[] {
   if (!isRecord(input)) return [];
   const values: unknown[] = [
     input.file_path,
@@ -1001,7 +1018,7 @@ function extractToolPaths(input: unknown): string[] {
   );
 }
 
-function isCheckTool(input: unknown): boolean {
+export function isCheckTool(input: unknown): boolean {
   if (!isRecord(input)) return false;
   const command = [input.command, input.cmd, input.script].find(
     (value): value is string =>
@@ -1043,7 +1060,8 @@ function projectSystemNotice(
       id: messageId,
       kind: "warning",
       message: boundedText(
-        typeof message.content === "string" ? message.content : "Warning",
+        getTextContent(message.message?.content ?? message.content) ||
+          "Warning",
       ),
       ...(timestamp ? { timestamp } : {}),
     };
@@ -1071,11 +1089,24 @@ function projectSystemNotice(
   }
   if (itemType === "collabAgentToolCall" || itemType === "subAgentActivity") {
     const title = firstString(item.tool, item.kind);
+    const agentThreadId = firstString(item.agentThreadId);
+    const agentPath = firstString(item.agentPath);
     return {
       type: "notice",
       id: messageId,
       kind: "subagent",
       ...(title ? { title: boundedText(title, 512) } : {}),
+      ...(itemType === "subAgentActivity"
+        ? {
+            subagent: {
+              kind: boundedText(firstString(item.kind) ?? "unknown", 64),
+              ...(agentThreadId && agentThreadId.length <= 512
+                ? { agentThreadId }
+                : {}),
+              ...(agentPath ? { agentPath: boundedText(agentPath, 512) } : {}),
+            },
+          }
+        : {}),
       status: lifecycle,
       ...(timestamp ? { timestamp } : {}),
     };

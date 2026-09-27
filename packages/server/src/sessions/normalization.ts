@@ -1,4 +1,5 @@
 import { basename, join } from "node:path";
+import { readCodexAsyncMessage } from "@yep-anywhere/shared";
 import type {
   ClaudeSessionEntry,
   CodexCompactedEntry,
@@ -71,6 +72,7 @@ import {
   normalizeCodexImageGenerationRecord,
   summarizeCodexImageGenerationResult,
 } from "../codex/image-generation.js";
+import { codexImagePreviewUrl } from "../codex/image-preview.js";
 import {
   type CodexToolCallContext,
   canonicalizeCodexToolName,
@@ -100,7 +102,11 @@ import {
   isCodexTurnAbortedNoticeText,
 } from "./codex-turn-aborted.js";
 import { parsePiProviderId } from "./pi-model-refs.js";
-import { canonicalizePiToolName, normalizePiToolInput } from "./pi-tools.js";
+import {
+  PI_ABANDONED_TOOL_RESULT_TEXT,
+  canonicalizePiToolName,
+  normalizePiToolInput,
+} from "./pi-tools.js";
 import {
   MANAGED_ATTACHMENT_MARKER,
   sanitizePublicUserPrompt,
@@ -591,6 +597,45 @@ function isPiUsageBearingAssistant(message: PiAssistantMessage): boolean {
   return piContextTokens(message.usage) > 0;
 }
 
+/**
+ * Error messages Pi persists when a turn was cancelled rather than broken.
+ *
+ * Pi's own contract (`references/pi/packages/agent/docs/harness.md`) settles a
+ * user abort as `stopReason: "aborted"`, but a request cancelled before its
+ * first stream event surfaces as the raw `AbortError` from `fetch`, which lands
+ * in the generic error branch (`output.stopReason = signal?.aborted ?
+ * "aborted" : "error"`) with an all-zero usage and empty content. Treating
+ * those as failures showed a red "failed" badge for every interrupt taken while
+ * the provider was still connecting.
+ */
+const PI_ABORT_ERROR_MESSAGES = new Set([
+  // Node/undici `DOMException` for `controller.abort()` with no reason.
+  "this operation was aborted",
+  "the operation was aborted",
+  // Thrown by Pi's own API adapters once they observe the pulled signal.
+  "request was aborted",
+  "request aborted by user",
+  "operation aborted",
+  // Older undici / node-fetch wording.
+  "the user aborted a request",
+  "aborterror",
+]);
+
+/**
+ * Whether an `error` stop reason actually describes a user-requested abort.
+ *
+ * Kept to an allowlist of known cancellation strings: a provider failure that
+ * merely mentions "aborted" should still be reported as a failure.
+ */
+function isPiAbortErrorMessage(errorMessage: string | undefined): boolean {
+  if (!errorMessage) return false;
+  const normalized = errorMessage
+    .trim()
+    .replace(/[.!]+$/, "")
+    .toLowerCase();
+  return PI_ABORT_ERROR_MESSAGES.has(normalized);
+}
+
 interface PiDerivationAccumulator {
   model?: string;
   reasoningEffort?: string;
@@ -748,12 +793,20 @@ function finishPiDerivation(
   // counted as one.
   const settledStopReason =
     stopReason === "stop" || stopReason === "length" || stopReason === "error";
+  // An `error` turn whose message is a cancellation was interrupted, not
+  // broken: Pi logs the raw `AbortError` when the abort lands before the first
+  // stream event, so the stop reason alone cannot tell the two apart.
+  const abortedAsError =
+    stopReason === "error" &&
+    isPiAbortErrorMessage(accumulator.lastAssistant?.errorMessage);
   const lastTurnStatus =
     accumulator.lastConversationRole === "user" ||
     accumulator.lastConversationRole === "toolResult"
       ? ("interrupted" as const)
       : stopReason === "error"
-        ? ("failed" as const)
+        ? abortedAsError
+          ? ("interrupted" as const)
+          : ("failed" as const)
         : !accumulator.lastAssistant
           ? undefined
           : settledStopReason
@@ -774,8 +827,11 @@ function finishPiDerivation(
         ? accumulator.compactEvents
         : undefined,
     lastTurnStatus,
+    // Abort messages must stay out of `lastErrorMessage`: the status badge
+    // treats any error text as a failure, which would keep the red badge even
+    // after `lastTurnStatus` reports the interrupt.
     lastErrorMessage:
-      stopReason === "error"
+      stopReason === "error" && !abortedAsError
         ? accumulator.lastAssistant?.errorMessage
         : undefined,
   };
@@ -899,6 +955,65 @@ function piAssistantContent(
   return blocks;
 }
 
+/**
+ * Pi stop reasons that end an assistant message without running the tools it
+ * asked for. A provider stream that dies before `message_stop` still persists
+ * the partial `toolCall` block (frequently with empty `arguments`), and Pi
+ * retries on a brand new assistant message, so the abandoned call never
+ * receives a `toolResult`.
+ */
+const PI_ABANDONED_TOOL_STOP_REASONS = new Set(["error", "aborted"]);
+
+/**
+ * Synthesize terminal results for tool calls Pi never executed.
+ *
+ * Without this the display reducer keeps such a call as a `running` step
+ * forever: it only closes steps on a `tool_result` or on an explicit turn
+ * status, so an abandoned call outlives the turn that produced it and shows up
+ * as a permanently spinning "still running" row.
+ */
+function piAbandonedToolResults(
+  entryId: string,
+  timestamp: string,
+  message: PiAssistantMessage,
+  resolvedToolCallIds: ReadonlySet<string>,
+): Message[] {
+  if (
+    typeof message.stopReason !== "string" ||
+    !PI_ABANDONED_TOOL_STOP_REASONS.has(message.stopReason) ||
+    !Array.isArray(message.content)
+  ) {
+    return [];
+  }
+  const results: Message[] = [];
+  for (const block of message.content) {
+    if (!block || typeof block !== "object" || block.type !== "toolCall") {
+      continue;
+    }
+    const id = block.id;
+    if (typeof id !== "string" || !id || resolvedToolCallIds.has(id)) continue;
+    results.push({
+      uuid: `${entryId}:abandoned-tool:${id}`,
+      parentUuid: entryId,
+      type: "user",
+      tool_use_id: id,
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: id,
+            content: PI_ABANDONED_TOOL_RESULT_TEXT,
+            is_error: true,
+          },
+        ],
+      },
+      timestamp,
+    });
+  }
+  return results;
+}
+
 function piToolResultContent(message: PiToolResultMessage): string {
   if (!Array.isArray(message.content)) return "";
   const parts: string[] = [];
@@ -923,6 +1038,16 @@ export function convertPiSession(
   const accumulator = createPiDerivationAccumulator();
   const resultDetailsByCallId = new Map<string, unknown>();
   const toolCallsById = new Map<string, PiToolCallRegistration[]>();
+  // Abandoned calls are only recognizable against the whole branch: a retry can
+  // reuse nothing, but an aborted turn may still deliver its result later in
+  // the log, and that real result must always win over a synthetic one.
+  const resolvedToolCallIds = new Set<string>();
+  for (const entry of session.activeEntries) {
+    if (!isPiSessionMessageEntry(entry)) continue;
+    const message = entry.message;
+    if (message.role === "toolResult" && typeof message.toolCallId === "string")
+      resolvedToolCallIds.add(message.toolCallId);
+  }
 
   const registerToolCall = (registration: PiToolCallRegistration): void => {
     const registrations = toolCallsById.get(registration.id) ?? [];
@@ -1004,6 +1129,14 @@ export function convertPiSession(
           ...(message.errorMessage ? { error: message.errorMessage } : {}),
           timestamp: entry.timestamp,
         });
+        messages.push(
+          ...piAbandonedToolResults(
+            entry.id,
+            entry.timestamp,
+            message,
+            resolvedToolCallIds,
+          ),
+        );
         break;
       case "toolResult": {
         resultDetailsByCallId.set(message.toolCallId, message.details);
@@ -1304,6 +1437,30 @@ export function convertCodexEntries(
     .filter((entry) => entry.type === "compacted")
     .map((entry) => timestampToMs(entry.timestamp))
     .filter((timestamp): timestamp is number => timestamp !== null);
+  // Async questions have an AgentMessage item but no ordinary response message.
+  const asyncItems = new Map<string, Record<string, unknown>>();
+  for (const entry of entries) {
+    if (entry.type !== "event_msg" || entry.payload.type !== "item_completed")
+      continue;
+    const item = entry.payload.item as Record<string, unknown>;
+    if (
+      item?.type === "AgentMessage" &&
+      typeof item.id === "string" &&
+      readCodexAsyncMessage(item)
+    ) {
+      asyncItems.set(item.id, item);
+    }
+  }
+  const responseMessageIds = new Set(
+    entries.flatMap((entry) =>
+      entry.type === "response_item" &&
+      entry.payload.type === "message" &&
+      entry.payload.id
+        ? [entry.payload.id]
+        : [],
+    ),
+  );
+  const emittedAsyncIds = new Set<string>();
   const toolCallContexts = new Map<string, CodexToolCallContext>();
   const externalToolCalls: PendingExternalCodexToolCall[] = [];
   const responseItemImageGenerationIds =
@@ -1330,6 +1487,13 @@ export function convertCodexEntries(
     );
 
     if (entry.type === "response_item") {
+      // The corresponding async AgentMessage is the user-facing representation.
+      if (
+        (entry.payload.type === "function_call" ||
+          entry.payload.type === "function_call_output") &&
+        asyncItems.has(entry.payload.call_id)
+      )
+        continue;
       messageIndex++;
       const converted = convertCodexResponseItem(
         entry,
@@ -1354,6 +1518,32 @@ export function convertCodexEntries(
         responseUserClientIds.get(entry),
       );
       for (const msg of convertedMessages) {
+        if (
+          entry.payload.type === "function_call" &&
+          canonicalizeCodexToolName(entry.payload.name).split(".").pop() ===
+            "view_image"
+        ) {
+          const blocks = msg.message?.content;
+          if (Array.isArray(blocks)) {
+            for (const block of blocks) {
+              if (block.type === "tool_use" && isRecord(block.input)) {
+                block.input = {
+                  ...block.input,
+                  snapshotUrl: codexImagePreviewUrl(
+                    sessionId,
+                    entry.payload.call_id,
+                  ),
+                };
+              }
+            }
+          }
+        }
+        if (entry.payload.type === "message" && entry.payload.id) {
+          const asyncMessage = readCodexAsyncMessage(
+            asyncItems.get(entry.payload.id),
+          );
+          if (asyncMessage) msg.codexAsyncMessage = asyncMessage;
+        }
         if (correlationKey) {
           msg.codexCorrelationKey = correlationKey;
         }
@@ -1399,6 +1589,48 @@ export function convertCodexEntries(
         messages.push(msg);
       }
     } else if (entry.type === "event_msg") {
+      if (entry.payload.type === "item_completed") {
+        const item = entry.payload.item as Record<string, unknown>;
+        const id = typeof item?.id === "string" ? item.id : undefined;
+        const asyncMessage = id
+          ? readCodexAsyncMessage(asyncItems.get(id))
+          : undefined;
+        if (
+          id &&
+          asyncMessage &&
+          !responseMessageIds.has(id) &&
+          !emittedAsyncIds.has(id)
+        ) {
+          const text = Array.isArray(item.content)
+            ? item.content
+                .map((block) =>
+                  typeof block?.text === "string" ? block.text : "",
+                )
+                .join("")
+            : "";
+          if (text.trim()) {
+            emittedAsyncIds.add(id);
+            messageIndex++;
+            const turnId = getCodexEventPayloadTurnId(entry.payload);
+            messages.push({
+              uuid: anchor,
+              type: "assistant",
+              timestamp: entry.timestamp,
+              codexTurnId: turnId,
+              codexThreadItemId: id,
+              ...(turnId
+                ? { codexCorrelationKey: `codex:${turnId}:agent-message:${id}` }
+                : {}),
+              codexMessagePhase: normalizeCodexMessagePhase(
+                item.phase as CodexMessagePhase,
+              ),
+              codexAsyncMessage: asyncMessage,
+              message: { role: "assistant", content: text },
+            });
+          }
+          continue;
+        }
+      }
       if (entry.payload.type === "token_count") {
         const contextUsage = extractCodexTokenCountContextUsage(
           entries,
@@ -3491,6 +3723,8 @@ export function convertZCodeMessages(session: ZCodeSessionContent): Message[] {
     for (const tr of toolResults) {
       messages.push({
         type: "user",
+        // Synthesized results need stable identities for pagination cursors.
+        uuid: `${stored.id}-result-${tr.toolUseId}`,
         session_id: sid,
         tool_use_id: tr.toolUseId,
         message: {

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
+import { join } from "node:path";
 import {
   type InputRequest,
   type ProviderName,
@@ -7,32 +8,79 @@ import {
   SESSION_DISPLAY_TOOL_DETAIL_PAGE_LIMIT,
   type SessionBranchState,
   type SessionDisplayPage,
+  type SessionFileActivityIndex,
   type SessionQuestionPage,
   SessionQuestionPageSchema,
   type SessionThinkingDetail,
   type SessionToolGroupDetailPage,
   isUrlProjectId,
+  normalizeSessionFilePath,
 } from "@yep-anywhere/shared";
+import { parsePatch } from "diff";
 import type { Context, Hono } from "hono";
-import { renderMarkdownToHtml } from "../augments/markdown-augments.js";
+import {
+  computeEditAugment,
+  computeStructuredPatchDiffHtml,
+} from "../augments/edit-augments.js";
+import {
+  renderMarkdownDocumentToHtml,
+  renderMarkdownToHtml,
+} from "../augments/markdown-augments.js";
 import type { CodexAppServerHistoryReader } from "../codex-history/CodexAppServerHistoryReader.js";
+import { getDataDir } from "../config.js";
+import type {
+  DisplaySelection,
+  SessionDisplayService,
+  SessionDisplaySource,
+} from "../display/SessionDisplayService.js";
 import type { ProjectScanner } from "../projects/scanner.js";
+import { getSessionFileOperationStore } from "../session-files/codex-operations.js";
+import {
+  importCodexFileHistory,
+  importStructuredFileHistory,
+} from "../session-files/history-operations.js";
+import {
+  countOperationPatch,
+  projectFileOperations,
+  selectFileOperations,
+} from "../session-files/operation-projection.js";
+import type { SessionFileOperationStore } from "../session-files/operation-store.js";
+import { importPiFileOperations } from "../session-files/pi-operations.js";
+import {
+  addSavedFileLineCounts,
+  decodeSavedText,
+  readSavedFileRecords,
+  savedFileActivities,
+  savedFileChangeComplete,
+} from "../session-files/reader.js";
+import { SessionFileStore } from "../session-files/store.js";
+import { RelativePathSchema } from "../session-files/types.js";
 import {
   buildSessionDisplayProjection,
   decodeSessionDisplayDetailRef,
   selectSessionDisplayToolMessages,
 } from "../sessions/display-projection.js";
+import { FileIndexCache } from "../sessions/file-index-cache.js";
 import {
   annotateBranchMessages,
   normalizeSession,
 } from "../sessions/normalization.js";
 import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.js";
+import { normalizeProviderGroup } from "../sessions/provider-groups.js";
 import {
   type ProviderResolutionDeps,
   type SessionSource,
   findSessionSummaryAcrossProviders,
+  resolveSessionSources,
 } from "../sessions/provider-resolution.js";
+import { buildSessionFileActivity } from "../sessions/session-file-activity.js";
+import {
+  type FileEditOp,
+  collectSessionFileEdits,
+  reconstructSessionBaseline,
+} from "../sessions/session-file-changes.js";
 import type { GetSessionOptions, LoadedSession } from "../sessions/types.js";
+import { isUserPromptMessage } from "../sessions/user-prompt-message.js";
 import { compactQuestionText } from "../sessions/user-questions.js";
 import type {
   Message,
@@ -62,12 +110,16 @@ interface SessionDisplayCursor {
 }
 
 export interface SessionDisplayRuntimeState {
+  projectId?: string;
   provider?: ProviderName;
   toolsMayBeActive: boolean;
   pendingInputRequest?: InputRequest | null;
 }
 
 export interface SessionDisplayRoutesDeps {
+  sessionFileStore?: SessionFileStore;
+  sessionFileOperationStore?: SessionFileOperationStore;
+  displayService?: SessionDisplayService;
   scanner: Pick<ProjectScanner, "getOrCreateProject">;
   providerResolution: ProviderResolutionDeps;
   codexAppServerHistoryReader?: Pick<
@@ -95,7 +147,7 @@ interface ResolvedDisplaySession {
 
 class SessionDisplayRouteError extends Error {
   constructor(
-    readonly status: 400 | 404 | 409 | 413 | 503,
+    readonly status: 400 | 404 | 409 | 413 | 415 | 503,
     readonly code: string,
     message: string,
   ) {
@@ -107,6 +159,90 @@ export function registerSessionDisplayRoutes(
   routes: Hono,
   deps: SessionDisplayRoutesDeps,
 ): void {
+  // Cache ownership follows this app's readers/store, not the whole process.
+  const fileIndexCaches: FileIndexCaches = {
+    saved: new FileIndexCache(16),
+    activity: new FileIndexCache(32),
+    operations: new FileIndexCache(16),
+    fileSessions: new FileIndexCache(16),
+  };
+
+  if (deps.displayService) {
+    const service = deps.displayService;
+    service.configureSource(createSessionDisplaySource(deps));
+    const selection = (c: Context): DisplaySelection => ({
+      projectId: c.req.param("projectId") ?? "",
+      sessionId: c.req.param("sessionId") ?? "",
+      ...(c.req.query("branchId") ? { branchId: c.req.query("branchId") } : {}),
+    });
+    routes.get(
+      "/projects/:projectId/sessions/:sessionId/display/view",
+      async (c) => {
+        try {
+          const cursor = c.req.query("cursor");
+          return c.json(
+            cursor
+              ? await service.older(selection(c), cursor)
+              : await service.snapshot(
+                  selection(c),
+                  c.req.query("reset") === "true",
+                ),
+          );
+        } catch (error) {
+          return displayErrorResponse(c, error);
+        }
+      },
+    );
+    routes.get(
+      "/projects/:projectId/sessions/:sessionId/display/groups/:groupId",
+      async (c) => {
+        try {
+          return c.json(
+            await service.group(
+              selection(c),
+              c.req.param("groupId"),
+              c.req.query("cursor"),
+            ),
+          );
+        } catch (error) {
+          return displayErrorResponse(c, error);
+        }
+      },
+    );
+    routes.get(
+      "/projects/:projectId/sessions/:sessionId/display/tools/:toolId/output",
+      async (c) => {
+        try {
+          c.header("Cache-Control", "no-store");
+          return c.json(
+            await service.output(
+              selection(c),
+              c.req.param("toolId"),
+              c.req.query("since"),
+            ),
+          );
+        } catch (error) {
+          return displayErrorResponse(c, error);
+        }
+      },
+    );
+    routes.get(
+      "/projects/:projectId/sessions/:sessionId/display/tools/:toolId",
+      async (c) => {
+        try {
+          return c.json(
+            await service.detail(
+              selection(c),
+              c.req.param("toolId"),
+              c.req.query("cursor"),
+            ),
+          );
+        } catch (error) {
+          return displayErrorResponse(c, error);
+        }
+      },
+    );
+  }
   routes.get("/projects/:projectId/sessions/:sessionId/display", async (c) => {
     try {
       const resolved = await resolveDisplaySession(
@@ -157,6 +293,334 @@ export function registerSessionDisplayRoutes(
         assertCursorBranch(cursor, branchId);
         const page = await readQuestionPage(deps, resolved, cursor, branchId);
         return c.json(page);
+      } catch (error) {
+        return displayErrorResponse(c, error);
+      }
+    },
+  );
+
+  // Session-scoped file index. Derived server-side from the *whole* session so
+  // it does not depend on how much of the transcript the client has paged in.
+  routes.get("/projects/:projectId/sessions/:sessionId/files", async (c) => {
+    try {
+      const resolved = await resolveDisplaySession(
+        deps,
+        c.req.param("projectId"),
+        c.req.param("sessionId"),
+        false,
+      );
+      const branchId = c.req.query("branchId") || undefined;
+      if (
+        resolved.source.provider === "codex" ||
+        resolved.source.provider === "pi"
+      ) {
+        const operations = await operationSelection(
+          deps,
+          fileIndexCaches,
+          resolved,
+          branchId,
+        );
+        if (
+          operations.snapshot.operations.length > 0 &&
+          c.req.query("source") !== "snapshot"
+        ) {
+          return c.json(operations.index);
+        }
+        const { selected, session, files, fileCount } =
+          await savedRecordsForSession(
+            deps,
+            fileIndexCaches,
+            resolved,
+            branchId,
+          );
+        if (files.length === 0 && c.req.query("source") !== "snapshot")
+          return c.json(operations.index);
+        return c.json({
+          projectId: resolved.project.id,
+          sessionId: resolved.sessionId,
+          files,
+          source: "snapshot",
+          coverageIncomplete: selected.incomplete || session.hasOlderMessages,
+          coverageReasons: selected.coverageReasons,
+          truncated:
+            selected.truncated || session.hasOlderMessages || fileCount > 500,
+          generatedAt: new Date().toISOString(),
+        });
+      }
+      // Other providers remain on their existing path until their full adapter
+      // acceptance is complete. An explicit source enables compatibility verification.
+      if (c.req.query("source") === "operation") {
+        const operationIndex = await operationSelection(
+          deps,
+          fileIndexCaches,
+          resolved,
+          branchId,
+        );
+        return c.json(operationIndex.index);
+      }
+      const index = await readSessionFileIndex(
+        resolved,
+        branchId,
+        fileIndexCaches.activity,
+      );
+      return c.json(index);
+    } catch (error) {
+      return displayErrorResponse(c, error);
+    }
+  });
+
+  routes.get(
+    "/projects/:projectId/sessions/:sessionId/files/content",
+    async (c) => {
+      try {
+        const resolved = await resolveDisplaySession(
+          deps,
+          c.req.param("projectId"),
+          c.req.param("sessionId"),
+          false,
+        );
+        const path = c.req.query("path") ?? "";
+        const recordId = c.req.query("recordId");
+        if (recordId?.startsWith("op:")) {
+          const { store, change } = await selectOperationChange(
+            deps,
+            fileIndexCaches,
+            resolved,
+            c.req.query("branchId"),
+            path,
+            recordId,
+          );
+          const ref = change.after ?? change.before;
+          if (!ref)
+            throw new SessionDisplayRouteError(
+              404,
+              "SESSION_FILE_CONTENT_NOT_RECORDED",
+              "Full file content was not recorded; view the operation diff instead",
+            );
+          const bytes = await store.readContent(ref);
+          const content = decodeSavedText(bytes, true);
+          return c.json({
+            path,
+            recordId,
+            content,
+            renderedMarkdownHtml:
+              content !== undefined && /\.(md|markdown)$/i.test(path)
+                ? await renderMarkdownDocumentToHtml(content)
+                : undefined,
+            binary: content === undefined,
+            bytes: bytes.length,
+            deleted: change.kind === "deleted",
+            complete: true,
+          });
+        }
+        const { store, selected, change } = await selectSavedChange(
+          deps,
+          fileIndexCaches,
+          resolved,
+          c.req.query("branchId"),
+          path,
+          c.req.query("recordId"),
+        );
+        const version = change.after ?? change.before;
+        if (!version)
+          throw new SessionDisplayRouteError(
+            404,
+            "SESSION_FILE_VERSION_MISSING",
+            "Saved version is unavailable",
+          );
+        const bytes = await store.readBlob(version.blob);
+        const content = decodeSavedText(bytes);
+        const renderedMarkdownHtml =
+          content !== undefined && /\.(md|markdown)$/i.test(path)
+            ? await renderMarkdownDocumentToHtml(content)
+            : undefined;
+        return c.json({
+          path,
+          recordId: selected.id,
+          content,
+          renderedMarkdownHtml,
+          binary: content === undefined,
+          bytes: bytes.length,
+          deleted: !change.after,
+          complete: savedFileChangeComplete(selected.record),
+        });
+      } catch (error) {
+        return displayErrorResponse(c, error);
+      }
+    },
+  );
+
+  // Diff of one indexed file against the state it had when the session began,
+  // reconstructed from the session's own edit calls.
+  routes.post(
+    "/projects/:projectId/sessions/:sessionId/files/diff",
+    async (c) => {
+      try {
+        const resolved = await resolveDisplaySession(
+          deps,
+          c.req.param("projectId"),
+          c.req.param("sessionId"),
+          false,
+        );
+        let body: {
+          path?: unknown;
+          fullContext?: unknown;
+          branchId?: unknown;
+          recordId?: unknown;
+        };
+        try {
+          body = await c.req.json();
+        } catch {
+          throw new SessionDisplayRouteError(
+            400,
+            "SESSION_FILE_DIFF_INVALID_BODY",
+            "Invalid JSON body",
+          );
+        }
+        const path = typeof body.path === "string" ? body.path.trim() : "";
+        if (!path || path.startsWith("/") || path.split("/").includes("..")) {
+          throw new SessionDisplayRouteError(
+            400,
+            "SESSION_FILE_DIFF_INVALID_PATH",
+            "path must be a project-relative file path",
+          );
+        }
+        const branchId =
+          typeof body.branchId === "string" ? body.branchId : undefined;
+        if (
+          typeof body.recordId === "string" &&
+          body.recordId.startsWith("op:")
+        ) {
+          const { store, change } = await selectOperationChange(
+            deps,
+            fileIndexCaches,
+            resolved,
+            branchId,
+            path,
+            body.recordId,
+          );
+          if (change.kind === "mode-change")
+            return c.json({
+              path,
+              exact: true,
+              structuredPatch: [],
+              diffHtml: "",
+            });
+          if (change.before?.binary || change.after?.binary)
+            throw new SessionDisplayRouteError(
+              415,
+              "SESSION_FILE_BINARY",
+              "Binary file diff is unavailable",
+            );
+          if (
+            change.patch &&
+            countOperationPatch(change).availability === "complete"
+          ) {
+            const structuredPatch = parsePatch(change.patch.text).flatMap(
+              (patch) => patch.hunks,
+            );
+            return c.json({
+              path,
+              exact: true,
+              structuredPatch,
+              diffHtml: await computeStructuredPatchDiffHtml(
+                path,
+                structuredPatch,
+              ),
+            });
+          }
+          if (change.before === undefined || change.after === undefined)
+            throw new SessionDisplayRouteError(
+              404,
+              "SESSION_FILE_DIFF_UNAVAILABLE",
+              "File operation diff was not recorded",
+            );
+          const [before, after] = await Promise.all(
+            [change.before, change.after].map(async (ref) =>
+              ref === null
+                ? ""
+                : decodeSavedText(await store.readContent(ref), true),
+            ),
+          );
+          if (before === undefined || after === undefined)
+            throw new SessionDisplayRouteError(
+              415,
+              "SESSION_FILE_BINARY",
+              "Binary file diff is unavailable",
+            );
+          const augment = await computeEditAugment(
+            "session-operation-diff",
+            { file_path: path, old_string: before, new_string: after },
+            body.fullContext === true ? 999_999 : 3,
+          );
+          return c.json({
+            path,
+            exact: true,
+            diffHtml: augment.diffHtml,
+            structuredPatch: augment.structuredPatch,
+          });
+        }
+        if (
+          resolved.source.provider === "codex" ||
+          resolved.source.provider === "pi"
+        ) {
+          const { store, selected, change } = await selectSavedChange(
+            deps,
+            fileIndexCaches,
+            resolved,
+            branchId,
+            path,
+            typeof body.recordId === "string" ? body.recordId : undefined,
+          );
+          const before = change.before
+            ? decodeSavedText(await store.readBlob(change.before.blob))
+            : "";
+          const after = change.after
+            ? decodeSavedText(await store.readBlob(change.after.blob))
+            : "";
+          if (before === undefined || after === undefined)
+            throw new SessionDisplayRouteError(
+              415,
+              "SESSION_FILE_BINARY",
+              "Binary file diff is unavailable",
+            );
+          const augment = await computeEditAugment(
+            "session-snapshot-diff",
+            { file_path: path, old_string: before, new_string: after },
+            body.fullContext === true ? 999_999 : 3,
+          );
+          return c.json({
+            path,
+            exact: savedFileChangeComplete(selected.record),
+            diffHtml: augment.diffHtml,
+            structuredPatch: augment.structuredPatch,
+          });
+        }
+        const ops = await readSessionFileEdits(resolved, branchId, path);
+        if (!ops || ops.length === 0) {
+          throw new SessionDisplayRouteError(
+            404,
+            "SESSION_FILE_DIFF_NO_EDITS",
+            "This session recorded no edits for that file",
+          );
+        }
+        const current = await readWorktreeFile(resolved.project.path, path);
+        const baseline = reconstructSessionBaseline(current, ops);
+        const augment = await computeEditAugment(
+          "session-file-diff",
+          {
+            file_path: path,
+            old_string: baseline.content,
+            new_string: current,
+          },
+          body.fullContext === true ? 999_999 : 3,
+        );
+        return c.json({
+          path,
+          exact: baseline.exact,
+          diffHtml: augment.diffHtml,
+          structuredPatch: augment.structuredPatch,
+        });
       } catch (error) {
         return displayErrorResponse(c, error);
       }
@@ -226,6 +690,26 @@ export function registerSessionDisplayRoutes(
           );
         }
         const branchId = c.req.query("branchId") || undefined;
+        if (
+          deps.displayService &&
+          c.req.param("detailRef").startsWith("thinking:")
+        ) {
+          const detailRef = c.req.param("detailRef");
+          const content = await deps.displayService.reasoning(
+            {
+              projectId: resolved.project.id,
+              sessionId: resolved.sessionId,
+              branchId,
+            },
+            detailRef,
+          );
+          return c.json({
+            sessionId: resolved.sessionId,
+            revision,
+            detailRef,
+            content,
+          });
+        }
         const detail = await readThinkingDetail(
           deps,
           resolved,
@@ -241,11 +725,315 @@ export function registerSessionDisplayRoutes(
   );
 }
 
+/** Provider reads stay server-side; the view service owns identity and replay. */
+export function createSessionDisplaySource(
+  deps: SessionDisplayRoutesDeps,
+): SessionDisplaySource {
+  const resolvedCache = new Map<string, ResolvedDisplaySession>();
+  const resolve = async (selection: DisplaySelection) => {
+    const key = JSON.stringify([selection.projectId, selection.sessionId]);
+    let resolved = resolvedCache.get(key);
+    if (!resolved) {
+      resolved = await resolveDisplaySession(
+        deps,
+        selection.projectId,
+        selection.sessionId,
+        true,
+        true,
+      );
+      if (resolvedCache.size >= 32) {
+        const first = resolvedCache.keys().next().value;
+        if (first) resolvedCache.delete(first);
+      }
+      resolvedCache.set(key, resolved);
+    }
+    return {
+      ...resolved,
+      runtime:
+        (await deps.getRuntimeState?.(resolved.sessionId)) ?? resolved.runtime,
+    };
+  };
+  const stamp = async (selection: DisplaySelection) => {
+    const resolved = await resolve(selection);
+    let stats = await resolved.source.reader.getSessionFileStats?.(
+      resolved.sessionId,
+    );
+    if (!stats) {
+      const file = await resolved.source.reader.getSessionFilePath?.(
+        resolved.sessionId,
+      );
+      if (file) {
+        try {
+          const fileStat = await stat(file);
+          stats = { mtime: fileStat.mtimeMs, size: fileStat.size };
+        } catch {}
+      }
+    }
+    const summary = stats
+      ? resolved.summary
+      : ((await resolved.source.reader.getSessionSummary(
+          resolved.sessionId,
+          resolved.project.id,
+        )) ?? resolved.summary);
+    return JSON.stringify([
+      stats?.mtime ?? summary.updatedAt,
+      stats?.size,
+      resolved.runtime.toolsMayBeActive,
+      resolved.runtime.pendingInputRequest?.id,
+    ]);
+  };
+  const activity = (
+    resolved: ResolvedDisplaySession,
+    lastTurnStatus?: string,
+  ) =>
+    resolved.runtime.pendingInputRequest
+      ? ("waiting-input" as const)
+      : resolved.runtime.toolsMayBeActive
+        ? ("running" as const)
+        : lastTurnStatus === "completed" ||
+            lastTurnStatus === "failed" ||
+            lastTurnStatus === "interrupted"
+          ? lastTurnStatus
+          : ("unknown" as const);
+  const encode = (source: "native" | "reader", cursor: string) =>
+    Buffer.from(JSON.stringify({ source, cursor })).toString("base64url");
+  const decode = (
+    value?: string,
+  ): { source: "native" | "reader"; cursor: string } | undefined => {
+    if (!value) return undefined;
+    try {
+      const obj = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+      if (
+        (obj.source === "native" || obj.source === "reader") &&
+        typeof obj.cursor === "string"
+      )
+        return obj;
+    } catch {}
+    throw staleDisplayError();
+  };
+  return {
+    stamp,
+    read: async (selection, opaqueCursor) => {
+      const resolved = await resolve(selection);
+      const sourceStamp = await stamp(selection);
+      const cursor = decode(opaqueCursor);
+      const codex =
+        resolved.source.provider === "codex" ||
+        resolved.source.provider === "codex-oss";
+      if (
+        codex &&
+        deps.codexAppServerHistoryReader &&
+        (!cursor || cursor.source === "native")
+      ) {
+        const native =
+          await deps.codexAppServerHistoryReader.getSemanticTurnsPage(
+            resolved.sessionId,
+            resolved.project.id,
+            resolved.project.path,
+            {
+              limit: SESSION_DISPLAY_INITIAL_TURN_LIMIT,
+              itemsView: "full",
+              cursor: cursor?.cursor,
+              toolsMayBeActive: !cursor && resolved.runtime.toolsMayBeActive,
+            },
+          );
+        if (native.kind === "loaded") {
+          const turnStatuses = { ...native.turnStatuses };
+          const turnStarts = native.messages.flatMap((message) => {
+            if (message.type !== "user" || !message.timestamp) return [];
+            const timestamp = Date.parse(message.timestamp);
+            return Number.isFinite(timestamp) ? [timestamp] : [];
+          });
+          if (native.inferredLatestTurnId)
+            delete turnStatuses[native.inferredLatestTurnId];
+          const branch = await deps.getBranchState?.(
+            resolved.project,
+            resolved.sessionId,
+            native.summary,
+            selection.branchId,
+          );
+          return {
+            provider: native.provider,
+            messages: branch
+              ? annotateBranchMessages(native.messages, branch, {
+                  includeCodexAlias: true,
+                })
+              : native.messages,
+            turnStatuses,
+            ...(!cursor && native.turnStatuses && turnStarts.length > 0
+              ? {
+                  codexTurnWindow: {
+                    turnIds: Object.keys(native.turnStatuses),
+                    from: Math.min(...turnStarts),
+                    before: Math.max(...turnStarts),
+                  },
+                }
+              : {}),
+            activity: activity(
+              resolved,
+              native.inferredLatestTurnId
+                ? undefined
+                : native.summary.lastTurnStatus,
+            ),
+            stamp: sourceStamp,
+            ...(native.nextCursor
+              ? { cursor: encode("native", native.nextCursor) }
+              : {}),
+          };
+        }
+      }
+      const loaded = await resolved.source.reader.getSession(
+        resolved.sessionId,
+        resolved.project.id,
+        undefined,
+        {
+          branchId: selection.branchId,
+          maxMessages: 5_000,
+          beforeMessageId:
+            cursor?.source === "reader" ? cursor.cursor : undefined,
+          includeOrphans: false,
+          deferMedia: true,
+          deferThinking: true,
+        },
+      );
+      if (!loaded && resolved.runtime.toolsMayBeActive && !cursor)
+        return {
+          provider: resolved.source.provider,
+          messages: [],
+          activity: activity(resolved),
+          stamp: sourceStamp,
+        };
+      if (!loaded) throw sessionNotFoundError();
+      const session = normalizeSession(loaded, {
+        deferMedia: true,
+        deferThinking: true,
+      });
+      // Some provider readers return their entire native tree. Apply semantic
+      // paging here too, with an append-stable question anchor rather than a
+      // whole-file revision or an arbitrary tool-message cutoff.
+      let end = session.messages.length;
+      if (cursor?.source === "reader" && !loaded.paginationApplied) {
+        const found = session.messages.findIndex(
+          (message) => (message.uuid ?? message.id) === cursor.cursor,
+        );
+        if (found < 0) throw staleDisplayError();
+        end = found;
+      }
+      const prompts = session.messages
+        .slice(0, end)
+        .flatMap((message, index) =>
+          isUserPromptMessage(message) ? [index] : [],
+        );
+      const start =
+        prompts.length > SESSION_DISPLAY_INITIAL_TURN_LIMIT
+          ? (prompts[prompts.length - SESSION_DISPLAY_INITIAL_TURN_LIMIT] ?? 0)
+          : 0;
+      const selectedMessages = session.messages.slice(start, end);
+      const firstQuestion = selectedMessages.find(isUserPromptMessage);
+      const next =
+        start > 0
+          ? (firstQuestion?.uuid ?? firstQuestion?.id)
+          : loaded.pagination?.hasOlderMessages
+            ? loaded.pagination.truncatedBeforeMessageId
+            : undefined;
+      const statuses = loaded.summary.lastTurnStatus;
+      return {
+        provider: resolved.source.provider,
+        messages: selectedMessages,
+        ...(!resolved.runtime.toolsMayBeActive &&
+        (statuses === "completed" ||
+          statuses === "failed" ||
+          statuses === "interrupted")
+          ? { turnStatuses: { session: statuses } }
+          : {}),
+        activity: activity(resolved, statuses),
+        stamp: sourceStamp,
+        ...(typeof next === "string" && next
+          ? { cursor: encode("reader", next) }
+          : {}),
+      };
+    },
+    reasoning: async (selection, id) => {
+      const resolved = await resolve(selection);
+      const separator = id.lastIndexOf(":");
+      const messageId = id.slice("thinking:".length, separator);
+      const blockIndex = Number(id.slice(separator + 1));
+      if (
+        !id.startsWith("thinking:") ||
+        !Number.isSafeInteger(blockIndex) ||
+        blockIndex < 0
+      )
+        throw staleDisplayError();
+      const loaded = await resolved.source.reader.getSession(
+        resolved.sessionId,
+        resolved.project.id,
+        undefined,
+        {
+          branchId: selection.branchId,
+          deferMedia: true,
+          deferThinking: false,
+          maxMessages: DETAIL_AROUND_MESSAGE_LIMIT,
+        },
+      );
+      if (!loaded) throw sessionNotFoundError();
+      const message = normalizeSession(loaded, {
+        deferMedia: true,
+        deferThinking: false,
+      }).messages.find((m) => (m.uuid ?? m.id) === messageId);
+      const content = message?.message?.content ?? message?.content;
+      const block = Array.isArray(content) ? content[blockIndex] : undefined;
+      if (block?.type !== "thinking" || typeof block.thinking !== "string")
+        throw staleDisplayError();
+      return block.thinking;
+    },
+    detail: async (selection, runId, rawId) => {
+      const resolved = await resolve(selection);
+      let messages: Message[] | undefined;
+      if (
+        (resolved.source.provider === "codex" ||
+          resolved.source.provider === "codex-oss") &&
+        deps.codexAppServerHistoryReader &&
+        runId !== "session"
+      ) {
+        const native = await deps.codexAppServerHistoryReader.getSemanticTurn(
+          resolved.sessionId,
+          resolved.project.path,
+          runId,
+        );
+        if (native.kind === "loaded") messages = native.messages;
+      }
+      if (!messages) {
+        const loaded = await resolved.source.reader.getSession(
+          resolved.sessionId,
+          resolved.project.id,
+          undefined,
+          {
+            branchId: selection.branchId,
+            deferMedia: true,
+            deferThinking: true,
+            includeOrphans: false,
+            maxMessages: DETAIL_AROUND_MESSAGE_LIMIT,
+          },
+        );
+        if (!loaded) throw sessionNotFoundError();
+        messages = normalizeSession(loaded, {
+          deferMedia: true,
+          deferThinking: true,
+        }).messages;
+      }
+      return rawId
+        ? selectSessionDisplayToolMessages(messages, [rawId])
+        : messages;
+    },
+  };
+}
+
 async function resolveDisplaySession(
   deps: SessionDisplayRoutesDeps,
   projectId: string,
   requestedSessionId: string,
   includeRuntime = true,
+  allowUnpersisted = false,
 ): Promise<ResolvedDisplaySession> {
   if (!isUrlProjectId(projectId)) {
     throw new SessionDisplayRouteError(
@@ -271,13 +1059,49 @@ async function resolveDisplaySession(
     : { toolsMayBeActive: false };
   const preferredProvider =
     runtime.provider ?? deps.getPersistedProvider?.(sessionId);
-  const resolved = await findSessionSummaryAcrossProviders(
+  let resolved = await findSessionSummaryAcrossProviders(
     project,
     sessionId,
     project.id,
     deps.providerResolution,
     preferredProvider,
   );
+  if (
+    !resolved &&
+    allowUnpersisted &&
+    runtime.toolsMayBeActive &&
+    runtime.projectId === project.id &&
+    runtime.provider
+  ) {
+    // A project may still be classified by an older provider until the new
+    // session is persisted. Include the running provider explicitly, just as
+    // the summary lookup does, and match variants sharing the same storage.
+    const source = resolveSessionSources(
+      project,
+      deps.providerResolution,
+      undefined,
+      runtime.provider,
+    ).find(
+      (s) =>
+        normalizeProviderGroup(s.provider) ===
+        normalizeProviderGroup(runtime.provider),
+    );
+    if (source)
+      resolved = {
+        source,
+        summary: {
+          id: sessionId,
+          projectId: project.id,
+          title: null,
+          fullTitle: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          messageCount: 0,
+          ownership: { owner: "none" },
+          provider: runtime.provider,
+        },
+      };
+  }
   if (!resolved) {
     throw new SessionDisplayRouteError(
       404,
@@ -315,6 +1139,7 @@ async function readDisplayPage(
         limit,
         itemsView: "full",
         expectedRevision: cursor?.revision,
+        toolsMayBeActive: !cursor && resolved.runtime.toolsMayBeActive,
       },
     );
     if (native.kind === "loaded") {
@@ -333,6 +1158,7 @@ async function readDisplayPage(
             })
           : native.messages,
         questionCoverage: native.nextCursor ? "partial" : "complete",
+        ...(native.turnStatuses ? { turnStatuses: native.turnStatuses } : {}),
         ...(!cursor && resolved.runtime.pendingInputRequest
           ? { pendingInputRequest: resolved.runtime.pendingInputRequest }
           : {}),
@@ -622,6 +1448,257 @@ function selectDisplayTurns(
     firstTurnId: turns.find((turn) => turn.question)?.id,
   };
 }
+
+interface SavedFileSelection {
+  selected: Awaited<ReturnType<typeof readSavedFileRecords>>;
+  hasOlderMessages: boolean;
+  files: SessionFileActivityIndex["files"];
+  fileCount: number;
+}
+
+interface FileIndexCaches {
+  saved: FileIndexCache<SavedFileSelection>;
+  activity: FileIndexCache<SessionFileActivityIndex>;
+  operations: FileIndexCache<
+    Awaited<ReturnType<typeof buildOperationSelection>>
+  >;
+  fileSessions: FileIndexCache<
+    Awaited<ReturnType<typeof loadSessionForFileIndex>>
+  >;
+}
+
+async function savedRecordsForSession(
+  deps: SessionDisplayRoutesDeps,
+  caches: FileIndexCaches,
+  resolved: ResolvedDisplaySession,
+  branchId?: string,
+) {
+  const provider = resolved.source.provider;
+  if (provider !== "codex" && provider !== "pi")
+    throw new SessionDisplayRouteError(
+      404,
+      "SESSION_FILE_SNAPSHOTS_UNAVAILABLE",
+      "Saved files are unavailable for this provider",
+    );
+  const store =
+    deps.sessionFileStore ??
+    new SessionFileStore(join(getDataDir(), "session-file-snapshots"));
+  const ids = await store.listRecords({
+    provider,
+    sessionId: resolved.sessionId,
+  });
+  const stamp = `${await sessionFileIndexStamp(resolved)}:${createHash("sha256").update(ids.join(",")).digest("hex")}`;
+  const key = JSON.stringify([
+    store.directory,
+    resolved.project.path,
+    provider,
+    resolved.sessionId,
+    branchId,
+  ]);
+  const cached = await caches.saved.get(key, stamp, async () => {
+    const session = await cachedFileSession(deps, caches, resolved, branchId);
+    const selected = await readSavedFileRecords(
+      store,
+      provider,
+      resolved.sessionId,
+      resolved.project.path,
+      session.messages,
+      ids,
+    );
+    const all = savedFileActivities(selected.records);
+    const files = all.slice(0, 500);
+    await addSavedFileLineCounts(store, selected.records, files);
+    return {
+      selected,
+      hasOlderMessages: session.hasOlderMessages,
+      files,
+      fileCount: all.length,
+    };
+  });
+  return {
+    store,
+    selected: cached.selected,
+    session: { hasOlderMessages: cached.hasOlderMessages },
+    files: cached.files,
+    fileCount: cached.fileCount,
+  };
+}
+
+async function selectSavedChange(
+  deps: SessionDisplayRoutesDeps,
+  caches: FileIndexCaches,
+  resolved: ResolvedDisplaySession,
+  branchId: string | undefined,
+  path: string,
+  recordId?: string,
+) {
+  if (!RelativePathSchema.safeParse(path).success)
+    throw new SessionDisplayRouteError(
+      400,
+      "SESSION_FILE_INVALID_PATH",
+      "Expected a workspace-relative path",
+    );
+  const { store, selected } = await savedRecordsForSession(
+    deps,
+    caches,
+    resolved,
+    branchId,
+  );
+  const match = selected.records.find(
+    (entry) =>
+      (!recordId || entry.id === recordId) &&
+      entry.record.changes.some((change) => change.path === path),
+  );
+  const change = match?.record.changes.find((entry) => entry.path === path);
+  if (!match || !change)
+    throw new SessionDisplayRouteError(
+      404,
+      "SESSION_FILE_VERSION_MISSING",
+      "No saved version in the selected session branch",
+    );
+  return { store, selected: match, change };
+}
+
+const SESSION_FILE_INDEX_MAX_MESSAGES = 20_000;
+
+/** Cheap change token so repeated inspector opens do not re-scan the session. */
+async function sessionFileIndexStamp(
+  resolved: ResolvedDisplaySession,
+): Promise<string> {
+  let stats = await resolved.source.reader.getSessionFileStats?.(
+    resolved.sessionId,
+  );
+  if (!stats) {
+    const file = await resolved.source.reader.getSessionFilePath?.(
+      resolved.sessionId,
+    );
+    if (file) {
+      try {
+        const fileStat = await stat(file);
+        stats = { mtime: fileStat.mtimeMs, size: fileStat.size };
+      } catch {}
+    }
+  }
+  return JSON.stringify([
+    stats?.mtime ?? resolved.summary.updatedAt,
+    stats?.size ?? resolved.summary.messageCount,
+  ]);
+}
+
+async function readSessionFileIndex(
+  resolved: ResolvedDisplaySession,
+  branchId: string | undefined,
+  cache: FileIndexCache<SessionFileActivityIndex>,
+): Promise<SessionFileActivityIndex> {
+  const cacheKey = JSON.stringify([
+    resolved.source.provider,
+    resolved.project.id,
+    resolved.sessionId,
+    branchId,
+  ]);
+  const stamp = await sessionFileIndexStamp(resolved);
+  return cache.get(cacheKey, stamp, () =>
+    scanSessionFileIndex(resolved, branchId),
+  );
+}
+
+async function scanSessionFileIndex(
+  resolved: ResolvedDisplaySession,
+  branchId: string | undefined,
+): Promise<SessionFileActivityIndex> {
+  const session = await loadSessionForFileIndex(resolved, branchId);
+  const { files, truncated } = buildSessionFileActivity(session.messages, {
+    projectPath: resolved.project.path,
+  });
+  const index: SessionFileActivityIndex = {
+    projectId: resolved.project.id,
+    sessionId: resolved.sessionId,
+    files,
+    truncated: truncated || session.hasOlderMessages,
+    generatedAt: new Date().toISOString(),
+  };
+
+  return index;
+}
+
+async function loadSessionForFileIndex(
+  resolved: ResolvedDisplaySession,
+  branchId: string | undefined,
+  operationStore?: SessionFileOperationStore,
+): Promise<{ messages: Message[]; hasOlderMessages: boolean }> {
+  const loaded = await resolved.source.reader.getSession(
+    resolved.sessionId,
+    resolved.project.id,
+    undefined,
+    {
+      branchId,
+      maxMessages: SESSION_FILE_INDEX_MAX_MESSAGES,
+      includeOrphans: false,
+      deferMedia: true,
+      deferThinking: true,
+    },
+  );
+  if (!loaded) throw sessionNotFoundError();
+  const session = normalizeSession(loaded, {
+    deferMedia: true,
+    deferThinking: true,
+  });
+  if (operationStore) {
+    if (loaded.data.provider === "codex") {
+      await importCodexFileHistory(
+        operationStore,
+        { sessionId: resolved.sessionId, workspace: resolved.project.path },
+        loaded.data.session.entries,
+        session.messages,
+      );
+    } else if (resolved.source.provider !== "pi") {
+      await importStructuredFileHistory(
+        operationStore,
+        {
+          provider: resolved.source.provider,
+          sessionId: resolved.sessionId,
+          workspace: resolved.project.path,
+        },
+        session.messages,
+      );
+    }
+  }
+  return {
+    messages: session.messages,
+    hasOlderMessages: loaded.pagination?.hasOlderMessages === true,
+  };
+}
+
+/** Ordered edit operations this session applied to one file. */
+async function readSessionFileEdits(
+  resolved: ResolvedDisplaySession,
+  branchId: string | undefined,
+  path: string,
+): Promise<FileEditOp[] | undefined> {
+  const session = await loadSessionForFileIndex(resolved, branchId);
+  const edits = collectSessionFileEdits(session.messages, {
+    resolvePath: (rawPath) =>
+      normalizeSessionFilePath(rawPath, resolved.project.path)?.path ?? null,
+  });
+  return edits.get(path);
+}
+
+/** Current worktree content, or empty when the session deleted the file. */
+async function readWorktreeFile(
+  projectPath: string,
+  path: string,
+): Promise<string> {
+  try {
+    const target = join(projectPath, path);
+    const info = await stat(target);
+    if (!info.isFile() || info.size > SESSION_FILE_DIFF_MAX_BYTES) return "";
+    return await readFile(target, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+const SESSION_FILE_DIFF_MAX_BYTES = 2 * 1024 * 1024;
 
 async function readQuestionPage(
   deps: SessionDisplayRoutesDeps,
@@ -1174,4 +2251,181 @@ function displayErrorResponse(c: Context, error: unknown) {
     );
   }
   throw error;
+}
+
+async function buildOperationSelection(
+  resolved: ResolvedDisplaySession,
+  branchId: string | undefined,
+  store: SessionFileOperationStore,
+  snapshot: Awaited<ReturnType<SessionFileOperationStore["snapshot"]>>,
+  session: Awaited<ReturnType<typeof loadSessionForFileIndex>>,
+) {
+  const visibleTurns = new Map<string, string>();
+  let questionId: string | undefined;
+  for (const message of session.messages) {
+    const id =
+      message.uuid ?? (typeof message.id === "string" ? message.id : undefined);
+    if (isUserPromptMessage(message)) {
+      questionId = id;
+      if (resolved.source.provider !== "codex" && id) visibleTurns.set(id, id);
+    }
+    const turn = message.codexTurnId ?? message.turnId;
+    if (
+      resolved.source.provider === "codex" &&
+      typeof turn === "string" &&
+      (questionId || id)
+    )
+      visibleTurns.set(turn.replace(/^turn:/, ""), questionId ?? id ?? turn);
+  }
+  const selected = selectFileOperations(
+    snapshot.operations,
+    resolved.project.path,
+    visibleTurns,
+  );
+  const projected = await projectFileOperations(
+    store,
+    selected,
+    resolved.project.path,
+    visibleTurns,
+  );
+  const index: SessionFileActivityIndex = {
+    projectId: resolved.project.id,
+    sessionId: resolved.sessionId,
+    files: projected.files,
+    source: "operation",
+    schemaVersion: 2,
+    operationCoverage: "supported-tools",
+    revision: snapshot.revision,
+    unavailableOperations: projected.unavailableOperations,
+    truncated:
+      projected.truncated || snapshot.truncated || session.hasOlderMessages,
+    generatedAt: new Date().toISOString(),
+  };
+  return { visibleTurns, index };
+}
+
+async function operationSelection(
+  deps: SessionDisplayRoutesDeps,
+  caches: FileIndexCaches,
+  resolved: ResolvedDisplaySession,
+  branchId?: string,
+) {
+  const store =
+    deps.sessionFileOperationStore ?? getSessionFileOperationStore();
+  const importFailures =
+    resolved.source.provider === "pi"
+      ? await importPiFileOperations(store, resolved.sessionId)
+      : 0;
+  const session = await cachedFileSession(deps, caches, resolved, branchId);
+  const snapshot = await store.snapshot({
+    provider: resolved.source.provider,
+    sourceId: "local",
+    sessionId: resolved.sessionId,
+  });
+  const key = JSON.stringify([
+    store.directory,
+    resolved.project.path,
+    resolved.source.provider,
+    resolved.sessionId,
+    branchId,
+  ]);
+  const stamp = `${snapshot.revision}:${await sessionFileIndexStamp(resolved)}`;
+  const selection = await caches.operations.get(key, stamp, () =>
+    buildOperationSelection(resolved, branchId, store, snapshot, session),
+  );
+  return {
+    store,
+    snapshot,
+    selected: selectFileOperations(
+      snapshot.operations,
+      resolved.project.path,
+      selection.visibleTurns,
+    ),
+    ...selection,
+    index: importFailures
+      ? {
+          ...selection.index,
+          unavailableOperations:
+            (selection.index.unavailableOperations ?? 0) + importFailures,
+        }
+      : selection.index,
+  };
+}
+
+async function selectOperationChange(
+  deps: SessionDisplayRoutesDeps,
+  caches: FileIndexCaches,
+  resolved: ResolvedDisplaySession,
+  branchId: string | undefined,
+  path: string,
+  recordId: string,
+) {
+  if (
+    !RelativePathSchema.safeParse(path).success ||
+    !/^op:[a-f0-9]{64}$/.test(recordId)
+  )
+    throw new SessionDisplayRouteError(
+      400,
+      "SESSION_FILE_INVALID_PATH",
+      "Invalid file operation selection",
+    );
+  const selection = await operationSelection(deps, caches, resolved, branchId);
+  const entry = selection.selected.find(
+    (entry) => entry.id === recordId.slice(3) && !entry.conflict,
+  );
+  const change = entry?.record.changes.find(
+    (change) =>
+      change.outcome === "applied" &&
+      normalizeSessionFilePath(change.path, resolved.project.path)?.path ===
+        path,
+  );
+  if (!entry || !change)
+    throw new SessionDisplayRouteError(
+      404,
+      "SESSION_FILE_VERSION_MISSING",
+      "No file operation in the selected session branch",
+    );
+  return { store: selection.store, entry, change };
+}
+
+async function cachedFileSession(
+  deps: SessionDisplayRoutesDeps,
+  caches: FileIndexCaches,
+  resolved: ResolvedDisplaySession,
+  branchId?: string,
+) {
+  const store =
+    deps.sessionFileOperationStore ?? getSessionFileOperationStore();
+  const key = JSON.stringify([
+    store.directory,
+    resolved.project.path,
+    resolved.source.provider,
+    resolved.sessionId,
+    branchId,
+  ]);
+  return caches.fileSessions.get(
+    key,
+    await sessionFileIndexStamp(resolved),
+    async () => {
+      const session = await loadSessionForFileIndex(resolved, branchId, store);
+      // Retain ancestry identities only, not a second cache of full transcript/tool payloads.
+      return {
+        ...session,
+        messages: session.messages.map((message): Message => {
+          const prompt = isUserPromptMessage(message);
+          return {
+            uuid: message.uuid,
+            id: message.id,
+            type: prompt ? "user" : "assistant",
+            codexTurnId: message.codexTurnId,
+            turnId: message.turnId,
+            message: {
+              role: prompt ? "user" : "assistant",
+              content: prompt ? "file-index-prompt" : [],
+            },
+          };
+        }),
+      };
+    },
+  );
 }

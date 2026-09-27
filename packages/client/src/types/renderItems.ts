@@ -1,3 +1,4 @@
+import type { CodexAsyncMessage } from "@yep-anywhere/shared";
 import type {
   KimiGoalSnapshot,
   SessionDisplaySegment,
@@ -19,7 +20,6 @@ export type RenderItem =
   | SessionSetupItem
   | SystemItem
   | DisplayToolGroupItem
-  | AssistantOutputToolGroupItem
   | CodexNativeItem;
 
 /** Base fields shared by all render items */
@@ -36,6 +36,7 @@ export interface TextItem extends RenderItemBase {
   text: string;
   /** Codex assistant phase; commentary is an explicit model progress update. */
   phase?: "commentary" | "final_answer";
+  asyncMessage?: CodexAsyncMessage;
   /** True if this text is still being streamed */
   isStreaming?: boolean;
   /** Pre-rendered HTML from server (for completed messages) */
@@ -126,17 +127,6 @@ export interface DisplayToolGroupItem extends RenderItemBase {
 }
 
 /**
- * In-memory tool batch closed by a later user-readable assistant message.
- * Unlike display_tool_group, all details are already present from the live
- * stream/legacy compatibility path and expansion never performs a request.
- */
-export interface AssistantOutputToolGroupItem extends RenderItemBase {
-  type: "assistant_output_tool_group";
-  id: string;
-  tools: ToolCallItem[];
-}
-
-/**
  * Codex app-server native ThreadItem projected through the canonical overlay.
  *
  * The server emits these as system messages with `subtype: "codex_native_item"`
@@ -148,6 +138,8 @@ export interface AssistantOutputToolGroupItem extends RenderItemBase {
 export interface CodexNativeItem extends RenderItemBase {
   type: "codex_native_item";
   id: string;
+  /** Project context for links to child conversations in the display page. */
+  projectId?: string;
   /** The projected ThreadItem payload (type + item-specific fields). */
   threadItem: {
     type: string;

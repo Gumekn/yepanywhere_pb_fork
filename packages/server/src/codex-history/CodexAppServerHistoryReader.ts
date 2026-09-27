@@ -1,5 +1,7 @@
+import { readCodexAsyncMessage } from "@yep-anywhere/shared";
 import type {
   SessionBranchState,
+  SessionDisplayTurnStatus,
   UrlProjectId,
   ZCodeStoredMessage,
 } from "@yep-anywhere/shared";
@@ -8,6 +10,7 @@ import {
   publicCodexFileChanges,
   publicCodexFilePath,
 } from "../codex/file-change.js";
+import { codexImagePreviewUrl } from "../codex/image-preview.js";
 import { codexUserMessageIdentity } from "../codex/user-message-identity.js";
 import { canonicalizeProjectPath } from "../projects/paths.js";
 import type { ThreadItem } from "../sdk/providers/codex-protocol/generated/v2/ThreadItem.js";
@@ -83,6 +86,10 @@ export type CodexAppServerSemanticPageResult =
       summary: SessionSummary;
       provider: "codex" | "codex-oss";
       revision: string;
+      /** Native lifecycle keyed by Codex turn id for display reconciliation. */
+      turnStatuses?: Readonly<Record<string, SessionDisplayTurnStatus>>;
+      /** Detached history has no terminal timing for this newest turn. */
+      inferredLatestTurnId?: string;
       nextCursor?: string;
     }
   | {
@@ -95,6 +102,8 @@ export interface CodexAppServerSemanticPageOptions {
   limit: number;
   itemsView: "summary" | "full";
   expectedRevision?: string;
+  /** Live runtime evidence for the newest turn; never applied to older pages. */
+  toolsMayBeActive?: boolean;
 }
 
 export interface CodexForkBranchCandidate {
@@ -255,8 +264,23 @@ export class CodexAppServerHistoryReader {
             sessionId,
             turn.id,
           );
+          // This read-only app-server does not own the executing thread.
+          // Codex normalizes its unfinished turns to "interrupted" when the
+          // thread is not loaded locally. Only reopen the newest turn when
+          // Yep still observes live work and no native completion timing was
+          // recorded; actual interruptions and older turns stay terminal.
+          const status =
+            options.toolsMayBeActive === true &&
+            !options.cursor &&
+            turn.id === newestTurn?.id &&
+            turn.status === "interrupted" &&
+            turn.completedAt == null &&
+            turn.durationMs == null
+              ? ("inProgress" as const)
+              : turn.status;
           return {
             ...turn,
+            status,
             items:
               options.itemsView === "full"
                 ? items
@@ -313,10 +337,22 @@ export class CodexAppServerHistoryReader {
           projectId,
           provider,
           messages.length,
-          newestTurn,
+          pageTurns[0],
         ),
         provider,
         revision,
+        turnStatuses: Object.fromEntries(
+          pageTurns.map((turn) => [
+            turn.id,
+            projectCodexTurnStatus(turn.status),
+          ]),
+        ),
+        ...(!options.cursor &&
+        newestTurn?.status === "interrupted" &&
+        newestTurn.completedAt == null &&
+        newestTurn.durationMs == null
+          ? { inferredLatestTurnId: newestTurn.id }
+          : {}),
         ...(turnsPage.nextCursor ? { nextCursor: turnsPage.nextCursor } : {}),
       };
     } catch (error) {
@@ -338,7 +374,7 @@ export class CodexAppServerHistoryReader {
     sessionId: string,
     projectPath: string,
     turnId: string,
-    expectedRevision: string,
+    expectedRevision?: string,
   ): Promise<CodexAppServerSemanticTurnResult> {
     if (this.mode === "rollout") {
       return { kind: "fallback", reason: "disabled" };
@@ -364,7 +400,8 @@ export class CodexAppServerHistoryReader {
       thread.id,
       thread.updatedAt,
     );
-    if (revision !== expectedRevision) throw staleCursorError();
+    if (expectedRevision && revision !== expectedRevision)
+      throw staleCursorError();
 
     try {
       const items = await readAllTurnItems(
@@ -572,10 +609,12 @@ export class CodexAppServerHistoryReader {
       }
       for (const entry of entries) {
         const itemType = (entry.item as { type?: unknown }).type;
+        // Titles need text from all turns, including those older than the
+        // bounded lifecycle metadata page; their timestamps/status are optional.
         if (
           typeof itemType !== "string" ||
           !KNOWN_THREAD_ITEM_TYPES.has(itemType) ||
-          !turnsById.has(entry.turnId)
+          (!options.titleProjection && !turnsById.has(entry.turnId))
         ) {
           throw new CodexHistoryParityError();
         }
@@ -589,7 +628,9 @@ export class CodexAppServerHistoryReader {
         (direction === "older" && !cursor) ||
           (direction === "newer" && !itemsPage.nextCursor),
         projectPath,
-        options.inspectorProjection ? "semantic-display" : "strict",
+        options.inspectorProjection || options.titleProjection
+          ? "semantic-display"
+          : "strict",
       );
       if (messages.length > messageLimit) {
         throw new CodexHistoryParityError();
@@ -927,6 +968,12 @@ function sourceName(source: unknown): string | undefined {
   return undefined;
 }
 
+function projectCodexTurnStatus(
+  status: Turn["status"],
+): SessionDisplayTurnStatus {
+  return status === "inProgress" ? "running" : status;
+}
+
 function threadSummary(
   thread: Awaited<ReturnType<CodexHistoryClient["readThread"]>>["thread"],
   projectId: UrlProjectId,
@@ -1051,6 +1098,9 @@ function projectThreadItem(
           type: "assistant",
           codexCorrelationKey: `codex:${entry.turnId}:agent-message:${item.id}`,
           ...(item.phase ? { codexMessagePhase: item.phase } : {}),
+          ...(item.delivery === "async"
+            ? { codexAsyncMessage: readCodexAsyncMessage(item) }
+            : {}),
           message: { role: "assistant", content: item.text },
         },
       ];
@@ -1164,11 +1214,20 @@ function projectThreadItem(
         throw new CodexHistoryParityError();
       }
       const publicPath = publicCodexFilePath(item.path, { workspaceRoot });
-      return toolMessages(base, "ViewImage", { path: publicPath }, item.id, {
-        content: `Viewed image: ${publicPath}`,
-        isError: false,
-        completed: true,
-      });
+      return toolMessages(
+        base,
+        "ViewImage",
+        {
+          path: publicPath,
+          snapshotUrl: codexImagePreviewUrl(sessionId, item.id),
+        },
+        item.id,
+        {
+          content: `Viewed image: ${publicPath}`,
+          isError: false,
+          completed: true,
+        },
+      );
     }
     case "imageGeneration": {
       if (projectionMode === "strict") {

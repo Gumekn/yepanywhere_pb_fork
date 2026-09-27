@@ -1,4 +1,9 @@
 export {
+  CodexAsyncMessageSchema,
+  readCodexAsyncMessage,
+} from "./codex-async-message.js";
+export type { CodexAsyncMessage } from "./codex-async-message.js";
+export {
   isIdeMetadata,
   stripIdeMetadata,
   stripBridgeMetadata,
@@ -30,6 +35,7 @@ export type {
   FeishuDomain,
   FeishuGroupSessionMode,
   FeishuPermissionMode,
+  FeishuProxyMode,
   FeishuReplyMode,
   FeishuSecretRef,
   FeishuSecretSource,
@@ -52,7 +58,10 @@ export type {
   GeneratedArtifactSourceType,
   GeneratedArtifactWarning,
 } from "./generated-artifact.js";
-export { isGeneratedArtifactDownloadUrl } from "./generated-artifact.js";
+export {
+  isGeneratedArtifactDownloadUrl,
+  isSafeGeneratedArtifactFileName,
+} from "./generated-artifact.js";
 export type {
   CodexThreadItemRenderPolicy,
   CodexThreadItemType,
@@ -202,6 +211,30 @@ export type {
   GitFileChange,
   ProjectGitStatusSummary,
 } from "./git-status.js";
+
+export type {
+  SessionFileActivity,
+  SessionFileActivityConfidence,
+  SessionFileActivityIndex,
+  SessionFileActivityKind,
+  SessionFileActivitySource,
+  SessionFileCoverageReason,
+  SessionFileDiff,
+  SessionSavedFileVersion,
+  SessionSavedFileContent,
+  NormalizedSessionFilePath,
+} from "./session-files.js";
+export {
+  SESSION_FILE_ACTIVITY_MAX_PATHS,
+  classifyFileActivityKind,
+  extractShellWritePaths,
+  extractToolCommand,
+  extractToolFilePaths,
+  looksLikeShellCommand,
+  normalizeSessionFilePath,
+  normalizeToolName,
+  prioritizeFileActivityKind,
+} from "./session-files.js";
 
 export {
   orderByParentChain,
@@ -377,6 +410,7 @@ export {
   SessionDisplayThinkingSegmentSchema,
   SessionDisplayToolGroupSegmentSchema,
   SessionDisplayTurnSchema,
+  SessionDisplayTurnStatusSchema,
   SessionDisplayUserContentSchema,
   SessionDisplayUserMediaBlockSchema,
   SessionDisplayUserTextBlockSchema,
@@ -388,6 +422,7 @@ export type {
   SessionDisplayQuestion,
   SessionDisplaySegment,
   SessionDisplayTurn,
+  SessionDisplayTurnStatus,
   SessionDisplayUserContent,
   SessionQuestionPage,
   SessionQuestionPageItem,
@@ -777,3 +812,53 @@ export {
   decompressBytes,
   compressJsonIfBeneficial,
 } from "./compression.js";
+
+export {
+  SessionDisplayToolStepSchema,
+  SessionDisplaySnapshotSchema,
+  SessionDisplayPatchSchema,
+  SessionDisplayNodeSchema,
+  SessionDisplayViewSchema,
+  SessionDisplayActivitySchema,
+  SESSION_DISPLAY_LIVE_STEP_LIMIT,
+  SESSION_DISPLAY_STEP_PREVIEW_LIMIT,
+  applySessionDisplayPatch,
+  sameSessionDisplayView,
+  sessionDisplaySnapshotPage,
+} from "./session-display.js";
+export type {
+  SessionDisplayToolStep,
+  SessionDisplayNode,
+  SessionDisplayView,
+  SessionDisplayActivity,
+  SessionDisplaySnapshot,
+  SessionDisplayPatch,
+  SessionDisplaySubscriptionOptions,
+  SessionDisplayGroupPage,
+  SessionDisplayToolDetail,
+  SessionDisplayToolOutput,
+} from "./session-display.js";
+export * from "./feishu-user-auth.js";
+export {
+  extractBashCommandFromInput,
+  getShellLauncherPrefixLength,
+  isShellLauncherWrappedCommand,
+  tokenizeShellCommand,
+  unwrapShellLauncherCommand,
+} from "./shell-command.js";
+
+export { getSessionArchiveBlock } from "./session-archive.js";
+
+export {
+  SessionFileOperationSchema,
+  SessionFileOperationChangeSchema,
+  SessionFileOperationIdentitySchema,
+  SessionFileOperationScopeSchema,
+  SessionFileContentRefSchema,
+  type SessionFileOperation,
+  type SessionFileOperationChange,
+  type SessionFileOperationIdentity,
+  type SessionFileOperationScope,
+  type SessionFileContentRef,
+  type SessionFileOperationStats,
+} from "./session-file-operation.js";

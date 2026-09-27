@@ -17,6 +17,7 @@ import type {
   ThinkingConfig,
 } from "@yep-anywhere/shared";
 import { getDataDir } from "../../config.js";
+import { resolveGatewayKeyForChannel } from "../../llm-gateways/gateway-keys.js";
 import {
   LLM_GATEWAYS_ENV,
   type LlmGatewayChannel,
@@ -27,6 +28,8 @@ import {
   resolveLlmGatewayProxyBaseUrl,
 } from "../../llm-gateways/index.js";
 import { getLogger } from "../../logging/logger.js";
+import { getSessionFileOperationStore } from "../../session-files/codex-operations.js";
+import { importPiFileOperations } from "../../session-files/pi-operations.js";
 import {
   PI_SESSIONS_DIR,
   PI_SESSION_DIR_IS_EXACT,
@@ -38,6 +41,7 @@ import {
   qualifyPiModelId,
 } from "../../sessions/pi-model-refs.js";
 import {
+  PI_ABANDONED_TOOL_RESULT_TEXT,
   canonicalizePiToolName,
   normalizePiToolInput,
 } from "../../sessions/pi-tools.js";
@@ -183,6 +187,10 @@ interface PiStreamState {
    * the pending tool call instead of appending a new row.
    */
   toolCallOwners: Map<string, SDKMessage>;
+  toolOutputSnapshots: Map<
+    string,
+    { terminal: string; log: string; combined: string }
+  >;
 }
 
 interface PiExtensionProviderConfig {
@@ -713,6 +721,8 @@ export class PiProvider implements AgentProvider {
   private readonly extensionPath: string;
   private readonly timeout: number;
   private modelCache?: { catalog: PiModelCatalog; at: number };
+  /** In-flight background refresh, shared so concurrent callers fetch once. */
+  private modelRefresh?: Promise<PiModelCatalog>;
   /** Last successful catalog per channel, used when one gateway is failing. */
   private readonly channelModelCache = new Map<string, ModelInfo[]>();
 
@@ -769,16 +779,53 @@ export class PiProvider implements AgentProvider {
     });
   }
 
-  /** The full catalog, including models a picker does not offer. */
+  /**
+   * The full catalog, including models a picker does not offer.
+   *
+   * A caller that passes `waitForRefresh: false` never blocks on the gateways,
+   * but a stale cache is still revalidated in the background. Without that the
+   * listing endpoints — which all pass `false` — would pin the very first
+   * catalog a process ever fetched, so a model the gateway added later stayed
+   * invisible until a restart or an explicit `?fresh=1` request.
+   */
   private async loadRoutableCatalog(options?: {
     waitForRefresh?: boolean;
   }): Promise<PiModelCatalog> {
     const cached = this.modelCache;
     const cacheFresh =
       cached !== undefined && Date.now() - cached.at < PI_MODEL_CATALOG_TTL_MS;
-    if (cached && (cacheFresh || options?.waitForRefresh === false)) {
+    if (cached && cacheFresh) return clonePiModelCatalog(cached.catalog);
+    if (cached && options?.waitForRefresh === false) {
+      void this.refreshRoutableCatalog().catch(() => undefined);
       return clonePiModelCatalog(cached.catalog);
     }
+    return clonePiModelCatalog(await this.refreshRoutableCatalog());
+  }
+
+  /** Fetch every channel once, deduplicating concurrent refreshes. */
+  private refreshRoutableCatalog(): Promise<PiModelCatalog> {
+    const pending = this.modelRefresh;
+    if (pending) return pending;
+    const refresh = this.fetchRoutableCatalog()
+      .catch((error: unknown) => {
+        getLogger().warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "Unable to refresh the Pi model catalog",
+        );
+        const cached = this.modelCache;
+        return cached
+          ? clonePiModelCatalog(cached.catalog)
+          : { models: [], routes: new Map<string, PiCatalogRoute>() };
+      })
+      .finally(() => {
+        if (this.modelRefresh === refresh) this.modelRefresh = undefined;
+      });
+    this.modelRefresh = refresh;
+    return refresh;
+  }
+
+  private async fetchRoutableCatalog(): Promise<PiModelCatalog> {
+    const cached = this.modelCache;
     const channels = resolveLlmGatewayChannels(process.env);
     if (channels.length === 0) return { models: [], routes: new Map() };
 
@@ -1135,6 +1182,10 @@ export class PiProvider implements AgentProvider {
       }
 
       const childEnv = filterEnvForChildProcess(process.env);
+      childEnv.YEP_PI_FILE_OPERATIONS_DIRECTORY = join(
+        getSessionFileOperationStore().directory,
+        "pi-ingress",
+      );
       // Pi's bash tool inherits this environment, so every gateway credential
       // and the channel declaration itself are removed. The extension receives
       // the keys through YEP_PI_LLM_API_KEYS and deletes them once captured.
@@ -1172,7 +1223,32 @@ export class PiProvider implements AgentProvider {
                 piProviderId("anthropic", candidate) === provider.id ||
                 piProviderId("openai-compatible", candidate) === provider.id,
             );
-            return channel ? [[provider.id, channel.apiKey]] : [];
+            if (!channel) return [];
+            // A session can be pinned to one of the extra keys configured for
+            // this channel; an unknown or foreign id falls back to the
+            // environment key so a removed key degrades instead of failing.
+            const sessionKey = resolveGatewayKeyForChannel(
+              channel.id,
+              options.llmGatewayKeyId,
+            );
+            if (
+              options.llmGatewayKeyId &&
+              !sessionKey &&
+              !options.llmGatewayKeyId.startsWith("env:")
+            ) {
+              // Silent fallback here means the session starts burning another
+              // credential than the user picked, which only shows up much
+              // later as a quota error on the wrong key. Make it visible.
+              getLogger().warn(
+                {
+                  event: "pi_gateway_key_unresolved",
+                  channelId: channel.id,
+                  llmGatewayKeyId: options.llmGatewayKeyId,
+                },
+                "Pi session key id did not resolve for this channel; using the environment key",
+              );
+            }
+            return [[provider.id, sessionKey ?? channel.apiKey]];
           }),
         ),
       );
@@ -1246,6 +1322,7 @@ export class PiProvider implements AgentProvider {
           message: { role: "user", content: projection.publicPrompt },
         };
 
+        if (signal.aborted) break;
         await client.send({
           type: "prompt",
           message: projection.internalPrompt,
@@ -1257,6 +1334,7 @@ export class PiProvider implements AgentProvider {
           blocks: new Map(),
           sequence: 0,
           toolCallOwners: new Map(),
+          toolOutputSnapshots: new Map(),
           pendingUser: {
             uuid: userId,
             tempId: message.tempId,
@@ -1290,7 +1368,9 @@ export class PiProvider implements AgentProvider {
             signal,
             runtime,
           );
-          for (const sdkMessage of emitted) yield sdkMessage;
+          for (const sdkMessage of emitted) {
+            yield sdkMessage;
+          }
         }
       }
     } catch (error) {
@@ -1317,6 +1397,51 @@ export class PiProvider implements AgentProvider {
     signal: AbortSignal,
     runtime?: PiRuntimeRef,
   ): Promise<SDKMessage[]> {
+    if (event.type === "tool_execution_update") {
+      const result = isRecord(event.partialResult) ? event.partialResult : {};
+      const content = result.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content
+                .filter(isRecord)
+                .map((block) => stringValue(block.text) ?? "")
+                .join("\n")
+            : "";
+      return this.toolOutputSdkMessages(
+        event.toolCallId,
+        text,
+        "terminal",
+        stream,
+      );
+    }
+    if (event.type === "tool_execution_end") {
+      stream.toolOutputSnapshots.delete(stringValue(event.toolCallId) ?? "");
+      stream.toolCallOwners.delete(stringValue(event.toolCallId) ?? "");
+      return [];
+    }
+    if (
+      event.type === "extension_ui_request" &&
+      typeof event.message === "string" &&
+      event.message.startsWith("__YEP_PI_FILE_OPERATION__:")
+    ) {
+      if (event.message === "__YEP_PI_FILE_OPERATION__:capture-failed") {
+        getLogger().warn(
+          { sessionId },
+          "Pi file operation capture failed before artifact publication",
+        );
+      }
+      try {
+        await importPiFileOperations(getSessionFileOperationStore(), sessionId);
+      } catch (error) {
+        getLogger().warn(
+          { error, sessionId },
+          "Pi file operation import failed",
+        );
+      }
+      return [];
+    }
     if (event.type === "extension_ui_request") {
       const partial = this.partialToolOutputSdkMessages(event, stream);
       if (partial) return partial;
@@ -1366,16 +1491,25 @@ export class PiProvider implements AgentProvider {
         stream.assistantId = null;
         stream.blocks.clear();
         const errorMessage = stringValue(message.errorMessage);
+        // A stream that dies before `message_stop` still carries whatever tool
+        // call blocks it had assembled. Pi never runs them and retries on a new
+        // assistant message, so without a synthetic terminal result the display
+        // reducer would spin on those steps for the rest of the session.
+        const abandoned =
+          message.stopReason === "error"
+            ? this.abandonedToolResultSdkMessages(message, sessionId)
+            : [];
         return errorMessage && message.stopReason === "error"
           ? [
               result,
+              ...abandoned,
               {
                 type: "error",
                 session_id: sessionId,
                 error: errorMessage,
               },
             ]
-          : [result];
+          : [result, ...abandoned];
       }
       if (message.role === "toolResult") {
         return [this.toolResultSdkMessage(message, sessionId)];
@@ -1577,6 +1711,7 @@ export class PiProvider implements AgentProvider {
       const oldest = stream.toolCallOwners.keys().next();
       if (oldest.done) break;
       stream.toolCallOwners.delete(oldest.value);
+      stream.toolOutputSnapshots.delete(oldest.value);
     }
   }
 
@@ -1607,18 +1742,43 @@ export class PiProvider implements AgentProvider {
       // A malformed relay is a dropped preview frame, never a turn failure.
       return [];
     }
-    const toolCallId = stringValue(payload.toolCallId);
-    const text = typeof payload.text === "string" ? payload.text : "";
-    if (!toolCallId || !text) return [];
+    return this.toolOutputSdkMessages(
+      payload.toolCallId,
+      payload.text,
+      payload.source === "log" ? "log" : "terminal",
+      stream,
+    );
+  }
 
+  private toolOutputSdkMessages(
+    rawId: unknown,
+    rawText: unknown,
+    source: "terminal" | "log",
+    stream: PiStreamState,
+  ): SDKMessage[] {
+    const toolCallId = stringValue(rawId);
+    if (
+      !toolCallId ||
+      typeof rawText !== "string" ||
+      (!rawText && source !== "log")
+    )
+      return [];
     const owner = stream.toolCallOwners.get(toolCallId);
     const content = owner?.message?.content;
     if (!owner || !Array.isArray(content)) return [];
-
-    const bounded =
-      text.length > PI_PARTIAL_OUTPUT_LIMIT
-        ? text.slice(-PI_PARTIAL_OUTPUT_LIMIT)
-        : text;
+    const snapshot = stream.toolOutputSnapshots.get(toolCallId) ?? {
+      terminal: "",
+      log: "",
+      combined: "",
+    };
+    snapshot[source] = rawText.slice(-8_000);
+    const bounded = [snapshot.terminal, snapshot.log]
+      .filter(Boolean)
+      .join("\n")
+      .slice(-PI_PARTIAL_OUTPUT_LIMIT);
+    if (bounded === snapshot.combined) return [];
+    snapshot.combined = bounded;
+    stream.toolOutputSnapshots.set(toolCallId, snapshot);
     return [
       {
         ...owner,
@@ -1709,6 +1869,44 @@ export class PiProvider implements AgentProvider {
       },
       is_error: message.isError === true,
     };
+  }
+
+  /**
+   * Terminal results for tool calls an interrupted assistant stream never ran.
+   * Mirrors `piAbandonedToolResults` on the persisted-session path so a live
+   * turn and a later reload agree on the same terminal step state.
+   */
+  private abandonedToolResultSdkMessages(
+    message: JsonRecord,
+    sessionId: string,
+  ): SDKMessage[] {
+    const content = Array.isArray(message.content) ? message.content : [];
+    const results: SDKMessage[] = [];
+    for (const raw of content) {
+      if (!isRecord(raw) || raw.type !== "toolCall") continue;
+      const callId = stringValue(raw.id);
+      if (!callId) continue;
+      results.push({
+        type: "user",
+        uuid: `pi-abandoned-tool-${callId}`,
+        session_id: sessionId,
+        tool_use_id: callId,
+        timestamp: toIsoTimestamp(message.timestamp),
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: callId,
+              content: PI_ABANDONED_TOOL_RESULT_TEXT,
+              is_error: true,
+            },
+          ],
+        },
+        is_error: true,
+      });
+    }
+    return results;
   }
 
   private async handleExtensionUiRequest(

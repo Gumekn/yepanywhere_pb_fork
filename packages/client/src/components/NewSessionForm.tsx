@@ -32,6 +32,7 @@ import { ENTER_SENDS_MESSAGE } from "../constants";
 import { useToastContext } from "../contexts/ToastContext";
 import { useConnection } from "../hooks/useConnection";
 import { useDraftPersistence } from "../hooks/useDraftPersistence";
+import { useLlmGatewayKeys } from "../hooks/useLlmGatewayKeys";
 import {
   EFFORT_LEVEL_OPTIONS,
   type EffortLevel,
@@ -50,6 +51,15 @@ import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useServerSettings } from "../hooks/useServerSettings";
 import { useI18n } from "../i18n";
 import { getAgentCommandConfigs } from "../lib/agentCommands";
+import {
+  countAttachmentTokens,
+  deleteAttachmentTokenAtCaret,
+  hasAttachmentToken,
+  insertAttachmentToken,
+  matchTokenToAttachment,
+  removeAttachmentToken,
+  sanitizeAttachmentTokenName,
+} from "../lib/attachmentTokens";
 import { readClipboardUserInput } from "../lib/clipboard";
 import {
   getModelReasoningEfforts,
@@ -66,9 +76,13 @@ import {
   shouldRestoreHistoricalEditAfterFailure,
 } from "../lib/sessionBranching";
 import type { PermissionMode, SessionNavigationState } from "../types";
+import { AttachmentPreviewModal } from "./AttachmentPreviewModal";
+import { CodexAccountSelect } from "./CodexAccountSelect";
 import { CodexUsageCard } from "./CodexUsageCard";
+import { ComposerTokenHighlight } from "./ComposerTokenHighlight";
 import { FilterDropdown, type FilterOption } from "./FilterDropdown";
 import { clearFabPrefill, getFabPrefill } from "./FloatingActionButton";
+import { PiGatewayKeySelect } from "./PiGatewayKeySelect";
 import { SlashCommandButton } from "./SlashCommandButton";
 import { VoiceInputButton, type VoiceInputButtonRef } from "./VoiceInputButton";
 
@@ -323,7 +337,17 @@ export function NewSessionForm({
     useState<LlmGatewayRequestProtocol>("openai-compatible");
   const [selectedCodexMcpMode, setSelectedCodexMcpMode] =
     useState<CodexMcpMode>("standard");
+  /** Codex account (isolated CODEX_HOME); null = machine-wide ~/.codex login. */
+  const [selectedCodexAccountId, setSelectedCodexAccountId] = useState<
+    string | null
+  >(null);
+  /** Pi gateway API key; null = the channel's server-side environment key. */
+  const [selectedLlmGatewayKeyId, setSelectedLlmGatewayKeyId] = useState<
+    string | null
+  >(null);
+  const llmGatewayKeys = useLlmGatewayKeys(selectedProvider === "pi");
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  const [previewFileId, setPreviewFileId] = useState<string | null>(null);
   const pendingFilesRef = useRef<PendingFile[]>(pendingFiles);
   pendingFilesRef.current = pendingFiles;
   const [isStarting, setIsStarting] = useState(false);
@@ -493,11 +517,7 @@ export function NewSessionForm({
       ? resolveModelReasoningEffort(
           selectedModelInfo,
           codexReasoningEffort ??
-            (codexReasoningEfforts.length === 0
-              ? thinkingLevel === "max"
-                ? "xhigh"
-                : thinkingLevel
-              : undefined),
+            (codexReasoningEfforts.length === 0 ? thinkingLevel : undefined),
         )
       : undefined;
   const effectiveKimiReasoningEffort =
@@ -530,11 +550,15 @@ export function NewSessionForm({
       ? resolveModelReasoningEffort(selectedModelInfo, thinkingLevel)
       : undefined;
   const effectiveThinkingEffort =
-    resolvedClaudeThinkingEffort && isEffortLevel(resolvedClaudeThinkingEffort)
-      ? resolvedClaudeThinkingEffort
-      : resolvedPiThinkingEffort && isEffortLevel(resolvedPiThinkingEffort)
-        ? resolvedPiThinkingEffort
-        : thinkingLevel;
+    effectiveCodexReasoningEffort &&
+    isEffortLevel(effectiveCodexReasoningEffort)
+      ? effectiveCodexReasoningEffort
+      : resolvedClaudeThinkingEffort &&
+          isEffortLevel(resolvedClaudeThinkingEffort)
+        ? resolvedClaudeThinkingEffort
+        : resolvedPiThinkingEffort && isEffortLevel(resolvedPiThinkingEffort)
+          ? resolvedPiThinkingEffort
+          : thinkingLevel;
   const selectedThinkingPreset: ThinkingPreset =
     selectedProvider === "codex" &&
     thinkingMode === "on" &&
@@ -600,13 +624,9 @@ export function NewSessionForm({
         return;
       }
       const effort = preset.slice(3);
-      if (
-        selectedProvider === "codex" &&
-        codexReasoningEfforts.some(
-          (option) => option.reasoningEffort === effort,
-        )
-      ) {
+      if (selectedProvider === "codex") {
         setCodexReasoningEffort(effort);
+        if (isEffortLevel(effort)) setEffortLevel(effort);
         setThinkingMode("on");
         return;
       }
@@ -614,7 +634,7 @@ export function NewSessionForm({
       setEffortLevel(effort);
       setThinkingMode("on");
     },
-    [codexReasoningEfforts, selectedProvider, setEffortLevel, setThinkingMode],
+    [selectedProvider, setEffortLevel, setThinkingMode],
   );
   const handleThinkingSelect = useCallback(
     (selected: ThinkingPreset[]) => {
@@ -730,6 +750,14 @@ export function NewSessionForm({
           ? (savedDefaults?.codexMcpMode ?? "standard")
           : "standard",
       );
+      setSelectedCodexAccountId(
+        providerName === "codex"
+          ? (savedDefaults?.codexAccountId ?? null)
+          : null,
+      );
+      setSelectedLlmGatewayKeyId(
+        providerName === "pi" ? (savedDefaults?.llmGatewayKeyId ?? null) : null,
+      );
       setKimiReasoningEffort(
         providerName === "kimi"
           ? (savedDefaults?.reasoningEffort ?? null)
@@ -756,9 +784,7 @@ export function NewSessionForm({
         providerName === "codex"
           ? (savedDefaults?.reasoningEffort ??
             (savedThinkingPreset?.startsWith("on:")
-              ? savedThinkingPreset.slice(3) === "max"
-                ? "xhigh"
-                : savedThinkingPreset.slice(3)
+              ? savedThinkingPreset.slice(3)
               : null))
           : null;
       setCodexReasoningEffort(savedCodexReasoningEffort);
@@ -830,6 +856,42 @@ export function NewSessionForm({
     );
   };
 
+  // When an explicit gateway key is picked, the model dropdown narrows to the
+  // models that key can actually reach: a key only works on its own gateway,
+  // and aggregator keys often expose a subset of that gateway's catalog.
+  const gatewayKeyModelFilter = useMemo(():
+    | ((modelId: string) => boolean)
+    | null => {
+    if (selectedProvider !== "pi" || !selectedLlmGatewayKeyId) return null;
+    const key = llmGatewayKeys.keys.find(
+      (entry) => entry.id === selectedLlmGatewayKeyId,
+    );
+    if (!key) return null;
+    const channels = llmGatewayKeys.channels;
+    const defaultChannelId =
+      (channels.find((channel) => channel.isDefault) ?? channels[0])?.id ??
+      null;
+    const reachable = key.status?.ok === true ? (key.status.models ?? []) : [];
+    return (modelId: string) => {
+      if (modelId === "default") return true;
+      const separator = modelId.indexOf("/");
+      const prefix = separator > 0 ? modelId.slice(0, separator) : null;
+      const qualified =
+        prefix !== null && channels.some((channel) => channel.id === prefix);
+      const channelId = qualified ? prefix : defaultChannelId;
+      if (channelId !== key.channelId) return false;
+      if (reachable.length === 0) return true;
+      return reachable.includes(
+        qualified ? modelId.slice(separator + 1) : modelId,
+      );
+    };
+  }, [
+    llmGatewayKeys.channels,
+    llmGatewayKeys.keys,
+    selectedLlmGatewayKeyId,
+    selectedProvider,
+  ]);
+
   // Build model options for FilterDropdown
   const modelOptions = useMemo((): FilterOption<string>[] => {
     const options: FilterOption<string>[] = [];
@@ -845,6 +907,7 @@ export function NewSessionForm({
     };
 
     for (const model of availableModels) {
+      if (gatewayKeyModelFilter && !gatewayKeyModelFilter(model.id)) continue;
       const label = model.size
         ? `${model.name} (${(model.size / (1024 * 1024 * 1024)).toFixed(1)} GB)`
         : model.name;
@@ -916,6 +979,7 @@ export function NewSessionForm({
     return options;
   }, [
     availableModels,
+    gatewayKeyModelFilter,
     getEffortLabel,
     selectedProvider,
     selectedProviderInfo?.codexModelSources,
@@ -995,6 +1059,24 @@ export function NewSessionForm({
     [availableModels, selectedGatewayProtocol, selectedProvider],
   );
 
+  // Keep the model consistent with the chosen key: if the current model is not
+  // reachable on it, fall back to the first model the key does serve.
+  useEffect(() => {
+    if (!gatewayKeyModelFilter || selectedProvider !== "pi") return;
+    if (availableModels.length === 0) return;
+    if (selectedModel && gatewayKeyModelFilter(selectedModel)) return;
+    const next = availableModels.find((model) =>
+      gatewayKeyModelFilter(model.id),
+    );
+    handleModelSelect(next ? [next.id] : []);
+  }, [
+    availableModels,
+    gatewayKeyModelFilter,
+    handleModelSelect,
+    selectedModel,
+    selectedProvider,
+  ]);
+
   const handleGatewayProtocolSelect = useCallback(
     (protocol: LlmGatewayRequestProtocol) => {
       if (!selectedGatewayProtocols.includes(protocol)) return;
@@ -1040,30 +1122,84 @@ export function NewSessionForm({
     }
   }, [setMessage]);
 
-  const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files?.length) return;
+  /** Restores the caret after React has flushed the new textarea value. */
+  const setCaretSoon = (position: number) => {
+    const apply = () => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(position, position);
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(apply);
+    } else {
+      setTimeout(apply, 0);
+    }
+  };
 
-    const newPendingFiles: PendingFile[] = Array.from(files).map((file) => ({
+  const addPendingFiles = (
+    files: File[],
+    baseMessage?: string,
+    baseCursor?: number,
+  ) => {
+    if (files.length === 0) return;
+
+    const newPendingFiles: PendingFile[] = files.map((file) => ({
       id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       file,
       previewUrl: file.type.startsWith("image/")
         ? URL.createObjectURL(file)
         : undefined,
     }));
-
     setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+
+    // Drop an inline token at the caret so the prompt records where each file
+    // belongs relative to the typed text.
+    const textarea = textareaRef.current;
+    let nextMessage = baseMessage ?? textarea?.value ?? message;
+    let nextCursor =
+      baseCursor ?? textarea?.selectionStart ?? nextMessage.length;
+    // Pasted Yep clipboard payloads already carry `@[name]` inside the copied
+    // text; reuse those tokens instead of appending duplicates.
+    const consumed = new Map<string, number>();
+    for (const pendingFile of newPendingFiles) {
+      const name = sanitizeAttachmentTokenName(pendingFile.file.name);
+      const used = consumed.get(name) ?? 0;
+      consumed.set(name, used + 1);
+      if (countAttachmentTokens(nextMessage, name) > used) continue;
+      const inserted = insertAttachmentToken(
+        nextMessage,
+        nextCursor,
+        pendingFile.file.name,
+      );
+      nextMessage = inserted.text;
+      nextCursor = inserted.cursor;
+    }
+
+    setInterimTranscript("");
+    setMessage(nextMessage);
+    setCaretSoon(nextCursor);
+  };
+
+  const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files?.length) return;
+
+    addPendingFiles(Array.from(files));
     e.target.value = ""; // Reset for re-selection
   };
 
   const handleRemoveFile = (id: string) => {
-    setPendingFiles((prev) => {
-      const file = prev.find((f) => f.id === id);
-      if (file?.previewUrl) {
-        URL.revokeObjectURL(file.previewUrl);
-      }
-      return prev.filter((f) => f.id !== id);
-    });
+    const file = pendingFilesRef.current.find((f) => f.id === id);
+    if (file?.previewUrl) {
+      URL.revokeObjectURL(file.previewUrl);
+    }
+    if (file) {
+      const textarea = textareaRef.current;
+      const currentValue = textarea?.value ?? message;
+      setMessage(removeAttachmentToken(currentValue, file.file.name));
+    }
+    setPendingFiles((prev) => prev.filter((f) => f.id !== id));
   };
 
   const handleModeSelect = (selectedMode: PermissionMode) => {
@@ -1073,14 +1209,6 @@ export function NewSessionForm({
   const handleCodexMcpModeSelect = (selectedMode: CodexMcpMode) => {
     setSelectedCodexMcpMode(selectedMode);
   };
-
-  const handleSelectEffort = useCallback(
-    (effort: EffortLevel) => {
-      setEffortLevel(effort);
-      setThinkingMode("on");
-    },
-    [setEffortLevel, setThinkingMode],
-  );
 
   const gatewayModelLimits = useMemo((): LlmGatewayModelLimits | undefined => {
     if (selectedProvider !== "pi") return undefined;
@@ -1139,9 +1267,18 @@ export function NewSessionForm({
         selectedModelForRequest ??
         undefined)
       : selectedModelForRequest;
-  const thinkingForRequest = supportsThinkingToggle
-    ? getThinkingOption(thinkingMode, effectiveThinkingEffort)
-    : undefined;
+  // Native Codex tiers outside the shared enum (e.g. ultra) travel only in
+  // reasoningEffort; never send an unrelated shared thinking level alongside.
+  const thinkingForRequest =
+    supportsThinkingToggle &&
+    !(
+      selectedProvider === "codex" &&
+      thinkingMode === "on" &&
+      effectiveCodexReasoningEffort &&
+      !isEffortLevel(effectiveCodexReasoningEffort)
+    )
+      ? getThinkingOption(thinkingMode, effectiveThinkingEffort)
+      : undefined;
   const currentProviderDefaults = useMemo(
     (): NewSessionProviderDefaults => ({
       model: modelForRequest,
@@ -1152,11 +1289,21 @@ export function NewSessionForm({
       codexMcpMode:
         selectedProvider === "codex" ? selectedCodexMcpMode : undefined,
       codexModelProvider: codexModelProviderForRequest,
+      codexAccountId:
+        selectedProvider === "codex"
+          ? (selectedCodexAccountId ?? undefined)
+          : undefined,
+      llmGatewayKeyId:
+        selectedProvider === "pi"
+          ? (selectedLlmGatewayKeyId ?? undefined)
+          : undefined,
       llmGatewayConfig: llmGatewayConfigForRequest,
     }),
     [
       mode,
       llmGatewayConfigForRequest,
+      selectedCodexAccountId,
+      selectedLlmGatewayKeyId,
       selectedCodexMcpMode,
       codexModelProviderForRequest,
       modelForRequest,
@@ -1238,6 +1385,15 @@ export function NewSessionForm({
 
       // Get model and thinking settings
       const thinking = thinkingForRequest;
+      // Session input toolbars initialize from this preference. Persist the
+      // resolved native tier as well when restoring defaults or changing models.
+      if (
+        selectedProvider === "codex" &&
+        selectedReasoningEffort &&
+        isEffortLevel(selectedReasoningEffort)
+      ) {
+        setEffortLevel(selectedReasoningEffort);
+      }
       const sessionOptions = {
         mode,
         model: modelForRequest,
@@ -1248,6 +1404,14 @@ export function NewSessionForm({
         codexMcpMode:
           selectedProvider === "codex" ? selectedCodexMcpMode : undefined,
         codexModelProvider: codexModelProviderForRequest,
+        codexAccountId:
+          selectedProvider === "codex"
+            ? (selectedCodexAccountId ?? undefined)
+            : undefined,
+        llmGatewayKeyId:
+          selectedProvider === "pi"
+            ? (selectedLlmGatewayKeyId ?? undefined)
+            : undefined,
         llmGatewayConfig: llmGatewayConfigForRequest,
       };
 
@@ -1344,6 +1508,9 @@ export function NewSessionForm({
         },
         initialTitle: trimmedMessage,
         initialProvider: selectedProvider ?? undefined,
+        initialModel: sessionOptions.model,
+        initialReasoningEffort: sessionOptions.reasoningEffort,
+        initialServiceTier: sessionOptions.serviceTier,
       };
       navigate(`${basePath}/projects/${projectId}/sessions/${sessionId}`, {
         state: navigationState,
@@ -1394,6 +1561,42 @@ export function NewSessionForm({
   };
 
   const handleKeyDown = (e: KeyboardEvent) => {
+    // Attachment tokens delete as one unit, like a chip would.
+    if (
+      (e.key === "Backspace" || e.key === "Delete") &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey
+    ) {
+      const textarea = textareaRef.current;
+      const deletion = textarea
+        ? deleteAttachmentTokenAtCaret(
+            textarea.value,
+            textarea.selectionStart,
+            textarea.selectionEnd,
+            e.key === "Backspace" ? "backward" : "forward",
+            pendingFileNames,
+          )
+        : null;
+      if (deletion) {
+        e.preventDefault();
+        setInterimTranscript("");
+        setMessage(deletion.text);
+        setCaretSoon(deletion.cursor);
+        const removed = matchTokenToAttachment(
+          pendingFiles,
+          (candidate) => candidate.file.name,
+          deletion.name,
+          0,
+        );
+        if (removed) {
+          if (removed.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+          setPendingFiles((prev) => prev.filter((f) => f.id !== removed.id));
+        }
+        return;
+      }
+    }
+
     if (e.key === "Enter") {
       // Skip Enter during IME composition (e.g. Chinese/Japanese/Korean input)
       if (e.nativeEvent.isComposing) return;
@@ -1432,27 +1635,19 @@ export function NewSessionForm({
     if (copiedInput && copiedInput.images.length > 0) {
       e.preventDefault();
 
-      if (copiedInput.text) {
-        const textarea = textareaRef.current;
-        const currentValue = textarea?.value ?? message;
-        const start = textarea?.selectionStart ?? currentValue.length;
-        const end = textarea?.selectionEnd ?? start;
-        const nextMessage = `${currentValue.slice(0, start)}${copiedInput.text}${currentValue.slice(end)}`;
-        const nextCursor = start + copiedInput.text.length;
+      const textarea = textareaRef.current;
+      const currentValue = textarea?.value ?? message;
+      const start = textarea?.selectionStart ?? currentValue.length;
+      const end = textarea?.selectionEnd ?? start;
 
-        setInterimTranscript("");
-        setMessage(nextMessage);
-        setTimeout(() => {
-          textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
-        }, 0);
+      let baseMessage = currentValue;
+      let baseCursor = start;
+      if (copiedInput.text) {
+        baseMessage = `${currentValue.slice(0, start)}${copiedInput.text}${currentValue.slice(end)}`;
+        baseCursor = start + copiedInput.text.length;
       }
 
-      const newPendingFiles: PendingFile[] = copiedInput.images.map((file) => ({
-        id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-        file,
-        previewUrl: URL.createObjectURL(file),
-      }));
-      setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+      addPendingFiles(copiedInput.images, baseMessage, baseCursor);
       return;
     }
 
@@ -1471,14 +1666,7 @@ export function NewSessionForm({
 
     if (files.length > 0) {
       e.preventDefault();
-      const newPendingFiles: PendingFile[] = files.map((file) => ({
-        id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-        file,
-        previewUrl: file.type.startsWith("image/")
-          ? URL.createObjectURL(file)
-          : undefined,
-      }));
-      setPendingFiles((prev) => [...prev, ...newPendingFiles]);
+      addPendingFiles(files);
     }
   };
 
@@ -1546,6 +1734,30 @@ export function NewSessionForm({
   );
 
   const hasContent = message.trim() || pendingFiles.length > 0;
+  const pendingFileNames = pendingFiles.map((pf) => pf.file.name);
+  // Files referenced inline in the prompt are rendered as tokens; only the
+  // remaining ones still need a chip below the composer.
+  const detachedPendingFiles = pendingFiles.filter(
+    (pf) => !hasAttachmentToken(displayText, pf.file.name),
+  );
+  const hasInlineTokens = pendingFileNames.some((name) =>
+    hasAttachmentToken(displayText, name),
+  );
+
+  const handleTokenClick = (name: string, occurrence: number) => {
+    const pendingFile = matchTokenToAttachment(
+      pendingFiles,
+      (candidate) => candidate.file.name,
+      name,
+      occurrence,
+    );
+    if (!pendingFile) return;
+    setPreviewFileId(pendingFile.id);
+  };
+
+  const previewFile = previewFileId
+    ? pendingFiles.find((pf) => pf.id === previewFileId)
+    : undefined;
   const savedDefaults = settings?.newSessionDefaults;
   const savedProviderDefaults = selectedProvider
     ? getNewSessionProviderDefaults(savedDefaults, selectedProvider)
@@ -1553,7 +1765,9 @@ export function NewSessionForm({
   const codexMcpDefaultsMatch =
     selectedProvider === "codex"
       ? (savedProviderDefaults?.codexMcpMode ?? "standard") ===
-        selectedCodexMcpMode
+          selectedCodexMcpMode &&
+        (savedProviderDefaults?.codexAccountId ?? null) ===
+          selectedCodexAccountId
       : true;
   const thinkingDefaultsMatch = supportsThinkingToggle
     ? (savedProviderDefaults?.thinking ?? undefined) === thinkingForRequest
@@ -1570,7 +1784,9 @@ export function NewSessionForm({
       ? sameLlmGatewayConfig(
           savedProviderDefaults?.llmGatewayConfig,
           llmGatewayConfigForRequest,
-        )
+        ) &&
+        (savedProviderDefaults?.llmGatewayKeyId ?? null) ===
+          selectedLlmGatewayKeyId
       : true;
   const savedPermissionMode = normalizeProviderPermissionMode(
     selectedProvider,
@@ -1649,20 +1865,30 @@ export function NewSessionForm({
   // Shared input area with toolbar (textarea + attach/voice on left, send on right)
   const inputArea = (
     <>
-      <textarea
-        ref={textareaRef}
-        value={displayText}
-        onChange={(e) => {
-          setInterimTranscript("");
-          setMessage(e.target.value);
-        }}
-        onKeyDown={handleKeyDown}
-        onPaste={handlePaste}
-        placeholder={resolvedPlaceholder}
-        disabled={isStarting}
-        rows={rows}
-        className="new-session-form-textarea"
-      />
+      <div className="new-session-composer">
+        {hasInlineTokens && (
+          <ComposerTokenHighlight
+            textareaRef={textareaRef}
+            text={displayText}
+            names={pendingFileNames}
+            onTokenClick={handleTokenClick}
+          />
+        )}
+        <textarea
+          ref={textareaRef}
+          value={displayText}
+          onChange={(e) => {
+            setInterimTranscript("");
+            setMessage(e.target.value);
+          }}
+          onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
+          placeholder={resolvedPlaceholder}
+          disabled={isStarting}
+          rows={rows}
+          className={`new-session-form-textarea${hasInlineTokens ? " has-token-mirror" : ""}`}
+        />
+      </div>
       <div className="new-session-form-toolbar">
         <div className="new-session-form-toolbar-left">
           <input
@@ -1802,24 +2028,25 @@ export function NewSessionForm({
             {t("newSessionEffortTitle")}
           </span>
           <div className="new-session-effort-options">
-            {EFFORT_LEVEL_OPTIONS.map((option) => {
-              const label = getEffortLabel(option.value);
-              const selected =
-                thinkingMode === "on" && thinkingLevel === option.value;
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  className={`new-session-effort-option ${selected ? "selected" : ""}`}
-                  onClick={() => handleSelectEffort(option.value)}
-                  disabled={isStarting}
-                  aria-pressed={selected}
-                  aria-label={`${t("newSessionEffortTitle")}: ${label}`}
-                >
-                  {label}
-                </button>
-              );
-            })}
+            {thinkingOptions
+              .filter((option) => option.value.startsWith("on:"))
+              .map((option) => {
+                const label = getEffortLabel(option.value.slice(3));
+                const selected = selectedThinkingPreset === option.value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={`new-session-effort-option ${selected ? "selected" : ""}`}
+                    onClick={() => applyThinkingPreset(option.value)}
+                    disabled={isStarting}
+                    aria-pressed={selected}
+                    aria-label={`${t("newSessionEffortTitle")}: ${label}`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
           </div>
         </div>
       )}
@@ -1848,9 +2075,9 @@ export function NewSessionForm({
           </div>
         </div>
       )}
-      {pendingFiles.length > 0 && (
+      {detachedPendingFiles.length > 0 && (
         <div className="pending-files-list">
-          {pendingFiles.map((pf) => {
+          {detachedPendingFiles.map((pf) => {
             const progress = uploadProgress[pf.id];
             return (
               <div key={pf.id} className="pending-file-chip">
@@ -1897,6 +2124,13 @@ export function NewSessionForm({
           })}
         </div>
       )}
+      {previewFile && (
+        <AttachmentPreviewModal
+          name={previewFile.file.name}
+          src={previewFile.previewUrl ?? null}
+          onClose={() => setPreviewFileId(null)}
+        />
+      )}
     </>
   );
 
@@ -1925,7 +2159,34 @@ export function NewSessionForm({
         <p className="new-session-subtitle">{t("newSessionHeaderSubtitle")}</p>
       </div>
 
+      {selectedProvider === "codex" && (
+        <CodexAccountSelect
+          value={selectedCodexAccountId}
+          onChange={setSelectedCodexAccountId}
+          disabled={isStarting}
+        />
+      )}
       {selectedProvider === "codex" && <CodexUsageCard />}
+      {selectedProvider === "pi" && (
+        <PiGatewayKeySelect
+          value={selectedLlmGatewayKeyId}
+          onChange={setSelectedLlmGatewayKeyId}
+          channels={llmGatewayKeys.channels}
+          loading={llmGatewayKeys.loading}
+          busy={llmGatewayKeys.busy}
+          error={llmGatewayKeys.error}
+          onAdd={llmGatewayKeys.addKey}
+          onRemove={llmGatewayKeys.removeKey}
+          onRefresh={llmGatewayKeys.refresh}
+          modelId={
+            // Pi's managed gateway models travel in `llmGatewayConfig`, not in
+            // `model`, and only that id carries the channel prefix that says
+            // which gateway's keys are selectable.
+            llmGatewayConfigForRequest?.model ?? modelForRequest
+          }
+          disabled={isStarting}
+        />
+      )}
 
       <div className="new-session-input-area">{inputArea}</div>
 

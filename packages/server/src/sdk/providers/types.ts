@@ -10,6 +10,7 @@ import type {
   SessionRetryStatus,
   SlashCommand,
 } from "@yep-anywhere/shared";
+import type { FeishuMcpConfig } from "../../channels/feishu/user-auth/mcp-gateway.js";
 import type { MessageQueue } from "../messageQueue.js";
 import type { CanUseTool, SDKMessage, UserMessage } from "../types.js";
 import type { CodexSessionControls } from "./codex-controls.js";
@@ -80,12 +81,24 @@ export interface StartSessionOptions {
   codexMcpMode?: CodexMcpMode;
   /** Codex model source (Codex `model_provider`). Only consumed by Codex. */
   codexModelProvider?: string;
+  /**
+   * Codex account id (isolated `CODEX_HOME`). Only consumed by Codex;
+   * undefined / "default" uses the machine-wide `~/.codex` login.
+   */
+  codexAccountId?: string;
   /** Optional stable account key for per-account Codex event-spine rollout. */
   codexEventAccountId?: string;
+  feishuMcpConfig?: FeishuMcpConfig;
   /** Optional stable project key recorded on canonical Codex event envelopes. */
   codexEventProjectId?: string;
   /** Provider-neutral managed gateway settings. */
   llmGatewayConfig?: LlmGatewaySessionConfig;
+  /**
+   * Gateway API key id this session runs on (see the server's
+   * `llm-gateways/gateway-keys.ts`). Only consumed by Pi; undefined uses each
+   * channel's environment key.
+   */
+  llmGatewayKeyId?: string;
   /** Tool approval callback */
   onToolApproval?: CanUseTool;
   /**

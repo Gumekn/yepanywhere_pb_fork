@@ -17,12 +17,15 @@ import type { FeishuBindingStore } from "./channels/feishu/binding-store.js";
 import type { FeishuDurableInbox } from "./channels/feishu/inbox.js";
 import type { FeishuOperationStore } from "./channels/feishu/operation-store.js";
 import type { FeishuChannelService } from "./channels/feishu/service.js";
+import { CodexAccountsService } from "./codex-bridge/CodexAccountsService.js";
+import { readCodexAccountProfiles } from "./codex-bridge/codex-account-home.js";
 import type { CodexBridgeController } from "./codex-bridge/types.js";
 import { CodexAppServerHistoryReader } from "./codex-history/CodexAppServerHistoryReader.js";
 import { getCodexHistoryClient } from "./codex-history/CodexHistoryClient.js";
 import { CodexSessionCatalog } from "./codex-history/CodexSessionCatalog.js";
 import type { SessionTitleGenerationConfig } from "./config.js";
 import type { DeviceBridgeService } from "./device/DeviceBridgeService.js";
+import { SessionDisplayService } from "./display/SessionDisplayService.js";
 import type { FrontendProxy } from "./frontend/index.js";
 import type {
   SessionContentIndexService,
@@ -30,6 +33,7 @@ import type {
 } from "./indexes/index.js";
 import type { InteractionBroker } from "./interactions/InteractionBroker.js";
 import { SessionInteractionService } from "./interactions/SessionInteractionService.js";
+import { LlmGatewayKeysService } from "./llm-gateways/LlmGatewayKeysService.js";
 import { getLogger } from "./logging/logger.js";
 import type {
   ProjectMetadataService,
@@ -70,7 +74,9 @@ import type { RecentsService } from "./recents/index.js";
 import { createActivityRoutes } from "./routes/activity.js";
 import { createBrowserProfilesRoutes } from "./routes/browser-profiles.js";
 import { createClientLogsRoutes } from "./routes/client-logs.js";
+import { createCodexAccountsRoutes } from "./routes/codex-accounts.js";
 import { createCodexBridgeRoutes } from "./routes/codex-bridge.js";
+import { createCodexImageRoutes } from "./routes/codex-images.js";
 import {
   type CodexTranscriptStoreSource,
   createCodexTranscriptRoutes,
@@ -85,11 +91,13 @@ import {
 import { createDevRoutes } from "./routes/dev.js";
 import { createDeviceRoutes } from "./routes/devices.js";
 import { createFeishuChannelRoutes } from "./routes/feishu-channel.js";
+import { createFeishuUserAuthRoutes } from "./routes/feishu-user-auth.js";
 import { createFilesRoutes } from "./routes/files.js";
 import { createGitStatusRoutes } from "./routes/git-status.js";
 import { createGlobalSessionsRoutes } from "./routes/global-sessions.js";
 import { health } from "./routes/health.js";
 import { createInboxRoutes } from "./routes/inbox.js";
+import { createLlmGatewayKeysRoutes } from "./routes/llm-gateway-keys.js";
 import { createLocalFileRoutes } from "./routes/local-file.js";
 import { createLocalImageRoutes } from "./routes/local-image.js";
 import { createNetworkBindingRoutes } from "./routes/network-binding.js";
@@ -129,10 +137,13 @@ import { SessionCommandService } from "./services/SessionCommandService.js";
 import { SessionTitleService } from "./services/SessionTitleService.js";
 import type { SharingService } from "./services/SharingService.js";
 import { CodexSessionReader } from "./sessions/codex-reader.js";
-import { invalidateCodexSessionManifest } from "./sessions/codex-session-manifest.js";
+import { resolveExistingCodexRolloutPath } from "./sessions/codex-rollout-file.js";
+import {
+  getCodexSessionManifest,
+  invalidateCodexSessionManifest,
+} from "./sessions/codex-session-manifest.js";
 import { GeminiSessionReader } from "./sessions/gemini-reader.js";
 import { KimiSessionReader } from "./sessions/kimi-reader.js";
-import { normalizeSession } from "./sessions/normalization.js";
 import { PI_SESSIONS_DIR } from "./sessions/pi-files.js";
 import { PiSessionReader } from "./sessions/pi-reader.js";
 import { normalizeProviderGroup } from "./sessions/provider-groups.js";
@@ -142,6 +153,7 @@ import {
   resolveSessionSources,
 } from "./sessions/provider-resolution.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
+import { loadSessionTitleContext } from "./sessions/session-title-context.js";
 import type { ISessionReader } from "./sessions/types.js";
 import { ZCODE_DB_PATH } from "./sessions/zcode-db.js";
 import { ZCodeSessionReader } from "./sessions/zcode-reader.js";
@@ -260,8 +272,6 @@ export interface AppOptions {
   voiceInputEnabled?: boolean;
   /** Allowed directory prefixes for serving local images. Default: ["/tmp"] */
   allowedImagePaths?: string[];
-  /** Allowed directory prefixes for serving local markdown/text files. */
-  allowedLocalFilePaths?: string[];
   /** Directory containing Markdown report documents for the Reports page. */
   reportsDir?: string;
   /**
@@ -276,6 +286,7 @@ export interface AppOptions {
 }
 
 export interface AppResult {
+  sessionDisplayService: SessionDisplayService;
   app: Hono<{ Bindings: HttpBindings }>;
   /** Supervisor instance for debug API access */
   supervisor: Supervisor;
@@ -674,7 +685,23 @@ export function createApp(options: AppOptions): AppResult {
         }),
     );
   const codexHistoryClient =
-    codexEnabled && !options.sdk ? getCodexHistoryClient() : undefined;
+    codexEnabled && !options.sdk
+      ? getCodexHistoryClient({
+          resolveThreadCodexHome: (sessionId) => {
+            const accountId =
+              options.sessionMetadataService?.getCodexAccountId?.(sessionId);
+            if (!accountId || accountId === "default") return undefined;
+            // History databases are private per home even though rollouts are
+            // shared. Reading another home's empty projection is not history.
+            const profile = readCodexAccountProfiles(options.dataDir).find(
+              (account) => account.id === accountId,
+            );
+            if (!profile)
+              throw new Error("Codex history account is unavailable");
+            return profile.codexHome;
+          },
+        })
+      : undefined;
   const codexAppServerHistoryReader = codexHistoryClient
     ? new CodexAppServerHistoryReader({ client: codexHistoryClient })
     : undefined;
@@ -846,11 +873,16 @@ export function createApp(options: AppOptions): AppResult {
 
   // Bridge clients observe the shared Codex upstream and
   // replay lifecycle changes onto the EventBus. Teach them which sessions the
-  // Supervisor owns so they stay silent about ownership for owned sessions;
-  // otherwise a bridge poll racing the Supervisor's own ownership event flips
+  // agent runtime owns so they stay silent about ownership for owned sessions;
+  // otherwise a bridge poll racing the runtime's own ownership event flips
   // the client into a transient "external session" banner during resume.
-  const bridgeOwnershipResolver = (sessionId: string): boolean =>
-    Boolean(supervisor.getProcessForSession(sessionId));
+  //
+  // This must go through runtimeController, not the local Supervisor: with an
+  // external runtime the processes live in another process and the Supervisor
+  // created above owns nothing, so asking it would report every runtime-owned
+  // session as external.
+  const bridgeOwnershipResolver = async (sessionId: string): Promise<boolean> =>
+    Boolean(await runtimeController.getProcessForSession(sessionId));
   options.codexBridgeService?.setOwnershipResolver?.(bridgeOwnershipResolver);
 
   // Create external session tracker if eventBus is available
@@ -902,15 +934,29 @@ export function createApp(options: AppOptions): AppResult {
           },
           options.sessionMetadataService?.getProvider(sessionId),
         );
-        const loaded = await resolved?.source.reader.getSession(
+        if (!resolved) return null;
+        const session = await loadSessionTitleContext(
+          resolved.source.reader,
           sessionId,
           project.id,
-          undefined,
-          { includeOrphans: false },
+          codexAppServerHistoryReader &&
+            normalizeProviderGroup(resolved.summary.provider) === "codex"
+            ? {
+                getSession: async (id, pid, after, readOptions = {}) => {
+                  const result = await codexAppServerHistoryReader.getSession(
+                    id,
+                    pid,
+                    project.path,
+                    after,
+                    { ...readOptions, titleProjection: true },
+                  );
+                  return result.kind === "loaded" ? result.session : null;
+                },
+              }
+            : undefined,
         );
-        if (!loaded) return null;
+        if (!session) return null;
 
-        const session = normalizeSession(loaded);
         const metadata = options.sessionMetadataService?.getMetadata(sessionId);
         return {
           ...session,
@@ -1234,6 +1280,26 @@ export function createApp(options: AppOptions): AppResult {
     );
   }
 
+  // Multi-account Codex usage / login (works independently of the bridge).
+  if (options.dataDir) {
+    app.route(
+      "/api/codex-accounts",
+      createCodexAccountsRoutes({
+        codexAccountsService: new CodexAccountsService({
+          dataDir: options.dataDir,
+        }),
+      }),
+    );
+  }
+
+  // Selectable LLM gateway keys (Pi sessions pick one per session).
+  app.route(
+    "/api/llm-gateway-keys",
+    createLlmGatewayKeysRoutes({
+      llmGatewayKeysService: new LlmGatewayKeysService(),
+    }),
+  );
+
   const codexTranscriptStoreSources =
     options.codexTranscriptStoreSources ??
     (options.dataDir
@@ -1243,6 +1309,10 @@ export function createApp(options: AppOptions): AppResult {
             process.env.YEP_CODEX_EVENT_STORE_PATH?.trim(),
         })
       : []);
+
+  const sessionDisplayService = new SessionDisplayService({
+    runtime: runtimeController,
+  });
 
   // Mount API routes
   app.route(
@@ -1278,6 +1348,7 @@ export function createApp(options: AppOptions): AppResult {
   app.route(
     "/api",
     createSessionsRoutes({
+      sessionDisplayService,
       runtimeController,
       supervisor,
       scanner,
@@ -1546,6 +1617,10 @@ export function createApp(options: AppOptions): AppResult {
 
   if (options.feishuChannelService) {
     app.route(
+      "/api/auth/feishu",
+      createFeishuUserAuthRoutes(options.feishuChannelService),
+    );
+    app.route(
       "/api/channels/feishu",
       createFeishuChannelRoutes({
         feishuChannelService: options.feishuChannelService,
@@ -1610,6 +1685,17 @@ export function createApp(options: AppOptions): AppResult {
     );
   }
 
+  app.route(
+    "/api/sessions",
+    createCodexImageRoutes({
+      resolveSessionFile: async (sessionId) => {
+        const manifest = await getCodexSessionManifest(CODEX_SESSIONS_DIR);
+        const entry = manifest.byId.get(sessionId);
+        return entry ? resolveExistingCodexRolloutPath(entry.filePath) : null;
+      },
+    }),
+  );
+
   // Local image serving (opt-in, restricted to allowed paths)
   if (options.allowedImagePaths && options.allowedImagePaths.length > 0) {
     app.route(
@@ -1620,18 +1706,8 @@ export function createApp(options: AppOptions): AppResult {
     );
   }
 
-  // Local markdown/text file serving (opt-in, restricted to allowed paths)
-  if (
-    options.allowedLocalFilePaths &&
-    options.allowedLocalFilePaths.length > 0
-  ) {
-    app.route(
-      "/api/local-file",
-      createLocalFileRoutes({
-        allowedPaths: options.allowedLocalFilePaths,
-      }),
-    );
-  }
+  // Local document previews are available across projects and sessions.
+  app.route("/api/local-file", createLocalFileRoutes());
 
   // Push notification routes
   if (options.pushService) {
@@ -1692,6 +1768,7 @@ export function createApp(options: AppOptions): AppResult {
 
   return {
     app,
+    sessionDisplayService,
     supervisor,
     runtimeController,
     sessionInteractionService,

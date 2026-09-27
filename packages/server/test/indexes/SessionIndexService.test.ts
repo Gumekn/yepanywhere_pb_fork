@@ -332,48 +332,51 @@ describe("SessionIndexService", () => {
       expect(sessions).toHaveLength(1);
     });
 
-    it("rebuilds a v12 index instead of serving its stale derived summary", async () => {
-      // Entries are revalidated only against file size/mtime, so a session
-      // whose file never changes again keeps whatever the reader derived at
-      // index time. v12 predates the Pi context-usage fix, where an
-      // aborted/errored turn zeroed `contextUsage` — the composer/list ring
-      // would have shown 0% forever. Bumping the schema version is what
-      // retires those readings.
-      await createSession("session-1", "Real title");
-      const fileStats = await stat(join(sessionDir, "session-1.jsonl"));
-      const indexPath = service.getIndexPath(sessionDir);
-      await mkdir(join(testDir, "indexes"), { recursive: true });
-      await writeFile(
-        indexPath,
-        JSON.stringify({
-          version: 12,
-          projectId,
-          sessions: {
-            "session-1": {
-              title: "Stale title",
-              fullTitle: "Stale title",
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-              messageCount: 1,
-              contextUsage: { inputTokens: 0, percentage: 0 },
-              indexedBytes: fileStats.size,
-              fileMtime: fileStats.mtimeMs,
-              provider: "pi",
+    it.each([12, 13])(
+      "rebuilds a v%s index instead of serving its stale derived summary",
+      async (version) => {
+        // Entries are revalidated only against file size/mtime, so a session
+        // whose file never changes again keeps whatever the reader derived at
+        // index time. v12 predates the Pi context-usage fix, where an
+        // aborted/errored turn zeroed `contextUsage` — the composer/list ring
+        // would have shown 0% forever. Bumping the schema version is what
+        // retires those readings.
+        await createSession("session-1", "Real title");
+        const fileStats = await stat(join(sessionDir, "session-1.jsonl"));
+        const indexPath = service.getIndexPath(sessionDir);
+        await mkdir(join(testDir, "indexes"), { recursive: true });
+        await writeFile(
+          indexPath,
+          JSON.stringify({
+            version,
+            projectId,
+            sessions: {
+              "session-1": {
+                title: "Stale title",
+                fullTitle: "Stale title",
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                messageCount: 1,
+                contextUsage: { inputTokens: 0, percentage: 0 },
+                indexedBytes: fileStats.size,
+                fileMtime: fileStats.mtimeMs,
+                provider: "pi",
+              },
             },
-          },
-        }),
-      );
+          }),
+        );
 
-      const reloaded = new SessionIndexService({ dataDir, projectsDir });
-      await reloaded.initialize();
-      const sessions = await reloaded.getSessionsWithCache(
-        sessionDir,
-        projectId,
-        reader,
-      );
-      expect(sessions).toHaveLength(1);
-      expect(sessions[0]?.title).toBe("Real title");
-    });
+        const reloaded = new SessionIndexService({ dataDir, projectsDir });
+        await reloaded.initialize();
+        const sessions = await reloaded.getSessionsWithCache(
+          sessionDir,
+          projectId,
+          reader,
+        );
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]?.title).toBe("Real title");
+      },
+    );
 
     it("rebuilds a current-version index containing a poisoned Kimi title", async () => {
       await createSession("session-1", "Recovered title");
@@ -384,7 +387,7 @@ describe("SessionIndexService", () => {
       await writeFile(
         indexPath,
         JSON.stringify({
-          version: 13,
+          version: 14,
           projectId,
           sessions: {
             "session-1": {
@@ -668,6 +671,96 @@ describe("SessionIndexService", () => {
         expect(refreshed[0]?.title).toBe("Updated title");
       },
     );
+
+    it("refreshes a modified Pi session on the stale list path", async () => {
+      const eventBus = new EventBus();
+      const piService = new SessionIndexService({
+        dataDir,
+        projectsDir,
+        eventBus,
+        fullValidationIntervalMs: 60_000,
+        fullValidationMinIntervalMs: 60_000,
+      });
+      await piService.initialize();
+
+      const piDir = join(testDir, "pi-sessions");
+      await mkdir(piDir, { recursive: true });
+      const piSessionId = "01a0d292-23f4-7697-b039-1d66a9ca6a9a";
+      const piFile = join(
+        piDir,
+        `2026-09-24T08-39-47-956Z_${piSessionId}.jsonl`,
+      );
+      await writeFile(piFile, "interrupted\n");
+
+      const piReader: ISessionReader = {
+        getIndexScopeKey: (dir) => `pi::${dir}::/tmp/project`,
+        listSessionFiles: async () => [
+          { sessionId: piSessionId, filePath: piFile },
+        ],
+        getSessionFilePath: async () => piFile,
+        getSessionSummaryIfChanged: async (
+          sessionId,
+          scopedProjectId,
+          cachedMtime,
+          cachedSize,
+        ) => {
+          const stats = await stat(piFile);
+          if (stats.mtimeMs === cachedMtime && stats.size === cachedSize) {
+            return null;
+          }
+          const summary = await piReader.getSessionSummary(
+            sessionId,
+            scopedProjectId,
+          );
+          return summary
+            ? { summary, mtime: stats.mtimeMs, size: stats.size }
+            : null;
+        },
+        getSessionSummary: async (sessionId, scopedProjectId) => {
+          const status = (await readFile(piFile, "utf-8")).trim();
+          return {
+            id: sessionId,
+            projectId: scopedProjectId,
+            title: "pi",
+            fullTitle: "pi",
+            createdAt: "2026-09-24T08:39:47.956Z",
+            updatedAt: "2026-09-24T08:39:47.956Z",
+            messageCount: 2,
+            ownership: { owner: "none" },
+            provider: "pi",
+            lastTurnStatus: status as SessionSummary["lastTurnStatus"],
+          };
+        },
+        getAgentMappings: async () => [],
+        getAgentSession: async () => null,
+      };
+
+      const first = await piService.getSessionsWithCache(
+        piDir,
+        projectId,
+        piReader,
+      );
+      expect(first[0]?.lastTurnStatus).toBe("interrupted");
+
+      await writeFile(piFile, "completed\n");
+      eventBus.emit({
+        type: "file-change",
+        provider: "pi",
+        path: piFile,
+        relativePath: `--tmp-project--/${piFile.split("/").at(-1)}`,
+        changeType: "modify",
+        timestamp: new Date().toISOString(),
+        fileType: "session",
+      });
+
+      const refreshed = await piService.getSessionsWithCache(
+        piDir,
+        projectId,
+        piReader,
+        { allowStale: true },
+      );
+      expect(refreshed[0]?.lastTurnStatus).toBe("completed");
+    });
 
     it.each(["gemini", "kimi"] as const)(
       "does not leak a modified %s session into another project scope",
@@ -1018,7 +1111,7 @@ describe("SessionIndexService", () => {
       await writeFile(
         indexPath,
         JSON.stringify({
-          version: 13,
+          version: 14,
           projectId,
           sessions: {
             legacy: {

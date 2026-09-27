@@ -55,6 +55,7 @@ export interface MessageInputToolbarProps {
   isThinking?: boolean;
   onStop?: () => void;
   onSend?: () => void;
+  onInterruptSend?: () => void;
   /** Queue a deferred message. Only provided when agent is running. */
   onQueue?: () => void;
   canSend?: boolean;
@@ -97,6 +98,7 @@ export function MessageInputToolbar({
   isThinking,
   onStop,
   onSend,
+  onInterruptSend,
   onQueue,
   canSend,
   disabled,
@@ -106,6 +108,13 @@ export function MessageInputToolbar({
   const { thinkingMode, cycleThinkingMode, thinkingLevel } = useModelSettings();
   const [isContextModalOpen, setIsContextModalOpen] = useState(false);
   const showStop = isRunning && onStop && isThinking;
+  const replyOnSend = provider === "codex";
+  const activeSendLabel = t(
+    replyOnSend ? "toolbarReplyContinueLabel" : "toolbarInsertLabel",
+  );
+  const activeSendTitle = t(
+    replyOnSend ? "toolbarReplyContinueTitle" : "toolbarInsertTitle",
+  );
   const visibleCommandButtons =
     commandButtons?.filter((button) => button.showButton) ??
     (showCommandButton
@@ -232,6 +241,17 @@ export function MessageInputToolbar({
               label={button.label}
             />
           ))}
+        <ContextUsageIndicator
+          usage={contextUsage}
+          size={16}
+          labelMode="tokens"
+          onClick={
+            projectId && sessionId
+              ? () => setIsContextModalOpen(true)
+              : undefined
+          }
+          ariaLabel={t("contextBreakdownTitle")}
+        />
       </div>
       <div className="message-input-actions">
         {/* Pending approval indicator */}
@@ -254,17 +274,6 @@ export function MessageInputToolbar({
             </span>
           </button>
         )}
-        <ContextUsageIndicator
-          usage={contextUsage}
-          size={16}
-          labelMode="tokens"
-          onClick={
-            projectId && sessionId
-              ? () => setIsContextModalOpen(true)
-              : undefined
-          }
-          ariaLabel={t("contextBreakdownTitle")}
-        />
         {/* Keep both submission choices visible while the agent is running. */}
         {onQueue && (
           <button
@@ -296,19 +305,52 @@ export function MessageInputToolbar({
             <span>{t("toolbarQueueLabel")}</span>
           </button>
         )}
+        {onInterruptSend && (
+          <button
+            type="button"
+            onClick={onInterruptSend}
+            disabled={disabled || !canSend}
+            className="queue-button message-submit-choice"
+            title={t("toolbarInterruptTitle")}
+            aria-label={t("toolbarInterruptLabel")}
+          >
+            <span className="message-submit-label-full">
+              {t("toolbarInterruptLabel")}
+            </span>
+            <span className="message-submit-label-compact" aria-hidden="true">
+              {t("toolbarInterruptCompact")}
+            </span>
+          </button>
+        )}
         {onSend && (onQueue || !showStop || canSend) && (
           <button
             type="button"
             onClick={onSend}
             disabled={disabled || !canSend}
             className={`send-button${onQueue ? " message-submit-choice" : ""}`}
-            title={onQueue ? t("toolbarInsertTitle") : undefined}
-            aria-label={onQueue ? t("toolbarInsertLabel") : t("toolbarSend")}
+            title={onQueue ? activeSendTitle : undefined}
+            aria-label={onQueue ? activeSendLabel : t("toolbarSend")}
           >
             <span className="send-icon" aria-hidden="true">
               ↑
             </span>
-            {onQueue && <span>{t("toolbarInsertLabel")}</span>}
+            {onQueue && (
+              <>
+                <span className="message-submit-label-full">
+                  {activeSendLabel}
+                </span>
+                <span
+                  className="message-submit-label-compact"
+                  aria-hidden="true"
+                >
+                  {t(
+                    replyOnSend
+                      ? "toolbarReplyContinueCompact"
+                      : "toolbarInsertCompact",
+                  )}
+                </span>
+              </>
+            )}
           </button>
         )}
         {showStop && (onQueue || !canSend) && (

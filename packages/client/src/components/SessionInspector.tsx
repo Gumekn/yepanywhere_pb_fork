@@ -1,8 +1,16 @@
-import type { MarkdownAugment, SessionQuestion } from "@yep-anywhere/shared";
+import type {
+  MarkdownAugment,
+  SessionFileActivity,
+  SessionFileActivityKind,
+  SessionFileCoverageReason,
+  SessionQuestion,
+} from "@yep-anywhere/shared";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { useDocumentVisibility } from "../hooks/useDocumentVisibility";
 import { useGitStatus } from "../hooks/useGitStatus";
+import { useSessionFileIndex } from "../hooks/useSessionFileIndex";
 import { useI18n } from "../i18n";
 import { formatSmartTime } from "../lib/datetime";
 import {
@@ -23,7 +31,10 @@ import type {
   RenderItem,
   ToolCallItem,
 } from "../types/renderItems";
+import { FileViewerModal } from "./FilePathLink";
 import { ProviderBadge } from "./ProviderBadge";
+import { SessionFileDiffPanel } from "./SessionFileDiffPanel";
+import { SessionSavedFilePanel } from "./SessionSavedFilePanel";
 import { CodexNativeGoalBlock } from "./blocks/codex/CodexNativeGoalBlock";
 import {
   type ChecklistItem,
@@ -32,10 +43,22 @@ import {
 
 type InspectorPresentation = "sidebar" | "drawer";
 type InspectorTab = "questions" | "files" | "checks" | "git";
-type FileActivityKind = "modified" | "read" | "searched" | "other";
+type FileActivityKind = SessionFileActivityKind;
 type CheckStatus = "passed" | "failed" | "running" | "pending";
 type CodexMessagePhase = "commentary" | "final_answer";
 type TFunction = ReturnType<typeof useI18n>["t"];
+
+const COVERAGE_REASON_KEYS: Record<
+  SessionFileCoverageReason,
+  Parameters<TFunction>[0]
+> = {
+  "byte-budget": "sessionSavedCoverageBudget",
+  "too-large": "sessionSavedCoverageFileSize",
+  "entry-limit": "sessionSavedCoverageEntries",
+  "file-unavailable": "sessionSavedCoverageUnavailable",
+  "execution-partial": "sessionSavedCoverageExecution",
+  "workspace-mismatch": "sessionSavedCoverageWorkspace",
+};
 
 interface SessionInspectorProps {
   presentation: InspectorPresentation;
@@ -52,6 +75,7 @@ interface SessionInspectorProps {
   activeToolApproval?: ActiveToolApproval;
   projectId: string;
   sessionId: string;
+  branchId?: string;
   provider?: ProviderName;
   model?: string;
   reasoningEffort?: string;
@@ -68,15 +92,6 @@ interface QuestionItem {
   timestamp?: string;
   clientUserMessageId?: string;
   codexCorrelationKey?: string;
-}
-
-interface FileActivity {
-  path: string;
-  kind: FileActivityKind;
-  tools: Set<string>;
-  count: number;
-  messageId: string;
-  lastIndex: number;
 }
 
 interface CheckItem {
@@ -111,7 +126,7 @@ interface SubagentItem {
   sessionId: string;
   description: string;
   agent?: string;
-  status: ToolCallItem["status"];
+  status: ToolCallItem["status"] | "unknown";
 }
 
 interface CodexChannelSummary {
@@ -149,6 +164,7 @@ export function SessionInspector({
   activeToolApproval,
   projectId,
   sessionId,
+  branchId,
   provider,
   model,
   reasoningEffort,
@@ -161,56 +177,87 @@ export function SessionInspector({
   const { t, locale } = useI18n();
   const [activeTab, setActiveTab] = useState<InspectorTab>("questions");
   const [copiedSessionId, setCopiedSessionId] = useState(false);
+  const pageVisible = useDocumentVisibility();
+  const isVisible = isOpen && pageVisible;
   const {
     gitStatus,
     loading: gitLoading,
     error: gitError,
-  } = useGitStatus(projectId);
+  } = useGitStatus(isVisible && activeTab === "git" ? projectId : undefined);
   const isCodexProvider = provider === "codex" || provider === "codex-oss";
 
   const renderItems = useMemo(
     () =>
-      preprocessMessages(messages, {
-        markdown: markdownAugments,
-        activeToolApproval,
-      }),
-    [activeToolApproval, markdownAugments, messages],
+      isVisible
+        ? preprocessMessages(messages, {
+            markdown: markdownAugments,
+            activeToolApproval,
+          })
+        : [],
+    [isVisible, activeToolApproval, markdownAugments, messages],
   );
 
   const messageQuestions = useMemo(
-    () => buildQuestionItems(renderItems),
-    [renderItems],
+    () => (isVisible ? buildQuestionItems(renderItems) : []),
+    [isVisible, renderItems],
   );
   const questions = useMemo(
-    () => mergeQuestionItems(userQuestions, messageQuestions),
-    [messageQuestions, userQuestions],
+    () =>
+      isVisible ? mergeQuestionItems(userQuestions, messageQuestions) : [],
+    [isVisible, messageQuestions, userQuestions],
   );
-  const fileActivities = useMemo(
-    () => buildFileActivities(renderItems),
-    [renderItems],
+  const checks = useMemo(
+    () =>
+      isVisible && activeTab === "checks" ? buildCheckItems(renderItems) : [],
+    [isVisible, activeTab, renderItems],
   );
-  const checks = useMemo(() => buildCheckItems(renderItems), [renderItems]);
   const subagents = useMemo(
-    () => buildSubagentItems(renderItems),
-    [renderItems],
+    () => (isVisible ? buildSubagentItems(renderItems) : []),
+    [isVisible, renderItems],
   );
   const planProgress = useMemo(
-    () => buildPlanProgress(renderItems, t),
-    [renderItems, t],
+    () => (isVisible ? buildPlanProgress(renderItems, t) : null),
+    [isVisible, renderItems, t],
   );
   const currentCodexGoal = useMemo(
-    () => (isCodexProvider ? buildCurrentCodexGoal(renderItems) : null),
-    [isCodexProvider, renderItems],
+    () =>
+      isVisible && isCodexProvider ? buildCurrentCodexGoal(renderItems) : null,
+    [isVisible, isCodexProvider, renderItems],
   );
   const codexChannelSummaries = useMemo(
-    () => (isCodexProvider ? buildCodexChannelSummaries(messages) : []),
-    [isCodexProvider, messages],
+    () =>
+      isVisible && isCodexProvider ? buildCodexChannelSummaries(messages) : [],
+    [isVisible, isCodexProvider, messages],
   );
   const legacyDetailsDeferred = !hasLegacyDetails && processState === "in-turn";
 
+  // Server-derived index covers the whole session, including files touched by
+  // turns the client never paged in and writes performed via shell commands.
+  const {
+    index: fileIndex,
+    loading: fileIndexLoading,
+    error: fileIndexError,
+  } = useSessionFileIndex(projectId, sessionId, {
+    enabled: isVisible && activeTab === "files",
+    branchId,
+    revision: `${messages.length}:${status.owner}:${processState ?? ""}`,
+  });
+  const snapshotProvider = provider === "codex" || provider === "pi";
+  const fileActivitiesFallback = useMemo(
+    () =>
+      isVisible && activeTab === "files" && !snapshotProvider && !fileIndex
+        ? buildFileActivities(renderItems)
+        : [],
+    [isVisible, activeTab, snapshotProvider, fileIndex, renderItems],
+  );
+  const fileActivities =
+    fileIndex?.files ?? (snapshotProvider ? [] : fileActivitiesFallback);
+  const fileIndexPending =
+    !fileIndex && fileIndexLoading && fileActivities.length === 0;
+
   useEffect(() => {
     if (
-      !isOpen ||
+      !isVisible ||
       hasLegacyDetails ||
       legacyDetailsDeferred ||
       legacyDetailsLoading ||
@@ -221,7 +268,7 @@ export function SessionInspector({
     void onLoadLegacyDetails?.();
   }, [
     hasLegacyDetails,
-    isOpen,
+    isVisible,
     legacyDetailsDeferred,
     legacyDetailsError,
     legacyDetailsLoading,
@@ -249,6 +296,8 @@ export function SessionInspector({
       console.error("Failed to copy session ID:", error);
     }
   };
+
+  if (presentation === "drawer" && !isOpen) return null;
 
   const body = (
     <>
@@ -481,8 +530,40 @@ export function SessionInspector({
             title={t("sessionInspectorFiles")}
             count={fileActivities.length}
           >
-            {(legacyDetailsLoading || legacyDetailsDeferred) &&
-            !hasLegacyDetails ? (
+            {fileIndex?.source === "operation" ? (
+              <EmptyState text={t("sessionOperationCoverage")} />
+            ) : null}
+            {fileIndex?.source === "snapshot" ? (
+              <EmptyState text={t("sessionOperationLegacy")} />
+            ) : null}
+            {fileIndex?.unavailableOperations ? (
+              <EmptyState
+                text={t("sessionOperationUnknown", {
+                  count: fileIndex.unavailableOperations,
+                })}
+              />
+            ) : null}
+            {fileIndex?.coverageIncomplete ? (
+              <EmptyState
+                text={[
+                  t("sessionSavedPartial"),
+                  ...Array.from(
+                    new Set(fileIndex.coverageReasons ?? []),
+                  ).flatMap((reason) =>
+                    COVERAGE_REASON_KEYS[reason]
+                      ? [t(COVERAGE_REASON_KEYS[reason])]
+                      : [],
+                  ),
+                ].join(" ")}
+              />
+            ) : null}
+            {snapshotProvider && fileIndexError ? (
+              <EmptyState text={t("sessionSavedUnavailable")} />
+            ) : null}
+            {!snapshotProvider &&
+            !fileIndex &&
+            !hasLegacyDetails &&
+            (legacyDetailsLoading || legacyDetailsDeferred) ? (
               <EmptyState
                 text={t(
                   legacyDetailsDeferred
@@ -491,34 +572,28 @@ export function SessionInspector({
                 )}
               />
             ) : fileActivities.length > 0 ? (
-              <ul className="session-inspector-list">
-                {fileActivities.slice(0, 10).map((activity) => (
-                  <li key={activity.path}>
-                    <button
-                      type="button"
-                      className="session-inspector-row"
-                      onClick={() => handleSelect(activity.messageId)}
-                      title={activity.path}
-                    >
-                      <span
-                        className={`session-inspector-file-dot kind-${activity.kind}`}
-                      />
-                      <span className="session-inspector-row-main">
-                        <span className="session-inspector-row-title">
-                          {shortPath(activity.path)}
-                        </span>
-                        <span className="session-inspector-row-meta">
-                          {getFileKindLabel(t, activity.kind)} -{" "}
-                          {[...activity.tools].slice(0, 3).join(", ")}
-                          {activity.count > 1 ? ` - ${activity.count}` : ""}
-                        </span>
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
+              <InspectorFilesTab
+                key={`${sessionId}:${branchId ?? ""}`}
+                branchId={branchId}
+                activities={fileActivities}
+                projectId={projectId}
+                sessionId={sessionId}
+                truncated={fileIndex?.truncated === true}
+                onSelectMessage={handleSelect}
+                t={t}
+              />
+            ) : fileIndexPending ? (
+              <EmptyState text={t("sessionInspectorLoadingDetails")} />
             ) : (
-              <EmptyState text={t("sessionInspectorNoFiles")} />
+              <EmptyState
+                text={t(
+                  fileIndex?.source === "operation"
+                    ? "sessionOperationNoFiles"
+                    : snapshotProvider
+                      ? "sessionSavedNoFiles"
+                      : "sessionInspectorNoFiles",
+                )}
+              />
             )}
           </InspectorSection>
         ) : null}
@@ -645,7 +720,6 @@ export function SessionInspector({
   );
 
   if (presentation === "drawer") {
-    if (!isOpen) return null;
     return (
       <div
         className="session-inspector-overlay"
@@ -710,6 +784,235 @@ function InspectorSection({
 
 function EmptyState({ text }: { text: string }) {
   return <div className="session-inspector-empty">{text}</div>;
+}
+
+const FILE_GROUP_ORDER: FileActivityKind[] = [
+  "modified",
+  "read",
+  "searched",
+  "other",
+];
+const FILE_GROUP_PAGE = 25;
+
+/**
+ * Files touched by the session, grouped by what happened to them.
+ *
+ * Rows open the file itself (the point of the panel); the secondary action
+ * jumps back to the message that touched it.
+ */
+function InspectorFilesTab({
+  activities,
+  projectId,
+  sessionId,
+  branchId,
+  truncated,
+  onSelectMessage,
+  t,
+}: {
+  activities: SessionFileActivity[];
+  projectId: string;
+  sessionId: string;
+  branchId?: string;
+  truncated: boolean;
+  onSelectMessage: (messageId: string) => void;
+  t: TFunction;
+}) {
+  const [openFile, setOpenFile] = useState<{
+    path: string;
+    mode: "diff" | "file" | "saved";
+  } | null>(null);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+
+  const groups = useMemo(() => {
+    const byKind = new Map<FileActivityKind, SessionFileActivity[]>();
+    for (const activity of activities) {
+      const bucket = byKind.get(activity.kind);
+      if (bucket) bucket.push(activity);
+      else byKind.set(activity.kind, [activity]);
+    }
+    return FILE_GROUP_ORDER.flatMap((kind) => {
+      const items = byKind.get(kind);
+      return items && items.length > 0 ? [{ kind, items }] : [];
+    });
+  }, [activities]);
+
+  const selectedActivity = activities.find(
+    (file) => file.path === openFile?.path,
+  );
+
+  return (
+    <>
+      {groups.map(({ kind, items }) => {
+        const isExpanded = expanded[kind] === true;
+        const visible = isExpanded ? items : items.slice(0, FILE_GROUP_PAGE);
+        return (
+          <div className="session-inspector-file-group" key={kind}>
+            <div className="session-inspector-file-group-title">
+              {getFileKindLabel(t, kind)}
+              <span className="session-inspector-file-group-count">
+                {items.length}
+              </span>
+            </div>
+            <ul className="session-inspector-list">
+              {visible.map((activity) => (
+                <li className="session-inspector-file-row" key={activity.path}>
+                  <button
+                    type="button"
+                    className="session-inspector-row"
+                    onClick={() =>
+                      setOpenFile({
+                        path: activity.path,
+                        // Only files with a measurable delta have a diff to show.
+                        mode: activity.savedVersions?.length
+                          ? "saved"
+                          : hasDelta(activity)
+                            ? "diff"
+                            : "file",
+                      })
+                    }
+                    disabled={activity.outsideProject}
+                    title={activity.path}
+                  >
+                    <span
+                      className={`session-inspector-file-dot kind-${activity.kind}`}
+                    />
+                    <span className="session-inspector-row-main">
+                      <span className="session-inspector-row-title">
+                        {shortPath(activity.path)}
+                      </span>
+                      <span className="session-inspector-row-meta">
+                        {activity.source === "operation"
+                          ? t("sessionOperationTotals")
+                          : activity.source === "snapshot"
+                            ? t("sessionSavedObserved")
+                            : activity.tools.slice(0, 3).join(", ")}
+                        {activity.unknownOperations
+                          ? ` · ${t("sessionOperationUnknown", { count: activity.unknownOperations })}`
+                          : ""}
+                        {activity.count > 1 ? ` - ${activity.count}` : ""}
+                        {activity.confidence === "low"
+                          ? ` - ${t("sessionInspectorFileMaybe")}`
+                          : ""}
+                      </span>
+                    </span>
+                    {activity.additions !== undefined ||
+                    activity.deletions !== undefined ||
+                    activity.unknownOperations ? (
+                      <span
+                        className="session-inspector-file-delta"
+                        title={
+                          activity.source === "operation"
+                            ? t("sessionOperationTotals")
+                            : activity.source === "snapshot"
+                              ? t("sessionSavedLineCounts")
+                              : undefined
+                        }
+                      >
+                        {activity.additions !== undefined ? (
+                          <span className="git-lines-added">
+                            +{activity.additions}
+                          </span>
+                        ) : null}
+                        {activity.deletions !== undefined ? (
+                          <span className="git-lines-deleted">
+                            -{activity.deletions}
+                          </span>
+                        ) : null}
+                        {activity.unknownOperations ? (
+                          <span>
+                            {t(
+                              activity.knownOperations
+                                ? "sessionOperationPartialStats"
+                                : "sessionOperationUnknownStats",
+                            )}
+                          </span>
+                        ) : null}
+                      </span>
+                    ) : null}
+                  </button>
+                  <button
+                    type="button"
+                    className="session-inspector-file-jump"
+                    onClick={() => onSelectMessage(activity.messageId)}
+                    title={t("sessionInspectorJumpToMessage")}
+                    aria-label={t("sessionInspectorJumpToMessage")}
+                  >
+                    <JumpToMessageIcon />
+                  </button>
+                </li>
+              ))}
+            </ul>
+            {items.length > visible.length ? (
+              <button
+                type="button"
+                className="session-inspector-file-more"
+                onClick={() =>
+                  setExpanded((prev) => ({ ...prev, [kind]: true }))
+                }
+              >
+                {t("sessionInspectorShowAll")} ({items.length})
+              </button>
+            ) : null}
+          </div>
+        );
+      })}
+      {truncated ? (
+        <div className="session-inspector-file-truncated">
+          {t("sessionInspectorFilesTruncated")}
+        </div>
+      ) : null}
+      {openFile?.mode === "saved" && selectedActivity ? (
+        <SessionSavedFilePanel
+          projectId={projectId}
+          sessionId={sessionId}
+          branchId={branchId}
+          file={selectedActivity}
+          onClose={() => setOpenFile(null)}
+          onOpenCurrent={() =>
+            setOpenFile({ path: openFile.path, mode: "file" })
+          }
+        />
+      ) : openFile?.mode === "diff" ? (
+        <SessionFileDiffPanel
+          projectId={projectId}
+          sessionId={sessionId}
+          branchId={branchId}
+          filePath={openFile.path}
+          onClose={() => setOpenFile(null)}
+          onOpenFile={() => setOpenFile({ path: openFile.path, mode: "file" })}
+        />
+      ) : openFile?.mode === "file" ? (
+        <FileViewerModal
+          projectId={projectId}
+          filePath={openFile.path}
+          onClose={() => setOpenFile(null)}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function hasDelta(activity: SessionFileActivity): boolean {
+  return (activity.additions ?? 0) > 0 || (activity.deletions ?? 0) > 0;
+}
+
+function JumpToMessageIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M14 3v4a3 3 0 0 1-3 3H3" />
+      <path d="m6 7-3 3 3 3" />
+    </svg>
+  );
 }
 
 function InspectorPlanProgress({
@@ -1016,7 +1319,7 @@ function buildCodexChannelSummaries(
 
   for (const message of messages) {
     const phase = getCodexMessagePhase(message.codexMessagePhase);
-    if (!phase || message.type !== "assistant") {
+    if (!phase || message.type !== "assistant" || message.codexAsyncMessage) {
       continue;
     }
 
@@ -1049,8 +1352,11 @@ function getCodexMessagePhase(value: unknown): CodexMessagePhase | null {
   return value === "commentary" || value === "final_answer" ? value : null;
 }
 
-function buildFileActivities(items: RenderItem[]): FileActivity[] {
-  const grouped = new Map<string, FileActivity>();
+function buildFileActivities(items: RenderItem[]): SessionFileActivity[] {
+  const grouped = new Map<
+    string,
+    { activity: SessionFileActivity; lastIndex: number }
+  >();
 
   items.forEach((item, index) => {
     if (item.type !== "tool_call") return;
@@ -1064,27 +1370,39 @@ function buildFileActivities(items: RenderItem[]): FileActivity[] {
     for (const path of paths) {
       const existing = grouped.get(path);
       if (existing) {
-        existing.count += 1;
-        existing.tools.add(item.toolName);
+        existing.activity.count += 1;
+        if (!existing.activity.tools.includes(item.toolName)) {
+          existing.activity.tools.push(item.toolName);
+        }
         if (index >= existing.lastIndex) {
-          existing.kind = prioritizeFileKind(existing.kind, kind);
-          existing.messageId = messageId;
+          existing.activity.kind = prioritizeFileKind(
+            existing.activity.kind,
+            kind,
+          );
+          existing.activity.messageId = messageId;
           existing.lastIndex = index;
         }
       } else {
         grouped.set(path, {
-          path,
-          kind,
-          tools: new Set([item.toolName]),
-          count: 1,
-          messageId,
           lastIndex: index,
+          activity: {
+            path,
+            outsideProject: false,
+            kind,
+            tools: [item.toolName],
+            count: 1,
+            source: "tool",
+            confidence: "high",
+            messageId,
+          },
         });
       }
     }
   });
 
-  return [...grouped.values()].sort((a, b) => b.lastIndex - a.lastIndex);
+  return [...grouped.values()]
+    .sort((a, b) => b.lastIndex - a.lastIndex)
+    .map((entry) => entry.activity);
 }
 
 function buildCheckItems(items: RenderItem[]): CheckItem[] {
@@ -1148,18 +1466,27 @@ function buildSubagentItems(items: RenderItem[]): SubagentItem[] {
       const kind =
         typeof threadItem.kind === "string" ? threadItem.kind : undefined;
       const description = agentPath ?? sessionId;
-      const status: ToolCallItem["status"] =
-        kind?.toLowerCase() === "interrupted" ? "aborted" : "pending";
       const existingIndex = resultIndexBySessionId.get(sessionId);
+      const existing =
+        existingIndex === undefined ? undefined : result[existingIndex];
+      // A message can be queued for an idle agent. Like Codex TUI, do not
+      // interpret "interacted" as evidence of a new running turn.
+      const status: SubagentItem["status"] =
+        kind?.toLowerCase() === "started"
+          ? "pending"
+          : kind?.toLowerCase() === "completed"
+            ? "complete"
+            : kind?.toLowerCase() === "interrupted"
+              ? "aborted"
+              : (existing?.status ?? "unknown");
       if (existingIndex === undefined) {
         resultIndexBySessionId.set(sessionId, result.length);
         result.push({ sessionId, description, status });
       } else {
-        const existing = result[existingIndex];
         if (existing) {
           result[existingIndex] = {
             ...existing,
-            description,
+            description: agentPath ?? existing.description,
             status,
           };
         }
@@ -1232,7 +1559,7 @@ function collabAgentStatusToItemStatus(status: string): ToolCallItem["status"] {
 
 function getSubagentStatusLabel(
   t: TFunction,
-  status: ToolCallItem["status"],
+  status: SubagentItem["status"],
 ): string {
   switch (status) {
     case "pending":
@@ -1241,15 +1568,19 @@ function getSubagentStatusLabel(
       return t("subagentStatusFailed");
     case "aborted":
       return t("subagentStatusInterrupted");
+    case "unknown":
+      return t("subagentStatusUnknown");
     default:
       return t("subagentStatusCompleted");
   }
 }
 
-function getSubagentDotStatus(status: ToolCallItem["status"]): CheckStatus {
+function getSubagentDotStatus(status: SubagentItem["status"]): CheckStatus {
   switch (status) {
     case "pending":
       return "running";
+    case "unknown":
+      return "pending";
     case "error":
     case "aborted":
       return "failed";

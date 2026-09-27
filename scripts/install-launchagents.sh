@@ -30,15 +30,29 @@ source "$SCRIPT_DIR/lib/deploy-env.sh"
 # shellcheck source=scripts/lib/deploy-lock.sh
 source "$SCRIPT_DIR/lib/deploy-lock.sh"
 load_deploy_env_file
+# shellcheck source=scripts/lib/deploy-runtime.sh
+source "$SCRIPT_DIR/lib/deploy-runtime.sh"
 
 SERVER_LABEL="${YEP_LAUNCHD_SERVER_LABEL:-com.yueyuan.yepanywhere.server}"
 BRIDGE_LABEL="${YEP_LAUNCHD_BRIDGE_LABEL:-com.yueyuan.yepanywhere.codex-bridge}"
+RUNTIME_LABEL="${YEP_LAUNCHD_RUNTIME_LABEL:-com.yueyuan.yepanywhere.runtime}"
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
 SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
 SERVER_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
 SERVER_ALLOWED_HOSTS="${ALLOWED_HOSTS:-}"
 BRIDGE_PORT="${YEP_CODEX_BRIDGE_PORT:-${CODEX_BRIDGE_PORT:-4510}}"
 BRIDGE_URL="${YEP_CODEX_BRIDGE_CONTROL_URL:-${CODEX_BRIDGE_CONTROL_URL:-http://127.0.0.1:${BRIDGE_PORT}}}"
+# External runtime splits live agent processes out of the web/API shell so the
+# shell can be redeployed without aborting active turns. Opt-in: switching a
+# running deployment between embedded and external costs one restart.
+resolve_deploy_runtime "$HOME/Library/LaunchAgents/$SERVER_LABEL.plist" "$SERVER_PORT"
+RUNTIME_PORT="$DEPLOY_RUNTIME_PORT"
+RUNTIME_URL="$DEPLOY_RUNTIME_URL"
+case "${YEP_RUNTIME_EXTERNAL:-}" in
+  1|true|yes|external) RUNTIME_EXTERNAL=true ;;
+  "") RUNTIME_EXTERNAL=false; [[ "$DEPLOY_RUNTIME_MODE" != external ]] || RUNTIME_EXTERNAL=true ;;
+  *) RUNTIME_EXTERNAL=false ;;
+esac
 CODEX_CLI_PATH="${YEP_CODEX_PATH:-${CODEX_PATH:-}}"
 if [[ -n "${YEP_LAUNCHD_NODE:-}" ]]; then
   NODE_BIN="$YEP_LAUNCHD_NODE"
@@ -69,18 +83,24 @@ USER_DOMAIN="gui/$(id -u)"
 START_NOW=true
 INSTALL_SERVER=true
 INSTALL_CODEX_BRIDGE=true
+INSTALL_RUNTIME_EXPLICIT=false
+INSTALL_RUNTIME_ONLY=false
 
 usage() {
   sed -n '2,6p' "$0" | sed 's/^# *//'
   cat <<'EOF'
 
 Usage:
-  scripts/install-launchagents.sh [--server-only|--bridge-only] [--no-start]
+  scripts/install-launchagents.sh [--server-only|--bridge-only|--runtime-only] [--no-start]
 
 Options:
   --server-only                Write/reload only the 8022 server LaunchAgent
   --bridge-only, --codex-bridge-only
                                Write/reload only the 4510 Codex bridge LaunchAgent
+  --runtime-only               Write/reload only the agent runtime LaunchAgent
+                               (implies YEP_RUNTIME_EXTERNAL=true)
+  --external-runtime           Install the agent runtime LaunchAgent alongside the
+                               server and point the server at it
   --no-start                   Write plist file(s) without unloading or starting LaunchAgents
   --server-plist PATH          Write the server definition to PATH
 
@@ -93,6 +113,12 @@ Environment overrides:
                                (default: sibling research_tasks directory)
   RESEARCH_TASKS_DIR           Legacy fallback when YEP_REPORTS_DIR is unset
   YEP_CODEX_BRIDGE_PORT        Codex bridge port (default: 4510)
+  YEP_RUNTIME_EXTERNAL         Set to true to run the agent runtime as its own
+                               LaunchAgent so 8022 restarts keep live turns alive
+  YEP_RUNTIME_PORT             Agent runtime control port (default: server port + 3)
+  YEP_RUNTIME_CONTROL_URL      Agent runtime control URL (default: http://127.0.0.1:<runtime port>)
+  YEP_LAUNCHD_RUNTIME_LABEL    Agent runtime LaunchAgent label
+                               (default: com.yueyuan.yepanywhere.runtime)
   YEP_LAUNCHD_NODE             Absolute node binary path
   YEP_LAUNCHD_PATH             PATH stored in the LaunchAgent environment
   YEP_CODEX_PATH               Absolute Codex CLI path stored for server/bridge detection
@@ -156,6 +182,19 @@ while [[ $# -gt 0 ]]; do
       INSTALL_CODEX_BRIDGE=false
       shift
       ;;
+    --external-runtime)
+      RUNTIME_EXTERNAL=true
+      INSTALL_RUNTIME_EXPLICIT=true
+      shift
+      ;;
+    --runtime-only)
+      RUNTIME_EXTERNAL=true
+      INSTALL_RUNTIME_EXPLICIT=true
+      INSTALL_RUNTIME_ONLY=true
+      INSTALL_SERVER=false
+      INSTALL_CODEX_BRIDGE=false
+      shift
+      ;;
     --bridge-only|--codex-bridge-only)
       INSTALL_SERVER=false
       INSTALL_CODEX_BRIDGE=true
@@ -173,8 +212,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! $INSTALL_SERVER && ! $INSTALL_CODEX_BRIDGE; then
-  err "Nothing to install: server and Codex bridge are both disabled."
+# --server-only / --bridge-only refresh only the selected service. Preserving
+# external wiring does not authorize installing or starting its worker.
+if $INSTALL_RUNTIME_EXPLICIT || { $RUNTIME_EXTERNAL && $INSTALL_SERVER && $INSTALL_CODEX_BRIDGE; }; then
+  INSTALL_RUNTIME=true
+else
+  INSTALL_RUNTIME=false
+fi
+if $INSTALL_RUNTIME_ONLY; then
+  INSTALL_RUNTIME=true
+fi
+
+if ! $INSTALL_SERVER && ! $INSTALL_CODEX_BRIDGE && ! $INSTALL_RUNTIME; then
+  err "Nothing to install: server, Codex bridge and agent runtime are all disabled."
   exit 2
 fi
 
@@ -257,6 +307,10 @@ fi
 if $INSTALL_CODEX_BRIDGE; then
   prepare_private_log "$LOG_DIR/codex-bridge-launchd.out.log"
   prepare_private_log "$LOG_DIR/codex-bridge-launchd.err.log"
+fi
+if $INSTALL_RUNTIME; then
+  prepare_private_log "$LOG_DIR/runtime-launchd.out.log"
+  prepare_private_log "$LOG_DIR/runtime-launchd.err.log"
 fi
 
 log "Syncing LaunchAgent runtime outside the repository ..."
@@ -444,9 +498,100 @@ write_bridge_plist() {
   echo "$plist"
 }
 
+# Environment shared by every process that may spawn provider CLIs. With an
+# external runtime these belong to the runtime worker, but the shell keeps them
+# too so an embedded deployment (and shell-side features such as AI session
+# titles) behave identically.
+PROVIDER_ENV_ARGS=()
+
+build_provider_env_args() {
+  local gateway_key_env existing_index already_present
+  PROVIDER_ENV_ARGS=()
+
+  if [[ -n "$CODEX_CLI_PATH" ]]; then
+    PROVIDER_ENV_ARGS+=("YEP_CODEX_PATH" "$CODEX_CLI_PATH")
+  fi
+  if [[ -n "$SESSION_TITLE_API_KEY" ]]; then
+    PROVIDER_ENV_ARGS+=("SESSION_TITLE_LLM_API_KEY" "$SESSION_TITLE_API_KEY")
+  fi
+  if [[ -n "$SESSION_TITLE_API_BASE" ]]; then
+    PROVIDER_ENV_ARGS+=("SESSION_TITLE_LLM_API_BASE" "$SESSION_TITLE_API_BASE")
+  fi
+  if [[ -n "$SESSION_TITLE_SUB_MODULE_VALUE" ]]; then
+    PROVIDER_ENV_ARGS+=("SESSION_TITLE_SUB_MODULE" "$SESSION_TITLE_SUB_MODULE_VALUE")
+  fi
+  if [[ -n "$LLM_GATEWAY_API_KEY" ]]; then
+    PROVIDER_ENV_ARGS+=("YEP_LLM_GATEWAY_API_KEY" "$LLM_GATEWAY_API_KEY")
+  fi
+  if [[ -n "$LLM_GATEWAY_API_BASE" ]]; then
+    PROVIDER_ENV_ARGS+=("YEP_LLM_GATEWAY_API_BASE" "$LLM_GATEWAY_API_BASE")
+  fi
+  if [[ -n "$LLM_GATEWAY_SUB_MODULE_VALUE" ]]; then
+    PROVIDER_ENV_ARGS+=("YEP_LLM_GATEWAY_SUB_MODULE" "$LLM_GATEWAY_SUB_MODULE_VALUE")
+  fi
+  if [[ -n "${YEP_LLM_GATEWAYS:-}" ]]; then
+    PROVIDER_ENV_ARGS+=("YEP_LLM_GATEWAYS" "$YEP_LLM_GATEWAYS")
+    while IFS= read -r gateway_key_env; do
+      [[ -z "$gateway_key_env" ]] && continue
+      already_present=false
+      for ((existing_index = 0; existing_index < ${#PROVIDER_ENV_ARGS[@]}; existing_index += 2)); do
+        if [[ "${PROVIDER_ENV_ARGS[$existing_index]}" == "$gateway_key_env" ]]; then
+          already_present=true
+          break
+        fi
+      done
+      if [[ "$already_present" == false && -n "${!gateway_key_env+x}" ]]; then
+        PROVIDER_ENV_ARGS+=("$gateway_key_env" "${!gateway_key_env}")
+      fi
+    done < <(llm_gateway_key_env_names "$YEP_LLM_GATEWAYS")
+  fi
+  # Set-but-empty is meaningful: it disables the default model allowlist.
+  if [[ -n "${YEP_LLM_GATEWAY_MODELS+x}" ]]; then
+    PROVIDER_ENV_ARGS+=("YEP_LLM_GATEWAY_MODELS" "$YEP_LLM_GATEWAY_MODELS")
+  fi
+  if [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then
+    PROVIDER_ENV_ARGS+=("DEEPSEEK_API_KEY" "$DEEPSEEK_API_KEY")
+  fi
+  if [[ -n "${SESSION_TITLE_MODEL:-}" ]]; then
+    PROVIDER_ENV_ARGS+=("SESSION_TITLE_MODEL" "$SESSION_TITLE_MODEL")
+  fi
+  if [[ -n "${SESSION_TITLE_GENERATION+x}" ]]; then
+    PROVIDER_ENV_ARGS+=("SESSION_TITLE_GENERATION" "$SESSION_TITLE_GENERATION")
+  fi
+  if [[ -n "${SESSION_TITLE_TIMEOUT_MS:-}" ]]; then
+    PROVIDER_ENV_ARGS+=("SESSION_TITLE_TIMEOUT_MS" "$SESSION_TITLE_TIMEOUT_MS")
+  fi
+}
+
+# Control-plane wiring the shell needs to reach an external runtime worker.
+write_runtime_plist() {
+  local plist="$LAUNCH_AGENTS_DIR/$RUNTIME_LABEL.plist"
+  local env_args=(
+    "NODE_ENV" "production"
+    "PATH" "$LAUNCHD_PATH"
+    "YEP_DEPLOY_REPO_ROOT" "$REPO_ROOT"
+    "YEP_REPORTS_DIR" "$SERVER_REPORTS_DIR"
+    "ALLOWED_IMAGE_PATHS" "$SERVER_ALLOWED_IMAGE_PATHS"
+    "PORT" "$SERVER_PORT"
+    "YEP_RUNTIME_PORT" "$RUNTIME_PORT"
+    "YEP_CODEX_BRIDGE_MODE" "external"
+    "YEP_CODEX_BRIDGE_CONTROL_URL" "$BRIDGE_URL"
+    "YEP_CODEX_BRIDGE_PORT" "$BRIDGE_PORT"
+  )
+  if [[ -n "$DEPLOY_RUNTIME_TOKEN_FILE" ]]; then
+    env_args+=("YEP_RUNTIME_TOKEN_FILE" "$DEPLOY_RUNTIME_TOKEN_FILE")
+  fi
+  env_args+=(${PROVIDER_ENV_ARGS[@]+"${PROVIDER_ENV_ARGS[@]}"})
+
+  write_header "$plist" "$RUNTIME_LABEL" "$LOG_DIR/runtime-launchd.out.log" "$LOG_DIR/runtime-launchd.err.log"
+  append_server_recovery_policy "$plist"
+  append_env "$plist" "${env_args[@]}"
+  append_program_arguments "$plist" "$NODE_BIN" "$CLI_JS" "--runtime-only" "--port" "$SERVER_PORT" "--runtime-port" "$RUNTIME_PORT"
+  echo "$plist"
+}
+
 write_server_plist() {
   local plist="$LAUNCH_AGENTS_DIR/$SERVER_LABEL.plist"
-  local gateway_key_env existing_index already_present
   local env_args=(
     "NODE_ENV" "production"
     "PATH" "$LAUNCHD_PATH"
@@ -459,11 +604,18 @@ write_server_plist() {
     "YEP_CODEX_BRIDGE_CONTROL_URL" "$BRIDGE_URL"
     "YEP_CODEX_BRIDGE_PORT" "$BRIDGE_PORT"
   )
-  if [[ -n "$CODEX_CLI_PATH" ]]; then
-    env_args+=("YEP_CODEX_PATH" "$CODEX_CLI_PATH")
-  fi
   if [[ -n "$SERVER_ALLOWED_HOSTS" ]]; then
     env_args+=("ALLOWED_HOSTS" "$SERVER_ALLOWED_HOSTS")
+  fi
+  if $RUNTIME_EXTERNAL; then
+    env_args+=(
+      "YEP_RUNTIME_MODE" "external"
+      "YEP_RUNTIME_PORT" "$RUNTIME_PORT"
+      "YEP_RUNTIME_CONTROL_URL" "$RUNTIME_URL"
+    )
+    if [[ -n "$DEPLOY_RUNTIME_TOKEN_FILE" ]]; then
+      env_args+=("YEP_RUNTIME_TOKEN_FILE" "$DEPLOY_RUNTIME_TOKEN_FILE")
+    fi
   fi
 
   if [[ -n "${YEP_ANYWHERE_PROFILE:-}" ]]; then
@@ -479,58 +631,7 @@ write_server_plist() {
     env_args+=("YEP_FCM_SERVICE_ACCOUNT_JSON" "$FCM_SERVICE_ACCOUNT_JSON")
   fi
 
-  if [[ -n "$SESSION_TITLE_API_KEY" ]]; then
-    env_args+=("SESSION_TITLE_LLM_API_KEY" "$SESSION_TITLE_API_KEY")
-  fi
-  if [[ -n "$SESSION_TITLE_API_BASE" ]]; then
-    env_args+=("SESSION_TITLE_LLM_API_BASE" "$SESSION_TITLE_API_BASE")
-  fi
-  if [[ -n "$SESSION_TITLE_SUB_MODULE_VALUE" ]]; then
-    env_args+=("SESSION_TITLE_SUB_MODULE" "$SESSION_TITLE_SUB_MODULE_VALUE")
-  fi
-  if [[ -n "$LLM_GATEWAY_API_KEY" ]]; then
-    env_args+=("YEP_LLM_GATEWAY_API_KEY" "$LLM_GATEWAY_API_KEY")
-  fi
-  if [[ -n "$LLM_GATEWAY_API_BASE" ]]; then
-    env_args+=("YEP_LLM_GATEWAY_API_BASE" "$LLM_GATEWAY_API_BASE")
-  fi
-  if [[ -n "$LLM_GATEWAY_SUB_MODULE_VALUE" ]]; then
-    env_args+=("YEP_LLM_GATEWAY_SUB_MODULE" "$LLM_GATEWAY_SUB_MODULE_VALUE")
-  fi
-  # Extra gateway channels are consumed by the Pi provider inside the main
-  # server and are deliberately not forwarded to the Codex bridge plist.
-  if [[ -n "${YEP_LLM_GATEWAYS:-}" ]]; then
-    env_args+=("YEP_LLM_GATEWAYS" "$YEP_LLM_GATEWAYS")
-    while IFS= read -r gateway_key_env; do
-      [[ -z "$gateway_key_env" ]] && continue
-      already_present=false
-      for ((existing_index = 0; existing_index < ${#env_args[@]}; existing_index += 2)); do
-        if [[ "${env_args[$existing_index]}" == "$gateway_key_env" ]]; then
-          already_present=true
-          break
-        fi
-      done
-      if [[ "$already_present" == false && -n "${!gateway_key_env+x}" ]]; then
-        env_args+=("$gateway_key_env" "${!gateway_key_env}")
-      fi
-    done < <(llm_gateway_key_env_names "$YEP_LLM_GATEWAYS")
-  fi
-  # Set-but-empty is meaningful: it disables the default model allowlist.
-  if [[ -n "${YEP_LLM_GATEWAY_MODELS+x}" ]]; then
-    env_args+=("YEP_LLM_GATEWAY_MODELS" "$YEP_LLM_GATEWAY_MODELS")
-  fi
-  if [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then
-    env_args+=("DEEPSEEK_API_KEY" "$DEEPSEEK_API_KEY")
-  fi
-  if [[ -n "${SESSION_TITLE_MODEL:-}" ]]; then
-    env_args+=("SESSION_TITLE_MODEL" "$SESSION_TITLE_MODEL")
-  fi
-  if [[ -n "${SESSION_TITLE_GENERATION+x}" ]]; then
-    env_args+=("SESSION_TITLE_GENERATION" "$SESSION_TITLE_GENERATION")
-  fi
-  if [[ -n "${SESSION_TITLE_TIMEOUT_MS:-}" ]]; then
-    env_args+=("SESSION_TITLE_TIMEOUT_MS" "$SESSION_TITLE_TIMEOUT_MS")
-  fi
+  env_args+=(${PROVIDER_ENV_ARGS[@]+"${PROVIDER_ENV_ARGS[@]}"})
 
   write_header "$plist" "$SERVER_LABEL" "$LOG_DIR/server-launchd.out.log" "$LOG_DIR/server-launchd.err.log"
   append_server_recovery_policy "$plist"
@@ -543,6 +644,7 @@ reload_agent() {
   local label="$1"
   local plist="$2"
   local old_pid=""
+  local wait_i
 
   if ! $START_NOW; then
     dim "wrote $plist; active LaunchAgent was not reloaded"
@@ -560,6 +662,24 @@ reload_agent() {
       sleep 0.25
     done
   fi
+  # bootout is asynchronous: launchd may keep the label registered briefly
+  # after the process exits, and bootstrapping in that window fails with
+  # "Bootstrap failed: 5: Input/output error". Wait for the label to unload,
+  # then retry the bootstrap a few times while the bootout settles.
+  for wait_i in $(seq 1 40); do
+    launchctl print "$USER_DOMAIN/$label" >/dev/null 2>&1 || break
+    sleep 0.25
+  done
+  local try_i
+  for try_i in 1 2 3 4 5; do
+    if launchctl bootstrap "$USER_DOMAIN" "$plist" 2>/dev/null; then
+      launchctl enable "$USER_DOMAIN/$label"
+      launchctl kickstart -k "$USER_DOMAIN/$label"
+      return 0
+    fi
+    sleep 0.5
+  done
+  # Final attempt without output suppression so the real error is surfaced.
   launchctl bootstrap "$USER_DOMAIN" "$plist"
   launchctl enable "$USER_DOMAIN/$label"
   launchctl kickstart -k "$USER_DOMAIN/$label"
@@ -567,9 +687,18 @@ reload_agent() {
 
 log "Installing Yep Anywhere LaunchAgents ..."
 
+build_provider_env_args
+
 if $INSTALL_CODEX_BRIDGE; then
   BRIDGE_PLIST="$(write_bridge_plist)"
   reload_agent "$BRIDGE_LABEL" "$BRIDGE_PLIST"
+fi
+
+# The runtime must be listening before the shell boots; otherwise the shell's
+# first control request fails and live-session routes stay degraded until retry.
+if $INSTALL_RUNTIME; then
+  RUNTIME_PLIST="$(write_runtime_plist)"
+  reload_agent "$RUNTIME_LABEL" "$RUNTIME_PLIST"
 fi
 
 if $INSTALL_SERVER; then
@@ -583,6 +712,13 @@ if $INSTALL_SERVER; then
   dim "reports: $SERVER_REPORTS_DIR"
 else
   dim "server: skipped"
+fi
+if $INSTALL_RUNTIME; then
+  dim "agent runtime: $RUNTIME_LABEL -> $RUNTIME_URL (external mode)"
+elif $RUNTIME_EXTERNAL; then
+  dim "agent runtime: external mode requested but the runtime LaunchAgent was skipped"
+else
+  dim "agent runtime: embedded in the $SERVER_PORT process"
 fi
 if $INSTALL_CODEX_BRIDGE; then
   dim "codex bridge:  $BRIDGE_LABEL -> $BRIDGE_URL"
@@ -617,3 +753,6 @@ if $INSTALL_SERVER; then
   fi
 fi
 dim "8022 restarts after abnormal exits only (10s launchd throttle); the Codex bridge starts at login only."
+if $INSTALL_RUNTIME; then
+  dim "the agent runtime keeps provider processes alive across 8022 restarts; restarting it aborts live turns."
+fi

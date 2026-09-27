@@ -30,6 +30,8 @@ import { SessionSearchBar } from "../components/SessionSearchBar";
 import { SessionTitleGenerationStatus } from "../components/SessionTitleGenerationStatus";
 import { SessionMessagesSkeleton } from "../components/Skeleton";
 import { ToolApprovalPanel } from "../components/ToolApprovalPanel";
+import { TranscriptRendererProvider } from "../components/TranscriptRendererProvider";
+import { ProjectedToolStepRow } from "../components/blocks/ProjectedToolGroupRow";
 import { AgentContentProvider } from "../contexts/AgentContentContext";
 import { SessionMetadataProvider } from "../contexts/SessionMetadataContext";
 import {
@@ -41,6 +43,8 @@ import { useActivityBusState } from "../hooks/useActivityBusState";
 import { useConnection } from "../hooks/useConnection";
 import { useDeveloperMode } from "../hooks/useDeveloperMode";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import { useDocumentVisibility } from "../hooks/useDocumentVisibility";
+import { useDraftAttachments } from "../hooks/useDraftAttachments";
 import type { DraftControls } from "../hooks/useDraftPersistence";
 import { useEngagementTracking } from "../hooks/useEngagementTracking";
 import { useHideSplashOnReady } from "../hooks/useHideSplashOnReady";
@@ -53,6 +57,7 @@ import {
   type StreamingMarkdownCallbacks,
   useSession,
 } from "../hooks/useSession";
+import { useSessionInspectorHistory } from "../hooks/useSessionInspectorHistory";
 import { useSessionInspectorPreference } from "../hooks/useSessionInspectorPreference";
 import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
@@ -60,6 +65,7 @@ import {
   getAgentCommandConfig,
   getAgentCommandConfigs,
 } from "../lib/agentCommands";
+import { stripAttachmentTokensForTitle } from "../lib/attachmentTokens";
 import {
   type CodexSkillCommand,
   parseCodexSkillsList,
@@ -67,7 +73,6 @@ import {
   resolveCodexSkillInputs,
 } from "../lib/codexInputCommands";
 import { normalizeExternalHttpUrl } from "../lib/externalUrl";
-import { groupToolsBeforeAssistantOutput } from "../lib/liveToolGrouping";
 import { getMessageId } from "../lib/mergeMessages";
 import { isStalePendingInputError } from "../lib/pendingInputError";
 import { preprocessMessages } from "../lib/preprocessMessages";
@@ -87,7 +92,6 @@ import {
 import {
   buildSessionDisplayRenderItems,
   mergeSessionInspectorMessages,
-  resolveSessionInspectorNavigation,
 } from "../lib/sessionDisplay";
 import { generateUUID } from "../lib/uuid";
 import type { Message, Session, SessionNavigationState } from "../types";
@@ -108,11 +112,13 @@ export function SessionPage() {
   // Wrap with StreamingMarkdownProvider for server-rendered markdown streaming
   return (
     <StreamingMarkdownProvider>
-      <SessionPageContent
-        key={sessionId}
-        projectId={projectId}
-        sessionId={sessionId}
-      />
+      <TranscriptRendererProvider>
+        <SessionPageContent
+          key={`${projectId}:${sessionId}`}
+          projectId={projectId}
+          sessionId={sessionId}
+        />
+      </TranscriptRendererProvider>
     </StreamingMarkdownProvider>
   );
 }
@@ -169,17 +175,6 @@ function calculateDisplayForkExcludedTurns(
   if (index < 0) return null;
   const excluded = questions.length - index;
   return excluded > 0 ? excluded : null;
-}
-
-function isRetryableInspectorHistoryError(error: unknown): boolean {
-  const code =
-    error && typeof error === "object"
-      ? (error as { code?: unknown }).code
-      : undefined;
-  return (
-    code === "SESSION_HISTORY_CURSOR_STALE" ||
-    code === "SESSION_HISTORY_CHANGED"
-  );
 }
 
 function getApprovalAgentName(
@@ -297,6 +292,7 @@ function SessionPageContent({
     displayQuestions,
     displayQuestionCoverage,
     hydratedLiveTailDetailRef,
+    displayActivity,
     agentContent,
     setAgentContent,
     toolUseToAgent,
@@ -422,32 +418,23 @@ function SessionPageContent({
     setIsExpanded: setInspectorExpanded,
   } = useSessionInspectorPreference();
   const [isSessionSearchOpen, setSessionSearchOpen] = useState(false);
-  const [legacyInspectorMessages, setLegacyInspectorMessages] = useState<
-    Message[] | null
-  >(null);
-  const [legacyInspectorLoading, setLegacyInspectorLoading] = useState(false);
-  const [legacyInspectorError, setLegacyInspectorError] = useState(false);
-  const legacyInspectorLoadGenerationRef = useRef(0);
-  const legacyInspectorRevisionRef = useRef<string | null>(null);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: session/branch identity intentionally invalidates the derived Inspector index
-  useEffect(() => {
-    legacyInspectorLoadGenerationRef.current += 1;
-    legacyInspectorRevisionRef.current = null;
-    setLegacyInspectorMessages(null);
-    setLegacyInspectorLoading(false);
-    setLegacyInspectorError(false);
-  }, [actualSessionId, selectedBranchId]);
-  useEffect(() => {
-    if (processState !== "in-turn") return;
-    // The lightweight display and live tail remain authoritative while a turn
-    // is changing. A complete Inspector index spans multiple persisted-history
-    // pages, so cancel its logical generation instead of mixing pages from
-    // different active snapshots or surfacing a transient stale cursor.
-    legacyInspectorLoadGenerationRef.current += 1;
-    legacyInspectorRevisionRef.current = null;
-    setLegacyInspectorLoading(false);
-    setLegacyInspectorError(false);
-  }, [processState]);
+  const pageVisible = useDocumentVisibility();
+  const isInspectorVisible =
+    pageVisible && (isWideScreen ? isInspectorExpanded : isInspectorDrawerOpen);
+  const {
+    messages: legacyInspectorMessages,
+    loading: legacyInspectorLoading,
+    error: legacyInspectorError,
+    load: loadLegacyInspectorHistory,
+  } = useSessionInspectorHistory({
+    projectId,
+    sessionId: actualSessionId,
+    branchId: selectedBranchId,
+    revision: displayPage?.revision,
+    processState,
+    enabled: isInspectorVisible,
+    onError: () => showToast(t("sessionInspectorDetailsLoadFailed"), "error"),
+  });
   const handleTargetFocused = useCallback(() => {
     setTargetMessageId(null);
   }, []);
@@ -462,156 +449,12 @@ function SessionPageContent({
     setSessionSearchOpen(false);
   }, []);
 
-  const loadLegacyInspectorHistory = useCallback(
-    async (force = false) => {
-      if (
-        !displayPage ||
-        processState === "in-turn" ||
-        (!force && legacyInspectorMessages) ||
-        legacyInspectorLoading
-      )
-        return;
-      const generation = ++legacyInspectorLoadGenerationRef.current;
-      const projectedRevision = displayPage.revision;
-      setLegacyInspectorLoading(true);
-      setLegacyInspectorError(false);
-      try {
-        let loaded: Message[] | null = null;
-        let lastError: unknown;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          try {
-            let data = await api.getSession(
-              projectId,
-              actualSessionId,
-              undefined,
-              {
-                view: "canonical",
-                inspectorProjection: true,
-                tailCompactions: 2,
-                maxMessages: 100,
-                branchId: selectedBranchId,
-              },
-            );
-            if (generation !== legacyInspectorLoadGenerationRef.current) return;
-            let snapshot = data.messages.map((message) => ({
-              ...message,
-              _source: "jsonl" as const,
-            }));
-            for (let pageIndex = 0; pageIndex < 1_000; pageIndex += 1) {
-              const paginationInfo = data.pagination;
-              if (
-                !paginationInfo?.hasOlderMessages ||
-                !paginationInfo.truncatedBeforeMessageId
-              ) {
-                break;
-              }
-              data = await api.getSession(
-                projectId,
-                actualSessionId,
-                undefined,
-                {
-                  view: "canonical",
-                  inspectorProjection: true,
-                  tailCompactions: 2,
-                  maxMessages: 100,
-                  beforeMessageId: paginationInfo.truncatedBeforeMessageId,
-                  rolloutRevision: paginationInfo.rolloutRevision,
-                  branchId: selectedBranchId,
-                },
-              );
-              if (generation !== legacyInspectorLoadGenerationRef.current)
-                return;
-              snapshot = [
-                ...data.messages.map((message) => ({
-                  ...message,
-                  _source: "jsonl" as const,
-                })),
-                ...snapshot,
-              ];
-            }
-            if (data.pagination?.hasOlderMessages) {
-              throw new Error(
-                "Session index exceeds the safe pagination budget",
-              );
-            }
-            loaded = snapshot;
-            break;
-          } catch (error) {
-            lastError = error;
-            if (generation !== legacyInspectorLoadGenerationRef.current) return;
-            if (attempt === 0 && isRetryableInspectorHistoryError(error)) {
-              continue;
-            }
-            throw error;
-          }
-        }
-        if (!loaded)
-          throw lastError ?? new Error("Session index is unavailable");
-        if (generation !== legacyInspectorLoadGenerationRef.current) return;
-        const seen = new Set<string>();
-        setLegacyInspectorMessages(
-          resolveSessionInspectorNavigation(
-            loaded.filter((message) => {
-              const id = getMessageId(message);
-              if (seen.has(id)) return false;
-              seen.add(id);
-              return true;
-            }),
-          ),
-        );
-        legacyInspectorRevisionRef.current = projectedRevision;
-      } catch (error) {
-        if (generation !== legacyInspectorLoadGenerationRef.current) return;
-        console.error("Failed to load session inspector index:", error);
-        if (force && legacyInspectorMessages) {
-          // Keep the last complete safe index and wait for the next revision
-          // instead of turning one transient idle refresh into a retry loop.
-          legacyInspectorRevisionRef.current = projectedRevision;
-          return;
-        }
-        setLegacyInspectorError(true);
-        showToast(t("sessionInspectorDetailsLoadFailed"), "error");
-      } finally {
-        if (generation === legacyInspectorLoadGenerationRef.current) {
-          setLegacyInspectorLoading(false);
-        }
-      }
-    },
-    [
-      actualSessionId,
-      displayPage,
-      legacyInspectorLoading,
-      legacyInspectorMessages,
-      projectId,
-      processState,
-      selectedBranchId,
-      showToast,
-      t,
-    ],
-  );
-
-  useEffect(() => {
-    if (
-      !displayPage ||
-      !legacyInspectorMessages ||
-      legacyInspectorLoading ||
-      processState !== "idle" ||
-      legacyInspectorRevisionRef.current === displayPage.revision
-    ) {
-      return;
-    }
-    void loadLegacyInspectorHistory(true);
-  }, [
-    displayPage,
-    legacyInspectorLoading,
-    legacyInspectorMessages,
-    loadLegacyInspectorHistory,
-    processState,
-  ]);
-
   const inspectorMessages = useMemo(
-    () => mergeSessionInspectorMessages(legacyInspectorMessages, messages),
-    [legacyInspectorMessages, messages],
+    () =>
+      isInspectorVisible
+        ? mergeSessionInspectorMessages(legacyInspectorMessages, messages)
+        : [],
+    [isInspectorVisible, legacyInspectorMessages, messages],
   );
 
   // React Router can reuse this component when only the session parameter
@@ -975,8 +818,11 @@ function SessionPageContent({
     basePath,
   ]);
 
-  // File attachment state
-  const [attachments, setAttachments] = useState<UploadedFile[]>([]);
+  // File attachment state. Persisted alongside the draft text so the inline
+  // `@[name]` tokens keep working after navigating away and back.
+  const [attachments, setAttachments] = useDraftAttachments(
+    `draft-attachments-${sessionId}`,
+  );
   const [uploadProgress, setUploadProgress] = useState<UploadProgress[]>([]);
   // Track in-flight upload promises so handleSend can wait for them
   const pendingUploadsRef = useRef<Map<string, Promise<UploadedFile | null>>>(
@@ -1027,6 +873,10 @@ function SessionPageContent({
   });
 
   const requestCodexCompaction = async (): Promise<boolean> => {
+    if (isCompacting || isStartingCodexCompaction) {
+      showToast(t("codexCompactAlreadyRunning"), "info");
+      return false;
+    }
     if (status.owner === "external") {
       showToast(t("codexCompactExternalSessionRequired"), "error");
       return false;
@@ -1039,12 +889,9 @@ function SessionPageContent({
       showToast(t("codexCompactActiveSessionRequired"), "error");
       return false;
     }
-    if (isCompacting || isStartingCodexCompaction) {
-      showToast(t("codexCompactAlreadyRunning"), "info");
-      return false;
-    }
 
     setIsStartingCodexCompaction(true);
+    setScrollTrigger((prev) => prev + 1);
     try {
       if (status.owner === "self" && status.processId) {
         await api.executeCodexControl(actualSessionId ?? sessionId, {
@@ -1066,7 +913,6 @@ function SessionPageContent({
           },
         );
         setStatus({ owner: "self", processId: result.processId });
-        setProcessState("idle");
       }
       showToast(t("sessionCompactionStarted"), "success");
       return true;
@@ -1080,7 +926,7 @@ function SessionPageContent({
     }
   };
 
-  const handleSend = async (text: string) => {
+  const handleSend = async (text: string, interruptBeforeSend = false) => {
     if (effectiveProvider === "codex") {
       const command = parseCodexSlashCommand(text);
       if (command.kind === "invalid-compact-args") {
@@ -1359,6 +1205,7 @@ function SessionPageContent({
           session?.reasoningEffort,
           false,
           codexInputs,
+          effectiveProvider === "codex" && interruptBeforeSend,
         );
         // If process was restarted due to thinking mode change, reconnect stream
         if (result.restarted && result.processId) {
@@ -1444,9 +1291,27 @@ function SessionPageContent({
         draftControlsRef.current?.clearDraft();
         setAttachments([]);
       }
-      setProcessState("idle");
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      showToast(t("sessionSendFailed", { message: errorMsg }), "error");
+      const errorCode = (err as { code?: string })?.code;
+      if (
+        errorCode === "interrupt_send_failed" ||
+        errorCode === "interrupt_not_supported" ||
+        errorCode === "interrupt_send_in_progress"
+      ) {
+        // Preserve the state received from the stream: a failed interrupt
+        // may leave the old turn running, while a timeout may follow its end.
+        showToast(
+          t(
+            errorCode === "interrupt_send_in_progress"
+              ? "sessionInterruptSendInProgress"
+              : "sessionInterruptSendFailed",
+          ),
+          "error",
+        );
+      } else {
+        setProcessState("idle");
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        showToast(t("sessionSendFailed", { message: errorMsg }), "error");
+      }
     }
   };
 
@@ -1835,12 +1700,15 @@ function SessionPageContent({
         pendingUploadsRef.current.set(tempId, uploadPromise);
       }
     },
-    [projectId, sessionId, showToast, connection, t],
+    [projectId, sessionId, setAttachments, showToast, connection, t],
   );
 
-  const handleRemoveAttachment = useCallback((id: string) => {
-    setAttachments((prev) => prev.filter((a) => a.id !== id));
-  }, []);
+  const handleRemoveAttachment = useCallback(
+    (id: string) => {
+      setAttachments((prev) => prev.filter((a) => a.id !== id));
+    },
+    [setAttachments],
+  );
 
   // Check if pending request is an AskUserQuestion
   const isAskUserQuestion = pendingInputRequest?.toolName === "AskUserQuestion";
@@ -1880,9 +1748,7 @@ function SessionPageContent({
     );
     preprocessCacheRef.current = result.cache;
     const combined = [...displayItems, ...result.renderItems];
-    return displayHistoryEnabled
-      ? groupToolsBeforeAssistantOutput(combined)
-      : combined;
+    return combined;
   }, [
     displayPage,
     hydratedLiveTailDetailRef,
@@ -1894,7 +1760,6 @@ function SessionPageContent({
     session?.branchState,
     session?.codexBranchState,
     t,
-    displayHistoryEnabled,
   ]);
 
   // Detect if session has pending tool calls without results
@@ -1902,19 +1767,21 @@ function SessionPageContent({
   // that is waiting for user input (tool approval, question answer)
   const hasPendingToolCalls = useMemo(() => {
     if (status.owner !== "none") return false;
+    if (displayHistoryEnabled)
+      return displayActivity?.state === "waiting-input";
     return renderItems.some(
       (item) =>
         (item.type === "tool_call" &&
           item.status === "pending" &&
           item.toolResult === undefined) ||
-        (item.type === "assistant_output_tool_group" &&
-          item.tools.some(
-            (tool) =>
-              tool.status === "pending" && tool.toolResult === undefined,
-          )) ||
         (item.type === "display_tool_group" && item.group.status === "running"),
     );
-  }, [renderItems, status.owner]);
+  }, [
+    renderItems,
+    status.owner,
+    displayHistoryEnabled,
+    displayActivity?.state,
+  ]);
 
   // Compute display title - priority:
   // 1. Local custom title (user renamed in this session)
@@ -1922,11 +1789,12 @@ function SessionPageContent({
   // 3. Initial title from navigation state (optimistic, before server responds)
   // 4. "Untitled" as final fallback
   const sessionTitle = getSessionDisplayTitle(session);
-  const displayTitle =
+  const displayTitle = stripAttachmentTokensForTitle(
     localCustomTitle ??
-    (sessionTitle !== "Untitled" ? sessionTitle : null) ??
-    initialTitle ??
-    t("sessionUntitled");
+      (sessionTitle !== "Untitled" ? sessionTitle : null) ??
+      initialTitle ??
+      t("sessionUntitled"),
+  );
   const isArchived = localIsArchived ?? session?.isArchived ?? false;
   // `isStarred` is the persisted compatibility bit; the product semantics are
   // now pinning, so existing favorites become pins without a migration.
@@ -2484,49 +2352,84 @@ function SessionPageContent({
                 projectId={projectId}
                 sessionId={sessionId}
               >
-                <MessageList
-                  messages={messages}
-                  preprocessedItems={renderItems}
-                  provider={session?.provider}
-                  isProcessing={
-                    status.owner === "self" && processState === "in-turn"
-                  }
-                  lastActivityAt={lastStreamActivityAt}
-                  isCompacting={isCompacting}
-                  scrollTrigger={scrollTrigger + activeWindowTrimRevision}
-                  pendingMessages={pendingMessages}
-                  deferredMessages={deferredMessages}
-                  onCancelDeferred={(tempId) =>
-                    api.cancelDeferredMessage(sessionId, tempId)
-                  }
-                  markdownAugments={markdownAugments}
-                  activeToolApproval={activeToolApproval}
-                  hasOlderMessages={
-                    displayPage
-                      ? Boolean(displayPage.nextCursor)
-                      : pagination?.hasOlderMessages
-                  }
-                  hasNewerMessages={pagination?.hasNewerMessages}
-                  loadingOlder={loadingOlder}
-                  loadingNewer={loadingNewer}
-                  loadingTargetMessage={loadingTargetMessage}
-                  onLoadOlderMessages={loadOlderMessages}
-                  onLoadNewerMessages={loadNewerMessages}
-                  onLoadTargetMessage={loadTargetMessageWindow}
-                  onFollowingBottomChange={updateActiveWindowFollowingBottom}
-                  onEditUserPrompt={
-                    !isViewingHistoricalBranch &&
-                    supportsHistoricalMessageEditing(session?.provider)
-                      ? handleEditUserPrompt
-                      : undefined
-                  }
-                  onSelectBranch={handleSelectBranch}
-                  focusBranchId={pendingBranchFocusId}
-                  onBranchFocused={handleBranchFocused}
-                  targetMessageId={targetMessageId}
-                  onTargetFocused={handleTargetFocused}
-                  transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
-                />
+                <>
+                  <MessageList
+                    messages={messages}
+                    preprocessedItems={renderItems}
+                    provider={session?.provider}
+                    isProcessing={
+                      status.owner === "self" && processState === "in-turn"
+                    }
+                    lastActivityAt={lastStreamActivityAt}
+                    isCompacting={isCompacting || isStartingCodexCompaction}
+                    scrollTrigger={scrollTrigger + activeWindowTrimRevision}
+                    pendingMessages={pendingMessages}
+                    deferredMessages={deferredMessages}
+                    onCancelDeferred={(tempId) =>
+                      api.cancelDeferredMessage(sessionId, tempId)
+                    }
+                    markdownAugments={markdownAugments}
+                    activeToolApproval={activeToolApproval}
+                    hasOlderMessages={
+                      displayPage
+                        ? Boolean(displayPage.nextCursor)
+                        : pagination?.hasOlderMessages
+                    }
+                    hasNewerMessages={pagination?.hasNewerMessages}
+                    loadingOlder={loadingOlder}
+                    loadingNewer={loadingNewer}
+                    loadingTargetMessage={loadingTargetMessage}
+                    onLoadOlderMessages={loadOlderMessages}
+                    onLoadNewerMessages={loadNewerMessages}
+                    onLoadTargetMessage={loadTargetMessageWindow}
+                    onFollowingBottomChange={updateActiveWindowFollowingBottom}
+                    onEditUserPrompt={
+                      !isViewingHistoricalBranch &&
+                      supportsHistoricalMessageEditing(session?.provider)
+                        ? handleEditUserPrompt
+                        : undefined
+                    }
+                    onSelectBranch={handleSelectBranch}
+                    focusBranchId={pendingBranchFocusId}
+                    onBranchFocused={handleBranchFocused}
+                    targetMessageId={targetMessageId}
+                    onTargetFocused={handleTargetFocused}
+                    transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
+                  />
+                  {displayActivity && (
+                    <div className="display-tool-group-state" role="status">
+                      {!sessionUpdatesConnected
+                        ? t("sessionDisplaySyncing")
+                        : displayActivity.state === "finishing"
+                          ? t("sessionDisplayFinishing")
+                          : displayActivity.state === "interrupted"
+                            ? t("sessionDisplayInterrupted")
+                            : displayActivity.state === "failed"
+                              ? t("sessionDisplayFailed")
+                              : displayActivity.state === "unknown" &&
+                                  displayActivity.runningCount > 0
+                                ? t("sessionDisplayUnknown")
+                                : null}
+                    </div>
+                  )}
+                  {displayActivity && displayActivity.tools.length > 0 && (
+                    <div className="display-current-activity">
+                      <div className="display-tool-group-state">
+                        {t("sessionDisplayPreviousTools")}
+                      </div>
+                      {displayActivity.tools.map((step) => (
+                        <ProjectedToolStepRow
+                          key={`${displayPage?.revision}:${step.id}`}
+                          step={step}
+                          projectId={projectId}
+                          sessionId={sessionId}
+                          branchId={selectedBranchId}
+                          sessionProvider={session?.provider}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </>
               </AgentContentProvider>
             </SessionMetadataProvider>
           )}
@@ -2685,6 +2588,14 @@ function SessionPageContent({
             ) && (
               <MessageInput
                 onSend={handleSend}
+                onInterruptSend={
+                  effectiveProvider === "codex" &&
+                  status.owner === "self" &&
+                  processState === "in-turn" &&
+                  !editRewind
+                    ? (text) => handleSend(text, true)
+                    : undefined
+                }
                 onQueue={
                   status.owner !== "none" && processState !== "idle"
                     ? handleQueue
@@ -2737,6 +2648,7 @@ function SessionPageContent({
       {isWideScreen ? (
         isInspectorExpanded ? (
           <SessionInspector
+            branchId={selectedBranchId}
             presentation="sidebar"
             onClose={() => setInspectorExpanded(false)}
             messages={inspectorMessages}
@@ -2749,15 +2661,21 @@ function SessionPageContent({
             hasLegacyDetails={!displayPage || legacyInspectorMessages !== null}
             legacyDetailsLoading={legacyInspectorLoading}
             legacyDetailsError={legacyInspectorError}
-            onLoadLegacyDetails={() => loadLegacyInspectorHistory()}
+            onLoadLegacyDetails={
+              legacyInspectorError
+                ? () => loadLegacyInspectorHistory(true)
+                : undefined
+            }
             markdownAugments={markdownAugments}
             activeToolApproval={activeToolApproval}
             projectId={projectId}
             sessionId={actualSessionId}
-            provider={session?.provider}
-            model={session?.model}
-            reasoningEffort={session?.reasoningEffort}
-            serviceTier={session?.serviceTier}
+            provider={effectiveProvider}
+            model={session?.model ?? navState?.initialModel}
+            reasoningEffort={
+              session?.reasoningEffort ?? navState?.initialReasoningEffort
+            }
+            serviceTier={session?.serviceTier ?? navState?.initialServiceTier}
             basePath={basePath}
             status={status}
             processState={processState}
@@ -2766,6 +2684,7 @@ function SessionPageContent({
         ) : null
       ) : (
         <SessionInspector
+          branchId={selectedBranchId}
           presentation="drawer"
           isOpen={isInspectorDrawerOpen}
           onClose={() => setInspectorDrawerOpen(false)}
@@ -2777,15 +2696,21 @@ function SessionPageContent({
           hasLegacyDetails={!displayPage || legacyInspectorMessages !== null}
           legacyDetailsLoading={legacyInspectorLoading}
           legacyDetailsError={legacyInspectorError}
-          onLoadLegacyDetails={() => loadLegacyInspectorHistory()}
+          onLoadLegacyDetails={
+            legacyInspectorError
+              ? () => loadLegacyInspectorHistory(true)
+              : undefined
+          }
           markdownAugments={markdownAugments}
           activeToolApproval={activeToolApproval}
           projectId={projectId}
           sessionId={actualSessionId}
-          provider={session?.provider}
-          model={session?.model}
-          reasoningEffort={session?.reasoningEffort}
-          serviceTier={session?.serviceTier}
+          provider={effectiveProvider}
+          model={session?.model ?? navState?.initialModel}
+          reasoningEffort={
+            session?.reasoningEffort ?? navState?.initialReasoningEffort
+          }
+          serviceTier={session?.serviceTier ?? navState?.initialServiceTier}
           basePath={basePath}
           status={status}
           processState={processState}

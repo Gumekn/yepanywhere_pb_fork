@@ -1,5 +1,6 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -24,6 +25,7 @@ import {
   getCodexEventDiagnostics,
   replayCodexSession,
 } from "../../src/codex-events/index.js";
+import { SessionFileOperationStore } from "../../src/session-files/operation-store.js";
 import type { EventBus } from "../../src/watcher/index.js";
 
 const BRIDGE_CONTROL_TOKEN = "codex-bridge-control-test-token";
@@ -104,6 +106,275 @@ describe("CodexBridgeService", () => {
     await closeWebSocketServer(upstreamWss);
     await closeServer(upstreamServer);
   });
+
+  it.each(["legacy-blocking", "lifecycle"] as const)(
+    "records only confirmed tool changes without scanning the workspace in %s mode",
+    async (journalMode) => {
+      const root = mkdtempSync(join(tmpdir(), "bridge-file-capture-"));
+      const cwd = join(root, "project");
+      mkdirSync(cwd);
+      writeFileSync(join(cwd, "report.md"), "before");
+      const store = new SessionFileOperationStore(join(root, "store"));
+      await bridge.shutdown();
+      bridge = new CodexBridgeService({
+        enabled: true,
+        host: "127.0.0.1",
+        port: bridgePort,
+        upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+        journalMode,
+        fileOperationStore: store,
+      });
+      let client: WebSocket | undefined;
+      try {
+        await bridge.start();
+        client = await connect(`ws://127.0.0.1:${bridgePort}`);
+        await waitFor(() => upstreamSocket !== null);
+        const started = waitForJson(client);
+        client.send(
+          JSON.stringify({ id: 1, method: "thread/start", params: { cwd } }),
+        );
+        await waitFor(() =>
+          upstreamMessages.some((m) => m.method === "thread/start"),
+        );
+        upstreamSocket?.send(
+          JSON.stringify({
+            id: 1,
+            result: { thread: { id: "capture-thread", cwd }, cwd },
+          }),
+        );
+        await started;
+        client.send(
+          JSON.stringify({
+            id: 2,
+            method: "turn/start",
+            params: { threadId: "capture-thread", input: [] },
+          }),
+        );
+        await waitFor(() =>
+          upstreamMessages.some((m) => m.method === "turn/start"),
+        );
+        expect(existsSync(join(store.directory, "executions"))).toBe(false);
+        writeFileSync(join(cwd, "report.md"), "after");
+        // The bridge awaits file persistence before forwarding this terminal
+        // frame. Synchronize on that barrier instead of polling the store while
+        // its writer holds the lock (which can outlast vi.waitFor's 1s default).
+        const completed = waitForJson(
+          client,
+          (message) => message.method === "turn/completed",
+        );
+        upstreamSocket?.send(
+          JSON.stringify({
+            id: 2,
+            result: { turn: { id: "capture-turn", status: "inProgress" } },
+          }),
+        );
+        writeFileSync(join(cwd, "external.md"), "another session");
+        upstreamSocket?.send(
+          JSON.stringify({
+            method: "item/completed",
+            params: {
+              threadId: "capture-thread",
+              turnId: "capture-turn",
+              item: {
+                type: "fileChange",
+                id: "patch-1",
+                status: "completed",
+                changes: [
+                  {
+                    path: "report.md",
+                    kind: { type: "update" },
+                    diff: "--- report.md\n+++ report.md\n@@ -1 +1 @@\n-before\n+after\n",
+                  },
+                ],
+              },
+            },
+          }),
+        );
+        upstreamSocket?.send(
+          JSON.stringify({
+            method: "turn/completed",
+            params: {
+              threadId: "capture-thread",
+              turn: { id: "capture-turn", status: "interrupted" },
+            },
+          }),
+        );
+        const scope = {
+          provider: "codex",
+          sourceId: "local",
+          sessionId: "capture-thread",
+        };
+        await completed;
+        const snapshot = await store.snapshot(scope);
+        expect(snapshot.operations).toHaveLength(1);
+        const record = snapshot.operations[0]?.record;
+        expect(record).toMatchObject({
+          identity: { turnId: "capture-turn" },
+          outcome: "applied",
+        });
+        expect(record?.changes).toEqual([
+          expect.objectContaining({
+            path: "report.md",
+            kind: "modified",
+            patch: expect.objectContaining({
+              text: expect.stringContaining("-before"),
+            }),
+          }),
+        ]);
+      } finally {
+        client?.close();
+        await bridge.shutdown();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  describe.each(["legacy-blocking", "lifecycle"] as const)(
+    "file environment inheritance in %s mode",
+    (journalMode) => {
+      it.each(["request", "response", "resume", "fork", "notification"])(
+        "does not capture local files for a remote environment from %s",
+        async (source) => {
+          const root = mkdtempSync(join(tmpdir(), "bridge-file-environment-"));
+          const cwd = join(root, "project");
+          mkdirSync(cwd);
+          writeFileSync(join(cwd, "local-only.md"), "local content");
+          const store = new SessionFileOperationStore(join(root, "store"));
+          const begin = vi.spyOn(store, "append");
+          await bridge.shutdown();
+          bridge = new CodexBridgeService({
+            enabled: true,
+            host: "127.0.0.1",
+            port: bridgePort,
+            upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+            journalMode,
+            fileOperationStore: store,
+          });
+          let client: WebSocket | undefined;
+          try {
+            await bridge.start();
+            client = await connect(`ws://127.0.0.1:${bridgePort}`);
+            await waitFor(() => upstreamSocket !== null);
+            const environments = [{ environmentId: "remote-host", cwd }];
+            const thread = { id: "remote-thread", cwd };
+            const started = waitForJson(client);
+            if (source === "notification") {
+              upstreamSocket?.send(
+                JSON.stringify({
+                  method: "thread/started",
+                  params: { thread: { ...thread, environments } },
+                }),
+              );
+            } else {
+              const method =
+                source === "resume"
+                  ? "thread/resume"
+                  : source === "fork"
+                    ? "thread/fork"
+                    : "thread/start";
+              client.send(
+                JSON.stringify({
+                  id: 1,
+                  method,
+                  params: {
+                    cwd,
+                    ...(method !== "thread/start"
+                      ? { threadId: "parent" }
+                      : {}),
+                    ...(source === "request" ? { environments } : {}),
+                  },
+                }),
+              );
+              await waitFor(() => upstreamMessages.some((m) => m.id === 1));
+              upstreamSocket?.send(
+                JSON.stringify({
+                  id: 1,
+                  result: {
+                    thread: {
+                      ...thread,
+                      ...(source !== "request" ? { environments } : {}),
+                    },
+                    cwd,
+                  },
+                }),
+              );
+            }
+            await started;
+            client.send(
+              JSON.stringify({
+                id: 2,
+                method: "turn/start",
+                params: { threadId: thread.id, input: [] },
+              }),
+            );
+            await waitFor(() => upstreamMessages.some((m) => m.id === 2));
+            expect(begin).not.toHaveBeenCalled();
+            // The notification also omits environments; it must not start a
+            // late local capture after the request correctly skipped one.
+            const turnStarted = waitForJson(client);
+            upstreamSocket?.send(
+              JSON.stringify({
+                method: "turn/started",
+                params: {
+                  threadId: thread.id,
+                  turn: { id: "remote-turn", status: "inProgress" },
+                },
+              }),
+            );
+            await turnStarted;
+            expect(begin).not.toHaveBeenCalled();
+            expect(existsSync(join(store.directory, "executions"))).toBe(false);
+
+            // An authoritative empty environment selection restores local
+            // capture, rather than permanently blacklisting this thread.
+            const localThread = waitForJson(client);
+            upstreamSocket?.send(
+              JSON.stringify({
+                method: "thread/started",
+                params: { thread: { ...thread, environments: [] } },
+              }),
+            );
+            await localThread;
+            client.send(
+              JSON.stringify({
+                id: 3,
+                method: "turn/start",
+                params: { threadId: thread.id, input: [], environments: [] },
+              }),
+            );
+            await waitFor(() => upstreamMessages.some((m) => m.id === 3));
+            upstreamSocket?.send(
+              JSON.stringify({
+                method: "item/completed",
+                params: {
+                  threadId: thread.id,
+                  turnId: "local-turn",
+                  item: {
+                    type: "fileChange",
+                    id: "local-patch",
+                    status: "completed",
+                    changes: [
+                      {
+                        path: "local-only.md",
+                        kind: { type: "add" },
+                        diff: "native content",
+                      },
+                    ],
+                  },
+                },
+              }),
+            );
+            await vi.waitFor(() => expect(begin).toHaveBeenCalledOnce());
+            expect(existsSync(join(store.directory, "executions"))).toBe(false);
+          } finally {
+            client?.close();
+            await bridge.shutdown();
+            rmSync(root, { recursive: true, force: true });
+          }
+        },
+      );
+    },
+  );
 
   it("defaults to lifecycle without constructing canonical ingress or touching the legacy store", async () => {
     const port = await findAvailablePort();
@@ -710,6 +981,109 @@ describe("CodexBridgeService", () => {
         connectionCount: 1,
         sessionCount: 1,
       });
+    } finally {
+      client.close();
+    }
+  });
+
+  it("keeps ephemeral structured-output threads out of session projections", async () => {
+    const client = await connect(`ws://127.0.0.1:${bridgePort}`);
+    try {
+      const startResponse = waitForJson(client);
+      client.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "temporary-structured-start",
+          method: "thread/start",
+          params: {
+            cwd: "/tmp/project-ephemeral",
+            ephemeral: true,
+          },
+        }),
+      );
+      await waitFor(() => upstreamMessages.length === 1);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "temporary-structured-start",
+          result: {
+            model: "gpt-5.6-luna",
+            cwd: "/tmp/project-ephemeral",
+            thread: {
+              id: "ephemeral-title-helper",
+              preview: "Generate a concise title",
+              ephemeral: true,
+              createdAt: 1_780_000_000,
+              updatedAt: 1_780_000_001,
+              cwd: "/tmp/project-ephemeral",
+              status: { type: "idle" },
+              turns: [],
+            },
+          },
+        }),
+      );
+      await startResponse;
+
+      const started = waitForJson(client);
+      upstreamSocket?.send(
+        JSON.stringify({
+          method: "thread/started",
+          params: {
+            thread: {
+              id: "ephemeral-title-helper",
+              cwd: "/tmp/project-ephemeral",
+              ephemeral: true,
+              status: { type: "idle" },
+              turns: [],
+            },
+          },
+        }),
+      );
+      await started;
+
+      const turnStarted = waitForJson(client);
+      upstreamSocket?.send(
+        JSON.stringify({
+          method: "turn/started",
+          params: {
+            threadId: "ephemeral-title-helper",
+            turn: { id: "ephemeral-title-turn" },
+          },
+        }),
+      );
+      await turnStarted;
+
+      const turnCompleted = waitForJson(client);
+      upstreamSocket?.send(
+        JSON.stringify({
+          method: "turn/completed",
+          params: {
+            threadId: "ephemeral-title-helper",
+            turn: {
+              id: "ephemeral-title-turn",
+              status: "completed",
+              items: [],
+            },
+          },
+        }),
+      );
+      await turnCompleted;
+      await delay(20);
+
+      expect(bridge.listSessions()).toEqual([]);
+      expect(bridge.listSessionViews()).toEqual([]);
+      expect(bridge.getSessionView("ephemeral-title-helper")).toBeNull();
+      expect(bridge.isSessionActive("ephemeral-title-helper")).toBe(false);
+      expect(bridge.getStatus().sessionCount).toBe(0);
+      expect(
+        emittedEvents.some(
+          (event) =>
+            (event as { session?: { id?: string } }).session?.id ===
+              "ephemeral-title-helper" ||
+            (event as { sessionId?: string }).sessionId ===
+              "ephemeral-title-helper",
+        ),
+      ).toBe(false);
     } finally {
       client.close();
     }
@@ -1907,6 +2281,81 @@ describe("CodexBridgeService", () => {
           ownership: { owner: "none" },
         },
         activity: "idle",
+      });
+    } finally {
+      client.close();
+    }
+  });
+
+  it("detaches a thread after a successful thread/unsubscribe response", async () => {
+    const client = await connect(`ws://127.0.0.1:${bridgePort}`);
+    try {
+      client.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "thread/read",
+          params: { threadId: "thread-unsubscribe" },
+        }),
+      );
+      await waitFor(() => upstreamMessages.length === 1);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            model: "gpt-5.3-codex",
+            cwd: "/tmp/project-unsubscribe",
+            thread: {
+              id: "thread-unsubscribe",
+              preview: "Completed helper",
+              ephemeral: false,
+              createdAt: 1_780_000_000,
+              updatedAt: 1_780_000_001,
+              cwd: "/tmp/project-unsubscribe",
+              status: { type: "idle" },
+              turns: [{}],
+            },
+          },
+        }),
+      );
+      await waitFor(() => bridge.isSessionActive("thread-unsubscribe"));
+
+      const unsubscribeResponse = waitForJson(client);
+      client.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "thread/unsubscribe",
+          params: { threadId: "thread-unsubscribe" },
+        }),
+      );
+      await waitFor(() => upstreamMessages.length === 2);
+      upstreamSocket?.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          result: { status: "unsubscribed" },
+        }),
+      );
+      await unsubscribeResponse;
+      await waitFor(() => !bridge.isSessionActive("thread-unsubscribe"));
+
+      expect(bridge.getSessionView("thread-unsubscribe")).toMatchObject({
+        session: {
+          id: "thread-unsubscribe",
+          ownership: { owner: "none" },
+        },
+        active: false,
+        activity: "idle",
+      });
+      const routing = await fetch(
+        `http://127.0.0.1:${bridgePort}/sessions/thread-unsubscribe/active`,
+        { headers: { authorization: `Bearer ${BRIDGE_CONTROL_TOKEN}` } },
+      );
+      expect(await routing.json()).toEqual({
+        active: false,
+        mcpProfile: "light",
       });
     } finally {
       client.close();
@@ -3213,6 +3662,17 @@ describe("CodexBridgeService", () => {
     }
     await first.shutdown();
 
+    expect(JSON.parse(readFileSync(statePath, "utf8"))).toMatchObject({
+      version: 2,
+      sessions: [
+        {
+          id: "thread-persist",
+          ephemeral: false,
+          executionProfile: "light",
+        },
+      ],
+    });
+
     const portB = await findAvailablePort();
     const second = new CodexBridgeService({
       enabled: true,
@@ -3238,8 +3698,62 @@ describe("CodexBridgeService", () => {
           contextWindow: 16_000,
         },
       });
+      const routing = await fetch(
+        `http://127.0.0.1:${portB}/sessions/thread-persist/active`,
+      );
+      expect(await routing.json()).toEqual({
+        active: false,
+        mcpProfile: "light",
+      });
     } finally {
       await second.shutdown();
+    }
+  });
+
+  it("drops legacy bridge session projections without ephemeral metadata", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "codex-bridge-v1-state-"));
+    const statePath = join(directory, "sessions.json");
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        sessions: [
+          {
+            id: "legacy-unclassified-helper",
+            isSubagent: false,
+            threadMetadataKnown: true,
+            projectPath: "/tmp/project-legacy-helper",
+            projectPathKnown: true,
+            title: null,
+            fullTitle: null,
+            createdAt: "2026-09-07T02:47:06.000Z",
+            updatedAt: "2026-09-07T02:47:11.523Z",
+            messageCount: 1,
+            model: "gpt-5.6-luna",
+            completedTurnIds: ["legacy-helper-turn"],
+            emitted: true,
+          },
+        ],
+      }),
+    );
+
+    const migrated = new CodexBridgeService({
+      enabled: true,
+      host: "127.0.0.1",
+      port: await findAvailablePort(),
+      upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+      statePath,
+    });
+    try {
+      await migrated.start();
+      expect(migrated.listSessions()).toEqual([]);
+      expect(JSON.parse(readFileSync(statePath, "utf8"))).toEqual({
+        version: 2,
+        sessions: [],
+      });
+    } finally {
+      await migrated.shutdown();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
   it("replays the derived durable bridge journal and deduplicates lifecycle events after reconnect", async () => {
@@ -3466,20 +3980,29 @@ async function connect(
   });
 }
 
-async function waitForJson(ws: WebSocket): Promise<JsonRpcMessage> {
-  return (await waitForJsonFrame(ws)).message;
+async function waitForJson(
+  ws: WebSocket,
+  predicate?: (message: JsonRpcMessage) => boolean,
+): Promise<JsonRpcMessage> {
+  return (await waitForJsonFrame(ws, predicate)).message;
 }
 
 async function waitForJsonFrame(
   ws: WebSocket,
+  predicate: (message: JsonRpcMessage) => boolean = () => true,
 ): Promise<{ message: JsonRpcMessage; isBinary: boolean }> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("message timeout")), 5000);
+    const timer = setTimeout(() => {
+      ws.off("message", handler);
+      reject(new Error("message timeout"));
+    }, 5000);
     const handler = (data: WebSocket.RawData, isBinary: boolean) => {
+      const message = JSON.parse(data.toString()) as JsonRpcMessage;
+      if (!predicate(message)) return;
       clearTimeout(timer);
       ws.off("message", handler);
       resolve({
-        message: JSON.parse(data.toString()) as JsonRpcMessage,
+        message,
         isBinary,
       });
     };

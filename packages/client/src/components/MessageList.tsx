@@ -11,18 +11,25 @@ import {
   useState,
 } from "react";
 import { useOptionalI18n } from "../i18n";
+import { hasAttachmentToken } from "../lib/attachmentTokens";
 import { hasActiveTextSelectionWithin } from "../lib/clipboard";
 import {
   type ActiveToolApproval,
   isSessionInspectorOnlyItem,
   preprocessMessages,
 } from "../lib/preprocessMessages";
+import { getTurnPhase } from "../lib/turnPhase";
 import type { Message } from "../types";
 import type { RenderItem } from "../types/renderItems";
 import { getMessageId } from "../utils";
 import { MessageActions } from "./MessageActions";
 import { ProcessingIndicator } from "./ProcessingIndicator";
 import { RenderItemComponent } from "./RenderItemComponent";
+import {
+  PromptTextWithAttachments,
+  UploadedFilesMetadata,
+  formatFileSize,
+} from "./blocks/UserPromptBlock";
 import {
   type DeferredMessage,
   type MessageRow,
@@ -914,6 +921,17 @@ export const MessageList = memo(function MessageList({
       case "assistant-turn": {
         // Assistant items wrapped in timeline container
         const usesLastUpdateTimestamp = row.key === lastUpdatedAssistantTurnKey;
+        const turnEndTimestamp = usesLastUpdateTimestamp
+          ? getLatestTimestamp(
+              row.turnTimestamp,
+              row.turnUpdatedAt,
+              lastActivityAt,
+            )
+          : getLatestTimestamp(row.turnTimestamp, row.turnUpdatedAt);
+        const turnDurationMs = getDurationMs(
+          row.turnStartedAt,
+          turnEndTimestamp,
+        );
         return (
           <div
             className={`assistant-turn${row.resumedAfterQuestion ? " assistant-turn-resumed" : ""}`}
@@ -949,15 +967,17 @@ export const MessageList = memo(function MessageList({
             })}
             <MessageActions
               timestamp={
-                usesLastUpdateTimestamp
-                  ? getLatestTimestamp(
-                      row.turnTimestamp,
-                      row.turnUpdatedAt,
-                      lastActivityAt,
-                    )
-                  : row.turnTimestamp
+                usesLastUpdateTimestamp ? turnEndTimestamp : row.turnTimestamp
               }
               timestampIsLastUpdate={usesLastUpdateTimestamp}
+              durationMs={turnDurationMs}
+              durationIsRunning={usesLastUpdateTimestamp && isProcessing}
+              turnStartedAt={row.turnStartedAt}
+              runningPhase={
+                usesLastUpdateTimestamp && isProcessing && !isCompacting
+                  ? getTurnPhase(row.items)
+                  : undefined
+              }
               copyText={row.turnCopyText}
             />
           </div>
@@ -995,21 +1015,39 @@ export const MessageList = memo(function MessageList({
             </div>
           </div>
         );
-      case "deferred":
+      case "deferred": {
         // Queued server-side, waiting for agent turn to end
+        const deferredFiles = (row.deferred.attachments ?? []).map((file) => ({
+          originalName: file.originalName,
+          mimeType: file.mimeType,
+          path: file.path,
+          size: formatFileSize(file.size),
+        }));
+        // Files referenced by an inline token render inside the text itself.
+        const deferredTrailingFiles = deferredFiles.filter(
+          (file) =>
+            !hasAttachmentToken(row.deferred.content, file.originalName),
+        );
         return (
           <div className="deferred-message">
             <div className="message-user-prompt deferred-message-bubble">
-              {row.deferred.content}
+              <PromptTextWithAttachments
+                text={row.deferred.content}
+                files={deferredFiles}
+              />
+              <UploadedFilesMetadata files={deferredTrailingFiles} />
             </div>
             <div className="deferred-message-footer">
               <span className="deferred-message-status">
-                {row.index === 0
-                  ? (i18n?.t("userPromptQueuedNext") ??
-                    "Queued · after this turn")
-                  : (i18n?.t("userPromptQueuedPosition", {
-                      position: row.index + 1,
-                    }) ?? `Queued (#${row.index + 1})`)}
+                {row.deferred.blocked
+                  ? (i18n?.t("userPromptQueueBlocked") ??
+                    "Not sent · session stopped; cancel and resend")
+                  : row.index === 0
+                    ? (i18n?.t("userPromptQueuedNext") ??
+                      "Queued · after this turn")
+                    : (i18n?.t("userPromptQueuedPosition", {
+                        position: row.index + 1,
+                      }) ?? `Queued (#${row.index + 1})`)}
               </span>
               {row.deferred.tempId && onCancelDeferred && (
                 <button
@@ -1028,16 +1066,33 @@ export const MessageList = memo(function MessageList({
             </div>
           </div>
         );
+      }
       case "compacting":
         // Shown when context is being compressed
         return (
-          <div className="system-message system-message-compacting">
+          <div
+            className="system-message system-message-compacting"
+            role="status"
+            aria-live="polite"
+          >
             <span className="system-message-icon spinning">⟳</span>
-            <span className="system-message-text">Compacting context...</span>
+            <span className="system-message-text">
+              {i18n?.t("sessionCompactingContext") ?? "Compacting context..."}
+            </span>
           </div>
         );
       case "processing":
-        return <ProcessingIndicator isProcessing={isProcessing} />;
+        return (
+          <>
+            {isProcessing &&
+              !isCompacting &&
+              !hasNewerMessages &&
+              !lastUpdatedAssistantTurnKey && (
+                <MessageActions runningPhase="llm" />
+              )}
+            <ProcessingIndicator isProcessing={isProcessing && !isCompacting} />
+          </>
+        );
     }
   };
 
@@ -1095,4 +1150,20 @@ function getLatestTimestamp(
   }
 
   return latestTimestamp;
+}
+
+/**
+ * Wall-clock duration between two ISO timestamps, or undefined when either end
+ * is missing/unparseable or the clock went backwards.
+ */
+function getDurationMs(
+  startedAt: string | undefined,
+  endedAt: string | undefined,
+): number | undefined {
+  if (!startedAt || !endedAt) return undefined;
+  const startMs = Date.parse(startedAt);
+  const endMs = Date.parse(endedAt);
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) return undefined;
+  if (endMs < startMs) return undefined;
+  return endMs - startMs;
 }

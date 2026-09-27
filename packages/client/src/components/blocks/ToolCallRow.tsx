@@ -7,6 +7,7 @@ import type { ToolResultData } from "../../types/renderItems";
 import { toolRegistry } from "../renderers/tools";
 import type { RenderContext } from "../renderers/types";
 import { getToolSummary } from "../tools/summaries";
+import { LiveOutputPreview } from "./LiveOutputPreview";
 import { ToolRenderErrorBoundary } from "./ToolRenderErrorBoundary";
 
 interface Props {
@@ -18,6 +19,8 @@ interface Props {
   sessionProvider?: string;
   /** Live streaming output preview while the tool is still running. */
   partialOutput?: string;
+  /** Render only the full body when another row already owns disclosure. */
+  detailOnly?: boolean;
 }
 
 type ToolCallStatus = Props["status"];
@@ -30,6 +33,7 @@ const ToolCallRowContent = memo(function ToolCallRowContent({
   status,
   sessionProvider,
   partialOutput,
+  detailOnly,
 }: Props) {
   // Create a minimal render context for tool renderers
   const renderContext: RenderContext = useMemo(
@@ -118,6 +122,7 @@ const ToolCallRowContent = memo(function ToolCallRowContent({
   const summary = useMemo(() => {
     return getToolSummary(toolName, toolInput, toolResult, status, {
       provider: sessionProvider,
+      summaries: toolRegistry.get(toolName),
     });
   }, [toolName, toolInput, toolResult, status, sessionProvider]);
 
@@ -126,6 +131,36 @@ const ToolCallRowContent = memo(function ToolCallRowContent({
       setExpanded(!expanded);
     }
   };
+
+  if (detailOnly) {
+    return (
+      <div className="tool-row-detail-only">
+        {hasInlineRenderer ? (
+          toolRegistry.renderInline(
+            toolName,
+            toolInput,
+            structuredResult,
+            toolResult?.isError ?? false,
+            status,
+            renderContext,
+          )
+        ) : status === "pending" || status === "aborted" ? (
+          <ToolUseExpanded
+            toolName={toolName}
+            toolInput={toolInput}
+            context={renderContext}
+          />
+        ) : (
+          <ToolResultExpanded
+            toolName={toolName}
+            toolInput={toolInput}
+            toolResult={toolResult}
+            context={renderContext}
+          />
+        )}
+      </div>
+    );
+  }
 
   // Inline renderers bypass the entire tool-row structure
   if (hasInlineRenderer) {
@@ -277,30 +312,6 @@ function shouldSuppressBashCollapsedPreview(
 function isBashToolName(toolName: string): boolean {
   const normalized = toolName.toLowerCase();
   return normalized === "bash" || normalized === "shell";
-}
-
-const LIVE_OUTPUT_MAX_LINES = 12;
-
-/** Scrolling tail of a running command's output, like the Codex TUI exec cell. */
-function LiveOutputPreview({ output }: { output: string }) {
-  const tail = useMemo(() => {
-    const lines = output.replace(/\r\n?/g, "\n").split("\n");
-    // Drop a trailing blank line from a final newline so the tail stays dense.
-    if (lines.length > 1 && lines[lines.length - 1] === "") {
-      lines.pop();
-    }
-    return lines.slice(-LIVE_OUTPUT_MAX_LINES).join("\n");
-  }, [output]);
-
-  if (!tail.trim()) {
-    return null;
-  }
-
-  return (
-    <div className="tool-live-output" aria-live="polite">
-      <pre>{tail}</pre>
-    </div>
-  );
 }
 
 function ToolUseExpanded({

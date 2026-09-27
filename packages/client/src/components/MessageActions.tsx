@@ -1,5 +1,6 @@
 import type { ContextUsage } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useElapsedLabel } from "../hooks/useElapsedLabel";
 import { useI18n } from "../i18n";
 import {
   type ClipboardImageSource,
@@ -7,13 +8,26 @@ import {
   writeClipboardText,
   writeClipboardUserInput,
 } from "../lib/clipboard";
+import { formatElapsed } from "../lib/formatElapsed";
 import { formatTokenCount } from "../lib/tokens";
+import type { TurnPhase } from "../lib/turnPhase";
 
 interface MessageActionsProps {
   /** ISO timestamp string from the source message; shown on hover. */
   timestamp?: string;
   /** Whether the timestamp represents live turn activity instead of turn start. */
   timestampIsLastUpdate?: boolean;
+  /** Elapsed wall-clock time of this turn, in milliseconds. */
+  durationMs?: number;
+  /**
+   * Turn is still running: the badge switches to a shared 1s ticker driven by
+   * `turnStartedAt` instead of the (stale between events) `durationMs`.
+   */
+  durationIsRunning?: boolean;
+  /** ISO timestamp the turn started, required for the live ticker. */
+  turnStartedAt?: string;
+  /** Foreground phase, supplied only for the active turn. */
+  runningPhase?: TurnPhase;
   /** Context-window usage snapshot associated with this message. */
   contextBefore?: ContextUsage;
   /** Plain-text payload to copy. When omitted, the copy button is hidden. */
@@ -45,6 +59,10 @@ type CopyFeedback = {
 export function MessageActions({
   timestamp,
   timestampIsLastUpdate = false,
+  durationMs,
+  durationIsRunning = false,
+  turnStartedAt,
+  runningPhase,
   contextBefore,
   copyText,
   copyImages = [],
@@ -114,16 +132,32 @@ export function MessageActions({
       ? `${contextBefore.inputTokens.toLocaleString()} context tokens`
       : undefined;
 
+  // A running turn emits no events while a long tool executes, so a value
+  // derived from message timestamps would freeze. Tick locally instead.
+  const liveElapsed = useElapsedLabel(turnStartedAt, durationIsRunning);
+  const durationLabel = liveElapsed
+    ? liveElapsed.label
+    : durationMs !== undefined && durationMs >= MIN_VISIBLE_DURATION_MS
+      ? formatElapsed(durationMs)
+      : null;
+
   const hasCopyPayload =
     copyText !== undefined && (copyText.length > 0 || copyImages.length > 0);
 
-  if (!timestamp && !contextTokenLabel && !hasCopyPayload && !onEdit)
+  if (
+    !timestamp &&
+    !durationLabel &&
+    !runningPhase &&
+    !contextTokenLabel &&
+    !hasCopyPayload &&
+    !onEdit
+  )
     return null;
 
   return (
     <span
       ref={actionsRef}
-      className={`message-actions${placement === "bubble" ? " message-actions-bubble" : ""}${copyFeedback ? " is-active" : ""}`}
+      className={`message-actions${placement === "bubble" ? " message-actions-bubble" : ""}${copyFeedback ? " is-active" : ""}${runningPhase ? " has-running-phase" : ""}`}
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => e.stopPropagation()}
     >
@@ -148,6 +182,25 @@ export function MessageActions({
         >
           {formatShortTime(timestamp)}
         </time>
+      )}
+      {durationLabel && (
+        <span
+          className={`message-actions-duration${durationIsRunning ? " is-running" : ""}`}
+          title={
+            durationIsRunning
+              ? t("messageActionDurationRunning", { duration: durationLabel })
+              : t("messageActionDuration", { duration: durationLabel })
+          }
+        >
+          {durationLabel}
+        </span>
+      )}
+      {runningPhase && (
+        <span className="message-actions-phase" role="status">
+          {runningPhase === "tools"
+            ? t("messageActionPhaseTools")
+            : t("messageActionPhaseLlm")}
+        </span>
       )}
       {contextTokenLabel && (
         <span className="message-actions-context" title={contextTokenTitle}>
@@ -303,3 +356,6 @@ function formatFullTimestamp(iso: string): string {
   if (Number.isNaN(date.getTime())) return iso;
   return date.toLocaleString();
 }
+
+/** Sub-second turns are noise; hide the badge below this threshold. */
+const MIN_VISIBLE_DURATION_MS = 1000;

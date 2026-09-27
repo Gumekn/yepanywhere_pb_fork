@@ -1,8 +1,8 @@
 import { memo, useCallback } from "react";
+import { useOptionalI18n } from "../i18n";
 import { getMessageId } from "../lib/mergeMessages";
 import { canEditPersistedUserPrompt } from "../lib/sessionBranching";
 import type { RenderItem } from "../types/renderItems";
-import { AssistantOutputToolGroupRow } from "./blocks/AssistantOutputToolGroupRow";
 import { DisplayToolGroupRow } from "./blocks/DisplayToolGroupRow";
 import { GoalInlineBlock } from "./blocks/GoalInlineRenderer";
 import { SessionSetupBlock } from "./blocks/SessionSetupBlock";
@@ -146,6 +146,7 @@ export const RenderItemComponent = memo(function RenderItemComponent({
   onEditUserPrompt,
   onSelectBranch,
 }: Props) {
+  const i18n = useOptionalI18n();
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
       // Don't interfere with text selection (important for mobile long-press)
@@ -180,6 +181,7 @@ export const RenderItemComponent = memo(function RenderItemComponent({
             isStreaming={item.isStreaming}
             augmentHtml={item.augmentHtml}
             phase={item.phase}
+            asyncMessage={item.asyncMessage}
           />
         );
 
@@ -210,14 +212,6 @@ export const RenderItemComponent = memo(function RenderItemComponent({
       case "display_tool_group":
         return (
           <DisplayToolGroupRow item={item} sessionProvider={sessionProvider} />
-        );
-
-      case "assistant_output_tool_group":
-        return (
-          <AssistantOutputToolGroupRow
-            item={item}
-            sessionProvider={sessionProvider}
-          />
         );
 
       case "user_prompt": {
@@ -276,7 +270,11 @@ export const RenderItemComponent = memo(function RenderItemComponent({
             >
               {icon}
             </span>
-            <span className="system-message-text">{item.content}</span>
+            <span className="system-message-text">
+              {item.subtype === "compact_boundary"
+                ? (i18n?.t("sessionDisplayCompaction") ?? item.content)
+                : item.content}
+            </span>
           </div>
         );
       }

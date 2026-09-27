@@ -1,3 +1,4 @@
+import { SessionFileStore } from "../../../src/session-files/store.js";
 /**
  * Unit tests for CodexProvider.
  *
@@ -15,7 +16,7 @@ import {
 } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GeneratedArtifactManifest } from "@yep-anywhere/shared";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -41,6 +42,7 @@ import {
   type CodexProviderConfig,
 } from "../../../src/sdk/providers/codex.js";
 import type { SDKMessage, ToolApprovalResult } from "../../../src/sdk/types.js";
+import { Process } from "../../../src/supervisor/Process.js";
 import { Supervisor } from "../../../src/supervisor/Supervisor.js";
 import { UploadManager } from "../../../src/uploads/manager.js";
 
@@ -194,6 +196,47 @@ describe("CodexProvider", () => {
   });
 
   describe("startSession", () => {
+    it("does not attribute unreported writes by scanning around turn/start", async () => {
+      const root = mkdtempSync(join(tmpdir(), "codex-file-lifecycle-"));
+      const data = mkdtempSync(join(tmpdir(), "codex-file-store-"));
+      const previousData = process.env.YEP_ANYWHERE_DATA_DIR;
+      const previousFile = process.env.CODEX_FAKE_SNAPSHOT_FILE;
+      const previousCapture = process.env.CODEX_FAKE_CAPTURE;
+      process.env.CODEX_FAKE_CAPTURE = join(data, "requests.json");
+      process.env.YEP_ANYWHERE_DATA_DIR = data;
+      process.env.CODEX_FAKE_SNAPSHOT_FILE = join(root, "report.md");
+      let session:
+        | Awaited<ReturnType<CodexProvider["startSession"]>>
+        | undefined;
+      try {
+        const provider = new CodexProvider({
+          codexPath: writeFakeCodexAppServer(root),
+          eventSpine: { store: new InMemoryCodexEventStore() },
+        });
+        session = await provider.startSession({
+          cwd: root,
+          initialMessage: { text: "write document", uuid: "file-user" },
+        });
+        for await (const message of session.iterator) {
+          if (message.type === "result") break;
+        }
+        const store = new SessionFileStore(
+          join(data, "session-file-snapshots"),
+        );
+        const scope = { provider: "codex" as const, sessionId: "thread-new" };
+        const ids = await store.listRecords(scope);
+        expect(ids).toEqual([]);
+        expect(existsSync(join(root, "report.md"))).toBe(true);
+      } finally {
+        session?.abort();
+        restoreEnv("YEP_ANYWHERE_DATA_DIR", previousData);
+        restoreEnv("CODEX_FAKE_SNAPSHOT_FILE", previousFile);
+        restoreEnv("CODEX_FAKE_CAPTURE", previousCapture);
+        rmSync(root, { recursive: true, force: true });
+        rmSync(data, { recursive: true, force: true });
+      }
+    });
+
     function writeFakeCodexAppServer(tempDir: string): string {
       const fakeCodexPath = join(tempDir, "fake-codex.js");
       writeFileSync(
@@ -206,6 +249,7 @@ if (argv[0] === "app-server" && process.env.CODEX_FAKE_APP_SERVER_ERROR) {
   process.exit(1);
 }
 let buffer = "";
+let activeThreadId = "thread-new";
 const attemptsByMethod = new Map();
 
 function send(id, result) {
@@ -341,7 +385,7 @@ function sendThread(id, threadId, cwd, options = {}) {
     modelProvider: "openai",
     serviceTier: options.serviceTier ?? process.env.CODEX_FAKE_SERVICE_TIER ?? null,
     cwd,
-    reasoningEffort: null,
+    reasoningEffort: options.reasoningEffort ?? process.env.CODEX_FAKE_REASONING_EFFORT ?? null,
     initialTurnsPage: options.initialTurnsPage || null,
     turnsBackwardsCursor: options.turnsBackwardsCursor || null,
     itemsBackwardsCursor: options.itemsBackwardsCursor || null,
@@ -372,7 +416,7 @@ function handle(message) {
     notify(
       "turn/completed",
       {
-        threadId: "thread-new",
+        threadId: activeThreadId,
         turn: {
           id: "turn-rewrite",
           status: "completed",
@@ -429,6 +473,7 @@ function handle(message) {
       (turn) => turn.id === message.params.lastTurnId,
     );
     sendThread(message.id, "thread-forked", message.params.cwd, {
+      reasoningEffort: message.params.config?.model_reasoning_effort,
       turns:
         message.params.excludeTurns === true || boundary < 0
           ? []
@@ -437,7 +482,29 @@ function handle(message) {
     });
     return;
   }
+  if (message.method === "turn/start" && process.env.CODEX_FAKE_LARGE_IMAGE === "1") {
+    const turnId = "large-turn-" + attempt;
+    const threadId = message.params.threadId;
+    send(message.id, { turn: { id: turnId, status: "inProgress", items: [], error: null } });
+    if (process.env.CODEX_FAKE_DISCONNECT === "1") {
+      setTimeout(() => process.exit(1), 20);
+      return;
+    }
+    const bytes = Buffer.alloc(8 * 1024 * 1024);
+    Buffer.from("89504e470d0a1a0a", "hex").copy(bytes);
+    notify("item/completed", { threadId, turnId, item: {
+      type: "imageGeneration", id: "image-" + attempt, status: "completed",
+      result: bytes.toString("base64"), transparentBackground: false,
+    } });
+    notify("item/completed", { threadId, turnId, item: {
+      type: "agentMessage", id: "reply-" + attempt, text: "reply " + attempt, phase: "final_answer",
+    } });
+    notify("turn/completed", { threadId, turn: { id: turnId, status: "completed", items: [], error: null } });
+    return;
+  }
   if (message.method === "turn/start") {
+    if (process.env.CODEX_FAKE_SNAPSHOT_FILE) fs.writeFileSync(process.env.CODEX_FAKE_SNAPSHOT_FILE, "Codex generated document");
+    activeThreadId = message.params.threadId;
     const eventMode = process.env.CODEX_FAKE_EVENT_MODE === "1";
     const activeTurn = process.env.CODEX_FAKE_ACTIVE_TURN === "1";
     const failedTurn = process.env.CODEX_FAKE_FAILED_TURN === "1";
@@ -462,7 +529,7 @@ function handle(message) {
       notify(
         "turn/started",
         {
-          threadId: "thread-new",
+          threadId: activeThreadId,
           turn: { id: "turn-rewrite", status: "inProgress", items: [] },
         },
         1000,
@@ -470,7 +537,7 @@ function handle(message) {
       notify(
         "item/completed",
         {
-          threadId: "thread-new",
+          threadId: activeThreadId,
           turnId: "turn-rewrite",
           item: {
             id: "agent-event-spine",
@@ -485,7 +552,7 @@ function handle(message) {
         notify(
           "item/completed",
           {
-            threadId: "thread-new",
+            threadId: activeThreadId,
             turnId: "turn-rewrite",
             item: {
               id: "file-generated",
@@ -506,7 +573,7 @@ function handle(message) {
       notify(
         "future/provider-event",
         {
-          threadId: "thread-new",
+          threadId: activeThreadId,
           turnId: "turn-rewrite",
           authorization: "Bearer must-not-be-persisted",
         },
@@ -516,7 +583,7 @@ function handle(message) {
         "approval-event-spine",
         "item/commandExecution/requestApproval",
         {
-          threadId: "thread-new",
+          threadId: activeThreadId,
           turnId: "turn-rewrite",
           itemId: "command-event-spine",
           command: "pwd",
@@ -574,6 +641,20 @@ function handle(message) {
       message.params.objective === "provider-invalid"
     ) {
       sendError(message.id, -32602, "synthetic invalid parameters");
+      return;
+    }
+    if (message.method === "thread/compact/start" && process.env.CODEX_FAKE_COMPACTION) {
+      const threadId = message.params.threadId;
+      const turnId = "compact-turn";
+      const item = { id: "compact-item", type: "contextCompaction" };
+      send(message.id, {});
+      notify("turn/started", { threadId, turn: { id: turnId, status: "inProgress", items: [], error: null } });
+      notify("item/started", { threadId, turnId, item });
+      setTimeout(() => {
+        const status = process.env.CODEX_FAKE_COMPACTION;
+        if (status === "completed") notify("item/completed", { threadId, turnId, item });
+        notify("turn/completed", { threadId, turn: { id: turnId, status, items: [], error: status === "failed" ? { message: "Compaction failed" } : null } });
+      }, 20);
       return;
     }
     if (message.method === "skills/list") {
@@ -708,6 +789,7 @@ function handle(message) {
         })
       : null;
   sendThread(message.id, threadId, message.params.cwd, {
+    reasoningEffort: message.params.config?.model_reasoning_effort,
     serviceTier: message.params.serviceTier,
     turns,
     initialTurnsPage,
@@ -736,6 +818,113 @@ process.stdin.on("data", (chunk) => {
       chmodSync(fakeCodexPath, 0o755);
       return fakeCodexPath;
     }
+
+    it.each([false, true])(
+      "handles queued input after a large image or transport failure (disconnect=%s)",
+      async (disconnect) => {
+        const tempDir = mkdtempSync(
+          join(require("node:os").tmpdir(), "codex-deferred-image-"),
+        );
+        const capturePath = join(tempDir, "capture.json");
+        const messageCapturePath = join(tempDir, "messages.jsonl");
+        vi.stubEnv("CODEX_FAKE_CAPTURE", capturePath);
+        vi.stubEnv("CODEX_FAKE_MESSAGE_CAPTURE", messageCapturePath);
+        vi.stubEnv("CODEX_FAKE_LARGE_IMAGE", "1");
+        vi.stubEnv("CODEX_FAKE_DISCONNECT", disconnect ? "1" : "0");
+        let managed: Process | undefined;
+        let session:
+          | Awaited<ReturnType<CodexProvider["startSession"]>>
+          | undefined;
+        try {
+          const provider = new CodexProvider({
+            codexPath: writeFakeCodexAppServer(tempDir),
+            eventSpine: { store: new InMemoryCodexEventStore() },
+            generatedArtifactUploadManager: new UploadManager({
+              uploadsDir: join(tempDir, "uploads"),
+            }),
+          });
+          session = await provider.startSession({
+            cwd: tempDir,
+            initialMessage: { text: "generate", uuid: "first" },
+          });
+          managed = new Process(session.iterator, {
+            projectPath: tempDir,
+            projectId: "project-1",
+            sessionId: "thread-new",
+            provider: "codex",
+            queue: session.queue,
+            abortFn: session.abort,
+            steerFn: session.steer,
+            idleTimeoutMs: 60_000,
+          });
+          const messages: SDKMessage[] = [];
+          managed.subscribe((event) => {
+            if (event.type === "message") messages.push(event.message);
+          });
+          const imagePath = join(tempDir, "attachment.png");
+          writeFileSync(imagePath, Buffer.from("89504e470d0a1a0a", "hex"));
+          managed.deferMessage({
+            text: "align these boxes",
+            tempId: "queued-image",
+            attachments: [
+              {
+                id: "attachment",
+                name: "attachment.png",
+                originalName: "attachment.png",
+                path: imagePath,
+                size: 8,
+                mimeType: "image/png",
+              },
+            ],
+          });
+          await vi.waitFor(() => expect(managed?.state.type).toBe("idle"), {
+            timeout: 10_000,
+          });
+          const starts = readMessageCapture(messageCapturePath).filter(
+            (request) => request.method === "turn/start",
+          );
+          if (disconnect) {
+            expect(starts).toHaveLength(1);
+            expect(managed.getDeferredQueueSummary()).toMatchObject([
+              { tempId: "queued-image", blocked: true },
+            ]);
+            expect(
+              messages.some((message) => message.tempId === "queued-image"),
+            ).toBe(false);
+            expect(messages.some((message) => message.type === "error")).toBe(
+              true,
+            );
+          } else {
+            expect(starts).toHaveLength(2);
+            expect(JSON.stringify(starts[1]?.params)).toContain(
+              "align these boxes",
+            );
+            expect(starts[1]?.params).toMatchObject({
+              input: expect.arrayContaining([
+                { type: "localImage", path: imagePath },
+              ]),
+            });
+            expect(managed.getDeferredQueueSummary()).toEqual([]);
+            expect(
+              messages.filter((message) => message.type === "result"),
+            ).toHaveLength(2);
+            expect(messages.some((message) => message.type === "error")).toBe(
+              false,
+            );
+            expect(
+              messages.some(
+                (message) => message.message?.content === "reply 2",
+              ),
+            ).toBe(true);
+          }
+        } finally {
+          managed?.terminate("test_complete");
+          session?.abort();
+          vi.unstubAllEnvs();
+          rmSync(tempDir, { recursive: true, force: true });
+        }
+      },
+    );
 
     it.each([
       [false, "priority"],
@@ -780,6 +969,80 @@ process.stdin.on("data", (chunk) => {
           } else {
             expect(captured.params.serviceTier).toBe(serviceTier);
           }
+        } finally {
+          session?.abort();
+          vi.unstubAllEnvs();
+          rmSync(tempDir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    it.each([
+      [false, "medium"],
+      [false, "high"],
+      [false, "xhigh"],
+      [false, "max"],
+      [false, "ultra"],
+      [false, undefined],
+      [true, "high"],
+      [true, undefined],
+    ] as const)(
+      "applies effort before init and keeps it on turns (resume=%s, effort=%s)",
+      async (resume, reasoningEffort) => {
+        const tempDir = mkdtempSync(
+          join(require("node:os").tmpdir(), "codex-reasoning-effort-"),
+        );
+        const capturePath = join(tempDir, "capture.json");
+        const messageCapturePath = join(tempDir, "messages.jsonl");
+        vi.stubEnv("CODEX_FAKE_CAPTURE", capturePath);
+        vi.stubEnv("CODEX_FAKE_MESSAGE_CAPTURE", messageCapturePath);
+        vi.stubEnv("CODEX_FAKE_REASONING_EFFORT", "xhigh");
+        let session:
+          | Awaited<ReturnType<CodexProvider["startSession"]>>
+          | undefined;
+        try {
+          const provider = new CodexProvider({
+            codexPath: writeFakeCodexAppServer(tempDir),
+          });
+          // Create-only follows the attachment path: init must already carry
+          // the selection before any turn is queued.
+          session = await provider.startSession({
+            cwd: tempDir,
+            resumeSessionId: resume ? "thread-existing" : undefined,
+            reasoningEffort,
+          });
+          await expect(session.iterator.next()).resolves.toMatchObject({
+            value: {
+              type: "system",
+              subtype: "init",
+              reasoningEffort: reasoningEffort ?? "xhigh",
+            },
+          });
+          const captured = JSON.parse(readFileSync(capturePath, "utf8"));
+          expect(captured.method).toBe(
+            resume ? "thread/resume" : "thread/start",
+          );
+          if (reasoningEffort === undefined) {
+            expect(captured.params.config).not.toHaveProperty(
+              "model_reasoning_effort",
+            );
+          } else {
+            expect(captured.params.config.model_reasoning_effort).toBe(
+              reasoningEffort,
+            );
+          }
+          session.queue.push({ text: "first prompt", uuid: "effort-1" });
+          await expect(session.iterator.next()).resolves.toMatchObject({
+            value: { type: "user" },
+          });
+          await expect(session.iterator.next()).resolves.toMatchObject({
+            value: { type: "result" },
+          });
+          const turn = readMessageCapture(messageCapturePath).find(
+            ({ method }) => method === "turn/start",
+          );
+          expect(turn).toBeDefined();
+          expect(turn?.params?.effort).toBe(reasoningEffort);
         } finally {
           session?.abort();
           vi.unstubAllEnvs();
@@ -1205,6 +1468,40 @@ process.stdin.on("data", (chunk) => {
             });
           } else if (message.method === "turn/steer") {
             send({ turnId: "turn-live" });
+            for (const threadId of ["child-thread", "thread-bridge"]) {
+              socket.send(
+                JSON.stringify({
+                  method: "item/completed",
+                  params: {
+                    threadId,
+                    turnId: "turn-live",
+                    item: {
+                      type: "agentMessage",
+                      id: `${threadId}-reply`,
+                      text:
+                        threadId === "child-thread"
+                          ? "Disposition: fix"
+                          : "Parent reply",
+                      phase: "final_answer",
+                    },
+                  },
+                }),
+              );
+              socket.send(
+                JSON.stringify({
+                  method: "turn/completed",
+                  params: {
+                    threadId,
+                    turn: {
+                      id: "turn-live",
+                      status: "completed",
+                      items: [],
+                      error: null,
+                    },
+                  },
+                }),
+              );
+            }
             socket.send(
               JSON.stringify({
                 method: "turn/completed",
@@ -1239,8 +1536,10 @@ process.stdin.on("data", (chunk) => {
         resumeSessionId: "thread-bridge",
         initialMessage: { text: "continue", uuid: "bridge-message" },
       });
+      const runtimeMessages: SDKMessage[] = [];
       try {
         for await (const message of session.iterator) {
+          runtimeMessages.push(message);
           if (
             message.type === "result" &&
             message.clientUserMessageId === "bridge-message"
@@ -1283,6 +1582,17 @@ process.stdin.on("data", (chunk) => {
         const events = await eventStore.replay({
           sessionId: "thread-bridge",
         });
+        expect(events.some((event) => event.threadId === "child-thread")).toBe(
+          true,
+        );
+        expect(
+          runtimeMessages.filter((message) => message.type === "assistant"),
+        ).toMatchObject([
+          {
+            codexThreadId: "thread-bridge",
+            message: { content: "Parent reply" },
+          },
+        ]);
         expect(events.length).toBeGreaterThan(0);
         expect(
           events.every(
@@ -1484,6 +1794,13 @@ process.stdin.on("data", (chunk) => {
 
     it.each([
       {
+        name: "unsubscribed bridge thread with a retained writer",
+        initialTurnPresent: false,
+        runtimeStatus: "idle" as const,
+        startsNewTurn: true,
+        bridgeActive: false,
+      },
+      {
         name: "idle metadata after steer",
         initialTurnPresent: true,
         runtimeStatus: "idle" as const,
@@ -1503,7 +1820,12 @@ process.stdin.on("data", (chunk) => {
       },
     ])(
       "handles bridge rejoin safely for $name",
-      async ({ initialTurnPresent, runtimeStatus, startsNewTurn }) => {
+      async ({
+        initialTurnPresent,
+        runtimeStatus,
+        startsNewTurn,
+        bridgeActive = true,
+      }) => {
         const requests: Array<{
           method: string;
           params?: Record<string, unknown>;
@@ -1511,7 +1833,9 @@ process.stdin.on("data", (chunk) => {
         const httpServer = createServer((req, res) => {
           res.setHeader("content-type", "application/json");
           if (req.url === "/sessions/thread-bridge/active") {
-            res.end(JSON.stringify({ active: true, mcpProfile: "full" }));
+            res.end(
+              JSON.stringify({ active: bridgeActive, mcpProfile: "full" }),
+            );
             return;
           }
           if (req.url === "/status") {
@@ -1549,7 +1873,9 @@ process.stdin.on("data", (chunk) => {
                   cwd: "/repo",
                   modelProvider: "openai",
                   historyMode: "paginated",
-                  status: { type: "active", activeFlags: [] },
+                  status: bridgeActive
+                    ? { type: "active", activeFlags: [] }
+                    : { type: "idle" },
                   turns: [],
                   forkedFromId: null,
                 },
@@ -2275,6 +2601,85 @@ process.stdin.on("data", (chunk) => {
       }
     });
 
+    it.each([
+      ["completed", "legacy"],
+      ["failed", "legacy"],
+      ["interrupted", "legacy"],
+      ["completed", "primary"],
+      ["failed", "primary"],
+      ["interrupted", "primary"],
+    ] as const)(
+      "streams idle native compaction through %s (%s) and accepts the next prompt",
+      async (outcome, mode) => {
+        const tempDir = mkdtempSync(
+          join(require("node:os").tmpdir(), "codex-compact-"),
+        );
+        const fakeCodexPath = writeFakeCodexAppServer(tempDir);
+        const previous = process.env.CODEX_FAKE_COMPACTION;
+        const previousCapture = process.env.CODEX_FAKE_CAPTURE;
+        process.env.CODEX_FAKE_CAPTURE = join(tempDir, "capture.json");
+        process.env.CODEX_FAKE_COMPACTION = outcome;
+        let session:
+          | Awaited<ReturnType<CodexProvider["startSession"]>>
+          | undefined;
+        try {
+          session = await new CodexProvider({
+            codexPath: fakeCodexPath,
+            eventSpine: {
+              defaultMode: mode,
+              store: new InMemoryCodexEventStore(),
+            },
+          }).startSession({ cwd: tempDir });
+          await session.iterator.next();
+          const progress = session.iterator.next();
+          await expect(
+            session.codexControls?.invoke({ control: "thread/compact/start" }),
+          ).resolves.toMatchObject({ ok: true });
+          await expect(progress).resolves.toMatchObject({
+            value: {
+              type: "system",
+              subtype: "status",
+              status: "compacting",
+              codexTurnId: "compact-turn",
+            },
+          });
+          const messages: SDKMessage[] = [];
+          while (true) {
+            const next = await session.iterator.next();
+            if (next.done)
+              throw new Error("Compaction unexpectedly closed the session");
+            messages.push(next.value);
+            if (next.value.type === "result") break;
+          }
+          expect(messages.some((m) => m.subtype === "compact_boundary")).toBe(
+            outcome === "completed",
+          );
+          expect(messages.some((m) => m.type === "error")).toBe(
+            outcome === "failed",
+          );
+          expect(messages).toContainEqual(
+            expect.objectContaining({
+              subtype: "turn_complete",
+              turnStatus: outcome,
+            }),
+          );
+          const echo = session.iterator.next();
+          session.queue?.push({
+            text: "Continue after compact",
+            uuid: "after-compact",
+          });
+          await expect(echo).resolves.toMatchObject({
+            value: { type: "user", uuid: "after-compact" },
+          });
+        } finally {
+          session?.abort();
+          restoreEnv("CODEX_FAKE_COMPACTION", previous);
+          restoreEnv("CODEX_FAKE_CAPTURE", previousCapture);
+          rmSync(tempDir, { recursive: true, force: true });
+        }
+      },
+    );
+
     it("maps stable native controls to synchronized request contracts", async () => {
       const tempDir = mkdtempSync(
         join(require("node:os").tmpdir(), "codex-controls-contract-"),
@@ -2884,6 +3289,60 @@ process.stdin.on("data", (chunk) => {
       }
     });
 
+    it("injects an independent Yep Feishu transport without null overrides or old MCP processes", async () => {
+      const tempDir = mkdtempSync(
+        join(require("node:os").tmpdir(), "codex-yep-feishu-"),
+      );
+      const fakeCodexPath = writeFakeCodexAppServer(tempDir);
+      const capturePath = join(tempDir, "capture.json");
+      const previousCapture = process.env.CODEX_FAKE_CAPTURE;
+      const previousServers = process.env.CODEX_FAKE_MCP_SERVERS;
+      process.env.CODEX_FAKE_CAPTURE = capturePath;
+      process.env.CODEX_FAKE_MCP_SERVERS = JSON.stringify([
+        "lark",
+        "feishu-mcp",
+        "node_repl",
+      ]);
+      let session:
+        | Awaited<ReturnType<CodexProvider["startSession"]>>
+        | undefined;
+      try {
+        const native = {
+          command: process.execPath,
+          args: ["/yep/resources/feishu/connector.mjs", "/yep/client.json"],
+          env: {},
+          enabled: true,
+          tool_timeout_sec: 240,
+        };
+        session = await new CodexProvider({
+          codexPath: fakeCodexPath,
+        }).startSession({
+          cwd: tempDir,
+          resumeSessionId: "thread-existing",
+          feishuMcpConfig: native,
+        });
+        await session.iterator.next();
+        const capture = JSON.parse(readFileSync(capturePath, "utf8"));
+        expect(capture.params.config.mcp_servers).toMatchObject({
+          "yep-feishu": native,
+          lark: { enabled: false },
+          "feishu-mcp": { enabled: false },
+          node_repl: { enabled: true },
+        });
+        expect(
+          capture.params.config.mcp_servers["yep-feishu"],
+        ).not.toHaveProperty("url");
+        expect(
+          capture.params.config.mcp_servers["yep-feishu"],
+        ).not.toHaveProperty("http_headers");
+      } finally {
+        session?.abort();
+        restoreEnv("CODEX_FAKE_CAPTURE", previousCapture);
+        restoreEnv("CODEX_FAKE_MCP_SERVERS", previousServers);
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it("uses full Codex MCP profile with all configured MCP enabled", async () => {
       const tempDir = mkdtempSync(
         join(require("node:os").tmpdir(), "codex-app-server-"),
@@ -3227,7 +3686,7 @@ process.stdin.on("data", (chunk) => {
       }
     });
 
-    it("forks through stable lastTurnId without mutating the source or losing thread MCP config", async () => {
+    it("forks through stable lastTurnId without losing thread MCP config or the Fast opt-out", async () => {
       const tempDir = mkdtempSync(
         join(require("node:os").tmpdir(), "codex-app-server-"),
       );
@@ -3258,6 +3717,7 @@ process.stdin.on("data", (chunk) => {
           initialMessage: { text: "edited prompt", uuid: "message-edit" },
           rollbackNumTurns: 1,
           codexMcpMode: "clear",
+          serviceTier: "default",
         });
 
         const messages: Array<Record<string, unknown>> = [];
@@ -3311,6 +3771,7 @@ process.stdin.on("data", (chunk) => {
             params: expect.objectContaining({
               threadId: "thread-existing",
               lastTurnId: "turn-source-2",
+              serviceTier: "default",
               excludeTurns: true,
               config: expect.objectContaining({
                 mcp_servers: expect.objectContaining({
@@ -3998,6 +4459,7 @@ process.stdin.on("data", (chunk) => {
             .getMessageHistory()
             .filter((message) => message.type === "result"),
         ).toHaveLength(1);
+        expect(onSessionIdChanged).toHaveBeenCalledTimes(1);
         expect(onSessionIdChanged).toHaveBeenCalledWith(
           "thread-provisional",
           "thread-replacement",
@@ -4287,6 +4749,118 @@ describe("CodexProvider Event Normalization", () => {
     expect(typeof provider.startSession).toBe("function");
   });
 
+  it.each([
+    [
+      "item/started",
+      {
+        item: { id: "review", type: "agentMessage", text: "Disposition: fix" },
+      },
+    ],
+    [
+      "item/completed",
+      {
+        item: { id: "review", type: "agentMessage", text: "Disposition: fix" },
+      },
+    ],
+    [
+      "item/agentMessage/delta",
+      { itemId: "review", delta: "Disposition: fix" },
+    ],
+    [
+      "item/commandExecution/outputDelta",
+      { itemId: "command", delta: "child output" },
+    ],
+    [
+      "rawResponseItem/completed",
+      {
+        item: {
+          type: "custom_tool_call",
+          id: "tool",
+          call_id: "call",
+          name: "apply_patch",
+          input: "child edit",
+        },
+      },
+    ],
+    [
+      "turn/completed",
+      {
+        turn: { id: "child-turn", status: "completed", items: [], error: null },
+      },
+    ],
+    [
+      "error",
+      {
+        turnId: "child-turn",
+        error: { message: "child failed" },
+        willRetry: false,
+      },
+    ],
+  ])(
+    "isolates foreign-thread %s notifications from the parent",
+    (method, fields) => {
+      const provider = createTestProvider() as unknown as {
+        convertNotificationToSDKMessages: (
+          notification: { method: string; params: unknown },
+          sessionId: string,
+          usage: Map<string, unknown>,
+        ) => unknown[];
+      };
+      expect(
+        provider.convertNotificationToSDKMessages(
+          {
+            method,
+            params: {
+              threadId: "child-thread",
+              turnId: "child-turn",
+              ...fields,
+            },
+          },
+          "parent-thread",
+          new Map(),
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it("preserves async questions through agent-message lifecycle notifications", () => {
+    const provider = createTestProvider() as unknown as {
+      convertNotificationToSDKMessages: (
+        notification: { method: string; params: unknown },
+        sessionId: string,
+        usage: Map<string, unknown>,
+      ) => Array<Record<string, unknown>>;
+    };
+    const questions = [
+      { title: "Which address?", options: ["Production", "Local"] },
+    ];
+    for (const method of ["item/started", "item/completed"]) {
+      const messages = provider.convertNotificationToSDKMessages(
+        {
+          method,
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            item: {
+              id: "question",
+              type: "agentMessage",
+              text: "Which address?",
+              phase: "final_answer",
+              delivery: "async",
+              questions,
+            },
+          },
+        },
+        "thread-1",
+        new Map(),
+      );
+      expect(messages[0]).toMatchObject({
+        codexMessagePhase: "final_answer",
+        codexAsyncMessage: { delivery: "async", questions },
+      });
+    }
+  });
+
   it("uses one stable correlation key for agent-message lifecycle updates", () => {
     const provider = createTestProvider() as unknown as {
       convertNotificationToSDKMessages: (
@@ -4507,6 +5081,7 @@ describe("CodexProvider Event Normalization", () => {
         type: "system",
         subtype: "turn_complete",
         turnId: "turn-interrupted",
+        codexTurnId: "turn-interrupted",
         turnStatus: "interrupted",
       }),
     ]);
@@ -4733,7 +5308,7 @@ describe("CodexProvider Event Normalization", () => {
         exit_code: 0,
         status: "completed",
       },
-      "session-1",
+      "thread-1",
       "turn-1",
       "item/completed",
     );
@@ -4779,7 +5354,7 @@ describe("CodexProvider Event Normalization", () => {
         exit_code: 0,
         status: "completed",
       },
-      "session-1",
+      "thread-1",
       "turn-2",
       "item/completed",
     );
@@ -4818,6 +5393,38 @@ describe("CodexProvider Event Normalization", () => {
     });
   });
 
+  it("attaches per-call recorded image URLs to both started and completed live views", () => {
+    const provider = createTestProvider() as unknown as {
+      convertItemToSDKMessages: (
+        item: unknown,
+        sessionId: string,
+        turnId: string,
+        sourceEvent: "item/started" | "item/completed",
+      ) => Array<Record<string, unknown>>;
+    };
+    for (const sourceEvent of ["item/started", "item/completed"] as const) {
+      const messages = provider.convertItemToSDKMessages(
+        { id: "image-1", type: "image_view", path: "/tmp/phone.png" },
+        "thread-1",
+        "turn-1",
+        sourceEvent,
+      );
+      expect(messages[0]?.message).toMatchObject({
+        content: [
+          {
+            type: "tool_use",
+            id: "image-1",
+            name: "ViewImage",
+            input: {
+              path: "/tmp/phone.png",
+              snapshotUrl: "/api/sessions/thread-1/codex-images/image-1",
+            },
+          },
+        ],
+      });
+    }
+  });
+
   it("normalizes no-match ripgrep exit code as non-error Grep result", () => {
     const provider = createTestProvider() as unknown as {
       convertItemToSDKMessages: (
@@ -4837,7 +5444,7 @@ describe("CodexProvider Event Normalization", () => {
         exit_code: 1,
         status: "completed",
       },
-      "session-1",
+      "thread-1",
       "turn-2",
       "item/completed",
     );
@@ -4892,7 +5499,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
 
@@ -4961,7 +5568,7 @@ describe("CodexProvider Event Normalization", () => {
         threadId: "thread-1",
         turnId: "turn-1",
       },
-      "session-1",
+      "thread-1",
     );
     const changed = provider.attachCanonicalCodexItem(
       [{ type: "assistant", uuid: "file-normalized" }],
@@ -4990,7 +5597,7 @@ describe("CodexProvider Event Normalization", () => {
         threadId: "thread-1",
         turnId: "turn-1",
       },
-      "session-1",
+      "thread-1",
     );
 
     const serialized = JSON.stringify([generated, changed]);
@@ -5028,13 +5635,13 @@ describe("CodexProvider Event Normalization", () => {
             type: "image_generation_call",
             status: "generating",
             saved_path:
-              "/Users/test/.codex/generated_images/session-1/ig_456.png",
+              "/Users/test/.codex/generated_images/thread-1/ig_456.png",
             revised_prompt: "A saved generated image",
             result: "iVBORw0KGgoAAAANSUhEUgAA",
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
 
@@ -5090,7 +5697,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
 
@@ -5136,7 +5743,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
 
@@ -5169,7 +5776,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
 
@@ -5199,14 +5806,14 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
 
     expect(messages).toHaveLength(1);
     expect(messages[0]).toMatchObject({
       type: "error",
-      session_id: "session-1",
+      session_id: "thread-1",
       error:
         "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.",
       codexError: expect.objectContaining({
@@ -5240,7 +5847,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
 
@@ -5285,7 +5892,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       new Map(),
       new Map(),
@@ -5303,7 +5910,7 @@ describe("CodexProvider Event Normalization", () => {
           error: { message: "unknown Codex error" },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       new Map(),
       new Map(),
@@ -5352,7 +5959,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       contexts,
     );
@@ -5389,7 +5996,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       contexts,
     );
@@ -5516,7 +6123,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       new Map(),
     );
@@ -5563,7 +6170,7 @@ describe("CodexProvider Event Normalization", () => {
           delta: "line one\n",
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       new Map(),
       buffers,
@@ -5596,7 +6203,7 @@ describe("CodexProvider Event Normalization", () => {
           delta: "line two\n",
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       new Map(),
       buffers,
@@ -5621,7 +6228,7 @@ describe("CodexProvider Event Normalization", () => {
           },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       new Map(),
       buffers,
@@ -5637,7 +6244,7 @@ describe("CodexProvider Event Normalization", () => {
           turn: { id: "turn-1", status: "completed", items: [] },
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
       new Map(),
       buffers,
@@ -5659,7 +6266,7 @@ describe("CodexProvider Event Normalization", () => {
         method: "warning",
         params: { threadId: "thread-1", message: "Sandbox degraded" },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
     expect(warning).toHaveLength(1);
@@ -5675,7 +6282,7 @@ describe("CodexProvider Event Normalization", () => {
         method: "guardianWarning",
         params: { threadId: "thread-1", message: "Approval is required" },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
     expect(guardianWarning[0]).toMatchObject({
@@ -5690,7 +6297,7 @@ describe("CodexProvider Event Normalization", () => {
         method: "deprecationNotice",
         params: { summary: "Old flag", details: "Use --new-flag instead" },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
     expect(deprecation).toEqual([]);
@@ -5703,14 +6310,14 @@ describe("CodexProvider Event Normalization", () => {
           details: null,
         },
       },
-      "session-1",
+      "thread-1",
       new Map(),
     );
     expect(rollbackDeprecation).toEqual([]);
 
     const empty = provider.convertNotificationToSDKMessages(
       { method: "configWarning", params: {} },
-      "session-1",
+      "thread-1",
       new Map(),
     );
     expect(empty).toEqual([]);
@@ -5731,7 +6338,7 @@ describe("CodexProvider Event Normalization", () => {
           method: "future/provider-event",
           params: { authorization: "must-not-be-projected" },
         },
-        "session-1",
+        "thread-1",
         new Map(),
       ),
     ).toEqual([]);

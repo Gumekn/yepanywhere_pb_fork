@@ -652,6 +652,19 @@ function processMessage(
       subtype === "turn_aborted" ||
       subtype === "warning"
     ) {
+      const content = msg.message?.content ?? msg.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content
+                .flatMap((block) =>
+                  block.type === "text" && typeof block.text === "string"
+                    ? [block.text]
+                    : [],
+                )
+                .join("\n")
+            : "";
       const systemItem: SystemItem = {
         type: "system",
         id: msgId,
@@ -659,11 +672,7 @@ function processMessage(
         content:
           subtype === "turn_aborted"
             ? CODEX_TURN_ABORTED_DISPLAY_TEXT
-            : typeof msg.content === "string"
-              ? msg.content
-              : subtype === "warning"
-                ? "Warning"
-                : "Context compacted",
+            : text || (subtype === "warning" ? "Warning" : "Context compacted"),
         sourceMessages: [msg],
       };
       items.push(systemItem);
@@ -740,6 +749,7 @@ function processMessage(
         id: msgId,
         text: content,
         ...(msg.codexMessagePhase && { phase: msg.codexMessagePhase }),
+        ...(msg.codexAsyncMessage && { asyncMessage: msg.codexAsyncMessage }),
         sourceMessages: [msg],
         isSubagent: msg.isSubagent,
         augmentHtml: messageHtml ?? augments?.markdown?.[msgId]?.html,
@@ -807,6 +817,7 @@ function processMessage(
           id: blockId,
           text: block.text,
           ...(msg.codexMessagePhase && { phase: msg.codexMessagePhase }),
+          ...(msg.codexAsyncMessage && { asyncMessage: msg.codexAsyncMessage }),
           sourceMessages: [msg],
           isSubagent: msg.isSubagent,
           // Only show streaming cursor on the last text block
@@ -856,9 +867,7 @@ function processMessage(
                   0);
             const nextItem = appendSourceMessage(existingItem, msg);
             const incomingPartialOutput =
-              typeof block.partialOutput === "string" &&
-              block.partialOutput.length >
-                (existingItem.partialOutput?.length ?? 0)
+              typeof block.partialOutput === "string"
                 ? block.partialOutput
                 : existingItem.partialOutput;
             const withInput =

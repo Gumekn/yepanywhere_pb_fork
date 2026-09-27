@@ -2,12 +2,19 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SessionBranchState } from "@yep-anywhere/shared";
+import type {
+  ProviderName,
+  SessionBranchState,
+  SessionDisplayPage,
+} from "@yep-anywhere/shared";
 import { Hono } from "hono";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CodexAppServerHistoryReader } from "../../src/codex-history/CodexAppServerHistoryReader.js";
+import { SessionDisplayService } from "../../src/display/SessionDisplayService.js";
 import { encodeProjectId } from "../../src/projects/paths.js";
 import {
   type SessionDisplayRuntimeState,
+  createSessionDisplaySource,
   registerSessionDisplayRoutes,
 } from "../../src/routes/session-display.js";
 import { CodexSessionReader } from "../../src/sessions/codex-reader.js";
@@ -174,6 +181,194 @@ function createRoutes(
 }
 
 describe("session display routes", () => {
+  it.each<ProviderName>(["codex", "codex-oss", "gemini-acp"])(
+    "loads an unpersisted %s session in a Pi project and picks up its history later",
+    async (provider) => {
+      const { getSession } = createRoutes(1);
+      const loaded = await getSession();
+      let persisted = false;
+      const emptyReader = {
+        getSessionSummary: vi.fn(async () => null),
+        getSession: vi.fn(async () => null),
+      };
+      const reader = {
+        getSessionSummary: vi.fn(async () =>
+          persisted ? { ...loaded.summary, provider } : null,
+        ),
+        getSession: vi.fn(async () => (persisted ? loaded : null)),
+      };
+      const runtime = {
+        projectId: PROJECT_ID,
+        provider,
+        toolsMayBeActive: false,
+      };
+      const source = createSessionDisplaySource({
+        scanner: {
+          getOrCreateProject: vi.fn(async () => ({
+            ...project(),
+            provider: "pi" as const,
+          })),
+        },
+        providerResolution: {
+          readerFactory: () => reader as never,
+          codexReaderFactory: () => reader as never,
+          geminiReaderFactory: () => reader as never,
+          piReaderFactory: () => emptyReader as never,
+          kimiReaderFactory: () => emptyReader as never,
+          zcodeReaderFactory: () => emptyReader as never,
+        },
+        getRuntimeState: vi.fn(async () => runtime),
+      });
+      const selection = { projectId: PROJECT_ID, sessionId: SESSION_ID };
+      // Missing history is only tolerated for an active session in this project.
+      await expect(source.read(selection)).rejects.toMatchObject({
+        status: 404,
+      });
+      runtime.toolsMayBeActive = true;
+      runtime.projectId = encodeProjectId("/tmp/another-project");
+      await expect(source.read(selection)).rejects.toMatchObject({
+        status: 404,
+      });
+      runtime.projectId = PROJECT_ID;
+      expect(await source.read(selection)).toMatchObject({
+        messages: [],
+        activity: "running",
+      });
+      expect(reader.getSession).toHaveBeenCalledWith(
+        SESSION_ID,
+        PROJECT_ID,
+        undefined,
+        expect.any(Object),
+      );
+      persisted = true;
+      expect((await source.read(selection)).messages).toEqual(
+        loaded.projectedMessages,
+      );
+    },
+  );
+
+  it("shares concurrent file-index scans and isolates app instances", async () => {
+    const { app, getSession } = createRoutes(2);
+    const path = `/projects/${PROJECT_ID}/sessions/${SESSION_ID}/files`;
+    const responses = await Promise.all([
+      app.request(path),
+      app.request(path),
+      app.request(path),
+    ]);
+    expect(responses.map((response) => response.status)).toEqual([
+      200, 200, 200,
+    ]);
+    expect(getSession).toHaveBeenCalledTimes(1);
+    await app.request(path);
+    expect(getSession).toHaveBeenCalledTimes(1);
+    await app.request(`${path}?branchId=other`);
+    expect(getSession).toHaveBeenCalledTimes(2);
+    const other = createRoutes(2);
+    await other.app.request(path);
+    expect(other.getSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds legacy overlay cleanup by native turns and keeps the inferred live turn", async () => {
+    const { getSession } = createRoutes(2);
+    const loaded = await getSession();
+    const reader = {
+      getSession,
+      getSessionSummary: vi.fn(async () => loaded.summary),
+      getSessionFileStats: vi.fn(async () => ({ mtime: 1, size: 1 })),
+    };
+    const source = createSessionDisplaySource({
+      scanner: {
+        getOrCreateProject: vi.fn(async () => ({
+          ...project(),
+          provider: "codex" as const,
+        })),
+      },
+      providerResolution: {
+        readerFactory: () => reader as never,
+        codexReaderFactory: () => reader as never,
+        codexSessionsDir: "/tmp/codex-sessions",
+      },
+      codexAppServerHistoryReader: {
+        getSemanticTurn: vi.fn(),
+        getSemanticTurnsPage: vi.fn(async () => ({
+          kind: "loaded" as const,
+          provider: "codex" as const,
+          summary: loaded.summary,
+          revision: "revision",
+          messages: [
+            {
+              uuid: "first",
+              type: "user",
+              codexTurnId: "first",
+              timestamp: "2026-09-08T14:00:00Z",
+            },
+            {
+              uuid: "latest",
+              type: "user",
+              codexTurnId: "latest",
+              timestamp: "2026-09-08T14:50:00Z",
+            },
+          ] as Message[],
+          turnStatuses: {
+            first: "completed" as const,
+            latest: "interrupted" as const,
+          },
+          inferredLatestTurnId: "latest",
+          nextCursor: "older-native-turns",
+        })),
+      },
+    });
+    const selection = { projectId: PROJECT_ID, sessionId: SESSION_ID };
+    const page = await source.read(selection);
+    expect(page.turnStatuses).toEqual({ first: "completed" });
+    expect(page.codexTurnWindow).toEqual({
+      turnIds: ["first", "latest"],
+      from: Date.parse("2026-09-08T14:00:00Z"),
+      before: Date.parse("2026-09-08T14:50:00Z"),
+    });
+    expect(
+      (await source.read(selection, page.cursor)).codexTurnWindow,
+    ).toBeUndefined();
+  });
+
+  it("serves conditional output in the requested branch without fetching tool details", async () => {
+    const service = new SessionDisplayService({
+      runtime: {
+        getProcessForSession: vi.fn(),
+        subscribeSession: vi.fn(),
+      },
+    });
+    const output = vi
+      .spyOn(service, "output")
+      .mockResolvedValue({ revision: "same", status: "running" });
+    const detail = vi.spyOn(service, "detail");
+    const app = new Hono();
+    registerSessionDisplayRoutes(app, {
+      displayService: service,
+      scanner: { getOrCreateProject: vi.fn(async () => project()) },
+      providerResolution: { readerFactory: vi.fn() },
+    });
+    try {
+      const response = await app.request(
+        `/projects/${PROJECT_ID}/sessions/${SESSION_ID}/display/tools/tool-id/output?branchId=branch-1&since=same`,
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.json()).toEqual({
+        revision: "same",
+        status: "running",
+      });
+      expect(output).toHaveBeenCalledWith(
+        { projectId: PROJECT_ID, sessionId: SESSION_ID, branchId: "branch-1" },
+        "tool-id",
+        "same",
+      );
+      expect(detail).not.toHaveBeenCalled();
+    } finally {
+      service.dispose();
+    }
+  });
+
   it("annotates native Codex fork questions with cross-session alternatives", async () => {
     const summary: SessionSummary = {
       id: SESSION_ID,
@@ -263,6 +458,11 @@ describe("session display routes", () => {
       summary,
       provider: "codex" as const,
       revision: "cas1.1.session",
+      turnStatuses: {
+        "turn-a": "completed" as const,
+        "turn-b2": "interrupted" as const,
+        "turn-d": "completed" as const,
+      },
     }));
     const app = new Hono();
     registerSessionDisplayRoutes(app, {
@@ -291,6 +491,7 @@ describe("session display routes", () => {
     const page = (await response.json()) as {
       revision: string;
       turns: Array<{
+        status?: string;
         question: {
           messageId: string;
           branch?: {
@@ -309,6 +510,11 @@ describe("session display routes", () => {
     };
     expect(page.revision).toBe("cas1.1.session");
     expect(page.turns).toHaveLength(3);
+    expect(page.turns.map((turn) => turn.status)).toEqual([
+      "completed",
+      "interrupted",
+      "completed",
+    ]);
     expect(page.turns[1]?.question).toMatchObject({
       messageId: "user-b2-turn-b2",
       branch: {
@@ -509,6 +715,123 @@ describe("session display routes", () => {
       code: "SESSION_DISPLAY_STALE",
     });
   });
+
+  it.each([true, false])(
+    "reconciles a detached Codex history turn with live runtime activity (%s)",
+    async (active) => {
+      const summary: SessionSummary = {
+        id: SESSION_ID,
+        projectId: PROJECT_ID,
+        title: "Live Codex",
+        fullTitle: "Live Codex",
+        createdAt: "2026-09-01T00:00:00.000Z",
+        updatedAt: "2026-09-01T00:01:00.000Z",
+        messageCount: 3,
+        ownership: { owner: "self" },
+        provider: "codex",
+      };
+      const items = [
+        {
+          type: "userMessage",
+          id: "user",
+          clientId: null,
+          content: [{ type: "text", text: "Run", text_elements: [] }],
+        },
+        {
+          type: "agentMessage",
+          id: "progress",
+          text: "First step done, continuing.",
+          phase: "commentary",
+          memoryCitation: null,
+        },
+        {
+          type: "commandExecution",
+          id: "next-tool",
+          command: "pnpm test",
+          cwd: PROJECT_PATH,
+          status: "inProgress",
+          commandActions: [],
+          aggregatedOutput: null,
+          exitCode: null,
+          durationMs: null,
+        },
+      ];
+      const history = new CodexAppServerHistoryReader({
+        client: {
+          readThread: vi.fn(async () => ({
+            thread: {
+              id: SESSION_ID,
+              cwd: PROJECT_PATH,
+              historyMode: "paginated",
+              modelProvider: "openai",
+              preview: "Run",
+              status: { type: "notLoaded" },
+              createdAt: 1_777_000_000,
+              updatedAt: 1_777_000_100,
+            },
+          })),
+          listTurns: vi.fn(async () => ({
+            data: [
+              {
+                id: "turn-live",
+                items: [],
+                itemsView: "summary",
+                status: "interrupted",
+                error: null,
+                startedAt: 1_777_000_010,
+                completedAt: null,
+                durationMs: null,
+              },
+            ],
+            nextCursor: null,
+          })),
+          listItems: vi.fn(async () => ({
+            data: items.map((item) => ({ turnId: "turn-live", item })),
+            nextCursor: null,
+          })),
+          getCapability: vi.fn(),
+        } as never,
+      });
+      const reader = { getSessionSummary: vi.fn(async () => summary) };
+      const app = new Hono();
+      registerSessionDisplayRoutes(app, {
+        scanner: {
+          getOrCreateProject: vi.fn(async () => ({
+            ...project(),
+            provider: "codex" as const,
+          })),
+        },
+        providerResolution: {
+          readerFactory: () => reader as never,
+          codexSessionsDir: "/tmp/codex-sessions",
+          codexReaderFactory: () => reader as never,
+        },
+        codexAppServerHistoryReader: history,
+        getRuntimeState: vi.fn(async () => ({
+          provider: "codex",
+          toolsMayBeActive: active,
+        })),
+      });
+
+      const response = await app.request(
+        `/projects/${PROJECT_ID}/sessions/${SESSION_ID}/display`,
+      );
+      expect(response.status).toBe(200);
+      const page = (await response.json()) as SessionDisplayPage;
+      expect(page.turns[0]).toMatchObject({
+        id: "turn:turn-live",
+        status: active ? "running" : "interrupted",
+        segments: [
+          { type: "assistant_text", phase: "progress" },
+          { type: "tool_group", count: 1, status: "running" },
+        ],
+      });
+      const tail = page.turns[0]?.segments.at(-1);
+      expect(tail?.type === "tool_group" && tail.liveTail).toBe(
+        active ? true : undefined,
+      );
+    },
+  );
 
   it("marks the active live tail without including its raw body", async () => {
     const { app, getSession } = createRoutes(

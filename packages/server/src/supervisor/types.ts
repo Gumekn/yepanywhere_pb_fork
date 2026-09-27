@@ -1,5 +1,6 @@
 import type {
   AgentActivity,
+  CodexAsyncMessage,
   CodexBranchState,
   ContextCompactEvent,
   ContextCumulativeUsage,
@@ -17,6 +18,7 @@ import type {
   SessionRetryStatus,
   SessionRuntime,
   ThinkingConfig,
+  UploadedFile,
   UrlProjectId,
 } from "@yep-anywhere/shared";
 import type { PermissionMode, SDKMessage } from "../sdk/types.js";
@@ -211,6 +213,7 @@ export interface ContentBlock {
  * field contains the actual content. Use `type` for discrimination (user/assistant).
  */
 export interface Message {
+  codexAsyncMessage?: CodexAsyncMessage;
   type: string;
   uuid?: string;
   timestamp?: string;
@@ -300,7 +303,13 @@ export type ProcessEvent =
   | { type: "retry-status"; retryStatus?: SessionRetryStatus }
   | {
       type: "deferred-queue";
-      messages: { tempId?: string; content: string; timestamp: string }[];
+      messages: {
+        tempId?: string;
+        content: string;
+        timestamp: string;
+        attachments?: UploadedFile[];
+        blocked?: boolean;
+      }[];
     };
 
 // Process options

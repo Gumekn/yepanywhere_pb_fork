@@ -1,3 +1,4 @@
+import type { UploadedFile } from "@yep-anywhere/shared";
 import {
   type AgentActivity,
   type MarkdownAugment,
@@ -250,6 +251,8 @@ export type { StreamingMarkdownCallbacks } from "./useStreamingContent";
 
 /** Deferred message queued server-side, waiting for agent's turn to end */
 export interface DeferredMessage {
+  blocked?: boolean;
+  attachments?: UploadedFile[];
   tempId?: string;
   content: string;
   timestamp: string;
@@ -635,6 +638,7 @@ export function useSession(
   useEffect(() => {
     hasHandledConnectedEventRef.current = false;
     setLastStreamActivityAt(null);
+    setIsCompacting(false);
     setTurnHealth(null);
     setHistoryRewriteRequest(null);
     if (historyRewriteTimerRef.current) {
@@ -725,6 +729,8 @@ export function useSession(
   const {
     messages,
     displayPage,
+    displayActivity,
+    handleDisplayEvent,
     displayQuestions,
     displayQuestionCoverage,
     hydratedLiveTailDetailRef,
@@ -747,6 +753,7 @@ export function useSession(
     fetchNewMessages,
     refreshSessionMessages,
     fetchSessionMetadata,
+    updateSessionConfiguration,
     pagination,
     loadingOlder,
     loadingNewer,
@@ -866,14 +873,43 @@ export function useSession(
     };
   }, [historyRewriteRequest, historyRewriteSignal, refreshSessionMessages]);
 
-  // Optimistic pending-message queue, reconciled against `messages` inside the hook.
+  // Reconcile optimistic messages against accepted prompts and the server queue,
+  // including queue snapshots restored by the connected event.
+  const acceptedPrompts = useMemo(
+    () =>
+      displayPage
+        ? [
+            ...messages,
+            ...displayPage.turns.flatMap((turn) =>
+              turn.question
+                ? [
+                    {
+                      uuid:
+                        turn.question.clientUserMessageId ??
+                        turn.question.codexCorrelationKey ??
+                        turn.question.messageId,
+                      type: "user" as const,
+                      tempId: turn.question.tempId,
+                      timestamp: turn.question.timestamp,
+                      message: {
+                        role: "user" as const,
+                        content: turn.question.content as Message["content"],
+                      },
+                    },
+                  ]
+                : [],
+            ),
+          ]
+        : messages,
+    [displayPage, messages],
+  );
   const {
     pendingMessages,
     setPendingMessages,
     addPendingMessage,
     removePendingMessage,
     updatePendingMessage,
-  } = usePendingMessages(messages);
+  } = usePendingMessages(acceptedPrompts, deferredMessages);
 
   const messagesRef = useRef(messages);
   useEffect(() => {
@@ -893,6 +929,7 @@ export function useSession(
   > | null>(null);
   const authoritativeSnapshotRefreshGenerationRef = useRef(0);
   const scheduleAuthoritativeSnapshotRefresh = useCallback(() => {
+    if (preferDisplayHistory) return;
     const provider = session?.provider;
     if (provider !== "pi" && provider !== "kimi") {
       return;
@@ -956,7 +993,12 @@ export function useSession(
     authoritativeSnapshotRefreshTimerRef.current = setTimeout(() => {
       void refresh(0);
     }, initialDelay);
-  }, [displayPage, refreshSessionMessages, session?.provider]);
+  }, [
+    displayPage,
+    refreshSessionMessages,
+    session?.provider,
+    preferDisplayHistory,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -1341,6 +1383,11 @@ export function useSession(
     (event: SessionUpdatedEvent) => {
       if (event.sessionId !== sessionId) return;
 
+      updateSessionConfiguration({
+        model: event.model,
+        reasoningEffort: event.reasoningEffort,
+        serviceTier: event.serviceTier,
+      });
       // Update session metadata from stream event (no API call needed)
       setSession((prev) => {
         if (!prev) return prev;
@@ -1355,13 +1402,6 @@ export function useSession(
           }),
           ...(event.contextUsage !== undefined && {
             contextUsage: event.contextUsage,
-          }),
-          ...(event.model !== undefined && { model: event.model }),
-          ...(event.reasoningEffort !== undefined && {
-            reasoningEffort: event.reasoningEffort,
-          }),
-          ...(event.serviceTier !== undefined && {
-            serviceTier: event.serviceTier,
           }),
           ...(event.lastTurnStatus !== undefined && {
             lastTurnStatus: event.lastTurnStatus ?? undefined,
@@ -1433,6 +1473,7 @@ export function useSession(
       signalHistoryRewriteSync,
       status.owner,
       throttledFetch,
+      updateSessionConfiguration,
     ],
   );
 
@@ -1601,9 +1642,10 @@ export function useSession(
 
   const sessionWatchTarget = useMemo(
     () =>
-      status.owner === "self" &&
-      !historyRewriteRequest &&
-      !shouldWatchOwnedSessionFile(session?.provider)
+      preferDisplayHistory ||
+      (status.owner === "self" &&
+        !historyRewriteRequest &&
+        !shouldWatchOwnedSessionFile(session?.provider))
         ? null
         : {
             sessionId,
@@ -1612,6 +1654,7 @@ export function useSession(
           },
     [
       historyRewriteRequest,
+      preferDisplayHistory,
       projectId,
       session?.provider,
       sessionId,
@@ -1710,6 +1753,28 @@ export function useSession(
   // Subscribe to live updates
   const handleStreamMessage = useCallback(
     (data: { eventType: string; [key: string]: unknown }) => {
+      if (data.eventType.startsWith("display-")) {
+        setLastStreamActivityAt(new Date().toISOString());
+        const { eventType, ...payload } = data;
+        handleDisplayEvent(eventType, payload);
+        const activity = payload.activity as
+          | { state?: string; isCompacting?: boolean }
+          | undefined;
+        if (activity) setIsCompacting(activity.isCompacting === true);
+        if (activity?.state === "running" || activity?.state === "finishing")
+          setProcessState("in-turn");
+        else if (activity?.state === "hold") setProcessState("hold");
+        else if (activity?.state === "waiting-input") {
+          setProcessState("waiting-input");
+          if (displayActivity?.state !== "waiting-input")
+            void fetchSessionMetadata().catch(() => {});
+        } else if (
+          activity &&
+          ["completed", "interrupted", "failed"].includes(activity.state ?? "")
+        )
+          setProcessState("idle");
+        return;
+      }
       if (data.eventType === "message") {
         // Track stream activity for engagement tracking
         // This ensures sessions are marked as "seen" even when receiving
@@ -1799,6 +1864,22 @@ export function useSession(
 
         // Extract slash_commands, tools, and mcp_servers from init messages
         if (msgType === "system" && sdkMessage.subtype === "init") {
+          if (sdkMessage.isSubagent !== true && sdkMessage.isReplay !== true) {
+            updateSessionConfiguration({
+              model:
+                typeof sdkMessage.model === "string"
+                  ? sdkMessage.model
+                  : undefined,
+              reasoningEffort:
+                typeof sdkMessage.reasoningEffort === "string"
+                  ? sdkMessage.reasoningEffort
+                  : undefined,
+              serviceTier:
+                typeof sdkMessage.serviceTier === "string"
+                  ? sdkMessage.serviceTier
+                  : undefined,
+            });
+          }
           if (Array.isArray(sdkMessage.slash_commands)) {
             setSlashCommands(sdkMessage.slash_commands as string[]);
           }
@@ -1808,6 +1889,16 @@ export function useSession(
           if (Array.isArray(sdkMessage.mcp_servers)) {
             setMcpServers(sdkMessage.mcp_servers as string[]);
           }
+        }
+
+        if (
+          sdkMessage.isSubagent !== true &&
+          sdkMessage.isSidechain !== true &&
+          (msgType === "result" ||
+            (msgType === "error" && sdkMessage.willRetry !== true) ||
+            (msgType === "system" && sdkMessage.subtype === "turn_complete"))
+        ) {
+          setIsCompacting(false);
         }
 
         // Handle status messages (compacting indicator)
@@ -1909,6 +2000,7 @@ export function useSession(
         };
         setDeferredMessages(deferredData.messages ?? []);
       } else if (data.eventType === "complete") {
+        setIsCompacting(false);
         clearStreamingPlaceholders({ main: true, allAgents: true });
         setProcessState("idle");
         setStatus({ owner: "none" });
@@ -1916,6 +2008,7 @@ export function useSession(
         setDeferredMessages([]);
         scheduleAuthoritativeSnapshotRefresh();
       } else if (data.eventType === "error") {
+        setIsCompacting(false);
         clearStreamingPlaceholders({ main: true, allAgents: true });
       } else if (data.eventType === "connected") {
         // Sync state and permission mode from connected event
@@ -1971,29 +2064,13 @@ export function useSession(
           );
         }
 
-        // Update session with provider/model from connected event (belt-and-suspenders)
-        // This ensures the ProviderBadge shows even if the initial session load returned
-        // incomplete data (e.g., JSONL not yet written for new sessions)
-        const sseProvider = connectedData.provider;
-        const sseModel = connectedData.model;
-        const sseReasoningEffort = connectedData.reasoningEffort;
-        const sseServiceTier = connectedData.serviceTier;
-        if (sseProvider || sseModel || sseReasoningEffort || sseServiceTier) {
-          setSession((prev) => {
-            if (!prev) return prev;
-            // Always update model if the connected event has a resolved model
-            // (provider won't change, but model resolves from undefined/"Default" to actual name)
-            return {
-              ...prev,
-              ...(sseProvider && { provider: prev.provider || sseProvider }),
-              ...(sseModel && { model: sseModel }),
-              ...(sseReasoningEffort && {
-                reasoningEffort: sseReasoningEffort,
-              }),
-              ...(sseServiceTier && { serviceTier: sseServiceTier }),
-            };
-          });
-        }
+        // A new session can connect before its first metadata response.
+        updateSessionConfiguration({
+          provider: connectedData.provider,
+          model: connectedData.model,
+          reasoningEffort: connectedData.reasoningEffort,
+          serviceTier: connectedData.serviceTier,
+        });
 
         // Sync deferred messages from connected event
         setDeferredMessages(connectedData.deferredMessages ?? []);
@@ -2120,9 +2197,12 @@ export function useSession(
       scheduleAuthoritativeSnapshotRefresh,
       historyRewriteRequest,
       signalHistoryRewriteSync,
-      setSession,
+      updateSessionConfiguration,
       fetchNewMessages,
       session?.provider,
+      handleDisplayEvent,
+      displayActivity?.state,
+      fetchSessionMetadata,
     ],
   );
 
@@ -2143,16 +2223,21 @@ export function useSession(
       }
     } catch {
       // If session fetch fails, assume process is dead
+      if (preferDisplayHistory) return;
       setStatus({ owner: "none" });
       setProcessState("idle");
     }
-  }, [projectId, sessionId]);
+  }, [projectId, sessionId, preferDisplayHistory]);
 
   // Only connect to session stream when we own the session
   // External sessions are tracked via the activity stream instead
   const { connected, reconnect: reconnectStream } = useSessionStream(
-    status.owner === "self" ? sessionId : null,
-    { onMessage: handleStreamMessage, onError: handleStreamError },
+    preferDisplayHistory || status.owner === "self" ? sessionId : null,
+    {
+      onMessage: handleStreamMessage,
+      onError: handleStreamError,
+      ...(preferDisplayHistory ? { display: { projectId, branchId } } : {}),
+    },
   );
 
   const markPendingInputResolved = useCallback(
@@ -2192,7 +2277,7 @@ export function useSession(
   );
 
   const sessionUpdatesConnected =
-    status.owner === "self"
+    preferDisplayHistory || status.owner === "self"
       ? connected
       : status.owner === "external"
         ? sessionWatchConnected
@@ -2219,6 +2304,7 @@ export function useSession(
     setSessionModel,
     messages,
     displayPage,
+    displayActivity,
     displayQuestions,
     displayQuestionCoverage,
     hydratedLiveTailDetailRef,
@@ -2230,7 +2316,9 @@ export function useSession(
     status,
     processState,
     turnHealth, // Bridge-reported retry/failure state of the latest turn
-    isCompacting, // True when context is being compressed
+    isCompacting: displayActivity
+      ? displayActivity.isCompacting === true
+      : isCompacting,
     isHeld: processState === "hold", // Derived from process state
     pendingInputRequest,
     actualSessionId, // Real session ID from server (may differ from URL during temp→real transition)

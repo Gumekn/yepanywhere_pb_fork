@@ -1,3 +1,4 @@
+import type { CodexAsyncMessage } from "@yep-anywhere/shared";
 import {
   memo,
   useCallback,
@@ -37,6 +38,7 @@ interface Props {
   text: string;
   isStreaming?: boolean;
   phase?: "commentary" | "final_answer";
+  asyncMessage?: CodexAsyncMessage;
   /** Pre-rendered HTML from server (for completed messages) */
   augmentHtml?: string;
 }
@@ -45,10 +47,35 @@ function getProjectRelativePath(
   filePath: string,
   projectPath: string | null | undefined,
 ): string | null {
+  if (!filePath.startsWith("/")) {
+    return filePath.startsWith("../") || filePath === ".." ? null : filePath;
+  }
   const root = projectPath?.replace(/\/+$/, "");
   if (!root) return null;
   if (!filePath.startsWith(`${root}/`)) return null;
   return filePath.slice(root.length + 1);
+}
+
+function resolveLocalFilePath(
+  filePath: string,
+  projectPath: string | null | undefined,
+): string {
+  const path =
+    !filePath.startsWith("/") && projectPath
+      ? `${projectPath}/${filePath}`
+      : filePath;
+  const absolute = path.startsWith("/");
+  const parts: string[] = [];
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!absolute) parts.push(part);
+    } else {
+      parts.push(part);
+    }
+  }
+  return `${absolute ? "/" : ""}${parts.join("/")}`;
 }
 
 function isModifiedClick(e: React.MouseEvent): boolean {
@@ -151,6 +178,7 @@ export const TextBlock = memo(function TextBlock({
   text,
   isStreaming = false,
   phase,
+  asyncMessage,
   augmentHtml,
 }: Props) {
   const i18n = useOptionalI18n();
@@ -224,6 +252,10 @@ export const TextBlock = memo(function TextBlock({
 
       const localFileTarget = getLocalFileTarget(target);
       if (!localFileTarget) return;
+      localFileTarget.path = resolveLocalFilePath(
+        localFileTarget.path,
+        sessionMetadata?.projectPath,
+      );
 
       const relativePath = getProjectRelativePath(
         localFileTarget.path,
@@ -289,10 +321,23 @@ export const TextBlock = memo(function TextBlock({
     // biome-ignore lint/a11y/useKeyWithClickEvents: click handler intercepts local media links only
     <div
       ref={blockRef}
-      className={`text-block timeline-item${isStreaming ? " streaming" : ""}${phase === "commentary" ? " text-block-commentary" : ""}`}
+      className={`text-block timeline-item${isStreaming ? " streaming" : ""}${asyncMessage ? " text-block-async" : phase === "commentary" ? " text-block-commentary" : ""}`}
       onClick={handleClick}
     >
-      {phase === "commentary" && (
+      {asyncMessage && (
+        <div className="text-block-async-header">
+          <div className="text-block-phase">
+            {asyncMessage.questions?.length
+              ? (i18n?.t("messageAsyncQuestion") ?? "Question for you")
+              : (i18n?.t("messageAsyncUpdate") ?? "Async update")}
+          </div>
+          <div className="text-block-async-hint">
+            {i18n?.t("messageAsyncHint") ??
+              "The task keeps running. Type your answer in the message box and choose Reply & continue."}
+          </div>
+        </div>
+      )}
+      {!asyncMessage && phase === "commentary" && (
         <div className="text-block-phase">
           {i18n?.t("messagePhaseProgress") ?? "Progress"}
         </div>

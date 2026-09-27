@@ -18,6 +18,7 @@ import type {
   PendingInputType,
   SessionRetryStatus,
 } from "@yep-anywhere/shared";
+import type { FeishuMcpConfig } from "../channels/feishu/user-auth/mcp-gateway.js";
 import { getLogger } from "../logging/logger.js";
 import { getProvider } from "../sdk/providers/index.js";
 import { isProviderEnabled } from "../sdk/providers/policy.js";
@@ -43,6 +44,7 @@ import {
 } from "./WorkerQueue.js";
 import {
   DEFAULT_IDLE_PREEMPT_THRESHOLD_MS,
+  type ProcessEvent,
   type ProcessInfo,
   type ProcessOptions,
   type SessionOwnership,
@@ -88,8 +90,14 @@ export interface ModelSettings {
   codexMcpMode?: CodexMcpMode;
   /** Codex model source (Codex `model_provider`). Only consumed by Codex. */
   codexModelProvider?: string;
+  /** Codex account id (isolated `CODEX_HOME`). Only consumed by Codex. */
+  codexAccountId?: string;
+  /** Gateway API key id this session runs on. Currently consumed by Pi. */
+  llmGatewayKeyId?: string;
   /** Stable non-secret channel account key for Codex event-spine rollout. */
   codexEventAccountId?: string;
+  /** Trusted, channel-issued MCP configuration; never accepted from a request body. */
+  feishuMcpConfig?: FeishuMcpConfig;
   /** Managed LLM gateway configuration. */
   llmGatewayConfig?: LlmGatewaySessionConfig;
   /** Provider to use for this session. undefined = use the runtime default. */
@@ -195,6 +203,10 @@ export interface SupervisorOptions {
 
 export class Supervisor {
   private processes: Map<string, Process> = new Map();
+  private readonly feishuMcpConfigs = new Map<
+    string,
+    NonNullable<ModelSettings["feishuMcpConfig"]>
+  >();
   private sessionToProcess: Map<string, string> = new Map(); // sessionId -> processId
   private everOwnedSessions: Set<string> = new Set(); // Sessions we've ever owned (for orphan detection)
   private terminatedProcesses: ProcessInfo[] = []; // Recently terminated processes
@@ -483,7 +495,10 @@ export class Supervisor {
       serviceTier: modelSettings?.serviceTier,
       codexMcpMode: modelSettings?.codexMcpMode,
       codexModelProvider: modelSettings?.codexModelProvider,
+      codexAccountId: modelSettings?.codexAccountId,
+      llmGatewayKeyId: modelSettings?.llmGatewayKeyId,
       codexEventAccountId: modelSettings?.codexEventAccountId,
+      feishuMcpConfig: modelSettings?.feishuMcpConfig,
       codexEventProjectId: projectId,
       llmGatewayConfig: modelSettings?.llmGatewayConfig,
       executor: modelSettings?.executor,
@@ -579,6 +594,8 @@ export class Supervisor {
 
     const process = new Process(iterator, options);
     processHolder.process = process;
+    if (modelSettings?.feishuMcpConfig)
+      this.feishuMcpConfigs.set(process.id, modelSettings.feishuMcpConfig);
 
     // Wait for the real session ID from the provider
     try {
@@ -642,8 +659,11 @@ export class Supervisor {
         resumeSessionId: resumeSessionId ?? null,
         permissionMode: effectiveMode,
         model: modelSettings?.model ?? null,
+        serviceTier: modelSettings?.serviceTier ?? null,
         codexMcpMode: modelSettings?.codexMcpMode ?? null,
         codexModelProvider: modelSettings?.codexModelProvider ?? null,
+        codexAccountId: modelSettings?.codexAccountId ?? null,
+        llmGatewayKeyId: modelSettings?.llmGatewayKeyId ?? null,
         resumeSessionAt: rewind.resumeSessionAt,
         rollbackNumTurns: rewind.rollbackNumTurns,
       },
@@ -665,7 +685,10 @@ export class Supervisor {
       serviceTier: modelSettings?.serviceTier,
       codexMcpMode: modelSettings?.codexMcpMode,
       codexModelProvider: modelSettings?.codexModelProvider,
+      codexAccountId: modelSettings?.codexAccountId,
+      llmGatewayKeyId: modelSettings?.llmGatewayKeyId,
       codexEventAccountId: modelSettings?.codexEventAccountId,
+      feishuMcpConfig: modelSettings?.feishuMcpConfig,
       codexEventProjectId: projectId,
       llmGatewayConfig: modelSettings?.llmGatewayConfig,
       executor: modelSettings?.executor,
@@ -758,6 +781,8 @@ export class Supervisor {
 
     const process = new Process(iterator, options);
     processHolder.process = process;
+    if (modelSettings?.feishuMcpConfig)
+      this.feishuMcpConfigs.set(process.id, modelSettings.feishuMcpConfig);
 
     // Add the initial user message to history with the same UUID we passed to provider.
     process.addInitialUserMessage(message, messageUuid, message.tempId);
@@ -775,8 +800,10 @@ export class Supervisor {
     const requiresStrictSessionId =
       isForkedResume || activeProvider.name === "codex";
 
-    // Wait for the real session ID from the provider before registering
-    if (!resumeSessionId || isForkedResume) {
+    // A known Codex ID does not mean thread/resume succeeded. Wait for init
+    // on ordinary resumes too, so writer-lock failures reach the HTTP caller
+    // before it clears the draft and waits forever for a user-message echo.
+    if (!resumeSessionId || requiresStrictSessionId) {
       let resolvedSessionId: string;
       try {
         const sessionIdTimeoutMs = isForkedResume
@@ -799,7 +826,11 @@ export class Supervisor {
       }
     }
 
-    this.registerProcess(process, !resumeSessionId || isForkedResume);
+    this.registerProcess(
+      process,
+      !resumeSessionId || isForkedResume,
+      isForkedResume ? undefined : resumeSessionId,
+    );
 
     return process;
   }
@@ -877,6 +908,15 @@ export class Supervisor {
       if (existingProcess) {
         // Check if process is terminated - if so, start a fresh one
         if (existingProcess.isTerminated) {
+          this.unregisterProcess(existingProcess);
+        } else if (
+          modelSettings?.feishuMcpConfig &&
+          JSON.stringify(modelSettings.feishuMcpConfig) !==
+            JSON.stringify(this.feishuMcpConfigs.get(existingProcess.id))
+        ) {
+          if (existingProcess.state.type !== "idle")
+            return { error: "immediate_start_unavailable" };
+          await existingProcess.abort();
           this.unregisterProcess(existingProcess);
         } else if (rewind.hasRewind) {
           getLogger().info(
@@ -1099,8 +1139,12 @@ export class Supervisor {
     projectPath: string,
     message: UserMessage,
     permissionMode?: PermissionMode,
-    modelSettings?: ModelSettings,
-    admission?: { requireImmediate?: boolean; allowSteer?: boolean },
+    requestedModelSettings?: ModelSettings,
+    admission?: {
+      requireImmediate?: boolean;
+      allowSteer?: boolean;
+      interruptBeforeSend?: boolean;
+    },
   ): Promise<
     | { success: true; process: Process; restarted: boolean }
     | { success: false; error: string }
@@ -1115,6 +1159,40 @@ export class Supervisor {
 
     if (process.isTerminated) {
       return { success: false, error: "Process terminated" };
+    }
+
+    const managedConfig = this.feishuMcpConfigs.get(process.id);
+    const modelSettings =
+      !requestedModelSettings?.feishuMcpConfig && managedConfig
+        ? { ...requestedModelSettings, feishuMcpConfig: managedConfig }
+        : requestedModelSettings;
+    if (
+      modelSettings?.feishuMcpConfig &&
+      JSON.stringify(modelSettings.feishuMcpConfig) !==
+        JSON.stringify(managedConfig)
+    ) {
+      if (process.state.type !== "idle")
+        return {
+          success: false,
+          error:
+            "Finish the current task before changing Feishu authorization.",
+        };
+      await process.abort();
+      this.unregisterProcess(process);
+      const next = await this.resumeSession(
+        sessionId,
+        projectPath,
+        message,
+        permissionMode,
+        modelSettings,
+        admission,
+      );
+      return "id" in next
+        ? { success: true, process: next, restarted: true }
+        : {
+            success: false,
+            error: "Unable to apply Feishu MCP configuration immediately.",
+          };
     }
 
     // Check if thinking/effort settings changed
@@ -1209,6 +1287,7 @@ export class Supervisor {
 
     const result = await process.queueMessage(message, {
       allowSteer: admission?.allowSteer,
+      interruptBeforeSend: admission?.interruptBeforeSend,
     });
     if (result.success) {
       return { success: true, process, restarted: false };
@@ -1304,7 +1383,11 @@ export class Supervisor {
     this.eventBus.emit(event);
   }
 
-  private registerProcess(process: Process, isNewSession: boolean): void {
+  private registerProcess(
+    process: Process,
+    isNewSession: boolean,
+    resumedSessionId?: string,
+  ): void {
     const log = getLogger();
     log.info(
       {
@@ -1369,7 +1452,7 @@ export class Supervisor {
     this.emitWorkerActivity();
 
     // Listen for completion to auto-cleanup, and state changes for process state events
-    process.subscribe((event) => {
+    const handleEvent = (event: ProcessEvent) => {
       if (event.type === "complete") {
         this.unregisterProcess(process);
       } else if (event.type === "session-id-changed") {
@@ -1532,7 +1615,26 @@ export class Supervisor {
           event.reason,
         );
       }
-    });
+    };
+    process.subscribe(handleEvent);
+
+    // Strict initialization can replace a provisional resume ID before this
+    // subscription exists. Reconcile it through the same migration path as a
+    // late init, retaining both IDs without taking over another process's ID.
+    // Forks deliberately omit resumedSessionId: their parent stays independent.
+    if (
+      resumedSessionId &&
+      resumedSessionId !== process.sessionId &&
+      !this.sessionToProcess.has(resumedSessionId)
+    ) {
+      this.sessionToProcess.set(resumedSessionId, process.id);
+      this.everOwnedSessions.add(resumedSessionId);
+      handleEvent({
+        type: "session-id-changed",
+        oldSessionId: resumedSessionId,
+        newSessionId: process.sessionId,
+      });
+    }
   }
 
   private unregisterProcess(process: Process): void {
@@ -1565,6 +1667,7 @@ export class Supervisor {
     this.addTerminatedProcess(terminatedInfo);
 
     this.processes.delete(process.id);
+    this.feishuMcpConfigs.delete(process.id);
 
     // Delete all session ID mappings that point to this process
     // This handles both temp and real session IDs

@@ -15,9 +15,19 @@ import {
 } from "../hooks/useDraftPersistence";
 import { useI18n } from "../i18n";
 import type { AgentCommandConfig } from "../lib/agentCommands";
+import {
+  countAttachmentTokens,
+  deleteAttachmentTokenAtCaret,
+  hasAttachmentToken,
+  insertAttachmentToken,
+  matchTokenToAttachment,
+  sanitizeAttachmentTokenName,
+} from "../lib/attachmentTokens";
 import { readClipboardUserInput } from "../lib/clipboard";
 import { hasCoarsePointer } from "../lib/deviceDetection";
 import type { ContextUsage, PermissionMode } from "../types";
+import { AttachmentPreviewModal } from "./AttachmentPreviewModal";
+import { ComposerTokenHighlight } from "./ComposerTokenHighlight";
 import { MessageInputToolbar } from "./MessageInputToolbar";
 import type { VoiceInputButtonRef } from "./VoiceInputButton";
 
@@ -91,6 +101,8 @@ function filterCommands(commands: string[], query: string): string[] {
 
 interface Props {
   onSend: (text: string) => void;
+  /** Explicitly interrupt the active turn before sending. */
+  onInterruptSend?: (text: string) => void;
   /** Queue a deferred message (sent when agent's turn ends). Only provided when agent is running. */
   onQueue?: (text: string) => void;
   disabled?: boolean;
@@ -144,6 +156,7 @@ interface Props {
 
 export function MessageInput({
   onSend,
+  onInterruptSend,
   onQueue,
   disabled,
   placeholder,
@@ -188,6 +201,9 @@ export function MessageInput({
   const [dismissedCompletionKey, setDismissedCompletionKey] = useState<
     string | null
   >(null);
+  // Attachment names that were inserted as inline tokens; deleting the token
+  // text is how the user removes such an attachment.
+  const inlinedNamesRef = useRef<Set<string>>(new Set());
 
   // Combined display text: committed text + interim transcript
   const displayText = interimTranscript
@@ -326,10 +342,61 @@ export function MessageInput({
     [cursorPosition, onCustomCommand, setText, text],
   );
 
+  /** Restores the caret after React has flushed the new textarea value. */
+  const setCaretSoon = useCallback((position: number) => {
+    const apply = () => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(position, position);
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(apply);
+    } else {
+      setTimeout(apply, 0);
+    }
+  }, []);
+
+  /**
+   * Starts uploads and drops an inline token at the caret so the prompt keeps
+   * the ordering between typed text and attached files.
+   */
+  const attachFiles = useCallback(
+    (files: File[], baseText?: string, baseCursor?: number) => {
+      if (!onAttach || files.length === 0) return;
+      onAttach(files);
+
+      const textarea = textareaRef.current;
+      let nextText = baseText ?? textarea?.value ?? text;
+      let nextCursor =
+        baseCursor ?? textarea?.selectionStart ?? nextText.length;
+      // Pasted Yep clipboard payloads already carry `@[name]` inside the copied
+      // text; reuse those tokens instead of appending duplicates.
+      const consumed = new Map<string, number>();
+      for (const file of files) {
+        const name = sanitizeAttachmentTokenName(file.name);
+        inlinedNamesRef.current.add(name);
+        const used = consumed.get(name) ?? 0;
+        consumed.set(name, used + 1);
+        if (countAttachmentTokens(nextText, name) > used) continue;
+        const inserted = insertAttachmentToken(nextText, nextCursor, file.name);
+        nextText = inserted.text;
+        nextCursor = inserted.cursor;
+      }
+
+      setInterimTranscript("");
+      setDismissedCompletionKey(null);
+      setText(nextText);
+      setCursorPosition(nextCursor);
+      setCaretSoon(nextCursor);
+    },
+    [onAttach, setCaretSoon, setText, text],
+  );
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files?.length && onAttach) {
-      onAttach(Array.from(files));
+      attachFiles(Array.from(files));
       e.target.value = ""; // Reset for re-selection
     }
   };
@@ -339,27 +406,35 @@ export function MessageInput({
     onDraftControlsReady?.(controls);
   }, [controls, onDraftControlsReady]);
 
-  const handleSubmit = useCallback(() => {
-    // Stop voice recording and get any pending interim text
-    const pendingVoice = voiceButtonRef.current?.stopAndFinalize() ?? "";
+  const submitMessage = useCallback(
+    (send: (message: string) => void) => {
+      // Stop voice recording and get any pending interim text
+      const pendingVoice = voiceButtonRef.current?.stopAndFinalize() ?? "";
 
-    // Combine committed text with any pending voice text
-    let finalText = text.trimEnd();
-    if (pendingVoice) {
-      finalText = finalText ? `${finalText} ${pendingVoice}` : pendingVoice;
-    }
+      // Combine committed text with any pending voice text
+      let finalText = text.trimEnd();
+      if (pendingVoice) {
+        finalText = finalText ? `${finalText} ${pendingVoice}` : pendingVoice;
+      }
 
-    const hasContent = finalText.trim() || attachments.length > 0;
-    if (hasContent && !disabled) {
-      const message = finalText.trim();
-      // Clear input state but keep localStorage for failure recovery
-      controls.clearInput();
-      setInterimTranscript("");
-      onSend(message);
-      // Refocus the textarea so user can continue typing
-      textareaRef.current?.focus();
-    }
-  }, [text, disabled, controls, onSend, attachments.length]);
+      const hasContent = finalText.trim() || attachments.length > 0;
+      if (hasContent && !disabled) {
+        const message = finalText.trim();
+        // Clear input state but keep localStorage for failure recovery
+        controls.clearInput();
+        setInterimTranscript("");
+        send(message);
+        // Refocus the textarea so user can continue typing
+        textareaRef.current?.focus();
+      }
+    },
+    [text, disabled, controls, attachments.length],
+  );
+
+  const handleSubmit = useCallback(
+    () => submitMessage(onSend),
+    [submitMessage, onSend],
+  );
 
   const handleQueue = useCallback(() => {
     // Stop voice recording and get any pending interim text
@@ -388,6 +463,33 @@ export function MessageInput({
         voiceButtonRef.current.toggle();
       }
       return;
+    }
+
+    // Attachment tokens delete as one unit, like a chip would.
+    if (
+      (e.key === "Backspace" || e.key === "Delete") &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey
+    ) {
+      const textarea = textareaRef.current;
+      const deletion = textarea
+        ? deleteAttachmentTokenAtCaret(
+            textarea.value,
+            textarea.selectionStart,
+            textarea.selectionEnd,
+            e.key === "Backspace" ? "backward" : "forward",
+            attachmentNames,
+          )
+        : null;
+      if (deletion) {
+        e.preventDefault();
+        setInterimTranscript("");
+        setText(deletion.text);
+        setCursorPosition(deletion.cursor);
+        setCaretSoon(deletion.cursor);
+        return;
+      }
     }
 
     if (isCommandCompletionOpen) {
@@ -496,24 +598,19 @@ export function MessageInput({
     if (copiedInput && copiedInput.images.length > 0) {
       e.preventDefault();
 
-      if (copiedInput.text) {
-        const textarea = textareaRef.current;
-        const currentValue = textarea?.value ?? text;
-        const start = textarea?.selectionStart ?? currentValue.length;
-        const end = textarea?.selectionEnd ?? start;
-        const nextText = `${currentValue.slice(0, start)}${copiedInput.text}${currentValue.slice(end)}`;
-        const nextCursor = start + copiedInput.text.length;
+      const textarea = textareaRef.current;
+      const currentValue = textarea?.value ?? text;
+      const start = textarea?.selectionStart ?? currentValue.length;
+      const end = textarea?.selectionEnd ?? start;
 
-        setInterimTranscript("");
-        setDismissedCompletionKey(null);
-        setText(nextText);
-        setCursorPosition(nextCursor);
-        setTimeout(() => {
-          textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
-        }, 0);
+      let baseText = currentValue;
+      let baseCursor = start;
+      if (copiedInput.text) {
+        baseText = `${currentValue.slice(0, start)}${copiedInput.text}${currentValue.slice(end)}`;
+        baseCursor = start + copiedInput.text.length;
       }
 
-      onAttach(copiedInput.images);
+      attachFiles(copiedInput.images, baseText, baseCursor);
       return;
     }
 
@@ -534,9 +631,73 @@ export function MessageInput({
       // Prevent default only if we have files to handle
       // This allows text paste to still work normally
       e.preventDefault();
-      onAttach(files);
+      attachFiles(files);
     }
   };
+
+  // Names referenced by inline tokens (completed uploads + in-flight ones).
+  const attachmentNames = useMemo(
+    () => [
+      ...attachments.map((file) => file.originalName),
+      ...uploadProgress.map((progress) => progress.fileName),
+    ],
+    [attachments, uploadProgress],
+  );
+
+  // Attachments without an inline token (legacy drafts, or the user deleted
+  // the token text) still need a visible chip below the textarea.
+  const detachedAttachments = useMemo(
+    () =>
+      attachments.filter(
+        (file) => !hasAttachmentToken(text, file.originalName),
+      ),
+    [attachments, text],
+  );
+
+  const hasInlineTokens = useMemo(
+    () => attachmentNames.some((name) => hasAttachmentToken(text, name)),
+    [attachmentNames, text],
+  );
+
+  // Deleting the token text removes the attachment, mirroring how the chip
+  // behaves in other chat UIs. Attachments restored from a persisted draft are
+  // re-adopted here, so their tokens stay wired up after a navigation.
+  useEffect(() => {
+    for (const file of attachments) {
+      const name = sanitizeAttachmentTokenName(file.originalName);
+      if (hasAttachmentToken(text, name)) {
+        inlinedNamesRef.current.add(name);
+        continue;
+      }
+      if (!inlinedNamesRef.current.has(name)) continue;
+      inlinedNamesRef.current.delete(name);
+      onRemoveAttachment?.(file.id);
+    }
+  }, [attachments, onRemoveAttachment, text]);
+
+  // Inline token preview (click an `@[name]` chip in the composer).
+  const [previewAttachment, setPreviewAttachment] = useState<{
+    name: string;
+    apiPath: string | null;
+  } | null>(null);
+
+  const handleTokenClick = useCallback(
+    (name: string, occurrence: number) => {
+      const file = matchTokenToAttachment(
+        attachments,
+        (candidate) => candidate.originalName,
+        name,
+        occurrence,
+      );
+      if (!file) return;
+      const apiPath =
+        projectId && sessionId
+          ? `/api/projects/${projectId}/sessions/${sessionId}/upload/${encodeURIComponent(file.name)}`
+          : null;
+      setPreviewAttachment({ name: file.originalName, apiPath });
+    },
+    [attachments, projectId, sessionId],
+  );
 
   // Voice input handlers
   const handleVoiceTranscript = useCallback(
@@ -638,8 +799,17 @@ export function MessageInput({
             ))}
           </div>
         )}
+        {hasInlineTokens && !collapsed && (
+          <ComposerTokenHighlight
+            textareaRef={textareaRef}
+            text={displayText}
+            names={attachmentNames}
+            onTokenClick={handleTokenClick}
+          />
+        )}
         <textarea
           ref={textareaRef}
+          className={hasInlineTokens && !collapsed ? "has-token-mirror" : ""}
           value={displayText}
           onChange={(e) => {
             // If user edits while recording, only update committed text
@@ -661,11 +831,11 @@ export function MessageInput({
           rows={collapsed ? 1 : 3}
         />
 
-        {/* Attachment chips - show below textarea when not collapsed */}
+        {/* Attachment chips - only for files not referenced inline in the text */}
         {!collapsed &&
-          (attachments.length > 0 || uploadProgress.length > 0) && (
+          (detachedAttachments.length > 0 || uploadProgress.length > 0) && (
             <div className="attachment-list">
-              {attachments.map((file) => (
+              {detachedAttachments.map((file) => (
                 <div key={file.id} className="attachment-chip">
                   <span className="attachment-name" title={file.path}>
                     {file.originalName}
@@ -739,12 +909,22 @@ export function MessageInput({
             isThinking={isThinking}
             onStop={onStop}
             onSend={handleSubmit}
+            onInterruptSend={
+              onInterruptSend ? () => submitMessage(onInterruptSend) : undefined
+            }
             onQueue={onQueue ? handleQueue : undefined}
             canSend={!!(text.trim() || attachments.length > 0)}
             disabled={disabled}
           />
         )}
       </div>
+      {previewAttachment && (
+        <AttachmentPreviewModal
+          name={previewAttachment.name}
+          apiPath={previewAttachment.apiPath}
+          onClose={() => setPreviewAttachment(null)}
+        />
+      )}
     </div>
   );
 }

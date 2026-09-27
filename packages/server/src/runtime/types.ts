@@ -101,6 +101,8 @@ export type RuntimeSessionEventEmitter = (
 ) => void;
 
 export interface RuntimeSessionSubscriptionOptions {
+  /** Server display consumer: raw events plus plain streaming catch-up, without renderer augments. */
+  displayProjection?: boolean;
   replayAfterMessageId?: string;
   afterSeq?: number;
   onError?: (error: unknown) => void;
@@ -173,6 +175,8 @@ export interface QueueRuntimeMessageRequest {
   requireImmediate?: boolean;
   /** False queues behind an active turn instead of using provider steering. */
   allowSteer?: boolean;
+  /** Interrupt the active turn, then send this input before deferred messages. */
+  interruptBeforeSend?: boolean;
 }
 
 export interface RuntimeInputResponseRequest {

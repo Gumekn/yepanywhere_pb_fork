@@ -1,3 +1,4 @@
+import type { CodexAsyncMessage } from "@yep-anywhere/shared";
 // Import AgentStatus for local use in AgentSession interface
 import type {
   AgentStatus as AgentStatusType,
@@ -169,6 +170,7 @@ export interface Message {
   contextBefore?: ContextUsage;
   /** Codex app-server assistant message phase, when provided by Codex CLI. */
   codexMessagePhase?: "commentary" | "final_answer";
+  codexAsyncMessage?: CodexAsyncMessage;
   /** Allow any additional fields from SDK/server */
   [key: string]: unknown;
 }
@@ -188,6 +190,9 @@ export interface SessionNavigationState {
   initialStatus?: Extract<SessionOwnershipType, { owner: "self" }>;
   initialTitle?: string;
   initialProvider?: ProviderNameType;
+  initialModel?: string;
+  initialReasoningEffort?: string;
+  initialServiceTier?: string;
   targetMessageId?: string;
   targetBranchId?: string;
   /** Poll the newly-created native edit fork until its sibling graph lands. */

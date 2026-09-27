@@ -160,6 +160,132 @@ describe("Settings Routes", () => {
       },
     );
 
+    it("persists the Pi gateway key and the Codex account selection", async () => {
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+
+      const codexResponse = await routes.request("/", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newSessionDefaults: {
+            provider: "codex",
+            codexAccountId: "acct-work",
+            byProvider: { codex: { codexAccountId: "acct-work" } },
+          },
+        }),
+      });
+      expect(codexResponse.status).toBe(200);
+      expect(settings.newSessionDefaults?.byProvider?.codex).toMatchObject({
+        codexAccountId: "acct-work",
+      });
+
+      const piDefaults = {
+        llmGatewayKeyId: "key-aitl-1",
+        codexAccountId: null,
+        codexMcpMode: null,
+        serviceTier: null,
+      };
+      const piResponse = await routes.request("/", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newSessionDefaults: {
+            provider: "pi",
+            ...piDefaults,
+            byProvider: { pi: piDefaults },
+          },
+        }),
+      });
+      expect(piResponse.status).toBe(200);
+      expect(settings.newSessionDefaults).toMatchObject({
+        provider: "pi",
+        llmGatewayKeyId: "key-aitl-1",
+        byProvider: {
+          pi: { llmGatewayKeyId: "key-aitl-1" },
+          // The Codex save above must survive a Pi save.
+          codex: { codexAccountId: "acct-work" },
+        },
+      });
+    });
+
+    it("rejects a gateway key saved under a non-Pi provider", async () => {
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+      const response = await routes.request("/", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newSessionDefaults: {
+            provider: "codex",
+            byProvider: { codex: { llmGatewayKeyId: "key-aitl-1" } },
+          },
+        }),
+      });
+      expect(response.status).toBe(400);
+      expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
+    });
+
+    it("accepts a non-Codex provider payload that nulls Codex-only fields", async () => {
+      // api.updateServerSettings serializes `undefined` as `null`, so a Pi save
+      // ships serviceTier/codexMcpMode as null instead of omitting them.
+      settings = {
+        ...settings,
+        newSessionDefaults: {
+          provider: "codex",
+          model: "gpt-6-astra",
+          serviceTier: "priority",
+          byProvider: {
+            codex: { model: "gpt-6-astra", serviceTier: "priority" },
+          },
+        },
+      };
+      const routes = createSettingsRoutes({
+        serverSettingsService: mockServerSettingsService,
+      });
+      const piDefaults = {
+        model: null,
+        thinking: "on:high",
+        reasoningEffort: "high",
+        serviceTier: null,
+        permissionMode: "bypassPermissions",
+        codexMcpMode: null,
+        codexModelProvider: null,
+      };
+
+      const response = await routes.request("/", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newSessionDefaults: {
+            provider: "pi",
+            ...piDefaults,
+            byProvider: { pi: piDefaults },
+          },
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(settings.newSessionDefaults).toMatchObject({
+        provider: "pi",
+        thinking: "on:high",
+        reasoningEffort: "high",
+        permissionMode: "bypassPermissions",
+        byProvider: {
+          pi: {
+            thinking: "on:high",
+            reasoningEffort: "high",
+            permissionMode: "bypassPermissions",
+          },
+        },
+      });
+      expect(settings.newSessionDefaults?.byProvider?.pi).not.toHaveProperty(
+        "serviceTier",
+      );
+    });
+
     it("accepts Claude as the default provider", async () => {
       const routes = createSettingsRoutes({
         serverSettingsService: mockServerSettingsService,

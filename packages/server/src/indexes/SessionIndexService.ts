@@ -103,12 +103,14 @@ export interface SessionIndexState {
   // v12 persists question coverage so a bounded Codex summary cannot be
   // mistaken for a complete directory. It also rebuilds v11 entries whose
   // question ids were already byte-offset stable but lacked this field.
-  version: 13;
+  version: 14;
   projectId: string;
   sessions: Record<string, CachedSessionSummary>;
 }
 
-const CURRENT_VERSION = 13;
+// Rebuild persisted summaries that recorded the first Codex model instead of
+// the latest one; they are now used to restore the model on resume.
+const CURRENT_VERSION = 14;
 
 function needsPiTurnStatusMigration(index: SessionIndexState): boolean {
   return Object.values(index.sessions).some(
@@ -603,6 +605,32 @@ export class SessionIndexService implements ISessionIndexService {
     this.dirtySessionsByDir.delete(scopeKey);
   }
 
+  /**
+   * Mark a modified Pi session dirty in every loaded Pi scope that already
+   * indexes it. Pi names files `<timestamp>_<sessionId>.jsonl`; the filename is
+   * only a hint, so an id that no loaded index knows (new file, foreign scope,
+   * renamed file) falls back to the directory-wide reconciliation.
+   */
+  private markIndexedPiSessionDirty(filePath: string): boolean {
+    const match = path
+      .basename(filePath)
+      .match(
+        /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i,
+      );
+    const sessionId = match?.[1];
+    if (!sessionId) return false;
+
+    let marked = false;
+    for (const [scopeKey, index] of this.indexCache) {
+      if (!scopeKey.startsWith("pi::") || !index.sessions[sessionId]) continue;
+      const current = this.dirtySessionsByDir.get(scopeKey) ?? new Set();
+      current.add(sessionId);
+      this.dirtySessionsByDir.set(scopeKey, current);
+      marked = true;
+    }
+    return marked;
+  }
+
   private markMatchingScopesDirty(prefix: string): void {
     const knownScopeKeys = new Set<string>([
       ...this.indexCache.keys(),
@@ -808,7 +836,17 @@ export class SessionIndexService implements ISessionIndexService {
     }
 
     if (event.provider === "pi") {
-      // Pi sessions share one native tree and are filtered by header cwd.
+      // Pi sessions share one native tree and are filtered by header cwd. An
+      // append to an already indexed session only needs that one entry
+      // refreshed; marking whole scopes dirty made the stale-while-revalidate
+      // list path keep serving the mid-turn snapshot (e.g. a trailing
+      // toolResult reported as "interrupted") right after a turn completed.
+      if (
+        event.changeType === "modify" &&
+        this.markIndexedPiSessionDirty(event.path)
+      ) {
+        return;
+      }
       this.markMatchingScopesDirty("pi::");
       return;
     }

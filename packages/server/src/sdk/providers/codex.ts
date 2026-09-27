@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 /**
  * Codex Provider implementation using codex app-server JSON-RPC.
  *
@@ -17,7 +18,12 @@ import type {
   ProviderGoalState,
   UserQuestionAnswers,
 } from "@yep-anywhere/shared";
+import {
+  type CodexAsyncMessage,
+  readCodexAsyncMessage,
+} from "@yep-anywhere/shared";
 import { WebSocket } from "ws";
+import { resolveCodexHomeForAccount } from "../../codex-bridge/codex-account-home.js";
 import {
   buildCodexInteractiveResponse,
   toCodexInteractiveRequestView,
@@ -64,6 +70,7 @@ import {
   normalizeCodexImageGenerationRecord,
   summarizeCodexImageGenerationResult,
 } from "../../codex/image-generation.js";
+import { codexImagePreviewUrl } from "../../codex/image-preview.js";
 import {
   getCodexMcpAppServerArgs,
   resolveCodexMcpThreadProfile,
@@ -83,6 +90,7 @@ import { getDataDir } from "../../config.js";
 import { getLogger } from "../../logging/logger.js";
 import { encodeProjectId } from "../../projects/paths.js";
 import { ensureRuntimeToken } from "../../runtime/token.js";
+import { observeCodexFileNotification } from "../../session-files/codex-operations.js";
 import {
   GeneratedArtifactMaterializer,
   UploadManager,
@@ -508,6 +516,7 @@ type NormalizedThreadItem =
       type: "agent_message";
       text: string;
       phase?: CodexMessagePhase;
+      codexAsyncMessage?: CodexAsyncMessage;
     }
   | {
       id: string;
@@ -1200,6 +1209,10 @@ export class CodexAppServerClient {
     });
   }
 
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
   async nextNotification(signal?: AbortSignal): Promise<JsonRpcNotification> {
     return await this.notifications.shift(signal);
   }
@@ -1422,7 +1435,16 @@ export class CodexProvider implements AgentProvider {
         active?: unknown;
         mcpProfile?: unknown;
       };
-      if (activePayload.active !== true) return null;
+      const mcpProfile =
+        activePayload.mcpProfile === "clear" ||
+        activePayload.mcpProfile === "light" ||
+        activePayload.mcpProfile === "full"
+          ? activePayload.mcpProfile
+          : undefined;
+      // A detached TUI is no longer active in the bridge, but its app-server
+      // can still own the thread. Rejoin that profile instead of spawning a
+      // competing stdio writer during (or after) the unload delay.
+      if (activePayload.active !== true && !mcpProfile) return null;
 
       const statusResponse = await fetch(`${config.controlUrl}/status`, {
         headers,
@@ -1457,12 +1479,6 @@ export class CodexProvider implements AgentProvider {
           "Codex bridge returned a WebSocket endpoint on a different host",
         );
       }
-      const mcpProfile =
-        activePayload.mcpProfile === "clear" ||
-        activePayload.mcpProfile === "light" ||
-        activePayload.mcpProfile === "full"
-          ? activePayload.mcpProfile
-          : undefined;
       if (
         mcpProfile === "clear" ||
         (!mcpProfile && options.codexMcpMode === "clear")
@@ -1522,9 +1538,16 @@ export class CodexProvider implements AgentProvider {
 
   /**
    * Build environment overrides for Codex subprocesses.
+   *
+   * `codexHome` isolates the session on a non-default Codex account: it only
+   * changes where Codex reads `auth.json` from, because the alternate home
+   * symlinks its session storage back to the machine-wide one.
    */
-  private getCodexEnv(): NodeJS.ProcessEnv {
+  private getCodexEnv(codexHome?: string | null): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env };
+    if (codexHome) {
+      env.CODEX_HOME = codexHome;
+    }
     if (this.config.baseUrl) {
       env.OPENAI_BASE_URL = this.config.baseUrl;
     }
@@ -2817,7 +2840,10 @@ export class CodexProvider implements AgentProvider {
     const modelSource = registry.require(
       options.codexModelProvider ?? DEFAULT_CODEX_MODEL_PROVIDER,
     );
-    const codexEnv = this.getCodexEnv();
+    // Sessions bound to a non-default Codex account run against that account's
+    // isolated CODEX_HOME so the app-server picks up its credentials.
+    const sessionCodexHome = resolveCodexHomeForAccount(options.codexAccountId);
+    const codexEnv = this.getCodexEnv(sessionCodexHome);
     let appServer: CodexAppServerClient | undefined;
     let startupStage = "transport-selection";
     let transportKind: "stdio" | "bridge-websocket" = "stdio";
@@ -2881,7 +2907,9 @@ export class CodexProvider implements AgentProvider {
     };
 
     try {
-      const bridgeTarget = await this.resolveBridgeExecutionTarget(options);
+      const bridgeTarget = sessionCodexHome
+        ? null
+        : await this.resolveBridgeExecutionTarget(options);
       transportKind = bridgeTarget ? "bridge-websocket" : "stdio";
       const needsPaginatedHistoryApi =
         bridgeTarget !== null || options.rollbackNumTurns !== undefined;
@@ -2975,6 +3003,15 @@ export class CodexProvider implements AgentProvider {
       const mcpProfile = resolveCodexMcpThreadProfile(
         options.codexMcpMode,
         configRead.config,
+        options.feishuMcpConfig
+          ? {
+              mcp_servers: {
+                "yep-feishu": {
+                  ...options.feishuMcpConfig,
+                },
+              },
+            }
+          : undefined,
       );
 
       const policy = this.mapPermissionModeToThreadPolicy(
@@ -3021,6 +3058,22 @@ export class CodexProvider implements AgentProvider {
       // Omission leaves the native thread tier intact on ordinary resume.
       const serviceTier =
         modelSource.id === "openai" ? options.serviceTier : undefined;
+      const requestedReasoningEffort = this.mapEffortToReasoningEffort(
+        options.reasoningEffort,
+        options.effort,
+        options.thinking,
+        modelSource,
+        options.model,
+      );
+      // Apply the selected effort before init, including create-only sessions.
+      // Otherwise thread/start reports the CLI default, which can overwrite
+      // the client's selection and then be sent back on the next message.
+      const threadConfig = {
+        ...mcpProfile.threadConfig,
+        ...(requestedReasoningEffort !== undefined
+          ? { model_reasoning_effort: requestedReasoningEffort }
+          : {}),
+      };
       const threadResumeParams: ThreadResumeParams = {
         threadId: options.resumeSessionId ?? sessionId,
         model: requestedModel,
@@ -3029,7 +3082,7 @@ export class CodexProvider implements AgentProvider {
         cwd: options.cwd,
         approvalPolicy: policy.approvalPolicy,
         sandbox: policy.sandbox,
-        config: mcpProfile.threadConfig,
+        config: threadConfig,
         excludeTurns: true,
         ...(initialResumeTurnsPage
           ? { initialTurnsPage: initialResumeTurnsPage }
@@ -3042,7 +3095,7 @@ export class CodexProvider implements AgentProvider {
         cwd: options.cwd,
         approvalPolicy: policy.approvalPolicy,
         sandbox: policy.sandbox,
-        config: mcpProfile.threadConfig,
+        config: threadConfig,
       };
       let lifecycleHistorySupport: CodexLifecycleHistorySupport = "unknown";
       let resumedActiveTurnId: string | undefined;
@@ -3227,10 +3280,11 @@ export class CodexProvider implements AgentProvider {
             lastTurnId: boundary.turn.id,
             model: requestedModel,
             modelProvider: modelSource.id,
+            ...(serviceTier !== undefined ? { serviceTier } : {}),
             cwd: options.cwd,
             approvalPolicy: policy.approvalPolicy,
             sandbox: policy.sandbox,
-            config: mcpProfile.threadConfig,
+            config: threadConfig,
             excludeTurns: true,
           };
           log.info(
@@ -3371,8 +3425,15 @@ export class CodexProvider implements AgentProvider {
             params: request.params,
           });
         },
-        onServerNotification: async (notification) =>
-          await activeEventIngress.ingestNotification(notification),
+        onServerNotification: async (notification) => {
+          if (transportKind === "stdio") {
+            await observeCodexFileNotification(
+              { sessionId, workspace: options.cwd },
+              notification,
+            );
+          }
+          return await activeEventIngress.ingestNotification(notification);
+        },
       });
 
       runtimeState.ready = true;
@@ -3399,6 +3460,7 @@ export class CodexProvider implements AgentProvider {
           model: requestedModel,
           codexModelProvider: effectiveModelProvider,
           serviceTier: threadResult.serviceTier,
+          requestedServiceTier: serviceTier ?? null,
           transport: transportKind,
           credentialPresent: Boolean(
             modelSource.providerConfig?.envKey
@@ -3428,10 +3490,100 @@ export class CodexProvider implements AgentProvider {
       let isFirstMessage = !options.resumeSessionId || forkStartedFresh;
       startupStage = "turn-runtime";
 
-      for await (const message of messageGen) {
-        if (signal.aborted) {
-          break;
+      // Native controls (including /compact) start turns without enqueuing a
+      // user prompt. Keep consuming notifications while waiting for input.
+      // Retain the losing read: a second nextNotification would steal an event
+      // from the active turn after the input side wins the race.
+      const notificationClient = appServer;
+      let pendingInput: ReturnType<typeof messageGen.next> | undefined;
+      let pendingNotification: Promise<JsonRpcNotification> | undefined;
+      const nextNotification = async () => {
+        const next =
+          pendingNotification ?? notificationClient.nextNotification(signal);
+        pendingNotification = undefined;
+        return await next;
+      };
+      while (!signal.aborted) {
+        pendingInput ??= messageGen.next();
+        pendingNotification ??= appServer.nextNotification(signal);
+        const notificationReady = pendingNotification.then((notification) => ({
+          kind: "notification" as const,
+          notification,
+        }));
+        const next = runtimeState.activeTurnId
+          ? await notificationReady
+          : await Promise.race([
+              pendingInput.then((input) => ({ kind: "input" as const, input })),
+              notificationReady,
+            ]);
+        if (next.kind === "notification") {
+          pendingNotification = undefined;
+          const raw = next.notification;
+          if (appServer.isClosed) queue.close();
+          const event =
+            raw.canonicalEvent ??
+            (await activeEventIngress.ingestNotification(raw));
+          if (event.threadId && event.threadId !== sessionId) continue;
+          const notification =
+            projectionMode === "primary"
+              ? activeEventIngress.notificationFromEvent(event)
+              : raw;
+          const params = asRecord(notification.params);
+          if (notification.method === "turn/started") {
+            const turn = asRecord(params?.turn);
+            if (typeof turn?.id === "string")
+              runtimeState.activeTurnId = turn.id;
+          }
+          if (notification.method === "thread/tokenUsage/updated") {
+            const usage = this.extractTurnUsage(notification.params);
+            if (usage) usageByTurnId.set(usage.turnId, usage.snapshot);
+          }
+          const messages = this.convertNotificationToSDKMessages(
+            notification,
+            sessionId,
+            usageByTurnId,
+            customToolContexts,
+            commandOutputBuffers,
+            true,
+            projectionMode === "primary",
+            projectionMode === "primary"
+              ? canonicalRetryableErrorsByTurnId
+              : legacyRetryableErrorsByTurnId,
+            options.cwd,
+          );
+          const projectedMessages =
+            projectionMode === "primary"
+              ? this.attachCanonicalCodexItem(messages, event, sessionId)
+              : messages;
+          for (const message of projectedMessages) yield logMessage(message);
+          if (
+            runtimeState.activeTurnId &&
+            this.isTurnTerminalNotification(
+              notification,
+              runtimeState.activeTurnId,
+            )
+          ) {
+            const turnId = runtimeState.activeTurnId;
+            runtimeState.activeTurnId = null;
+            const turnStatus =
+              notification.method === "error"
+                ? "failed"
+                : this.asTurnCompletedNotification(notification.params)?.turn
+                    .status;
+            yield logMessage({
+              type: "result",
+              session_id: sessionId,
+              turnId,
+              codexTurnId: turnId,
+              turnStatus,
+              is_error: turnStatus === "failed",
+            } as SDKMessage);
+          }
+          continue;
         }
+        pendingInput = undefined;
+        if (next.input.done) break;
+        const message = next.input.value;
 
         let { internalPrompt, publicPrompt } = getUserPromptProjection(message);
         if (!internalPrompt) {
@@ -3452,13 +3604,7 @@ export class CodexProvider implements AgentProvider {
           threadId: sessionId,
           clientUserMessageId: message.uuid,
           input: buildCodexUserInput(message, internalPrompt),
-          effort: this.mapEffortToReasoningEffort(
-            options.reasoningEffort,
-            options.effort,
-            options.thinking,
-            modelSource,
-            options.model,
-          ),
+          effort: requestedReasoningEffort,
         };
         const retryObserver = async (update: AppServerRetryUpdate) =>
           await activeEventIngress.ingestClientRetry({
@@ -3470,6 +3616,7 @@ export class CodexProvider implements AgentProvider {
               ? { clientMessageId: update.metadata.clientMessageId }
               : {}),
           });
+        if (signal.aborted) break;
         let turnResult: TurnStartResponse | undefined;
         let activeTurnId: string;
         let sourceEvent: "turn/start" | "turn/steer" = "turn/start";
@@ -3609,14 +3756,25 @@ export class CodexProvider implements AgentProvider {
         let turnComplete =
           turnResult !== undefined && turnResult.turn.status !== "inProgress";
         let emittedTurnError = false;
-
         while (!turnComplete && !signal.aborted) {
-          const rawNotification = await appServer.nextNotification(signal);
+          const rawNotification = await nextNotification();
+          // A synthetic transport error is terminal for the input consumer,
+          // unlike a failed model turn on an otherwise healthy connection.
+          if (appServer.isClosed) queue.close();
           const canonicalEvent =
             rawNotification.canonicalEvent ??
             (await activeEventIngress.ingestNotification(rawNotification));
           const canonicalNotification =
             activeEventIngress.notificationFromEvent(canonicalEvent);
+
+          // The bridge also broadcasts child-thread activity. Keep it in the
+          // event journal, but never project it into this thread's runtime.
+          if (
+            canonicalEvent.threadId &&
+            canonicalEvent.threadId !== sessionId
+          ) {
+            continue;
+          }
 
           if (canonicalNotification.method === "thread/tokenUsage/updated") {
             const usage = this.extractTurnUsage(canonicalNotification.params);
@@ -3766,7 +3924,12 @@ export class CodexProvider implements AgentProvider {
             }
           }
           for (const msg of messages) {
-            yield logMessage(msg);
+            yield logMessage({
+              ...msg,
+              ...(canonicalEvent.threadId
+                ? { codexThreadId: canonicalEvent.threadId }
+                : {}),
+            });
           }
 
           if (
@@ -3835,6 +3998,9 @@ export class CodexProvider implements AgentProvider {
         } as SDKMessage);
       }
     } finally {
+      // The trailing result reports provider shutdown, not a reusable turn
+      // boundary. Reject admission before Process handles that result.
+      queue.close();
       runtimeState.activeTurnId = null;
       runtimeState.ready = false;
       await appServer?.closeAndWait();
@@ -4525,6 +4691,8 @@ export class CodexProvider implements AgentProvider {
     retryableErrorsByTurnId: Map<string, CanonicalCodexError> = new Map(),
     workspaceRoot?: string,
   ): SDKMessage[] {
+    const threadId = asRecord(notification.params)?.threadId;
+    if (typeof threadId === "string" && threadId !== sessionId) return [];
     switch (notification.method) {
       case "thread/tokenUsage/updated": {
         const usage = this.extractTurnUsage(notification.params);
@@ -4562,6 +4730,7 @@ export class CodexProvider implements AgentProvider {
           subtype: "turn_complete",
           session_id: sessionId,
           turnId,
+          ...(turnId ? { codexTurnId: turnId } : {}),
           turnStatus,
           usage: usage
             ? {
@@ -4666,6 +4835,24 @@ export class CodexProvider implements AgentProvider {
             ? this.asItemStartedNotification(notification.params)
             : this.asItemCompletedNotification(notification.params);
         if (!params) return [];
+
+        if (params.item.type === "contextCompaction") {
+          return [
+            withCodexTimestamp({
+              type: "system",
+              uuid: `${params.item.id}-${params.turnId}`,
+              session_id: sessionId,
+              turnId: params.turnId,
+              codexTurnId: params.turnId,
+              ...(notification.method === "item/started"
+                ? { subtype: "status", status: "compacting" }
+                : {
+                    subtype: "compact_boundary",
+                    content: "Context compacted",
+                  }),
+            } as SDKMessage),
+          ];
+        }
 
         // A steer response only admits input to Codex's pending queue. The
         // userMessage lifecycle is emitted when that input enters the turn's
@@ -5150,6 +5337,7 @@ export class CodexProvider implements AgentProvider {
           id,
           type: "agent_message",
           text,
+          codexAsyncMessage: readCodexAsyncMessage(itemRecord),
           ...(normalizedType === "agent_message"
             ? { phase: this.getCodexMessagePhase(itemRecord.phase) }
             : {}),
@@ -5529,6 +5717,9 @@ export class CodexProvider implements AgentProvider {
             uuid,
             codexCorrelationKey: `codex:${turnId}:agent-message:${item.id}`,
             ...(item.phase ? { codexMessagePhase: item.phase } : {}),
+            ...(item.codexAsyncMessage
+              ? { codexAsyncMessage: item.codexAsyncMessage }
+              : {}),
             message: {
               role: "assistant",
               content: item.text,
@@ -5898,7 +6089,10 @@ export class CodexProvider implements AgentProvider {
                   type: "tool_use",
                   id: item.id,
                   name: "ViewImage",
-                  input: { path: publicPath },
+                  input: {
+                    path: publicPath,
+                    snapshotUrl: codexImagePreviewUrl(sessionId, item.id),
+                  },
                 },
               ],
             },

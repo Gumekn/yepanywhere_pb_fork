@@ -310,7 +310,13 @@ function parseNewSessionProviderDefaults(
     }
   }
 
-  if (raw.serviceTier !== undefined) {
+  // Clients serialize "unset" as null (see api.updateServerSettings), so a
+  // null/empty tier must clear the field instead of failing validation.
+  if (
+    raw.serviceTier !== undefined &&
+    raw.serviceTier !== null &&
+    raw.serviceTier !== ""
+  ) {
     if (
       (raw.serviceTier !== "default" && raw.serviceTier !== "priority") ||
       (provider !== undefined && provider !== "codex")
@@ -349,6 +355,37 @@ function parseNewSessionProviderDefaults(
     }
     if (typeof raw.codexMcpMode === "string" && raw.codexMcpMode.length > 0) {
       parsed.codexMcpMode = raw.codexMcpMode as CodexMcpMode;
+    }
+  }
+
+  if ("codexAccountId" in raw) {
+    const rawAccountId = raw.codexAccountId;
+    if (
+      rawAccountId !== undefined &&
+      rawAccountId !== null &&
+      rawAccountId !== ""
+    ) {
+      if (
+        typeof rawAccountId !== "string" ||
+        (provider !== undefined && provider !== "codex")
+      ) {
+        return null;
+      }
+      parsed.codexAccountId = rawAccountId;
+    }
+  }
+
+  if ("llmGatewayKeyId" in raw) {
+    const rawKeyId = raw.llmGatewayKeyId;
+    if (rawKeyId !== undefined && rawKeyId !== null && rawKeyId !== "") {
+      if (
+        typeof rawKeyId !== "string" ||
+        rawKeyId.length > 200 ||
+        (provider !== undefined && provider !== "pi")
+      ) {
+        return null;
+      }
+      parsed.llmGatewayKeyId = rawKeyId;
     }
   }
 
