@@ -7,6 +7,8 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ## [Unreleased]
 
+## [2026.9.1] - 2026-09-27
+
 ### Changed
 - 输入框插入图片／附件标签时，前后与正文统一保留至少两个空格，避免标签紧贴前面的文字；保留已有换行、制表符和更宽间隔。
 - Codex 子智能体活动展示具体名称、中文／英文事件说明和子会话入口，便于查看任务、协作消息与结果；修复已完成子智能体仍显示「进行中」，发送消息不再被误判为重新运行。
