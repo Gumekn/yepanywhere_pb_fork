@@ -182,6 +182,13 @@ curl -X PUT http://localhost:3401/log/level -d '{"console": "debug"}'
 
 除非用户明确同意重启，否则避免调用 `POST /reload`。
 
+## 客户端字体与字号
+
+- 字体栈和字号只在 `packages/client/src/styles/typography.css` 定义；普通 UI 使用 `--font-sans`，代码/路径使用 `--font-mono`，字号使用已定义的 `--font-size-*` 或继承。
+- 新页面、侧栏、弹窗默认继承统一正文；不要自行写 px/rem/em 字号、拼接另一套字体栈、重定义字号变量或用局部倍数制造新字号。React 内联样式也遵守同样规则。
+- 用户字号由 `useFontSize` 单独调整根比例，不再对各 token 重复写像素值。移动输入框使用 `--font-size-input`；终端、SVG 和启动画面的有限例外见 [字体约束](docs/project/typography.md)。
+- 修改 UI 后运行 `pnpm lint:typography`；此检查也属于 `pnpm lint` 和客户端构建。新增字号角色应更新唯一入口和说明，不应绕开检查。
+
 ## 类型系统
 
 类型定义在 `packages/shared/src/claude-sdk-schema/`，以 Zod schema 作为事实来源。

@@ -16,6 +16,8 @@
   width: clamp(360px, 34vw, 480px);
   height: 100dvh;
   min-width: 0;
+  font-size: var(--font-size-base);
+  line-height: var(--line-height-base);
   color: var(--text-primary);
   background: var(--bg-surface);
   border-left: 1px solid var(--border-color);
@@ -167,5 +169,11 @@
     right: 0;
     z-index: 50;
     box-shadow: -8px 0 24px rgb(0 0 0 / 12%);
+  }
+}
+
+@media (max-width: 600px) {
+  .side-conversation-composer textarea {
+    font-size: var(--font-size-input);
   }
 }

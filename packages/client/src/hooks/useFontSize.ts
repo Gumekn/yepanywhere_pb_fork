@@ -27,15 +27,13 @@ function applyFontSize(size: FontSize) {
   const scale = fontSizeScales[size];
   const root = document.documentElement;
 
-  // Scale the root font-size to affect all rem/em units globally
-  // This is the standard approach for accessibility font scaling
-  root.style.fontSize = `${100 * scale}%`;
-
-  // Also scale the CSS variables for elements using them directly (px-based)
-  root.style.setProperty("--font-size-xs", `${10 * scale}px`);
-  root.style.setProperty("--font-size-sm", `${12 * scale}px`);
-  root.style.setProperty("--font-size-base", `${13 * scale}px`);
-  root.style.setProperty("--font-size-lg", `${14 * scale}px`);
+  // All typography tokens are rem-based; one scale covers every UI surface.
+  // Keep the root percentage so browser zoom and user default sizes still work.
+  root.style.fontSize = `${Math.round(100 * scale)}%`;
+  // Remove overrides left by older clients during development/HMR.
+  for (const token of ["xs", "sm", "base", "lg"]) {
+    root.style.removeProperty(`--font-size-${token}`);
+  }
 }
 
 function loadFontSize(): FontSize {

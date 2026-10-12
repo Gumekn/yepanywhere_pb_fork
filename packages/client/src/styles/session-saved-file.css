@@ -1,10 +1,10 @@
 .session-saved-source {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono);
 }
 
 .session-saved-note {
-  font-size: 0.85em;
+  font-size: var(--font-size-inline-caption);
   opacity: 0.75;
 }

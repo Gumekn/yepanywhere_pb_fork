@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node ../../scripts/run-with-safe-home.js vite",
-    "build": "tsc && vite build",
-    "build:stable": "tsc && vite build --base /_stable/ --outDir dist-stable",
+    "build": "node ../../scripts/check-typography.mjs && tsc && vite build",
+    "build:stable": "node ../../scripts/check-typography.mjs && tsc && vite build --base /_stable/ --outDir dist-stable",
     "test": "node ../../scripts/run-with-safe-home.js vitest run",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",

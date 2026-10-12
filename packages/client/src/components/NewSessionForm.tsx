@@ -1863,7 +1863,7 @@ export function NewSessionForm({
                       fill="var(--bg-primary, #1a1a2e)"
                       fontSize="8"
                       fontWeight="700"
-                      fontFamily="system-ui, sans-serif"
+                      fontFamily="var(--font-sans)"
                       stroke="none"
                     >
                       A

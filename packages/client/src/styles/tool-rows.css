@@ -319,7 +319,7 @@
 }
 
 .display-tool-group-summary {
-  font-size: 13px;
+  font-size: var(--font-size-base);
   font-weight: 600;
 }
 
@@ -328,7 +328,7 @@
   flex: 1;
   overflow: hidden;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -349,7 +349,7 @@
 .display-tool-group-state {
   padding: 10px;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--font-size-sm);
 }
 
 .display-tool-group-state.is-error {
@@ -483,7 +483,7 @@
   border: 1px solid var(--border-color);
   border-radius: 50%;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--font-size-sm);
   font-weight: 700;
   line-height: 1;
 }

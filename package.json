@@ -47,7 +47,9 @@
     "test:e2e:emulator:apk:adaptive": "corepack pnpm --filter client test:e2e:emulator:apk:adaptive",
     "test:e2e:chromeos": "corepack pnpm --filter client test:e2e:chromeos",
     "test:e2e:sdk": "corepack pnpm --filter server test:e2e",
-    "lint": "biome check .",
+    "lint": "corepack pnpm lint:typography && biome check .",
+    "lint:typography": "node scripts/check-typography.mjs",
+    "test:typography": "node --test scripts/check-typography.test.mjs",
     "format": "biome format --write .",
     "prepare": "husky",
     "postinstall": "chmod +x node_modules/.pnpm/node-pty@*/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null; exit 0",
@@ -57,6 +59,7 @@
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
     "husky": "^9.1.7",
+    "postcss": "8.5.8",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   },
