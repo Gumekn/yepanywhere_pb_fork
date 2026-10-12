@@ -35,6 +35,15 @@ export function SideConversationPanel({
   const running =
     conversation?.status === "running" || conversation?.status === "stopping";
   const ended = conversation?.status === "closed";
+  const canSend = side.supported && side.availability === "ready";
+  const availabilityLabel =
+    side.availability === "checking"
+      ? "sideChatChecking"
+      : side.availability === "unsupported"
+        ? "sideChatNeedsUpdate"
+        : side.availability === "connection_error"
+          ? "sideChatConnectionError"
+          : "sideChatNotReady";
   useEffect(() => {
     if (!visible) return;
     const previous = document.activeElement;
@@ -51,7 +60,7 @@ export function SideConversationPanel({
   }, [visible, conversation?.version]);
   const submit = async () => {
     const text = draft.trim();
-    if (!text || busy || running || ended) return;
+    if (!text || busy || running || ended || !canSend) return;
     // Flush/record the submitted draft before creation changes the side ID.
     controls.clearInput();
     if (await side.send(text, context)) {
@@ -65,6 +74,7 @@ export function SideConversationPanel({
   };
   return (
     <aside
+      id="side-conversation-panel"
       ref={panelRef}
       className={`side-conversation ${mobile ? "side-conversation--mobile" : ""}`}
       hidden={!visible}
@@ -174,7 +184,6 @@ export function SideConversationPanel({
           </p>
         )}
         {ended && <p>{t("sideChatEnded")}</p>}
-        {!side.supported && <p>{t("sideChatUnavailable")}</p>}
       </div>
       <form
         className="side-conversation-composer"
@@ -205,7 +214,10 @@ export function SideConversationPanel({
           value={draft}
           maxLength={32000}
           rows={3}
-          disabled={!side.supported || ended}
+          disabled={ended}
+          aria-describedby={
+            !canSend ? "side-conversation-availability" : undefined
+          }
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
             if (
@@ -218,6 +230,15 @@ export function SideConversationPanel({
             }
           }}
         />
+        {!canSend && (
+          <p
+            id="side-conversation-availability"
+            className="side-conversation-availability"
+            role="status"
+          >
+            {t(availabilityLabel)}
+          </p>
+        )}
         <div className="side-conversation-actions">
           {conversation && (
             <button
@@ -244,7 +265,7 @@ export function SideConversationPanel({
           ) : (
             <button
               type="submit"
-              disabled={busy || !side.supported || ended || !draft.trim()}
+              disabled={busy || !canSend || ended || !draft.trim()}
             >
               {t(busy ? "sideChatStarting" : "sideChatSend")}
             </button>

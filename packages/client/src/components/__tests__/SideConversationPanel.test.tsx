@@ -19,10 +19,13 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function fixture() {
+function fixture(
+  overrides: Partial<ReturnType<typeof useSideConversation>> = {},
+) {
   localStorage.setItem(UI_KEYS.locale, "en");
   const side: ReturnType<typeof useSideConversation> = {
     supported: true,
+    availability: "ready",
     error: undefined,
     busy: false,
     conversation: {
@@ -38,6 +41,7 @@ function fixture() {
     close: vi.fn(async () => {}),
     startNew: vi.fn(async () => undefined),
     interrupt: vi.fn(async () => undefined),
+    ...overrides,
   };
   const onClose = vi.fn();
   const onBringBack = vi.fn();
@@ -80,4 +84,25 @@ it("preserves the question after failure and never submits while composing with 
     expect((input as HTMLTextAreaElement).value).toBe("side question"),
   );
   expect(side.send).toHaveBeenCalledWith("side question", "snapshot");
+});
+
+it("keeps a writable independent draft when the runtime has no side endpoint", () => {
+  const { side } = fixture({
+    supported: false,
+    availability: "unsupported",
+    conversation: undefined,
+  });
+  expect(screen.getByRole("status").textContent).toContain(
+    "server needs an update",
+  );
+  const input = screen.getByRole("textbox") as HTMLTextAreaElement;
+  expect(input.disabled).toBe(false);
+  fireEvent.change(input, { target: { value: "parallel question" } });
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(input.value).toBe("parallel question");
+  expect(side.send).not.toHaveBeenCalled();
+  expect(
+    (screen.getByRole("button", { name: "Send" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
 });

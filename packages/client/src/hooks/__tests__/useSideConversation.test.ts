@@ -89,6 +89,7 @@ it("ignores an older poll that finishes after a send", async () => {
     supported: boolean;
     conversation: SideConversationSnapshot;
   }) => void;
+  vi.mocked(api.sideConversation).mockResolvedValueOnce({ supported: true });
   vi.mocked(api.sideConversation).mockImplementationOnce(
     () =>
       new Promise((resolve) => {
@@ -110,9 +111,12 @@ it("ignores an older poll that finishes after a send", async () => {
       },
     };
   });
-  const { result } = renderHook(() =>
-    useSideConversation("parent", true, true),
+  const { result, rerender } = renderHook(
+    ({ visible }) => useSideConversation("parent", true, visible),
+    { initialProps: { visible: false } },
   );
+  await waitFor(() => expect(result.current.availability).toBe("ready"));
+  rerender({ visible: true });
   await act(async () => {
     await result.current.send("why?");
   });
@@ -120,4 +124,27 @@ it("ignores an older poll that finishes after a send", async () => {
     finish({ supported: true, conversation: snapshot(1) });
   });
   expect(result.current.conversation?.version).toBe(3);
+});
+
+it("distinguishes an old runtime from startup and rechecks when opening the panel", async () => {
+  vi.mocked(api.sideConversation).mockResolvedValue({
+    supported: false,
+    reason: "unsupported",
+  });
+  const { result, rerender } = renderHook(
+    ({ visible }) => useSideConversation("parent", true, visible),
+    { initialProps: { visible: false } },
+  );
+  await waitFor(() => expect(result.current.availability).toBe("unsupported"));
+  await act(async () => {
+    expect(await result.current.send("draft")).toBe(false);
+  });
+  expect(
+    vi
+      .mocked(api.sideConversation)
+      .mock.calls.every(([, request]) => request.action === "get"),
+  ).toBe(true);
+  vi.mocked(api.sideConversation).mockResolvedValue({ supported: true });
+  rerender({ visible: true });
+  await waitFor(() => expect(result.current.availability).toBe("ready"));
 });

@@ -1,3 +1,14 @@
+.side-conversation-question-entry {
+  padding: var(--space-2) 0;
+}
+.side-conversation-launch:focus-visible {
+  outline: 2px solid var(--focus-border);
+  outline-offset: 2px;
+}
+.side-conversation-availability {
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
 .side-conversation {
   display: flex;
   flex-direction: column;

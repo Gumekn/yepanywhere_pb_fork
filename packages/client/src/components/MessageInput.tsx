@@ -103,6 +103,8 @@ interface Props {
   isRunning?: boolean;
   isThinking?: boolean;
   onStop?: () => void;
+  onOpenSideConversation?: () => void;
+  sideConversationOpen?: boolean;
   draftKey: string; // localStorage key for draft persistence
   /** Collapse to single-line but keep visible and focusable (for when approval panel is showing) */
   collapsed?: boolean;
@@ -159,6 +161,8 @@ export function MessageInput({
   isRunning,
   isThinking,
   onStop,
+  onOpenSideConversation,
+  sideConversationOpen,
   draftKey,
   collapsed: externalCollapsed,
   onDraftControlsReady,
@@ -699,6 +703,8 @@ export function MessageInput({
             isRunning={isRunning}
             isThinking={isThinking}
             onStop={onStop}
+            onOpenSideConversation={onOpenSideConversation}
+            sideConversationOpen={sideConversationOpen}
             onSend={handleSubmit}
             onInterruptSend={
               onInterruptSend ? () => submitMessage(onInterruptSend) : undefined

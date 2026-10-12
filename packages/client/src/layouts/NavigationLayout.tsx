@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Outlet, useOutletContext, useParams } from "react-router-dom";
 import { Sidebar } from "../components/Sidebar";
 import { useMobileViewport } from "../hooks/useMobileViewport";
+import { setRecentProjectId } from "../hooks/useRecentProject";
 import { useSidebarPreference } from "../hooks/useSidebarPreference";
 import { useSidebarWidth } from "../hooks/useSidebarWidth";
 import { useViewportWidth } from "../hooks/useViewportWidth";
@@ -19,7 +20,14 @@ export interface NavigationLayoutContext {
  */
 export function NavigationLayout() {
   // Extract sessionId from URL for highlighting in sidebar (works for session pages)
-  const { sessionId } = useParams<{ sessionId?: string }>();
+  const { sessionId, projectId } = useParams<{
+    sessionId?: string;
+    projectId?: string;
+  }>();
+  // Project history belongs to navigation, not to the retired floating button.
+  useEffect(() => {
+    if (projectId) setRecentProjectId(projectId);
+  }, [projectId]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { isExpanded, toggleExpanded } = useSidebarPreference();
   const {

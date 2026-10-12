@@ -860,12 +860,6 @@
   "gitStatusPreview": "Preview",
   "gitStatusDiffOnly": "Diff only",
   "gitStatusFullContext": "Full context",
-  "fabPlaceholder": "Start a new session...",
-  "fabGoToNewSession": "Go to new session",
-  "fabContinueToSetup": "Continue to set up",
-  "fabContinueToSetupHint": "Opens the new session page to choose provider, model and more",
-  "fabClose": "Close",
-  "fabNewSession": "New session",
   "modelSwitchTitle": "Switch Model",
   "modelSwitchLoadFailed": "Failed to load models",
   "modelSwitchChangeFailed": "Failed to switch model",
@@ -1734,5 +1728,10 @@
   "sideChatMainIdle": "Idle",
   "sideChatHandoff": "From side chat:\n\n{content}",
   "sideChatAttachments": "Side chat accepts text only. Keep attachments in the main input.",
-  "sideChatHistoricalEdit": "Finish or cancel the message edit before opening side chat."
+  "sideChatHistoricalEdit": "Finish or cancel the message edit before opening side chat.",
+  "sideChatOpenHint": "Open a separate chat alongside the main task",
+  "sideChatChecking": "Checking side chat availability. You can write a draft now.",
+  "sideChatNeedsUpdate": "The server needs an update before it can answer side messages. You can write a draft here; the main task keeps running.",
+  "sideChatNotReady": "Side chat is waiting for this session to be ready. You can write a draft now; it will not be sent to the main task.",
+  "sideChatConnectionError": "Could not reach side chat. Your draft is kept here while the connection retries."
 }

@@ -126,6 +126,29 @@ function renderAttachmentDraft(text: string, attachments: UploadedFile[]) {
 }
 
 describe("MessageInput", () => {
+  it("opens the side panel from an accessible icon while the main draft and running task are untouched", () => {
+    const onOpenSideConversation = vi.fn();
+    const onStop = vi.fn();
+    const { composer, onSend } = renderMessageInput({
+      onOpenSideConversation,
+      sideConversationOpen: false,
+      isRunning: true,
+      isThinking: true,
+      onStop,
+    });
+    typeInComposer(composer, "main task draft");
+    const button = screen.getByRole("button", { name: "Side chat" });
+    expect(button.textContent).toBe("");
+    expect(button.getAttribute("aria-controls")).toBe(
+      "side-conversation-panel",
+    );
+    fireEvent.click(button);
+    expect(onOpenSideConversation).toHaveBeenCalledTimes(1);
+    expect(composer.textContent).toBe("main task draft");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onStop).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     localStorage.clear();
     vi.stubGlobal("matchMedia", () => ({

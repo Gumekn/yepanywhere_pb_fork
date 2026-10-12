@@ -860,12 +860,6 @@
   "gitStatusPreview": "预览",
   "gitStatusDiffOnly": "仅看 Diff",
   "gitStatusFullContext": "完整上下文",
-  "fabPlaceholder": "开始一个新会话...",
-  "fabGoToNewSession": "前往新建会话",
-  "fabContinueToSetup": "继续配置",
-  "fabContinueToSetupHint": "将跳转到新建会话页,可选择提供商、模型等设置",
-  "fabClose": "关闭",
-  "fabNewSession": "新建会话",
   "modelSwitchTitle": "切换模型",
   "modelSwitchLoadFailed": "加载模型失败",
   "modelSwitchChangeFailed": "切换模型失败",
@@ -1734,5 +1728,10 @@
   "sideChatMainIdle": "空闲",
   "sideChatHandoff": "来自旁路聊天：\n\n{content}",
   "sideChatAttachments": "旁路暂时仅支持文字。附件保留在主输入框中。",
-  "sideChatHistoricalEdit": "请先完成或取消历史消息编辑，再打开旁路。"
+  "sideChatHistoricalEdit": "请先完成或取消历史消息编辑，再打开旁路。",
+  "sideChatOpenHint": "打开独立会话框，与主任务并行聊天",
+  "sideChatChecking": "正在检查旁路聊天是否可用，你可以先输入草稿。",
+  "sideChatNeedsUpdate": "服务端需要更新后才能回复旁路消息。你可以先在这里写草稿，主任务继续运行。",
+  "sideChatNotReady": "旁路聊天正在等待当前会话就绪。你可以先写草稿，内容不会发送给主任务。",
+  "sideChatConnectionError": "暂时无法连接旁路聊天，正在重试。草稿会保留在这里。"
 }

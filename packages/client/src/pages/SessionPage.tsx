@@ -29,6 +29,7 @@ import { SessionInspector } from "../components/SessionInspector";
 import { SessionMenu } from "../components/SessionMenu";
 import { SessionSearchBar } from "../components/SessionSearchBar";
 import { SessionTitleGenerationStatus } from "../components/SessionTitleGenerationStatus";
+import { SideConversationButton } from "../components/SideConversationButton";
 import { SideConversationPanel } from "../components/SideConversationPanel";
 import { SessionMessagesSkeleton } from "../components/Skeleton";
 import { SubagentDetailProvider } from "../components/SubagentDetailProvider";
@@ -443,12 +444,18 @@ function SessionPageContent({
     initialBranchFocus.messageId,
   );
   const [sideVisible, setSideVisible] = useState(false);
+  const hasSideConversation =
+    effectiveProvider === "codex" || effectiveProvider === "pi";
   const side = useSideConversation(
     actualSessionId,
-    effectiveProvider === "codex" || effectiveProvider === "pi",
+    hasSideConversation,
     sideVisible,
   );
   const [isInspectorDrawerOpen, setInspectorDrawerOpen] = useState(false);
+  const openSideConversation = useCallback(() => {
+    setSideVisible(true);
+    setInspectorDrawerOpen(false);
+  }, []);
   const {
     isExpanded: isInspectorExpanded,
     setIsExpanded: setInspectorExpanded,
@@ -769,12 +776,12 @@ function SessionPageContent({
               ...group.commands.filter(
                 (command) => command !== "side" && command !== "btw",
               ),
-              ...(side.supported ? ["side", "btw"] : []),
+              ...(hasSideConversation ? ["side", "btw"] : []),
             ],
           },
     );
   }, [
-    side.supported,
+    hasSideConversation,
     allSlashCommands,
     codexSkills,
     effectiveProvider,
@@ -1093,14 +1100,17 @@ function SessionPageContent({
         );
         return;
       }
-      if (!side.supported) {
+      if (!hasSideConversation) {
         draftControlsRef.current?.restoreFromStorage();
         showToast(t("sideChatUnavailable"), "error");
         return;
       }
       setSideVisible(true);
       setInspectorDrawerOpen(false);
-      if (!sideCommand.text || (await side.send(sideCommand.text)))
+      if (
+        !sideCommand.text ||
+        (side.supported && (await side.send(sideCommand.text)))
+      )
         draftControlsRef.current?.clearDraft();
       else draftControlsRef.current?.restoreFromStorage();
       return;
@@ -2429,33 +2439,6 @@ function SessionPageContent({
               >
                 <SessionSearchIcon />
               </button>
-              {side.supported && (
-                <button
-                  type="button"
-                  className="session-inspector-toggle"
-                  aria-label={t("sideChatTitle")}
-                  title={t("sideChatTitle")}
-                  aria-expanded={sideVisible}
-                  onClick={() => {
-                    setSideVisible(!sideVisible);
-                    setInspectorDrawerOpen(false);
-                  }}
-                >
-                  <svg
-                    width="20"
-                    height="20"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M9 3h12v12H9zM3 9v12h12M12 7h6M12 11h4" />
-                  </svg>
-                </button>
-              )}
               {(!isWideScreen || !isInspectorExpanded || sideVisible) && (
                 <button
                   type="button"
@@ -2700,6 +2683,17 @@ function SessionPageContent({
                 />
               )}
 
+            {hasSideConversation &&
+              isAskUserQuestion &&
+              pendingInputRequest?.sessionId === actualSessionId && (
+                <div className="side-conversation-question-entry">
+                  <SideConversationButton
+                    onClick={openSideConversation}
+                    expanded={sideVisible}
+                  />
+                </div>
+              )}
+
             {/* Tool approval: show panel + always-visible toolbar */}
             {pendingInputRequest &&
               pendingInputRequest.sessionId === actualSessionId &&
@@ -2735,6 +2729,10 @@ function SessionPageContent({
                     isRunning={status.owner === "self"}
                     isThinking={processState === "in-turn"}
                     onStop={handleAbort}
+                    onOpenSideConversation={
+                      hasSideConversation ? openSideConversation : undefined
+                    }
+                    sideConversationOpen={sideVisible}
                     pendingApproval={
                       approvalCollapsed
                         ? {
@@ -2876,6 +2874,10 @@ function SessionPageContent({
                 isRunning={status.owner === "self"}
                 isThinking={processState === "in-turn"}
                 onStop={handleAbort}
+                onOpenSideConversation={
+                  hasSideConversation ? openSideConversation : undefined
+                }
+                sideConversationOpen={sideVisible}
                 draftKey={`draft-message-${sessionId}`}
                 onDraftControlsReady={handleDraftControlsReady}
                 collapsed={

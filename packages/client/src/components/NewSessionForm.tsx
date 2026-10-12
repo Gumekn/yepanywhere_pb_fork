@@ -54,6 +54,10 @@ import {
   resolveModelReasoningEffort,
 } from "../lib/codexReasoning";
 import { handleComposerSubmitKey } from "../lib/composerKeyboard";
+import {
+  clearLegacySessionPrefill,
+  getLegacySessionPrefill,
+} from "../lib/legacySessionPrefill";
 import { updateNewSessionLayout } from "../lib/newSessionLayout";
 import {
   getProviderPermissionModes,
@@ -74,7 +78,6 @@ import { CodexAccountSelect } from "./CodexAccountSelect";
 import { CodexUsageCard } from "./CodexUsageCard";
 import { ComposerAttachmentCard } from "./ComposerAttachmentCard";
 import { FilterDropdown, type FilterOption } from "./FilterDropdown";
-import { clearFabPrefill, getFabPrefill } from "./FloatingActionButton";
 import { NewSessionSetupSkeleton } from "./NewSessionSkeleton";
 import { PiGatewayKeySelect } from "./PiGatewayKeySelect";
 import { SlashCommandButton } from "./SlashCommandButton";
@@ -1108,12 +1111,12 @@ export function NewSessionForm({
     }
   }, [autoFocus]);
 
-  // Check for FAB pre-fill on mount (when coming from FloatingActionButton)
+  // Recover a pending draft handoff from clients with the retired floating composer.
   useEffect(() => {
-    const prefill = getFabPrefill();
+    const prefill = getLegacySessionPrefill();
     if (prefill) {
       setMessage(prefill);
-      clearFabPrefill();
+      clearLegacySessionPrefill();
       // Focus and move cursor to end
       if (textareaRef.current) {
         textareaRef.current.focus();

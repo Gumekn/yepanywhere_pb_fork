@@ -7,6 +7,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import { generateUUID } from "../lib/uuid";
 
+export type SideConversationAvailability =
+  | "checking"
+  | "ready"
+  | "not_ready"
+  | "unsupported"
+  | "connection_error";
+
 export function useSideConversation(
   sessionId: string,
   enabled: boolean,
@@ -14,6 +21,8 @@ export function useSideConversation(
 ) {
   const [conversation, setConversation] = useState<SideConversationSnapshot>();
   const [supported, setSupported] = useState(false);
+  const [availability, setAvailability] =
+    useState<SideConversationAvailability>("checking");
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const state = useRef<SideConversationSnapshot | undefined>(undefined);
@@ -35,6 +44,9 @@ export function useSideConversation(
   const accept = useCallback((response: SideConversationResponse) => {
     if (!mounted.current) return;
     setSupported(response.supported);
+    setAvailability(
+      response.supported ? "ready" : (response.reason ?? "unsupported"),
+    );
     if (!response.unchanged) {
       const next =
         response.conversation ??
@@ -67,8 +79,10 @@ export function useSideConversation(
         });
         if (!cancelled && epoch === revision.current) accept(result);
       } catch (err) {
-        if (!cancelled && epoch === revision.current)
+        if (!cancelled && epoch === revision.current) {
+          setAvailability("connection_error");
           setError(err instanceof Error ? err.message : "Connection lost");
+        }
       }
       probes++;
       if (!cancelled && (visible || (!state.current && probes < 6)))
@@ -115,7 +129,8 @@ export function useSideConversation(
 
   const send = useCallback(
     async (text: string, context: "snapshot" | "empty" = "snapshot") => {
-      if (mutating.current) return false;
+      if (mutating.current || !supported || availability !== "ready")
+        return false;
       let current = state.current;
       if (!current || current.status === "closed") {
         const result = await request({
@@ -145,7 +160,7 @@ export function useSideConversation(
       if (accepted) pendingSend.current = undefined;
       return Boolean(accepted);
     },
-    [request],
+    [request, supported, availability],
   );
 
   const close = useCallback(async () => {
@@ -170,6 +185,7 @@ export function useSideConversation(
   return {
     conversation,
     supported,
+    availability,
     error,
     busy,
     send,
