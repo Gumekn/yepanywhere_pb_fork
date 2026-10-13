@@ -927,8 +927,11 @@ export class CodexAppServerClient {
 
     this.process = child;
 
-    child.stdout?.on("data", (chunk: Buffer) => {
-      this.stdoutBuffer += chunk.toString("utf-8");
+    // Pipe chunks may split UTF-8 characters; decode across chunks before
+    // framing JSON lines (also used by the read-only history client).
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      this.stdoutBuffer += chunk;
       const lines = this.stdoutBuffer.split("\n");
       this.stdoutBuffer = lines.pop() ?? "";
       for (const raw of lines) {
@@ -938,8 +941,9 @@ export class CodexAppServerClient {
       }
     });
 
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const stderr = chunk.toString("utf-8").trim();
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      const stderr = chunk.trim();
       if (stderr) {
         this.stderrBuffer = `${this.stderrBuffer}${stderr}\n`.slice(
           -MAX_APP_SERVER_STDERR_LENGTH,
@@ -2037,8 +2041,9 @@ export class CodexProvider implements AgentProvider {
         );
       }, MODEL_LIST_TIMEOUT_MS);
 
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdoutBuffer += chunk.toString("utf-8");
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdoutBuffer += chunk;
         const lines = stdoutBuffer.split("\n");
         stdoutBuffer = lines.pop() ?? "";
         for (const raw of lines) {
@@ -2048,8 +2053,9 @@ export class CodexProvider implements AgentProvider {
         }
       });
 
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderrChunks.push(chunk.toString("utf-8"));
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderrChunks.push(chunk);
       });
 
       child.on("error", (error) => {
@@ -3667,6 +3673,14 @@ export class CodexProvider implements AgentProvider {
           : {}),
       });
       const activeEventIngress = eventIngress;
+      // Legacy projection consumes the raw notification. Deltas that lifecycle
+      // (or minimal) will not journal only need a thread id for the child-thread
+      // filter. Shadow and primary still serialize, because they project from
+      // the envelope. Full retention ignores the flag inside ingress.
+      const notificationIngestOptions =
+        projectionMode === "legacy"
+          ? { threadIdOnly: true as const }
+          : undefined;
       for (const update of startupRetryUpdates) {
         await activeEventIngress.ingestClientRetry({
           requestId: update.requestId,
@@ -3729,7 +3743,10 @@ export class CodexProvider implements AgentProvider {
               notification,
             );
           }
-          return await activeEventIngress.ingestNotification(notification);
+          return await activeEventIngress.ingestNotification(
+            notification,
+            notificationIngestOptions,
+          );
         },
       });
 
@@ -3823,7 +3840,10 @@ export class CodexProvider implements AgentProvider {
           if (appServer.isClosed) queue.close();
           const event =
             raw.canonicalEvent ??
-            (await activeEventIngress.ingestNotification(raw));
+            (await activeEventIngress.ingestNotification(
+              raw,
+              notificationIngestOptions,
+            ));
           if (event.threadId && event.threadId !== sessionId) continue;
           const notification =
             projectionMode === "primary"
@@ -4064,7 +4084,10 @@ export class CodexProvider implements AgentProvider {
           if (appServer.isClosed) queue.close();
           const canonicalEvent =
             rawNotification.canonicalEvent ??
-            (await activeEventIngress.ingestNotification(rawNotification));
+            (await activeEventIngress.ingestNotification(
+              rawNotification,
+              notificationIngestOptions,
+            ));
           const canonicalNotification =
             activeEventIngress.notificationFromEvent(canonicalEvent);
 

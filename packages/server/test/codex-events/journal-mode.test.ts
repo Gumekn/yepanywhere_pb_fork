@@ -144,6 +144,131 @@ describe("CodexEventIngress journal mode", () => {
     expect(journalled.map((event) => event.sequence)).toEqual([1, 2]);
   });
 
+  it("skips the payload walk for deltas that will not be journaled", async () => {
+    const store = new InMemoryCodexEventStore();
+    const ingress = await CodexEventIngress.create({
+      store,
+      runtime: CODEX_EVENT_RUNTIME_IDENTITY,
+      sessionId: "session-1",
+      journalMode: "lifecycle",
+    });
+    let walked = false;
+    const delta = await ingress.ingestNotification(
+      {
+        method: "turn/diff/updated",
+        emittedAtMs: 12,
+        params: {
+          thread: { id: "nested-thread" },
+          get blob() {
+            walked = true;
+            return "x".repeat(50_000);
+          },
+        },
+      },
+      { threadIdOnly: true },
+    );
+
+    expect(walked).toBe(false);
+    expect(delta.threadId).toBe("nested-thread");
+    expect(delta.sequence).toBe(0);
+    expect(delta.appServerEmittedAtMs).toBe(12);
+    expect(delta.payload.data).toBeNull();
+    await expect(store.replay({ sessionId: "session-1" })).resolves.toEqual([]);
+
+    const direct = await ingress.ingestNotification(
+      {
+        method: "item/agentMessage/delta",
+        params: {
+          threadId: "direct-thread",
+          thread: { id: "nested-thread" },
+          delta: "hello",
+        },
+      },
+      { threadIdOnly: true },
+    );
+    expect(direct.threadId).toBe("direct-thread");
+    expect(direct.sequence).toBe(0);
+  });
+
+  it("keeps dense journal sequences when thread-id deltas are dropped", async () => {
+    const store = new InMemoryCodexEventStore();
+    const ingress = await CodexEventIngress.create({
+      store,
+      runtime: CODEX_EVENT_RUNTIME_IDENTITY,
+      sessionId: "session-1",
+      journalMode: "lifecycle",
+    });
+
+    await ingress.ingestNotification(
+      notification("turn/started", { threadId: "thread-1", turnId: "turn-1" }),
+      { threadIdOnly: true },
+    );
+    await ingress.ingestNotification(
+      notification("item/agentMessage/delta", {
+        threadId: "thread-1",
+        delta: "a",
+      }),
+      { threadIdOnly: true },
+    );
+    const completed = await ingress.ingestNotification(
+      notification("turn/completed", {
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+      { threadIdOnly: true },
+    );
+
+    expect(completed.payload.data).toMatchObject({
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    const journalled = await store.replay({ sessionId: "session-1" });
+    expect(journalled.map((event) => event.method)).toEqual([
+      "turn/started",
+      "turn/completed",
+    ]);
+    expect(journalled.map((event) => event.sequence)).toEqual([1, 2]);
+    expect(journalled.map((event) => event.threadId)).toEqual([
+      "thread-1",
+      "thread-1",
+    ]);
+  });
+
+  it("still journals a delta when full retention is asked to skip the payload", async () => {
+    const store = new InMemoryCodexEventStore();
+    const ingress = await CodexEventIngress.create({
+      store,
+      runtime: CODEX_EVENT_RUNTIME_IDENTITY,
+      sessionId: "session-1",
+      journalMode: "full",
+    });
+    let walked = false;
+    const delta = await ingress.ingestNotification(
+      {
+        method: "item/agentMessage/delta",
+        params: {
+          threadId: "thread-1",
+          delta: "hello",
+          get blob() {
+            walked = true;
+            return "kept";
+          },
+        },
+      },
+      { threadIdOnly: true },
+    );
+
+    expect(walked).toBe(true);
+    expect(delta.sequence).toBe(1);
+    expect(ingress.notificationFromEvent(delta).params).toMatchObject({
+      delta: "hello",
+      blob: "kept",
+    });
+    await expect(
+      store.replay({ sessionId: "session-1" }),
+    ).resolves.toHaveLength(1);
+  });
+
   it("journals deltas when explicitly configured for full retention", async () => {
     const store = new InMemoryCodexEventStore();
     const ingress = await CodexEventIngress.create({

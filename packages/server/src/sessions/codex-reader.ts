@@ -251,6 +251,64 @@ interface CodexEntryRecord {
 }
 
 const inFlightCodexSummaryScans = new Map<string, Promise<CodexSummaryScan>>();
+
+/**
+ * Successful summary scans, keyed by rollout path and validated against
+ * `codexRolloutRevision` before reuse. A miss, a changed file, or a scan that
+ * loses the before/after revision race falls through to a full read.
+ */
+const CODEX_SUMMARY_SCAN_CACHE_MAX_ENTRIES = positiveEnvInt(
+  "YEP_CODEX_SUMMARY_SCAN_CACHE_ENTRIES",
+  32,
+);
+const codexSummaryScanCache = new Map<string, CodexSummaryScan>();
+let codexSummaryScanReads = 0;
+let codexSummaryScanAfterReadHook: (() => void | Promise<void>) | undefined;
+
+/** Test seam: runs after a summary walk and before the revision is committed. */
+export function setCodexSummaryScanAfterReadHookForTests(
+  hook: (() => void | Promise<void>) | undefined,
+): void {
+  codexSummaryScanAfterReadHook = hook;
+}
+
+/** Drops cached summary scans. Tests use this to isolate read counts. */
+export function resetCodexSummaryScanCache(): void {
+  codexSummaryScanCache.clear();
+  codexSummaryScanReads = 0;
+}
+
+/** How many times a summary scan actually walked a rollout. */
+export function codexSummaryScanReadCount(): number {
+  return codexSummaryScanReads;
+}
+
+function readCachedCodexSummaryScan(
+  filePath: string,
+  revisionKey: string,
+): CodexSummaryScan | undefined {
+  const cached = codexSummaryScanCache.get(filePath);
+  if (!cached || cached.revisionKey !== revisionKey) {
+    if (cached) codexSummaryScanCache.delete(filePath);
+    return undefined;
+  }
+  codexSummaryScanCache.delete(filePath);
+  codexSummaryScanCache.set(filePath, cached);
+  return cached;
+}
+
+function rememberCodexSummaryScan(
+  filePath: string,
+  scan: CodexSummaryScan,
+): void {
+  codexSummaryScanCache.delete(filePath);
+  codexSummaryScanCache.set(filePath, scan);
+  while (codexSummaryScanCache.size > CODEX_SUMMARY_SCAN_CACHE_MAX_ENTRIES) {
+    const oldest = codexSummaryScanCache.keys().next().value;
+    if (oldest === undefined) break;
+    codexSummaryScanCache.delete(oldest);
+  }
+}
 const CODEX_MAX_ADMISSION_BYTES = positiveEnvInt(
   "YEP_CODEX_ROLLOUT_ADMISSION_BYTES",
   512 * 1024 * 1024,
@@ -1132,6 +1190,15 @@ export class CodexSessionReader implements ISessionReader {
   private async scanCodexRolloutSummaryUnshared(
     filePath: string,
   ): Promise<CodexSummaryScan> {
+    const current = await stat(filePath);
+    const currentRevision = codexRolloutRevision(current);
+    const cached = readCachedCodexSummaryScan(filePath, currentRevision.key);
+    if (cached) {
+      // Parsed fields stay shared. `stats` is the stat that just matched the
+      // cached revision, so size and mtime agree with this observation.
+      return { ...cached, stats: current };
+    }
+
     return withCodexRolloutAdmission(filePath, async () => {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const before = await stat(filePath);
@@ -1141,10 +1208,17 @@ export class CodexSessionReader implements ISessionReader {
           before,
           revision.key,
         );
+        await codexSummaryScanAfterReadHook?.();
         const after = await stat(filePath);
         const afterRevision = codexRolloutRevision(after);
         if (sameCodexRolloutRevision(revision, afterRevision)) {
-          return { ...scan, stats: after, revisionKey: afterRevision.key };
+          const result = {
+            ...scan,
+            stats: after,
+            revisionKey: afterRevision.key,
+          };
+          rememberCodexSummaryScan(filePath, result);
+          return result;
         }
       }
 
@@ -1157,6 +1231,7 @@ export class CodexSessionReader implements ISessionReader {
     stats: Stats,
     revisionKey: string,
   ): Promise<CodexSummaryScan> {
+    codexSummaryScanReads += 1;
     const responseQuestions: SessionQuestion[] = [];
     const eventQuestions: SessionQuestion[] = [];
     const responseUserTurns: CodexUserTurnScan[] = [];

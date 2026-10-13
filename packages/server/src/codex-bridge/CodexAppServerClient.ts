@@ -59,9 +59,12 @@ export class CodexAppServerClient {
     });
     this.child = child;
 
-    child.stdout?.on("data", (chunk: Buffer) => this.consume(chunk));
-    child.stderr?.on("data", (chunk: Buffer) => {
-      this.stderrChunks.push(chunk.toString("utf-8"));
+    // Preserve UTF-8 characters split across OS pipe reads before JSON parsing.
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => this.consume(chunk));
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      this.stderrChunks.push(chunk);
       if (this.stderrChunks.length > 50) this.stderrChunks.shift();
     });
     child.on("error", (error) => this.fail(error.message));
@@ -123,8 +126,8 @@ export class CodexAppServerClient {
     forceKill.unref();
   }
 
-  private consume(chunk: Buffer): void {
-    this.buffer += chunk.toString("utf-8");
+  private consume(chunk: string): void {
+    this.buffer += chunk;
     const lines = this.buffer.split("\n");
     this.buffer = lines.pop() ?? "";
     for (const raw of lines) {

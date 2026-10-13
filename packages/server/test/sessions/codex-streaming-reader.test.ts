@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CodexSessionReader } from "../../src/sessions/codex-reader.js";
+import {
+  CodexSessionReader,
+  codexSummaryScanReadCount,
+  resetCodexSummaryScanCache,
+  setCodexSummaryScanAfterReadHookForTests,
+} from "../../src/sessions/codex-reader.js";
 import { invalidateCodexSessionManifest } from "../../src/sessions/codex-session-manifest.js";
 import { normalizeSession } from "../../src/sessions/normalization.js";
 
@@ -67,6 +72,8 @@ describe("Codex streaming reader windows", () => {
   });
 
   afterEach(async () => {
+    setCodexSummaryScanAfterReadHookForTests(undefined);
+    resetCodexSummaryScanCache();
     invalidateCodexSessionManifest(sessionsDir);
     await rm(sessionsDir, { recursive: true, force: true });
   });
@@ -239,5 +246,134 @@ describe("Codex streaming reader windows", () => {
       totalMessageCount: 24,
       returnedMessageCount: 3,
     });
+  });
+
+  it("reuses a summary scan while the rollout revision is unchanged", async () => {
+    resetCodexSummaryScanCache();
+    const reader = new CodexSessionReader({ sessionsDir });
+    const first = await reader.getSessionSummary(sessionId, projectId);
+    expect(codexSummaryScanReadCount()).toBe(1);
+    const second = await reader.getSessionSummary(sessionId, projectId);
+    expect(codexSummaryScanReadCount()).toBe(1);
+    expect(second).toEqual(first);
+
+    const loaded = await reader.getSession(sessionId, projectId, undefined, {
+      maxMessages: 5,
+    });
+    expect(codexSummaryScanReadCount()).toBe(1);
+    expect(loaded?.summary.messageCount).toBe(first?.messageCount);
+    const again = await reader.getSession(sessionId, projectId, undefined, {
+      maxMessages: 5,
+    });
+    expect(codexSummaryScanReadCount()).toBe(1);
+    expect(again?.pagination?.totalMessageCount).toBe(24);
+
+    const [parallelA, parallelB] = await Promise.all([
+      reader.getSessionSummary(sessionId, projectId),
+      reader.getSessionSummary(sessionId, projectId),
+    ]);
+    expect(codexSummaryScanReadCount()).toBe(1);
+    expect(parallelB).toEqual(parallelA);
+  });
+
+  it("does not cache a summary when the rollout changes during the scan", async () => {
+    resetCodexSummaryScanCache();
+    const reader = new CodexSessionReader({ sessionsDir });
+    const rolloutPath = join(sessionsDir, `rollout-${sessionId}.jsonl`);
+    let bumpMs = Date.now() + 60_000;
+    setCodexSummaryScanAfterReadHookForTests(async () => {
+      bumpMs += 1000;
+      const seconds = bumpMs / 1000;
+      await utimes(rolloutPath, seconds, seconds);
+    });
+
+    await expect(
+      reader.getSession(sessionId, projectId, undefined, { maxMessages: 5 }),
+    ).rejects.toThrow("ROLLOUT_CHANGED_DURING_SCAN");
+    expect(codexSummaryScanReadCount()).toBe(2);
+    setCodexSummaryScanAfterReadHookForTests(undefined);
+
+    const loaded = await reader.getSession(sessionId, projectId, undefined, {
+      maxMessages: 5,
+    });
+    expect(codexSummaryScanReadCount()).toBe(3);
+    expect(loaded?.pagination?.totalMessageCount).toBe(24);
+  });
+
+  it("rescans a summary after the rollout grows or is rolled back", async () => {
+    resetCodexSummaryScanCache();
+    const reader = new CodexSessionReader({ sessionsDir });
+    const before = await reader.getSessionSummary(sessionId, projectId);
+    expect(before?.messageCount).toBe(24);
+    expect(codexSummaryScanReadCount()).toBe(1);
+
+    const rolloutPath = join(sessionsDir, `rollout-${sessionId}.jsonl`);
+    await writeFile(
+      rolloutPath,
+      `${JSON.stringify(message("assistant", "new tail", 99))}\n`,
+      { encoding: "utf8", flag: "a" },
+    );
+    const after = await reader.getSessionSummary(sessionId, projectId);
+    expect(codexSummaryScanReadCount()).toBe(2);
+    expect(after?.messageCount).toBe(25);
+
+    const rolledBack = [
+      meta(sessionId),
+      { type: "turn_context", payload: { model: "gpt-6-astra" } },
+      message("user", "keep", 1),
+      message("assistant", "kept", 2),
+      message("user", "discard", 3),
+      { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      message("assistant", "discarded", 4),
+      {
+        type: "event_msg",
+        payload: { type: "thread_rolled_back", num_turns: 1 },
+      },
+    ];
+    await writeFile(
+      rolloutPath,
+      `${rolledBack.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    );
+    expect(await reader.getSessionSummary(sessionId, projectId)).toMatchObject({
+      model: "gpt-6-astra",
+    });
+    expect(codexSummaryScanReadCount()).toBe(3);
+  });
+
+  it("drops the oldest summary scan once the cache is full", async () => {
+    resetCodexSummaryScanCache();
+    const reader = new CodexSessionReader({ sessionsDir });
+    const ids = [sessionId];
+    for (let index = 1; index < 33; index += 1) {
+      const id = randomUUID();
+      ids.push(id);
+      await writeFile(
+        join(sessionsDir, `rollout-${id}.jsonl`),
+        `${[meta(id), message("user", `prompt ${index}`, 1)]
+          .map((entry) => JSON.stringify(entry))
+          .join("\n")}\n`,
+      );
+    }
+
+    for (const id of ids) {
+      expect(await reader.getSessionSummary(id, projectId)).toMatchObject({
+        id,
+      });
+    }
+    expect(codexSummaryScanReadCount()).toBe(33);
+
+    const newest = ids[32];
+    const oldest = ids[0];
+    if (!newest || !oldest) throw new Error("expected 33 cached sessions");
+
+    expect(await reader.getSessionSummary(newest, projectId)).toMatchObject({
+      id: newest,
+    });
+    expect(codexSummaryScanReadCount()).toBe(33);
+
+    expect(await reader.getSessionSummary(oldest, projectId)).toMatchObject({
+      id: oldest,
+    });
+    expect(codexSummaryScanReadCount()).toBe(34);
   });
 });
