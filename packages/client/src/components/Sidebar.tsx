@@ -111,14 +111,17 @@ function groupSessionsByProject(
 
   const groups = Array.from(groupsByProject.values());
 
-  // Keep pins first, then sort each project's sessions by activity. Group order
-  // itself stays in hook (insertion) order so an active session's project does
-  // not jump under the pointer during high-frequency live updates.
+  // Pins stay first within their project; project order follows the newest
+  // session timestamp even when the hook updates existing sessions in place.
   for (const group of groups) {
     group.sessions.sort(compareSessionsByPinAndUpdatedAt);
   }
 
-  return groups;
+  return groups.sort(
+    (a, b) =>
+      new Date(b.latestUpdatedAt).getTime() -
+      new Date(a.latestUpdatedAt).getTime(),
+  );
 }
 
 interface SidebarSessionItemProps {
@@ -431,8 +434,7 @@ export function Sidebar({
   // Sessions updated in the last 24 hours, plus every pinned session. An old
   // pin is elevated into its project's recent card instead of living in a
   // second, independently maintained collection.
-  // Keep the hook-provided order stable so high-frequency live updates don't
-  // move an active session back under the user's pointer while browsing.
+  // Ordering is applied after grouping by each project's latest activity.
   const recentSessions = useMemo(() => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const isWithinLastDay = (date: Date) => date.getTime() >= oneDayAgo;
@@ -445,7 +447,6 @@ export function Sidebar({
   }, [globalSessions]);
 
   // Older sessions (unpinned, non-archived, NOT in last 24 hours).
-  // Preserve stable ordering here for the same reason as recentSessions.
   const olderSessions = useMemo(() => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const isOlderThanOneDay = (date: Date) => date.getTime() < oneDayAgo;

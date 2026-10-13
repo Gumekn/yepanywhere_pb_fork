@@ -366,58 +366,108 @@ describe("Sidebar recent session browsing", () => {
     );
   });
 
-  it("keeps project order stable when an active session receives a newer timestamp", () => {
-    const projectB = createSession({
-      id: "session-b",
-      title: "Session B",
-      projectId: "project-b",
-      projectName: "Project B",
-      updatedAt: "2026-01-01T00:10:00.000Z",
-    });
-    const projectA = createSession({
-      id: "session-a",
-      title: "Session A",
-      projectId: "project-a",
-      projectName: "Project A",
-      updatedAt: "2026-01-01T00:01:00.000Z",
-      activity: "in-turn",
-    });
+  it.each(["recent", "older"])(
+    "moves the project with the latest session activity to the top of the %s section",
+    (section) => {
+      const now =
+        Date.now() - (section === "older" ? 2 * 24 * 60 * 60 * 1000 : 0);
+      const projectB = createSession({
+        id: "session-b",
+        title: "Session B",
+        projectId: "project-b",
+        projectName: "Project B",
+        updatedAt: new Date(now - 10 * 60_000).toISOString(),
+      });
+      const projectA = createSession({
+        id: "session-a",
+        title: "Session A",
+        projectId: "project-a",
+        projectName: "Project A",
+        updatedAt: new Date(now - 20 * 60_000).toISOString(),
+        activity: "in-turn",
+      });
 
-    const { container, rerender } = renderSidebar([projectB, projectA], {
-      currentSessionId: "session-a",
-    });
+      const { container, rerender } = renderSidebar([projectB, projectA], {
+        currentSessionId: "session-a",
+      });
 
-    expect(projectNameOrder(container)).toEqual(["Project B", "Project A"]);
+      expect(projectNameOrder(container)).toEqual(["Project B", "Project A"]);
+      fireEvent.click(screen.getByRole("button", { name: /Project A/i }));
+      expect(screen.queryByText("Session A")).toBeNull();
 
-    mockUseGlobalSessions.mockImplementation(() => ({
-      sessions: [
-        projectB,
-        {
-          ...projectA,
-          updatedAt: "2026-01-01T00:20:00.000Z",
-        },
-      ],
-      loading: false,
-      refetch: vi.fn(),
-    }));
+      mockUseGlobalSessions.mockImplementation(() => ({
+        sessions: [
+          projectB,
+          {
+            ...projectA,
+            updatedAt: new Date(now).toISOString(),
+          },
+        ],
+        loading: false,
+        refetch: vi.fn(),
+      }));
 
-    rerender(
-      <MemoryRouter>
-        <I18nProvider>
-          <ToastProvider>
-            <Sidebar
-              isOpen
-              onClose={vi.fn()}
-              onNavigate={vi.fn()}
-              isDesktop
-              currentSessionId="session-a"
-            />
-          </ToastProvider>
-        </I18nProvider>
-      </MemoryRouter>,
-    );
+      rerender(
+        <MemoryRouter>
+          <I18nProvider>
+            <ToastProvider>
+              <Sidebar
+                isOpen
+                onClose={vi.fn()}
+                onNavigate={vi.fn()}
+                isDesktop
+                currentSessionId="session-a"
+              />
+            </ToastProvider>
+          </I18nProvider>
+        </MemoryRouter>,
+      );
 
-    expect(projectNameOrder(container)).toEqual(["Project B", "Project A"]);
+      expect(projectNameOrder(container)).toEqual(["Project A", "Project B"]);
+      expect(screen.queryByText("Session A")).toBeNull();
+    },
+  );
+
+  it("orders projects by their newest session even when an older pin arrives first", () => {
+    const now = Date.now();
+    const { container } = renderSidebar([
+      createSession({
+        id: "pinned-c",
+        projectId: "project-c",
+        projectName: "Project C",
+        updatedAt: new Date(now - 2 * 24 * 60 * 60_000).toISOString(),
+        isStarred: true,
+      }),
+      createSession({
+        id: "pinned-a",
+        title: "Pinned A",
+        projectId: "project-a",
+        projectName: "Project A",
+        updatedAt: new Date(now - 7 * 24 * 60 * 60_000).toISOString(),
+        isStarred: true,
+      }),
+      createSession({
+        id: "session-b",
+        projectId: "project-b",
+        projectName: "Project B",
+        updatedAt: new Date(now - 10 * 60_000).toISOString(),
+      }),
+      createSession({
+        id: "latest-a",
+        title: "Latest A",
+        projectId: "project-a",
+        projectName: "Project A",
+        updatedAt: new Date(now).toISOString(),
+      }),
+    ]);
+
+    expect(projectNameOrder(container)).toEqual([
+      "Project A",
+      "Project B",
+      "Project C",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /Project A/i }));
+    expect(sessionTitleOrder(container)).toEqual(["Pinned A", "Latest A"]);
   });
 
   it("orders sessions within a project group by most recent activity", () => {
