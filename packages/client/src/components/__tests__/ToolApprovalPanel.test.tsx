@@ -87,6 +87,78 @@ async function renderKeyboardPanel(feedback?: string) {
 describe("ToolApprovalPanel", () => {
   afterEach(() => cleanup());
 
+  it.each(["Bash", "Edit"])(
+    "routes Cursor %s persistent approval to the native Always handler",
+    async (toolName) => {
+      const always = vi.fn(async () => undefined);
+      const acceptEdits = vi.fn(async () => undefined);
+      render(
+        <I18nProvider>
+          <ToolApprovalPanel
+            request={{
+              id: "cursor-permission",
+              sessionId: "cursor-permission",
+              type: "tool-approval",
+              prompt: "Allow?",
+              toolName,
+              toolInput: {
+                command: "node probe.js",
+                approvalKind: "acp_tool_call",
+                acpPermissionOptions: [
+                  { optionId: "native-always", kind: "allow_always" },
+                ],
+              },
+              timestamp: "2026-10-13T00:00:00Z",
+            }}
+            sessionId="cursor-permission"
+            onApprove={vi.fn()}
+            onDeny={vi.fn()}
+            onApproveAlways={always}
+            onApproveAcceptEdits={acceptEdits}
+          />
+        </I18nProvider>,
+      );
+      const button = screen.getByRole("button", { name: /Always allow/i });
+      await waitFor(() =>
+        expect((button as HTMLButtonElement).disabled).toBe(false),
+      );
+      fireEvent.click(button);
+      await waitFor(() => expect(always).toHaveBeenCalledOnce());
+      expect(acceptEdits).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not invent persistent edit approval when Cursor only offers once", () => {
+    render(
+      <I18nProvider>
+        <ToolApprovalPanel
+          request={{
+            id: "cursor-once",
+            sessionId: "cursor-once",
+            type: "tool-approval",
+            prompt: "Allow?",
+            toolName: "Edit",
+            toolInput: {
+              approvalKind: "acp_tool_call",
+              acpPermissionOptions: [{ optionId: "once", kind: "allow_once" }],
+            },
+            timestamp: "2026-10-13T00:00:00Z",
+          }}
+          sessionId="cursor-once"
+          onApprove={vi.fn()}
+          onDeny={vi.fn()}
+          onApproveAlways={vi.fn()}
+          onApproveAcceptEdits={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+    expect(
+      screen.queryByRole("button", {
+        name: /Always allow|don't ask|for session/i,
+      }),
+    ).toBeNull();
+  });
+
   it("does not approve or deny while typing in another editor", async () => {
     const { onApprove, onDeny } = await renderKeyboardPanel();
     for (const target of [
@@ -161,7 +233,11 @@ describe("ToolApprovalPanel", () => {
       type: "tool-approval",
       prompt: "Accept this plan?",
       toolName: "ExitPlanMode",
-      toolInput: { kind: "switch_mode", title: "ExitPlanMode" },
+      toolInput: {
+        kind: "switch_mode",
+        title: "ExitPlanMode",
+        plan: "Read the fixture, then propose the change.",
+      },
       timestamp: "2026-08-14T00:00:00.000Z",
     };
     render(
@@ -176,6 +252,9 @@ describe("ToolApprovalPanel", () => {
         />
       </I18nProvider>,
     );
+    expect(
+      screen.getByText("Read the fixture, then propose the change."),
+    ).toBeTruthy();
 
     const approve = screen.getByRole("button", {
       name: /Approve and keep current permission mode/i,

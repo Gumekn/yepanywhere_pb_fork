@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -16,6 +17,7 @@ const __dirname = path.dirname(__filename);
 
 const MAX_LOG_BYTES = 96 * 1024;
 const MAX_JOBS = 20;
+const JOB_START_GRACE_MS = 30_000;
 let deploymentStartInFlight = false;
 
 export type DeploymentActionId =
@@ -123,6 +125,7 @@ export interface StartDeploymentRequest {
 export interface DeploymentRestartTargets {
   server?: boolean;
   codexBridge?: boolean;
+  runtime?: boolean;
 }
 
 export interface DeployRoutesOptions {
@@ -289,11 +292,21 @@ function parseRestartTargets(value: unknown): DeploymentRestartTargets {
   if ("codexBridge" in input) {
     targets.codexBridge = input.codexBridge === true;
   }
+  if ("runtime" in input) {
+    if (typeof input.runtime !== "boolean") {
+      throw new Error("restartTargets.runtime must be a boolean.");
+    }
+    targets.runtime = input.runtime;
+  }
   return targets;
 }
 
 function hasRestartTargets(targets: DeploymentRestartTargets): boolean {
-  return targets.server === true || targets.codexBridge === true;
+  return (
+    targets.server === true ||
+    targets.codexBridge === true ||
+    targets.runtime === true
+  );
 }
 
 function buildServicesRestartArgs(targets: DeploymentRestartTargets): string[] {
@@ -310,6 +323,7 @@ function buildServicesRestartArgs(targets: DeploymentRestartTargets): string[] {
   if (targets.codexBridge) {
     args.push("--restart-codex-bridge");
   }
+  if (targets.runtime) args.push("--restart-runtime");
   return args;
 }
 
@@ -333,6 +347,7 @@ function appendOptionalRestartTargetArgs(
   if (targets.codexBridge) {
     args.push("--restart-codex-bridge");
   }
+  if (targets.runtime) args.push("--restart-runtime");
 }
 
 export function buildDeployArgs(input: StartDeploymentRequest): {
@@ -621,8 +636,13 @@ async function hydrateJob(
   let current = record;
   const log = await readLogTail(record.logPath);
   const result = await readJobResult(record.resultPath);
+  const stillStarting =
+    record.pid === undefined &&
+    Date.now() - Date.parse(record.startedAt) < JOB_START_GRACE_MS;
 
-  if (record.status === "running" && result) {
+  // The detached runner's result is authoritative, including records that an
+  // older server incorrectly marked failed before their PID was published.
+  if (result) {
     current = {
       ...record,
       status: result.exitCode === 0 ? "succeeded" : "failed",
@@ -631,8 +651,19 @@ async function hydrateJob(
       exitCode: result.exitCode,
       signal: result.signal,
     };
-    await writeJobRecord(dataDir, current);
-  } else if (record.status === "running" && !isProcessRunning(record.pid)) {
+    if (
+      record.status !== current.status ||
+      record.finishedAt !== current.finishedAt ||
+      record.exitCode !== current.exitCode ||
+      record.signal !== current.signal
+    ) {
+      await writeJobRecord(dataDir, current);
+    }
+  } else if (
+    record.status === "running" &&
+    !stillStarting &&
+    !isProcessRunning(record.pid)
+  ) {
     const now = new Date().toISOString();
     current = {
       ...record,
@@ -880,8 +911,6 @@ export async function startDeploymentJob(
       logPath,
       resultPath,
     };
-    await writeJobRecord(options?.dataDir, record);
-
     const logFd = fs.openSync(logPath, "a");
     const child = spawn(
       process.execPath,
@@ -898,26 +927,31 @@ export async function startDeploymentJob(
     );
     fs.closeSync(logFd);
 
-    const spawnedRecord: DeploymentJobRecord = {
-      ...record,
-      pid: child.pid,
-      updatedAt: new Date().toISOString(),
-    };
-    child.once("error", (err) => {
+    try {
+      await once(child, "spawn");
+    } catch (error) {
       const finishedAt = new Date().toISOString();
-      fs.appendFileSync(
-        logPath,
-        `\n[deploy-api] spawn error: ${err.message}\n`,
-      );
-      void writeJobRecord(options?.dataDir, {
-        ...spawnedRecord,
+      const message = error instanceof Error ? error.message : String(error);
+      fs.appendFileSync(logPath, `\n[deploy-api] spawn error: ${message}\n`);
+      const failedRecord: DeploymentJobRecord = {
+        ...record,
         status: "failed",
         exitCode: null,
         signal: null,
         updatedAt: finishedAt,
         finishedAt,
-      });
-    });
+      };
+      await writeJobRecord(options?.dataDir, failedRecord);
+      return hydrateJob(options?.dataDir, failedRecord);
+    }
+
+    // Publish once, with a known-live runner PID. Polling must never see a
+    // "running" record without its PID and write a false terminal state over it.
+    const spawnedRecord: DeploymentJobRecord = {
+      ...record,
+      pid: child.pid,
+      updatedAt: new Date().toISOString(),
+    };
 
     await writeJobRecord(options?.dataDir, spawnedRecord);
     await pruneOldJobs(options?.dataDir);

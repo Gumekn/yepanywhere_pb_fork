@@ -4,6 +4,33 @@ import {
   supportsToolApprovalFeedback,
 } from "../src/tool-approval.js";
 
+describe("ACP approval choices", () => {
+  it("exposes persistence only when the native request offers allow_always", () => {
+    expect(
+      getToolApprovalPersistence({
+        approvalKind: "acp_tool_call",
+        acpPermissionOptions: [
+          { optionId: "native-rule", kind: "allow_always" },
+        ],
+      }),
+    ).toEqual({ kind: "provider-policy", response: "approve_always" });
+    expect(
+      getToolApprovalPersistence({
+        approvalKind: "acp_tool_call",
+        acpPermissionOptions: [
+          { optionId: "allow-always", kind: "allow_once" },
+        ],
+      }),
+    ).toBeUndefined();
+    expect(
+      getToolApprovalPersistence({
+        approvalKind: "acp_tool_call",
+        acpPermissionOptions: [],
+      }),
+    ).toBeUndefined();
+  });
+});
+
 describe("tool approval projection", () => {
   it("keeps session and policy decisions semantically distinct", () => {
     expect(

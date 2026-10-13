@@ -10,6 +10,18 @@ function wrapper({ children }: { children: ReactNode }) {
 }
 
 describe("useProviderPermissionModeConfig", () => {
+  it("distinguishes Cursor session auto-approval from persistent native rules", () => {
+    const { result } = renderHook(
+      () => useProviderPermissionModeConfig("cursor"),
+      { wrapper },
+    );
+    expect(result.current.labels.bypassPermissions).toBe(
+      enMessages.modeCursorAllowAllLabel,
+    );
+    expect(result.current.descriptions.bypassPermissions).toBe(
+      enMessages.modeCursorAllowAllDescription,
+    );
+  });
   it("uses Pi-specific approval copy", () => {
     const pi = renderHook(() => useProviderPermissionModeConfig("pi"), {
       wrapper,

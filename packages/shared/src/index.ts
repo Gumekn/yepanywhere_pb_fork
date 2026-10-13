@@ -388,6 +388,8 @@ export type {
   UnifiedSession,
   ClaudeSessionFile,
   CodexSessionContent,
+  CursorSessionContent,
+  CursorTranscriptMessage,
   SessionLocation,
   SessionLocationSource,
   SessionLocateResponse,
@@ -873,3 +875,8 @@ export {
 } from "./session-file-operation.js";
 
 export * from "./side-conversations.js";
+export type {
+  CursorAccountResponse,
+  CursorModelConfigOption,
+  CursorUsage,
+} from "./cursor.js";

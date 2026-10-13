@@ -308,10 +308,17 @@ export interface SearchResponse {
   searchDurationMs: number;
 }
 
-export type ArchiveProvider = "claude" | "codex" | "pi" | "kimi" | "zcode";
+export type ArchiveProvider =
+  | "claude"
+  | "codex"
+  | "pi"
+  | "kimi"
+  | "zcode"
+  | "cursor";
 export type ArchiveReason = "manual" | "auto";
 
 export interface ArchivedFileRecord {
+  directory?: boolean;
   kind: "session" | "agent-session" | "agent-meta";
   originalPath: string;
   archivePath: string;
@@ -816,6 +823,7 @@ export interface StartDeploymentRequest {
 export interface DeploymentRestartTargets {
   server?: boolean;
   codexBridge?: boolean;
+  runtime?: boolean;
 }
 
 export interface GetVersionOptions {
@@ -987,6 +995,12 @@ export const api = {
 
   // Server info API (host/port binding for Local Access settings)
   getServerInfo: () => fetchJSON<ServerInfo>("/server-info"),
+  getCursorAccount: (options?: { fresh?: boolean }) =>
+    fetchJSON<import("@yep-anywhere/shared").CursorAccountResponse>(
+      options?.fresh
+        ? "/providers/cursor/account?fresh=1"
+        : "/providers/cursor/account",
+    ),
 
   getCodexUsage: (options?: { fresh?: boolean }) =>
     fetchJSON<CodexUsageResponse>(

@@ -1095,6 +1095,7 @@ async function startServer() {
     enableKimi: false,
     enablePi: false,
     enableZCode: false,
+    enableCursor: false,
   });
   const uploadRoutes = createUploadRoutes({
     scanner: uploadScanner,

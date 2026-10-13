@@ -10,6 +10,7 @@ import { api } from "../api/client";
 import { getMessageId } from "../lib/mergeMessages";
 import { type AgentTask, findAgentTasks } from "../lib/pendingTasks";
 import { normalizeProviderPermissionMode } from "../lib/providerPermissionModes";
+import { SeenActivityThrottle } from "../lib/seenActivityThrottle";
 import { extractSessionIdFromFileEvent } from "../lib/sessionFile";
 import { generateUUID } from "../lib/uuid";
 import type {
@@ -602,6 +603,20 @@ export function useSession(
   const [lastStreamActivityAt, setLastStreamActivityAt] = useState<
     string | null
   >(null);
+  // Live turn clock above; seen-marking is coalesced to about one second.
+  const [seenStreamActivityAt, setSeenStreamActivityAt] = useState<
+    string | null
+  >(null);
+  const seenActivityThrottleRef = useRef<SeenActivityThrottle | null>(null);
+  if (!seenActivityThrottleRef.current) {
+    seenActivityThrottleRef.current = new SeenActivityThrottle((iso) => {
+      setSeenStreamActivityAt(iso);
+    });
+  }
+  const noteStreamActivity = useCallback((iso: string) => {
+    setLastStreamActivityAt(iso);
+    seenActivityThrottleRef.current?.note(iso);
+  }, []);
 
   // Deferred messages queue - messages queued server-side waiting for agent's turn to end
   const [deferredMessages, setDeferredMessages] = useState<DeferredMessage[]>(
@@ -639,6 +654,8 @@ export function useSession(
     hasHandledConnectedEventRef.current = false;
     setError(null);
     setLastStreamActivityAt(null);
+    setSeenStreamActivityAt(null);
+    seenActivityThrottleRef.current?.reset();
     setIsCompacting(false);
     setTurnHealth(null);
     setHistoryRewriteRequest(null);
@@ -647,6 +664,12 @@ export function useSession(
       historyRewriteTimerRef.current = null;
     }
   }, [sessionId]);
+
+  useEffect(() => {
+    return () => {
+      seenActivityThrottleRef.current?.reset();
+    };
+  }, []);
 
   // Slash commands available for this session (from init message)
   const [slashCommands, setSlashCommands] = useState<string[]>([]);
@@ -1785,7 +1808,7 @@ export function useSession(
   const handleStreamMessage = useCallback(
     (data: { eventType: string; [key: string]: unknown }) => {
       if (data.eventType.startsWith("display-")) {
-        setLastStreamActivityAt(new Date().toISOString());
+        noteStreamActivity(new Date().toISOString());
         const { eventType, ...payload } = data;
         handleDisplayEvent(eventType, payload);
         const activity = payload.activity as
@@ -1810,7 +1833,7 @@ export function useSession(
         // Track stream activity for engagement tracking
         // This ensures sessions are marked as "seen" even when receiving
         // subagent content (which doesn't update parent session file mtime)
-        setLastStreamActivityAt(new Date().toISOString());
+        noteStreamActivity(new Date().toISOString());
 
         // The message event contains the SDK message directly
         // Pass through all fields without stripping
@@ -2275,6 +2298,7 @@ export function useSession(
       handleDisplayEvent,
       displayActivity?.state,
       fetchSessionMetadata,
+      noteStreamActivity,
     ],
   );
 
@@ -2401,7 +2425,8 @@ export function useSession(
     connected,
     sessionWatchConnected,
     sessionUpdatesConnected,
-    lastStreamActivityAt, // Last stream message timestamp for engagement tracking
+    lastStreamActivityAt, // Live stream clock for the turn timer
+    seenStreamActivityAt, // Coalesced clock for marking the session seen
     setStatus,
     setProcessState,
     setPermissionMode,

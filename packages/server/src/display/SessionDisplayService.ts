@@ -16,6 +16,7 @@ import type {
   RuntimeController,
   RuntimeSessionSubscription,
 } from "../runtime/types.js";
+import { cursorStreamError } from "../sdk/providers/cursor-errors.js";
 import {
   extractToolPaths,
   selectSessionDisplayToolMessages,
@@ -67,7 +68,7 @@ interface Entry {
   sourceSubscription?: RuntimeSessionSubscription | null;
   controller: AbortController;
   overlay: Map<string, RecordValue>;
-  bootstrapReplay: RecordValue[];
+  bootstrapReplay: Map<string, RecordValue>;
   controls: Map<string, unknown>;
   details: Map<string, Message>;
   detailBytes: number;
@@ -137,6 +138,7 @@ export function compactDisplayMessage(message: RecordValue): RecordValue {
     "codexTurnId",
     "codexThreadId",
     "turnId",
+    "cursorTurnIndex",
     "codexCorrelationKey",
     "clientUserMessageId",
     "codexMessagePhase",
@@ -325,7 +327,8 @@ export class SessionDisplayService {
       runtime: Pick<
         RuntimeController,
         "subscribeSession" | "getProcessForSession"
-      >;
+      > &
+        Partial<Pick<RuntimeController, "replay">>;
       pollMs?: number;
       retentionMs?: number;
       maxEntries?: number;
@@ -370,7 +373,7 @@ export class SessionDisplayService {
         listeners: new Set(),
         controller: new AbortController(),
         overlay: new Map(),
-        bootstrapReplay: [],
+        bootstrapReplay: new Map(),
         controls: new Map(),
         details: new Map(),
         detailBytes: 0,
@@ -402,6 +405,59 @@ export class SessionDisplayService {
       );
     }
     await this.refresh(entry, true);
+    if (
+      entry.provider === "cursor" &&
+      !entry.selection.branchId &&
+      this.options.runtime.replay
+    ) {
+      try {
+        const process = await this.options.runtime.getProcessForSession(
+          entry.selection.sessionId,
+        );
+        const records = await this.options.runtime.replay({
+          sessionId: entry.selection.sessionId,
+          ...(process ? { processId: process.id } : {}),
+        });
+        const failures = new Map<unknown, RecordValue>();
+        const terminals = new Map<unknown, RecordValue>();
+        for (const record of records) {
+          if (
+            record.type !== "message" ||
+            record.sessionId !== entry.selection.sessionId
+          )
+            continue;
+          const message = asRecord(record.data);
+          if (!message) continue;
+          this.rememberBody(entry, message);
+          const failure = cursorStreamError(messageContent(message));
+          if (failure || message.type === "error")
+            failures.set(message.turnId, {
+              ...message,
+              isReplay: false,
+              type: "error",
+              message: undefined,
+              content: undefined,
+              role: undefined,
+              error: failure?.message ?? message.error,
+            });
+          if (message.type === "result") terminals.set(message.turnId, message);
+        }
+        for (const [turnId, failure] of failures) {
+          this.event(entry, "message", failure);
+          const terminal = terminals.get(turnId);
+          if (terminal)
+            this.event(entry, "message", {
+              ...terminal,
+              isReplay: false,
+              turnStatus: "failed",
+              is_error: true,
+            });
+        }
+      } catch {
+        // Native history remains usable during a runtime/journal outage.
+        // On-demand reasoning can retry recovery when the connection returns.
+      }
+    }
     this.poll(entry);
     this.expire(entry);
   }
@@ -410,6 +466,22 @@ export class SessionDisplayService {
     const content = messageContent(message);
     if (!Array.isArray(content)) return message;
     const mergedBlocks = new Map<unknown, RecordValue>();
+    // ACP thought IDs only exist in the live stream. Keep their complete bodies
+    // under the same bounded budget as tool bodies, including after a turn ends.
+    const identity = message.codexCorrelationKey ?? message.uuid ?? message.id;
+    content.forEach((value, index) => {
+      const block = asRecord(value);
+      if (
+        typeof identity !== "string" ||
+        block?.type !== "thinking" ||
+        typeof block.thinking !== "string"
+      )
+        return;
+      this.cacheBody(entry, `thinking:${identity}:${index}`, {
+        ...message,
+        message: { role: "assistant", content: [block] },
+      } as Message);
+    });
     const blocks = content.filter((v) => {
       const b = asRecord(v);
       return b?.type === "tool_use" || b?.type === "tool_result";
@@ -436,20 +508,7 @@ export class SessionDisplayService {
           content: [mergedBlock],
         },
       } as Message;
-      const bytes = JSON.stringify(next).length * 2;
-      if (bytes > MAX_DETAILS_BYTES / 2) continue;
-      if (previous) {
-        entry.detailBytes -= JSON.stringify(previous).length * 2;
-        entry.details.delete(key);
-      }
-      entry.details.set(key, next);
-      entry.detailBytes += bytes;
-      while (entry.detailBytes > MAX_DETAILS_BYTES) {
-        const first = entry.details.entries().next().value;
-        if (!first) break;
-        entry.detailBytes -= JSON.stringify(first[1]).length * 2;
-        entry.details.delete(first[0]);
-      }
+      this.cacheBody(entry, key, next);
     }
     // A returning reader may only have the invocation in subscription replay,
     // while persisted history still lacks the running command. Hydrate live
@@ -461,6 +520,24 @@ export class SessionDisplayService {
         content: content.map((block) => mergedBlocks.get(block) ?? block),
       },
     };
+  }
+
+  private cacheBody(entry: Entry, key: string, message: Message): void {
+    const bytes = JSON.stringify(message).length * 2;
+    if (bytes > MAX_DETAILS_BYTES / 2) return;
+    const previous = entry.details.get(key);
+    if (previous) {
+      entry.detailBytes -= JSON.stringify(previous).length * 2;
+      entry.details.delete(key);
+    }
+    entry.details.set(key, message);
+    entry.detailBytes += bytes;
+    while (entry.detailBytes > MAX_DETAILS_BYTES) {
+      const first = entry.details.entries().next().value;
+      if (!first) break;
+      entry.detailBytes -= JSON.stringify(first[1]).length * 2;
+      entry.details.delete(first[0]);
+    }
   }
 
   private stopStreaming(
@@ -533,8 +610,18 @@ export class SessionDisplayService {
         return;
       const remembered = this.rememberBody(entry, message);
       if (message.isReplay === true) {
-        if (!entry.model && entry.bootstrapReplay.length < 500)
-          entry.bootstrapReplay.push(compactDisplayMessage(remembered));
+        if (!entry.model) {
+          const key = String(
+            message.uuid ??
+              message.id ??
+              `${message.type}:${message.turnId ?? entry.bootstrapReplay.size}`,
+          );
+          entry.bootstrapReplay.set(key, compactDisplayMessage(remembered));
+          if (entry.bootstrapReplay.size > 500) {
+            const first = entry.bootstrapReplay.keys().next().value;
+            if (first) entry.bootstrapReplay.delete(first);
+          }
+        }
         return;
       }
       if (
@@ -847,13 +934,40 @@ export class SessionDisplayService {
       if (!force && stamp === entry.stamp) return;
       const page = await source.read(entry.selection);
       if (entry.controller.signal.aborted) return;
+      if (page.provider === "cursor") {
+        // The CLI does not persist its error-text chunks to native history.
+        // Recover both new typed failures and older wrongly-completed turns.
+        const failedTurns = new Set<unknown>();
+        for (const [id, message] of entry.bootstrapReplay) {
+          const failure = cursorStreamError(messageContent(message));
+          if (message.type !== "error" && !failure) continue;
+          failedTurns.add(message.turnId);
+          entry.overlay.set(id, {
+            ...message,
+            type: "error",
+            message: undefined,
+            content: undefined,
+            role: undefined,
+            error: failure?.message ?? message.error,
+            errorCode: failure?.code ?? message.errorCode,
+          });
+        }
+        for (const [id, message] of entry.bootstrapReplay) {
+          if (message.type === "result" && failedTurns.has(message.turnId))
+            entry.overlay.set(id, {
+              ...message,
+              turnStatus: "failed",
+              is_error: true,
+            });
+        }
+      }
       this.acknowledgePersisted(entry, page);
       const model = new SessionDisplayReducer(entry.view, page.provider);
       model.restore(page.messages, page.turnStatuses);
       if (!page.messages.length)
-        for (const message of entry.bootstrapReplay)
+        for (const message of entry.bootstrapReplay.values())
           model.message(message, true);
-      entry.bootstrapReplay = [];
+      entry.bootstrapReplay.clear();
       model.setRuntime(page.activity);
       for (const message of entry.overlay.values()) {
         if (message.subtype === "turn_complete") continue;
@@ -964,6 +1078,27 @@ export class SessionDisplayService {
               })
               .join("")
           : "";
+    const cursorTurns = new Map<number, { hasPrompt: boolean; text: string }>();
+    const completedCursorTurns = new Set<number>();
+    if (page.provider === "cursor") {
+      for (const message of entry.overlay.values()) {
+        if (
+          message.type === "result" &&
+          typeof message.cursorTurnIndex === "number"
+        )
+          completedCursorTurns.add(message.cursorTurnIndex);
+      }
+      for (const message of page.messages) {
+        const index = message.cursorTurnIndex;
+        if (typeof index !== "number") continue;
+        const turn = cursorTurns.get(index) ?? { hasPrompt: false, text: "" };
+        const content = messageContent(message);
+        if (message.type === "user" && typeof content === "string")
+          turn.hasPrompt = true;
+        if (message.type === "assistant") turn.text += text(content);
+        cursorTurns.set(index, turn);
+      }
+    }
     for (const message of page.messages) {
       const nativeKey = nativeIdentity(message);
       if (nativeKey) nativeItems.add(nativeKey);
@@ -1042,6 +1177,32 @@ export class SessionDisplayService {
       const tools = blocks.filter(
         (block) => block?.type === "tool_use" || block?.type === "tool_result",
       );
+      // Cursor persists content hashes while ACP chunks have local UUIDs.
+      // Correlate within the native turn ordinal; matching an older turn's
+      // identical reply must never erase output from a new turn.
+      const cursorTurn =
+        typeof message.cursorTurnIndex === "number"
+          ? cursorTurns.get(message.cursorTurnIndex)
+          : undefined;
+      if (cursorTurn?.hasPrompt && !tools.length) {
+        const body = text(content);
+        const settledThinking =
+          message.type === "assistant" &&
+          !body &&
+          cursorTurn.text &&
+          completedCursorTurns.has(message.cursorTurnIndex as number) &&
+          blocks.every((block) => block?.type === "thinking");
+        if (
+          message.type === "user" ||
+          settledThinking ||
+          (message.type === "assistant" &&
+            body &&
+            cursorTurn.text.includes(body))
+        ) {
+          entry.overlay.delete(key);
+          continue;
+        }
+      }
       // A later committed item can replace an abandoned sampling attempt while
       // the turn keeps running. Wait for that specific replacement in history;
       // until then retain the partial text with its streaming indicator stopped.
@@ -1398,6 +1559,49 @@ export class SessionDisplayService {
   }
 
   async reasoning(selection: DisplaySelection, id: string): Promise<string> {
+    const entry = await this.get(selection);
+    const cached = () => {
+      const content = messageContent(entry.details.get(id) ?? {});
+      const block = Array.isArray(content) ? asRecord(content[0]) : undefined;
+      return block?.type === "thinking" && typeof block.thinking === "string"
+        ? block.thinking
+        : undefined;
+    };
+    const body = cached();
+    if (body !== undefined) return body;
+    // Cursor persists different IDs and may encrypt reasoning in its native
+    // store. The retained runtime journal is authoritative for live-only IDs.
+    if (
+      entry.provider === "cursor" &&
+      !selection.branchId &&
+      this.options.runtime.replay
+    ) {
+      const process = await this.options.runtime.getProcessForSession(
+        selection.sessionId,
+      );
+      const records = await this.options.runtime.replay({
+        sessionId: selection.sessionId,
+        ...(process ? { processId: process.id } : {}),
+      });
+      for (const record of records) {
+        if (
+          record.type !== "message" ||
+          record.sessionId !== selection.sessionId
+        )
+          continue;
+        const message = asRecord(record.data);
+        const identity =
+          message?.codexCorrelationKey ?? message?.uuid ?? message?.id;
+        if (
+          message &&
+          typeof identity === "string" &&
+          id.startsWith(`thinking:${identity}:`)
+        )
+          this.rememberBody(entry, message);
+      }
+      const replayed = cached();
+      if (replayed !== undefined) return replayed;
+    }
     const read = this.requireSource().reasoning;
     if (!read) throw new Error("Reasoning detail is unavailable");
     return read(selection, id);

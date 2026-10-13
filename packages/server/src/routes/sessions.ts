@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { SideConversationRequestSchema } from "@yep-anywhere/shared";
 import {
   ALL_PERMISSION_MODES,
@@ -61,6 +61,7 @@ import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
+import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import { canonicalizeProjectPath, encodeProjectId } from "../projects/paths.js";
@@ -198,6 +199,7 @@ export interface SessionsDeps {
   piReaderFactory?: (projectPath: string) => PiSessionReader;
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiScanner?: KimiSessionScanner;
+  cursorScanner?: CursorSessionScanner;
   kimiSessionsDir?: string;
   /** Optional shared Kimi reader factory for cross-provider session lookups */
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
@@ -751,13 +753,15 @@ function emitArchiveFileEvents(
   if (!deps.eventBus) return;
 
   const providerRoot =
-    record.provider === "codex"
-      ? deps.codexSessionsDir
-      : record.provider === "pi"
-        ? deps.piSessionsDir
-        : record.provider === "kimi"
-          ? deps.kimiSessionsDir
-          : deps.claudeProjectsDir;
+    record.provider === "cursor"
+      ? dirname(record.files[0]?.originalPath ?? "")
+      : record.provider === "codex"
+        ? deps.codexSessionsDir
+        : record.provider === "pi"
+          ? deps.piSessionsDir
+          : record.provider === "kimi"
+            ? deps.kimiSessionsDir
+            : deps.claudeProjectsDir;
   if (!providerRoot) return;
 
   for (const file of record.files) {
@@ -765,8 +769,15 @@ function emitArchiveFileEvents(
     deps.eventBus.emit({
       type: "file-change",
       provider: record.provider,
-      path: file.originalPath,
-      relativePath: relative(providerRoot, file.originalPath),
+      path: file.directory
+        ? join(file.originalPath, "store.db")
+        : file.originalPath,
+      relativePath: relative(
+        providerRoot,
+        file.directory
+          ? join(file.originalPath, "store.db")
+          : file.originalPath,
+      ),
       changeType,
       timestamp: new Date().toISOString(),
       fileType: "session",
@@ -2975,6 +2986,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         });
         deps.scanner.invalidateCache();
         deps.codexScanner?.invalidateCache();
+        deps.cursorScanner?.invalidateCache();
         emitArchiveFileEvents(deps, record, "delete");
         archiveResult = { physical: true, action: "archive", record };
       } catch (error) {
@@ -3004,6 +3016,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           await deps.sessionArchiveService.restoreSession(sessionId);
         deps.scanner.invalidateCache();
         deps.codexScanner?.invalidateCache();
+        deps.cursorScanner?.invalidateCache();
         emitArchiveFileEvents(deps, record, "create");
         archiveResult = { physical: true, action: "restore", record };
       } catch (error) {

@@ -903,6 +903,9 @@ function nativeDecisionDescriptor(
     return { kind: "acceptForSession", scope: "session" };
   }
   const persistence = getToolApprovalPersistence(request.toolInput);
+  if (persistence?.kind === "provider-policy") {
+    return { kind: "allow_always", scope: "policy" };
+  }
   if (persistence?.kind === "command-policy") {
     return { kind: "acceptWithExecpolicyAmendment", scope: "policy" };
   }

@@ -5,6 +5,16 @@ import {
 } from "../providerPermissionModes";
 
 describe("provider permission modes", () => {
+  it("offers explicit session auto-approval for Cursor while defaulting to asks", () => {
+    expect(getProviderPermissionModes("cursor")).toEqual([
+      "default",
+      "plan",
+      "bypassPermissions",
+    ]);
+    expect(normalizeProviderPermissionMode("cursor", undefined)).toBe(
+      "default",
+    );
+  });
   it("keeps all native Claude permission modes", () => {
     expect(getProviderPermissionModes("claude")).toEqual([
       "auto",

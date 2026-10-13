@@ -17,27 +17,18 @@ import {
 import { api, isQueuedResumeSessionResponse } from "../api/client";
 import { ExpandableSessionTitle } from "../components/ExpandableSessionTitle";
 import { GoalModal } from "../components/GoalModal";
-import { MessageInput, type UploadProgress } from "../components/MessageInput";
-import { MessageInputToolbar } from "../components/MessageInputToolbar";
-import { MessageList } from "../components/MessageList";
+import type { UploadProgress } from "../components/MessageInput";
 import { ModelSwitchModal } from "../components/ModelSwitchModal";
 import { PinIcon } from "../components/PinIcon";
 import { ProcessInfoModal } from "../components/ProcessInfoModal";
-import { QuestionAnswerPanel } from "../components/QuestionAnswerPanel";
 import { RemoteProjectIcon } from "../components/RemoteProjectIcon";
 import { SessionInspector } from "../components/SessionInspector";
 import { SessionMenu } from "../components/SessionMenu";
 import { SessionSearchBar } from "../components/SessionSearchBar";
 import { SessionTitleGenerationStatus } from "../components/SessionTitleGenerationStatus";
-import { SideConversationButton } from "../components/SideConversationButton";
 import { SideConversationPanel } from "../components/SideConversationPanel";
-import { SessionMessagesSkeleton } from "../components/Skeleton";
 import { SubagentDetailProvider } from "../components/SubagentDetailProvider";
-import { ToolApprovalPanel } from "../components/ToolApprovalPanel";
 import { TranscriptRendererProvider } from "../components/TranscriptRendererProvider";
-import { ProjectedToolStepRow } from "../components/blocks/ProjectedToolGroupRow";
-import { AgentContentProvider } from "../contexts/AgentContentContext";
-import { SessionMetadataProvider } from "../contexts/SessionMetadataContext";
 import {
   StreamingMarkdownProvider,
   useStreamingMarkdownContext,
@@ -111,6 +102,7 @@ import {
 import { generateUUID } from "../lib/uuid";
 import type { Message, Session, SessionNavigationState } from "../types";
 import { getSessionDisplayTitle } from "../utils";
+import { SessionComposer, SessionTranscript } from "./SessionStreamPanes";
 
 export function SessionPage() {
   const { projectId, sessionId } = useParams<{
@@ -212,6 +204,8 @@ function getApprovalAgentName(
       return "Kimi";
     case "zcode":
       return "ZCode";
+    case "cursor":
+      return "Cursor";
     default:
       return "Claude";
   }
@@ -261,6 +255,16 @@ function hasBranchChoices(session: Session | null | undefined): boolean {
         (session?.provider !== "codex" || branch.sessionId === session.id),
     ) ?? false
   );
+}
+
+function useStableCallback<Args extends unknown[], Result>(
+  callback: (...args: Args) => Result,
+): (...args: Args) => Result {
+  const callbackRef = useRef(callback);
+  useEffect(() => {
+    callbackRef.current = callback;
+  });
+  return useCallback((...args: Args) => callbackRef.current(...args), []);
 }
 
 function SessionPageContent({
@@ -333,6 +337,7 @@ function SessionPageContent({
     connected,
     sessionUpdatesConnected,
     lastStreamActivityAt,
+    seenStreamActivityAt,
     setStatus,
     setProcessState,
     setPermissionMode,
@@ -1005,7 +1010,7 @@ function SessionPageContent({
   // unread again via updatedAt.
   //
   // We use two timestamps:
-  // - activityAt: max(session summary update, SSE activity) - triggers the mark-seen action
+  // - activityAt: max(session summary update, coalesced stream activity) - triggers the mark-seen action
   // - updatedAt: latest visible session activity - the timestamp we record
   //
   // This separation prevents a race condition where SSE timestamps (client clock)
@@ -1013,14 +1018,15 @@ function SessionPageContent({
   // never become unread again after viewing.
   const sessionUpdatedAt = session?.updatedAt ?? null;
   const activityAt = useMemo(() => {
-    if (!sessionUpdatedAt && !lastStreamActivityAt) return null;
-    if (!sessionUpdatedAt) return lastStreamActivityAt;
-    if (!lastStreamActivityAt) return sessionUpdatedAt;
-    // Return the more recent timestamp
-    return sessionUpdatedAt > lastStreamActivityAt
+    if (!sessionUpdatedAt && !seenStreamActivityAt) return null;
+    if (!sessionUpdatedAt) return seenStreamActivityAt;
+    if (!seenStreamActivityAt) return sessionUpdatedAt;
+    // Return the more recent timestamp. Stream ticks are coalesced so this
+    // trigger moves at most about once a second.
+    return sessionUpdatedAt > seenStreamActivityAt
       ? sessionUpdatedAt
-      : lastStreamActivityAt;
-  }, [sessionUpdatedAt, lastStreamActivityAt]);
+      : seenStreamActivityAt;
+  }, [sessionUpdatedAt, seenStreamActivityAt]);
   useEngagementTracking({
     sessionId,
     activityAt,
@@ -1934,6 +1940,19 @@ function SessionPageContent({
     [setAttachments],
   );
 
+  const restoreAttachment = useCallback(
+    (file: UploadedFile) => {
+      setAttachments((prev) =>
+        [...prev.filter((item) => item.id !== file.id), file].sort(
+          (left, right) =>
+            attachmentOrderRef.current.indexOf(left.id) -
+            attachmentOrderRef.current.indexOf(right.id),
+        ),
+      );
+    },
+    [setAttachments],
+  );
+
   // Check if pending request is an AskUserQuestion
   const isAskUserQuestion = pendingInputRequest?.toolName === "AskUserQuestion";
   const isPersistedInputRequest = pendingInputRequest?.source === "persisted";
@@ -2203,6 +2222,10 @@ function SessionPageContent({
       showToast(msg, "error");
     }
   }, [displayTitle, showToast, t]);
+
+  const sendMessage = useStableCallback(handleSend);
+  const queueMessage = useStableCallback(handleQueue);
+  const abortTurn = useStableCallback(handleAbort);
 
   if (error)
     return (
@@ -2564,357 +2587,114 @@ function SessionPageContent({
           </div>
         )}
 
-        <main className="session-messages">
-          {loading ? (
-            <SessionMessagesSkeleton />
-          ) : (
-            <SessionMetadataProvider
-              projectId={projectId}
-              projectPath={project?.path ?? null}
-              sessionId={actualSessionId}
-            >
-              <AgentContentProvider
-                agentContent={agentContent}
-                setAgentContent={setAgentContent}
-                toolUseToAgent={toolUseToAgent}
-                toolUseToAgentIds={toolUseToAgentIds}
-                projectId={projectId}
-                sessionId={sessionId}
-              >
-                <>
-                  <MessageList
-                    messages={messages}
-                    preprocessedItems={renderItems}
-                    provider={session?.provider}
-                    isProcessing={
-                      status.owner === "self" && processState === "in-turn"
-                    }
-                    lastActivityAt={lastStreamActivityAt}
-                    isCompacting={isCompacting || isStartingCodexCompaction}
-                    scrollTrigger={scrollTrigger + activeWindowTrimRevision}
-                    pendingMessages={pendingMessages}
-                    deferredMessages={deferredMessages}
-                    onCancelDeferred={(tempId) =>
-                      api.cancelDeferredMessage(sessionId, tempId)
-                    }
-                    markdownAugments={markdownAugments}
-                    activeToolApproval={activeToolApproval}
-                    hasOlderMessages={
-                      displayPage
-                        ? Boolean(displayPage.nextCursor)
-                        : pagination?.hasOlderMessages
-                    }
-                    hasNewerMessages={pagination?.hasNewerMessages}
-                    loadingOlder={loadingOlder}
-                    loadingNewer={loadingNewer}
-                    loadingTargetMessage={loadingTargetMessage}
-                    onLoadOlderMessages={loadOlderMessages}
-                    onLoadNewerMessages={loadNewerMessages}
-                    onLoadTargetMessage={loadTargetMessageWindow}
-                    onFollowingBottomChange={updateActiveWindowFollowingBottom}
-                    onEditUserPrompt={
-                      !isViewingHistoricalBranch &&
-                      supportsHistoricalMessageEditing(session?.provider)
-                        ? handleEditUserPrompt
-                        : undefined
-                    }
-                    onSelectBranch={handleSelectBranch}
-                    focusBranchId={pendingBranchFocusId}
-                    onBranchFocused={handleBranchFocused}
-                    targetMessageId={targetMessageId}
-                    onTargetFocused={handleTargetFocused}
-                    transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
-                  />
-                  {displayActivity && (
-                    <div className="display-tool-group-state" role="status">
-                      {!sessionUpdatesConnected
-                        ? t("sessionDisplaySyncing")
-                        : displayActivity.state === "finishing"
-                          ? t("sessionDisplayFinishing")
-                          : displayActivity.state === "interrupted"
-                            ? t("sessionDisplayInterrupted")
-                            : displayActivity.state === "failed"
-                              ? t("sessionDisplayFailed")
-                              : displayActivity.state === "unknown" &&
-                                  displayActivity.runningCount > 0
-                                ? t("sessionDisplayUnknown")
-                                : null}
-                    </div>
-                  )}
-                  {displayActivity && displayActivity.tools.length > 0 && (
-                    <div className="display-current-activity">
-                      <div className="display-tool-group-state">
-                        {t("sessionDisplayPreviousTools")}
-                      </div>
-                      {displayActivity.tools.map((step) => (
-                        <ProjectedToolStepRow
-                          key={`${displayPage?.revision}:${step.id}`}
-                          step={step}
-                          projectId={projectId}
-                          sessionId={sessionId}
-                          branchId={selectedBranchId}
-                          sessionProvider={session?.provider}
-                        />
-                      ))}
-                    </div>
-                  )}
-                </>
-              </AgentContentProvider>
-            </SessionMetadataProvider>
-          )}
-        </main>
-
-        <footer className="session-input">
-          <div
-            className={`session-connection-bar session-connection-${sessionConnectionStatus}`}
-          />
-          <div className="session-input-inner">
-            {/* User question panel */}
-            {pendingInputRequest &&
-              pendingInputRequest.sessionId === actualSessionId &&
-              isAskUserQuestion && (
-                <QuestionAnswerPanel
-                  key={pendingInputRequest.id}
-                  request={pendingInputRequest}
-                  sessionId={actualSessionId}
-                  onSubmit={handleQuestionSubmit}
-                  onDeny={handleDeny}
-                  readOnly={isPersistedInputRequest}
-                />
-              )}
-
-            {hasSideConversation &&
-              isAskUserQuestion &&
-              pendingInputRequest?.sessionId === actualSessionId && (
-                <div className="side-conversation-question-entry">
-                  <SideConversationButton
-                    onClick={openSideConversation}
-                    expanded={sideVisible}
-                  />
-                </div>
-              )}
-
-            {/* Tool approval: show panel + always-visible toolbar */}
-            {pendingInputRequest &&
-              pendingInputRequest.sessionId === actualSessionId &&
-              !isAskUserQuestion && (
-                <>
-                  <ToolApprovalPanel
-                    request={pendingInputRequest}
-                    sessionId={actualSessionId}
-                    agentName={approvalAgentName}
-                    onApprove={handleApprove}
-                    onDeny={handleDeny}
-                    onApproveAcceptEdits={handleApproveAcceptEdits}
-                    onApproveForSession={handleApproveForSession}
-                    onApproveStrictAutoReview={handleApproveStrictAutoReview}
-                    onApproveAlways={handleApproveAlways}
-                    onDenyWithFeedback={handleDenyWithFeedback}
-                    preserveModeOnPlanApproval={effectiveProvider === "kimi"}
-                    collapsed={approvalCollapsed}
-                    onCollapsedChange={setApprovalCollapsed}
-                  />
-                  <MessageInputToolbar
-                    mode={permissionMode}
-                    onModeChange={setPermissionMode}
-                    isHeld={holdModeEnabled ? isHeld : undefined}
-                    onHoldChange={holdModeEnabled ? setHold : undefined}
-                    supportsPermissionMode={supportsPermissionMode}
-                    provider={effectiveProvider}
-                    permissionModes={permissionModes}
-                    supportsThinkingToggle={supportsThinkingToggle}
-                    contextUsage={session?.contextUsage}
-                    projectId={projectId}
-                    sessionId={actualSessionId}
-                    isRunning={status.owner === "self"}
-                    isThinking={processState === "in-turn"}
-                    onStop={handleAbort}
-                    onOpenSideConversation={
-                      hasSideConversation ? openSideConversation : undefined
-                    }
-                    sideConversationOpen={sideVisible}
-                    pendingApproval={
-                      approvalCollapsed
-                        ? {
-                            type: "tool-approval",
-                            onExpand: () => setApprovalCollapsed(false),
-                          }
-                        : undefined
-                    }
-                  />
-                </>
-              )}
-
-            {/* Bridge-reported turn health: retry backoff / failed turn */}
-            {turnHealth?.retryStatus && processState === "in-turn" && (
-              <div
-                className="turn-health-banner turn-health-banner-retry"
-                data-testid="turn-health-retry"
-              >
-                <span className="turn-health-banner-text">
-                  {typeof turnHealth.retryStatus.attempt === "number" &&
-                  turnHealth.retryStatus.attempt > 0
-                    ? t("statusBadgeRetryingAttempt", {
-                        attempt: String(turnHealth.retryStatus.attempt),
-                      })
-                    : t("statusBadgeRetrying")}
-                  {turnHealth.retryStatus.message
-                    ? ` — ${turnHealth.retryStatus.message}`
-                    : ""}
-                </span>
-                {retryActionLink && (
-                  <a
-                    className="turn-health-banner-action"
-                    href={retryActionLink}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {turnHealth.retryStatus.actionLabel ?? retryActionLink}
-                  </a>
-                )}
-              </div>
-            )}
-            {turnHealth?.lastErrorMessage &&
-              turnHealth.lastTurnStatus === "failed" &&
-              processState === "idle" && (
-                <div
-                  className="turn-health-banner turn-health-banner-error"
-                  data-testid="turn-health-error"
-                >
-                  <span className="turn-health-banner-text">
-                    {t("statusBadgeFailed")}: {turnHealth.lastErrorMessage}
-                  </span>
-                </div>
-              )}
-
-            {/* Edit/rewind banner: shown while editing a past message */}
-            {(editRewind || isRestoringEdit) && (
-              <div
-                className="edit-rewind-banner"
-                data-testid="edit-rewind-banner"
-              >
-                <span className="edit-rewind-banner-text">
-                  {isRestoringEdit
-                    ? t("sessionRestoringEditAttachments")
-                    : t("sessionEditingFromHere")}
-                </span>
-                <button
-                  type="button"
-                  className="edit-rewind-banner-cancel"
-                  onClick={handleCancelEdit}
-                >
-                  {t("actionCancel")}
-                </button>
-              </div>
-            )}
-
-            {/* Codex edit: waiting for the rewritten branch snapshot to land */}
-            {historyRewritePending && !editRewind && (
-              <div
-                className="session-branch-sync-banner"
-                data-testid="branch-sync-banner"
-                role="status"
-                aria-live="polite"
-              >
-                <span
-                  className="session-branch-sync-spinner"
-                  aria-hidden="true"
-                />
-                <span className="session-branch-sync-text">
-                  {t("sessionSyncingBranch")}
-                </span>
-              </div>
-            )}
-
-            {/* Keep the draft mounted while approval temporarily hides it. */}
-            <div
-              hidden={
-                !!(
-                  pendingInputRequest &&
-                  pendingInputRequest.sessionId === actualSessionId &&
-                  !isAskUserQuestion
-                ) &&
-                !editRewind &&
-                !isRestoringEdit
-              }
-            >
-              <MessageInput
-                disabled={isRestoringEdit}
-                onSend={handleSend}
-                onInterruptSend={
-                  effectiveProvider === "codex" &&
-                  status.owner === "self" &&
-                  processState === "in-turn" &&
-                  !editRewind
-                    ? (text) => handleSend(text, true)
-                    : undefined
-                }
-                onQueue={
-                  !editRewind &&
-                  status.owner !== "none" &&
-                  processState !== "idle"
-                    ? handleQueue
-                    : undefined
-                }
-                placeholder={
-                  status.owner === "external"
-                    ? t("sessionPlaceholderExternal")
-                    : processState === "idle"
-                      ? t("sessionPlaceholderResume")
-                      : t("sessionPlaceholderQueue")
-                }
-                mode={permissionMode}
-                onModeChange={setPermissionMode}
-                isHeld={holdModeEnabled ? isHeld : undefined}
-                onHoldChange={holdModeEnabled ? setHold : undefined}
-                supportsPermissionMode={supportsPermissionMode}
-                provider={effectiveProvider}
-                permissionModes={permissionModes}
-                supportsThinkingToggle={supportsThinkingToggle}
-                isRunning={status.owner === "self"}
-                isThinking={processState === "in-turn"}
-                onStop={handleAbort}
-                onOpenSideConversation={
-                  hasSideConversation ? openSideConversation : undefined
-                }
-                sideConversationOpen={sideVisible}
-                draftKey={`draft-message-${sessionId}`}
-                onDraftControlsReady={handleDraftControlsReady}
-                collapsed={
-                  !editRewind &&
-                  !isRestoringEdit &&
-                  !!(
-                    pendingInputRequest &&
-                    pendingInputRequest.sessionId === actualSessionId
-                  )
-                }
-                contextUsage={session?.contextUsage}
-                projectId={projectId}
-                sessionId={sessionId}
-                attachments={attachments}
-                onAttach={handleAttach}
-                onRemoveAttachment={handleRemoveAttachment}
-                onRestoreAttachment={(file) =>
-                  setAttachments((prev) =>
-                    [...prev.filter((item) => item.id !== file.id), file].sort(
-                      (left, right) =>
-                        attachmentOrderRef.current.indexOf(left.id) -
-                        attachmentOrderRef.current.indexOf(right.id),
-                    ),
-                  )
-                }
-                attachmentOrder={attachmentOrderRef.current}
-                uploadProgress={uploadProgress}
-                commandPrefix={commandPrefix}
-                commandLabel={commandLabel}
-                commands={activeCommands}
-                showCommandButton={showCommandButton}
-                commandButtons={commandButtons}
-                onCustomCommand={handleCustomCommand}
-              />
-            </div>
-          </div>
-        </footer>
+        <SessionTranscript
+          loading={loading}
+          projectId={projectId}
+          projectPath={project?.path ?? null}
+          sessionId={sessionId}
+          actualSessionId={actualSessionId}
+          provider={session?.provider}
+          messages={messages}
+          renderItems={renderItems}
+          isProcessing={status.owner === "self" && processState === "in-turn"}
+          lastActivityAt={lastStreamActivityAt}
+          isCompacting={isCompacting || isStartingCodexCompaction}
+          scrollTrigger={scrollTrigger + activeWindowTrimRevision}
+          pendingMessages={pendingMessages}
+          deferredMessages={deferredMessages}
+          markdownAugments={markdownAugments}
+          activeToolApproval={activeToolApproval}
+          hasOlderMessages={
+            displayPage
+              ? Boolean(displayPage.nextCursor)
+              : pagination?.hasOlderMessages
+          }
+          hasNewerMessages={pagination?.hasNewerMessages}
+          loadingOlder={loadingOlder}
+          loadingNewer={loadingNewer}
+          loadingTargetMessage={loadingTargetMessage}
+          onLoadOlderMessages={loadOlderMessages}
+          onLoadNewerMessages={loadNewerMessages}
+          onLoadTargetMessage={loadTargetMessageWindow}
+          onFollowingBottomChange={updateActiveWindowFollowingBottom}
+          onEditUserPrompt={
+            !isViewingHistoricalBranch &&
+            supportsHistoricalMessageEditing(session?.provider)
+              ? handleEditUserPrompt
+              : undefined
+          }
+          onSelectBranch={handleSelectBranch}
+          focusBranchId={pendingBranchFocusId}
+          onBranchFocused={handleBranchFocused}
+          targetMessageId={targetMessageId}
+          onTargetFocused={handleTargetFocused}
+          transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
+          agentContent={agentContent}
+          setAgentContent={setAgentContent}
+          toolUseToAgent={toolUseToAgent}
+          toolUseToAgentIds={toolUseToAgentIds}
+          displayActivity={displayActivity}
+          displayRevision={displayPage?.revision}
+          sessionUpdatesConnected={sessionUpdatesConnected}
+          selectedBranchId={selectedBranchId}
+        />
+        <SessionComposer
+          sessionConnectionStatus={sessionConnectionStatus}
+          pendingInputRequest={pendingInputRequest}
+          actualSessionId={actualSessionId}
+          sessionId={sessionId}
+          projectId={projectId}
+          isAskUserQuestion={isAskUserQuestion}
+          isPersistedInputRequest={isPersistedInputRequest}
+          hasSideConversation={hasSideConversation}
+          sideVisible={sideVisible}
+          openSideConversation={openSideConversation}
+          approvalAgentName={approvalAgentName}
+          provider={effectiveProvider}
+          approvalCollapsed={approvalCollapsed}
+          setApprovalCollapsed={setApprovalCollapsed}
+          permissionMode={permissionMode}
+          setPermissionMode={setPermissionMode}
+          holdModeEnabled={holdModeEnabled}
+          isHeld={isHeld}
+          setHold={setHold}
+          supportsPermissionMode={supportsPermissionMode}
+          permissionModes={permissionModes}
+          supportsThinkingToggle={supportsThinkingToggle}
+          contextUsage={session?.contextUsage}
+          status={status}
+          processState={processState}
+          onAbort={abortTurn}
+          turnHealth={turnHealth}
+          retryActionLink={retryActionLink}
+          isRestoringEdit={isRestoringEdit}
+          onCancelEdit={handleCancelEdit}
+          historyRewritePending={historyRewritePending}
+          onSend={sendMessage}
+          onQueue={queueMessage}
+          editRewindActive={Boolean(editRewind)}
+          attachments={attachments}
+          onAttach={handleAttach}
+          onRemoveAttachment={handleRemoveAttachment}
+          onRestoreAttachment={restoreAttachment}
+          attachmentOrder={attachmentOrderRef.current}
+          uploadProgress={uploadProgress}
+          commandPrefix={commandPrefix}
+          commandLabel={commandLabel}
+          commands={activeCommands}
+          showCommandButton={showCommandButton}
+          commandButtons={commandButtons}
+          onCustomCommand={handleCustomCommand}
+          onDraftControlsReady={handleDraftControlsReady}
+          onQuestionSubmit={handleQuestionSubmit}
+          onDeny={handleDeny}
+          onApprove={handleApprove}
+          onApproveAcceptEdits={handleApproveAcceptEdits}
+          onApproveForSession={handleApproveForSession}
+          onApproveStrictAutoReview={handleApproveStrictAutoReview}
+          onApproveAlways={handleApproveAlways}
+          onDenyWithFeedback={handleDenyWithFeedback}
+        />
       </div>
       <SideConversationPanel
         side={side}

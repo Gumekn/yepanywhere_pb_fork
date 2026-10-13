@@ -78,6 +78,31 @@ describe("InteractionBroker", () => {
     expect(provider).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves opaque ACP choice IDs and their persistent scope", async () => {
+    const broker = track(brokers, new InteractionBroker());
+    const request = makeRequest({
+      toolInput: {
+        approvalKind: "acp_tool_call",
+        acpPermissionOptions: [
+          { optionId: "yes-one", kind: "allow_once" },
+          { optionId: "native-rule", kind: "allow_always" },
+          { optionId: "no", kind: "reject_once" },
+        ],
+      },
+    });
+    const operation = await broker.register({
+      request,
+      owner: "process",
+      provider: "cursor",
+      resolveProvider: vi.fn(async () => true),
+    });
+    expect(operation.allowedDecisions).toEqual([
+      { id: "yes-one", scope: "once", tone: "primary" },
+      { id: "native-rule", scope: "persistent", tone: "primary" },
+      { id: "no", scope: "once", tone: "danger" },
+    ]);
+  });
+
   it("persists only durable CAS metadata with owner-only permissions", async () => {
     const dataDir = await createDataDir(dataDirs);
     const broker = track(brokers, new InteractionBroker({ dataDir }));

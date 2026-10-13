@@ -22,6 +22,7 @@ import type {
 } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
+import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import { canonicalizeProjectPath, isAbsolutePath } from "../projects/paths.js";
@@ -90,6 +91,7 @@ export interface ProjectsDeps {
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   /** Kimi scanner for checking if a project has Kimi sessions */
   kimiScanner?: KimiSessionScanner;
+  cursorScanner?: CursorSessionScanner;
   /** Kimi sessions directory */
   kimiSessionsDir?: string;
   /** Optional shared Kimi reader factory for cross-provider session lookups */
@@ -698,6 +700,7 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
         geminiScanner: deps.geminiScanner,
         piScanner: deps.piScanner,
         kimiScanner: deps.kimiScanner,
+        cursorScanner: deps.cursorScanner,
         codexSessionCatalog: deps.codexSessionCatalog,
       }),
     );

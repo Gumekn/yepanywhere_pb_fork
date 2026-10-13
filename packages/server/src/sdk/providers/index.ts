@@ -78,6 +78,9 @@ export {
   type ZCodeProviderConfig,
 } from "./zcode.js";
 
+import { cursorProvider } from "./cursor.js";
+export { CursorProvider, cursorProvider } from "./cursor.js";
+
 /**
  * Get all active provider instances exposed by the provider catalog.
  *
@@ -94,6 +97,7 @@ export function getAllProviders(): AgentProvider[] {
     piProvider,
     kimiProvider,
     zcodeProvider,
+    cursorProvider,
   ];
 }
 
@@ -122,6 +126,8 @@ export function getProvider(name: ProviderName | string): AgentProvider | null {
       return kimiProvider;
     case "zcode":
       return zcodeProvider;
+    case "cursor":
+      return cursorProvider;
     default:
       return null;
   }

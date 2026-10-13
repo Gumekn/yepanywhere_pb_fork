@@ -57,6 +57,223 @@ function fixture(pollMs = 60_000) {
   };
 }
 describe("SessionDisplayService", () => {
+  it("loads full streamed reasoning from the live body cache without looking up an unrelated native ID", async () => {
+    const { service, source, push } = fixture();
+    const page = await source.read();
+    source.read.mockResolvedValue({ ...page, provider: "cursor" });
+    await service.subscribe(selection, vi.fn());
+    const content = "A complete streamed thought. ".repeat(80);
+    push("message", {
+      type: "assistant",
+      uuid: "live-thought",
+      turnId: "turn",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: content }],
+      },
+    });
+    expect(await service.reasoning(selection, "thinking:live-thought:0")).toBe(
+      content,
+    );
+    push("message", {
+      type: "result",
+      uuid: "done",
+      turnId: "turn",
+      turnStatus: "completed",
+    });
+    expect(await service.reasoning(selection, "thinking:live-thought:0")).toBe(
+      content,
+    );
+  });
+
+  it("recovers Cursor reasoning after a shell restart using the exact journal message identity", async () => {
+    const { service, source, runtime } = fixture();
+    const page = await source.read();
+    source.read.mockResolvedValue({ ...page, provider: "cursor" });
+    const replay = vi.fn(async () => [
+      {
+        type: "message",
+        sessionId: "another-session",
+        data: {
+          uuid: "live",
+          message: {
+            content: [{ type: "thinking", thinking: "Wrong session" }],
+          },
+        },
+      },
+      {
+        type: "message",
+        sessionId: selection.sessionId,
+        data: {
+          uuid: "live",
+          type: "assistant",
+          message: { content: [{ type: "thinking", thinking: "First chunk" }] },
+        },
+      },
+      {
+        type: "message",
+        sessionId: selection.sessionId,
+        data: {
+          uuid: "live",
+          type: "assistant",
+          message: {
+            content: [{ type: "thinking", thinking: "Complete body" }],
+          },
+        },
+      },
+    ]);
+    Object.assign(runtime, { replay });
+    expect(await service.reasoning(selection, "thinking:live:0")).toBe(
+      "Complete body",
+    );
+    expect(replay).toHaveBeenCalledWith({
+      processId: "process",
+      sessionId: selection.sessionId,
+    });
+    expect(await service.reasoning(selection, "thinking:live:0")).toBe(
+      "Complete body",
+    );
+    expect(replay).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a Cursor backend error even after hundreds of streamed thinking updates", async () => {
+    const { service, source, runtime } = fixture();
+    const page = await source.read();
+    source.read.mockResolvedValue({ ...page, provider: "cursor" });
+    runtime.subscribeSession.mockImplementation(async (_id, emit) => {
+      for (let index = 0; index < 600; index++)
+        emit("message", {
+          isReplay: true,
+          type: "assistant",
+          uuid: "thought",
+          turnId: "turn",
+          message: {
+            content: [{ type: "thinking", thinking: `Chunk ${index}` }],
+          },
+        });
+      emit("message", {
+        isReplay: true,
+        type: "assistant",
+        uuid: "failure",
+        turnId: "turn",
+        message: {
+          content: "\n\nError: RetriableError: [resource_exhausted] Error",
+        },
+      });
+      emit("message", {
+        isReplay: true,
+        type: "result",
+        uuid: "end",
+        turnId: "turn",
+        turnStatus: "completed",
+      });
+      return { cleanup: vi.fn() };
+    });
+    const snapshot = await service.snapshot(selection);
+    expect(JSON.stringify(snapshot)).toContain("resource_exhausted");
+    expect(snapshot.activity.state).toBe("failed");
+  });
+  it("reconciles Cursor replies by native turn without erasing an identical later reply", async () => {
+    const { service, source, push } = fixture();
+    const first: Message[] = [
+      {
+        uuid: "disk-user-1",
+        type: "user",
+        cursorTurnIndex: 1,
+        turnId: "cursor-turn-1",
+        message: { role: "user", content: "Repeat" },
+      },
+      {
+        uuid: "disk-answer-1",
+        type: "assistant",
+        cursorTurnIndex: 1,
+        turnId: "cursor-turn-1",
+        message: { role: "assistant", content: "Same answer" },
+      },
+    ];
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: first,
+      activity: "running",
+      stamp: "1",
+    });
+    await service.subscribe(selection, vi.fn());
+    push("message", {
+      uuid: "live-user-2",
+      type: "user",
+      cursorTurnIndex: 2,
+      turnId: "cursor-turn-2",
+      message: { role: "user", content: "Repeat" },
+    });
+    push("message", {
+      uuid: "live-thought-2",
+      type: "assistant",
+      cursorTurnIndex: 2,
+      turnId: "cursor-turn-2",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "Transient thought" }],
+      },
+    });
+    push("message", {
+      uuid: "live-answer-2",
+      type: "assistant",
+      cursorTurnIndex: 2,
+      turnId: "cursor-turn-2",
+      message: { role: "assistant", content: "Same answer" },
+    });
+    push("message", {
+      uuid: "cursor-result-2",
+      type: "result",
+      cursorTurnIndex: 2,
+      turnId: "cursor-turn-2",
+      turnStatus: "completed",
+    });
+    push("status", { state: "idle" });
+    await vi.waitFor(async () => {
+      const snapshot = await service.snapshot(selection);
+      expect(
+        snapshot.nodes.filter(
+          (n) => n.type === "segment" && n.segment.type === "assistant_text",
+        ),
+      ).toHaveLength(2);
+    });
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        ...first,
+        {
+          uuid: "disk-user-2",
+          type: "user",
+          cursorTurnIndex: 2,
+          turnId: "cursor-turn-2",
+          message: { role: "user", content: "Repeat" },
+        },
+        {
+          uuid: "disk-answer-2",
+          type: "assistant",
+          cursorTurnIndex: 2,
+          turnId: "cursor-turn-2",
+          message: { role: "assistant", content: "Same answer" },
+        },
+      ],
+      activity: "unknown",
+      stamp: "2",
+    });
+    push("status", { state: "idle" });
+    await vi.waitFor(async () => {
+      const snapshot = await service.snapshot(selection);
+      expect(
+        snapshot.nodes.filter(
+          (n) => n.type === "segment" && n.segment.type === "assistant_text",
+        ),
+      ).toHaveLength(2);
+      expect(JSON.stringify(snapshot)).toContain("disk-answer-2");
+      expect(JSON.stringify(snapshot)).not.toContain("live-answer-2");
+      expect(JSON.stringify(snapshot)).not.toContain("Transient thought");
+      expect(snapshot.activity.state).toBe("completed");
+    });
+  });
   it.each([
     "tool",
     "progress",

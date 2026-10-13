@@ -23,6 +23,7 @@ const FALLBACK_PERMISSION_MODES: Partial<
   // Kimi's ACP modes are default/manual, plan, auto, and yolo. The shared
   // bypassPermissions value is presented as YOLO by Kimi-specific UI.
   kimi: ["default", "plan", "auto", "bypassPermissions"],
+  cursor: ["default", "plan", "bypassPermissions"],
 };
 
 const PROVIDER_DEFAULT_PERMISSION_MODES: Partial<
@@ -30,6 +31,7 @@ const PROVIDER_DEFAULT_PERMISSION_MODES: Partial<
 > = {
   // Never make Kimi's fully autonomous `auto` mode the implicit default.
   kimi: "default",
+  cursor: "default",
 };
 
 export function getProviderPermissionModes(

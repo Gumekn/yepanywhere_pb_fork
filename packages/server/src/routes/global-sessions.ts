@@ -31,6 +31,7 @@ import type { SessionIndexService } from "../indexes/index.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
+import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
@@ -101,6 +102,7 @@ export interface GlobalSessionsDeps {
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   /** Kimi scanner for checking if a project has Kimi sessions */
   kimiScanner?: KimiSessionScanner;
+  cursorScanner?: CursorSessionScanner;
   /** Kimi sessions directory */
   kimiSessionsDir?: string;
   /** Optional shared Kimi reader factory for cross-provider session lookups */
@@ -433,6 +435,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       geminiScanner: deps.geminiScanner,
       piScanner: deps.piScanner,
       kimiScanner: deps.kimiScanner,
+      cursorScanner: deps.cursorScanner,
       codexSessionCatalog: deps.codexSessionCatalog,
     });
     const seenSessionIds = new Set<string>();
@@ -645,6 +648,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         geminiScanner: deps.geminiScanner,
         piScanner: deps.piScanner,
         kimiScanner: deps.kimiScanner,
+        cursorScanner: deps.cursorScanner,
         codexSessionCatalog: deps.codexSessionCatalog,
       }),
     );

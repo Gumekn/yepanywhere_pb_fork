@@ -9,6 +9,7 @@ import type { ISessionIndexService } from "../indexes/types.js";
 import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
+import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import { decodeProjectId, getProjectName } from "../projects/paths.js";
@@ -16,6 +17,7 @@ import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
+import type { CursorSessionReader } from "../sessions/cursor-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
@@ -43,8 +45,11 @@ export interface RecentsDeps {
   piReaderFactory?: (projectPath: string) => PiSessionReader;
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiScanner?: KimiSessionScanner;
+  cursorScanner?: CursorSessionScanner;
   kimiSessionsDir?: string;
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  cursorSessionsDir?: string;
+  cursorReaderFactory?: (projectPath: string) => CursorSessionReader;
 }
 
 export function createRecentsRoutes(deps: RecentsDeps): Hono {
@@ -96,6 +101,8 @@ export function createRecentsRoutes(deps: RecentsDeps): Hono {
           piReaderFactory: deps.piReaderFactory,
           kimiSessionsDir: deps.kimiSessionsDir,
           kimiReaderFactory: deps.kimiReaderFactory,
+          cursorSessionsDir: deps.cursorSessionsDir,
+          cursorReaderFactory: deps.cursorReaderFactory,
         },
       );
       if (!resolved) {

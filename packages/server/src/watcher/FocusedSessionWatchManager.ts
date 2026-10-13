@@ -491,7 +491,9 @@ export class FocusedSessionWatchManager {
   private normalizeProvider(
     provider: string | undefined,
   ): WatchProvider | null {
-    return normalizeProviderGroup(provider);
+    const group = normalizeProviderGroup(provider);
+    if (!group || group === "cursor") return null;
+    return group;
   }
 
   private async fileExists(filePath: string): Promise<boolean> {

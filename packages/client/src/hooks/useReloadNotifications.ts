@@ -50,6 +50,14 @@ export function useReloadNotifications() {
   const runtimeDirtyGenerationRef = useRef<string | null>(null);
   const dismissedRuntimeGenerationRef = useRef<string | null>(null);
 
+  const applyWorkerActivity = useCallback((data: WorkerActivityEvent) => {
+    setWorkerActivity((prev) => ({
+      ...data,
+      // Count-only events must not hide the production runtime selector.
+      runtimeMode: data.runtimeMode ?? prev.runtimeMode,
+    }));
+  }, []);
+
   const applyRuntimeDirtyStatus = useCallback((data: DevStatus) => {
     const generation =
       data.runtimeDirtyGeneration ??
@@ -76,9 +84,10 @@ export function useReloadNotifications() {
     fetchJSON<DevStatus>("/dev/status")
       .then((data) => {
         setDevStatus(data);
-        if (data && !data.backendDirty) {
-          setPendingReloads((prev) => ({ ...prev, backend: false }));
-        }
+        setPendingReloads((prev) => ({
+          ...prev,
+          backend: data.backendDirty === true,
+        }));
         applyRuntimeDirtyStatus(data);
       })
       .catch(() => {
@@ -88,31 +97,18 @@ export function useReloadNotifications() {
     // Sync worker activity
     fetchJSON<WorkerActivityEvent>("/status/workers")
       .then((data) => {
-        if (data) setWorkerActivity(data);
+        if (data) applyWorkerActivity(data);
       })
       .catch(() => {
         // Ignore errors
       });
-  }, [applyRuntimeDirtyStatus]);
+  }, [applyRuntimeDirtyStatus, applyWorkerActivity]);
 
-  // Check if server is in dev mode and get persisted dirty state
+  // Production does not expose /dev/status. Always load /status/workers too,
+  // even when the shared activity connection was established before mounting.
   useEffect(() => {
-    if (window.location.pathname === "/login") {
-      return;
-    }
-
-    fetchJSON<DevStatus>("/dev/status")
-      .then((data) => {
-        setDevStatus(data);
-        if (data.backendDirty) {
-          setPendingReloads((prev) => ({ ...prev, backend: true }));
-        }
-        applyRuntimeDirtyStatus(data);
-      })
-      .catch(() => {
-        setDevStatus(null);
-      });
-  }, [applyRuntimeDirtyStatus]);
+    syncFromServer();
+  }, [syncFromServer]);
 
   // Subscribe to events from the bus
   useEffect(() => {
@@ -134,9 +130,7 @@ export function useReloadNotifications() {
     );
 
     unsubscribers.push(
-      activityBus.on("worker-activity-changed", (data: WorkerActivityEvent) => {
-        setWorkerActivity(data);
-      }),
+      activityBus.on("worker-activity-changed", applyWorkerActivity),
     );
 
     // On reconnect, sync state from server
@@ -159,7 +153,7 @@ export function useReloadNotifications() {
         unsub();
       }
     };
-  }, [syncFromServer]);
+  }, [syncFromServer, applyWorkerActivity]);
 
   // Sync connected state with bus
   useEffect(() => {
@@ -169,13 +163,6 @@ export function useReloadNotifications() {
     const interval = setInterval(checkConnection, 1000);
     return () => clearInterval(interval);
   }, []);
-
-  // Initial sync when dev mode is detected
-  useEffect(() => {
-    if (devStatus?.noBackendReload || devStatus?.noFrontendReload) {
-      syncFromServer();
-    }
-  }, [devStatus, syncFromServer]);
 
   useEffect(() => {
     if (devStatus?.runtimeMode !== "external") return;
@@ -265,6 +252,9 @@ export function useReloadNotifications() {
     devStatus?.noFrontendReload ||
     devStatus?.runtimeMode === "external";
 
+  // The worker endpoint is available in production; dev status is a fallback.
+  const runtimeMode = workerActivity.runtimeMode ?? devStatus?.runtimeMode;
+
   return {
     isManualReloadMode,
     pendingReloads,
@@ -276,8 +266,8 @@ export function useReloadNotifications() {
     dismiss,
     dismissAll,
     workerActivity,
-    unsafeToRestart:
-      workerActivity.hasActiveWork && workerActivity.runtimeMode !== "external",
+    runtimeMode,
+    unsafeToRestart: workerActivity.hasActiveWork && runtimeMode !== "external",
     unsafeToReloadRuntime: workerActivity.hasActiveWork,
   };
 }

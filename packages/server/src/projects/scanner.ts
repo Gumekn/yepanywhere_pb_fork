@@ -14,11 +14,13 @@ import {
   tryMapLocalPathToRemote,
   tryMapRemotePathToLocal,
 } from "../sdk/remote-path-mapping.js";
+import { CURSOR_ACP_SESSIONS_DIR } from "../sessions/cursor-reader.js";
 import { PI_SESSIONS_DIR } from "../sessions/pi-files.js";
 import { ZCODE_DB_PATH } from "../sessions/zcode-db.js";
 import type { Project } from "../supervisor/types.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
 import { CODEX_SESSIONS_DIR, CodexSessionScanner } from "./codex-scanner.js";
+import { CursorSessionScanner } from "./cursor-scanner.js";
 import { GEMINI_TMP_DIR, GeminiSessionScanner } from "./gemini-scanner.js";
 import { KIMI_SESSIONS_DIR, KimiSessionScanner } from "./kimi-scanner.js";
 import {
@@ -44,11 +46,13 @@ export interface ScannerOptions {
   kimiScanner?: KimiSessionScanner | null; // shared provider scanner
   piScanner?: PiSessionScanner | null; // shared provider scanner
   zcodeScanner?: ZCodeSessionScanner | null; // shared provider scanner
+  cursorScanner?: CursorSessionScanner | null; // shared provider scanner
   enableCodex?: boolean; // whether to include Codex projects (default: true)
   enableGemini?: boolean; // whether to include Gemini projects (default: true)
   enableKimi?: boolean; // whether to include Kimi projects (default: true)
   enablePi?: boolean; // whether to include Pi projects (default: true)
   enableZCode?: boolean; // whether to include ZCode projects (default: true)
+  enableCursor?: boolean; // whether to include Cursor ACP projects (default: true)
   projectMetadataService?: ProjectMetadataService; // for persisting added projects
   /** Remote Claude executors whose shared stores should also be scanned. */
   remoteExecutors?: RemoteExecutorConfig[];
@@ -78,11 +82,13 @@ export class ProjectScanner {
   private kimiScanner: KimiSessionScanner | null;
   private piScanner: PiSessionScanner | null;
   private zcodeScanner: ZCodeSessionScanner | null;
+  private cursorScanner: CursorSessionScanner | null;
   private enableCodex: boolean;
   private enableGemini: boolean;
   private enableKimi: boolean;
   private enablePi: boolean;
   private enableZCode: boolean;
+  private enableCursor: boolean;
   private projectMetadataService: ProjectMetadataService | null;
   private cacheTtlMs: number;
   private cacheDirty = true;
@@ -100,6 +106,7 @@ export class ProjectScanner {
     this.enableKimi = options.enableKimi ?? true;
     this.enablePi = options.enablePi ?? true;
     this.enableZCode = options.enableZCode ?? true;
+    this.enableCursor = options.enableCursor ?? true;
     this.codexScanner = this.enableCodex
       ? (options.codexScanner ??
         new CodexSessionScanner({
@@ -126,6 +133,9 @@ export class ProjectScanner {
       : null;
     this.zcodeScanner = this.enableZCode
       ? (options.zcodeScanner ?? new ZCodeSessionScanner())
+      : null;
+    this.cursorScanner = this.enableCursor
+      ? (options.cursorScanner ?? new CursorSessionScanner())
       : null;
     this.projectMetadataService = options.projectMetadataService ?? null;
     this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? 5000);
@@ -381,6 +391,8 @@ export class ProjectScanner {
       this.piScanner?.invalidateCache();
     } else if (event.provider === "zcode") {
       this.zcodeScanner?.invalidateCache();
+    } else if (event.provider === "cursor") {
+      this.cursorScanner?.invalidateCache();
     }
   }
 
@@ -683,6 +695,42 @@ export class ProjectScanner {
           hasPiSessions: false,
           hasKimiSessions: false,
           hasZCodeSessions: true,
+          hasCursorSessions: false,
+        });
+      }
+    }
+
+    if (this.cursorScanner) {
+      const cursorProjects = await this.cursorScanner.listProjects();
+      for (const cursorProject of cursorProjects) {
+        const projectPath = canonicalizeProjectPath(cursorProject.path);
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasCursorSessions = true;
+          existing.sessionCount += cursorProject.sessionCount;
+          if (
+            cursorProject.lastActivity &&
+            (!existing.lastActivity ||
+              cursorProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = cursorProject.lastActivity;
+          }
+          continue;
+        }
+        seenPaths.add(projectPath);
+        projects.push({
+          ...cursorProject,
+          id: encodeProjectId(projectPath),
+          path: projectPath,
+          name: basename(projectPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
+          hasPiSessions: false,
+          hasKimiSessions: false,
+          hasZCodeSessions: false,
+          hasCursorSessions: true,
         });
       }
     }
@@ -851,6 +899,14 @@ export class ProjectScanner {
           provider = "zcode";
         }
       }
+
+      if (provider === "claude" && this.cursorScanner) {
+        const cursorSessions =
+          await this.cursorScanner.getSessionsForProject(projectPath);
+        if (cursorSessions.length > 0) {
+          provider = "cursor";
+        }
+      }
     }
 
     // Create a virtual project entry
@@ -867,6 +923,8 @@ export class ProjectScanner {
       sessionDir = KIMI_SESSIONS_DIR;
     } else if (provider === "zcode") {
       sessionDir = ZCODE_DB_PATH;
+    } else if (provider === "cursor") {
+      sessionDir = CURSOR_ACP_SESSIONS_DIR;
     } else {
       sessionDir = this.getClaudeSessionDirForProject(projectPath);
     }
@@ -882,6 +940,7 @@ export class ProjectScanner {
       hasPiSessions: provider === "pi",
       hasKimiSessions: provider === "kimi",
       hasZCodeSessions: provider === "zcode",
+      hasCursorSessions: provider === "cursor",
       activeOwnedCount: 0,
       activeExternalCount: 0,
       lastActivity: null,

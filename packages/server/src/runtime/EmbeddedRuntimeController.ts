@@ -24,6 +24,7 @@ import type { Supervisor } from "../supervisor/Supervisor.js";
 import type { ProcessEvent, ProcessInfo } from "../supervisor/types.js";
 import type { EventBus } from "../watcher/index.js";
 import type { RuntimeEventStore } from "./RuntimeEventStore.js";
+import { CURSOR_RUNTIME_VERSION } from "./cursor-availability.js";
 import {
   type CreateRuntimeSessionRequest,
   type QueueRuntimeMessageRequest,
@@ -198,6 +199,8 @@ export class EmbeddedRuntimeController implements RuntimeController {
       mode: this.mode,
       protocolVersion: RUNTIME_CONTROLLER_PROTOCOL_VERSION,
       processCount: this.supervisor.getProcessInfoList().length,
+      availableProviders: this.supervisor.getAvailableProviderNames(),
+      providerVersions: { cursor: CURSOR_RUNTIME_VERSION },
     };
   }
 

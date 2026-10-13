@@ -52,6 +52,21 @@ export function useProviderPermissionModeConfig(
     };
   }
 
+  if (provider === "cursor") {
+    return {
+      labels: {
+        ...genericLabels,
+        bypassPermissions: t("modeCursorAllowAllLabel"),
+      },
+      descriptions: {
+        ...genericDescriptions,
+        bypassPermissions: t("modeCursorAllowAllDescription"),
+      },
+      title: t("newSessionModeTitle"),
+      description: null,
+    };
+  }
+
   if (provider === "codex") {
     return {
       labels: {

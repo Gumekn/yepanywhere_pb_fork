@@ -100,6 +100,21 @@ export class ACPClient {
   }
   private onSessionUpdate: SessionUpdateCallback | null = null;
   private onPermissionRequest: PermissionRequestCallback | null = null;
+  private onExtensionRequest:
+    | ((
+        method: string,
+        params: Record<string, unknown>,
+      ) => Promise<Record<string, unknown>>)
+    | null = null;
+
+  setExtensionRequestCallback(
+    callback: (
+      method: string,
+      params: Record<string, unknown>,
+    ) => Promise<Record<string, unknown>>,
+  ): void {
+    this.onExtensionRequest = callback;
+  }
 
   /**
    * Set callback for session update notifications.
@@ -176,6 +191,15 @@ export class ACPClient {
       "Creating ACP client handlers",
     );
     return {
+      extMethod: async (method, params) => {
+        if (this.onExtensionRequest)
+          return this.onExtensionRequest(method, params);
+        throw new Error(`Unsupported ACP extension: ${method}`);
+      },
+      extNotification: async (method, params) => {
+        if (this.onExtensionRequest)
+          await this.onExtensionRequest(method, params);
+      },
       sessionUpdate: async (params: SessionNotification) => {
         this.log.trace({ update: params }, "ACP session update");
         this.onSessionUpdate?.(params);
@@ -227,6 +251,39 @@ export class ACPClient {
 
     this.log.debug({ result }, "ACP initialization complete");
     return result;
+  }
+
+  /**
+   * Authenticate with a method advertised by `initialize`.
+   * Cursor CLI expects `cursor_login` after `agent login` or `CURSOR_API_KEY`.
+   */
+  async authenticate(methodId: string): Promise<void> {
+    if (!this.connection) {
+      throw new Error("ACPClient not connected. Call connect() first.");
+    }
+    this.log.debug({ methodId }, "Authenticating ACP connection");
+    await this.connection.authenticate({ methodId });
+  }
+
+  /** Call a provider's advertised ACP extension without creating a session. */
+  async requestExtension(
+    method: string,
+    params: Record<string, unknown> = {},
+  ): Promise<unknown> {
+    if (!this.connection) {
+      throw new Error("ACPClient not connected. Call connect() first.");
+    }
+    return this.connection.extMethod(method, params);
+  }
+
+  /**
+   * Cancel the active prompt for a session. The agent decides how much of the
+   * in-flight turn to keep.
+   */
+  async cancel(sessionId: string): Promise<void> {
+    if (!this.connection) return;
+    this.log.debug({ sessionId }, "Cancelling ACP session prompt");
+    await this.connection.cancel({ sessionId });
   }
 
   /**
@@ -399,5 +456,6 @@ export class ACPClient {
     this.connection = null;
     this.onSessionUpdate = null;
     this.onPermissionRequest = null;
+    this.onExtensionRequest = null;
   }
 }

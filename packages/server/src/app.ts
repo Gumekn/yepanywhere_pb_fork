@@ -52,6 +52,7 @@ import {
   CODEX_SESSIONS_DIR,
   CodexSessionScanner,
 } from "./projects/codex-scanner.js";
+import { CursorSessionScanner } from "./projects/cursor-scanner.js";
 import {
   GEMINI_TMP_DIR,
   GeminiSessionScanner,
@@ -144,6 +145,10 @@ import {
   getCodexSessionManifest,
   invalidateCodexSessionManifest,
 } from "./sessions/codex-session-manifest.js";
+import {
+  CURSOR_ACP_SESSIONS_DIR,
+  CursorSessionReader,
+} from "./sessions/cursor-reader.js";
 import { GeminiSessionReader } from "./sessions/gemini-reader.js";
 import { KimiSessionReader } from "./sessions/kimi-reader.js";
 import { PI_SESSIONS_DIR } from "./sessions/pi-files.js";
@@ -496,6 +501,9 @@ export function createApp(options: AppOptions): AppResult {
   const zcodeScanner = providerEnabled("zcode")
     ? new ZCodeSessionScanner()
     : undefined;
+  const cursorScanner = providerEnabled("cursor")
+    ? new CursorSessionScanner()
+    : undefined;
   const scanner = new ProjectScanner({
     projectsDir: options.projectsDir,
     remoteExecutors:
@@ -505,11 +513,13 @@ export function createApp(options: AppOptions): AppResult {
     kimiScanner,
     piScanner,
     zcodeScanner,
+    cursorScanner,
     enableCodex: codexEnabled,
     enableGemini: geminiEnabled,
     enableKimi: Boolean(kimiScanner),
     enablePi: Boolean(piScanner),
     enableZCode: Boolean(zcodeScanner),
+    enableCursor: Boolean(cursorScanner),
     projectMetadataService: options.projectMetadataService,
     eventBus: options.eventBus,
     cacheTtlMs: options.projectScanCacheTtlMs,
@@ -637,6 +647,15 @@ export function createApp(options: AppOptions): AppResult {
           () =>
             new KimiSessionReader({
               sessionsDir: KIMI_SESSIONS_DIR,
+              projectPath: project.path,
+            }),
+        );
+      case "cursor":
+        return getOrCreateReader(
+          `cursor::${CURSOR_ACP_SESSIONS_DIR}::${project.path}`,
+          () =>
+            new CursorSessionReader({
+              sessionsDir: CURSOR_ACP_SESSIONS_DIR,
               projectPath: project.path,
             }),
         );
@@ -770,6 +789,15 @@ export function createApp(options: AppOptions): AppResult {
           projectPath,
         }),
     );
+  const cursorReaderFactory = (projectPath: string): CursorSessionReader =>
+    getOrCreateReader(
+      `cursor-extra::${CURSOR_ACP_SESSIONS_DIR}::${projectPath}`,
+      () =>
+        new CursorSessionReader({
+          sessionsDir: CURSOR_ACP_SESSIONS_DIR,
+          projectPath,
+        }),
+    );
   const zcodeReaderFactory = (projectPath: string): ZCodeSessionReader =>
     getOrCreateReader(`zcode-extra::${ZCODE_DB_PATH}::${projectPath}`, () => {
       const mis = options.modelInfoService;
@@ -805,6 +833,8 @@ export function createApp(options: AppOptions): AppResult {
         zcodeReaderFactory,
         kimiSessionsDir: KIMI_SESSIONS_DIR,
         kimiReaderFactory,
+        cursorSessionsDir: CURSOR_ACP_SESSIONS_DIR,
+        cursorReaderFactory,
       },
       options.sessionMetadataService?.getProvider(sessionId),
     );
@@ -1002,6 +1032,7 @@ export function createApp(options: AppOptions): AppResult {
         geminiScanner,
         piScanner,
         kimiScanner,
+        cursorScanner,
       });
       const roots = {
         claudeProjectsDir: options.projectsDir ?? CLAUDE_PROJECTS_DIR,
@@ -1020,6 +1051,8 @@ export function createApp(options: AppOptions): AppResult {
         zcodeReaderFactory,
         kimiSessionsDir: KIMI_SESSIONS_DIR,
         kimiReaderFactory,
+        cursorSessionsDir: CURSOR_ACP_SESSIONS_DIR,
+        cursorReaderFactory,
       };
       const seenSessionIds = new Set<string>();
       let archivedCount = 0;
@@ -1348,6 +1381,7 @@ export function createApp(options: AppOptions): AppResult {
       geminiReaderFactory,
       piScanner,
       kimiScanner,
+      cursorScanner,
       piSessionsDir: PI_SESSIONS_DIR,
       zcodeDbPath: ZCODE_DB_PATH,
       piReaderFactory,
@@ -1382,6 +1416,7 @@ export function createApp(options: AppOptions): AppResult {
       geminiReaderFactory,
       piScanner,
       kimiScanner,
+      cursorScanner,
       piSessionsDir: PI_SESSIONS_DIR,
       zcodeDbPath: ZCODE_DB_PATH,
       piReaderFactory,
@@ -1440,6 +1475,11 @@ export function createApp(options: AppOptions): AppResult {
               reader: zcodeReaderFactory(project.path),
               sessionDir: ZCODE_DB_PATH,
             };
+          case "cursor":
+            return {
+              reader: cursorReaderFactory(project.path),
+              sessionDir: CURSOR_ACP_SESSIONS_DIR,
+            };
           default:
             return {
               reader: readerFactory(project),
@@ -1471,6 +1511,7 @@ export function createApp(options: AppOptions): AppResult {
       geminiReaderFactory,
       piScanner,
       kimiScanner,
+      cursorScanner,
       piSessionsDir: PI_SESSIONS_DIR,
       zcodeDbPath: ZCODE_DB_PATH,
       piReaderFactory,
@@ -1502,6 +1543,7 @@ export function createApp(options: AppOptions): AppResult {
       geminiReaderFactory,
       piScanner,
       kimiScanner,
+      cursorScanner,
       piSessionsDir: PI_SESSIONS_DIR,
       zcodeDbPath: ZCODE_DB_PATH,
       piReaderFactory,
@@ -1535,12 +1577,15 @@ export function createApp(options: AppOptions): AppResult {
         geminiReaderFactory,
         piScanner,
         kimiScanner,
+        cursorScanner,
         piSessionsDir: PI_SESSIONS_DIR,
         zcodeDbPath: ZCODE_DB_PATH,
         piReaderFactory,
         zcodeReaderFactory,
         kimiSessionsDir: KIMI_SESSIONS_DIR,
         kimiReaderFactory,
+        cursorSessionsDir: CURSOR_ACP_SESSIONS_DIR,
+        cursorReaderFactory,
       }),
     );
   }
@@ -1570,12 +1615,15 @@ export function createApp(options: AppOptions): AppResult {
         geminiReaderFactory,
         piScanner,
         kimiScanner,
+        cursorScanner,
         piSessionsDir: PI_SESSIONS_DIR,
         zcodeDbPath: ZCODE_DB_PATH,
         piReaderFactory,
         zcodeReaderFactory,
         kimiSessionsDir: KIMI_SESSIONS_DIR,
         kimiReaderFactory,
+        cursorSessionsDir: CURSOR_ACP_SESSIONS_DIR,
+        cursorReaderFactory,
       }),
     );
   }
@@ -1612,6 +1660,7 @@ export function createApp(options: AppOptions): AppResult {
   app.route(
     "/api/providers",
     createProvidersRoutes({
+      runtimeController,
       modelInfoService: options.modelInfoService,
       enabledProviders: options.enabledProviders,
     }),

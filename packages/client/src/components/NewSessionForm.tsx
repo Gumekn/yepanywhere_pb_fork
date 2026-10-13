@@ -54,6 +54,7 @@ import {
   resolveModelReasoningEffort,
 } from "../lib/codexReasoning";
 import { handleComposerSubmitKey } from "../lib/composerKeyboard";
+import { getPreferredCursorModelId } from "../lib/cursorModels";
 import {
   clearLegacySessionPrefill,
   getLegacySessionPrefill,
@@ -77,6 +78,8 @@ import { AttachmentPreviewModal } from "./AttachmentPreviewModal";
 import { CodexAccountSelect } from "./CodexAccountSelect";
 import { CodexUsageCard } from "./CodexUsageCard";
 import { ComposerAttachmentCard } from "./ComposerAttachmentCard";
+import { CursorAccountCard } from "./CursorAccountCard";
+import { CursorModelSelect } from "./CursorModelSelect";
 import { FilterDropdown, type FilterOption } from "./FilterDropdown";
 import { NewSessionSetupSkeleton } from "./NewSessionSkeleton";
 import { PiGatewayKeySelect } from "./PiGatewayKeySelect";
@@ -102,6 +105,7 @@ const NEW_SESSION_PROVIDER_ACCENTS = {
   pi: "var(--provider-pi)",
   kimi: "var(--provider-kimi)",
   zcode: "var(--provider-zcode)",
+  cursor: "var(--provider-cursor)",
 } satisfies Record<LiveProviderName, string>;
 
 export function getNewSessionProviderAccent(
@@ -433,7 +437,11 @@ export function NewSessionForm({
   const { showToast } = useToastContext();
 
   // Fetch available providers
-  const { providers, loading: providersLoading } = useProviders();
+  const {
+    providers,
+    loading: providersLoading,
+    refetch: refetchProviders,
+  } = useProviders();
   const {
     settings,
     isLoading: settingsLoading,
@@ -722,20 +730,25 @@ export function NewSessionForm({
           : undefined;
 
       const preferredModel =
-        providerName === "pi"
-          ? getPreferredGatewayModelId(
+        providerName === "cursor"
+          ? getPreferredCursorModelId(
               models,
-              savedGatewayConfig?.model ??
-                savedDefaults?.model ??
-                provider.currentModel,
+              savedDefaults?.model ?? provider.currentModel,
             )
-          : getPreferredModelId(
-              models,
-              codexPreferredModel ??
-                savedDefaults?.model ??
-                provider.currentModel,
-              providerName === "codex" ? DEFAULT_CODEX_MODEL : undefined,
-            );
+          : providerName === "pi"
+            ? getPreferredGatewayModelId(
+                models,
+                savedGatewayConfig?.model ??
+                  savedDefaults?.model ??
+                  provider.currentModel,
+              )
+            : getPreferredModelId(
+                models,
+                codexPreferredModel ??
+                  savedDefaults?.model ??
+                  provider.currentModel,
+                providerName === "codex" ? DEFAULT_CODEX_MODEL : undefined,
+              );
 
       setSelectedProvider(providerName);
       setMode(
@@ -1372,6 +1385,7 @@ export function NewSessionForm({
       !hasContent ||
       isStarting ||
       startRetryBlockedMessage ||
+      selectedProviderInfo?.unavailableReason ||
       hasGatewayConfigError
     ) {
       return;
@@ -1538,8 +1552,14 @@ export function NewSessionForm({
       // Show user-visible error message
       let errorMessage = t("newSessionStartError");
       if (err instanceof Error) {
+        const code = (err as Error & { code?: string }).code;
         // Check for specific error types
-        if (err.message.includes("Queue is full")) {
+        if (code === "runtime-update-required") {
+          errorMessage = t("cursorRuntimeUpdateRequired");
+          void refetchProviders();
+        } else if (code === "runtime-unavailable") {
+          errorMessage = t("cursorRuntimeUnavailable");
+        } else if (err.message.includes("Queue is full")) {
           errorMessage = t("newSessionServerBusy");
         } else if (err.message.includes("503")) {
           errorMessage = t("newSessionServerCapacity");
@@ -1880,6 +1900,7 @@ export function NewSessionForm({
           disabled={
             isStarting ||
             Boolean(startRetryBlockedMessage) ||
+            Boolean(selectedProviderInfo?.unavailableReason) ||
             !hasContent ||
             hasGatewayConfigError
           }
@@ -1996,6 +2017,14 @@ export function NewSessionForm({
         data-provider={selectedProvider ?? undefined}
         style={newSessionThemeStyle}
       >
+        {selectedProviderInfo?.unavailableReason && (
+          <p role="status" className="cursor-account-notice">
+            {selectedProviderInfo.unavailableReason ===
+            "runtime-update-required"
+              ? t("cursorRuntimeUpdateRequired")
+              : t("cursorRuntimeUnavailable")}
+          </p>
+        )}
         {inputArea}
       </div>
     );
@@ -2026,6 +2055,13 @@ export function NewSessionForm({
         />
       )}
       {selectedProvider === "codex" && <CodexUsageCard />}
+      {selectedProvider === "cursor" && (
+        <CursorAccountCard
+          providerInfo={selectedProviderInfo}
+          unavailableReason={selectedProviderInfo?.unavailableReason}
+          onRefresh={refetchProviders}
+        />
+      )}
       {selectedProvider === "pi" && (
         <PiGatewayKeySelect
           value={selectedLlmGatewayKeyId}
@@ -2078,7 +2114,17 @@ export function NewSessionForm({
       )}
 
       {/* Model / Thinking Selection */}
+      {selectedProvider === "cursor" && availableModels.length > 0 && (
+        <CursorModelSelect
+          models={availableModels}
+          value={selectedModel}
+          onChange={setSelectedModel}
+          accentColor={selectedProviderAccent}
+          disabled={isStarting}
+        />
+      )}
       {selectedProvider &&
+        selectedProvider !== "cursor" &&
         (modelOptions.length > 0 ||
           supportsThinkingToggle ||
           showKimiReasoningSelector) && (

@@ -3,6 +3,7 @@ import {
   CodexOssProvider,
   CodexProvider,
 } from "./implementations/CodexProvider";
+import { CursorProvider } from "./implementations/CursorProvider";
 import { GeminiACPProvider } from "./implementations/GeminiACPProvider";
 import { GeminiProvider } from "./implementations/GeminiProvider";
 import { KimiProvider } from "./implementations/KimiProvider";
@@ -18,6 +19,7 @@ const activeProviders: Record<string, Provider> = {
   pi: new PiProvider(),
   kimi: new KimiProvider(),
   zcode: new ZCodeProvider(),
+  cursor: new CursorProvider(),
 };
 
 const providers: Record<string, Provider> = {

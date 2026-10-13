@@ -30,6 +30,7 @@ import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
+import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
@@ -77,6 +78,7 @@ export interface InboxDeps {
   piReaderFactory?: (projectPath: string) => PiSessionReader;
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiScanner?: KimiSessionScanner;
+  cursorScanner?: CursorSessionScanner;
   kimiSessionsDir?: string;
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
   codexBridgeService?: CodexBridgeController;
@@ -227,6 +229,7 @@ export function createInboxRoutes(deps: InboxDeps): Hono {
       geminiScanner: deps.geminiScanner,
       piScanner: deps.piScanner,
       kimiScanner: deps.kimiScanner,
+      cursorScanner: deps.cursorScanner,
     });
     const bridgeSessionViews = await listBridgeSessionViews(deps);
     const bridgedSessionById = new Map(

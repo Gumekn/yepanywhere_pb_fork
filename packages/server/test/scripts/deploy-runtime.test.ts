@@ -1,5 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -70,6 +76,77 @@ const external = {
 };
 
 describe("deployment runtime wiring", () => {
+  it.each([
+    {
+      runtime: true,
+      server: false,
+      expected: ["--restart", "--restart-runtime", "--no-restart"],
+    },
+    {
+      runtime: true,
+      server: true,
+      expected: ["--restart", "--restart-runtime"],
+    },
+    { runtime: false, server: true, expected: ["--restart"] },
+    { runtime: false, server: false, expected: null },
+  ])(
+    "dispatches selected services safely: runtime=$runtime server=$server",
+    ({ runtime, server, expected }) => {
+      const source = readFileSync(join(root, "scripts/deploy.sh"), "utf8");
+      const dir = mkdtempSync(join(tmpdir(), "yep-deploy-dispatch-"));
+      dirs.push(dir);
+      mkdirSync(join(dir, "scripts"));
+      // Run the actual dispatch branch against an argument-printing fixture.
+      // No production deploy script, launchd, port, or service is executed.
+      writeFileSync(
+        join(dir, "scripts/redeploy-server.sh"),
+        '#!/bin/zsh\nprintf "%s\\n" "$@"\n',
+        { mode: 0o755 },
+      );
+      const helperStart = source.indexOf("server_args_contain() {");
+      const helper = source.slice(
+        helperStart,
+        source.indexOf("\n}", helperStart) + 2,
+      );
+      const guard = source.slice(
+        source.indexOf("if ! $DO_SERVER && ! $DO_CODEX_BRIDGE && ! $DO_APK"),
+        source.indexOf("\nacquire_deploy_lock\n"),
+      );
+      const dispatch = source.slice(
+        source.indexOf("if $DO_DEV_SERVER; then\n  start_dev_server"),
+        source.indexOf('\nif $DO_APK; then\n  log "Building/installing APK'),
+      );
+      const result = spawnSync(
+        "/bin/zsh",
+        [
+          "-c",
+          `
+set -eu
+DO_SERVER=${server}
+DO_CODEX_BRIDGE=false
+DO_APK=false
+DO_DEV_SERVER=false
+ALLOW_YEP_SESSION_INTERRUPT=false
+SERVER_ARGS=(--restart ${runtime ? "--restart-runtime" : ""})
+log() { :; }
+warn() { :; }
+err() { print -r -- "$*" >&2; }
+${helper}
+${guard}
+${dispatch}
+`,
+        ],
+        { cwd: dir, encoding: "utf8" },
+      );
+      if (expected) {
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout.trim().split("\n")).toEqual(expected);
+      } else {
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain("Nothing to deploy");
+      }
+    },
+  );
   it("preserves installed external wiring without requiring another opt-in", () => {
     const result = run(printConfig, external);
     expect(result.status).toBe(0);

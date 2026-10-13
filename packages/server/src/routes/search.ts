@@ -19,11 +19,13 @@ import type {
 } from "../indexes/index.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
+import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
+import type { CursorSessionReader } from "../sessions/cursor-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
 import { normalizeSession } from "../sessions/normalization.js";
@@ -51,8 +53,11 @@ export interface SearchDeps {
   piReaderFactory?: (projectPath: string) => PiSessionReader;
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiScanner?: KimiSessionScanner;
+  cursorScanner?: CursorSessionScanner;
   kimiSessionsDir?: string;
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  cursorSessionsDir?: string;
+  cursorReaderFactory?: (projectPath: string) => CursorSessionReader;
 }
 
 export interface SearchMatch {
@@ -169,6 +174,7 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       geminiScanner: deps.geminiScanner,
       piScanner: deps.piScanner,
       kimiScanner: deps.kimiScanner,
+      cursorScanner: deps.cursorScanner,
     });
 
     const resolutionDeps = {
@@ -182,6 +188,8 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       piReaderFactory: deps.piReaderFactory,
       kimiSessionsDir: deps.kimiSessionsDir,
       kimiReaderFactory: deps.kimiReaderFactory,
+      cursorSessionsDir: deps.cursorSessionsDir,
+      cursorReaderFactory: deps.cursorReaderFactory,
     };
 
     // sessionId -> result (dedupe across sources/projects; first wins)

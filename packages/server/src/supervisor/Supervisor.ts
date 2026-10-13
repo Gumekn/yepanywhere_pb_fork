@@ -20,7 +20,7 @@ import type {
 } from "@yep-anywhere/shared";
 import type { FeishuMcpConfig } from "../channels/feishu/user-auth/mcp-gateway.js";
 import { getLogger } from "../logging/logger.js";
-import { getProvider } from "../sdk/providers/index.js";
+import { getAllProviders, getProvider } from "../sdk/providers/index.js";
 import { isProviderEnabled } from "../sdk/providers/policy.js";
 import type { AgentProvider } from "../sdk/providers/types.js";
 import type { ClaudeSDK, PermissionMode, UserMessage } from "../sdk/types.js";
@@ -60,6 +60,8 @@ const TERMINATED_RETENTION_MS = 10 * 60 * 1000;
 
 /** How often to check for stale processes (60 seconds) */
 const STALE_CHECK_INTERVAL_MS = 60 * 1000;
+/** Cursor authenticates and starts ACP before it can return a native session ID. */
+const CURSOR_SESSION_ID_TIMEOUT_MS = 30_000;
 
 /** Default in-turn stale threshold for providers with frequent heartbeat/tool events. */
 const DEFAULT_STALE_IN_TURN_THRESHOLD_MS = 5 * 60 * 1000;
@@ -265,6 +267,14 @@ export class Supervisor {
     if (!this.provider && !this.sdk) {
       throw new Error("Either provider or sdk must be provided");
     }
+  }
+
+  getAvailableProviderNames(): ProviderName[] {
+    return getAllProviders()
+      .filter((provider) =>
+        isProviderEnabled(provider.name, this.enabledProviders),
+      )
+      .map((provider) => provider.name);
   }
 
   private resolveProvider(modelSettings?: ModelSettings): AgentProvider | null {
@@ -602,8 +612,15 @@ export class Supervisor {
     // Wait for the real session ID from the provider
     try {
       await process.waitForSessionId(
-        activeProvider.name === "codex" ? CODEX_SESSION_ID_TIMEOUT_MS : 5000,
-        { strict: activeProvider.name === "codex" },
+        activeProvider.name === "codex"
+          ? CODEX_SESSION_ID_TIMEOUT_MS
+          : activeProvider.name === "cursor"
+            ? CURSOR_SESSION_ID_TIMEOUT_MS
+            : 5000,
+        {
+          strict:
+            activeProvider.name === "codex" || activeProvider.name === "cursor",
+        },
       );
     } catch (error) {
       await process.abort();
@@ -802,7 +819,9 @@ export class Supervisor {
       Boolean(resumeSessionId && modelSettings?.rollbackNumTurns);
     const isForkedResume = isCrossSessionEditFork || isCodexFork;
     const requiresStrictSessionId =
-      isForkedResume || activeProvider.name === "codex";
+      isForkedResume ||
+      activeProvider.name === "codex" ||
+      activeProvider.name === "cursor";
 
     // A known Codex ID does not mean thread/resume succeeded. Wait for init
     // on ordinary resumes too, so writer-lock failures reach the HTTP caller
@@ -814,7 +833,9 @@ export class Supervisor {
           ? this.nativeForkSessionIdTimeoutMs
           : activeProvider.name === "codex"
             ? CODEX_SESSION_ID_TIMEOUT_MS
-            : 5000;
+            : activeProvider.name === "cursor"
+              ? CURSOR_SESSION_ID_TIMEOUT_MS
+              : 5000;
         resolvedSessionId = await process.waitForSessionId(sessionIdTimeoutMs, {
           strict: requiresStrictSessionId,
         });

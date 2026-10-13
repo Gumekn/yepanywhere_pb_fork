@@ -22,6 +22,7 @@
   --provider-pi: #0891b2;
   --provider-kimi: #1783ff;
   --provider-zcode: #6366f1;
+  --provider-cursor: #7c3aed;
 
   /* Semantic Colors */
   --thinking-color: var(--app-claude-orange);
@@ -7512,15 +7513,15 @@ a.sidebar-nav-item {
   padding: var(--space-3);
 }
 
-.deployment-status-running {
+.settings-status-badge.deployment-status-running {
   background: var(--warning-badge-bg);
 }
 
-.deployment-status-succeeded {
+.settings-status-badge.deployment-status-succeeded {
   background: var(--success-color, var(--app-yep-green));
 }
 
-.deployment-status-failed {
+.settings-status-badge.deployment-status-failed {
   background: var(--error-color);
 }
 
@@ -9881,6 +9882,42 @@ button.context-usage-indicator--button:focus-visible {
   gap: var(--space-2);
 }
 
+.tool-approval-plan-content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-sans);
+  margin: var(--space-3) 0;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.cursor-account-summary {
+  --new-session-accent: var(--provider-cursor);
+}
+
+.cursor-account-summary .mode-option-content {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cursor-account-dot,
+.cursor-usage-card .codex-usage-progress-value {
+  background: var(--provider-cursor);
+}
+
+.cursor-usage-card .codex-account-actions {
+  align-items: center;
+}
+
+.cursor-usage-card a.codex-usage-refresh {
+  text-decoration: none;
+}
+
+.cursor-account-notice {
+  color: var(--text-primary);
+  margin: var(--space-2) 0 0;
+}
+
 .codex-usage-card {
   container: codex-usage / inline-size;
   border: 1px solid var(--border-input);
@@ -9989,7 +10026,8 @@ button.context-usage-indicator--button:focus-visible {
   margin: var(--space-2) 0 0;
 }
 
-.new-session-codex-account-section {
+.new-session-codex-account-section,
+.new-session-cursor-account-section {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
@@ -10315,6 +10353,10 @@ button.context-usage-indicator--button:focus-visible {
 
 .provider-option-dot.provider-zcode {
   background: var(--provider-zcode);
+}
+
+.provider-option-dot.provider-cursor {
+  background: var(--provider-cursor);
 }
 
 .provider-option-dot.provider-local {
@@ -11065,7 +11107,8 @@ button.context-usage-indicator--button:focus-visible {
   gap: var(--space-2);
 }
 
-.mode-option {
+.mode-option,
+.cursor-account-summary {
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -11073,10 +11116,13 @@ button.context-usage-indicator--button:focus-visible {
   background: var(--bg-code);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
-  cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
   text-align: left;
   width: 100%;
+}
+
+.mode-option {
+  cursor: pointer;
 }
 
 .mode-option:hover:not(:disabled) {
@@ -11084,7 +11130,8 @@ button.context-usage-indicator--button:focus-visible {
   border-color: var(--text-dimmed);
 }
 
-.mode-option.selected {
+.mode-option.selected,
+.cursor-account-summary.selected {
   border-color: var(--new-session-accent);
   background: color-mix(in srgb, var(--new-session-accent) 10%, transparent);
 }

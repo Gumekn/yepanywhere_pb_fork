@@ -43,6 +43,7 @@ import {
 } from "../projects/paths.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
+import { getCursorRuntimeAvailability } from "../runtime/cursor-availability.js";
 import type {
   RuntimeController,
   RuntimeProcessSnapshot,
@@ -856,6 +857,11 @@ export class SessionCommandService {
     const prepared = this.prepareNewSession(project, body);
     if (!prepared.ok) return prepared.result;
 
+    const runtimeFailure = await this.validateCursorRuntime(
+      prepared.modelSettings?.providerName,
+    );
+    if (runtimeFailure) return runtimeFailure;
+
     console.log("[startSession] Request body:", {
       provider: body.provider,
       executor: prepared.executor,
@@ -924,6 +930,11 @@ export class SessionCommandService {
 
     const prepared = this.prepareNewSession(project, body);
     if (!prepared.ok) return prepared.result;
+
+    const runtimeFailure = await this.validateCursorRuntime(
+      prepared.modelSettings?.providerName,
+    );
+    if (runtimeFailure) return runtimeFailure;
 
     const result = await this.deps.runtimeController.createSession({
       projectPath: project.path,
@@ -1268,6 +1279,8 @@ export class SessionCommandService {
         effectiveCodexForkExcludedTurns !== undefined) ||
       ((providerName === "pi" || providerName === "zcode") &&
         Boolean(body.resumeSessionAt));
+    const runtimeFailure = await this.validateCursorRuntime(providerName);
+    if (runtimeFailure) return runtimeFailure;
     const result = await this.deps.runtimeController.resumeSession({
       sessionId,
       projectPath: project.path,
@@ -2134,6 +2147,23 @@ export class SessionCommandService {
       });
     }
     return null;
+  }
+
+  private async validateCursorRuntime(
+    provider: unknown,
+  ): Promise<SessionCommandResult<never> | null> {
+    if (provider !== "cursor") return null;
+    const availability = await getCursorRuntimeAvailability(
+      this.deps.runtimeController,
+    );
+    if (availability === "ready") return null;
+    return commandFailure(
+      availability === "runtime-update-required"
+        ? "Cursor requires an updated agent runtime. Update it when active sessions can be interrupted."
+        : "The agent runtime is unavailable. Retry when it reconnects.",
+      503,
+      { code: availability },
+    );
   }
 
   private prepareNewSession(

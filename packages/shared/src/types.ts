@@ -6,6 +6,7 @@
  * - "gemini": Google Gemini via CLI
  * - "pi": Pi coding agent via its JSONL RPC mode
  * - "kimi": Kimi Code CLI via Agent Client Protocol (`kimi acp`)
+ * - "cursor": Cursor CLI via Agent Client Protocol (`agent acp`)
  */
 export type ProviderName =
   | "claude"
@@ -16,7 +17,8 @@ export type ProviderName =
   | "gemini-acp"
   | "pi"
   | "kimi"
-  | "zcode";
+  | "zcode"
+  | "cursor";
 
 /** Providers that can be registered or selected by the current product. */
 export type LiveProviderName = ProviderName;
@@ -39,6 +41,7 @@ export const ALL_PROVIDERS: readonly LiveProviderName[] = [
   "pi",
   "kimi",
   "zcode",
+  "cursor",
 ] as const;
 
 /**
@@ -101,6 +104,8 @@ export interface ReasoningEffortInfo {
 }
 
 export interface ModelInfo {
+  /** Cursor's native model parameters, from cursor/list_available_models. */
+  cursorConfigOptions?: import("./cursor.js").CursorModelConfigOption[];
   /**
    * Model identifier used in the picker. For providers that expose multiple
    * upstream channels this may be a composite `source/model`
@@ -250,6 +255,8 @@ export interface ProviderInfo {
   installed: boolean;
   authenticated: boolean;
   enabled: boolean;
+  /** A local CLI may be ready while an older external runtime cannot launch it. */
+  unavailableReason?: "runtime-update-required" | "runtime-unavailable";
   expiresAt?: string;
   user?: { email?: string; name?: string };
   /** Available models for this provider */

@@ -12,6 +12,7 @@ const PROVIDER_COLORS: Record<LiveProviderName, string> = {
   pi: "var(--provider-pi)", // Pi cyan
   kimi: "var(--provider-kimi, #1783ff)", // Kimi KMBlue
   zcode: "var(--provider-zcode)", // ZCode
+  cursor: "var(--provider-cursor)",
 };
 
 const PROVIDER_LABELS: Record<LiveProviderName, string> = {
@@ -28,6 +29,7 @@ const PROVIDER_LABELS: Record<LiveProviderName, string> = {
   pi: "Pi",
   kimi: "Kimi",
   zcode: "ZCode",
+  cursor: "Cursor",
 };
 
 interface ProviderBadgeProps {

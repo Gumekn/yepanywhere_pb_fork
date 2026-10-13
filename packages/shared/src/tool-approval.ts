@@ -1,7 +1,8 @@
 export type ToolApprovalPersistenceKind =
   | "session"
   | "command-policy"
-  | "network-policy";
+  | "network-policy"
+  | "provider-policy";
 
 export interface ToolApprovalPersistence {
   kind: ToolApprovalPersistenceKind;
@@ -21,6 +22,19 @@ export function getToolApprovalPersistence(
 ): ToolApprovalPersistence | undefined {
   const input = asRecord(toolInput);
   if (!input) return undefined;
+
+  if (input.approvalKind === "acp_tool_call") {
+    const options = input.acpPermissionOptions;
+    return Array.isArray(options) &&
+      options.some((option) => {
+        const value = asRecord(option);
+        return (
+          value?.kind === "allow_always" && typeof value.optionId === "string"
+        );
+      })
+      ? { kind: "provider-policy", response: "approve_always" }
+      : undefined;
+  }
 
   const rawDecisions = input.availableDecisions;
   const hasAvailableDecisions = Array.isArray(rawDecisions);

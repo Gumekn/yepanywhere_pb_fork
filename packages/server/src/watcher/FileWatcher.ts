@@ -304,6 +304,10 @@ export class FileWatcher {
       case "zcode":
         // P2: parse ZCode SQLite session file types.
         return "other";
+      case "cursor":
+        return /(?:^|\/)(?:store\.db(?:-wal)?|meta\.json)$/.test(relativePath)
+          ? "session"
+          : "other";
     }
   }
 

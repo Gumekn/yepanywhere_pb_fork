@@ -743,7 +743,7 @@ export class SessionDisplayReducer {
           } else if (
             block.type === "thinking" &&
             typeof block.thinking === "string" &&
-            this.provider === "pi"
+            (this.provider === "pi" || this.provider === "cursor")
           ) {
             this.text(
               `thinking:${identity}:${index}`,

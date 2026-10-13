@@ -3,6 +3,10 @@ import type { ISessionIndexService } from "../indexes/types.js";
 import { canonicalizeProjectPath } from "../projects/paths.js";
 import type { Project, SessionSummary } from "../supervisor/types.js";
 import { CodexSessionReader } from "./codex-reader.js";
+import {
+  CURSOR_ACP_SESSIONS_DIR,
+  CursorSessionReader,
+} from "./cursor-reader.js";
 import { collapseEditForkFamilies } from "./edit-fork-families.js";
 import { GeminiSessionReader } from "./gemini-reader.js";
 import { KimiSessionReader } from "./kimi-reader.js";
@@ -23,6 +27,7 @@ export interface ProviderProjectCatalog {
   piPaths: Set<string>;
   kimiPaths: Set<string>;
   zcodePaths: Set<string>;
+  cursorPaths: Set<string>;
   geminiHashToCwd?: Promise<Map<string, string>>;
   codexSessionsByPath?: Map<string, SessionSummary[]>;
 }
@@ -39,6 +44,8 @@ export interface ProviderResolutionDeps {
   piReaderFactory?: (projectPath: string) => PiSessionReader;
   kimiSessionsDir?: string;
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  cursorSessionsDir?: string;
+  cursorReaderFactory?: (projectPath: string) => CursorSessionReader;
   zcodeDbPath?: string;
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   allowStaleSessionCache?: boolean;
@@ -55,7 +62,7 @@ export interface SessionSource {
   provider: ProviderName;
   reader: ISessionReader;
   sessionDir: string;
-  kind: "primary" | "codex" | "gemini" | "pi" | "kimi" | "zcode";
+  kind: "primary" | "codex" | "gemini" | "pi" | "kimi" | "zcode" | "cursor";
 }
 
 export interface ResolvedSessionSummary {
@@ -109,6 +116,24 @@ function mayHavePiSessions(
   }
   const provider = normalizeProviderGroup(project.provider);
   return provider === "claude" || provider === "codex" || provider === "gemini";
+}
+
+function mayHaveCursorSessions(
+  project: Project,
+  catalog?: ProviderProjectCatalog,
+): boolean {
+  if (catalog) {
+    return catalog.cursorPaths.has(canonicalizeProjectPath(project.path));
+  }
+  const provider = normalizeProviderGroup(project.provider);
+  return (
+    provider === "claude" ||
+    provider === "codex" ||
+    provider === "gemini" ||
+    provider === "pi" ||
+    provider === "kimi" ||
+    provider === "zcode"
+  );
 }
 
 function mayHaveZCodeSessions(
@@ -269,6 +294,9 @@ function buildCandidateGroups(
   if (mayHaveZCodeSessions(project, catalog)) {
     pushGroup("zcode");
   }
+  if (mayHaveCursorSessions(project, catalog)) {
+    pushGroup("cursor");
+  }
 
   return groups;
 }
@@ -292,7 +320,28 @@ function getSourceForGroup(
       return createKimiSource(project, deps);
     case "zcode":
       return createZCodeSource(project, deps);
+    case "cursor":
+      return createCursorSource(project, deps);
   }
+}
+
+function createCursorSource(
+  project: Project,
+  deps: ProviderResolutionDeps,
+): SessionSource {
+  const sessionsDir = deps.cursorSessionsDir ?? CURSOR_ACP_SESSIONS_DIR;
+  const reader =
+    deps.cursorReaderFactory?.(project.path) ??
+    new CursorSessionReader({
+      sessionsDir,
+      projectPath: project.path,
+    });
+  return {
+    provider: "cursor",
+    reader,
+    sessionDir: sessionsDir,
+    kind: "cursor",
+  };
 }
 
 function getSessionSources(

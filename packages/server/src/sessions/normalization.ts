@@ -500,6 +500,50 @@ export function normalizeSession(
         ...summary,
         messages: convertKimiMessages(data.session),
       });
+    case "cursor": {
+      let cursorTurnIndex = 0;
+      return sanitizePublicNormalizedSession({
+        ...summary,
+        messages: data.session.messages.map((message) => {
+          if (message.role === "user") cursorTurnIndex += 1;
+          const turnId = `cursor-turn-${cursorTurnIndex}`;
+          if (message.blocks) {
+            const role = message.role === "assistant" ? "assistant" : "user";
+            return {
+              type: role,
+              uuid: message.id,
+              cursorTurnIndex,
+              turnId,
+              message: { role, content: message.blocks },
+            };
+          }
+          if (message.role === "user") {
+            return {
+              type: "user",
+              uuid: message.id,
+              cursorTurnIndex,
+              turnId,
+              message: { role: "user", content: message.text },
+            };
+          }
+          const content = message.reasoning
+            ? [
+                { type: "thinking" as const, thinking: message.reasoning },
+                ...(message.text
+                  ? [{ type: "text" as const, text: message.text }]
+                  : []),
+              ]
+            : message.text;
+          return {
+            type: "assistant",
+            uuid: message.id,
+            cursorTurnIndex,
+            turnId,
+            message: { role: "assistant", content },
+          };
+        }),
+      });
+    }
     case "zcode": {
       const messages = convertZCodeMessages(data.session);
       return sanitizePublicNormalizedSession({

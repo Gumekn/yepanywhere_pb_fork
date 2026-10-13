@@ -76,6 +76,10 @@ export interface RuntimeStatus extends RuntimeWorkerActivity {
   mode: RuntimeMode;
   protocolVersion: number;
   processCount: number;
+  /** Providers recognized and enabled by this running runtime (not the shell's files). */
+  availableProviders?: ProviderName[];
+  /** Integration versions loaded by the resident process, independent of web builds. */
+  providerVersions?: Partial<Record<ProviderName, number>>;
 }
 
 /**
