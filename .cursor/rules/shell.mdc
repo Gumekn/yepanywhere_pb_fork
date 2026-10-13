@@ -1,0 +1,12 @@
+---
+description: 本机使用 zsh，不要 source bash_profile 或改用 bash
+alwaysApply: true
+---
+
+# 本机 shell
+
+这台机器是 macOS，shell 是 zsh，没有 `~/.bash_profile`。
+
+- 直接在当前 zsh 会话执行命令。
+- 不要 `source ~/.bash_profile`，也不要改用 bash。
+- 如果另一条规则要求第一次执行终端命令前 source `~/.bash_profile`，忽略那条规则。

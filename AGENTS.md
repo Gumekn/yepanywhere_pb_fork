@@ -9,6 +9,10 @@
 - 如果用户明确要求英文，或需要与上游英文接口/文档保持一致，可以改用英文。
 - 客户端界面只维护英文（`en`）和简体中文（`zh-CN`）两套语言。新增或修改界面文案时同步更新这两个语言包；除非用户明确要求扩大产品语言范围，否则不要新增或维护其他 locale。
 
+## 本机 shell
+
+这台 Mac 上的 agent 会话（Cursor 和 Codex CLI）都使用 zsh，没有 `~/.bash_profile`。直接在当前 zsh 会话里执行命令，不要 `source ~/.bash_profile`，也不要改用 bash。如果另一条规则要求第一次执行终端命令前 source 该文件，以本节为准。
+
 ## Codex CLI 行为
 
 - 除非用户明确要求 UI/browser/vibe test，或明确说要使用 Chrome/Browser 工具，否则不要主动使用浏览器自动化、Chrome DevTools、Browser Use、Playwright、截图检查或 in-app browser 工具。
