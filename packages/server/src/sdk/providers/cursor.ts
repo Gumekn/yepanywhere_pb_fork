@@ -26,6 +26,11 @@ import { ACPClient } from "./acp/client.js";
 import { cursorAccountService } from "./cursor-account.js";
 import { findCursorAgentPath } from "./cursor-cli.js";
 import { cursorStreamError } from "./cursor-errors.js";
+import {
+  CURSOR_ACP_CLIENT_CAPABILITIES,
+  applyCursorModelParameters,
+  cursorLaunchModel,
+} from "./cursor-model-selection.js";
 import { loadCursorModelCatalog } from "./cursor-models.js";
 import { claimCursorPrepare } from "./cursor-prepare.js";
 import type {
@@ -318,15 +323,12 @@ export class CursorProvider implements AgentProvider {
     try {
       if (!handoff) {
         const args = ["acp"];
-        if (options.model) {
-          args.unshift("--model", options.model);
+        const launchModel = cursorLaunchModel(options.model);
+        if (launchModel) {
+          args.unshift("--model", launchModel);
         }
         await client.connect({ command: agentPath, args, cwd: options.cwd });
-        await client.initialize({
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-          _meta: { subagents: {} },
-        });
+        await client.initialize(CURSOR_ACP_CLIENT_CAPABILITIES);
         await client.authenticate("cursor_login");
       }
 
@@ -352,6 +354,7 @@ export class CursorProvider implements AgentProvider {
         sessionId,
         toCursorMode(options.permissionMode),
       );
+      await applyCursorModelParameters(client, sessionId, options.model);
 
       yield {
         type: "system",

@@ -2,9 +2,12 @@
  * Warm Cursor ACP processes so sending a message does not pay for
  * authenticate + newSession on the critical path.
  *
- * One process is bound to one model (`--model` is a startup flag) and, after
- * newSession, to one chat. Resume reuses an already authenticated idle process
- * and still has to loadSession.
+ * One process is bound to one model family (`--model` is a startup flag) and,
+ * after newSession, to one chat. Parameterized selections launch the base id;
+ * the session applies each option before the first prompt. A new or resumed
+ * session with no prepared chat claims an already authenticated idle process
+ * and only pays for newSession or loadSession. These maps live in the process
+ * that calls them, so external mode must prepare and warm inside the runtime.
  */
 
 import { rm, stat } from "node:fs/promises";
@@ -16,6 +19,10 @@ import { canonicalizeProjectPath } from "../../projects/paths.js";
 import { CURSOR_ACP_SESSIONS_DIR } from "../../sessions/cursor-reader.js";
 import { ACPClient } from "./acp/client.js";
 import { findCursorAgentPath } from "./cursor-cli.js";
+import {
+  CURSOR_ACP_CLIENT_CAPABILITIES,
+  cursorLaunchModel,
+} from "./cursor-model-selection.js";
 
 const log = getLogger();
 const PREPARE_TTL_MS = 10 * 60 * 1000;
@@ -71,17 +78,14 @@ async function connectAuthenticated(
   const client = new ACPClient();
   try {
     const args = ["acp"];
-    if (model) args.unshift("--model", model);
+    const launchModel = cursorLaunchModel(model);
+    if (launchModel) args.unshift("--model", launchModel);
     await client.connect({
       command: agentPath,
       args,
       cwd: cwd ?? homedir(),
     });
-    await client.initialize({
-      fs: { readTextFile: false, writeTextFile: false },
-      terminal: false,
-      _meta: { subagents: {} },
-    });
+    await client.initialize(CURSOR_ACP_CLIENT_CAPABILITIES);
     await client.authenticate("cursor_login");
     return client;
   } catch (error) {
@@ -213,47 +217,54 @@ export function warmCursorAuth(model?: string): Promise<void> {
   return promise.then(() => undefined);
 }
 
+async function claimIdleClient(
+  model: string | undefined,
+): Promise<ACPClient | null> {
+  const key = modelKey(model);
+  const idle = idleClients.get(key);
+  if (!idle) return null;
+  idleClients.delete(key);
+  try {
+    const client = await idle.promise;
+    void warmCursorAuth(model).catch((error) => {
+      log.warn({ err: error }, "Cursor auth warm failed");
+    });
+    return client;
+  } catch (error) {
+    log.warn({ err: error }, "Cursor warm claim failed");
+    return null;
+  }
+}
+
 export async function claimCursorPrepare(input: {
   cwd: string;
   model?: string;
   permissionMode?: PermissionMode;
   resumeSessionId?: string;
 }): Promise<CursorPrepareClaim | null> {
-  if (input.resumeSessionId) {
-    const key = modelKey(input.model);
-    const idle = idleClients.get(key);
-    if (!idle) return null;
-    idleClients.delete(key);
-    try {
-      const client = await idle.promise;
-      void warmCursorAuth(input.model).catch((error) => {
-        log.warn({ err: error }, "Cursor auth warm failed");
-      });
-      return { client };
-    } catch (error) {
-      log.warn({ err: error }, "Cursor resume warm claim failed");
-      return null;
+  if (!input.resumeSessionId) {
+    const id = prepareKey(input.cwd, input.model);
+    const slot = slots.get(id);
+    if (slot) {
+      slots.delete(id);
+      try {
+        const prepared = await slot.promise;
+        await applyMode(prepared, input.permissionMode);
+        void warmCursorAuth(input.model).catch((error) => {
+          log.warn({ err: error }, "Cursor auth warm failed");
+        });
+        return { client: prepared.client, sessionId: prepared.sessionId };
+      } catch (error) {
+        log.warn({ err: error }, "Cursor prepare claim failed");
+        await slot.promise
+          .then((prepared) => prepared.client.close())
+          .catch(() => undefined);
+      }
     }
   }
 
-  const id = prepareKey(input.cwd, input.model);
-  const slot = slots.get(id);
-  if (!slot) return null;
-  slots.delete(id);
-  try {
-    const prepared = await slot.promise;
-    await applyMode(prepared, input.permissionMode);
-    void warmCursorAuth(input.model).catch((error) => {
-      log.warn({ err: error }, "Cursor auth warm failed");
-    });
-    return { client: prepared.client, sessionId: prepared.sessionId };
-  } catch (error) {
-    log.warn({ err: error }, "Cursor prepare claim failed");
-    await slot.promise
-      .then((prepared) => prepared.client.close())
-      .catch(() => undefined);
-    return null;
-  }
+  const client = await claimIdleClient(input.model);
+  return client ? { client } : null;
 }
 
 /**

@@ -21,6 +21,7 @@ import {
   type PromptResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
+  type SessionConfigOption,
   type SessionNotification,
   type SetSessionConfigOptionResponse,
   ndJsonStream,
@@ -72,6 +73,8 @@ export class ACPClient {
   private process: ChildProcess | null = null;
   private connection: ClientSideConnection | null = null;
   private log = getLogger();
+  /** Latest config options reported by the agent, keyed by session id. */
+  private sessionConfigOptions = new Map<string, SessionConfigOption[]>();
 
   /** OS PID of the spawned ACP agent child process */
   get pid(): number | undefined {
@@ -303,6 +306,9 @@ export class ACPClient {
     });
 
     this.log.debug({ sessionId: result.sessionId }, "ACP session created");
+    if (result.configOptions) {
+      this.sessionConfigOptions.set(result.sessionId, result.configOptions);
+    }
     return result.sessionId;
   }
 
@@ -317,11 +323,24 @@ export class ACPClient {
 
     this.log.debug({ sessionId, cwd }, "Loading existing ACP session");
 
-    await this.connection.loadSession({
+    const result = await this.connection.loadSession({
       sessionId,
       cwd,
       mcpServers: [],
     });
+    if (result?.configOptions) {
+      this.sessionConfigOptions.set(sessionId, result.configOptions);
+    }
+  }
+
+  /**
+   * Config options last reported for a session (from new/load or the latest
+   * set_config_option response). Undefined when the agent never reported any.
+   */
+  getSessionConfigOptions(
+    sessionId: string,
+  ): SessionConfigOption[] | undefined {
+    return this.sessionConfigOptions.get(sessionId);
   }
 
   /**
@@ -381,11 +400,13 @@ export class ACPClient {
       { sessionId, configId, value },
       "Setting ACP session config option",
     );
-    return this.connection.setSessionConfigOption({
+    const result = await this.connection.setSessionConfigOption({
       sessionId,
       configId,
       value,
     });
+    this.sessionConfigOptions.set(sessionId, result.configOptions);
+    return result;
   }
 
   /**

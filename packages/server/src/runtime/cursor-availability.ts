@@ -1,6 +1,6 @@
 import type { RuntimeController } from "./types.js";
 
-export const CURSOR_RUNTIME_VERSION = 2;
+export const CURSOR_RUNTIME_VERSION = 3;
 
 /** Provider discovery alone cannot prove that a resident runtime has current fixes. */
 export async function getCursorRuntimeAvailability(

@@ -104,11 +104,16 @@ export function createProvidersRoutes(deps: ProviderRouteDeps = {}): Hono {
     const cwd = cursorPrepareCwd(body);
     if (!cwd) return c.json({ error: "projectId is required" }, 400);
     try {
-      await prepareCursorSession({
+      const input = {
         cwd,
         model: stringField(body, "model"),
         permissionMode: cursorPermissionMode(body.permissionMode),
-      });
+      };
+      if (deps.runtimeController?.mode === "external") {
+        await deps.runtimeController.prepareCursorSession(input);
+      } else {
+        await prepareCursorSession(input);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Prepare failed";
       return c.json({ error: message }, 503);
@@ -122,7 +127,12 @@ export function createProvidersRoutes(deps: ProviderRouteDeps = {}): Hono {
     const body = await readJsonObject(c);
     const cwd = cursorPrepareCwd(body);
     if (!cwd) return c.json({ error: "projectId is required" }, 400);
-    await discardCursorPrepare({ cwd, model: stringField(body, "model") });
+    const input = { cwd, model: stringField(body, "model") };
+    if (deps.runtimeController?.mode === "external") {
+      await deps.runtimeController.discardCursorPrepare(input);
+    } else {
+      await discardCursorPrepare(input);
+    }
     return c.json({ ok: true });
   });
 
@@ -130,7 +140,12 @@ export function createProvidersRoutes(deps: ProviderRouteDeps = {}): Hono {
     if (!isProviderEnabled("cursor", deps.enabledProviders))
       return c.json({ error: "Provider not found" }, 404);
     const body = await readJsonObject(c);
-    void warmCursorAuth(stringField(body, "model")).catch(() => undefined);
+    const model = stringField(body, "model");
+    if (deps.runtimeController?.mode === "external") {
+      void deps.runtimeController.warmCursorAuth(model).catch(() => undefined);
+    } else {
+      void warmCursorAuth(model).catch(() => undefined);
+    }
     return c.json({ ok: true });
   });
 

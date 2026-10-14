@@ -56,6 +56,25 @@ export function createRuntimeControlApp(
     await controller.updateProviderSettings(body);
     return c.json({ ok: true });
   });
+  app.post("/cursor/prepare", async (c) => {
+    const body = await c.req.json<{
+      cwd: string;
+      model?: string;
+      permissionMode?: RuntimePermissionModeRequest["mode"];
+    }>();
+    await controller.prepareCursorSession(body);
+    return c.json({ ok: true });
+  });
+  app.post("/cursor/prepare/discard", async (c) => {
+    const body = await c.req.json<{ cwd: string; model?: string }>();
+    await controller.discardCursorPrepare(body);
+    return c.json({ ok: true });
+  });
+  app.post("/cursor/warm", async (c) => {
+    const body = await c.req.json<{ model?: string }>();
+    await controller.warmCursorAuth(body.model);
+    return c.json({ ok: true });
+  });
   app.get("/processes", async (c) =>
     c.json({ processes: await controller.listProcesses() }),
   );

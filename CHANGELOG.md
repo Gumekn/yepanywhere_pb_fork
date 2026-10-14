@@ -20,6 +20,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ### Changed
 - 修复 Cursor 会话上下文压缩后历史顺序错乱：压缩前的提问、工具调用和中间说明排到最终回复之后，看起来像停在半路。现在先展示压缩前的历史，再显示「上下文已压缩」分隔，最后是压缩后的继续工作和最终回复；压缩时重复带上的提问不再重复显示，摘要也不再算作用户提问。
+- 修复 Cursor 新建和续接会话时，上下文窗口、推理力度和 Fast 只写进 `--model`、实际仍落到默认档（例如 Grok 4.7 的 256K High Fast）的问题。启动时声明 parameterized model picker，会话建立后用 `session/set_config_option` 写入并核对每一项；CLI 未保持所选值时会话启动失败，不再静默使用默认窗口。
 - Cursor 选好项目和模型后预先完成认证并创建会话，发送时直接提问；表单关掉且还没发送时，只删除没有 `store.db` 的预备目录。续接复用已经认证的空闲进程。模型目录在后台刷新，不再挡住整个 provider 列表；只有选中 Cursor 且目录为空时，模型选择器才等待加载。
 - Cursor 会话写入 `~/.cursor/acp-sessions` 后，侧栏会更新标题和消息数。回合结束后保留本轮思考正文，日志还在时重新打开可以恢复；落盘签名无法解密，过期后不再补写思考内容。
 - Cursor 的待办、子任务和生图通知显示为现有工具卡片。子任务没有子会话记录，因此不能点进子会话。
@@ -56,6 +57,8 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - 收紧新建会话页 Codex 用量卡片的留白：账号块、用量窗口、进度条、额外限额等区块的间距和内边距整体下调一档，多账号时卡片高度明显降低，信息密度更高，不影响布局结构与移动端单列回退。
 
 ### Fixed
+- 修复外置 runtime 下 Cursor 新建会话仍然冷启动、容易撞上 30 秒初始化超时：新建页的预备和登录预热原来发生在 web/API 进程，真正的 `startSession` 在 runtime 进程，两边的进程池互不可见。现在 `prepare`、`discard`、`warm` 都转到 runtime 里执行；没有预备好的会话时，新建会领用该模型已经登录的空闲 `agent acp`，只补一次 `session/new`。旧 runtime 会提示需要更新（Cursor 集成版本 3）。
+- 修复 Cursor 选了带参数的模型（如 Grok 4.7 500K High 非 Fast）后新建会话发送失败、报 `Provider initialization timed out after 30000ms`：之前每次启动固定写 7 次 `session/set_config_option`（每次约 2–3 秒），加上认证和建会话超过 30 秒初始化上限。现在只写和当前值不一致的选项，全部对上就停，并直接用 `session/new`／`session/load` 返回的配置跳过多余的模型写入；本机实测启动从约 28 秒降到约 6 秒。
 - 修复 Cursor 会话开头用户原文要等原生记录写入后才出现：在 `<user_query>` 可读之前保留已注入的用户消息，并放在该回合的工具和回复之前；原生记录对齐后去掉重复气泡。
 - 修复 Cursor 思维链在回合结束后落到正文下面：原生历史只保留加密签名时，按 runtime 日志把每条思考放回它后面的回复或工具调用之前。
 

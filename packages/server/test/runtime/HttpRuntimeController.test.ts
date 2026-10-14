@@ -268,6 +268,48 @@ describe("HttpRuntimeController", () => {
     });
   });
 
+  it("runs Cursor prepare inside the resident runtime", async () => {
+    const prepareCursorSession = vi.fn(async () => undefined);
+    const discardCursorPrepare = vi.fn(async () => undefined);
+    const warmCursorAuth = vi.fn(async () => undefined);
+    const app = createRuntimeControlApp({
+      controller: {
+        prepareCursorSession,
+        discardCursorPrepare,
+        warmCursorAuth,
+      } as unknown as RuntimeController,
+      token: "runtime-test-token",
+    });
+    const controller = new HttpRuntimeController({
+      baseUrl: "http://runtime.test",
+      token: "runtime-test-token",
+      fetch: (input, init) =>
+        app.fetch(input instanceof Request ? input : new Request(input, init)),
+    });
+
+    await controller.prepareCursorSession({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+      permissionMode: "plan",
+    });
+    await controller.discardCursorPrepare({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+    });
+    await controller.warmCursorAuth("auto");
+
+    expect(prepareCursorSession).toHaveBeenCalledWith({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+      permissionMode: "plan",
+    });
+    expect(discardCursorPrepare).toHaveBeenCalledWith({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+    });
+    expect(warmCursorAuth).toHaveBeenCalledWith("auto");
+  });
+
   it("round-trips immediate admission without entering the external runtime queue", async () => {
     const { controller } = createHarness({ maxWorkers: 1 });
     await controller.start();

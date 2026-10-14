@@ -11,6 +11,11 @@ import {
   codexControlFailure,
 } from "../sdk/providers/codex-controls.js";
 import {
+  discardCursorPrepare as discardCursorPrepareState,
+  prepareCursorSession as prepareCursorSessionState,
+  warmCursorAuth as warmCursorAuthState,
+} from "../sdk/providers/cursor-prepare.js";
+import {
   codexProvider,
   configureClaudeRemoteExecutors,
 } from "../sdk/providers/index.js";
@@ -206,6 +211,25 @@ export class EmbeddedRuntimeController implements RuntimeController {
 
   async getWorkerActivity(): Promise<RuntimeWorkerActivity> {
     return this.supervisor.getWorkerActivity();
+  }
+
+  async prepareCursorSession(input: {
+    cwd: string;
+    model?: string;
+    permissionMode?: PermissionMode;
+  }): Promise<void> {
+    await prepareCursorSessionState(input);
+  }
+
+  async discardCursorPrepare(input: {
+    cwd: string;
+    model?: string;
+  }): Promise<void> {
+    await discardCursorPrepareState(input);
+  }
+
+  async warmCursorAuth(model?: string): Promise<void> {
+    await warmCursorAuthState(model);
   }
 
   async listProcesses(): Promise<ProcessInfo[]> {

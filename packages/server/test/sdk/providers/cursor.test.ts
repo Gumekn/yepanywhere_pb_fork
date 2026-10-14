@@ -46,6 +46,21 @@ beforeEach(() => {
   vi.spyOn(ACPClient.prototype, "authenticate").mockResolvedValue();
   vi.spyOn(ACPClient.prototype, "newSession").mockResolvedValue("cursor-test");
   vi.spyOn(ACPClient.prototype, "setSessionMode").mockResolvedValue();
+  const selected = new Map<string, string>();
+  vi.spyOn(ACPClient.prototype, "setSessionConfigOption").mockImplementation(
+    async (_sessionId, configId, value) => {
+      selected.set(configId, value);
+      return {
+        configOptions: [...selected.entries()].map(([id, currentValue]) => ({
+          id,
+          name: id,
+          type: "select" as const,
+          currentValue,
+          options: [{ value: currentValue, name: currentValue }],
+        })),
+      };
+    },
+  );
   vi.spyOn(ACPClient.prototype, "close").mockImplementation(() => {});
   vi.spyOn(ACPClient.prototype, "cancel").mockResolvedValue();
   vi.spyOn(ACPClient.prototype, "setSessionUpdateCallback").mockImplementation(
@@ -125,7 +140,7 @@ describe("Cursor ACP lifecycle", () => {
       }),
     );
   });
-  it("passes the saved parameterized model to the CLI unchanged", async () => {
+  it("launches a parameterized model by base id and applies each option", async () => {
     const model = "gpt-5.6-sol[context=1m,reasoning=xhigh,fast=true]";
     const session = await start({ model, permissionMode: "plan" });
     expect((await session.iterator.next()).value).toMatchObject({
@@ -134,12 +149,83 @@ describe("Cursor ACP lifecycle", () => {
     });
     expect(ACPClient.prototype.connect).toHaveBeenCalledWith(
       expect.objectContaining({
-        args: expect.arrayContaining(["--model", model, "acp"]),
+        args: expect.arrayContaining(["--model", "gpt-5.6-sol", "acp"]),
+      }),
+    );
+    expect(ACPClient.prototype.initialize).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _meta: { subagents: {}, parameterizedModelPicker: true },
       }),
     );
     expect(ACPClient.prototype.setSessionMode).toHaveBeenCalledWith(
       "cursor-test",
       "plan",
+    );
+    expect(ACPClient.prototype.setSessionConfigOption).toHaveBeenNthCalledWith(
+      1,
+      "cursor-test",
+      "model",
+      "gpt-5.6-sol",
+    );
+    expect(ACPClient.prototype.setSessionConfigOption).toHaveBeenNthCalledWith(
+      2,
+      "cursor-test",
+      "context",
+      "1m",
+    );
+    expect(ACPClient.prototype.setSessionConfigOption).toHaveBeenNthCalledWith(
+      4,
+      "cursor-test",
+      "fast",
+      "true",
+    );
+    expect(ACPClient.prototype.setSessionConfigOption).toHaveBeenCalledTimes(4);
+  });
+  it("fails startup when Cursor does not keep the selected context window", async () => {
+    vi.spyOn(ACPClient.prototype, "setSessionConfigOption").mockResolvedValue({
+      configOptions: [
+        {
+          id: "context",
+          name: "Context",
+          type: "select",
+          currentValue: "256k",
+          options: [{ value: "256k", name: "256k" }],
+        },
+      ],
+    });
+    const session = await start({
+      model: "grok-4.7[context=500k,reasoning_effort=high,fast=false]",
+    });
+    expect((await session.iterator.next()).value).toMatchObject({
+      type: "error",
+      error: expect.stringContaining("context=500k"),
+    });
+  });
+  it("applies selected parameters on a prepared session before the first prompt", async () => {
+    const model = "grok-4.7[context=500k,reasoning_effort=high,fast=false]";
+    await prepareCursorSession({ cwd: "/test", model });
+    expect(ACPClient.prototype.connect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        args: expect.arrayContaining(["--model", "grok-4.7", "acp"]),
+      }),
+    );
+    expect(ACPClient.prototype.newSession).toHaveBeenCalledTimes(1);
+    vi.mocked(ACPClient.prototype.setSessionConfigOption).mockClear();
+    const session = await start({ model });
+    expect((await session.iterator.next()).value).toMatchObject({
+      type: "system",
+      model,
+    });
+    expect(ACPClient.prototype.newSession).toHaveBeenCalledTimes(1);
+    expect(ACPClient.prototype.setSessionConfigOption).toHaveBeenCalledWith(
+      "cursor-test",
+      "context",
+      "500k",
+    );
+    expect(ACPClient.prototype.setSessionConfigOption).toHaveBeenCalledWith(
+      "cursor-test",
+      "fast",
+      "false",
     );
   });
   it("streams cumulative text before completion and emits one terminal result", async () => {
@@ -486,6 +572,23 @@ describe("Cursor ACP lifecycle", () => {
       "/test",
     );
     expect(ACPClient.prototype.newSession).not.toHaveBeenCalled();
+  });
+
+  it("starts a new session on an already authenticated idle process", async () => {
+    vi.spyOn(ACPClient.prototype, "prompt").mockResolvedValue({
+      stopReason: "end_turn",
+    });
+    await warmCursorAuth("auto");
+    const session = await start({ model: "auto" });
+    expect((await session.iterator.next()).value).toMatchObject({
+      type: "system",
+      session_id: "cursor-test",
+    });
+    expect(ACPClient.prototype.connect).not.toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: "/test" }),
+    );
+    expect(ACPClient.prototype.newSession).toHaveBeenCalledTimes(1);
+    expect(ACPClient.prototype.newSession).toHaveBeenCalledWith("/test");
   });
 
   it("returns the cached model list without waiting for a cold catalog", async () => {

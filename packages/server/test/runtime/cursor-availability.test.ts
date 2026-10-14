@@ -5,7 +5,7 @@ import {
 } from "../../src/runtime/cursor-availability.js";
 
 describe("resident Cursor integration version", () => {
-  it.each([undefined, 0, 1, CURSOR_RUNTIME_VERSION])(
+  it.each([undefined, 0, 1, 2, CURSOR_RUNTIME_VERSION])(
     "checks the resident capability version %s, not only the provider name",
     async (version) => {
       expect(

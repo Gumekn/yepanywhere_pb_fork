@@ -245,6 +245,17 @@ export interface RuntimeController {
   resumeSession(
     input: ResumeRuntimeSessionRequest,
   ): Promise<RuntimeSessionStartResponse>;
+  /**
+   * Cursor prepare/warm state is in-memory and only useful in the process that
+   * later claims it. External mode must run these inside the resident runtime.
+   */
+  prepareCursorSession(input: {
+    cwd: string;
+    model?: string;
+    permissionMode?: PermissionMode;
+  }): Promise<void>;
+  discardCursorPrepare(input: { cwd: string; model?: string }): Promise<void>;
+  warmCursorAuth(model?: string): Promise<void>;
   queueMessage(
     input: QueueRuntimeMessageRequest,
   ): Promise<RuntimeQueueMessageResponse>;

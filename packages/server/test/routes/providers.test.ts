@@ -50,6 +50,59 @@ describe("provider routes", () => {
     const account = await app.request("/cursor/account?fresh=1");
     expect(account.status).toBe(200);
     expect(getCursorAccount).toHaveBeenCalledWith({ fresh: true });
+    const prepareCursorSession = vi.fn(async () => undefined);
+    const discardCursorPrepare = vi.fn(async () => undefined);
+    const warmCursorAuth = vi.fn(async () => undefined);
+    const projectId = encodeProjectId("/tmp/cursor-prepare");
+    const forwarded = createProvidersRoutes({
+      runtimeController: {
+        mode: "external",
+        prepareCursorSession,
+        discardCursorPrepare,
+        warmCursorAuth,
+      } as unknown as RuntimeController,
+    });
+    expect(
+      (
+        await forwarded.request("/cursor/prepare", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            projectId,
+            model: "auto",
+            permissionMode: "plan",
+          }),
+        })
+      ).status,
+    ).toBe(200);
+    expect(prepareCursorSession).toHaveBeenCalledWith({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+      permissionMode: "plan",
+    });
+    expect(
+      (
+        await forwarded.request("/cursor/prepare/discard", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ projectId, model: "auto" }),
+        })
+      ).status,
+    ).toBe(200);
+    expect(discardCursorPrepare).toHaveBeenCalledWith({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+    });
+    expect(
+      (
+        await forwarded.request("/cursor/warm", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "auto" }),
+        })
+      ).status,
+    ).toBe(200);
+    await vi.waitFor(() => expect(warmCursorAuth).toHaveBeenCalledWith("auto"));
     expect(
       (
         await createProvidersRoutes({

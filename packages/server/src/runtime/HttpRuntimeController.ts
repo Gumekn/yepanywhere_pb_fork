@@ -230,6 +230,34 @@ export class HttpRuntimeController implements RuntimeController {
     });
   }
 
+  async prepareCursorSession(input: {
+    cwd: string;
+    model?: string;
+    permissionMode?: PermissionMode;
+  }): Promise<void> {
+    await this.request("/cursor/prepare", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async discardCursorPrepare(input: {
+    cwd: string;
+    model?: string;
+  }): Promise<void> {
+    await this.request("/cursor/prepare/discard", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async warmCursorAuth(model?: string): Promise<void> {
+    await this.request("/cursor/warm", {
+      method: "POST",
+      body: JSON.stringify({ model }),
+    });
+  }
+
   async queueMessage(
     input: QueueRuntimeMessageRequest,
   ): Promise<RuntimeQueueMessageResponse> {
