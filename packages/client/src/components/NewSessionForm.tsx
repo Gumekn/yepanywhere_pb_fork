@@ -93,7 +93,6 @@ interface PendingFile {
 }
 
 const CODEX_MCP_MODE_ORDER: CodexMcpMode[] = ["clear", "standard", "full"];
-const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 
 const NEW_SESSION_PROVIDER_ACCENTS = {
   claude: "var(--provider-claude)",
@@ -206,17 +205,11 @@ function formatContextWindow(tokens: number): string {
 function getPreferredModelId(
   models: ModelInfo[],
   preferredModelId?: string | null,
-  fallbackModelId?: string,
 ) {
   const configuredModelId = preferredModelId ?? resolveModel(getModelSetting());
 
   if (!configuredModelId) {
-    return (
-      models.find((m) => m.id === "default")?.id ??
-      models[0]?.id ??
-      models.find((m) => m.id === fallbackModelId)?.id ??
-      null
-    );
+    return models.find((m) => m.id === "default")?.id ?? models[0]?.id ?? null;
   }
 
   if (configuredModelId) {
@@ -245,9 +238,7 @@ function getPreferredModelId(
     }
   }
 
-  return (
-    models.find((m) => m.id === fallbackModelId)?.id ?? models[0]?.id ?? null
-  );
+  return models[0]?.id ?? null;
 }
 
 function getPreferredGatewayModelId(
@@ -731,7 +722,6 @@ export function NewSessionForm({
               codexPreferredModel ??
                 savedDefaults?.model ??
                 provider.currentModel,
-              providerName === "codex" ? DEFAULT_CODEX_MODEL : undefined,
             );
 
       setSelectedProvider(providerName);

@@ -145,6 +145,38 @@ describe("Codex new session reasoning", () => {
     },
   );
 
+  it("uses the provider model catalog when no model is saved", async () => {
+    vi.mocked(useProviders).mockReturnValue({
+      providers: [
+        {
+          ...provider,
+          models: [
+            { id: "official-model", name: "Official Provider Model" },
+            { id: "second-model", name: "Second Provider Model" },
+          ],
+        },
+      ],
+      loading: false,
+      error: null,
+      refetch: vi.fn(),
+    });
+    vi.mocked(useServerSettings).mockReturnValue({
+      settings: {
+        newSessionDefaults: { provider: "codex" },
+      } as ServerSettings,
+      isLoading: false,
+      error: null,
+      updateSetting: vi.fn(),
+      refetch: vi.fn(),
+    });
+
+    renderForm(false);
+
+    expect(
+      await screen.findByRole("button", { name: "Official Provider Model" }),
+    ).toBeDefined();
+  });
+
   it("restores and submits the same native tier when saved shared thinking disagrees", async () => {
     renderForm(true);
     expect(

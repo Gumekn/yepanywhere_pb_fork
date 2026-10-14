@@ -7,6 +7,12 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ## [Unreleased]
 
+### Changed
+- 新建会话模型默认选择改为使用 provider 返回的模型目录顺序；Codex 模型名称保留 provider 返回值，不再由前端或服务端重新格式化。
+
+### Fixed
+- 修复添加项目路径选择器的返回上一级在 Windows 路径下可能跨级跳转的问题，按当前目录逐级返回；修复添加按钮因引用不存在的主题变量而显示为透明的问题。
+
 ## [2026.9.1] - 2026-09-27
 
 ### Changed

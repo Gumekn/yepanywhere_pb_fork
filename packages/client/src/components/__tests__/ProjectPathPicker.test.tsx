@@ -91,6 +91,29 @@ describe("ProjectPathPicker", () => {
     expect((input as HTMLInputElement).value).toBe("/Users/test/code");
   });
 
+  it("moves up one Windows path segment at a time", async () => {
+    browseProjectDirectories.mockImplementation(async (path: string) =>
+      browseResponse({
+        path: path || "C:/Users/ZhuanZ/AppData",
+        parent: "C:/",
+        home: "C:/Users/ZhuanZ",
+      }),
+    );
+    render(<PickerHarness initialValue="C:/Users/ZhuanZ/AppData" />);
+
+    const upButton = await screen.findByRole("button", { name: /up/i });
+    await waitFor(() =>
+      expect((upButton as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(upButton);
+
+    await waitFor(() => {
+      expect(
+        (screen.getByLabelText("Project folder") as HTMLInputElement).value,
+      ).toBe("C:/Users/ZhuanZ");
+    });
+  });
+
   it("keeps Enter available for submitting an exact directory", async () => {
     render(<PickerHarness initialValue="/Users/test" />);
 

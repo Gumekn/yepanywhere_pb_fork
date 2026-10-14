@@ -591,12 +591,13 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
         }),
       );
 
-    const parent = dirname(browsePath);
+    const canonicalPath = canonicalizeProjectPath(browsePath);
+    const canonicalParent = canonicalizeProjectPath(dirname(browsePath));
     const directories = directoryEntries.slice(0, MAX_DIRECTORY_BROWSE_RESULTS);
 
     return c.json({
-      path: canonicalizeProjectPath(browsePath),
-      parent: parent === browsePath ? null : canonicalizeProjectPath(parent),
+      path: canonicalPath,
+      parent: canonicalParent === canonicalPath ? null : canonicalParent,
       home: canonicalizeProjectPath(homedir()),
       directories,
       exact: requestedIsDirectory,

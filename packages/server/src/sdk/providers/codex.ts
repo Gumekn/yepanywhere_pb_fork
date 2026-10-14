@@ -238,7 +238,6 @@ const CODEX_DEPRECATION_LOG_SUMMARY_LIMIT = 512;
 const CODEX_DEPRECATION_LOG_KEY_LIMIT = 32;
 const DEFAULT_CODEX_MODEL_PROVIDER = DEFAULT_CODEX_MODEL_SOURCE;
 const CODEX_MODEL_PROVIDER_NAMES = new Set(["openai", "azure"]);
-const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 
 /**
  * Local debug knobs for Codex app-server policy behavior.
@@ -261,25 +260,6 @@ const CODEX_POLICY_OVERRIDES: {
  */
 const DECLARE_CODEX_ORIGINATOR = true;
 const DECLARED_CODEX_ORIGINATOR = "Codex Desktop";
-
-// Static fallback used only when the live `model/list` query fails. Keep this in
-// sync with the models Codex actually offers, and list a ChatGPT-account-safe
-// default first: `-codex` models are rejected by OpenAI for ChatGPT-account auth
-// ("model is not supported when using Codex with a ChatGPT account"), so they
-// must never be the default the picker preselects.
-const PREFERRED_MODEL_ORDER = [
-  DEFAULT_CODEX_MODEL,
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.3-codex",
-  "gpt-5.2-codex",
-  "gpt-5.1-codex-max",
-  "gpt-5.2",
-  "gpt-5.1-codex-mini",
-] as const;
 
 const CODEX_REASONING_EFFORTS = [
   {
@@ -1813,9 +1793,6 @@ export class CodexProvider implements AgentProvider {
     models: AppServerModel[],
     source: CodexModelSourceDefinition,
   ): ModelInfo[] {
-    const orderLookup = new Map<string, number>(
-      PREFERRED_MODEL_ORDER.map((id, idx) => [id, idx]),
-    );
     // Track the account's own default so it sorts to the front of the picker
     // (it is guaranteed to be valid for the current auth mode).
     const defaultIds = new Set<string>();
@@ -1836,7 +1813,7 @@ export class CodexProvider implements AgentProvider {
         id: modelId,
         modelProvider: source.id,
         providerModelId: modelId,
-        name: this.formatModelName(model.displayName || modelId),
+        name: model.displayName?.trim() || modelId,
         description: model.description,
         supportedReasoningEfforts: model.supportedReasoningEfforts
           ?.filter(
@@ -1865,7 +1842,7 @@ export class CodexProvider implements AgentProvider {
           id: upgradeId,
           modelProvider: source.id,
           providerModelId: upgradeId,
-          name: this.formatModelName(upgradeId),
+          name: upgradeId,
         });
       }
     }
@@ -1874,31 +1851,10 @@ export class CodexProvider implements AgentProvider {
       .map((model, index) => ({
         model,
         index,
-        rank: defaultIds.has(model.id)
-          ? -2
-          : model.id === DEFAULT_CODEX_MODEL
-            ? -1
-            : (orderLookup.get(model.id) ??
-              PREFERRED_MODEL_ORDER.length + index),
+        rank: defaultIds.has(model.id) ? -1 : index,
       }))
       .sort((a, b) => a.rank - b.rank)
       .map((entry) => entry.model);
-  }
-
-  private formatModelName(value: string): string {
-    return value
-      .trim()
-      .split("-")
-      .map((part) => {
-        const lower = part.toLowerCase();
-        if (lower === "gpt") return "GPT";
-        if (lower === "codex") return "Codex";
-        if (lower === "mini") return "Mini";
-        if (lower === "max") return "Max";
-        if (lower.length === 0) return "";
-        return lower.charAt(0).toUpperCase() + lower.slice(1);
-      })
-      .join("-");
   }
 
   private mapEffortToReasoningEffort(

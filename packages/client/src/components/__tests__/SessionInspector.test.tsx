@@ -281,6 +281,11 @@ describe("SessionInspector", () => {
 
     expect((modelSelect as HTMLSelectElement).value).toBe("gpt-5.6-sol");
     expect(
+      Array.from((modelSelect as HTMLSelectElement).options).map(
+        (option) => option.textContent,
+      ),
+    ).toContain("GPT-5.6 Sol");
+    expect(
       Array.from((reasoningSelect as HTMLSelectElement).options).map(
         (option) => option.value,
       ),

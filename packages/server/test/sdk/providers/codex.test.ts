@@ -7011,6 +7011,18 @@ describe("CodexProvider Configuration", () => {
       expect(result[0]?.id).toBe("gpt-5.5");
     });
 
+    it("preserves the provider display name", () => {
+      const result = normalize([
+        {
+          id: "gpt-6-astra",
+          model: "gpt-6-astra",
+          displayName: "Official GPT-6 Astra Name",
+        },
+      ]);
+
+      expect(result[0]?.name).toBe("Official GPT-6 Astra Name");
+    });
+
     it("filters out hidden models", () => {
       const result = normalize([
         { id: "gpt-5.5", model: "gpt-5.5", displayName: "GPT-5.5" },

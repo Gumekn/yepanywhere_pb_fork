@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../../src/app.js";
 import { MockClaudeSDK } from "../../src/sdk/mock.js";
@@ -102,6 +102,7 @@ describe("Projects API", () => {
       const listJson = await listResponse.json();
       expect(listJson).toMatchObject({
         path: apiPath(browseRoot),
+        parent: apiPath(dirname(browseRoot)),
         exact: true,
         truncated: false,
       });

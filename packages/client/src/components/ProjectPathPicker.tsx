@@ -18,6 +18,21 @@ interface ProjectPathPickerProps {
   autoFocus?: boolean;
 }
 
+/** Resolve one lexical parent for both POSIX and Windows display paths. */
+function getDisplayParentPath(path: string): string | null {
+  const normalized = path.replaceAll("\\", "/").replace(/\/+$/, "");
+  if (!normalized || normalized === "/" || /^[A-Za-z]:$/.test(normalized)) {
+    return null;
+  }
+  const slash = normalized.lastIndexOf("/");
+  if (slash < 0) return null;
+  if (slash === 0) return "/";
+  if (slash === 2 && /^[A-Za-z]:/.test(normalized)) {
+    return `${normalized.slice(0, 2)}/`;
+  }
+  return normalized.slice(0, slash);
+}
+
 function FolderIcon({ open = false }: { open?: boolean }) {
   return (
     <svg
@@ -171,6 +186,9 @@ export function ProjectPathPicker({
 
   const directories = browseResult?.directories ?? [];
   const hasResults = !loading && browseError === null && directories.length > 0;
+  const parentPath = browseResult
+    ? (getDisplayParentPath(browseResult.path) ?? browseResult.parent)
+    : null;
 
   return (
     <div className="project-path-picker">
@@ -243,11 +261,9 @@ export function ProjectPathPicker({
             <button
               type="button"
               onClick={() => {
-                if (browseResult?.parent) {
-                  selectDirectory(browseResult.parent);
-                }
+                if (parentPath) selectDirectory(parentPath);
               }}
-              disabled={disabled || loading || !browseResult?.parent}
+              disabled={disabled || loading || !parentPath}
               title={t("projectsDirectoryUp")}
             >
               <span aria-hidden="true">..</span>
