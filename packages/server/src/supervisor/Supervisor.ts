@@ -44,6 +44,7 @@ import {
 } from "./WorkerQueue.js";
 import {
   DEFAULT_IDLE_PREEMPT_THRESHOLD_MS,
+  DEFAULT_RESIDENT_IDLE_TTL_MS,
   type ProcessEvent,
   type ProcessInfo,
   type ProcessOptions,
@@ -189,6 +190,11 @@ export interface SupervisorOptions {
   maxWorkers?: number;
   /** Idle threshold in milliseconds for preemption. Workers idle longer than this can be preempted. */
   idlePreemptThresholdMs?: number;
+  /**
+   * Release live provider processes that have been idle this long.
+   * 0 = keep idle resident processes forever. Default 60 minutes.
+   */
+  residentIdleTtlMs?: number;
   /** Maximum queue size. 0 = unlimited (default) */
   maxQueueSize?: number;
   /** Callback to persist executor when session ID is received (for remote execution resume) */
@@ -219,6 +225,7 @@ export class Supervisor {
   private eventBus?: EventBus;
   private maxWorkers: number;
   private idlePreemptThresholdMs: number;
+  private residentIdleTtlMs: number;
   private workerQueue: WorkerQueue;
   private onSessionExecutor?: OnSessionExecutorCallback;
   private onSessionIdChanged?: OnSessionIdChangedCallback;
@@ -243,6 +250,10 @@ export class Supervisor {
     this.maxWorkers = options.maxWorkers ?? 0; // 0 = unlimited
     this.idlePreemptThresholdMs =
       options.idlePreemptThresholdMs ?? DEFAULT_IDLE_PREEMPT_THRESHOLD_MS;
+    this.residentIdleTtlMs = Math.max(
+      0,
+      options.residentIdleTtlMs ?? DEFAULT_RESIDENT_IDLE_TTL_MS,
+    );
     this.workerQueue = new WorkerQueue({
       eventBus: options.eventBus,
       maxQueueSize: options.maxQueueSize,
@@ -258,10 +269,10 @@ export class Supervisor {
       ),
     );
     this.enabledProviders = options.enabledProviders;
-    this.staleCheckTimer = setInterval(
-      () => this.terminateStaleProcesses(),
-      STALE_CHECK_INTERVAL_MS,
-    );
+    this.staleCheckTimer = setInterval(() => {
+      this.terminateStaleProcesses();
+      void this.reclaimExpiredIdleProcesses();
+    }, STALE_CHECK_INTERVAL_MS);
     this.staleCheckTimer.unref(); // Don't keep process alive for cleanup
 
     if (!this.provider && !this.sdk) {
@@ -2020,6 +2031,82 @@ export class Supervisor {
         `stale: no SDK messages for ${Math.round(silentMs / 1000)}s`,
       );
     }
+  }
+
+  /**
+   * Release resident provider processes that stayed idle past the TTL.
+   *
+   * Process.startIdleTimer keeps live processes owned on purpose so a session
+   * stays warm between turns. Without an upper bound every session ever opened
+   * keeps its provider process (e.g. one Codex app-server each) until the
+   * runtime restarts. Only plain `idle` processes are eligible: in-turn,
+   * waiting-input and hold states are never reclaimed.
+   */
+  async reclaimExpiredIdleProcesses(now = Date.now()): Promise<number> {
+    if (this.isShuttingDown || this.residentIdleTtlMs <= 0) return 0;
+
+    const expired: Process[] = [];
+    for (const process of this.processes.values()) {
+      if (process.state.type !== "idle") continue;
+      if (this.preemptingProcessIds.has(process.id)) continue;
+      if (process.getDeferredQueueSummary().length > 0) continue;
+      const idleMs = now - process.state.since.getTime();
+      if (idleMs < this.residentIdleTtlMs) continue;
+      expired.push(process);
+    }
+
+    let reclaimed = 0;
+    for (const process of expired) {
+      // State may have changed while earlier reclaims were awaiting exit.
+      if (
+        this.isShuttingDown ||
+        this.processes.get(process.id) !== process ||
+        process.state.type !== "idle" ||
+        this.preemptingProcessIds.has(process.id)
+      ) {
+        continue;
+      }
+
+      const idleMs = now - process.state.since.getTime();
+      this.preemptingProcessIds.add(process.id);
+      try {
+        getLogger().info(
+          {
+            event: "idle_resident_reclaimed",
+            sessionId: process.sessionId,
+            processId: process.id,
+            projectId: process.projectId,
+            provider: process.provider,
+            idleMs,
+            residentIdleTtlMs: this.residentIdleTtlMs,
+            processAlive: process.isProcessAlive,
+          },
+          `Releasing idle provider process: ${process.sessionId} (idle ${Math.round(idleMs / 60_000)}m)`,
+        );
+        // Same grace handling as an explicit abort, so files written while the
+        // provider shuts down are not mistaken for an external session.
+        this.emitSessionAborted(process.sessionId, process.projectId);
+        await process.abort();
+        if (this.processes.get(process.id) === process) {
+          this.unregisterProcess(process);
+        }
+        reclaimed += 1;
+      } catch (error) {
+        getLogger().warn(
+          {
+            event: "idle_resident_reclaim_failed",
+            sessionId: process.sessionId,
+            processId: process.id,
+            provider: process.provider,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          `Failed to release idle provider process: ${process.sessionId}`,
+        );
+      } finally {
+        this.preemptingProcessIds.delete(process.id);
+      }
+    }
+    return reclaimed;
   }
 
   // ============ Worker Pool Methods ============

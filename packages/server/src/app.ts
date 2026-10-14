@@ -199,6 +199,8 @@ export interface AppOptions {
   maxWorkers?: number;
   /** Idle threshold in milliseconds for preemption */
   idlePreemptThresholdMs?: number;
+  /** Release live provider processes idle longer than this (0 = never) */
+  residentIdleTtlMs?: number;
   /** Frontend proxy for dev mode (proxies non-API requests to Vite) */
   frontendProxy?: FrontendProxy;
   /** PushService for web push notifications */
@@ -850,6 +852,7 @@ export function createApp(options: AppOptions): AppResult {
     eventBus: options.eventBus,
     maxWorkers: options.maxWorkers,
     idlePreemptThresholdMs: options.idlePreemptThresholdMs,
+    residentIdleTtlMs: options.residentIdleTtlMs,
     maxQueueSize: options.maxQueueSize,
     enabledProviders: options.enabledProviders,
     // Save executor for remote sessions to support resume

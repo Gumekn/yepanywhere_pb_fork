@@ -26,6 +26,13 @@ import type { PermissionMode, SDKMessage } from "../sdk/types.js";
 // Constants
 export const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 export const DEFAULT_IDLE_PREEMPT_THRESHOLD_MS = 10 * 1000; // 10 seconds - workers idle longer than this can be preempted
+/**
+ * Resident provider processes (Codex app-server, Claude CLI, Pi RPC, ...)
+ * stay owned while they are alive. Once a session has been idle this long its
+ * provider process is released; the next message resumes it cold.
+ * 0 disables the cap.
+ */
+export const DEFAULT_RESIDENT_IDLE_TTL_MS = 60 * 60 * 1000; // 60 minutes
 
 // Re-export path utilities for backward compatibility
 // See packages/server/src/projects/paths.ts for full documentation on encoding schemes

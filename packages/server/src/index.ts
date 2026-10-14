@@ -923,6 +923,7 @@ async function startServer() {
     projectScanCacheTtlMs: config.projectScanCacheTtlMs,
     maxWorkers: config.maxWorkers,
     idlePreemptThresholdMs: config.idlePreemptThresholdMs,
+    residentIdleTtlMs: config.residentIdleTtlMs,
     pushService,
     nativePushService,
     recentsService,

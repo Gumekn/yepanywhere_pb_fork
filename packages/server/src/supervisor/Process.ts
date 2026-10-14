@@ -2599,7 +2599,8 @@ export class Process {
 
       // Keep ownership while the underlying process is still alive. This lets
       // long-lived Claude sessions remain reusable instead of decaying into
-      // "external" after the idle timeout.
+      // "external" after the idle timeout. Supervisor.reclaimExpiredIdleProcesses
+      // releases live processes once they pass the resident idle TTL.
       if (this.isProcessAlive === true) {
         getLogger().debug(
           {

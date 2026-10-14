@@ -59,6 +59,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 ### Fixed
 - 修复外置 runtime 下 Cursor 新建会话仍然冷启动、容易撞上 30 秒初始化超时：新建页的预备和登录预热原来发生在 web/API 进程，真正的 `startSession` 在 runtime 进程，两边的进程池互不可见。现在 `prepare`、`discard`、`warm` 都转到 runtime 里执行；没有预备好的会话时，新建会领用该模型已经登录的空闲 `agent acp`，只补一次 `session/new`。旧 runtime 会提示需要更新（Cursor 集成版本 3）。
 - 修复 Cursor 选了带参数的模型（如 Grok 4.7 500K High 非 Fast）后新建会话发送失败、报 `Provider initialization timed out after 30000ms`：之前每次启动固定写 7 次 `session/set_config_option`（每次约 2–3 秒），加上认证和建会话超过 30 秒初始化上限。现在只写和当前值不一致的选项，全部对上就停，并直接用 `session/new`／`session/load` 返回的配置跳过多余的模型写入；本机实测启动从约 28 秒降到约 6 秒。
+- 修复会话结束后 provider 常驻进程（Codex app-server、Claude、Pi、Kimi、ZCode、Cursor 等）只增不减、要等 runtime 重启才释放的问题：会话闲置超过 60 分钟后自动释放对应进程，之后再发消息会冷启动续接。运行中、等待审批或暂停的会话不受影响。可以用 `RESIDENT_IDLE_TTL`（秒）调整时长，设为 `0` 恢复为永久保留。
 - 修复 Cursor 会话开头用户原文要等原生记录写入后才出现：在 `<user_query>` 可读之前保留已注入的用户消息，并放在该回合的工具和回复之前；原生记录对齐后去掉重复气泡。
 - 修复 Cursor 思维链在回合结束后落到正文下面：原生历史只保留加密签名时，按 runtime 日志把每条思考放回它后面的回复或工具调用之前。
 

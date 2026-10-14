@@ -131,6 +131,8 @@ export interface Config {
   maxWorkers: number;
   /** Idle threshold in milliseconds for preemption. Workers idle longer than this can be preempted. */
   idlePreemptThresholdMs: number;
+  /** Release live provider processes idle longer than this. 0 = never. */
+  residentIdleTtlMs: number;
   /** Whether to serve frontend (proxy in dev, static in prod) */
   serveFrontend: boolean;
   /** Vite dev server port for frontend proxy */
@@ -422,6 +424,9 @@ export function loadConfig(): Config {
     maxWorkers: parseIntOrDefault(process.env.MAX_WORKERS, 0),
     idlePreemptThresholdMs:
       parseIntOrDefault(process.env.IDLE_PREEMPT_THRESHOLD, 10) * 1000,
+    // Seconds; 0 keeps idle resident provider processes forever.
+    residentIdleTtlMs:
+      parseIntOrDefault(process.env.RESIDENT_IDLE_TTL, 60 * 60) * 1000,
     serveFrontend,
     // Vite port defaults to main port + 2, keeping all ports sequential
     vitePort: parseIntOrDefault(
