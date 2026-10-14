@@ -2,9 +2,19 @@ import type {
   RequestPermissionRequest,
   SessionNotification,
 } from "@agentclientprotocol/sdk";
+import type { ModelInfo } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ACPClient } from "../../../src/sdk/providers/acp/client.js";
-import { CursorProvider } from "../../../src/sdk/providers/cursor.js";
+import { loadCursorModelCatalog } from "../../../src/sdk/providers/cursor-models.js";
+import {
+  prepareCursorSession,
+  resetCursorPrepareStateForTests,
+  warmCursorAuth,
+} from "../../../src/sdk/providers/cursor-prepare.js";
+import {
+  CursorProvider,
+  resetCursorModelCacheForTests,
+} from "../../../src/sdk/providers/cursor.js";
 import type {
   AgentSession,
   StartSessionOptions,
@@ -13,6 +23,9 @@ import { Process } from "../../../src/supervisor/Process.js";
 
 vi.mock("../../../src/sdk/providers/cursor-cli.js", () => ({
   findCursorAgentPath: async () => "/test/agent",
+}));
+vi.mock("../../../src/sdk/providers/cursor-models.js", () => ({
+  loadCursorModelCatalog: vi.fn(async () => [{ id: "auto", name: "Auto" }]),
 }));
 let update: (notification: SessionNotification) => void;
 let permission: (request: RequestPermissionRequest) => Promise<unknown>;
@@ -56,6 +69,8 @@ beforeEach(() => {
 afterEach(async () => {
   for (const session of sessions.splice(0)) session.abort();
   await Promise.all(processes.splice(0).map((process) => process.abort()));
+  await resetCursorPrepareStateForTests();
+  resetCursorModelCacheForTests();
   vi.restoreAllMocks();
 });
 async function start(options: Partial<StartSessionOptions> = {}) {
@@ -429,5 +444,134 @@ describe("Cursor ACP lifecycle", () => {
         ],
       }),
     ).toEqual({ outcome: { outcome: "selected", optionId: "no" } });
+  });
+
+  it("prompts a prepared ACP process without connecting again", async () => {
+    vi.spyOn(ACPClient.prototype, "prompt").mockImplementation(async () => {
+      sendText("pong");
+      return { stopReason: "end_turn" };
+    });
+    await prepareCursorSession({
+      cwd: "/test",
+      model: "auto",
+      permissionMode: "default",
+    });
+    expect(ACPClient.prototype.connect).toHaveBeenCalledTimes(1);
+    expect(ACPClient.prototype.newSession).toHaveBeenCalledTimes(1);
+    const session = await start({ model: "auto" });
+    const first = await session.iterator.next();
+    expect(first.value).toMatchObject({
+      type: "system",
+      session_id: "cursor-test",
+    });
+    expect(ACPClient.prototype.newSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes on an already authenticated idle process", async () => {
+    vi.spyOn(ACPClient.prototype, "loadSession").mockResolvedValue(undefined);
+    vi.spyOn(ACPClient.prototype, "prompt").mockResolvedValue({
+      stopReason: "end_turn",
+    });
+    await warmCursorAuth("auto");
+    vi.mocked(ACPClient.prototype.connect).mockClear();
+    vi.mocked(ACPClient.prototype.authenticate).mockClear();
+    const session = await start({
+      model: "auto",
+      resumeSessionId: "resume-1",
+      initialMessage: { text: "continue" },
+    });
+    await session.iterator.next();
+    expect(ACPClient.prototype.loadSession).toHaveBeenCalledWith(
+      "resume-1",
+      "/test",
+    );
+    expect(ACPClient.prototype.newSession).not.toHaveBeenCalled();
+  });
+
+  it("returns the cached model list without waiting for a cold catalog", async () => {
+    let resolveCatalog: (models: ModelInfo[]) => void = () => {};
+    vi.mocked(loadCursorModelCatalog).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCatalog = resolve;
+        }),
+    );
+    const provider = new CursorProvider();
+    await expect(
+      provider.getAvailableModels({ waitForRefresh: false }),
+    ).resolves.toEqual([]);
+    const waiting = provider.getAvailableModels();
+    resolveCatalog([{ id: "auto", name: "Auto" }]);
+    await expect(waiting).resolves.toEqual([{ id: "auto", name: "Auto" }]);
+    await expect(
+      provider.getAvailableModels({ waitForRefresh: false }),
+    ).resolves.toEqual([{ id: "auto", name: "Auto" }]);
+  });
+
+  it("shows todo, task, and image notifications as tool cards", async () => {
+    vi.spyOn(ACPClient.prototype, "prompt").mockImplementation(async () => {
+      await extension("cursor/update_todos", {
+        toolCallId: "todo-1",
+        merge: false,
+        todos: [
+          { id: "a", content: "Write tests", status: "completed" },
+          { id: "b", content: "Ship", status: "cancelled" },
+        ],
+      });
+      await extension("cursor/task", {
+        toolCallId: "task-1",
+        description: "Look around",
+        prompt: "Find the bug",
+        subagentType: "explore",
+        model: "auto",
+        agentId: "child-should-not-link",
+        durationMs: 1200,
+      });
+      await extension("cursor/generate_image", {
+        toolCallId: "img-1",
+        description: "A diagram",
+        filePath: "/tmp/diagram.png",
+      });
+      update({
+        sessionId: "cursor-test",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "todo-1",
+          kind: "other",
+          title: "Update todos",
+          status: "completed",
+        },
+      } as SessionNotification);
+      return { stopReason: "end_turn" };
+    });
+    const session = await start();
+    const messages = [];
+    while (true) {
+      const next = (await session.iterator.next()).value;
+      messages.push(next);
+      if (next.type === "result") break;
+    }
+    const todo = messages.find(
+      (message) => message.uuid === "cursor-tool-todo-1",
+    );
+    expect(JSON.stringify(todo)).toContain("TodoWrite");
+    expect(JSON.stringify(todo)).toContain("Write tests");
+    expect(JSON.stringify(todo)).toContain("pending");
+    expect(JSON.stringify(todo)).not.toContain("cancelled");
+    const task = messages.find(
+      (message) => message.uuid === "cursor-tool-task-1",
+    );
+    expect(JSON.stringify(task)).toContain("Task");
+    expect(JSON.stringify(task)).toContain("Look around");
+    expect(JSON.stringify(task)).toContain("Find the bug");
+    expect(JSON.stringify(task)).not.toContain("child-should-not-link");
+    const image = messages.find(
+      (message) => message.uuid === "cursor-tool-img-1",
+    );
+    expect(JSON.stringify(image)).toContain("ViewImage");
+    expect(JSON.stringify(image)).toContain("/tmp/diagram.png");
+    expect(
+      messages.filter((message) => message.uuid === "cursor-tool-todo-1"),
+    ).toHaveLength(1);
   });
 });

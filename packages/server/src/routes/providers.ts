@@ -1,17 +1,23 @@
 import {
   type LiveProviderName,
+  type PermissionMode,
   type ProviderInfo,
   type ProviderName,
   isUrlProjectId,
 } from "@yep-anywhere/shared";
 import type { CursorAccountResponse } from "@yep-anywhere/shared";
 import { Hono } from "hono";
-import { decodeProjectId } from "../projects/paths.js";
+import { canonicalizeProjectPath, decodeProjectId } from "../projects/paths.js";
 import { getCursorRuntimeAvailability } from "../runtime/cursor-availability.js";
 import type { RuntimeController } from "../runtime/types.js";
 import type { ClaudeUsageResponse } from "../sdk/providers/claude-control.js";
 import { getCodexModelSourceRegistry } from "../sdk/providers/codex-model-sources.js";
 import { cursorAccountService } from "../sdk/providers/cursor-account.js";
+import {
+  discardCursorPrepare,
+  prepareCursorSession,
+  warmCursorAuth,
+} from "../sdk/providers/cursor-prepare.js";
 import { claudeProvider, getAllProviders } from "../sdk/providers/index.js";
 import {
   isProviderEnabled,
@@ -89,6 +95,43 @@ export function createProvidersRoutes(deps: ProviderRouteDeps = {}): Hono {
       deps.getCursorAccount ??
       ((options) => cursorAccountService.getAccount(options));
     return c.json(await getAccount({ fresh: c.req.query("fresh") === "1" }));
+  });
+
+  routes.post("/cursor/prepare", async (c) => {
+    if (!isProviderEnabled("cursor", deps.enabledProviders))
+      return c.json({ error: "Provider not found" }, 404);
+    const body = await readJsonObject(c);
+    const cwd = cursorPrepareCwd(body);
+    if (!cwd) return c.json({ error: "projectId is required" }, 400);
+    try {
+      await prepareCursorSession({
+        cwd,
+        model: stringField(body, "model"),
+        permissionMode: cursorPermissionMode(body.permissionMode),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Prepare failed";
+      return c.json({ error: message }, 503);
+    }
+    return c.json({ ok: true });
+  });
+
+  routes.post("/cursor/prepare/discard", async (c) => {
+    if (!isProviderEnabled("cursor", deps.enabledProviders))
+      return c.json({ error: "Provider not found" }, 404);
+    const body = await readJsonObject(c);
+    const cwd = cursorPrepareCwd(body);
+    if (!cwd) return c.json({ error: "projectId is required" }, 400);
+    await discardCursorPrepare({ cwd, model: stringField(body, "model") });
+    return c.json({ ok: true });
+  });
+
+  routes.post("/cursor/warm", async (c) => {
+    if (!isProviderEnabled("cursor", deps.enabledProviders))
+      return c.json({ error: "Provider not found" }, 404);
+    const body = await readJsonObject(c);
+    void warmCursorAuth(stringField(body, "model")).catch(() => undefined);
+    return c.json({ ok: true });
   });
 
   // GET /api/providers/claude/usage - Claude.ai plan utilization from the
@@ -197,4 +240,47 @@ export function createProvidersRoutes(deps: ProviderRouteDeps = {}): Hono {
   });
 
   return routes;
+}
+
+async function readJsonObject(c: {
+  req: { json: () => Promise<unknown> };
+}): Promise<Record<string, unknown>> {
+  try {
+    const body = await c.req.json();
+    if (body && typeof body === "object" && !Array.isArray(body)) {
+      return body as Record<string, unknown>;
+    }
+  } catch {
+    // Callers treat a missing body as an empty object and validate fields.
+  }
+  return {};
+}
+
+function stringField(
+  body: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = body[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function cursorPermissionMode(value: unknown): PermissionMode | undefined {
+  if (
+    value === "default" ||
+    value === "plan" ||
+    value === "bypassPermissions"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function cursorPrepareCwd(body: Record<string, unknown>): string | null {
+  if (typeof body.projectId === "string" && isUrlProjectId(body.projectId)) {
+    return canonicalizeProjectPath(decodeProjectId(body.projectId));
+  }
+  if (typeof body.cwd === "string" && body.cwd.trim()) {
+    return canonicalizeProjectPath(body.cwd);
+  }
+  return null;
 }

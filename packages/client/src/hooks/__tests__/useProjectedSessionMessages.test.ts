@@ -73,6 +73,60 @@ afterEach(() => {
 });
 
 describe("projected session messages", () => {
+  it("applies streamed Cursor context before metadata loads and after compaction", async () => {
+    const metadata = deferred<unknown>();
+    api.getSessionMetadata.mockReturnValue(metadata.promise);
+    const { result } = renderHook(() => useProjectedSessionMessages(options));
+    const usage = {
+      inputTokens: 196_533,
+      contextWindow: 256_000,
+      percentage: 76.8,
+    };
+    act(() =>
+      result.current.handleDisplayEvent?.("display-context-usage", {
+        sessionId: "session",
+        contextUsage: usage,
+      }),
+    );
+    await act(async () => {
+      metadata.resolve({
+        session: {
+          id: "session",
+          provider: "cursor",
+          contextUsage: { ...usage, inputTokens: 100_000 },
+        },
+        ownership: { owner: "self", processId: "p" },
+      });
+    });
+    await waitFor(() =>
+      expect(result.current.session?.contextUsage).toEqual(usage),
+    );
+    const compacted = { ...usage, inputTokens: 20_000, percentage: 7.8 };
+    act(() =>
+      result.current.handleDisplayEvent?.("display-context-usage", {
+        sessionId: "session",
+        contextUsage: compacted,
+      }),
+    );
+    expect(result.current.session?.contextUsage).toEqual(compacted);
+    act(() => {
+      result.current.handleDisplayEvent?.("display-context-usage", {
+        sessionId: "another-session",
+        contextUsage: usage,
+      });
+      result.current.handleDisplayEvent?.("display-context-usage", {
+        sessionId: "session",
+        branchId: "another-branch",
+        contextUsage: usage,
+      });
+      result.current.handleDisplayEvent?.("display-context-usage", {
+        sessionId: "session",
+        contextUsage: { ...usage, contextWindow: 0 },
+      });
+    });
+    expect(result.current.session?.contextUsage).toEqual(compacted);
+  });
+
   it("loads display and metadata concurrently when refreshing a branch", async () => {
     const { result } = renderHook(() => useProjectedSessionMessages(options));
     await waitFor(() => expect(result.current.loading).toBe(false));

@@ -87,6 +87,7 @@ import {
   SharingService,
   ZCodeSessionChangeMonitor,
 } from "./services/index.js";
+import { CURSOR_ACP_SESSIONS_DIR } from "./sessions/cursor-reader.js";
 import { PI_SESSIONS_DIR } from "./sessions/pi-files.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
 import { ZCODE_DB_PATH } from "./sessions/zcode-db.js";
@@ -480,7 +481,7 @@ console.log(
 // Helper to create watcher if directory exists
 function createWatcherIfExists(
   watchDir: string,
-  provider: "claude" | "gemini" | "codex" | "pi" | "kimi",
+  provider: "claude" | "gemini" | "codex" | "pi" | "kimi" | "cursor",
   ensureDirectory = false,
   persistent = false,
   periodicRescanOverrideMs?: number,
@@ -562,6 +563,13 @@ createWatcherIfExists(config.geminiSessionsDir, "gemini", false, true);
 createWatcherIfExists(config.codexSessionsDir, "codex", false, true);
 createWatcherIfExists(config.kimiSessionsDir, "kimi", false, true);
 createWatcherIfExists(PI_SESSIONS_DIR, "pi", true, true);
+createWatcherIfExists(
+  CURSOR_ACP_SESSIONS_DIR,
+  "cursor",
+  false,
+  true,
+  process.platform === "darwin" || process.platform === "win32" ? 5_000 : 0,
+);
 
 // When running without tsx watch (NO_BACKEND_RELOAD=true), start source watcher
 // to notify the UI when server code changes and needs manual reload

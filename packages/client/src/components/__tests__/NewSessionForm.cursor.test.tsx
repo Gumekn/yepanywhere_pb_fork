@@ -96,6 +96,9 @@ beforeEach(() => {
     };
     return { settings };
   });
+  vi.spyOn(api, "prepareCursorSession").mockResolvedValue({ ok: true });
+  vi.spyOn(api, "discardCursorSession").mockResolvedValue({ ok: true });
+  vi.spyOn(api, "warmCursorSession").mockResolvedValue({ ok: true });
   vi.spyOn(api, "startSession").mockResolvedValue({
     sessionId: "test",
     processId: "test",

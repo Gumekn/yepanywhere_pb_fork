@@ -27,6 +27,7 @@ import { cursorAccountService } from "./cursor-account.js";
 import { findCursorAgentPath } from "./cursor-cli.js";
 import { cursorStreamError } from "./cursor-errors.js";
 import { loadCursorModelCatalog } from "./cursor-models.js";
+import { claimCursorPrepare } from "./cursor-prepare.js";
 import type {
   AgentProvider,
   AgentSession,
@@ -38,8 +39,14 @@ const execFileAsync = promisify(execFile);
 const log = getLogger();
 
 const MODEL_CACHE_MS = 10 * 60 * 1000;
+const STRUCTURED_CURSOR_TOOLS = new Set(["TodoWrite", "Task", "ViewImage"]);
 let modelCache: { at: number; models: ModelInfo[] } | null = null;
 let modelRequest: Promise<ModelInfo[]> | null = null;
+
+export function resetCursorModelCacheForTests(): void {
+  modelCache = null;
+  modelRequest = null;
+}
 
 function toCursorMode(mode: PermissionMode | undefined): "agent" | "plan" {
   return mode === "plan" ? "plan" : "agent";
@@ -164,10 +171,21 @@ export class CursorProvider implements AgentProvider {
     return cursorAccountService.getAuthStatus();
   }
 
-  async getAvailableModels(): Promise<ModelInfo[]> {
+  async getAvailableModels(options?: {
+    waitForRefresh?: boolean;
+  }): Promise<ModelInfo[]> {
     if (modelCache && Date.now() - modelCache.at < MODEL_CACHE_MS) {
       return modelCache.models;
     }
+    const refresh = this.refreshModels();
+    if (options?.waitForRefresh === false) {
+      void refresh.catch(() => undefined);
+      return modelCache?.models ?? [];
+    }
+    return refresh;
+  }
+
+  private refreshModels(): Promise<ModelInfo[]> {
     if (modelRequest) return modelRequest;
     modelRequest = this.loadModels().finally(() => {
       modelRequest = null;
@@ -208,8 +226,14 @@ export class CursorProvider implements AgentProvider {
     const queue = new MessageQueue();
     const abortController = new AbortController();
     if (options.initialMessage) queue.push(options.initialMessage);
-    const client = new ACPClient();
-    let sessionId: string | null = null;
+    const claimed = await claimCursorPrepare({
+      cwd: options.cwd,
+      model: options.model,
+      permissionMode: options.permissionMode,
+      resumeSessionId: options.resumeSessionId,
+    });
+    const client = claimed?.client ?? new ACPClient();
+    let sessionId: string | null = claimed?.sessionId ?? null;
     const iterator = this.runSession(
       client,
       sessionOptions,
@@ -218,6 +242,7 @@ export class CursorProvider implements AgentProvider {
       (id) => {
         sessionId = id;
       },
+      claimed,
     );
     return {
       iterator,
@@ -256,6 +281,7 @@ export class CursorProvider implements AgentProvider {
     queue: MessageQueue,
     signal: AbortSignal,
     onSessionId: (sessionId: string) => void,
+    handoff?: { sessionId?: string } | null,
   ): AsyncIterableIterator<SDKMessage> {
     const agentPath = await findCursorAgentPath();
     if (!agentPath) {
@@ -268,6 +294,9 @@ export class CursorProvider implements AgentProvider {
     }
 
     const updateQueue: SessionNotification[] = [];
+    const sideMessages: SDKMessage[] = [];
+    const toolNames = new Map<string, string>();
+    let activeSessionId = handoff?.sessionId ?? "";
     client.setSessionUpdateCallback((update) => {
       updateQueue.push(update);
     });
@@ -275,30 +304,43 @@ export class CursorProvider implements AgentProvider {
       this.handlePermissionRequest(request, options, signal),
     );
     client.setExtensionRequestCallback((method, params) =>
-      this.handleExtensionRequest(method, params, options, signal),
+      this.handleExtensionRequest(
+        method,
+        params,
+        options,
+        signal,
+        sideMessages,
+        toolNames,
+        () => activeSessionId,
+      ),
     );
 
     try {
-      const args = ["acp"];
-      if (options.model) {
-        args.unshift("--model", options.model);
+      if (!handoff) {
+        const args = ["acp"];
+        if (options.model) {
+          args.unshift("--model", options.model);
+        }
+        await client.connect({ command: agentPath, args, cwd: options.cwd });
+        await client.initialize({
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+          _meta: { subagents: {} },
+        });
+        await client.authenticate("cursor_login");
       }
-      await client.connect({ command: agentPath, args, cwd: options.cwd });
-      await client.initialize({
-        fs: { readTextFile: false, writeTextFile: false },
-        terminal: false,
-        _meta: { subagents: {} },
-      });
-      await client.authenticate("cursor_login");
 
       let sessionId: string;
-      if (options.resumeSessionId) {
+      if (handoff?.sessionId) {
+        sessionId = handoff.sessionId;
+      } else if (options.resumeSessionId) {
         await client.loadSession(options.resumeSessionId, options.cwd);
         sessionId = options.resumeSessionId;
         updateQueue.length = 0;
       } else {
         sessionId = await client.newSession(options.cwd);
       }
+      activeSessionId = sessionId;
       onSessionId(sessionId);
       const history = options.resumeSessionId
         ? await readCursorSessionDir(join(CURSOR_ACP_SESSIONS_DIR, sessionId))
@@ -346,6 +388,8 @@ export class CursorProvider implements AgentProvider {
           sessionId,
           internalPrompt,
           updateQueue,
+          sideMessages,
+          toolNames,
           signal,
         )) {
           yield {
@@ -374,6 +418,8 @@ export class CursorProvider implements AgentProvider {
     sessionId: string,
     prompt: string,
     updateQueue: SessionNotification[],
+    sideMessages: SDKMessage[],
+    toolNames: Map<string, string>,
     signal: AbortSignal,
   ): AsyncIterableIterator<SDKMessage> {
     let promptDone = false;
@@ -394,10 +440,23 @@ export class CursorProvider implements AgentProvider {
     let thinkingText = "";
     let thinkingId: string | null = null;
     let thinkingDirty = false;
-    const toolNames = new Map<string, string>();
 
-    while (!signal.aborted && (!promptDone || updateQueue.length > 0)) {
+    while (
+      !signal.aborted &&
+      (!promptDone || updateQueue.length > 0 || sideMessages.length > 0)
+    ) {
+      while (sideMessages.length > 0) {
+        const message = sideMessages.shift();
+        if (message) yield message;
+      }
+      if (promptDone && updateQueue.length === 0 && sideMessages.length === 0) {
+        break;
+      }
       await new Promise((resolve) => setTimeout(resolve, 40));
+      while (sideMessages.length > 0) {
+        const message = sideMessages.shift();
+        if (message) yield message;
+      }
       while (updateQueue.length > 0) {
         const notification = updateQueue.shift();
         if (!notification || notification.sessionId !== sessionId) continue;
@@ -532,10 +591,20 @@ export class CursorProvider implements AgentProvider {
     params: Record<string, unknown>,
     options: StartSessionOptions,
     signal: AbortSignal,
+    sideMessages: SDKMessage[],
+    toolNames: Map<string, string>,
+    sessionId: () => string,
   ): Promise<Record<string, unknown>> {
     const name = method.replace(/^_/, "");
     const cancelled = { outcome: { outcome: "cancelled" } };
     if (signal.aborted) return cancelled;
+    const displayed = cursorExtensionMessages(
+      name,
+      params,
+      sessionId(),
+      toolNames,
+    );
+    if (displayed.length) sideMessages.push(...displayed);
     if (name === "cursor/ask_question") {
       if (!options.onToolApproval || !Array.isArray(params.questions))
         return cancelled;
@@ -708,11 +777,154 @@ function thinkingMessage(
   } as SDKMessage;
 }
 
+function cursorTodos(value: unknown): Array<{
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm: string;
+}> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const todo = item as { content?: unknown; status?: unknown };
+    if (typeof todo.content !== "string" || !todo.content.trim()) return [];
+    const status =
+      todo.status === "in_progress" || todo.status === "completed"
+        ? todo.status
+        : "pending";
+    return [{ content: todo.content, status, activeForm: todo.content }];
+  });
+}
+
+function cursorToolMessage(
+  sessionId: string,
+  toolCallId: string,
+  name: string,
+  input: Record<string, unknown>,
+  result?: unknown,
+): SDKMessage {
+  return {
+    type: "assistant",
+    uuid: `cursor-tool-${toolCallId}`,
+    session_id: sessionId,
+    message: {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: toolCallId, name, input },
+        ...(result === undefined
+          ? []
+          : [
+              { type: "tool_result", tool_use_id: toolCallId, content: result },
+            ]),
+      ],
+    },
+  } as SDKMessage;
+}
+
+/**
+ * Cursor sends these after the work is done and ignores the response.
+ * Map them onto the existing tool cards, keyed by the same toolCallId the
+ * generic tool_call update uses, so the two don't both stay on screen.
+ */
+function cursorExtensionMessages(
+  method: string,
+  params: Record<string, unknown>,
+  sessionId: string,
+  toolNames: Map<string, string>,
+): SDKMessage[] {
+  const toolCallId =
+    typeof params.toolCallId === "string" ? params.toolCallId : "";
+  if (!toolCallId) return [];
+  if (method === "cursor/update_todos") {
+    const todos = cursorTodos(params.todos);
+    toolNames.set(toolCallId, "TodoWrite");
+    return [
+      cursorToolMessage(
+        sessionId,
+        toolCallId,
+        "TodoWrite",
+        { todos, merge: params.merge === true },
+        { oldTodos: [], newTodos: todos },
+      ),
+    ];
+  }
+  if (method === "cursor/task") {
+    const description =
+      typeof params.description === "string" ? params.description : "";
+    const prompt = typeof params.prompt === "string" ? params.prompt : "";
+    const subagentType =
+      typeof params.subagentType === "string" ? params.subagentType : "task";
+    const model = typeof params.model === "string" ? params.model : undefined;
+    const durationMs =
+      typeof params.durationMs === "number" ? params.durationMs : undefined;
+    const detail = [
+      description,
+      prompt,
+      model ? `Model: ${model}` : "",
+      durationMs !== undefined ? `Duration: ${Math.round(durationMs)}ms` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    toolNames.set(toolCallId, "Task");
+    return [
+      cursorToolMessage(
+        sessionId,
+        toolCallId,
+        "Task",
+        {
+          description: description || prompt || "Task",
+          prompt,
+          subagent_type: subagentType,
+          ...(model ? { model } : {}),
+        },
+        {
+          status: "completed",
+          prompt,
+          totalDurationMs: durationMs ?? 0,
+          totalTokens: 0,
+          totalToolUseCount: 0,
+          content: detail ? [{ type: "text", text: detail }] : [],
+        },
+      ),
+    ];
+  }
+  if (method === "cursor/generate_image") {
+    const filePath = typeof params.filePath === "string" ? params.filePath : "";
+    const description =
+      typeof params.description === "string" ? params.description : "";
+    toolNames.set(toolCallId, "ViewImage");
+    return [
+      cursorToolMessage(
+        sessionId,
+        toolCallId,
+        "ViewImage",
+        {
+          ...(filePath ? { path: filePath } : {}),
+          ...(description ? { title: description } : {}),
+        },
+        filePath || description,
+      ),
+    ];
+  }
+  return [];
+}
+
 function convertUpdate(
   update: SessionUpdate,
   sessionId: string,
   toolNames: Map<string, string>,
 ): SDKMessage | null {
+  const toolCallId =
+    "toolCallId" in update && typeof update.toolCallId === "string"
+      ? update.toolCallId
+      : undefined;
+  if (
+    toolCallId &&
+    STRUCTURED_CURSOR_TOOLS.has(toolNames.get(toolCallId) ?? "")
+  ) {
+    // A notification already published this call as TodoWrite, Task, or
+    // ViewImage. A later generic tool_call would replace that card.
+    return null;
+  }
   if (
     update.sessionUpdate === "tool_call" ||
     (update.sessionUpdate === "tool_call_update" &&

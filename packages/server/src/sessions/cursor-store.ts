@@ -10,8 +10,12 @@
 
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { CursorTranscriptMessage } from "@yep-anywhere/shared";
+import type {
+  ContextUsage,
+  CursorTranscriptMessage,
+} from "@yep-anywhere/shared";
 import { withSqliteDatabase } from "../sqlite/query.js";
+import { readCursorContextUsage } from "./cursor-context-usage.js";
 
 export interface CursorSessionDiskMeta {
   schemaVersion?: number;
@@ -26,6 +30,7 @@ export interface CursorStoredSession {
   createdAt: string;
   updatedAt: string;
   messages: CursorTranscriptMessage[];
+  contextUsage?: ContextUsage;
 }
 
 interface StoreMeta {
@@ -108,6 +113,7 @@ export async function readCursorSessionDir(
     createdAt: stored.createdAt,
     updatedAt,
     messages: stored.messages,
+    contextUsage: stored.contextUsage,
   };
 }
 
@@ -115,6 +121,7 @@ interface StoreRead {
   name: string | null;
   createdAt: string;
   messages: CursorTranscriptMessage[];
+  contextUsage?: ContextUsage;
 }
 
 function readStore(db: {
@@ -147,6 +154,7 @@ function readStore(db: {
 
   const messages: CursorTranscriptMessage[] = [];
   walkBlob(root, blobs, new Set(), messages, 0);
+  const rootData = blobs.get(root);
 
   const createdMs =
     typeof storeMeta.createdAt === "number" ? storeMeta.createdAt : Date.now();
@@ -154,6 +162,7 @@ function readStore(db: {
     name: typeof storeMeta.name === "string" ? storeMeta.name : null,
     createdAt: new Date(createdMs).toISOString(),
     messages,
+    contextUsage: rootData ? readCursorContextUsage(rootData) : undefined,
   };
 }
 

@@ -24,6 +24,7 @@ import {
 } from "@yep-anywhere/shared";
 import { getLogger } from "../logging/logger.js";
 import { isRetiredProviderName } from "../sdk/providers/policy.js";
+import { cursorSessionIdFromWatchPath } from "../sessions/cursor-reader.js";
 import type { ISessionReader, SessionFileEntry } from "../sessions/types.js";
 import type { SessionSummary } from "../supervisor/types.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
@@ -605,6 +606,21 @@ export class SessionIndexService implements ISessionIndexService {
     this.dirtySessionsByDir.delete(scopeKey);
   }
 
+  /** Refresh one already indexed Cursor session instead of every project scope. */
+  private markIndexedCursorSessionDirty(sessionId: string): boolean {
+    let marked = false;
+    for (const [scopeKey, index] of this.indexCache) {
+      if (!scopeKey.startsWith("cursor::") || !index.sessions[sessionId]) {
+        continue;
+      }
+      const current = this.dirtySessionsByDir.get(scopeKey) ?? new Set();
+      current.add(sessionId);
+      this.dirtySessionsByDir.set(scopeKey, current);
+      marked = true;
+    }
+    return marked;
+  }
+
   /**
    * Mark a modified Pi session dirty in every loaded Pi scope that already
    * indexes it. Pi names files `<timestamp>_<sessionId>.jsonl`; the filename is
@@ -832,6 +848,19 @@ export class SessionIndexService implements ISessionIndexService {
     if (event.provider === "gemini") {
       // Gemini uses the same shared-tree + project-scoped index pattern.
       this.markMatchingScopesDirty("gemini::");
+      return;
+    }
+
+    if (event.provider === "cursor") {
+      const sessionId = cursorSessionIdFromWatchPath(event.path);
+      if (
+        sessionId &&
+        event.changeType === "modify" &&
+        this.markIndexedCursorSessionDirty(sessionId)
+      ) {
+        return;
+      }
+      this.markMatchingScopesDirty("cursor::");
       return;
     }
 

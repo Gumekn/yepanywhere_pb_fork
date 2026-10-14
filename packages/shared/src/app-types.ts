@@ -17,6 +17,7 @@ import type {
   UserEntry,
 } from "./claude-sdk-schema/types.js";
 import type {
+  ContextCategoryEntry,
   ContextCompactEvent,
   ContextCumulativeUsage,
 } from "./context-status.js";
@@ -280,6 +281,8 @@ export interface ContextUsage {
   percentage: number;
   /** Context window size used to compute percentage */
   contextWindow?: number;
+  /** Provider-reported categories for this context snapshot, when available. */
+  categories?: ContextCategoryEntry[];
   /** Output tokens generated in the last response (optional - may not be available) */
   outputTokens?: number;
   /** Cache read tokens (tokens served from cache) */

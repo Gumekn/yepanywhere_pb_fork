@@ -1,8 +1,9 @@
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   type AgentMapping,
+  type ContextUsage,
   type CursorSessionContent,
   SESSION_TITLE_MAX_LENGTH,
   type UrlProjectId,
@@ -25,6 +26,23 @@ export const CURSOR_ACP_SESSIONS_DIR = join(
   process.env.CURSOR_CONFIG_DIR?.trim() || join(homedir(), ".cursor"),
   "acp-sessions",
 );
+
+const CURSOR_SESSION_FILES = new Set([
+  "store.db",
+  "store.db-wal",
+  "store.db-shm",
+  "meta.json",
+]);
+
+/** Session id is the parent directory of store.db, its WAL, or meta.json. */
+export function cursorSessionIdFromWatchPath(filePath: string): string | null {
+  if (!CURSOR_SESSION_FILES.has(basename(filePath))) return null;
+  const sessionId = basename(dirname(filePath));
+  if (!sessionId || sessionId === "acp-sessions" || sessionId === ".") {
+    return null;
+  }
+  return sessionId;
+}
 
 export interface CursorSessionReaderOptions {
   sessionsDir?: string;
@@ -132,7 +150,8 @@ export class CursorSessionReader implements ISessionReader {
   }
 
   getIndexScopeKey(sessionDir: string): string {
-    return `${sessionDir}::${this.projectPath ?? "*"}`;
+    // Rebuild pre-usage summaries even for sessions whose database is unchanged.
+    return `cursor::${sessionDir}::${this.projectPath ?? "*"}::context-v1`;
   }
 
   private async loadOne(sessionId: string) {
@@ -177,6 +196,7 @@ function toSummary(
     createdAt: string;
     updatedAt: string;
     messages: CursorSessionContent["messages"];
+    contextUsage?: ContextUsage;
   },
   projectId: UrlProjectId,
 ): SessionSummary {
@@ -203,6 +223,7 @@ function toSummary(
     userQuestionCoverage: "complete",
     ownership: { owner: "none" },
     provider: "cursor",
+    contextUsage: session.contextUsage,
   };
 }
 

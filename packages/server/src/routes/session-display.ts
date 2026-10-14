@@ -940,6 +940,7 @@ export function createSessionDisplaySource(
       return {
         provider: resolved.source.provider,
         messages: selectedMessages,
+        contextUsage: session.contextUsage,
         ...(!resolved.runtime.toolsMayBeActive &&
         (statuses === "completed" ||
           statuses === "failed" ||

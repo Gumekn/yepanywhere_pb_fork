@@ -405,6 +405,10 @@ function SessionPageContent({
   // Effective provider for immediate display before session data loads
   const effectiveProvider = session?.provider ?? initialProvider;
   const approvalAgentName = getApprovalAgentName(effectiveProvider);
+  useEffect(() => {
+    if (effectiveProvider !== "cursor" || !session?.id) return;
+    void api.warmCursorSession({ model: session.model }).catch(() => undefined);
+  }, [effectiveProvider, session?.id, session?.model]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
   const draftControlsRef = useRef<DraftControls | null>(null);

@@ -243,7 +243,7 @@ const ACTIVE_WINDOW_MIN_BOUNDARY_AGE_MS = 60_000;
 export function contextUsageFromStatus(
   status: ContextStatusResponse,
 ): ContextUsage | undefined {
-  if (status.source === "jsonl") return status.contextUsage;
+  if (status.source !== "sdk") return status.contextUsage;
   if (
     !Number.isFinite(status.totalTokens) ||
     status.totalTokens <= 0 ||
@@ -986,10 +986,14 @@ export function useLegacySessionMessages(
             ...current,
             contextUsage,
             ...(!current.model && status.model ? { model: status.model } : {}),
-            ...(!current.cumulativeUsage && status.cumulativeUsage
+            ...(!current.cumulativeUsage &&
+            status.source !== "native" &&
+            status.cumulativeUsage
               ? { cumulativeUsage: status.cumulativeUsage }
               : {}),
-            ...(!current.compactEvents && status.compactEvents
+            ...(!current.compactEvents &&
+            status.source !== "native" &&
+            status.compactEvents
               ? { compactEvents: status.compactEvents }
               : {}),
           };

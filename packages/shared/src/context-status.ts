@@ -9,6 +9,8 @@
 import type { ContextUsage } from "./app-types.js";
 
 export interface ContextCategoryEntry {
+  /** Stable provider category id, when available (also used for localization). */
+  id?: string;
   name: string;
   tokens: number;
   color?: string;
@@ -170,4 +172,12 @@ export interface ContextStatusEstimatePayload {
 
 export type ContextStatusResponse =
   | ContextStatusSdkPayload
-  | ContextStatusEstimatePayload;
+  | ContextStatusEstimatePayload
+  | ContextStatusNativePayload;
+
+/** Latest provider-native context snapshot persisted with the session. */
+export interface ContextStatusNativePayload {
+  source: "native";
+  model?: string;
+  contextUsage?: ContextUsage;
+}

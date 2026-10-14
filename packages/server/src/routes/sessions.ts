@@ -1484,6 +1484,17 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         project.provider;
       const model = sessionSummary?.model;
 
+      if (providerName === "cursor") {
+        // Cursor saves its native window and category estimates in store.db.
+        // Do not substitute a model heuristic or Claude's larger-window tier.
+        const payload: ContextStatusResponse = {
+          source: "native",
+          model: model ?? process?.model,
+          contextUsage: sessionSummary?.contextUsage,
+        };
+        return c.json(payload);
+      }
+
       const summaryWindow = sessionSummary?.contextUsage?.contextWindow;
       const cachedWindow = deps.modelInfoService?.getCachedContextWindow(
         model,

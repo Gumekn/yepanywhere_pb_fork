@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import * as path from "node:path";
 import {
   type AgentActivity,
@@ -12,6 +12,8 @@ import {
 import { getCodexSubagentMetadata } from "../codex/subagent.js";
 import { decodeProjectId, encodeProjectId } from "../projects/paths.js";
 import type { ProjectScanner } from "../projects/scanner.js";
+import { cursorSessionIdFromWatchPath } from "../sessions/cursor-reader.js";
+import { parseCursorMetaJson } from "../sessions/cursor-store.js";
 import {
   type PiSessionTailActivity,
   readPiSessionTailActivity,
@@ -522,6 +524,11 @@ export class ExternalSessionTracker {
       return;
     }
 
+    if (event.provider === "cursor") {
+      await this.handleCursorFileChange(event);
+      return;
+    }
+
     // Parse sessionId and projectId from path
     // Format: projects/<projectId>/<sessionId>.jsonl
     const parsed = this.parseSessionPath(event.relativePath);
@@ -615,6 +622,50 @@ export class ExternalSessionTracker {
     return Boolean(
       value && (value.startsWith("-") || /^[a-zA-Z]--/.test(value)),
     );
+  }
+
+  private async handleCursorFileChange(event: FileChangeEvent): Promise<void> {
+    const sessionId = cursorSessionIdFromWatchPath(event.path);
+    if (!sessionId) return;
+
+    const process = this.supervisor.getProcessForSession(sessionId);
+    const runtimeProcess = process
+      ? null
+      : await this.getRuntimeProcess?.(sessionId);
+    if (runtimeProcess) this.runtimeOwnedSessions.add(sessionId);
+    else this.runtimeOwnedSessions.delete(sessionId);
+
+    if (process || runtimeProcess) {
+      this.removeExternal(sessionId);
+      if (this.getSessionSummary) {
+        const getSessionSummary = this.getSessionSummary;
+        const projectId = process?.projectId ?? runtimeProcess?.projectId;
+        if (!projectId) return;
+        this.sessionParser.enqueue(sessionId, () =>
+          getSessionSummary(sessionId, projectId),
+        );
+      }
+      return;
+    }
+
+    if (this.isInAbortGracePeriod(sessionId)) return;
+
+    const dir = path.dirname(event.path);
+    let cwd: string | null = null;
+    try {
+      cwd =
+        parseCursorMetaJson(await readFile(path.join(dir, "meta.json"), "utf8"))
+          ?.cwd ?? null;
+    } catch {
+      return;
+    }
+    if (!cwd) return;
+
+    await this.handleUnownedSessionActivity(sessionId, {
+      provider: "cursor",
+      projectId: encodeProjectId(cwd),
+      sessionFilePath: path.join(dir, "store.db"),
+    });
   }
 
   private async handlePiFileChange(event: FileChangeEvent): Promise<void> {

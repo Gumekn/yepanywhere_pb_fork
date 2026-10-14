@@ -1172,6 +1172,31 @@ export const api = {
       `/providers/${encodeURIComponent(name)}${options?.fresh ? "?fresh=1" : ""}`,
     ),
 
+  prepareCursorSession: (body: {
+    projectId: string;
+    model?: string;
+    permissionMode?: string;
+  }) =>
+    fetchJSON<{ ok: true }>("/providers/cursor/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  discardCursorSession: (body: { projectId: string; model?: string }) =>
+    fetchJSON<{ ok: true }>("/providers/cursor/prepare/discard", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  warmCursorSession: (body: { model?: string }) =>
+    fetchJSON<{ ok: true }>("/providers/cursor/warm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
   /**
    * Read-only ZCode MCP server status snapshot for a project's workspace.
    * The server spawns a short-lived app-server and queries mcp/list in

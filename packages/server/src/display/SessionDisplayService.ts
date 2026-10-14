@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  ContextUsage,
   SessionDisplayActivity,
   SessionDisplayGroupPage,
   SessionDisplaySnapshot,
@@ -36,6 +37,7 @@ export interface DisplaySelection {
 export interface DisplaySourcePage {
   provider: string;
   messages: Message[];
+  contextUsage?: ContextUsage;
   turnStatuses?: Readonly<Record<string, SessionDisplayTurnStatus>>;
   /** Native Codex turns covering [from, before); newer live turns may lag history. */
   codexTurnWindow?: { turnIds: string[]; from: number; before: number };
@@ -102,6 +104,82 @@ function asRecord(value: unknown): RecordValue | undefined {
 }
 function messageContent(message: RecordValue): unknown {
   return asRecord(message.message)?.content ?? message.content;
+}
+
+function thinkingBody(message: RecordValue): string {
+  const content = messageContent(message);
+  if (!Array.isArray(content)) return "";
+  return content
+    .flatMap((value) => {
+      const block = asRecord(value);
+      return block?.type === "thinking" && typeof block.thinking === "string"
+        ? [block.thinking.trim()]
+        : [];
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function cursorPromptBody(message: RecordValue): string {
+  const content = messageContent(message);
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .flatMap((value) => {
+      const block = asRecord(value);
+      return block?.type === "text" && typeof block.text === "string"
+        ? [block.text]
+        : [];
+    })
+    .join("")
+    .trim();
+}
+
+/** ACP does not echo the user prompt; the injected copy is a plain user message. */
+function isCursorUserPrompt(message: RecordValue): boolean {
+  if (message.type !== "user") return false;
+  const content = messageContent(message);
+  if (
+    Array.isArray(content) &&
+    content.some((value) => asRecord(value)?.type === "tool_result")
+  )
+    return false;
+  return cursorPromptBody(message).length > 0;
+}
+
+function cursorPromptsMatch(native: string, live: string): boolean {
+  if (!native || !live) return false;
+  return native === live || native.includes(live) || live.includes(native);
+}
+
+/**
+ * Place the still-live prompt ahead of the native rows for its turn.
+ * An opening turn can persist tools before `<user_query>` is readable.
+ */
+function insertCursorPrompt(
+  messages: readonly Message[],
+  prompt: RecordValue,
+): Message[] {
+  const id = prompt.uuid ?? prompt.id;
+  if (
+    typeof id === "string" &&
+    messages.some((message) => message.uuid === id || message.id === id)
+  )
+    return [...messages];
+  const stored = prompt as Message;
+  const index = prompt.cursorTurnIndex;
+  if (typeof index === "number") {
+    const at = messages.findIndex(
+      (message) => message.cursorTurnIndex === index,
+    );
+    if (at < 0) return [...messages, stored];
+    return [...messages.slice(0, at), stored, ...messages.slice(at)];
+  }
+  const hasPrompt = messages.some(
+    (message) =>
+      message.type === "user" && cursorPromptBody(message).length > 0,
+  );
+  return hasPrompt ? [...messages, stored] : [stored, ...messages];
 }
 
 function hasToolInvocation(messages: readonly Message[]): boolean {
@@ -420,6 +498,7 @@ export class SessionDisplayService {
         });
         const failures = new Map<unknown, RecordValue>();
         const terminals = new Map<unknown, RecordValue>();
+        const thoughts = new Map<string, RecordValue>();
         for (const record of records) {
           if (
             record.type !== "message" ||
@@ -429,6 +508,14 @@ export class SessionDisplayService {
           const message = asRecord(record.data);
           if (!message) continue;
           this.rememberBody(entry, message);
+          if (
+            message.type === "assistant" &&
+            typeof message.uuid === "string" &&
+            thinkingBody(message)
+          ) {
+            // Later chunks for the same live id replace earlier ones.
+            thoughts.set(message.uuid, message);
+          }
           const failure = cursorStreamError(messageContent(message));
           if (failure || message.type === "error")
             failures.set(message.turnId, {
@@ -452,6 +539,11 @@ export class SessionDisplayService {
               turnStatus: "failed",
               is_error: true,
             });
+        }
+        for (const thought of thoughts.values()) {
+          const uuid = thought.uuid;
+          if (typeof uuid === "string" && entry.overlay.has(uuid)) continue;
+          this.event(entry, "message", { ...thought, isReplay: false });
         }
       } catch {
         // Native history remains usable during a runtime/journal outage.
@@ -934,6 +1026,18 @@ export class SessionDisplayService {
       if (!force && stamp === entry.stamp) return;
       const page = await source.read(entry.selection);
       if (entry.controller.signal.aborted) return;
+      if (page.provider === "cursor" && page.contextUsage) {
+        const usage = {
+          sessionId: entry.selection.sessionId,
+          branchId: entry.selection.branchId,
+          contextUsage: page.contextUsage,
+        };
+        const previous = entry.controls.get("display-context-usage");
+        if (JSON.stringify(previous) !== JSON.stringify(usage)) {
+          entry.controls.set("display-context-usage", usage);
+          this.emit(entry, "display-context-usage", usage);
+        }
+      }
       if (page.provider === "cursor") {
         // The CLI does not persist its error-text chunks to native history.
         // Recover both new typed failures and older wrongly-completed turns.
@@ -960,10 +1064,41 @@ export class SessionDisplayService {
               is_error: true,
             });
         }
+        // Native history can contain tool or assistant rows before `<user_query>`
+        // is committed. Keep the injected prompt until that row is readable.
+        const promptedTurns = new Set<number>();
+        const promptTexts: string[] = [];
+        for (const message of page.messages) {
+          if (message.type !== "user") continue;
+          const body = cursorPromptBody(message);
+          if (!body) continue;
+          promptTexts.push(body);
+          if (typeof message.cursorTurnIndex === "number")
+            promptedTurns.add(message.cursorTurnIndex);
+        }
+        for (const [id, message] of entry.bootstrapReplay) {
+          if (!isCursorUserPrompt(message)) continue;
+          const index = message.cursorTurnIndex;
+          if (typeof index === "number" && promptedTurns.has(index)) continue;
+          const body = cursorPromptBody(message);
+          if (
+            typeof index !== "number" &&
+            promptTexts.some((native) => cursorPromptsMatch(native, body))
+          )
+            continue;
+          entry.overlay.set(id, message);
+        }
       }
       this.acknowledgePersisted(entry, page);
       const model = new SessionDisplayReducer(entry.view, page.provider);
-      model.restore(page.messages, page.turnStatuses);
+      let restored = page.messages;
+      if (page.provider === "cursor") {
+        for (const message of entry.overlay.values()) {
+          if (isCursorUserPrompt(message))
+            restored = insertCursorPrompt(restored, message);
+        }
+      }
+      model.restore(restored, page.turnStatuses);
       if (!page.messages.length)
         for (const message of entry.bootstrapReplay.values())
           model.message(message, true);
@@ -1080,6 +1215,7 @@ export class SessionDisplayService {
           : "";
     const cursorTurns = new Map<number, { hasPrompt: boolean; text: string }>();
     const completedCursorTurns = new Set<number>();
+    const cursorPromptTexts: string[] = [];
     if (page.provider === "cursor") {
       for (const message of entry.overlay.values()) {
         if (
@@ -1093,8 +1229,11 @@ export class SessionDisplayService {
         if (typeof index !== "number") continue;
         const turn = cursorTurns.get(index) ?? { hasPrompt: false, text: "" };
         const content = messageContent(message);
-        if (message.type === "user" && typeof content === "string")
+        if (message.type === "user" && typeof content === "string") {
           turn.hasPrompt = true;
+          const body = content.trim();
+          if (body) cursorPromptTexts.push(body);
+        }
         if (message.type === "assistant") turn.text += text(content);
         cursorTurns.set(index, turn);
       }
@@ -1180,16 +1319,40 @@ export class SessionDisplayService {
       // Cursor persists content hashes while ACP chunks have local UUIDs.
       // Correlate within the native turn ordinal; matching an older turn's
       // identical reply must never erase output from a new turn.
+      if (
+        page.provider === "cursor" &&
+        isCursorUserPrompt(message) &&
+        typeof message.cursorTurnIndex !== "number" &&
+        cursorPromptTexts.some((native) =>
+          cursorPromptsMatch(native, cursorPromptBody(message)),
+        )
+      ) {
+        entry.overlay.delete(key);
+        continue;
+      }
       const cursorTurn =
         typeof message.cursorTurnIndex === "number"
           ? cursorTurns.get(message.cursorTurnIndex)
           : undefined;
       if (cursorTurn?.hasPrompt && !tools.length) {
         const body = text(content);
+        const thinkingBodies = blocks.flatMap((block) =>
+          block?.type === "thinking" &&
+          typeof block.thinking === "string" &&
+          block.thinking.trim()
+            ? [block.thinking]
+            : [],
+        );
+        // Native history keeps an encrypted signature and an empty reasoning
+        // body. Drop the live thought only when that body is actually in the
+        // persisted assistant text.
         const settledThinking =
           message.type === "assistant" &&
           !body &&
-          cursorTurn.text &&
+          thinkingBodies.length > 0 &&
+          thinkingBodies.every((thinking) =>
+            cursorTurn.text.includes(thinking),
+          ) &&
           completedCursorTurns.has(message.cursorTurnIndex as number) &&
           blocks.every((block) => block?.type === "thinking");
         if (
@@ -1370,6 +1533,8 @@ export class SessionDisplayService {
         : {}),
     });
     emit("display-snapshot", entry.snapshot);
+    const contextUsage = entry.controls.get("display-context-usage");
+    if (contextUsage) emit("display-context-usage", contextUsage);
     for (const [key, value] of entry.controls)
       if (key.startsWith("message:init")) emit("message", value);
     entry.listeners.add(emit);

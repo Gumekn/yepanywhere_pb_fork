@@ -1,4 +1,5 @@
 import {
+  type ContextUsage,
   type SessionDisplayActivity,
   type SessionDisplayNode,
   SessionDisplayPatchSchema,
@@ -76,6 +77,10 @@ export function useProjectedSessionMessages(
   const [session, setSession] = useState<Session | null>(null);
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const nativeContextUsageRef = useRef<{
+    key: string;
+    usage: ContextUsage;
+  } | null>(null);
   const configuration = useRef<
     Partial<
       Pick<Session, "provider" | "model" | "reasoningEffort" | "serviceTier">
@@ -138,10 +143,17 @@ export function useProjectedSessionMessages(
 
   const fetchSessionMetadata = useCallback(async () => {
     const expected = keyRef.current;
+    const usageAtRequest = nativeContextUsageRef.current;
     const data = await api.getSessionMetadata(projectId, sessionId);
     if (keyRef.current !== expected) return;
     const current = sessionRef.current;
     const next = { ...current, ...data.session, ...configuration.current };
+    const streamedUsage = nativeContextUsageRef.current;
+    if (
+      streamedUsage?.key === expected &&
+      (streamedUsage !== usageAtRequest || !next.contextUsage)
+    )
+      next.contextUsage = streamedUsage.usage;
     for (const name of [
       "model",
       "reasoningEffort",
@@ -251,7 +263,33 @@ export function useProjectedSessionMessages(
   const handleDisplayEvent = useCallback(
     (type: string, data: unknown) => {
       if (!enabled) return;
-      if (type === "display-snapshot") {
+      if (type === "display-context-usage") {
+        const update = data as {
+          sessionId?: string;
+          branchId?: string;
+          contextUsage?: ContextUsage;
+        } | null;
+        const usage = update?.contextUsage;
+        if (
+          update?.sessionId !== sessionId ||
+          update?.branchId !== branchId ||
+          !usage ||
+          !Number.isFinite(usage.inputTokens) ||
+          usage.inputTokens < 0 ||
+          !Number.isFinite(usage.percentage) ||
+          !usage.contextWindow ||
+          !Number.isFinite(usage.contextWindow) ||
+          usage.contextWindow < 0
+        )
+          return;
+        nativeContextUsageRef.current = { key: keyRef.current, usage };
+        setSession((current) => {
+          if (!current) return current;
+          const next = { ...current, contextUsage: usage };
+          sessionRef.current = next;
+          return next;
+        });
+      } else if (type === "display-snapshot") {
         const parsed = SessionDisplaySnapshotSchema.safeParse(data);
         if (parsed.success) install(parsed.data);
       } else if (type === "display-patch") {

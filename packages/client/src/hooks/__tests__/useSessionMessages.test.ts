@@ -2,6 +2,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetSessionSnapshotCacheForTests } from "../../lib/sessionSnapshotCache";
 import type { Message, Session } from "../../types";
+import { contextUsageFromStatus } from "../useLegacySessionMessages";
 import {
   planActiveMessageWindowTrim,
   truncateMessagesForEdit,
@@ -51,6 +52,19 @@ vi.mock("../../api/client", () => ({
     getSessionQuestions: mockGetSessionQuestions,
   },
 }));
+
+it("hydrates Cursor context from its native snapshot without losing the categories", () => {
+  const usage = {
+    inputTokens: 196_533,
+    contextWindow: 256_000,
+    percentage: 76.8,
+    categories: [{ id: "conversation", name: "Conversation", tokens: 196_533 }],
+  };
+  expect(
+    contextUsageFromStatus({ source: "native", contextUsage: usage }),
+  ).toBe(usage);
+  expect(contextUsageFromStatus({ source: "native" })).toBeUndefined();
+});
 
 function message(id: string, extra: Partial<Message> = {}): Message {
   return {

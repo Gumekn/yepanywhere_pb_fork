@@ -371,6 +371,9 @@ export function NewSessionForm({
   > | null>(null);
   const [zcodeMcpLoading, setZcodeMcpLoading] = useState(false);
   const [zcodeMcpError, setZcodeMcpError] = useState<string | null>(null);
+  const [cursorCatalog, setCursorCatalog] = useState<ModelInfo[] | null>(null);
+  const [cursorCatalogLoading, setCursorCatalogLoading] = useState(false);
+  const cursorPrepareKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (selectedProvider !== "zcode") return;
@@ -478,7 +481,16 @@ export function NewSessionForm({
     untrusted: t("newSessionZcodeMcpStatusUntrusted"),
   };
   // Get models and capabilities for the currently selected provider.
-  const availableModels: ModelInfo[] = selectedProviderInfo?.models ?? [];
+  // A cold Cursor catalog must not block the shared provider list, so the
+  // form loads it only after Cursor is selected and the list is still empty.
+  const listedModels = selectedProviderInfo?.models ?? [];
+  const availableModels: ModelInfo[] =
+    selectedProvider === "cursor" &&
+    listedModels.length === 0 &&
+    cursorCatalog &&
+    cursorCatalog.length > 0
+      ? cursorCatalog
+      : listedModels;
   const selectedModelInfo = availableModels.find(
     (model) => model.id === selectedModel,
   );
@@ -1287,6 +1299,74 @@ export function NewSessionForm({
         selectedModelForRequest ??
         undefined)
       : selectedModelForRequest;
+
+  const cursorListedCount =
+    providers.find((provider) => provider.name === "cursor")?.models?.length ??
+    0;
+  useEffect(() => {
+    if (selectedProvider !== "cursor" || cursorListedCount > 0) return;
+    let cancelled = false;
+    setCursorCatalogLoading(true);
+    api
+      .getProvider("cursor", { fresh: true })
+      .then((result) => {
+        if (cancelled) return;
+        setCursorCatalog(result.provider.models ?? []);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setCursorCatalogLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProvider, cursorListedCount]);
+
+  useEffect(() => {
+    const discard = (key: string | null) => {
+      if (!key) return;
+      const splitAt = key.indexOf("\0");
+      void api
+        .discardCursorSession({
+          projectId: key.slice(0, splitAt),
+          model: key.slice(splitAt + 1) || undefined,
+        })
+        .catch(() => undefined);
+    };
+    if (selectedProvider !== "cursor" || !projectId || !modelForRequest) {
+      discard(cursorPrepareKeyRef.current);
+      cursorPrepareKeyRef.current = null;
+      return;
+    }
+    const key = `${projectId}\0${modelForRequest}`;
+    if (cursorPrepareKeyRef.current && cursorPrepareKeyRef.current !== key) {
+      discard(cursorPrepareKeyRef.current);
+    }
+    cursorPrepareKeyRef.current = key;
+    void api
+      .prepareCursorSession({
+        projectId,
+        model: modelForRequest,
+        permissionMode: mode,
+      })
+      .catch(() => undefined);
+  }, [mode, modelForRequest, projectId, selectedProvider]);
+
+  useEffect(
+    () => () => {
+      const key = cursorPrepareKeyRef.current;
+      cursorPrepareKeyRef.current = null;
+      if (!key) return;
+      const splitAt = key.indexOf("\0");
+      void api
+        .discardCursorSession({
+          projectId: key.slice(0, splitAt),
+          model: key.slice(splitAt + 1) || undefined,
+        })
+        .catch(() => undefined);
+    },
+    [],
+  );
   // Native Codex tiers outside the shared enum (e.g. ultra) travel only in
   // reasoningEffort; never send an unrelated shared thinking level alongside.
   const thinkingForRequest =
@@ -2123,6 +2203,13 @@ export function NewSessionForm({
           disabled={isStarting}
         />
       )}
+      {selectedProvider === "cursor" &&
+        availableModels.length === 0 &&
+        cursorCatalogLoading && (
+          <p className="new-session-model-section">
+            {t("cursorModelsLoading")}
+          </p>
+        )}
       {selectedProvider &&
         selectedProvider !== "cursor" &&
         (modelOptions.length > 0 ||

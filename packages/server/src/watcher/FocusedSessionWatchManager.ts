@@ -3,10 +3,18 @@ import { stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { UrlProjectId } from "@yep-anywhere/shared";
 import type { ZCodeSessionInfo } from "../projects/zcode-scanner.js";
+import { CURSOR_ACP_SESSIONS_DIR } from "../sessions/cursor-reader.js";
 import { normalizeProviderGroup } from "../sessions/provider-groups.js";
 import type { Project } from "../supervisor/types.js";
 
-type WatchProvider = "claude" | "codex" | "gemini" | "pi" | "kimi" | "zcode";
+type WatchProvider =
+  | "claude"
+  | "codex"
+  | "gemini"
+  | "pi"
+  | "kimi"
+  | "zcode"
+  | "cursor";
 type ChangeSource = "fs-watch" | "poll";
 
 interface CodexSessionInfo {
@@ -449,6 +457,18 @@ export class FocusedSessionWatchManager {
         continue;
       }
 
+      if (provider === "cursor") {
+        const candidate = join(
+          CURSOR_ACP_SESSIONS_DIR,
+          target.sessionId,
+          "store.db",
+        );
+        if (await this.fileExists(candidate)) {
+          return { filePath: candidate, provider };
+        }
+        continue;
+      }
+
       if (provider === "zcode") {
         const sessions =
           (await this.zcodeScanner?.getSessionsForProject(project.path)) ?? [];
@@ -485,6 +505,7 @@ export class FocusedSessionWatchManager {
     pushCandidate("gemini");
     pushCandidate("pi");
     pushCandidate("zcode");
+    pushCandidate("cursor");
     return candidates;
   }
 
@@ -492,7 +513,7 @@ export class FocusedSessionWatchManager {
     provider: string | undefined,
   ): WatchProvider | null {
     const group = normalizeProviderGroup(provider);
-    if (!group || group === "cursor") return null;
+    if (!group) return null;
     return group;
   }
 

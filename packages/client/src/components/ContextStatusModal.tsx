@@ -1,4 +1,5 @@
 import type {
+  ContextCategoryEntry,
   ContextCumulativeUsage,
   ContextStatusResponse,
 } from "@yep-anywhere/shared";
@@ -86,6 +87,37 @@ export function ContextStatusModal({
 
 function ContextStatusContent({ data }: { data: ContextStatusResponse }) {
   const { t } = useI18n();
+
+  if (data.source === "native") {
+    const usage = data.contextUsage;
+    return (
+      <div className="context-status-body">
+        <SourceBadge source="native" />
+        {usage?.contextWindow ? (
+          <>
+            <HeroMeter
+              percentage={usage.percentage}
+              used={usage.inputTokens}
+              total={usage.contextWindow}
+              model={data.model}
+              modelLabel={t("processInfoLabelModel")}
+            />
+            <CursorCategories
+              categories={usage.categories}
+              maxTokens={usage.contextWindow}
+            />
+            <p className="context-status-hint">
+              {t("contextBreakdownCursorHint")}
+            </p>
+          </>
+        ) : (
+          <p className="context-status-hint">
+            {t("contextBreakdownCursorUnavailable")}
+          </p>
+        )}
+      </div>
+    );
+  }
 
   if (data.source === "jsonl") {
     const used = data.contextUsage?.inputTokens ?? 0;
@@ -266,7 +298,7 @@ function HeroMeter({
     <div className="context-status-hero">
       <div className="context-status-hero-numbers">
         <span className={`context-status-percent-big severity-${severity}`}>
-          {formatPercent(clamped)}%
+          {formatPercent(Math.max(0, percentage))}%
         </span>
         <span className="context-status-fraction">
           {formatTokens(used)} / {formatTokens(total)}
@@ -436,13 +468,58 @@ function CumulativeUsageSection({
   );
 }
 
-function SourceBadge({ source }: { source: "sdk" | "jsonl" }) {
+const CURSOR_CATEGORY_KEYS = {
+  system_prompt: "contextCursorSystemPrompt",
+  tools: "contextCursorTools",
+  rules: "contextCursorRules",
+  skills: "contextCursorSkills",
+  mcp: "contextCursorMcp",
+  subagents: "contextCursorSubagents",
+  summarized_conversation: "contextCursorSummarizedConversation",
+  conversation: "contextCursorConversation",
+} as const;
+
+function CursorCategories({
+  categories,
+  maxTokens,
+}: {
+  categories?: ContextCategoryEntry[];
+  maxTokens: number;
+}) {
+  const { t } = useI18n();
+  if (!categories?.length) return null;
+  return (
+    <Section heading={t("contextCategoryHeading")}>
+      <TokenRowList
+        rows={categories.map((category) => {
+          const key =
+            category.id && Object.hasOwn(CURSOR_CATEGORY_KEYS, category.id)
+              ? CURSOR_CATEGORY_KEYS[
+                  category.id as keyof typeof CURSOR_CATEGORY_KEYS
+                ]
+              : undefined;
+          return {
+            key: category.id ?? category.name,
+            label: key ? t(key) : category.name,
+            tokens: category.tokens,
+          };
+        })}
+        maxTokens={maxTokens}
+        showBar
+      />
+    </Section>
+  );
+}
+
+function SourceBadge({ source }: { source: ContextStatusResponse["source"] }) {
   const { t } = useI18n();
   return (
     <span className={`context-status-source-badge source-${source}`}>
       {source === "sdk"
         ? t("contextBreakdownSourceSDK")
-        : t("contextBreakdownSourceEstimate")}
+        : source === "native"
+          ? t("contextBreakdownSourceNative")
+          : t("contextBreakdownSourceEstimate")}
     </span>
   );
 }

@@ -57,6 +57,55 @@ function fixture(pollMs = 60_000) {
   };
 }
 describe("SessionDisplayService", () => {
+  it("streams and replays Cursor context snapshots even when only usage changes", async () => {
+    vi.useFakeTimers();
+    const { service, source } = fixture(1_000);
+    const initial = {
+      ...(await source.read()),
+      provider: "cursor",
+      contextUsage: {
+        inputTokens: 196_533,
+        contextWindow: 256_000,
+        percentage: 76.8,
+      },
+    };
+    source.read.mockResolvedValue(initial);
+    const events = vi.fn();
+    const subscription = await service.subscribe(selection, events);
+    expect(events).toHaveBeenCalledWith("display-context-usage", {
+      sessionId: selection.sessionId,
+      contextUsage: initial.contextUsage,
+    });
+    events.mockClear();
+    // The prompt text is unchanged; a new root contains post-compaction usage.
+    const contextUsage = {
+      inputTokens: 20_000,
+      contextWindow: 256_000,
+      percentage: 7.8,
+    };
+    source.stamp.mockResolvedValue("2");
+    source.read.mockResolvedValue({ ...initial, stamp: "2", contextUsage });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(events).toHaveBeenCalledWith("display-context-usage", {
+      sessionId: selection.sessionId,
+      contextUsage,
+    });
+    events.mockClear();
+    source.stamp.mockResolvedValue("3");
+    source.read.mockResolvedValue({ ...initial, stamp: "3", contextUsage });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(
+      events.mock.calls.filter(([type]) => type === "display-context-usage"),
+    ).toHaveLength(0);
+    subscription.cleanup();
+    const reconnected = vi.fn();
+    await service.subscribe(selection, reconnected);
+    expect(reconnected).toHaveBeenCalledWith("display-context-usage", {
+      sessionId: selection.sessionId,
+      contextUsage,
+    });
+  });
+
   it("loads full streamed reasoning from the live body cache without looking up an unrelated native ID", async () => {
     const { service, source, push } = fixture();
     const page = await source.read();
@@ -270,8 +319,129 @@ describe("SessionDisplayService", () => {
       ).toHaveLength(2);
       expect(JSON.stringify(snapshot)).toContain("disk-answer-2");
       expect(JSON.stringify(snapshot)).not.toContain("live-answer-2");
-      expect(JSON.stringify(snapshot)).not.toContain("Transient thought");
+      expect(JSON.stringify(snapshot)).toContain("Transient thought");
       expect(snapshot.activity.state).toBe("completed");
+    });
+  });
+  it("restores Cursor thinking from the runtime journal when native history has none", async () => {
+    const { service, source, runtime } = fixture();
+    runtime.getProcessForSession.mockResolvedValue(null);
+    (runtime as { replay: (query: unknown) => Promise<unknown[]> }).replay =
+      vi.fn(async () => [
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "journal-thought",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "thinking", thinking: "Kept from the journal" },
+              ],
+            },
+          },
+        },
+      ]);
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        {
+          uuid: "disk-user",
+          type: "user",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "user", content: "Explain" },
+        },
+        {
+          uuid: "disk-answer",
+          type: "assistant",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "assistant", content: "The answer" },
+        },
+      ],
+      activity: "unknown",
+      stamp: "1",
+    });
+    await service.subscribe(selection, vi.fn());
+    const snapshot = await service.snapshot(selection);
+    expect(JSON.stringify(snapshot)).toContain("Kept from the journal");
+    expect(JSON.stringify(snapshot)).toContain("The answer");
+  });
+  it("keeps the injected Cursor prompt until native history contains that user query", async () => {
+    const { service, source, runtime } = fixture();
+    let emit: (type: string, data: unknown) => void = () => {};
+    const tool = {
+      uuid: "disk-tool",
+      type: "assistant",
+      cursorTurnIndex: 1,
+      turnId: "cursor-turn-1",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "Read",
+            input: { path: "README.md" },
+          },
+        ],
+      },
+    } satisfies Message;
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [tool],
+      activity: "running",
+      stamp: "1",
+    });
+    runtime.subscribeSession.mockImplementation(async (_id, send) => {
+      emit = send;
+      send("message", {
+        isReplay: true,
+        type: "user",
+        uuid: "live-user",
+        message: { role: "user", content: "详细审核一下该项目" },
+      });
+      return { cleanup: vi.fn() };
+    });
+    await service.subscribe(selection, vi.fn());
+    const first = await service.snapshot(selection);
+    const questions = first.nodes.filter((node) => node.type === "question");
+    const toolAt = first.nodes.findIndex(
+      (node) => node.type === "segment" && node.segment.type === "tool_group",
+    );
+    expect(questions).toHaveLength(1);
+    const question = questions[0];
+    if (!question) throw new Error("Expected question node");
+    expect(JSON.stringify(question)).toContain("详细审核一下该项目");
+    expect(JSON.stringify(question)).toContain("live-user");
+    expect(toolAt).toBeGreaterThan(first.nodes.indexOf(question));
+
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        {
+          uuid: "disk-user",
+          type: "user",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "user", content: "详细审核一下该项目" },
+        },
+        tool,
+      ],
+      activity: "running",
+      stamp: "2",
+    });
+    emit("status", { state: "idle" });
+    await vi.waitFor(async () => {
+      const next = await service.snapshot(selection);
+      const settled = next.nodes.filter((node) => node.type === "question");
+      expect(settled).toHaveLength(1);
+      expect(JSON.stringify(settled[0])).toContain("disk-user");
+      expect(JSON.stringify(settled)).not.toContain("live-user");
     });
   });
   it.each([
