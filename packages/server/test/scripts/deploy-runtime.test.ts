@@ -100,7 +100,7 @@ describe("deployment runtime wiring", () => {
       // No production deploy script, launchd, port, or service is executed.
       writeFileSync(
         join(dir, "scripts/redeploy-server.sh"),
-        '#!/bin/zsh\nprintf "%s\\n" "$@"\n',
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$@"\n',
         { mode: 0o755 },
       );
       const helperStart = source.indexOf("server_args_contain() {");
@@ -117,7 +117,7 @@ describe("deployment runtime wiring", () => {
         source.indexOf('\nif $DO_APK; then\n  log "Building/installing APK'),
       );
       const result = spawnSync(
-        "/bin/zsh",
+        "bash",
         [
           "-c",
           `
@@ -130,7 +130,7 @@ ALLOW_YEP_SESSION_INTERRUPT=false
 SERVER_ARGS=(--restart ${runtime ? "--restart-runtime" : ""})
 log() { :; }
 warn() { :; }
-err() { print -r -- "$*" >&2; }
+err() { printf '%s\\n' "$*" >&2; }
 ${helper}
 ${guard}
 ${dispatch}
@@ -138,11 +138,12 @@ ${dispatch}
         ],
         { cwd: dir, encoding: "utf8" },
       );
+      const failure = result.error?.message ?? result.stderr;
       if (expected) {
-        expect(result.status, result.stderr).toBe(0);
+        expect(result.status, failure).toBe(0);
         expect(result.stdout.trim().split("\n")).toEqual(expected);
       } else {
-        expect(result.status).toBe(2);
+        expect(result.status, failure).toBe(2);
         expect(result.stderr).toContain("Nothing to deploy");
       }
     },
