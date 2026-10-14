@@ -74,6 +74,13 @@ interface Entry {
   controls: Map<string, unknown>;
   details: Map<string, Message>;
   detailBytes: number;
+  /**
+   * Cursor thoughts still waiting for the assistant text or tool that followed
+   * them. Native history keeps only an encrypted signature, so a later refresh
+   * uses the anchor on each thought instead of appending the chain after the
+   * answer.
+   */
+  cursorPendingThoughts: string[];
   streamId?: string;
   provider?: string;
   stamp?: string;
@@ -104,6 +111,69 @@ function asRecord(value: unknown): RecordValue | undefined {
 }
 function messageContent(message: RecordValue): unknown {
   return asRecord(message.message)?.content ?? message.content;
+}
+
+function isCursorTrackedMessage(
+  message: RecordValue,
+  provider: string | undefined,
+): boolean {
+  return (
+    provider === "cursor" ||
+    typeof message.cursorTurnIndex === "number" ||
+    (typeof message.turnId === "string" &&
+      message.turnId.startsWith("cursor-turn-"))
+  );
+}
+
+/** A live Cursor thought, with no answer or tool call in the same message. */
+function isCursorThinkingOnly(message: RecordValue): boolean {
+  if (message.type !== "assistant") return false;
+  const content = messageContent(message);
+  if (!Array.isArray(content) || content.length === 0) return false;
+  let hasThinking = false;
+  for (const value of content) {
+    const block = asRecord(value);
+    if (
+      block?.type === "thinking" &&
+      typeof block.thinking === "string" &&
+      block.thinking.trim()
+    ) {
+      hasThinking = true;
+      continue;
+    }
+    return false;
+  }
+  return hasThinking;
+}
+
+/**
+ * The next visible Cursor step after a thought.
+ * Tool results and user prompts are not anchors: the thought was flushed
+ * before the tool call or the assistant text that followed it.
+ */
+function cursorThinkingAnchor(
+  message: RecordValue,
+): { text?: string; toolId?: string } | undefined {
+  if (message.type !== "assistant") return undefined;
+  const content = messageContent(message);
+  if (typeof content === "string") {
+    const text = content.trim();
+    return text ? { text } : undefined;
+  }
+  if (!Array.isArray(content)) return undefined;
+  for (const value of content) {
+    const block = asRecord(value);
+    if (!block) continue;
+    if (block.type === "tool_use" && typeof block.id === "string" && block.id)
+      return { toolId: block.id };
+    if (
+      block.type === "text" &&
+      typeof block.text === "string" &&
+      block.text.trim()
+    )
+      return { text: block.text.trim() };
+  }
+  return undefined;
 }
 
 function thinkingBody(message: RecordValue): string {
@@ -234,6 +304,7 @@ export function compactDisplayMessage(message: RecordValue): RecordValue {
     "error",
     "parentUuid",
     "branch",
+    "cursorThinkingBefore",
   ]) {
     if (message[key] !== undefined) result[key] = message[key];
   }
@@ -455,6 +526,7 @@ export class SessionDisplayService {
         controls: new Map(),
         details: new Map(),
         detailBytes: 0,
+        cursorPendingThoughts: [],
       };
       this.entries.set(key, entry);
       const current = entry;
@@ -499,6 +571,7 @@ export class SessionDisplayService {
         const failures = new Map<unknown, RecordValue>();
         const terminals = new Map<unknown, RecordValue>();
         const thoughts = new Map<string, RecordValue>();
+        const pendingThoughts: RecordValue[] = [];
         for (const record of records) {
           if (
             record.type !== "message" ||
@@ -509,12 +582,31 @@ export class SessionDisplayService {
           if (!message) continue;
           this.rememberBody(entry, message);
           if (
-            message.type === "assistant" &&
-            typeof message.uuid === "string" &&
-            thinkingBody(message)
+            isCursorThinkingOnly(message) &&
+            typeof message.uuid === "string"
           ) {
             // Later chunks for the same live id replace earlier ones.
+            const previous = thoughts.get(message.uuid);
+            if (
+              previous?.cursorThinkingBefore !== undefined &&
+              message.cursorThinkingBefore === undefined
+            )
+              message.cursorThinkingBefore = previous.cursorThinkingBefore;
             thoughts.set(message.uuid, message);
+            const pendingAt = pendingThoughts.findIndex(
+              (thought) => thought.uuid === message.uuid,
+            );
+            if (pendingAt >= 0) pendingThoughts[pendingAt] = message;
+            else pendingThoughts.push(message);
+          } else {
+            const anchor = cursorThinkingAnchor(message);
+            if (anchor) {
+              for (const thought of pendingThoughts) {
+                if (thought.cursorThinkingBefore === undefined)
+                  thought.cursorThinkingBefore = anchor;
+              }
+              pendingThoughts.length = 0;
+            }
           }
           const failure = cursorStreamError(messageContent(message));
           if (failure || message.type === "error")
@@ -529,6 +621,10 @@ export class SessionDisplayService {
             });
           if (message.type === "result") terminals.set(message.turnId, message);
         }
+        for (const thought of pendingThoughts) {
+          if (thought.cursorThinkingBefore === undefined)
+            thought.cursorThinkingBefore = { fallback: true };
+        }
         for (const [turnId, failure] of failures) {
           this.event(entry, "message", failure);
           const terminal = terminals.get(turnId);
@@ -540,11 +636,26 @@ export class SessionDisplayService {
               is_error: true,
             });
         }
+        let anchorsChanged = false;
         for (const thought of thoughts.values()) {
           const uuid = thought.uuid;
-          if (typeof uuid === "string" && entry.overlay.has(uuid)) continue;
+          if (typeof uuid !== "string") continue;
+          const existing = entry.overlay.get(uuid);
+          if (existing) {
+            if (
+              existing.cursorThinkingBefore === undefined &&
+              thought.cursorThinkingBefore !== undefined
+            ) {
+              existing.cursorThinkingBefore = thought.cursorThinkingBefore;
+              anchorsChanged = true;
+            }
+            continue;
+          }
           this.event(entry, "message", { ...thought, isReplay: false });
         }
+        // Thoughts already on screen were appended before this journal pass
+        // could see what followed them. Rebuild so the new anchors apply.
+        if (anchorsChanged) await this.refresh(entry, true);
       } catch {
         // Native history remains usable during a runtime/journal outage.
         // On-demand reasoning can retry recovery when the connection returns.
@@ -663,6 +774,43 @@ export class SessionDisplayService {
       };
       entry.overlay.set(id, stopped);
       entry.model?.message(stopped);
+    }
+  }
+
+  /**
+   * Remember which assistant text or tool call followed each Cursor thought.
+   * Streaming updates of that same message refresh the anchor text in place.
+   */
+  private bindCursorThinking(
+    entry: Entry,
+    id: string,
+    compact: RecordValue,
+  ): void {
+    if (!isCursorTrackedMessage(compact, entry.provider)) return;
+    if (isCursorThinkingOnly(compact)) {
+      if (
+        compact.cursorThinkingBefore === undefined &&
+        !entry.cursorPendingThoughts.includes(id)
+      )
+        entry.cursorPendingThoughts.push(id);
+      return;
+    }
+    const anchor = cursorThinkingAnchor(compact);
+    if (anchor && entry.cursorPendingThoughts.length > 0) {
+      const bound = { ...anchor, sourceId: id };
+      for (const thoughtId of entry.cursorPendingThoughts) {
+        const thought = entry.overlay.get(thoughtId);
+        if (thought && thought.cursorThinkingBefore === undefined)
+          thought.cursorThinkingBefore = bound;
+      }
+      entry.cursorPendingThoughts.length = 0;
+    }
+    if (!anchor) return;
+    for (const thought of entry.overlay.values()) {
+      const before = asRecord(thought.cursorThinkingBefore);
+      if (before?.sourceId !== id) continue;
+      if (anchor.text) before.text = anchor.text;
+      if (anchor.toolId) before.toolId = anchor.toolId;
     }
   }
 
@@ -923,6 +1071,12 @@ export class SessionDisplayService {
             content: [...merged.values()],
           };
         }
+        if (
+          compact.cursorThinkingBefore === undefined &&
+          previous?.cursorThinkingBefore !== undefined
+        )
+          compact.cursorThinkingBefore = previous.cursorThinkingBefore;
+        this.bindCursorThinking(entry, id, compact);
         entry.overlay.set(id, compact);
         if (entry.overlay.size > 2_000) {
           const first = entry.overlay.keys().next().value;

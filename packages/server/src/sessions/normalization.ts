@@ -507,6 +507,16 @@ export function normalizeSession(
         messages: data.session.messages.map((message) => {
           if (message.role === "user") cursorTurnIndex += 1;
           const turnId = `cursor-turn-${cursorTurnIndex}`;
+          if (message.role === "compaction") {
+            return {
+              type: "system",
+              subtype: "compact_boundary",
+              uuid: message.id,
+              cursorTurnIndex,
+              turnId,
+              content: message.text || "Context compacted",
+            };
+          }
           if (message.blocks) {
             const role = message.role === "assistant" ? "assistant" : "user";
             return {

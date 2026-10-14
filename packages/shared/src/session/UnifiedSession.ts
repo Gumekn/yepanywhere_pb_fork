@@ -18,10 +18,14 @@ export interface CodexSessionContent {
   entries: CodexSessionEntry[];
 }
 
-/** One visible turn recovered from a Cursor ACP `store.db` blob. */
+/**
+ * One visible turn recovered from a Cursor ACP `store.db` blob.
+ * `compaction` marks where Cursor summarized earlier history; `text` is the
+ * summary body.
+ */
 export interface CursorTranscriptMessage {
   id: string;
-  role: "user" | "assistant" | "tool";
+  role: "user" | "assistant" | "tool" | "compaction";
   text: string;
   reasoning?: string;
   /** Ordered visible content, including native tool calls and results. */

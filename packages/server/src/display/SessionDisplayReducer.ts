@@ -90,6 +90,40 @@ function outputText(value: unknown): string {
       .join("\n");
   return "";
 }
+interface CursorThinkingPlacement {
+  text?: string;
+  toolId?: string;
+  fallback?: boolean;
+  section?: string;
+}
+
+function cursorTextsMatch(native: string, live: string): boolean {
+  const left = native.trim();
+  const right = live.trim();
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (Math.min(left.length, right.length) < 24) return false;
+  return left.includes(right) || right.includes(left);
+}
+
+function readCursorThinkingPlacement(
+  message: RecordValue,
+): CursorThinkingPlacement | undefined {
+  const raw = record(message.cursorThinkingBefore);
+  if (!raw) return undefined;
+  const text = string(raw.text);
+  const toolId = string(raw.toolId);
+  const fallback = raw.fallback === true;
+  if (!text && !toolId && !fallback) return undefined;
+  const turnId = string(message.turnId);
+  return {
+    ...(text ? { text } : {}),
+    ...(toolId ? { toolId } : {}),
+    ...(fallback ? { fallback: true } : {}),
+    ...(turnId ? { section: `turn:${turnId}` } : {}),
+  };
+}
+
 function toolSummary(input: unknown): string {
   const args = record(input);
   if (!args) return typeof input === "string" ? input.slice(0, 1_024) : "";
@@ -178,6 +212,59 @@ export class SessionDisplayReducer {
     } else this.nodes[index] = node;
   }
 
+  private insertAt(index: number, node: SessionDisplayNode): void {
+    this.nodes.splice(index, 0, node);
+    for (let cursor = index; cursor < this.nodes.length; cursor += 1) {
+      const current = this.nodes[cursor];
+      if (current) this.nodeIndices.set(current.id, cursor);
+    }
+  }
+
+  /**
+   * Put a recovered Cursor thought above the answer it preceded.
+   * A missed anchor still stays before that turn's last reply.
+   */
+  private findCursorThinkingIndex(
+    placement: CursorThinkingPlacement,
+  ): number | undefined {
+    const section = placement.section ?? this.currentSection;
+    const runId = section.startsWith("turn:")
+      ? section.slice("turn:".length)
+      : this.currentRun;
+    if (placement.toolId) {
+      const mapped = this.rawToolIds.get(placement.toolId);
+      const tool =
+        this.tools.get(displayToolId(runId, placement.toolId)) ??
+        (mapped ? this.tools.get(mapped) : undefined);
+      if (tool && (tool.runId === runId || tool.runId === this.currentRun)) {
+        const index = this.nodeIndices.get(tool.step.groupId);
+        if (index !== undefined) return index;
+      }
+    }
+    if (placement.text) {
+      for (let index = 0; index < this.nodes.length; index += 1) {
+        const node = this.nodes[index];
+        if (
+          node?.type === "segment" &&
+          node.segment.type === "assistant_text" &&
+          node.turnId === section &&
+          cursorTextsMatch(node.segment.content, placement.text)
+        )
+          return index;
+      }
+    }
+    for (let index = this.nodes.length - 1; index >= 0; index -= 1) {
+      const node = this.nodes[index];
+      if (
+        node?.type === "segment" &&
+        node.segment.type === "assistant_text" &&
+        node.turnId === section
+      )
+        return index;
+    }
+    return undefined;
+  }
+
   setRuntime(state: SessionDisplayActivity["state"]): void {
     if (state !== "running" && state !== "unknown") this.stopStreaming();
     if (["completed", "interrupted", "failed"].includes(state))
@@ -256,6 +343,7 @@ export class SessionDisplayReducer {
     deferred = false,
     asyncMessage?: CodexAsyncMessage,
     provisional = false,
+    placement?: CursorThinkingPlacement,
   ): void {
     if (!text.trim()) return;
     if (streaming && this.committed.has(id)) return;
@@ -265,13 +353,14 @@ export class SessionDisplayReducer {
     if (active && !thinking) this.streamingTexts.set(id, this.currentRun);
     else this.streamingTexts.delete(id);
     if (old === undefined) this.currentGroup = undefined;
-    this.put({
+    const section =
+      old === undefined
+        ? (placement?.section ?? this.currentSection)
+        : (this.nodes[old]?.turnId ?? this.currentSection);
+    const node: SessionDisplayNode = {
       type: "segment",
       id,
-      turnId:
-        old === undefined
-          ? this.currentSection
-          : (this.nodes[old]?.turnId ?? this.currentSection),
+      turnId: section,
       segment: thinking
         ? {
             type: "thinking",
@@ -296,7 +385,14 @@ export class SessionDisplayReducer {
                   : "text",
             ...(timestamp ? { timestamp } : {}),
           },
-    });
+    };
+    if (old === undefined && placement && thinking) {
+      const at = this.findCursorThinkingIndex(placement);
+      if (at !== undefined) {
+        const turnId = this.nodes[at]?.turnId ?? section;
+        this.insertAt(at, { ...node, turnId });
+      } else this.put(node);
+    } else this.put(node);
     if (!streaming && !provisional && !this.committed.has(id)) {
       this.committed.add(id);
       this.closeBefore(id);
@@ -753,6 +849,11 @@ export class SessionDisplayReducer {
               timestamp,
               true,
               block.deferred === true,
+              undefined,
+              false,
+              this.provider === "cursor"
+                ? readCursorThinkingPlacement(message)
+                : undefined,
             );
           } else if (block.type === "tool_use") {
             this.tool(block, effectiveRun, timestamp, replay, identity);

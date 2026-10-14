@@ -6,6 +6,12 @@
  * that blob is a protobuf node whose 32-byte children are either JSON chat
  * messages or further protobuf nodes. Assistant text lives on the JSON
  * `assistant` blobs; system and `<user_info>` preamble blobs are skipped.
+ *
+ * After a context compaction the root keeps the post-compaction conversation
+ * in field 1 and the pre-compaction history in a field-13 record (its own
+ * field 1 messages plus the summary blob in field 4). The record is walked
+ * first so history reads chronologically; the prompt Cursor repeats after
+ * the summary dedupes by blob id, and the summary becomes a compaction row.
  */
 
 import { readFile, stat } from "node:fs/promises";
@@ -40,6 +46,10 @@ interface StoreMeta {
 }
 
 const USER_QUERY_RE = /<user_query>\s*([\s\S]*?)\s*<\/user_query>/;
+const CONVERSATION_SUMMARY_RE =
+  /^\s*<conversation_summary>\s*([\s\S]*?)\s*(?:<\/conversation_summary>\s*)?$/;
+/** Root field holding a compacted (pre-summary) history record. */
+const COMPACTION_RECORD_FIELD = 13;
 
 /** SQLite commits usually change the WAL while store.db itself stays unchanged. */
 export async function getCursorSessionFileStats(
@@ -184,8 +194,13 @@ function walkBlob(
     return;
   }
 
-  for (const child of protobufDigestChildren(data)) {
-    if (blobs.has(child)) walkBlob(child, blobs, seen, out, depth + 1);
+  const children = protobufDigestFields(data);
+  const ordered = [
+    ...children.filter((child) => child.field === COMPACTION_RECORD_FIELD),
+    ...children.filter((child) => child.field !== COMPACTION_RECORD_FIELD),
+  ];
+  for (const child of ordered) {
+    if (blobs.has(child.id)) walkBlob(child.id, blobs, seen, out, depth + 1);
   }
 }
 
@@ -203,6 +218,14 @@ function transcriptFromJsonBlob(
   const role = (parsed as { role?: unknown }).role;
   const content = (parsed as { content?: unknown }).content;
   if (role === "user") {
+    const summary = flattenText(content).match(CONVERSATION_SUMMARY_RE);
+    if (summary) {
+      return {
+        id: `cursor-${id.slice(0, 12)}`,
+        role: "compaction",
+        text: summary[1]?.trim() ?? "",
+      };
+    }
     const text = extractUserText(content);
     if (!text) return null;
     return { id: `cursor-${id.slice(0, 12)}`, role: "user", text };
@@ -349,7 +372,13 @@ function flattenText(content: unknown): string {
 
 /** Length-delimited protobuf fields whose payload is a 32-byte blob digest. */
 export function protobufDigestChildren(data: Buffer): string[] {
-  const children: string[] = [];
+  return protobufDigestFields(data).map((child) => child.id);
+}
+
+function protobufDigestFields(
+  data: Buffer,
+): Array<{ field: number; id: string }> {
+  const children: Array<{ field: number; id: string }> = [];
   let offset = 0;
   while (offset < data.length) {
     const tag = readVarint(data, offset);
@@ -377,7 +406,11 @@ export function protobufDigestChildren(data: Buffer): string[] {
     const end = offset + length.value;
     if (end > data.length) break;
     const chunk = data.subarray(offset, end);
-    if (chunk.length === 32) children.push(Buffer.from(chunk).toString("hex"));
+    if (chunk.length === 32)
+      children.push({
+        field: Math.floor(tag.value / 8),
+        id: Buffer.from(chunk).toString("hex"),
+      });
     offset = end;
   }
   return children;

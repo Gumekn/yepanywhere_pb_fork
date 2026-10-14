@@ -13,6 +13,17 @@ import {
 } from "../../src/display/SessionDisplayService.js";
 import type { Message } from "../../src/supervisor/types.js";
 const selection = { projectId: "project", sessionId: "session" };
+function displayNodeLabels(snapshot: SessionDisplaySnapshot): string[] {
+  return snapshot.nodes.map((node) => {
+    if (node.type === "question") return "question";
+    if (node.type !== "segment") return node.type;
+    if (node.segment.type === "thinking")
+      return `thinking:${node.segment.content}`;
+    if (node.segment.type === "assistant_text")
+      return `text:${node.segment.content}`;
+    return node.segment.type;
+  });
+}
 const services: SessionDisplayService[] = [];
 afterEach(() => {
   for (const service of services.splice(0)) service.dispose();
@@ -321,6 +332,13 @@ describe("SessionDisplayService", () => {
       expect(JSON.stringify(snapshot)).not.toContain("live-answer-2");
       expect(JSON.stringify(snapshot)).toContain("Transient thought");
       expect(snapshot.activity.state).toBe("completed");
+      const labels = displayNodeLabels(snapshot);
+      const thoughtAt = labels.indexOf("thinking:Transient thought");
+      const answers = labels.flatMap((label, index) =>
+        label === "text:Same answer" ? [index] : [],
+      );
+      expect(thoughtAt).toBeGreaterThan(answers[0] ?? -1);
+      expect(thoughtAt).toBeLessThan(answers[1] ?? -1);
     });
   });
   it("restores Cursor thinking from the runtime journal when native history has none", async () => {
@@ -370,6 +388,124 @@ describe("SessionDisplayService", () => {
     const snapshot = await service.snapshot(selection);
     expect(JSON.stringify(snapshot)).toContain("Kept from the journal");
     expect(JSON.stringify(snapshot)).toContain("The answer");
+    const labels = displayNodeLabels(snapshot);
+    expect(labels.indexOf("thinking:Kept from the journal")).toBeLessThan(
+      labels.indexOf("text:The answer"),
+    );
+  });
+  it("places recovered Cursor thoughts before the reply or tool that followed them", async () => {
+    const { service, source, runtime } = fixture();
+    runtime.getProcessForSession.mockResolvedValue(null);
+    (runtime as { replay: (query: unknown) => Promise<unknown[]> }).replay =
+      vi.fn(async () => [
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "thought-before-tool",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "Before the tool" }],
+            },
+          },
+        },
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "live-tool",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "tool-1",
+                  name: "Read",
+                  input: { path: "README.md" },
+                },
+              ],
+            },
+          },
+        },
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "thought-before-answer",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "Before the answer" }],
+            },
+          },
+        },
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "live-answer",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: { role: "assistant", content: "The answer" },
+          },
+        },
+      ]);
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        {
+          uuid: "disk-user",
+          type: "user",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "user", content: "Explain" },
+        },
+        {
+          uuid: "disk-tool",
+          type: "assistant",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "tool-1",
+                name: "Read",
+                input: { path: "README.md" },
+              },
+            ],
+          },
+        },
+        {
+          uuid: "disk-answer",
+          type: "assistant",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "assistant", content: "The answer" },
+        },
+      ],
+      activity: "unknown",
+      stamp: "1",
+    });
+    await service.subscribe(selection, vi.fn());
+    const snapshot = await service.snapshot(selection);
+    expect(displayNodeLabels(snapshot)).toEqual([
+      "question",
+      "thinking:Before the tool",
+      "tool_group",
+      "thinking:Before the answer",
+      "text:The answer",
+    ]);
   });
   it("keeps the injected Cursor prompt until native history contains that user query", async () => {
     const { service, source, runtime } = fixture();

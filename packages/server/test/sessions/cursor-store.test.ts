@@ -271,4 +271,100 @@ describe("cursor ACP session store", () => {
       },
     ]);
   });
+
+  it("orders compacted history before the post-summary conversation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cursor-compact-"));
+    dirs.push(dir);
+    const sessionId = "22222222-2222-4222-8222-222222222222";
+    const sessionDir = join(dir, sessionId);
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(sessionDir);
+    await writeFile(
+      join(sessionDir, "meta.json"),
+      JSON.stringify({ cwd: "/tmp/cursor-project" }),
+    );
+    const sqlite = openSqlite();
+    const db = new sqlite.DatabaseSync(join(sessionDir, "store.db"));
+    db.exec(
+      "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)",
+    );
+    const insert = db.prepare("INSERT INTO blobs (id, data) VALUES (?, ?)");
+    const blob = (value: unknown) => {
+      const id = randomBytes(32);
+      insert.run(id.toString("hex"), Buffer.from(JSON.stringify(value)));
+      return id;
+    };
+    const field = (number: number, id: Buffer) =>
+      Buffer.concat([Buffer.from([(number << 3) | 2, 32]), id]);
+    const node = (parts: Buffer[]) => {
+      const id = randomBytes(32);
+      insert.run(id.toString("hex"), Buffer.concat(parts));
+      return id;
+    };
+
+    const first = blob({
+      role: "user",
+      content: "<user_query>Why</user_query>",
+    });
+    const firstReply = blob({ role: "assistant", content: "Because" });
+    const second = blob({
+      role: "user",
+      content: "<user_query>Fix</user_query>",
+    });
+    const before = blob({ role: "assistant", content: "Looking" });
+    const summary = blob({
+      role: "user",
+      content: "<conversation_summary>\nEarlier work\n</conversation_summary>",
+    });
+    const after = blob({ role: "assistant", content: "Fixed" });
+    const record = node([
+      field(1, first),
+      field(1, firstReply),
+      field(1, second),
+      field(1, before),
+      field(4, summary),
+    ]);
+    const root = node([
+      field(1, second),
+      field(1, summary),
+      field(1, after),
+      field(13, record),
+    ]);
+    db.prepare("INSERT INTO meta (key, value) VALUES ('0', ?)").run(
+      Buffer.from(
+        JSON.stringify({ latestRootBlobId: root.toString("hex") }),
+      ).toString("hex"),
+    );
+    db.close();
+
+    const session = await readCursorSessionDir(sessionDir);
+    expect(
+      session?.messages.map((message) => [message.role, message.text]),
+    ).toEqual([
+      ["user", "Why"],
+      ["assistant", "Because"],
+      ["user", "Fix"],
+      ["assistant", "Looking"],
+      ["compaction", "Earlier work"],
+      ["assistant", "Fixed"],
+    ]);
+    if (!session) throw new Error("Expected compacted Cursor history");
+    const loaded = await new CursorSessionReader({
+      sessionsDir: dir,
+      projectPath: "/tmp/cursor-project",
+    }).getSession(sessionId, "project");
+    if (!loaded) throw new Error("Expected loaded Cursor session");
+    expect(loaded.summary.userQuestions?.map((q) => q.text)).toEqual([
+      "Why",
+      "Fix",
+    ]);
+    const normalized = normalizeSession(loaded);
+    expect(normalized.messages.at(-2)).toMatchObject({
+      type: "system",
+      subtype: "compact_boundary",
+      content: "Earlier work",
+      cursorTurnIndex: 2,
+    });
+    expect(normalized.messages.at(-1)).toMatchObject({ cursorTurnIndex: 2 });
+  });
 });
