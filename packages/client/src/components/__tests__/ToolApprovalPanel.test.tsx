@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   createEvent,
   fireEvent,
@@ -51,36 +52,47 @@ async function renderKeyboardPanel(feedback?: string) {
   const onApprove = vi.fn(async () => undefined);
   const onDeny = vi.fn(async () => undefined);
   const onDenyWithFeedback = vi.fn(async (_feedback: string) => undefined);
-  render(
-    <I18nProvider>
-      <ToolApprovalPanel
-        request={{
-          id: "approval-shortcuts",
-          sessionId: "session-shortcuts",
-          type: "tool-approval",
-          prompt: "Run command?",
-          toolName: "Bash",
-          toolInput: { command: "pwd" },
-          timestamp: "2026-10-08T00:00:00.000Z",
-        }}
-        sessionId="session-shortcuts"
-        onApprove={onApprove}
-        onDeny={onDeny}
-        onDenyWithFeedback={onDenyWithFeedback}
-      />
-      <input aria-label="Other input" />
-      <textarea aria-label="Other draft" />
-      <div contentEditable suppressContentEditableWarning>
-        <span data-testid="historical-editor">Editing a historical prompt</span>
-      </div>
-    </I18nProvider>,
-  );
-  await waitFor(() =>
-    expect(
-      (screen.getByRole("button", { name: /^1.*Yes/ }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(false),
-  );
+  vi.useFakeTimers();
+  try {
+    render(
+      <I18nProvider>
+        <ToolApprovalPanel
+          request={{
+            id: "approval-shortcuts",
+            sessionId: "session-shortcuts",
+            type: "tool-approval",
+            prompt: "Run command?",
+            toolName: "Bash",
+            toolInput: { command: "pwd" },
+            timestamp: "2026-10-08T00:00:00.000Z",
+          }}
+          sessionId="session-shortcuts"
+          onApprove={onApprove}
+          onDeny={onDeny}
+          onDenyWithFeedback={onDenyWithFeedback}
+        />
+        <input aria-label="Other input" />
+        <textarea aria-label="Other draft" />
+        <div contentEditable suppressContentEditableWarning>
+          <span data-testid="historical-editor">
+            Editing a historical prompt
+          </span>
+        </div>
+      </I18nProvider>,
+    );
+    // The enabled DOM can appear before the passive effect replaces the
+    // keyboard listener. Flush the arming timer and React effects together
+    // before dispatching keys, independently of CI scheduling/load.
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(
+    (screen.getByRole("button", { name: /^1.*Yes/ }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(false);
   return { onApprove, onDeny, onDenyWithFeedback };
 }
 
@@ -207,6 +219,8 @@ describe("ToolApprovalPanel", () => {
     await waitFor(() =>
       expect(onDenyWithFeedback).toHaveBeenCalledWith("请调整命令"),
     );
+    expect(onDenyWithFeedback).toHaveBeenCalledTimes(1);
+    expect(onApprove).not.toHaveBeenCalled();
   });
 
   it("renders safe MCP URL actions as external links", () => {
