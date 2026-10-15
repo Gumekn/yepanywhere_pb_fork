@@ -37,11 +37,15 @@ function getUserMessageText(message: Message): string | null {
 function isPendingMessageConfirmed(
   pending: PendingMessage,
   message: Message,
+  visibleAtSubmission?: ReadonlySet<string>,
 ): boolean {
   const tempId = (message as { tempId?: unknown }).tempId;
-  if (typeof tempId === "string" && tempId === pending.tempId) {
-    return true;
+  if (typeof tempId === "string" && tempId) {
+    return tempId === pending.tempId;
   }
+
+  const id = message.uuid ?? message.id;
+  if (typeof id === "string" && visibleAtSubmission?.has(id)) return false;
 
   const messageTimestampMs =
     typeof message.timestamp === "string"
@@ -92,8 +96,8 @@ export function reconcilePendingMessagesWithConfirmedMessages(
 export interface UsePendingMessagesResult {
   /** Messages waiting for server confirmation (shown as "Sending..."). */
   pendingMessages: PendingMessage[];
-  /** Raw setter, for stream handlers that reconcile echoes by content. */
-  setPendingMessages: React.Dispatch<React.SetStateAction<PendingMessage[]>>;
+  /** Confirm at most one submission from a streamed user echo. */
+  confirmPendingMessage: (message: Message) => void;
   /** Add to the pending queue; returns the generated tempId. */
   addPendingMessage: (content: string) => string;
   /** Remove a pending message by tempId (server confirmed or send failed). */
@@ -133,20 +137,13 @@ export function usePendingMessages(
           visibleAtSubmission.current.delete(pending.tempId);
           return false;
         }
-        const baseline = visibleAtSubmission.current.get(pending.tempId);
-        const eligible = baseline
-          ? messages.filter((message) => {
-              const id = message.uuid ?? message.id;
-              return (
-                message.tempId === pending.tempId ||
-                typeof id !== "string" ||
-                !baseline.has(id)
-              );
-            })
-          : messages;
-        const confirmed =
-          reconcilePendingMessagesWithConfirmedMessages([pending], eligible)
-            .length === 0;
+        const confirmed = messages.some((message) =>
+          isPendingMessageConfirmed(
+            pending,
+            message,
+            visibleAtSubmission.current.get(pending.tempId),
+          ),
+        );
         if (confirmed) visibleAtSubmission.current.delete(pending.tempId);
         return !confirmed;
       });
@@ -179,6 +176,22 @@ export function usePendingMessages(
     setPendingMessages((prev) => prev.filter((p) => p.tempId !== tempId));
   }, []);
 
+  const confirmPendingMessage = useCallback((message: Message) => {
+    setPendingMessages((prev) => {
+      const index = prev.findIndex((pending) =>
+        isPendingMessageConfirmed(
+          pending,
+          message,
+          visibleAtSubmission.current.get(pending.tempId),
+        ),
+      );
+      const confirmed = prev[index];
+      if (!confirmed) return prev;
+      visibleAtSubmission.current.delete(confirmed.tempId);
+      return prev.filter((_, i) => i !== index);
+    });
+  }, []);
+
   const updatePendingMessage = useCallback(
     (tempId: string, updates: Partial<PendingMessage>) => {
       setPendingMessages((prev) =>
@@ -190,7 +203,7 @@ export function usePendingMessages(
 
   return {
     pendingMessages,
-    setPendingMessages,
+    confirmPendingMessage,
     addPendingMessage,
     removePendingMessage,
     updatePendingMessage,

@@ -73,6 +73,53 @@ afterEach(() => {
 });
 
 describe("projected session messages", () => {
+  it("keeps a fresh pending prompt through historical user replays until a fresh echo arrives", async () => {
+    const { result } = renderHook(() => useSession("project", "session"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    act(() => {
+      result.current.addPendingMessage("Run");
+    });
+    const stream = () => vi.mocked(useSessionStream).mock.calls.at(-1)?.[1];
+    const pending = result.current.pendingMessages[0];
+    expect(pending).toBeDefined();
+
+    // This prompt was already visible at submission, even without a timestamp.
+    act(() => {
+      stream()?.onMessage({
+        eventType: "message",
+        type: "user",
+        uuid: "u1",
+        isReplay: true,
+        message: { role: "user", content: "Run" },
+      });
+    });
+    expect(result.current.pendingMessages).toEqual([pending]);
+
+    // A previously unseen historical row is also ineligible by timestamp.
+    act(() => {
+      stream()?.onMessage({
+        eventType: "message",
+        type: "user",
+        uuid: "old-unseen",
+        timestamp: "2020-01-01T00:00:00.000Z",
+        isReplay: true,
+        message: { role: "user", content: "Run" },
+      });
+    });
+    expect(result.current.pendingMessages).toEqual([pending]);
+
+    act(() => {
+      stream()?.onMessage({
+        eventType: "message",
+        type: "user",
+        uuid: "fresh-echo",
+        timestamp: pending?.timestamp,
+        message: { role: "user", content: "Run" },
+      });
+    });
+    expect(result.current.pendingMessages).toEqual([]);
+  });
+
   it("applies streamed Cursor context before metadata loads and after compaction", async () => {
     const metadata = deferred<unknown>();
     api.getSessionMetadata.mockReturnValue(metadata.promise);
