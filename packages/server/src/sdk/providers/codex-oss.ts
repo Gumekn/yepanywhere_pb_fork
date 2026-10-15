@@ -382,6 +382,7 @@ export class CodexOSSProvider implements AgentProvider {
       turnNumber++;
       accumulatedText = "";
       accumulatedThinking = "";
+      let turnFailed = false;
 
       // Build CLI arguments - use resume for subsequent turns
       const isFirstTurn = turnNumber === 1 && !options.resumeSessionId;
@@ -429,6 +430,13 @@ export class CodexOSSProvider implements AgentProvider {
         return;
       }
 
+      // Observe exit before yielding any output: the CLI may close while the
+      // consumer is still handling its final error/message.
+      const exitPromise = new Promise<number | null>((resolve) => {
+        codexProcess.once("close", resolve);
+        codexProcess.once("error", () => resolve(null));
+      });
+
       // Handle abort
       const abortHandler = () => codexProcess.kill("SIGTERM");
       signal.addEventListener("abort", abortHandler);
@@ -469,6 +477,12 @@ export class CodexOSSProvider implements AgentProvider {
           // First try JSON parsing (works for first turn with --json)
           const event = this.parseEvent(line);
           if (event) {
+            if (event.type === "turn.failed" || event.type === "error") {
+              turnFailed = true;
+            } else if (event.type === "turn.completed") {
+              turnFailed = false;
+            }
+
             // Update session ID from thread.started (only on first turn)
             if (event.type === "thread.started") {
               log.debug(
@@ -592,10 +606,7 @@ export class CodexOSSProvider implements AgentProvider {
         }
 
         // Wait for exit
-        const exitCode = await new Promise<number | null>((resolve) => {
-          codexProcess.on("close", resolve);
-          codexProcess.on("error", () => resolve(null));
-        });
+        const exitCode = await exitPromise;
 
         if (exitCode !== 0 && stderr) {
           log.warn(
@@ -604,10 +615,16 @@ export class CodexOSSProvider implements AgentProvider {
           );
         }
 
-        // Emit result
+        const turnStatus = signal.aborted
+          ? "interrupted"
+          : turnFailed || exitCode !== 0
+            ? "failed"
+            : "completed";
         yield {
           type: "result",
           session_id: currentSessionId,
+          turnStatus,
+          is_error: turnStatus === "failed",
         } as SDKMessage;
       } finally {
         clearTimeout(timeoutId);
