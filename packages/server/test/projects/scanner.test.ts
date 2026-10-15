@@ -63,6 +63,7 @@ describe("ProjectScanner missing projectsDir", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
     });
 
     const projects = await scanner.listProjects();
@@ -101,6 +102,7 @@ describe("ProjectScanner cache", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
       cacheTtlMs: 60000,
     });
 
@@ -140,6 +142,7 @@ describe("ProjectScanner cache", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
       cacheTtlMs: 0,
     });
 
@@ -178,6 +181,7 @@ describe("ProjectScanner cache", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
       cacheTtlMs: 60000,
       eventBus,
     });
@@ -241,6 +245,7 @@ describe("ProjectScanner cache", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
       cacheTtlMs: 60000,
     });
 
@@ -297,6 +302,7 @@ describe("ProjectScanner cache", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
       cacheTtlMs: 60000,
       eventBus,
     });
@@ -379,6 +385,7 @@ describe("ProjectScanner stale-cwd recovery", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
     });
     const projects = await scanner.listProjects();
 
@@ -438,6 +445,7 @@ describe("ProjectScanner shared Claude storage", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
     });
 
     await expect(scanner.listProjects()).resolves.toEqual([
@@ -483,6 +491,7 @@ describe("ProjectScanner shared Claude storage", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
     });
 
     await expect(
@@ -518,6 +527,7 @@ describe("ProjectScanner shared Claude storage", () => {
       enableKimi: false,
       enablePi: false,
       enableZCode: false,
+      enableCursor: false,
     });
 
     await expect(
