@@ -1043,29 +1043,7 @@ export class SessionIndexService implements ISessionIndexService {
         ) {
           if (cached.isEmpty || isRetiredProviderName(cached.provider))
             continue;
-          summaries.push({
-            id: sessionId,
-            projectId,
-            title: cached.title,
-            fullTitle: cached.fullTitle,
-            createdAt: cached.createdAt,
-            updatedAt: cached.updatedAt,
-            messageCount: cached.messageCount,
-            userQuestions: cached.userQuestions,
-            userQuestionCoverage: cached.userQuestionCoverage,
-            ownership: { owner: "none" },
-            contextUsage: cached.contextUsage,
-            cumulativeUsage: cached.cumulativeUsage,
-            compactCount: cached.compactCount,
-            compactEvents: cached.compactEvents,
-            provider: cached.provider ?? DEFAULT_PROVIDER,
-            model: cached.model,
-            reasoningEffort: cached.reasoningEffort,
-            serviceTier: cached.serviceTier,
-            originator: cached.originator,
-            source: cached.source,
-            createdBy: cached.createdBy,
-          });
+          summaries.push(this.cachedToSummary(sessionId, cached, projectId));
         } else {
           cacheMisses.push({ sessionId, mtime, size });
         }
