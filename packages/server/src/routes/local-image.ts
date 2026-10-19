@@ -2,9 +2,11 @@ import { createReadStream } from "node:fs";
 import { type FileHandle, open, realpath, stat } from "node:fs/promises";
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
+import type { ProjectScanner } from "../projects/scanner.js";
 
 interface LocalImageDeps {
   allowedPaths: string[];
+  scanner?: Pick<ProjectScanner, "listProjects">;
 }
 
 const MEDIA_EXTENSIONS: Record<string, string> = {
@@ -31,7 +33,7 @@ const MEDIA_EXTENSIONS: Record<string, string> = {
  * Create routes for serving local images from allowed paths.
  *
  * Security: Only serves files that:
- * 1. Resolve (after symlink resolution) to a path under an allowed prefix
+ * 1. Resolve (after symlink resolution) under an allowed prefix or known local project
  * 2. Have a recognized image or video extension
  * 3. Are regular files (not directories, devices, etc.)
  */
@@ -89,9 +91,31 @@ export function createLocalImageRoutes(deps: LocalImageDeps) {
 
     // Check resolved path against resolved allowed prefixes
     const allowed = await getAllowedPaths();
-    const isAllowed = allowed.some((prefix) =>
+    let isAllowed = allowed.some((prefix) =>
       resolvedPath.startsWith(`${prefix}/`),
     );
+    if (!isAllowed && deps.scanner) {
+      // Use the scanner's current snapshot so newly discovered projects work
+      // without a restart and removed projects do not stay authorized forever.
+      const projects = await deps.scanner.listProjects();
+      const projectPaths = await Promise.all(
+        projects
+          .filter(
+            (project) =>
+              !project.isRemoteProject && project.path.startsWith("/"),
+          )
+          .map(async (project) => {
+            try {
+              return await realpath(project.path);
+            } catch {
+              return null;
+            }
+          }),
+      );
+      isAllowed = projectPaths.some(
+        (prefix) => prefix !== null && resolvedPath.startsWith(`${prefix}/`),
+      );
+    }
     if (!isAllowed) {
       return c.json({ error: "Path not in allowed directories" }, 403);
     }

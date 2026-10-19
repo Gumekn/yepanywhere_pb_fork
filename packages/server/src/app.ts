@@ -1777,15 +1777,14 @@ export function createApp(options: AppOptions): AppResult {
     }),
   );
 
-  // Local image serving (opt-in, restricted to allowed paths)
-  if (options.allowedImagePaths && options.allowedImagePaths.length > 0) {
-    app.route(
-      "/api/local-image",
-      createLocalImageRoutes({
-        allowedPaths: options.allowedImagePaths,
-      }),
-    );
-  }
+  // Local media from known local projects and explicitly allowed directories.
+  app.route(
+    "/api/local-image",
+    createLocalImageRoutes({
+      allowedPaths: options.allowedImagePaths ?? [],
+      scanner,
+    }),
+  );
 
   // Local document previews are available across projects and sessions.
   app.route("/api/local-file", createLocalFileRoutes());

@@ -326,6 +326,10 @@
 
 .local-media-error {
   color: var(--color-error);
+  min-width: 0;
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* Blockquotes in streaming blocks */

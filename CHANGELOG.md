@@ -58,6 +58,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ### Fixed
 - 修复会话索引全量校验命中缓存时丢失失败、中断及 fork 来源字段；流式用户消息确认统一使用时间戳和消息身份保护，并清理乐观消息的提交记录，避免历史回放误消除待发送消息；Codex OSS 失败或异常退出保留失败状态，不再被回合结束消息覆盖为成功。
+- 修复项目目录内生成的图片／视频预览返回 `403 Path not in allowed directories`：本地媒体接口动态允许已知本地项目，保留目录边界与符号链接校验；预览失败时长路径和错误详情在移动端自动换行。
 - 修复外置 runtime 下 Cursor 新建会话仍然冷启动、容易撞上 30 秒初始化超时：新建页的预备和登录预热原来发生在 web/API 进程，真正的 `startSession` 在 runtime 进程，两边的进程池互不可见。现在 `prepare`、`discard`、`warm` 都转到 runtime 里执行；没有预备好的会话时，新建会领用该模型已经登录的空闲 `agent acp`，只补一次 `session/new`。旧 runtime 会提示需要更新（Cursor 集成版本 3）。
 - 修复 Cursor 选了带参数的模型（如 Grok 4.7 500K High 非 Fast）后新建会话发送失败、报 `Provider initialization timed out after 30000ms`：之前每次启动固定写 7 次 `session/set_config_option`（每次约 2–3 秒），加上认证和建会话超过 30 秒初始化上限。现在只写和当前值不一致的选项，全部对上就停，并直接用 `session/new`／`session/load` 返回的配置跳过多余的模型写入；本机实测启动从约 28 秒降到约 6 秒。
 - 修复会话结束后 provider 常驻进程（Codex app-server、Claude、Pi、Kimi、ZCode、Cursor 等）只增不减、要等 runtime 重启才释放的问题：会话闲置超过 60 分钟后自动释放对应进程，之后再发消息会冷启动续接。运行中、等待审批或暂停的会话不受影响。可以用 `RESIDENT_IDLE_TTL`（秒）调整时长，设为 `0` 恢复为永久保留。
