@@ -6,11 +6,14 @@ import type { HarnessUpdateService } from "../services/HarnessUpdateService.js";
 export function createHarnessUpdateRoutes(options: {
   service: HarnessUpdateService;
   enabledProviders?: string[];
+  dshEnabled?: boolean;
 }): Hono {
   const routes = new Hono();
-  const ids: HarnessId[] = ["codex", "pi"];
+  const ids: HarnessId[] = ["codex", "pi", "dsh"];
   const enabled = (id: HarnessId) =>
-    isProviderEnabled(id, options.enabledProviders) ||
+    (id === "dsh"
+      ? options.dshEnabled === true
+      : isProviderEnabled(id, options.enabledProviders)) ||
     (id === "codex" &&
       isProviderEnabled("codex-oss", options.enabledProviders));
 

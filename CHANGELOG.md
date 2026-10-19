@@ -8,6 +8,8 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 ## [Unreleased]
 
 ### Added
+- 设置页的「CLI 更新」支持 dsh：只跟随 npm 官方 latest 渠道（可能包含 RC），正确比较候选版本且不降级，更新当前实际使用的安装目录；提供单独的停止／启动 dsh Web 操作，停止前确认任务中断影响，运行期间拒绝覆盖安装，更新与启动互斥，更新完成后由用户启动新版。
+- 侧栏新增 dsh 入口：按需启动并复用本机 dsh Web，在 Yep 内打开原生页面；HTTP、流式响应和 WebSocket 共用 Yep 的访问地址与认证，支持反向代理路径前缀。侧栏入口简写为 `dsh`，移除内嵌页面上方的标题和「在新标签页打开／重新连接」工具栏；桌面端内容直接从顶部开始，移动端保留侧栏按钮。
 - Cursor 会话输入框旁显示原生上下文 token 用量与窗口上限，点击可查看系统提示词、工具、规则、技能、MCP、子智能体和对话等分类；读取 CLI 最新持久化快照，随 SQLite WAL 更新，并保留 CLI 实际窗口，不推算或混用账号额度。
 - 开发设置支持选择会话运行服务（runtime），可随服务端重新部署或单独重启；默认保留会话，勾选后明确提示活跃任务会中断。生产环境从 worker 状态独立获取运行形态，避免开发接口不可用或会话活动更新导致选项消失。
 - 新增 Cursor provider：通过本机 `agent acp` 创建和续接会话，直播文本、思考、工具调用和审批，并在 `~/.cursor/acp-sessions` 里重新打开已经落盘的会话。IDE 侧栏聊天和 Cloud Agents 不在这次范围内。
@@ -58,6 +60,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ### Fixed
 - 修复会话索引全量校验命中缓存时丢失失败、中断及 fork 来源字段；流式用户消息确认统一使用时间戳和消息身份保护，并清理乐观消息的提交记录，避免历史回放误消除待发送消息；Codex OSS 失败或异常退出保留失败状态，不再被回合结束消息覆盖为成功。
+- 修复 Yep 内嵌 dsh 点击「添加工作区」无反应：启动时固定使用网页目录选择器，避免 macOS loopback 环境误选服务器原生目录对话框；同时加载目录浏览后端和网页交互组件。
 - 修复项目目录内生成的图片／视频预览返回 `403 Path not in allowed directories`：本地媒体接口动态允许已知本地项目，保留目录边界与符号链接校验；预览失败时长路径和错误详情在移动端自动换行。
 - 修复外置 runtime 下 Cursor 新建会话仍然冷启动、容易撞上 30 秒初始化超时：新建页的预备和登录预热原来发生在 web/API 进程，真正的 `startSession` 在 runtime 进程，两边的进程池互不可见。现在 `prepare`、`discard`、`warm` 都转到 runtime 里执行；没有预备好的会话时，新建会领用该模型已经登录的空闲 `agent acp`，只补一次 `session/new`。旧 runtime 会提示需要更新（Cursor 集成版本 3）。
 - 修复 Cursor 选了带参数的模型（如 Grok 4.7 500K High 非 Fast）后新建会话发送失败、报 `Provider initialization timed out after 30000ms`：之前每次启动固定写 7 次 `session/set_config_option`（每次约 2–3 秒），加上认证和建会话超过 30 秒初始化上限。现在只写和当前值不一致的选项，全部对上就停，并直接用 `session/new`／`session/load` 返回的配置跳过多余的模型写入；本机实测启动从约 28 秒降到约 6 秒。

@@ -3,7 +3,7 @@ import { createHarnessUpdateRoutes } from "../../src/routes/harness-updates.js";
 import { HarnessUpdateService } from "../../src/services/HarnessUpdateService.js";
 
 describe("harness update routes", () => {
-  function setup(enabledProviders?: string[]) {
+  function setup(enabledProviders?: string[], dshEnabled = false) {
     const service = new HarnessUpdateService();
     const getInfo = vi
       .spyOn(service, "getInfo")
@@ -21,7 +21,11 @@ describe("harness update routes", () => {
       log: "",
     });
     return {
-      routes: createHarnessUpdateRoutes({ service, enabledProviders }),
+      routes: createHarnessUpdateRoutes({
+        service,
+        enabledProviders,
+        dshEnabled,
+      }),
       getInfo,
       check,
       start,
@@ -70,5 +74,20 @@ describe("harness update routes", () => {
     expect(
       (await routes.request("/codex/update", { method: "POST" })).status,
     ).toBe(409);
+  });
+
+  it("lists DSH as a Web integration independently of provider allowlists", async () => {
+    const { routes, check } = setup(["pi"], true);
+    const response = await routes.request("/");
+    expect(
+      (await response.json()).harnesses.map((item: { id: string }) => item.id),
+    ).toEqual(["pi", "dsh"]);
+    expect(
+      (await routes.request("/dsh/check", { method: "POST" })).status,
+    ).toBe(200);
+    expect(check).toHaveBeenCalledWith("dsh");
+    expect(
+      (await setup().routes.request("/dsh/update", { method: "POST" })).status,
+    ).toBe(404);
   });
 });

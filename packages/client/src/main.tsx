@@ -90,6 +90,9 @@ const TerminalPage = lazy(() =>
     default: module.TerminalPage,
   })),
 );
+const DshPage = lazy(() =>
+  import("./pages/DshPage").then((module) => ({ default: module.DshPage })),
+);
 const SettingsLayout = lazy(() =>
   import("./pages/settings").then((module) => ({
     default: module.SettingsLayout,
@@ -181,6 +184,7 @@ createRoot(rootElement).render(
                     element={<LegacyDeviceRedirect />}
                   />
                   <Route path="/terminal" element={<TerminalPage />} />
+                  <Route path="/dsh" element={<DshPage />} />
                   <Route
                     path="/terminal/:terminalId"
                     element={<TerminalPage />}

@@ -1150,6 +1150,15 @@ export const api = {
     ),
 
   // Provider API
+  launchDshWeb: () =>
+    fetchJSON<{ url: string }>("/dsh/launch", { method: "POST" }),
+
+  stopDshWeb: () =>
+    fetchJSON<{ stopped: true }>("/dsh/stop", {
+      method: "POST",
+      body: JSON.stringify({ confirm: true }),
+    }),
+
   getHarnessUpdates: () =>
     fetchJSON<{ harnesses: HarnessUpdateInfo[] }>("/harness-updates"),
 

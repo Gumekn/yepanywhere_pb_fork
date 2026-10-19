@@ -969,6 +969,13 @@ export function Sidebar({
               basePath={basePath}
             />
             <SidebarNavItem
+              to="/dsh"
+              icon={SidebarIcons.dsh}
+              label={t("sidebarDsh")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
+            <SidebarNavItem
               to="/settings"
               icon={SidebarIcons.settings}
               label={t("sidebarSettings")}

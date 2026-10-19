@@ -13,6 +13,7 @@ import { HarnessUpdateService } from "../../src/services/HarnessUpdateService.js
 import {
   type HarnessInstallation,
   type RunHarnessCommand,
+  getLatestHarnessVersion,
   harnessInstallCommand,
   inspectHarnessInstallation,
   isNewerHarnessVersion,
@@ -63,6 +64,137 @@ async function finished(service: HarnessUpdateService) {
 }
 
 describe("HarnessUpdateService", () => {
+  it("uses a DSH update lease and recognizes numeric RC upgrades", async () => {
+    let version = "0.2.1-rc.2";
+    let leased = false;
+    const inspect = async (): Promise<HarnessInstallation> => ({
+      path: "/node/bin/dsh",
+      currentVersion: version,
+      manager: "npm",
+      command: { file: "/node/bin/npm", args: ["--prefix", "/node"] },
+    });
+    const run = vi.fn<RunHarnessCommand>(async (command) => {
+      if (command.args.includes("view")) {
+        expect(command.args).toContain("@deepseek-ai/dsh@latest");
+        return '"0.2.1-rc.10"';
+      }
+      expect(leased).toBe(true);
+      expect(command.args).toContain("@deepseek-ai/dsh@0.2.1-rc.10");
+      version = "0.2.1-rc.10";
+      return "installed";
+    });
+    const service = new HarnessUpdateService({
+      inspect,
+      run,
+      withUpdateLock: async (id, update) => {
+        expect(id).toBe("dsh");
+        leased = true;
+        try {
+          await update();
+        } finally {
+          leased = false;
+        }
+      },
+    });
+    expect(await service.check("dsh")).toMatchObject({
+      updateAvailable: true,
+      latestVersion: "0.2.1-rc.10",
+    });
+    service.start("dsh");
+    await vi.waitFor(async () =>
+      expect((await service.getInfo("dsh")).job?.status).toBe("completed"),
+    );
+    expect((await service.getInfo("dsh")).currentVersion).toBe("0.2.1-rc.10");
+    expect(leased).toBe(false);
+  });
+
+  it("accepts a stable DSH latest version and rejects malformed versions", async () => {
+    const installation: HarnessInstallation = {
+      manager: "npm",
+      command: { file: "/npm", args: [] },
+    };
+    expect(
+      await getLatestHarnessVersion("dsh", installation, async () => '"0.3.0"'),
+    ).toBe("0.3.0");
+    await expect(
+      getLatestHarnessVersion("dsh", installation, async () => '"--unsafe"'),
+    ).rejects.toThrow("valid DSH latest version");
+    expect(() =>
+      harnessInstallCommand("dsh", installation, "next; injected"),
+    ).toThrow("Invalid CLI update plan");
+    expect(() =>
+      harnessInstallCommand("pi", installation, "0.2.0-rc.1"),
+    ).toThrow("Invalid CLI update plan");
+  });
+
+  it("does not downgrade an installation updated by another server while waiting for the lease", async () => {
+    let version = "0.2.1-rc.2";
+    const run = vi.fn<RunHarnessCommand>(async () => '"0.2.1-rc.3"');
+    const service = new HarnessUpdateService({
+      inspect: async () => ({
+        path: "/node/bin/dsh",
+        currentVersion: version,
+        manager: "npm",
+        command: { file: "/node/bin/npm", args: [] },
+      }),
+      run,
+      withUpdateLock: async (_id, update) => {
+        version = "0.2.1-rc.4";
+        await update();
+      },
+    });
+    service.start("dsh");
+    await vi.waitFor(async () =>
+      expect((await service.getInfo("dsh")).job?.status).toBe("completed"),
+    );
+    expect((await service.getInfo("dsh")).job?.toVersion).toBe("0.2.1-rc.4");
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  it("retains a newer DSH candidate when official latest points to an older RC", async () => {
+    const run = vi.fn<RunHarnessCommand>(async () => '"0.2.0-rc.2"');
+    const lease = vi.fn(async (_id, update: () => Promise<void>) => update());
+    const service = new HarnessUpdateService({
+      inspect: async () => ({
+        path: "/node/bin/dsh",
+        currentVersion: "0.2.1-rc.2",
+        manager: "npm",
+        command: { file: "/node/bin/npm", args: [] },
+      }),
+      run,
+      withUpdateLock: lease,
+    });
+    expect(await service.check("dsh")).toMatchObject({
+      latestVersion: "0.2.0-rc.2",
+      currentVersion: "0.2.1-rc.2",
+      updateAvailable: false,
+    });
+    service.start("dsh");
+    await vi.waitFor(async () =>
+      expect((await service.getInfo("dsh")).job?.status).toBe("completed"),
+    );
+    expect((await service.getInfo("dsh")).job?.toVersion).toBe("0.2.1-rc.2");
+    expect(lease).not.toHaveBeenCalled();
+    expect(
+      run.mock.calls.every(
+        ([command]) =>
+          command.args.includes("view") &&
+          command.args.includes("@deepseek-ai/dsh@latest"),
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["0.2.1-rc.10", "0.2.1-rc.2", true],
+    ["0.2.1-rc.2", "0.2.1-rc.10", false],
+    ["0.2.1", "0.2.1-rc.10", true],
+    ["0.2.1-rc.1", "0.2.1-beta.9", true],
+    ["0.2.1-rc.1+new", "0.2.1-rc.1+old", false],
+    ["0.2.1-rc.01", "0.2.1-rc.1", false],
+  ])("compares %s against %s", (a, b, expected) => {
+    expect(isNewerHarnessVersion(a, b)).toBe(expected);
+  });
+
   it("only contacts the registry on demand and coalesces concurrent checks", async () => {
     const { service, run } = fixture();
     await service.getInfo("codex");

@@ -26,6 +26,7 @@ import { CodexSessionCatalog } from "./codex-history/CodexSessionCatalog.js";
 import type { SessionTitleGenerationConfig } from "./config.js";
 import type { DeviceBridgeService } from "./device/DeviceBridgeService.js";
 import { SessionDisplayService } from "./display/SessionDisplayService.js";
+import type { DshWebService } from "./dsh/web-service.js";
 import type { FrontendProxy } from "./frontend/index.js";
 import type {
   SessionContentIndexService,
@@ -227,6 +228,7 @@ export interface AppOptions {
   installId?: string;
   /** Data directory for persistent state (for onboarding state) */
   dataDir?: string;
+  dshWebService?: DshWebService;
   /** NetworkBindingService for runtime binding configuration */
   networkBindingService?: NetworkBindingService;
   /**
@@ -1647,16 +1649,28 @@ export function createApp(options: AppOptions): AppResult {
     "/api/harness-updates",
     createHarnessUpdateRoutes({
       enabledProviders: options.enabledProviders,
+      dshEnabled: Boolean(options.dshWebService),
       service: new HarnessUpdateService({
         isBusy: async (id) =>
-          (await runtimeController.listProcesses()).some(
-            (process) =>
-              !process.executor &&
-              (process.provider === id ||
-                (id === "codex" && process.provider === "codex-oss")) &&
-              (process.queueDepth > 0 ||
-                ["in-turn", "waiting-input", "hold"].includes(process.state)),
-          ),
+          id === "dsh"
+            ? ((await options.dshWebService?.isRunning()) ?? true)
+            : (await runtimeController.listProcesses()).some(
+                (process) =>
+                  !process.executor &&
+                  (process.provider === id ||
+                    (id === "codex" && process.provider === "codex-oss")) &&
+                  (process.queueDepth > 0 ||
+                    ["in-turn", "waiting-input", "hold"].includes(
+                      process.state,
+                    )),
+              ),
+        withUpdateLock: async (id, update) => {
+          if (id === "dsh") {
+            if (!options.dshWebService)
+              throw new Error("DSH Web management is unavailable");
+            await options.dshWebService.withUpdateLock(update);
+          } else await update();
+        },
       }),
     }),
   );

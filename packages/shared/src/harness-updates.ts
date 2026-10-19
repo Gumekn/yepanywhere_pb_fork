@@ -1,5 +1,5 @@
 /** CLI installations on the machine running the Yep server. */
-export type HarnessId = "codex" | "pi";
+export type HarnessId = "codex" | "pi" | "dsh";
 
 export type HarnessUpdateBlockReason =
   | "not_installed"
@@ -32,4 +32,6 @@ export interface HarnessUpdateInfo {
   blockedReason?: HarnessUpdateBlockReason;
   error?: string;
   job?: HarnessUpdateJob;
+  /** DSH Web must be explicitly stopped before changing its installation. */
+  webRunning?: boolean;
 }

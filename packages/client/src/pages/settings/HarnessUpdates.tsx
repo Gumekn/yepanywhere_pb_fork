@@ -11,6 +11,7 @@ export function HarnessUpdates() {
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<HarnessId | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [confirmDshStop, setConfirmDshStop] = useState(false);
   const mounted = useRef(false);
   // Invalidate an older poll when a button action returns newer state.
   const generation = useRef(0);
@@ -89,6 +90,26 @@ export function HarnessUpdates() {
     }
   };
 
+  const controlDsh = async (action: "start" | "stop") => {
+    if (actionInFlight.current) return;
+    actionInFlight.current = true;
+    ++generation.current;
+    setPending("dsh");
+    setError(null);
+    setConfirmDshStop(false);
+    try {
+      if (action === "stop") await api.stopDshWeb();
+      else await api.launchDshWeb();
+      await refresh();
+    } catch (err) {
+      if (mounted.current)
+        setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      actionInFlight.current = false;
+      if (mounted.current) setPending(null);
+    }
+  };
+
   const running = harnesses.some((item) => item.job?.status === "running");
   return (
     <section
@@ -131,7 +152,11 @@ export function HarnessUpdates() {
                         ? t("harnessUpdatesAvailable", {
                             version: item.latestVersion,
                           })
-                        : t("harnessUpdatesCurrentLatest")}
+                        : t(
+                            item.id === "dsh"
+                              ? "harnessUpdatesDshCurrentLatest"
+                              : "harnessUpdatesCurrentLatest",
+                          )}
                     </p>
                   )}
                 </div>
@@ -171,9 +196,72 @@ export function HarnessUpdates() {
                   </button>
                 </div>
               </div>
+              {item.id === "dsh" && (
+                <>
+                  <p className="settings-hint">
+                    {t("harnessUpdatesDshChannels")}
+                  </p>
+                  <p className="settings-hint">
+                    {t(
+                      item.webRunning
+                        ? "harnessUpdatesDshRunning"
+                        : "harnessUpdatesDshStopped",
+                    )}
+                  </p>
+                  {confirmDshStop ? (
+                    <div role="alert">
+                      <p>{t("harnessUpdatesDshStopConfirm")}</p>
+                      <div className="settings-item-actions">
+                        <button
+                          type="button"
+                          className="settings-button"
+                          disabled={!!pending || running}
+                          onClick={() => void controlDsh("stop")}
+                        >
+                          {t("harnessUpdatesDshConfirmStop")}
+                        </button>
+                        <button
+                          type="button"
+                          className="settings-button settings-button-secondary"
+                          onClick={() => setConfirmDshStop(false)}
+                        >
+                          {t("harnessUpdatesDshCancel")}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="settings-item-actions">
+                      <button
+                        type="button"
+                        className="settings-button settings-button-secondary"
+                        disabled={
+                          !!pending ||
+                          running ||
+                          (!item.webRunning && !item.path)
+                        }
+                        onClick={() =>
+                          item.webRunning
+                            ? setConfirmDshStop(true)
+                            : void controlDsh("start")
+                        }
+                      >
+                        {t(
+                          item.webRunning
+                            ? "harnessUpdatesDshStop"
+                            : "harnessUpdatesDshStart",
+                        )}
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
               {item.blockedReason && !isRunning && (
                 <p className="settings-hint">
-                  {t(blockMessages[item.blockedReason])}
+                  {t(
+                    item.id === "dsh" && item.blockedReason === "busy"
+                      ? "harnessUpdatesDshStopBeforeUpdate"
+                      : blockMessages[item.blockedReason],
+                  )}
                 </p>
               )}
               {item.checkedAt && (
@@ -191,9 +279,14 @@ export function HarnessUpdates() {
                 )}
                 {item.job?.status === "completed" && (
                   <p className="settings-hint">
-                    {t("harnessUpdatesCompleted", {
-                      version: item.job.toVersion ?? "",
-                    })}
+                    {t(
+                      item.id === "dsh"
+                        ? "harnessUpdatesDshCompleted"
+                        : "harnessUpdatesCompleted",
+                      {
+                        version: item.job.toVersion ?? "",
+                      },
+                    )}
                   </p>
                 )}
                 {item.job?.status === "failed" && (

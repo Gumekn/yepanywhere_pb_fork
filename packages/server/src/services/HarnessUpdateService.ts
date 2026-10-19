@@ -17,6 +17,7 @@ import {
 const DISPLAY_NAMES: Record<HarnessId, string> = {
   codex: "Codex CLI",
   pi: "Pi Agent",
+  dsh: "dsh",
 };
 const LOG_LIMIT = 16_000;
 
@@ -24,6 +25,10 @@ export interface HarnessUpdateServiceOptions {
   inspect?: (id: HarnessId) => Promise<HarnessInstallation>;
   run?: RunHarnessCommand;
   isBusy?: (id: HarnessId) => Promise<boolean>;
+  withUpdateLock?: (
+    id: HarnessId,
+    update: () => Promise<void>,
+  ) => Promise<void>;
 }
 
 /** Jobs belong to the server, so navigating away or disconnecting is harmless. */
@@ -31,6 +36,9 @@ export class HarnessUpdateService {
   private readonly inspect: (id: HarnessId) => Promise<HarnessInstallation>;
   private readonly run: RunHarnessCommand;
   private readonly isBusy: (id: HarnessId) => Promise<boolean>;
+  private readonly withUpdateLock: NonNullable<
+    HarnessUpdateServiceOptions["withUpdateLock"]
+  >;
   private readonly installations = new Map<
     HarnessId,
     {
@@ -55,6 +63,8 @@ export class HarnessUpdateService {
     this.inspect = options.inspect ?? inspectHarnessInstallation;
     this.run = options.run ?? runHarnessCommand;
     this.isBusy = options.isBusy ?? (async () => false);
+    this.withUpdateLock =
+      options.withUpdateLock ?? (async (_id, update) => update());
   }
 
   private installation(id: HarnessId): Promise<HarnessInstallation> {
@@ -109,6 +119,7 @@ export class HarnessUpdateService {
       blockedReason: installation.blockedReason ?? (busy ? "busy" : undefined),
       error: installation.error ?? latest?.error,
       job: job ? { ...job } : undefined,
+      ...(id === "dsh" ? { webRunning: busy } : {}),
     };
   }
 
@@ -183,24 +194,47 @@ export class HarnessUpdateService {
           throw new Error(
             "This harness has active work. Wait for it to finish and retry.",
           );
-        await this.run(harnessInstallCommand(id, installation, version), {
-          timeoutMs: 10 * 60_000,
-          onOutput: (text) => {
-            job.log = `${job.log}${text}`.slice(-LOG_LIMIT);
-          },
+        await this.withUpdateLock(id, async () => {
+          if (await this.isBusy(id))
+            throw new Error(
+              "Stop this harness before updating its installation.",
+            );
+          // Another server may have updated this installation while this job
+          // waited for the shared DSH lease. Re-inspect before any mutation.
+          const current = await this.inspect(id);
+          if (
+            current.path !== installation.path ||
+            !current.command ||
+            !current.currentVersion
+          ) {
+            throw new Error(
+              "The CLI installation changed while preparing the update. Check again before updating.",
+            );
+          }
+          job.fromVersion = current.currentVersion;
+          if (!isNewerHarnessVersion(version, current.currentVersion)) {
+            job.toVersion = current.currentVersion;
+            return;
+          }
+          await this.run(harnessInstallCommand(id, current, version), {
+            timeoutMs: (id === "dsh" ? 30 : 10) * 60_000,
+            onOutput: (text) => {
+              job.log = `${job.log}${text}`.slice(-LOG_LIMIT);
+            },
+          });
+          const updated = await this.inspect(id);
+          if (
+            updated.path !== installation.path ||
+            !updated.currentVersion ||
+            (updated.currentVersion !== version &&
+              !isNewerHarnessVersion(updated.currentVersion, version))
+          ) {
+            throw new Error(
+              "The update finished, but the CLI at the original path did not report the expected version. Check the log and retry.",
+            );
+          }
+          job.toVersion = updated.currentVersion;
         });
-        const updated = await this.inspect(id);
-        if (
-          updated.path !== installation.path ||
-          !updated.currentVersion ||
-          (updated.currentVersion !== version &&
-            !isNewerHarnessVersion(updated.currentVersion, version))
-        ) {
-          throw new Error(
-            "The update finished, but the CLI at the original path did not report the expected version. Check the log and retry.",
-          );
-        }
-        job.toVersion = updated.currentVersion;
       } else {
         // Never downgrade a newer or custom installation to the stable tag.
         job.toVersion = installation.currentVersion;

@@ -24,6 +24,7 @@ import {
 import { loadConfig } from "./config.js";
 import { DeviceBridgeService } from "./device/DeviceBridgeService.js";
 import { detectAdb } from "./device/adb.js";
+import { DshWebService } from "./dsh/web-service.js";
 import {
   attachUnifiedUpgradeHandler,
   createFrontendProxy,
@@ -68,6 +69,7 @@ import {
   getOrCreateVapidKeys,
 } from "./push/index.js";
 import { RecentsService } from "./recents/index.js";
+import { DSH_WEB_PATH, createDshRoutes } from "./routes/dsh.js";
 import { createUploadRoutes } from "./routes/upload.js";
 import { createWsRoutes } from "./routes/ws.js";
 import { HttpRuntimeController } from "./runtime/HttpRuntimeController.js";
@@ -900,6 +902,7 @@ async function startServer() {
     console.log("[AgentRuntime] mode=embedded");
   }
 
+  const dshWebService = new DshWebService(path.join(config.dataDir, "dsh-web"));
   const {
     app,
     sessionDisplayService,
@@ -909,6 +912,7 @@ async function startServer() {
     sessionCommandService,
     scanner,
   } = createApp({
+    dshWebService,
     projectsDir: config.claudeProjectsDir,
     idleTimeoutMs: config.idleTimeoutMs,
     defaultPermissionMode: config.defaultPermissionMode,
@@ -1095,6 +1099,20 @@ async function startServer() {
   // We get wss for the unified upgrade handler (instead of using injectWebSocket)
   const { wss, upgradeWebSocket } = createNodeWebSocket({ app });
 
+  app.route(
+    "/",
+    createDshRoutes({
+      service: dshWebService,
+      basePath: config.basePath,
+      upgradeWebSocket,
+      auth: {
+        authService,
+        authDisabled: config.authDisabled,
+        desktopAuthToken: config.desktopAuthToken,
+      },
+    }),
+  );
+
   // Add upload routes with WebSocket support
   // These must be added BEFORE the frontend proxy catch-all
   const uploadScanner = new ProjectScanner({
@@ -1237,7 +1255,9 @@ async function startServer() {
       // When BASE_PATH is set, the API routes live at `${basePath}/api/*`;
       // upgrade routing must match the same prefix or WS handshakes for
       // `/yep/api/ws` end up at the frontend proxy and 404.
-      isApiPath: (urlPath) => urlPath.startsWith(`${config.basePath}/api`),
+      isApiPath: (urlPath) =>
+        urlPath.startsWith(`${config.basePath}/api`) ||
+        urlPath.startsWith(`${config.basePath}${DSH_WEB_PATH}/`),
       app,
       wss,
     });

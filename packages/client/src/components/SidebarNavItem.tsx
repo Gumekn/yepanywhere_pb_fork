@@ -7,6 +7,20 @@ import { ThinkingIndicator } from "./ThinkingIndicator";
  * Extracted to avoid duplication across components.
  */
 export const SidebarIcons = {
+  dsh: (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      aria-hidden="true"
+    >
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 9h18M9 9v11M13 13l3 2-3 2" />
+    </svg>
+  ),
   inbox: (
     <svg
       width="16"

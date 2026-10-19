@@ -4,11 +4,13 @@ import { access, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import type { HarnessId, HarnessUpdateBlockReason } from "@yep-anywhere/shared";
+import { findDshCliPath } from "../dsh/cli.js";
 import { findCodexCliPath, findPiCliPath } from "../sdk/cli-detection.js";
 
 export const HARNESS_PACKAGES: Record<HarnessId, string> = {
   codex: "@openai/codex",
   pi: "@earendil-works/pi-coding-agent",
+  dsh: "@deepseek-ai/dsh",
 };
 
 export interface HarnessCommand {
@@ -76,12 +78,50 @@ export function isNewerHarnessVersion(
   latest: string,
   current: string,
 ): boolean {
-  const a = latest.split(/[.+-]/).slice(0, 3).map(Number);
-  const b = current.split(/[.+-]/).slice(0, 3).map(Number);
+  if (!validHarnessVersion(latest) || !validHarnessVersion(current))
+    return false;
+  const a = latest.split(/[.+-]/).slice(0, 3).map(BigInt);
+  const b = current.split(/[.+-]/).slice(0, 3).map(BigInt);
   for (let i = 0; i < 3; i++) {
     if (a[i] !== b[i]) return (a[i] ?? 0) > (b[i] ?? 0);
   }
-  return !latest.includes("-") && current.includes("-");
+  const prerelease = (version: string) =>
+    version.split("+", 1)[0]?.split("-").slice(1).join("-");
+  const ap = prerelease(latest);
+  const bp = prerelease(current);
+  if (!ap || !bp) return !ap && Boolean(bp);
+  const aa = ap.split(".");
+  const bb = bp.split(".");
+  for (let i = 0; i < Math.max(aa.length, bb.length); i++) {
+    const x = aa[i];
+    const y = bb[i];
+    if (x === y) continue;
+    if (x === undefined || y === undefined) return y === undefined;
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) return BigInt(x) > BigInt(y);
+    if (xn !== yn) return !xn;
+    return x > y;
+  }
+  return false;
+}
+
+function validHarnessVersion(value: string): boolean {
+  if (
+    !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
+      value,
+    )
+  )
+    return false;
+  const prerelease = value.split("+", 1)[0]?.split("-").slice(1).join("-");
+  return !prerelease?.split(".").some((part) => /^0\d+$/.test(part));
+}
+
+function allowedUpdateVersion(id: HarnessId, value: string): boolean {
+  return (
+    validHarnessVersion(value) &&
+    (id === "dsh" || /^\d+\.\d+\.\d+$/.test(value))
+  );
 }
 
 async function executable(path: string): Promise<boolean> {
@@ -105,7 +145,11 @@ export async function inspectHarnessInstallation(
   const path =
     options.path !== undefined
       ? options.path
-      : await (id === "codex" ? findCodexCliPath() : findPiCliPath());
+      : await (id === "codex"
+          ? findCodexCliPath()
+          : id === "dsh"
+            ? findDshCliPath()
+            : findPiCliPath());
   if (!path) return { blockedReason: "not_installed" };
   if ((options.platform ?? process.platform) === "win32") {
     return { path, blockedReason: "unsupported_platform" };
@@ -222,8 +266,14 @@ export async function getLatestHarnessVersion(
   const data = JSON.parse(output);
   const version =
     installation.manager === "npm" ? data : data.casks?.[0]?.version;
-  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
-    throw new Error("The package manager did not return a stable CLI version");
+  // DSH's official latest channel currently includes RC releases. Respect
+  // that channel explicitly rather than silently following next or alpha.
+  if (typeof version !== "string" || !allowedUpdateVersion(id, version)) {
+    throw new Error(
+      id === "dsh"
+        ? "The package manager did not return a valid DSH latest version"
+        : "The package manager did not return a stable CLI version",
+    );
   }
   return version;
 }
@@ -233,7 +283,7 @@ export function harnessInstallCommand(
   installation: HarnessInstallation,
   version: string,
 ): HarnessCommand {
-  if (!installation.command || !/^\d+\.\d+\.\d+$/.test(version)) {
+  if (!installation.command || !allowedUpdateVersion(id, version)) {
     throw new Error("Invalid CLI update plan");
   }
   const command = installation.command;

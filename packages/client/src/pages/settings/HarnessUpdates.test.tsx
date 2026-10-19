@@ -15,6 +15,8 @@ vi.mock("../../api/client", () => ({
     getHarnessUpdates: vi.fn(),
     checkHarnessUpdate: vi.fn(),
     updateHarness: vi.fn(),
+    stopDshWeb: vi.fn(),
+    launchDshWeb: vi.fn(),
   },
 }));
 vi.mock("../../i18n", () => ({
@@ -173,5 +175,85 @@ describe("HarnessUpdates", () => {
     await waitFor(() =>
       expect(api.updateHarness).toHaveBeenCalledWith("codex"),
     );
+  });
+
+  it("requires confirmation to stop DSH, then permits updating without automatically restarting", async () => {
+    const dsh: HarnessUpdateInfo = {
+      ...available,
+      id: "dsh",
+      displayName: "dsh",
+      currentVersion: "0.2.1-rc.2",
+      latestVersion: "0.2.1-rc.3",
+      canUpdate: false,
+      blockedReason: "busy",
+      webRunning: true,
+    };
+    vi.mocked(api.getHarnessUpdates).mockResolvedValue({ harnesses: [dsh] });
+    vi.mocked(api.stopDshWeb).mockImplementation(async () => {
+      vi.mocked(api.getHarnessUpdates).mockResolvedValue({
+        harnesses: [
+          {
+            ...dsh,
+            webRunning: false,
+            canUpdate: true,
+            blockedReason: undefined,
+          },
+        ],
+      });
+      return { stopped: true };
+    });
+    render(<HarnessUpdates />);
+    const stop = await screen.findByRole("button", {
+      name: "harnessUpdatesDshStop",
+    });
+    expect(
+      screen.getByRole("button", { name: "harnessUpdatesUpdateFor dsh" }),
+    ).toHaveProperty("disabled", true);
+    fireEvent.click(stop);
+    expect(api.stopDshWeb).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "harnessUpdatesDshCancel" }),
+    );
+    expect(api.stopDshWeb).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "harnessUpdatesDshStop" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "harnessUpdatesDshConfirmStop" }),
+    );
+    await screen.findByText("harnessUpdatesDshStopped");
+    expect(api.stopDshWeb).toHaveBeenCalledOnce();
+    const update = screen.getByRole("button", {
+      name: "harnessUpdatesUpdateFor dsh",
+    });
+    expect(update).toHaveProperty("disabled", false);
+    fireEvent.click(update);
+    await waitFor(() => expect(api.updateHarness).toHaveBeenCalledWith("dsh"));
+    expect(api.launchDshWeb).not.toHaveBeenCalled();
+  });
+
+  it("starts a stopped DSH process only on request", async () => {
+    const dsh: HarnessUpdateInfo = {
+      ...installed,
+      id: "dsh",
+      displayName: "dsh",
+      webRunning: false,
+    };
+    vi.mocked(api.getHarnessUpdates).mockResolvedValue({ harnesses: [dsh] });
+    vi.mocked(api.launchDshWeb).mockImplementation(async () => {
+      vi.mocked(api.getHarnessUpdates).mockResolvedValue({
+        harnesses: [
+          { ...dsh, webRunning: true, canUpdate: false, blockedReason: "busy" },
+        ],
+      });
+      return { url: "/yep/apps/dsh/" };
+    });
+    render(<HarnessUpdates />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "harnessUpdatesDshStart" }),
+    );
+    await screen.findByText("harnessUpdatesDshRunning");
+    expect(api.launchDshWeb).toHaveBeenCalledOnce();
+    expect(api.updateHarness).not.toHaveBeenCalled();
   });
 });
