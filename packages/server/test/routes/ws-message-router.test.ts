@@ -144,10 +144,8 @@ describe("WebSocket Message Router", () => {
       body: { error: "Internal server error" },
     });
   });
-
-  it("routes emulator signaling messages to onDeviceMessage", async () => {
+  it("routes terminal messages after removal of device signaling", async () => {
     const send = vi.fn();
-    const onDeviceMessage = vi.fn(async () => undefined);
     const handlers = {
       onRequest: vi.fn(async () => undefined),
       onSubscribe: vi.fn(async () => undefined),
@@ -156,39 +154,20 @@ describe("WebSocket Message Router", () => {
       onUploadChunk: vi.fn(async () => undefined),
       onUploadEnd: vi.fn(async () => undefined),
       onPing: vi.fn(async () => undefined),
-      onDeviceMessage,
+      onTerminalMessage: vi.fn(async () => undefined),
     };
-
     const messages: RemoteClientMessage[] = [
-      {
-        type: "device_stream_start",
-        sessionId: "session-1",
-        deviceId: "emulator-5554",
-      },
-      {
-        type: "device_stream_stop",
-        sessionId: "session-1",
-      },
-      {
-        type: "device_webrtc_answer",
-        sessionId: "session-1",
-        sdp: "v=0",
-      },
-      {
-        type: "device_ice_candidate",
-        sessionId: "session-1",
-        candidate: null,
-      },
+      { type: "terminal_open", terminalId: "term-1", cols: 80, rows: 24 },
+      { type: "terminal_input", terminalId: "term-1", data: "bHMK" },
+      { type: "terminal_resize", terminalId: "term-1", cols: 100, rows: 40 },
+      { type: "terminal_close", terminalId: "term-1" },
     ];
-
     for (const message of messages) {
       await routeClientMessageSafely(message, send, handlers);
     }
-
-    expect(onDeviceMessage).toHaveBeenCalledTimes(messages.length);
-    for (const [index, message] of messages.entries()) {
-      expect(onDeviceMessage).toHaveBeenNthCalledWith(index + 1, message);
-    }
+    expect(handlers.onTerminalMessage.mock.calls).toEqual(
+      messages.map((message) => [message]),
+    );
     expect(send).not.toHaveBeenCalled();
   });
 });

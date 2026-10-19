@@ -3805,7 +3805,6 @@ export class CodexProvider implements AgentProvider {
       );
 
       const messageGen = queue.generator();
-      let isFirstMessage = !options.resumeSessionId || forkStartedFresh;
       startupStage = "turn-runtime";
 
       // Native controls (including /compact) start turns without enqueuing a
@@ -3906,19 +3905,10 @@ export class CodexProvider implements AgentProvider {
         if (next.input.done) break;
         const message = next.input.value;
 
-        let { internalPrompt, publicPrompt } = getUserPromptProjection(message);
+        const { internalPrompt, publicPrompt } =
+          getUserPromptProjection(message);
         if (!internalPrompt) {
           continue;
-        }
-
-        // Prepend global instructions to the first message of new sessions
-        if (isFirstMessage && options.globalInstructions) {
-          const prefix = `[Global context]\n${options.globalInstructions}\n\n---\n\n`;
-          internalPrompt = `${prefix}${internalPrompt}`;
-          publicPrompt = `${prefix}${publicPrompt}`;
-          isFirstMessage = false;
-        } else {
-          isFirstMessage = false;
         }
 
         const turnStartParams: TurnStartParams = {

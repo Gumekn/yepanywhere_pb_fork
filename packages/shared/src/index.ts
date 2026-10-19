@@ -699,25 +699,6 @@ export type {
   ZCodeStoredPart,
 } from "./zcode-schema/session.js";
 
-// Device bridge streaming types (for device bridge remote control)
-export type {
-  DeviceAction,
-  DeviceInfo,
-  DeviceState,
-  DeviceType,
-  DeviceStreamStart,
-  DeviceStreamStop,
-  DeviceWebRTCAnswer,
-  DeviceICECandidate,
-  DeviceClientMessage,
-  DeviceWebRTCOffer,
-  DeviceICECandidateEvent,
-  DeviceSessionState,
-  DeviceStreamProfileEvent,
-  DeviceServerMessage,
-  RTCIceCandidateInit,
-} from "./devices.js";
-
 // Remote terminal types (for remote shell sessions)
 export type {
   TerminalOpen,

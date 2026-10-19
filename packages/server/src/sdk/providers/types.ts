@@ -115,8 +115,6 @@ export interface StartSessionOptions {
   onRetryStatus?: (status: SessionRetryStatus | undefined) => void;
   /** Configured SSH host for Claude remote execution. */
   executor?: string;
-  /** Global instructions to append to system prompt (from server settings) */
-  globalInstructions?: string;
 }
 
 /**

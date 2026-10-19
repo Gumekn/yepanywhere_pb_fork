@@ -55,13 +55,12 @@ channel 由构建期决定并写入 build metadata，不在运行期猜测。
 
 ### 2.2 tag 命名
 
-沿用仓库已有的前缀风格（`site-v*`、`bridge-v*`）：
+沿用仓库已有的前缀风格（`site-v*`）：
 
 | 产品面 | tag 前缀 | 现状 |
 | ---- | ---- | ---- |
 | 主产品（server + web client + bundle + mobile shell） | `ya-v*` | **新增** |
 | Website | `site-v*` | 已存在（`scripts/release-website.sh:23`） |
-| Device Bridge | `bridge-v*` | 已存在（`scripts/release-bridge.sh:23`） |
 | Desktop | `desktop-v*` | 待确认是否已有发布流程 |
 
 `v*` 命名空间保留给 upstream，本仓库不再创建。
@@ -148,12 +147,11 @@ CalVer 一次解决两件事：判断成本归零；`2026.8.0` 不可能与 upst
 | npm bundle | 同上 | 是 |
 | Mobile Shell（Android versionName） | `packages/mobile/src-tauri/tauri.conf.json` 的 `version` 指向 `../../../package.json` | 是（已自动） |
 | Website | `site-v*` + `site/CHANGELOG.md` | 否 |
-| Device Bridge | `bridge-v*` | 否 |
 | Desktop | `packages/desktop/package.json` + `src-tauri/Cargo.toml` + `tauri.conf.json`，当前均为 `0.1.0` | 否 |
 | Workspace 子包（`@yep-anywhere/server` 等 `0.0.1`） | 占位值 | 否，永不作为产品版本 |
 | `RESUME_PROTOCOL_VERSION`（当前 `2`，`packages/server/src/routes/version.ts:137`） | 兼容边界 | 否，仅在协议兼容性变化时提升 |
 
-一次变更同时影响主服务与 Device Bridge 时，分别提升两条版本，并在 CHANGELOG 中写明兼容关系。
+Device Bridge 已移除，`bridge-v*` 仅保留历史 tag，不再构建或发布。
 
 Desktop 版本分散在三处（package.json / Cargo.toml / tauri.conf.json），若后续要发布，应先统一为单一来源，本方案不覆盖。
 
@@ -369,7 +367,6 @@ AGENTS.md 只放长期规则，不放逐版本内容。拟在「发布」小节�
 | `.github/workflows/publish.yml` | `v*.*.*` 触发，发布 npm 包 `yepanywhere` | 删除，改为 `release.yml`（`ya-v*`，不发 npm） |
 | `scripts/build-bundle.ts` | 包名 `yepanywhere`，repository/homepage/bugs 指向 upstream | `@hustc5622/yepanywhere`，元数据指向 origin |
 | `AboutSettings.tsx` | 「报告问题」跳 upstream issue | 指向 origin |
-| `packages/device-bridge` Go 模块 | `github.com/kzahel/yepanywhere/device-bridge` | `github.com/hustc5622/...`；`.pb.go` 的 rawDesc 长度前缀同步修正 |
 
 **未处理（有意保留）**：
 

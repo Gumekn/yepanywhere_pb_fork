@@ -22,8 +22,6 @@ import {
   initCodexCorrelationDebugLogger,
 } from "./codex/correlationDebugLogger.js";
 import { loadConfig } from "./config.js";
-import { DeviceBridgeService } from "./device/DeviceBridgeService.js";
-import { detectAdb } from "./device/adb.js";
 import { DshWebService } from "./dsh/web-service.js";
 import {
   attachUnifiedUpgradeHandler,
@@ -180,7 +178,6 @@ codexProvider.configureBridgeExecution({
 
 // Track services for graceful shutdown (set after createApp)
 let runtimeControllerForShutdown: RuntimeController | null = null;
-let deviceBridgeForShutdown: DeviceBridgeService | null = null;
 let codexBridgeForShutdown: CodexBridgeController | null = null;
 let feishuChannelRuntimeForShutdown: FeishuChannelRuntime | null = null;
 let zcodeSessionChangeMonitorForShutdown: ZCodeSessionChangeMonitor | null =
@@ -228,16 +225,6 @@ async function gracefulShutdown(signal: string, exitCode = 0): Promise<void> {
       );
     } catch (error) {
       console.error("[Shutdown] Error shutting down runtime facade:", error);
-    }
-  }
-
-  // Shut down device bridge sidecar
-  if (deviceBridgeForShutdown) {
-    try {
-      await deviceBridgeForShutdown.shutdown();
-      console.log("[Shutdown] Device bridge shut down");
-    } catch (error) {
-      console.error("[Shutdown] Error shutting down emulator bridge:", error);
     }
   }
 
@@ -778,30 +765,6 @@ async function startServer() {
   const effectiveLocalhostUrl = `${serverProtocol}://127.0.0.1:${effectiveServerPort}`;
   console.log(`Server URL: ${effectiveLocalhostUrl}`);
 
-  // Detect ADB and create emulator bridge service (lazy start)
-  const adbPath = detectAdb();
-  let deviceBridgeService: DeviceBridgeService | undefined;
-  if (adbPath) {
-    deviceBridgeService = new DeviceBridgeService({
-      adbPath,
-      dataDir: config.dataDir,
-    });
-    console.log(`[DeviceBridge] ADB detected at ${adbPath}`);
-    if (deviceBridgeService.hasBinary()) {
-      console.log(
-        "[DeviceBridge] Sidecar binary found (will start on first use)",
-      );
-    } else {
-      console.log(
-        "[DeviceBridge] Sidecar binary not found (feature disabled until binary is available)",
-      );
-    }
-  } else {
-    console.log(
-      "[DeviceBridge] ADB not found, device bridge streaming disabled",
-    );
-  }
-
   // Create the app first (without WebSocket support initially)
   // We'll add WebSocket routes after setting up WebSocket support
   const configuredRuntimeController =
@@ -947,7 +910,6 @@ async function startServer() {
     onRemoteExecutorsChanged: syncClaudeSharedSessionWatchers,
     ohmyrouterBenchmarkService,
     sharingService,
-    deviceBridgeService,
     codexBridgeService,
     feishuChannelService: feishuChannelRuntime.service,
     feishuBindingStore: feishuChannelRuntime.bindingStore,
@@ -1062,7 +1024,6 @@ async function startServer() {
   disposeSessionDisplays = () => sessionDisplayService.dispose();
   runtimeControllerForShutdown = runtimeController;
   sessionInteractionServiceForShutdown = sessionInteractionService;
-  deviceBridgeForShutdown = deviceBridgeService ?? null;
   codexBridgeForShutdown = codexBridgeService ?? null;
   sessionArchiveServiceForShutdown = sessionArchiveService;
 
@@ -1151,7 +1112,6 @@ async function startServer() {
     connectedBrowsers: connectedBrowsersService,
     browserProfileService,
     focusedSessionWatchManager,
-    deviceBridgeService,
     terminalService,
   });
   app.get("/api/ws", wsHandler);

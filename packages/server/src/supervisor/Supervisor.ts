@@ -107,8 +107,6 @@ export interface ModelSettings {
   providerName?: ProviderName;
   /** Configured SSH host for Claude remote execution. */
   executor?: string;
-  /** Global instructions to append to system prompt (from server settings) */
-  globalInstructions?: string;
   /** Permission rules for tool filtering (deny/allow patterns) */
   permissions?: PermissionRules;
   /**
@@ -523,7 +521,6 @@ export class Supervisor {
       codexEventProjectId: projectId,
       llmGatewayConfig: modelSettings?.llmGatewayConfig,
       executor: modelSettings?.executor,
-      globalInstructions: modelSettings?.globalInstructions,
       onToolApproval: async (toolName, input, opts) => {
         if (!processHolder.process) {
           return { behavior: "deny", message: "Process not ready" };
@@ -722,7 +719,6 @@ export class Supervisor {
       codexEventProjectId: projectId,
       llmGatewayConfig: modelSettings?.llmGatewayConfig,
       executor: modelSettings?.executor,
-      globalInstructions: modelSettings?.globalInstructions,
       resumeSessionAt: modelSettings?.resumeSessionAt,
       rollbackNumTurns: modelSettings?.rollbackNumTurns,
       onToolApproval: async (toolName, input, opts) => {

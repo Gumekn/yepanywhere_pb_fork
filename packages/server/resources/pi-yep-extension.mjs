@@ -92,10 +92,6 @@ function parseProviderConfig() {
     // back into process.env (which the bash tool inherits).
     const config = {
       providers,
-      ...(typeof parsed.globalInstructions === "string" &&
-      parsed.globalInstructions.trim()
-        ? { globalInstructions: parsed.globalInstructions.trim() }
-        : {}),
     };
     globalThis[PROVIDER_STATE_KEY] = config;
     return config;
@@ -452,12 +448,6 @@ export default function yepPiExtension(pi) {
   const config = parseProviderConfig();
   for (const provider of config.providers) {
     pi.registerProvider(provider.id, provider.config);
-  }
-
-  if (config.globalInstructions) {
-    pi.on("before_agent_start", (event) => ({
-      systemPrompt: `${event.systemPrompt}\n\n${config.globalInstructions}`,
-    }));
   }
 
   registerPartialOutputRelay(pi);

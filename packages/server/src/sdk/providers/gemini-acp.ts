@@ -383,19 +383,11 @@ export class GeminiACPProvider implements AgentProvider {
 
       // Process messages from the queue
       const messageGen = queue.generator();
-      let isFirstNewMessage = true;
       for await (const message of messageGen) {
         if (signal.aborted) break;
 
-        let { internalPrompt, publicPrompt } = getUserPromptProjection(message);
-
-        // Prepend global instructions to the first message of new sessions
-        if (isFirstNewMessage && options.globalInstructions) {
-          const prefix = `[Global context]\n${options.globalInstructions}\n\n---\n\n`;
-          internalPrompt = `${prefix}${internalPrompt}`;
-          publicPrompt = `${prefix}${publicPrompt}`;
-        }
-        isFirstNewMessage = false;
+        const { internalPrompt, publicPrompt } =
+          getUserPromptProjection(message);
 
         // Emit user message
         // SDKUserMessage has uuid at top level

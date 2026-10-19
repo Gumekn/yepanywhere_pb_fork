@@ -191,7 +191,6 @@ interface PiStreamState {
 }
 
 interface PiExtensionProviderConfig {
-  globalInstructions?: string;
   providers: Array<{
     id: string;
     config: {
@@ -386,7 +385,6 @@ function applyPiSessionModelConfig(
 function buildPiExtensionConfig(
   routes: Map<string, PiModelRoute>,
   models: ModelInfo[],
-  globalInstructions?: string,
 ): PiExtensionProviderConfig {
   const modelsById = new Map(models.map((model) => [model.id, model]));
   const providers: PiExtensionProviderConfig["providers"] = [];
@@ -467,9 +465,6 @@ function buildPiExtensionConfig(
 
   return {
     providers,
-    ...(globalInstructions?.trim()
-      ? { globalInstructions: globalInstructions.trim() }
-      : {}),
   };
 }
 
@@ -1227,11 +1222,7 @@ export class PiProvider implements AgentProvider {
       ]) {
         delete childEnv[key];
       }
-      const extensionConfig = buildPiExtensionConfig(
-        runtime.routes,
-        models,
-        options.globalInstructions,
-      );
+      const extensionConfig = buildPiExtensionConfig(runtime.routes, models);
       childEnv.YEP_PI_LLM_API_KEYS = JSON.stringify(
         Object.fromEntries(
           extensionConfig.providers.flatMap((provider) => {

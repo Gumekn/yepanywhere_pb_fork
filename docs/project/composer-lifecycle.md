@@ -23,7 +23,7 @@
 | 问答 Other、直接回答、秘密输入 | `QuestionAnswerPanel` | Other 按 session/request 保存；秘密只留内存 | 多行回答中 Enter 换行；完成或失败由问题流程处理 |
 | 拒绝工具时的反馈 | `ToolApprovalPanel` 单行 input | `useToolApprovalFeedbackDraft` | 拒绝成功才清理，失败保留 |
 | 目标描述 | `GoalModal` textarea | 弹窗内存状态 | 按钮提交，忙碌时锁定；关闭不保留 |
-| 报告、Agent Context、授权设置等 | 各业务表单字段 | 各自业务数据 | 普通表单提交，不接入消息发送／附件规则 |
+| 报告、授权设置等 | 各业务表单字段 | 各自业务数据 | 普通表单提交，不接入消息发送／附件规则 |
 
 ## 统一流程与职责
 

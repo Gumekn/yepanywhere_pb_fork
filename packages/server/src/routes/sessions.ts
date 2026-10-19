@@ -203,7 +203,7 @@ export interface SessionsDeps {
   kimiSessionsDir?: string;
   /** Optional shared Kimi reader factory for cross-provider session lookups */
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
-  /** ServerSettingsService for reading global instructions */
+  /** Server-wide settings service */
   serverSettingsService?: ServerSettingsService;
   /** ModelInfoService for context window lookups */
   modelInfoService?: ModelInfoService;

@@ -1,6 +1,5 @@
 import type { SessionDisplaySubscriptionOptions } from "@yep-anywhere/shared";
 import type {
-  DeviceServerMessage,
   RemoteClientMessage,
   TerminalServerMessage,
   UploadedFile,
@@ -287,10 +286,6 @@ export class WebSocketConnection implements Connection {
 
   sendMessage(msg: RemoteClientMessage): void {
     this.send(msg);
-  }
-
-  onDeviceMessage(handler: (msg: DeviceServerMessage) => void): () => void {
-    return this.protocol.onDeviceMessage(handler);
   }
 
   onTerminalMessage(handler: (msg: TerminalServerMessage) => void): () => void {

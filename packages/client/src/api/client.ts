@@ -15,7 +15,6 @@ import type {
   ContextCumulativeUsage,
   ContextStatusResponse,
   ContextUsage,
-  DeviceInfo,
   EnrichedRecentEntry,
   FileContentResponse,
   GitStatusInfo,
@@ -668,16 +667,6 @@ export interface VersionInfo {
   resumeProtocolVersion?: number;
   /** Feature capabilities supported by the server. Undefined on older servers. */
   capabilities?: string[];
-  /** Device bridge availability and update state. Undefined on older servers. */
-  deviceBridgeState?:
-    | "available"
-    | "downloadable"
-    | "update-available"
-    | "unavailable";
-  /** Installed managed bridge binary version when known. */
-  deviceBridgeVersion?: string | null;
-  /** Latest bridge release version when known. */
-  latestDeviceBridgeVersion?: string | null;
 }
 
 export interface ServerInfo {
@@ -2405,50 +2394,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ html, title }),
     }),
-
-  // Device bridge API
-  getDevices: () => fetchJSON<DeviceInfo[]>("/devices"),
-
-  startDevice: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/start`, {
-      method: "POST",
-    }),
-
-  stopDevice: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/stop`, {
-      method: "POST",
-    }),
-
-  downloadDeviceBridge: () =>
-    fetchJSON<{
-      ok: boolean;
-      path?: string;
-      binaryPath?: string;
-      apkPath?: string;
-      error?: string;
-    }>("/devices/bridge/download", { method: "POST" }),
-
-  // Legacy aliases (kept while UI naming is still emulator-centric)
-  getEmulators: () => fetchJSON<DeviceInfo[]>("/devices"),
-
-  startEmulator: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/start`, {
-      method: "POST",
-    }),
-
-  stopEmulator: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/stop`, {
-      method: "POST",
-    }),
-
-  downloadEmulatorBridge: () =>
-    fetchJSON<{
-      ok: boolean;
-      path?: string;
-      binaryPath?: string;
-      apkPath?: string;
-      error?: string;
-    }>("/devices/bridge/download", { method: "POST" }),
 };
 
 export interface RemoteExecutorTestResult {
@@ -2477,14 +2422,8 @@ export interface ServerSettings {
   serviceWorkerEnabled: boolean;
   /** Remote-only Claude Code executors and path mappings. */
   remoteExecutors?: RemoteExecutorConfig[];
-  /** SSH host aliases for ChromeOS device bridge targets */
-  chromeOsHosts?: string[];
   /** Allowed hostnames for host/origin validation. "*" = allow all, comma-separated = specific hosts. */
   allowedHosts?: string;
-  /** Free-form instructions appended to the system prompt for all sessions */
-  globalInstructions?: string;
-  /** Whether the device bridge (emulator/device streaming) feature is enabled */
-  deviceBridgeEnabled?: boolean;
   /** Defaults applied when opening the new session form */
   newSessionDefaults?: NewSessionDefaults;
   /** Whether lifecycle webhook delivery is enabled */

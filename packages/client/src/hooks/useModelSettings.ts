@@ -16,7 +16,7 @@ import {
  */
 export type { EffortLevel, ModelOption, ThinkingMode, ThinkingOption };
 
-export const MODEL_OPTIONS: { value: ModelOption; label: string }[] = [
+const LEGACY_MODEL_OPTIONS: { value: ModelOption; label: string }[] = [
   { value: "default", label: "Default" },
   { value: "sonnet", label: "Sonnet 5" },
   { value: "claude-fable-5[1m]", label: "Fable 5 (1M)" },
@@ -50,7 +50,10 @@ function loadModel(): ModelOption {
         : stored === "opus[1m]" || stored === "best"
           ? "opus"
           : stored;
-  if (remapped && MODEL_OPTIONS.some((option) => option.value === remapped)) {
+  if (
+    remapped &&
+    LEGACY_MODEL_OPTIONS.some((option) => option.value === remapped)
+  ) {
     if (remapped !== stored) saveModel(remapped as ModelOption);
     return remapped as ModelOption;
   }
@@ -132,10 +135,9 @@ function saveVoiceInputEnabled(enabled: boolean) {
 }
 
 /**
- * Hook to manage model and thinking preferences.
+ * Hook to manage thinking and voice input preferences.
  */
 export function useModelSettings() {
-  const [model, setModelState] = useState<ModelOption>(loadModel);
   const [effortLevel, setEffortLevelState] =
     useState<EffortLevel>(loadEffortLevel);
   const [thinkingMode, setThinkingModeState] =
@@ -143,11 +145,6 @@ export function useModelSettings() {
   const [voiceInputEnabled, setVoiceInputEnabledState] = useState<boolean>(
     loadVoiceInputEnabled,
   );
-
-  const setModel = useCallback((m: ModelOption) => {
-    setModelState(m);
-    saveModel(m);
-  }, []);
 
   const setEffortLevel = useCallback((level: EffortLevel) => {
     setEffortLevelState(level);
@@ -178,8 +175,6 @@ export function useModelSettings() {
   }, [voiceInputEnabled]);
 
   return {
-    model,
-    setModel,
     effortLevel,
     setEffortLevel,
     // Keep thinkingLevel as alias for backward compat with components
@@ -195,7 +190,8 @@ export function useModelSettings() {
 }
 
 /**
- * Get model setting without React state (for non-component code).
+ * Read the retired model preference for compatibility with existing browsers.
+ * New defaults are saved per provider by NewSessionForm.
  */
 export function getModelSetting(): ModelOption {
   return loadModel();

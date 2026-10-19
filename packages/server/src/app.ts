@@ -24,7 +24,6 @@ import { CodexAppServerHistoryReader } from "./codex-history/CodexAppServerHisto
 import { getCodexHistoryClient } from "./codex-history/CodexHistoryClient.js";
 import { CodexSessionCatalog } from "./codex-history/CodexSessionCatalog.js";
 import type { SessionTitleGenerationConfig } from "./config.js";
-import type { DeviceBridgeService } from "./device/DeviceBridgeService.js";
 import { SessionDisplayService } from "./display/SessionDisplayService.js";
 import type { DshWebService } from "./dsh/web-service.js";
 import type { FrontendProxy } from "./frontend/index.js";
@@ -91,7 +90,6 @@ import {
   getDeploymentAvailability,
 } from "./routes/deploy.js";
 import { createDevRoutes } from "./routes/dev.js";
-import { createDeviceRoutes } from "./routes/devices.js";
 import { createFeishuChannelRoutes } from "./routes/feishu-channel.js";
 import { createFeishuUserAuthRoutes } from "./routes/feishu-user-auth.js";
 import { createFilesRoutes } from "./routes/files.js";
@@ -259,8 +257,6 @@ export interface AppOptions {
   modelInfoService?: ModelInfoService;
   /** SharingService for session sharing */
   sharingService?: SharingService;
-  /** DeviceBridgeService for Android emulator streaming */
-  deviceBridgeService?: DeviceBridgeService;
   /** Codex bridge for externally launched `codex --remote` TUI sessions. */
   codexBridgeService?: CodexBridgeController;
   /** Canonical Codex transcript sources. Primarily injectable for tests/embedders. */
@@ -1221,21 +1217,6 @@ export function createApp(options: AppOptions): AppResult {
   app.route(
     "/api/version",
     createVersionRoutes({
-      getDeviceBridgeState: () => {
-        if (!options.deviceBridgeService) return "unavailable";
-        return options.deviceBridgeService.hasBinary()
-          ? "available"
-          : "downloadable";
-      },
-      getDeviceBridgeStatus: ({ forceRefresh } = {}) => {
-        if (!options.deviceBridgeService) {
-          return Promise.resolve({ state: "unavailable" as const });
-        }
-        return options.deviceBridgeService.getBridgeStatus({ forceRefresh });
-      },
-      isDeviceBridgeEnabled: () =>
-        options.serverSettingsService?.getSetting("deviceBridgeEnabled") ??
-        false,
       installId: options.installId,
       voiceInputEnabled: options.voiceInputEnabled,
       isDeploymentAvailable: () =>
@@ -1251,7 +1232,6 @@ export function createApp(options: AppOptions): AppResult {
         host: options.serverHost,
         port: options.serverPort,
         installId: options.installId,
-        deviceBridgeAvailable: !!options.deviceBridgeService?.hasBinary(),
       }),
     );
   }
@@ -1753,17 +1733,6 @@ export function createApp(options: AppOptions): AppResult {
       createBrowserProfilesRoutes({
         browserProfileService: options.browserProfileService,
         pushService: options.pushService,
-      }),
-    );
-  }
-
-  // Emulator streaming routes (Android emulator remote control)
-  if (options.deviceBridgeService) {
-    app.route(
-      "/api/devices",
-      createDeviceRoutes({
-        deviceBridgeService: options.deviceBridgeService,
-        serverSettingsService: options.serverSettingsService,
       }),
     );
   }

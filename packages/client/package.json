@@ -9,12 +9,7 @@
     "build:stable": "node ../../scripts/check-typography.mjs && tsc && vite build --base /_stable/ --outDir dist-stable",
     "test": "node ../../scripts/run-with-safe-home.js vitest run",
     "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui",
-    "test:e2e:android": "playwright test --grep \"streams physical Android\"",
-    "test:e2e:android:soak": "YEP_E2E_ANDROID_LONG_STREAM=true YEP_E2E_ANDROID_LONG_STREAM_MS=${YEP_E2E_ANDROID_LONG_STREAM_MS:-120000} playwright test --grep \"long duration\"",
-    "test:e2e:emulator:apk": "DEVICE_BRIDGE_USE_APK_FOR_EMULATOR=true ANDROID_DEVICE_SERVER_APK=${ANDROID_DEVICE_SERVER_APK:-../android-device-server/app/build/outputs/apk/release/yep-device-server.apk} playwright test --grep \"APK transport override\"",
-    "test:e2e:emulator:apk:adaptive": "DEVICE_BRIDGE_USE_APK_FOR_EMULATOR=true ANDROID_DEVICE_SERVER_APK=${ANDROID_DEVICE_SERVER_APK:-../android-device-server/app/build/outputs/apk/release/yep-device-server.apk} YEP_BRIDGE_TEST_ADAPTIVE_PROFILE_CYCLE=true E2E_SERVER_LOG_LEVEL=info E2E_SERVER_FILE_LOG_LEVEL=info playwright test --grep \"adaptive profile downshift/upshift events via APK transport override\"",
-    "test:e2e:chromeos": "CHROMEOS_HOST=${CHROMEOS_HOST:-chromeroot} playwright test --grep \"streams ChromeOS\""
+    "test:e2e:ui": "playwright test --ui"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.14.7",

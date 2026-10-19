@@ -1317,9 +1317,6 @@ export class SessionCommandService {
         feishuMcpConfig: input.origin?.feishuMcpConfig,
         llmGatewayConfig,
         executor,
-        globalInstructions:
-          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
-          undefined,
         permissions: body.permissions,
         resumeSessionAt: supportsResumeSessionAt(providerName)
           ? body.resumeSessionAt
@@ -1776,9 +1773,6 @@ export class SessionCommandService {
           parsedBodyExecutor.executor ??
           metadataExecutor.executor ??
           process.executor ??
-          undefined,
-        globalInstructions:
-          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
           undefined,
         permissions: body.permissions,
       },
@@ -2299,9 +2293,6 @@ export class SessionCommandService {
         llmGatewayKeyId: parsedLlmGatewayKeyId.llmGatewayKeyId,
         llmGatewayConfig: parsedGatewayConfig.llmGatewayConfig,
         executor: parsedExecutor.executor,
-        globalInstructions:
-          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
-          undefined,
         permissions: body.permissions,
       },
     };

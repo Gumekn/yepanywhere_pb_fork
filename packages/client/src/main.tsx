@@ -10,7 +10,6 @@ import {
   Route,
   Routes,
   useLocation,
-  useParams,
 } from "react-router-dom";
 import { App } from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -105,24 +104,7 @@ function RedirectWithSearch({ to }: { to: string }) {
 }
 
 function LegacyDeviceRedirect() {
-  const location = useLocation();
-  const { deviceId } = useParams<{ deviceId?: string }>();
-  const searchParams = new URLSearchParams(location.search);
-
-  if (deviceId) {
-    searchParams.set("deviceId", deviceId);
-  }
-
-  const search = searchParams.toString();
-  return (
-    <Navigate
-      to={{
-        pathname: "/settings/emulator",
-        search: search ? `?${search}` : "",
-      }}
-      replace
-    />
-  );
+  return <Navigate to="/settings" replace />;
 }
 
 // Apply saved preferences before React renders to avoid flash

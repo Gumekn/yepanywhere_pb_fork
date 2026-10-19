@@ -364,17 +364,11 @@ export class CursorProvider implements AgentProvider {
         model: options.model,
       } as SDKMessage;
 
-      let applyGlobalInstructions = true;
       for await (const message of queue.generator()) {
         if (signal.aborted) break;
         turnIndex += 1;
-        let { internalPrompt, publicPrompt } = getUserPromptProjection(message);
-        if (applyGlobalInstructions && options.globalInstructions) {
-          const prefix = `[Global context]\n${options.globalInstructions}\n\n---\n\n`;
-          internalPrompt = `${prefix}${internalPrompt}`;
-          publicPrompt = `${prefix}${publicPrompt}`;
-          applyGlobalInstructions = false;
-        }
+        const { internalPrompt, publicPrompt } =
+          getUserPromptProjection(message);
         const userUuid = (message as { uuid?: string }).uuid ?? randomUUID();
         yield {
           type: "user",

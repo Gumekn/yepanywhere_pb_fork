@@ -40,15 +40,11 @@ describe("independent release policy", () => {
     );
   });
 
-  it("retains the fork-owned device bridge and scoped Desktop recovery", () => {
-    const goModule = readWorkspaceFile("packages/device-bridge/go.mod");
+  it("retains scoped Desktop recovery", () => {
     const desktopWorkflow = readWorkspaceFile(
       ".github/workflows/desktop-ci.yml",
     );
 
-    expect(goModule).toContain(
-      "module github.com/hustc5622/yepanywhere/device-bridge",
-    );
     expect(desktopWorkflow).toContain("workflow_dispatch:");
     expect(desktopWorkflow).toContain("steps.build_tauri.outcome == 'failure'");
   });

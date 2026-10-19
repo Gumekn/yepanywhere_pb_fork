@@ -7,8 +7,11 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import {
   type WSAdapter,
+  type WsHandlerDeps,
+  cleanupTerminalAttachments,
   createConnectionState,
   createSendFn,
+  handleMessage,
   handleSessionSubscribe,
   handleUnsubscribe,
 } from "../../src/routes/ws-handlers.js";
@@ -48,6 +51,37 @@ async function waitForFrames(sent: SentFrame[], count: number): Promise<void> {
 }
 
 describe("WebSocket handlers", () => {
+  it("preserves terminal attachment routing and detachment", async () => {
+    const send = vi.fn();
+    const terminalService = { handleMessage: vi.fn(), detachAll: vi.fn() };
+    const message = {
+      type: "terminal_open",
+      terminalId: "terminal-1",
+      cols: 80,
+      rows: 24,
+    };
+    const ws: WSAdapter = { send: vi.fn(), close: vi.fn() };
+    const deps = { terminalService } as unknown as WsHandlerDeps;
+    await handleMessage(
+      ws,
+      new Map(),
+      new Map(),
+      createConnectionState(),
+      send,
+      JSON.stringify(message),
+      deps,
+      {},
+      "attachment-1",
+    );
+    expect(terminalService.handleMessage).toHaveBeenCalledWith(
+      message,
+      "attachment-1",
+      send,
+    );
+    cleanupTerminalAttachments("attachment-1", deps.terminalService);
+    expect(terminalService.detachAll).toHaveBeenCalledWith("attachment-1");
+  });
+
   it("keeps outbound frame order while compressing large JSON asynchronously", async () => {
     const sent: SentFrame[] = [];
     const ws: WSAdapter = {

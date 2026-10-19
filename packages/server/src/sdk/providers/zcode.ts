@@ -672,7 +672,6 @@ export class ZCodeProvider implements AgentProvider {
 
       // Turn loop: drain queue → send → process notifications.
       const messageGen = queue.generator();
-      let isFirstMessage = true;
 
       for await (const message of messageGen) {
         if (signal.aborted) break;
@@ -681,12 +680,7 @@ export class ZCodeProvider implements AgentProvider {
           getUserPromptProjection(message);
         if (!internalPrompt) continue;
 
-        // Prepend global instructions to the first message.
-        let prompt = internalPrompt;
-        if (isFirstMessage && options.globalInstructions) {
-          prompt = `${options.globalInstructions}\n\n${internalPrompt}`;
-          isFirstMessage = false;
-        }
+        const prompt = internalPrompt;
 
         // Send user message to app-server.
         // Real CLI uses `content` (string, NOT nested message object),

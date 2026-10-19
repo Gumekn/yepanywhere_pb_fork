@@ -1110,24 +1110,17 @@ export class KimiProvider implements AgentProvider {
       } as SDKMessage;
 
       const messageGen = queue.generator();
-      let isFirstNewMessage = true;
       for await (const message of messageGen) {
         if (signal.aborted) break;
 
         let { internalPrompt, publicPrompt } = getUserPromptProjection(message);
 
-        if (isFirstNewMessage && options.globalInstructions) {
-          const prefix = `[Global context]\n${options.globalInstructions}\n\n---\n\n`;
-          internalPrompt = `${prefix}${internalPrompt}`;
-          publicPrompt = `${prefix}${publicPrompt}`;
-        }
         // Kimi's current ACP bridge reduces AskUserQuestion batches to the
         // first item and can only round-trip one optionId. Repeat this hidden
         // host constraint on every turn so compaction cannot discard it, and
         // explicitly forbid accepting a recommended default for a missing
         // answer.
         internalPrompt = `${KIMI_ACP_SINGLE_QUESTION_REMINDER}\n\n${internalPrompt}`;
-        isFirstNewMessage = false;
 
         const userUuid = (message as { uuid?: string }).uuid ?? randomUUID();
         yield {

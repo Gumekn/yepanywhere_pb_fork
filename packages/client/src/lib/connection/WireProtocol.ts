@@ -1,7 +1,6 @@
 import type { SessionDisplaySubscriptionOptions } from "@yep-anywhere/shared";
 import type {
   ClientPing,
-  DeviceServerMessage,
   RemoteClientMessage,
   ServerPong,
   TerminalServerMessage,
@@ -34,7 +33,6 @@ export interface WireTransport {
   isConnected(): boolean;
 }
 
-export type EmulatorMessageHandler = (msg: DeviceServerMessage) => void;
 export type TerminalMessageHandler = (msg: TerminalServerMessage) => void;
 
 export interface WireProtocolOptions {
@@ -89,8 +87,6 @@ export class WireProtocol {
   readonly subscriptions = new Map<string, StreamHandlers>();
   /** Recently-closed subscription IDs — suppresses warnings for in-flight events */
   private recentlyClosed = new Set<string>();
-  /** Registered handlers for emulator signaling messages */
-  private emulatorHandlers = new Set<EmulatorMessageHandler>();
   /** Registered handlers for terminal output / lifecycle messages */
   private terminalHandlers = new Set<TerminalMessageHandler>();
 
@@ -149,13 +145,6 @@ export class WireProtocol {
       case "pong":
         this.options.onPong?.(msg.id);
         break;
-      // Emulator signaling messages (server → client push)
-      case "device_webrtc_offer":
-      case "device_ice_candidate_event":
-      case "device_session_state":
-      case "device_stream_profile_event":
-        this.handleEmulatorMessage(msg as DeviceServerMessage);
-        break;
       // Remote terminal messages (server → client push)
       case "terminal_opened":
       case "terminal_output":
@@ -169,23 +158,6 @@ export class WireProtocol {
           (msg as { type?: string }).type,
         );
     }
-  }
-
-  private handleEmulatorMessage(msg: DeviceServerMessage): void {
-    for (const handler of this.emulatorHandlers) {
-      handler(msg);
-    }
-  }
-
-  /**
-   * Register a handler for emulator signaling messages.
-   * Returns an unsubscribe function.
-   */
-  onDeviceMessage(handler: EmulatorMessageHandler): () => void {
-    this.emulatorHandlers.add(handler);
-    return () => {
-      this.emulatorHandlers.delete(handler);
-    };
   }
 
   private handleTerminalMessage(msg: TerminalServerMessage): void {

@@ -30,10 +30,6 @@ import type {
   ServerSettings,
   ServerSettingsService,
 } from "../services/ServerSettingsService.js";
-import {
-  isValidSshHostAlias,
-  normalizeSshHostAlias,
-} from "../utils/sshHostAlias.js";
 
 const EFFORT_LEVELS: readonly EffortLevel[] = [
   "low",
@@ -53,27 +49,6 @@ export interface SettingsRoutesDeps {
   onRemoteExecutorsChanged?: (
     executors: RemoteExecutorConfig[],
   ) => void | Promise<void>;
-}
-
-function parseHostAliasList(rawHosts: unknown[]): {
-  hosts: string[];
-  invalidHost?: string;
-} {
-  const hosts: string[] = [];
-
-  for (const rawHost of rawHosts) {
-    if (typeof rawHost !== "string") continue;
-
-    const host = normalizeSshHostAlias(rawHost);
-    if (!host) continue;
-    if (!isValidSshHostAlias(host)) {
-      return { hosts: [], invalidHost: host };
-    }
-
-    hosts.push(host);
-  }
-
-  return { hosts };
 }
 
 function isEffortLevel(value: string): value is EffortLevel {
@@ -542,18 +517,6 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
       }
       updates.remoteExecutors = parsed.executors;
     }
-    // Handle chromeOsHosts array
-    if (Array.isArray(body.chromeOsHosts)) {
-      const { hosts, invalidHost } = parseHostAliasList(body.chromeOsHosts);
-      if (invalidHost) {
-        return c.json(
-          { error: `Invalid ChromeOS host alias: ${invalidHost}` },
-          400,
-        );
-      }
-      updates.chromeOsHosts = hosts;
-    }
-
     // Handle allowedHosts string ("*", comma-separated hostnames, or undefined to clear)
     if ("allowedHosts" in body) {
       if (
@@ -565,24 +528,6 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): Hono {
       } else if (typeof body.allowedHosts === "string") {
         updates.allowedHosts = body.allowedHosts;
       }
-    }
-
-    // Handle globalInstructions string (free-form text, or undefined/null/"" to clear)
-    if ("globalInstructions" in body) {
-      if (
-        body.globalInstructions === undefined ||
-        body.globalInstructions === null ||
-        body.globalInstructions === ""
-      ) {
-        updates.globalInstructions = undefined;
-      } else if (typeof body.globalInstructions === "string") {
-        updates.globalInstructions = body.globalInstructions.slice(0, 10000);
-      }
-    }
-
-    // Handle deviceBridgeEnabled boolean
-    if (typeof body.deviceBridgeEnabled === "boolean") {
-      updates.deviceBridgeEnabled = body.deviceBridgeEnabled;
     }
 
     if ("newSessionDefaults" in body) {
