@@ -103,7 +103,12 @@ class MainActivity : TauriActivity() {
       val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
       val bottomInset = maxOf(ime.bottom, systemBars.bottom)
       view.setPadding(0, 0, 0, bottomInset)
-      insets
+      // The child WebView now occupies a shorter area. Forward insets relative
+      // to that area, otherwise newer WebViews apply the same bottom IME/nav
+      // inset again. Keep top/side insets for the shim's safe-area padding and
+      // keep dispatching updates (including keyboard hide), rather than
+      // returning CONSUMED and leaving stale viewport/safe-area state behind.
+      insets.inset(0, 0, 0, bottomInset)
     }
     ViewCompat.requestApplyInsets(rootView)
 
