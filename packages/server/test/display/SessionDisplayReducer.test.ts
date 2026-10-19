@@ -3,7 +3,7 @@ import {
   SessionDisplaySnapshotSchema,
   applySessionDisplayPatch,
 } from "@yep-anywhere/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   SessionDisplayReducer,
   displayToolId,
@@ -554,34 +554,43 @@ describe("SessionDisplayReducer", () => {
     expect(required(groups(model.snapshot())[0]).count).toBe(1);
   });
   it("reconstructs the same facts at every entry point and deduplicates replay", () => {
-    const events = [
-      prompt,
-      tool("a"),
-      result("a"),
-      reply("p1", "Continue"),
-      tool("b"),
-      reply("p2", "Almost done"),
-      result("b"),
-      tool("c"),
-      result("c"),
-      reply("final", "Done", "final_answer"),
-      terminal,
-    ];
-    const uninterrupted = new SessionDisplayReducer(view, "codex");
-    uninterrupted.setRuntime("running");
-    for (const event of events) uninterrupted.message(event);
-    for (let cut = 0; cut <= events.length; cut++) {
-      const reopened = new SessionDisplayReducer(view, "codex");
-      reopened.setRuntime("running");
-      reopened.restore(events.slice(0, cut) as Message[]);
-      for (const event of events.slice(cut)) reopened.message(event);
-      expect(facts(reopened.snapshot()), `entry at ${cut}`).toEqual(
-        facts(uninterrupted.snapshot()),
-      );
-      const beforeReplay = reopened.snapshot();
-      for (const event of events)
-        reopened.message({ ...event, isReplay: true });
-      expect(facts(reopened.snapshot())).toEqual(facts(beforeReplay));
+    // Live steps without a source timestamp take their start from the wall
+    // clock. A millisecond boundary otherwise gives one entry point a duration
+    // the uninterrupted snapshot does not have.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    try {
+      const events = [
+        prompt,
+        tool("a"),
+        result("a"),
+        reply("p1", "Continue"),
+        tool("b"),
+        reply("p2", "Almost done"),
+        result("b"),
+        tool("c"),
+        result("c"),
+        reply("final", "Done", "final_answer"),
+        terminal,
+      ];
+      const uninterrupted = new SessionDisplayReducer(view, "codex");
+      uninterrupted.setRuntime("running");
+      for (const event of events) uninterrupted.message(event);
+      for (let cut = 0; cut <= events.length; cut++) {
+        const reopened = new SessionDisplayReducer(view, "codex");
+        reopened.setRuntime("running");
+        reopened.restore(events.slice(0, cut) as Message[]);
+        for (const event of events.slice(cut)) reopened.message(event);
+        expect(facts(reopened.snapshot()), `entry at ${cut}`).toEqual(
+          facts(uninterrupted.snapshot()),
+        );
+        const beforeReplay = reopened.snapshot();
+        for (const event of events)
+          reopened.message({ ...event, isReplay: true });
+        expect(facts(reopened.snapshot())).toEqual(facts(beforeReplay));
+      }
+    } finally {
+      vi.useRealTimers();
     }
   });
   it("uses the same native text identity for delta, committed text and a cold snapshot", () => {

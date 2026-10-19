@@ -32,7 +32,13 @@ describe("independent release policy", () => {
     expect(buildBundle).not.toContain("github.com/kzahel/yepanywhere");
     expect(buildBundle).not.toContain("npm publish");
     expect(buildBundle).not.toMatch(/execStep\("pnpm\b/);
-    expect(buildBundle.match(/execStep\("corepack pnpm\b/g)).toHaveLength(3);
+    expect(
+      buildBundle.match(/corepack pnpm --filter @yep-anywhere\/\S+ build/g),
+    ).toEqual([
+      "corepack pnpm --filter @yep-anywhere/shared build",
+      "corepack pnpm --filter @yep-anywhere/client build",
+      "corepack pnpm --filter @yep-anywhere/server build",
+    ]);
     expect(buildBundle).toContain("gitStatus.length > 0");
     expect(buildBundle).not.toContain("output.length > 0 ? output : null");
     expect(buildBundle).toContain(
