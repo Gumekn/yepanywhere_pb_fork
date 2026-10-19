@@ -21,6 +21,8 @@ export const ToolResultContentSchema = z.object({
     ),
   ]),
   is_error: z.boolean().optional(),
+  /** Native tool execution duration when the provider records it. */
+  durationMs: z.number().finite().nonnegative().optional(),
 });
 
 export type ToolResultContent = z.infer<typeof ToolResultContentSchema>;

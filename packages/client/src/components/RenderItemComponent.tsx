@@ -205,6 +205,7 @@ export const RenderItemComponent = memo(function RenderItemComponent({
             toolName={item.toolName}
             toolInput={item.toolInput}
             toolResult={item.toolResult}
+            sourceMessages={item.sourceMessages}
             status={item.status}
             sessionProvider={sessionProvider}
             partialOutput={item.partialOutput}

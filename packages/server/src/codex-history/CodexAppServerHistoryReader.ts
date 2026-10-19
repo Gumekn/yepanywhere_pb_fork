@@ -1332,6 +1332,7 @@ function projectThreadItem(
     }
     case "commandExecution":
       return toolMessages(base, "Bash", { command: item.command }, item.id, {
+        durationMs: item.durationMs,
         content: item.aggregatedOutput ?? "",
         isError:
           item.status === "failed" ||
@@ -1361,6 +1362,7 @@ function projectThreadItem(
         item.arguments,
         item.id,
         {
+          durationMs: item.durationMs,
           content:
             item.status === "completed"
               ? JSON.stringify(item.result)
@@ -1376,6 +1378,7 @@ function projectThreadItem(
         item.arguments,
         item.id,
         {
+          durationMs: item.durationMs,
           content: JSON.stringify(item.contentItems ?? []),
           isError: item.success === false,
           completed: item.status !== "inProgress",
@@ -1616,6 +1619,7 @@ function toolMessages(
     content: string;
     isError: boolean;
     completed: boolean;
+    durationMs?: number | null;
     toolUseResult?: unknown;
   },
 ): Message[] {
@@ -1632,6 +1636,11 @@ function toolMessages(
     type: "tool_result",
     tool_use_id: toolUseId,
     content: result.content,
+    ...(typeof result.durationMs === "number" &&
+    Number.isFinite(result.durationMs) &&
+    result.durationMs >= 0
+      ? { durationMs: result.durationMs }
+      : {}),
     ...(result.isError ? { is_error: true } : {}),
   };
   return [

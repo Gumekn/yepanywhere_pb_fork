@@ -32,6 +32,10 @@ export const SessionDisplayToolStepSchema = z
     truncated: z.boolean(),
     version: z.number().int().nonnegative(),
     timestamp: z.string().optional(),
+    /** Time this call returned a result; absent when no reliable end is known. */
+    completedAt: z.string().optional(),
+    /** Provider-reported duration, independent of absolute event timestamps. */
+    durationMs: z.number().finite().nonnegative().optional(),
   })
   .strict();
 export type SessionDisplayToolStep = z.infer<
@@ -134,6 +138,9 @@ export const SessionDisplayToolGroupSegmentSchema = z
     runningCount: z.number().int().nonnegative().optional(),
     unknownCount: z.number().int().nonnegative().optional(),
     interruptedCount: z.number().int().nonnegative().optional(),
+    /** Sum of known per-call durations; parallel calls count separately. */
+    durationMs: z.number().finite().nonnegative().optional(),
+    timedCount: z.number().int().nonnegative().optional(),
     steps: z.array(SessionDisplayToolStepSchema).optional(),
     version: z.number().int().nonnegative().optional(),
     timestamp: TimestampSchema.optional(),

@@ -659,6 +659,124 @@ describe("SessionDisplayReducer", () => {
       displayToolId("turn", "a"),
     );
   });
+  it("reports cumulative timing for parallel calls even after the group is collapsed", () => {
+    const model = new SessionDisplayReducer(view, "codex");
+    model.message(prompt, true);
+    for (const id of ["a", "b"])
+      model.message({ ...tool(id), timestamp: "2026-01-01T00:00:00Z" }, true);
+    model.message({ ...result("a"), timestamp: "2026-01-01T00:00:10Z" }, true);
+    model.message({ ...result("b"), timestamp: "2026-01-01T00:00:20Z" }, true);
+    model.message(reply("done", "Done", "final_answer"), true);
+    expect(groups(model.snapshot())[0]).toMatchObject({
+      count: 2,
+      durationMs: 30_000,
+      timedCount: 2,
+      displayMode: "summary",
+    });
+    expect(groups(model.snapshot())[0]).not.toHaveProperty("steps");
+  });
+
+  it("aggregates native durations beyond the visible step limit and reports partial coverage", () => {
+    const model = new SessionDisplayReducer(view, "codex");
+    model.message(prompt, true);
+    for (let i = 0; i < 55; i++) {
+      const id = `timed-${i}`;
+      model.message(tool(id), true);
+      const r = result(id);
+      model.message(
+        compactDisplayMessage({
+          ...r,
+          message: {
+            ...r.message,
+            content: [
+              {
+                ...required(r.message.content[0]),
+                durationMs: i === 0 ? 0 : 100,
+              },
+            ],
+          },
+        }),
+        true,
+      );
+    }
+    model.message(tool("no-timing"), true);
+    model.message(result("no-timing"), true);
+    expect(groups(model.snapshot())[0]).toMatchObject({
+      count: 56,
+      durationMs: 5400,
+      timedCount: 55,
+    });
+    expect(groups(model.snapshot())[0]?.steps).toHaveLength(50);
+    model.message(reply("done", "Done", "final_answer"), true);
+    expect(groups(model.snapshot())[0]).toMatchObject({
+      durationMs: 5400,
+      timedCount: 55,
+      displayMode: "summary",
+    });
+  });
+
+  it("retains each call's own completion time across replay and duplicate results", () => {
+    const events = [
+      prompt,
+      { ...tool("slow"), timestamp: "2026-01-02T10:00:00Z" },
+      { ...tool("fast"), timestamp: "2026-01-02T10:00:01Z" },
+      { ...result("fast"), timestamp: "2026-01-02T10:00:03Z" },
+      { ...result("slow"), timestamp: "2026-01-02T10:00:12Z" },
+    ];
+    for (const replay of [false, true]) {
+      const model = new SessionDisplayReducer(view, "codex");
+      for (const event of events)
+        model.message(compactDisplayMessage(event), replay);
+      const groupId = required(groups(model.snapshot())[0]).id;
+      expect(
+        model.groupSteps(groupId)?.map((s) => [s.timestamp, s.completedAt]),
+      ).toEqual([
+        ["2026-01-02T10:00:00Z", "2026-01-02T10:00:12Z"],
+        ["2026-01-02T10:00:01Z", "2026-01-02T10:00:03Z"],
+      ]);
+      model.message({
+        ...result("slow"),
+        timestamp: "2026-01-02T10:01:00Z",
+        isReplay: true,
+      });
+      expect(model.groupSteps(groupId)?.[0]?.completedAt).toBe(
+        "2026-01-02T10:00:12Z",
+      );
+      expect(
+        SessionDisplaySnapshotSchema.safeParse(model.snapshot()).success,
+      ).toBe(true);
+    }
+  });
+
+  it("keeps failure timing and does not invent timing for orphan or untimed historical results", () => {
+    const model = new SessionDisplayReducer(view, "claude");
+    model.message(prompt, true);
+    model.message(
+      { ...tool("failed"), timestamp: "2026-01-02T10:00:00Z" },
+      true,
+    );
+    const failed = result("failed");
+    failed.message.content[0] = {
+      ...required(failed.message.content[0]),
+      is_error: true,
+    } as (typeof failed.message.content)[0];
+    model.message({ ...failed, timestamp: "2026-01-02T10:00:03Z" }, true);
+    model.message(
+      { ...result("orphan"), timestamp: "2026-01-02T10:00:05Z" },
+      true,
+    );
+    model.message(tool("untimed"), true);
+    model.message(result("untimed"), true);
+    const steps = [...model.tools.values()].map((t) => t.step);
+    expect(steps[0]).toMatchObject({
+      status: "failed",
+      completedAt: "2026-01-02T10:00:03Z",
+    });
+    expect(steps[1]?.timestamp).toBeUndefined();
+    expect(steps[1]?.completedAt).toBeUndefined();
+    expect(steps[2]?.completedAt).toBeUndefined();
+  });
+
   it("stamps a start time on live steps and never invents one on replay", () => {
     const live = new SessionDisplayReducer(view, "codex");
     live.message(prompt);

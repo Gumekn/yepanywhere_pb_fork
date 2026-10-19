@@ -160,6 +160,7 @@ function LegacyDisplayToolGroupRow({
               toolName={tool.toolName}
               toolInput={tool.toolInput}
               toolResult={tool.toolResult}
+              sourceMessages={tool.sourceMessages}
               status={tool.status}
               sessionProvider={sessionProvider}
               partialOutput={tool.partialOutput}

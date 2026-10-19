@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { SchemaValidationProvider } from "../../../contexts/SchemaValidationContext";
 import { ToastProvider } from "../../../contexts/ToastContext";
+import type { Message } from "../../../types";
 import { ToolCallRow } from "../ToolCallRow";
 
 function renderWithToolProviders(ui: React.ReactNode) {
@@ -15,6 +16,50 @@ function renderWithToolProviders(ui: React.ReactNode) {
 describe("ToolCallRow", () => {
   afterEach(() => {
     cleanup();
+  });
+
+  it("shows a completed call duration beside its summary", () => {
+    renderWithToolProviders(
+      <ToolCallRow
+        id="timed"
+        toolName="Bash"
+        toolInput={{ command: "pnpm test" }}
+        status="complete"
+        toolResult={{ content: "passed", isError: false }}
+        sourceMessages={
+          [
+            {
+              id: "start",
+              type: "assistant",
+              timestamp: "2026-01-02T10:00:00Z",
+              message: {
+                content: [
+                  { type: "tool_use", id: "timed", name: "Bash", input: {} },
+                ],
+              },
+            },
+            {
+              id: "end",
+              type: "user",
+              timestamp: "2026-01-02T10:00:12Z",
+              message: {
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "timed",
+                    content: "passed",
+                  },
+                ],
+              },
+            },
+          ] as Message[]
+        }
+      />,
+    );
+    expect(screen.getByTestId("tool-call-duration").textContent).toBe("12s");
+    expect(
+      screen.getByText("pnpm test", { selector: ".tool-summary" }),
+    ).toBeDefined();
   });
 
   it("keeps pending Codex Bash rows collapsed without IN/OUT preview cards", () => {

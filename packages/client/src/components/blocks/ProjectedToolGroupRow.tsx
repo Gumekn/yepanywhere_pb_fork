@@ -5,7 +5,6 @@ import type {
 } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
-import { useElapsedLabel } from "../../hooks/useElapsedLabel";
 import { useI18n } from "../../i18n";
 import { preprocessMessages } from "../../lib/preprocessMessages";
 import { isHiddenCodexMainControlTool } from "../../lib/preprocessMessagesSubagents";
@@ -16,6 +15,8 @@ import type {
 } from "../../types/renderItems";
 import { LiveOutputPreview } from "./LiveOutputPreview";
 import { ToolCallRow } from "./ToolCallRow";
+import { ToolDuration } from "./ToolDuration";
+import { ToolGroupDuration } from "./ToolGroupDuration";
 
 interface ToolSelection {
   projectId: string;
@@ -196,7 +197,6 @@ export function ProjectedToolStepRow({
         : [],
     [detail, selection.mainTimeline, selection.representedAgentCallIds],
   );
-  const elapsed = useElapsedLabel(step.timestamp, step.status === "running");
   const showLiveOutput =
     step.status === "running" &&
     (!outputState || outputState.status === "running") &&
@@ -248,18 +248,13 @@ export function ProjectedToolStepRow({
             {step.summary}
           </span>
         )}
-        {elapsed && (
-          <span
-            className="display-step-elapsed"
-            data-testid="display-step-elapsed"
-            title={t("sessionDisplayStepElapsed", {
-              elapsed: elapsed.label,
-              time: new Date(elapsed.startedAt).toLocaleTimeString(),
-            })}
-          >
-            {elapsed.label}
-          </span>
-        )}
+        <ToolDuration
+          timestamp={step.timestamp}
+          completedAt={step.completedAt}
+          durationMs={step.durationMs}
+          running={step.status === "running"}
+          testId="display-step-elapsed"
+        />
         <span className="display-step-chevron" aria-hidden="true">
           {expanded ? "▾" : "▸"}
         </span>
@@ -527,6 +522,7 @@ export function ProjectedToolGroupRow({
               {t("sessionToolGroupChecks", { count: group.checkCount })}
             </span>
           ) : null}
+          {group.type === "tool_group" && <ToolGroupDuration group={group} />}
         </span>
         <span className="expand-chevron" aria-hidden="true">
           {expanded ? "▾" : "▸"}

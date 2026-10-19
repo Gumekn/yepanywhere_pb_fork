@@ -7,6 +7,8 @@ import {
   encodeCodexAppServerCursor,
 } from "../../src/codex-history/CodexAppServerHistoryReader.js";
 import { CodexHistoryClientError } from "../../src/codex-history/types.js";
+import { SessionDisplayReducer } from "../../src/display/SessionDisplayReducer.js";
+import { compactDisplayMessage } from "../../src/display/SessionDisplayService.js";
 import type { Thread } from "../../src/sdk/providers/codex-protocol/generated/v2/Thread.js";
 import type { Turn } from "../../src/sdk/providers/codex-protocol/generated/v2/Turn.js";
 import { publicCodexThreadItem } from "../../src/sdk/providers/codex.js";
@@ -448,6 +450,27 @@ describe("CodexAppServerHistoryReader", () => {
     if (result.kind !== "loaded") return;
     expect(result.nextCursor).toBe("older-turns");
     expect(result.revision).toBe(`cas1.${thread().updatedAt}.${thread().id}`);
+    // Cold history keeps the command's native 10ms, not the enclosing
+    // turn's 10,000ms; compact projection and closed groups retain it too.
+    const model = new SessionDisplayReducer(
+      { sessionId: thread().id, branchScopeId: "active", epoch: "timing" },
+      "codex",
+    );
+    model.restore(
+      result.messages.map((message) =>
+        compactDisplayMessage(message as unknown as Record<string, unknown>),
+      ) as Message[],
+      result.turnStatuses,
+    );
+    const group = model
+      .snapshot()
+      .nodes.find(
+        (node) => node.type === "segment" && node.segment.type === "tool_group",
+      );
+    expect(group).toMatchObject({
+      segment: { durationMs: 10, timedCount: 1, displayMode: "summary" },
+    });
+
     expect(result.turnStatuses).toEqual({
       "turn-semantic": "completed",
     });

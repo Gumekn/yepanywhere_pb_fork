@@ -534,7 +534,10 @@ export class SessionDisplayReducer {
           }
         : {}),
       ...(completed && !(replay && tool.step.status !== "running")
-        ? { status: "completed" as const }
+        ? {
+            status: "completed" as const,
+            completedAt: this.completionTimestamp(tool, timestamp, replay),
+          }
         : {}),
     };
     if (JSON.stringify(nextStep) !== JSON.stringify(tool.step))
@@ -552,14 +555,40 @@ export class SessionDisplayReducer {
     tool.check ||= isCheckTool(input);
   }
 
-  private result(block: RecordValue, runId: string): void {
+  private completionTimestamp(
+    tool: DisplayToolRecord,
+    timestamp: string | undefined,
+    replay: boolean,
+  ): string | undefined {
+    if (tool.step.completedAt) return tool.step.completedAt;
+    const end =
+      timestamp ??
+      (!replay && tool.step.status === "running"
+        ? new Date().toISOString()
+        : undefined);
+    const startMs = Date.parse(tool.step.timestamp ?? "");
+    const endMs = Date.parse(end ?? "");
+    // Identical timestamps often mean a whole call was persisted in one
+    // message. They do not establish a zero-duration execution.
+    return Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
+      ? end
+      : undefined;
+  }
+
+  private result(
+    block: RecordValue,
+    runId: string,
+    timestamp?: string,
+    replay = false,
+  ): void {
     const rawId = string(block.tool_use_id);
     if (!rawId) return;
     let id = displayToolId(runId, rawId);
     if (!this.tools.has(id)) id = this.rawToolIds.get(rawId) ?? id;
     let tool = this.tools.get(id);
     if (!tool) {
-      this.tool({ id: rawId }, runId);
+      // A result without its call cannot establish when execution started.
+      this.tool({ id: rawId }, runId, undefined, true);
       tool = this.tools.get(displayToolId(runId, rawId));
     }
     if (!tool) return;
@@ -567,6 +596,12 @@ export class SessionDisplayReducer {
     const nextStep: SessionDisplayToolStep = {
       ...tool.step,
       status: block.is_error === true ? "failed" : "completed",
+      completedAt: this.completionTimestamp(tool, timestamp, replay),
+      ...(typeof block.durationMs === "number" &&
+      Number.isFinite(block.durationMs) &&
+      block.durationMs >= 0
+        ? { durationMs: block.durationMs }
+        : {}),
       preview: text.slice(-SESSION_DISPLAY_STEP_PREVIEW_LIMIT),
       truncated:
         text.length > SESSION_DISPLAY_STEP_PREVIEW_LIMIT ||
@@ -864,7 +899,8 @@ export class SessionDisplayReducer {
     for (const block of blocks) {
       if (block.type === "tool_use" && role !== "assistant")
         this.tool(block, effectiveRun, timestamp, replay, rawId ?? undefined);
-      else if (block.type === "tool_result") this.result(block, effectiveRun);
+      else if (block.type === "tool_result")
+        this.result(block, effectiveRun, timestamp, replay);
     }
     if (message.type === "error" && message.willRetry !== true) {
       const id = `error:${rawId ?? effectiveRun}`;
@@ -897,6 +933,17 @@ export class SessionDisplayReducer {
     const tools = this.groupSteps(group.id) ?? [];
     const running = tools.filter((t) => t.status === "running");
     const failed = tools.filter((t) => t.status === "failed");
+    let durationMs = 0;
+    let timedCount = 0;
+    for (const tool of tools) {
+      if (tool.status === "running") continue;
+      const elapsed =
+        tool.durationMs ??
+        Date.parse(tool.completedAt ?? "") - Date.parse(tool.timestamp ?? "");
+      if (!Number.isFinite(elapsed) || elapsed < 0) continue;
+      durationMs += elapsed;
+      timedCount++;
+    }
     const paths = new Set<string>();
     let checks = 0;
     for (const id of group.tools) {
@@ -911,6 +958,7 @@ export class SessionDisplayReducer {
       detailRef: group.id,
       count: tools.length,
       failedCount: failed.length,
+      ...(timedCount > 0 ? { durationMs, timedCount } : {}),
       runningCount: running.length,
       unknownCount: tools.filter((t) => t.status === "unknown").length,
       interruptedCount: tools.filter((t) => t.status === "interrupted").length,

@@ -446,6 +446,11 @@ export function compactDisplayMessage(message: RecordValue): RecordValue {
             type: "tool_result",
             tool_use_id: block.tool_use_id,
             is_error: block.is_error,
+            ...(typeof block.durationMs === "number" &&
+            Number.isFinite(block.durationMs) &&
+            block.durationMs >= 0
+              ? { durationMs: block.durationMs }
+              : {}),
             content: text.slice(-2_048),
             displayTruncated: text.length > 2_048,
           };
