@@ -138,7 +138,25 @@ YEP_RUNTIME_EXTERNAL=false scripts/install-launchagents.sh --server-only
 - provider 相关的环境变量（`YEP_CODEX_PATH`、LLM gateway 那组）现在同时写进 runtime 和 server 两个 plist，由 `install-launchagents.sh` 的 `build_provider_env_args()` 统一生成。
 - `--runtime-only` 与 `--codex-bridge-only` 不能同时使用。
 
-## 4. 相关文件
+## 4. 部署耗时
+
+重新部署保留原有检查和进程切换保护，准备阶段采用以下优化：
+
+- LaunchAgent 的 Node 定位只检查 NVM 各版本的 `bin/node`，不递归扫描全局依赖；显式 `YEP_LAUNCHD_NODE`、`NVM_BIN` 的优先级不变。
+- 仅构建阶段不刷新 bridge/runtime 的 LaunchAgent 定义，实际切换进程前再刷新，避免环境同步流程重复执行。
+- shared 编译成功后，client/server 并行构建；任一失败都会等待另一个构建退出，且不发布新 bundle。
+- 前端 TypeScript 检查使用 `packages/client/node_modules/.cache/tsc/client.tsbuildinfo` 增量缓存，让部署预检和后续构建复用检查结果。源码或配置变化仍由 TypeScript 校验；删除该缓存即可恢复冷检查。
+- bundle 日志输出每个步骤的秒数；部署日志另外记录依赖安装、LaunchAgent runtime 文件同步耗时。并行步骤的耗时不能直接相加当作总耗时。
+
+需要单独测量构建、且不替换运行中的 bundle 时：
+
+```sh
+YEP_BUNDLE_OUTPUT_DIR=dist/deploy-benchmark /usr/bin/time -p pnpm build:bundle
+```
+
+该命令只构建到隔离目录，不调用部署或重启服务；整条部署的实际耗时还包括依赖安装、文件同步、等待空闲和进程切换。
+
+## 5. 相关文件
 
 - `scripts/hot-apply.mjs`：叠加命令入口。
 - `scripts/runtime-reload-classifier.js`：档位分类。

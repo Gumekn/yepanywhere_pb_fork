@@ -77,6 +77,37 @@ const external = {
 
 describe("deployment runtime wiring", () => {
   it.each([
+    [false, false, false],
+    [true, false, false],
+    [false, true, false],
+    [false, false, true],
+  ])(
+    "refreshes launch definitions only for cutover: server=%s bridge=%s runtime=%s",
+    (server, bridge, runtime) => {
+      const source = readFileSync(
+        join(root, "scripts/redeploy-server.sh"),
+        "utf8",
+      );
+      const branch = source.slice(
+        source.indexOf("# Build-only runs can precede"),
+        source.indexOf("# ----- restart -----"),
+      );
+      const result = run(`
+DO_BUILD=true
+DO_RESTART=${server}
+RESTART_CODEX_BRIDGE=${bridge}
+RESTART_RUNTIME=${runtime}
+refresh_installed_bridge_launchagents() { echo bridge; }
+refresh_installed_runtime_launchagent() { echo runtime; }
+${branch}
+`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(
+        server || bridge || runtime ? "bridge\nruntime\n" : "",
+      );
+    },
+  );
+  it.each([
     {
       runtime: true,
       server: false,

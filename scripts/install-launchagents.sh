@@ -62,7 +62,13 @@ else
   # launchd does not initialize the interactive shell, and a Homebrew Node
   # ahead of NVM on PATH can be incompatible with the installed native deps.
   # Prefer the locally managed NVM runtime when one is available.
-  NVM_NODE_BIN="$(find "$HOME/.nvm/versions/node" -path '*/bin/node' -type f -print 2>/dev/null | sort | tail -n 1)"
+  # Only inspect version/bin/node. A recursive find also walks every global
+  # package (including bundled SDKs) and can take seconds on each installer run.
+  NVM_NODE_BIN=""
+  for candidate in "$HOME"/.nvm/versions/node/*/bin/node; do
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    NVM_NODE_BIN="$candidate"
+  done
   NODE_BIN="${NVM_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
 fi
 SOURCE_BUNDLE_DIR="$REPO_ROOT/dist/npm-package"

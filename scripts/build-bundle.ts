@@ -12,7 +12,7 @@
  * The resulting server package contains everything needed for distribution.
  */
 
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -156,6 +156,7 @@ const BUILD_INFO = createBuildInfo();
 interface StepResult {
   step: string;
   success: boolean;
+  durationMs: number;
   error?: string;
 }
 
@@ -173,33 +174,51 @@ function execStep(
   command: string,
   cwd?: string,
   env?: Record<string, string | undefined>,
-): void {
-  execSync(command, {
-    stdio: "inherit",
-    cwd: cwd || ROOT_DIR,
-    env: env ? { ...process.env, ...env } : process.env,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      shell: true,
+      stdio: "inherit",
+      cwd: cwd || ROOT_DIR,
+      env: env ? { ...process.env, ...env } : process.env,
+    });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${command} failed (${signal ?? code})`));
+    });
   });
 }
 
-function step(name: string, fn: () => void): void {
+async function step(
+  name: string,
+  fn: () => void | Promise<void>,
+): Promise<void> {
+  const startedAt = performance.now();
   log(`\n${"=".repeat(60)}`);
   log(`Step: ${name}`);
   log("=".repeat(60));
 
   try {
-    fn();
-    results.push({ step: name, success: true });
-    log(`✓ ${name} completed`);
+    await fn();
+    const durationMs = performance.now() - startedAt;
+    results.push({ step: name, success: true, durationMs });
+    log(`✓ ${name} completed in ${(durationMs / 1000).toFixed(2)}s`);
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
-    results.push({ step: name, success: false, error: errorMsg });
+    results.push({
+      step: name,
+      success: false,
+      error: errorMsg,
+      durationMs: performance.now() - startedAt,
+    });
     error(`✗ ${name} failed: ${errorMsg}`);
     throw err;
   }
 }
 
 // Clean previous build artifacts
-step("Clean previous builds", () => {
+await step("Clean previous builds", () => {
   log("Removing old dist directories...");
 
   // Never clean PUBLISHED_DIR here. It is still serving the current UI while
@@ -215,72 +234,81 @@ step("Clean previous builds", () => {
 });
 
 // Build shared package (types/schemas)
-step("Build shared package", () => {
+await step("Build shared package", async () => {
   log("Building @yep-anywhere/shared (TypeScript compilation)...");
-  execStep("corepack pnpm --filter @yep-anywhere/shared build");
+  await execStep("corepack pnpm --filter @yep-anywhere/shared build");
 });
 
-// Build client
-step("Build client", () => {
-  // Vite's `base` is baked into asset URLs at build time. The server starts with
-  // BASE_PATH=/yep (see scripts/redeploy-server.sh) so the two must match;
-  // otherwise index.html references /assets/* while the server only serves
-  // /yep/assets/*, and the SPA fails to bootstrap. Honor an explicit BASE_PATH
-  // override but default to /yep to match the deployed Caddy route.
-  const clientBasePath = process.env.BASE_PATH ?? "/yep";
-  log(
-    `Building @yep-anywhere/client (Vite production build, BASE_PATH=${clientBasePath || "/"})...`,
-  );
-  execStep("corepack pnpm --filter @yep-anywhere/client build", undefined, {
-    BASE_PATH: clientBasePath,
-    YEP_BUILD_ID: BUILD_INFO.buildId,
-    YEP_BUILD_VERSION: BUILD_INFO.version,
-    YEP_BUILD_DATE: BUILD_INFO.builtAt,
-    YEP_BUILD_GIT_DESCRIBE: BUILD_INFO.gitDescribe ?? BUILD_INFO.version,
-    YEP_BUILD_PROFILE: BUILD_INFO.buildProfile,
-  });
-
-  // Verify client dist exists
-  if (!fs.existsSync(CLIENT_DIST)) {
-    throw new Error(
-      `Client dist not found at ${CLIENT_DIST} after build. Vite build may have failed.`,
+// Both depend on shared, but neither depends on the other. Wait for both
+// children even on failure so a retry cannot race a leftover compiler.
+const compilationResults = await Promise.allSettled([
+  step("Build client", async () => {
+    // Vite's `base` is baked into asset URLs at build time. The server starts with
+    // BASE_PATH=/yep (see scripts/redeploy-server.sh) so the two must match;
+    // otherwise index.html references /assets/* while the server only serves
+    // /yep/assets/*, and the SPA fails to bootstrap. Honor an explicit BASE_PATH
+    // override but default to /yep to match the deployed Caddy route.
+    const clientBasePath = process.env.BASE_PATH ?? "/yep";
+    log(
+      `Building @yep-anywhere/client (Vite production build, BASE_PATH=${clientBasePath || "/"})...`,
     );
-  }
-
-  const indexHtml = path.join(CLIENT_DIST, "index.html");
-  if (!fs.existsSync(indexHtml)) {
-    throw new Error(
-      "Client dist exists but index.html not found. Incomplete build?",
+    await execStep(
+      "corepack pnpm --filter @yep-anywhere/client build",
+      undefined,
+      {
+        BASE_PATH: clientBasePath,
+        YEP_BUILD_ID: BUILD_INFO.buildId,
+        YEP_BUILD_VERSION: BUILD_INFO.version,
+        YEP_BUILD_DATE: BUILD_INFO.builtAt,
+        YEP_BUILD_GIT_DESCRIBE: BUILD_INFO.gitDescribe ?? BUILD_INFO.version,
+        YEP_BUILD_PROFILE: BUILD_INFO.buildProfile,
+      },
     );
-  }
 
-  fs.writeFileSync(
-    path.join(CLIENT_DIST, "build-info.json"),
-    `${JSON.stringify(BUILD_INFO, null, 2)}\n`,
-  );
+    // Verify client dist exists
+    if (!fs.existsSync(CLIENT_DIST)) {
+      throw new Error(
+        `Client dist not found at ${CLIENT_DIST} after build. Vite build may have failed.`,
+      );
+    }
 
-  log(`  Client built successfully: ${path.relative(ROOT_DIR, CLIENT_DIST)}`);
-  log(`  Client build id: ${BUILD_INFO.buildId}`);
-});
+    const indexHtml = path.join(CLIENT_DIST, "index.html");
+    if (!fs.existsSync(indexHtml)) {
+      throw new Error(
+        "Client dist exists but index.html not found. Incomplete build?",
+      );
+    }
 
-// Build server
-step("Build server", () => {
-  log("Building @yep-anywhere/server (TypeScript compilation)...");
-  execStep("corepack pnpm --filter @yep-anywhere/server build");
-
-  // Verify server dist exists
-  const serverDist = path.join(SERVER_PACKAGE, "dist");
-  if (!fs.existsSync(serverDist)) {
-    throw new Error(
-      `Server dist not found at ${serverDist} after build. TypeScript compilation may have failed.`,
+    fs.writeFileSync(
+      path.join(CLIENT_DIST, "build-info.json"),
+      `${JSON.stringify(BUILD_INFO, null, 2)}\n`,
     );
-  }
 
-  log(`  Server built successfully: ${path.relative(ROOT_DIR, serverDist)}`);
-});
+    log(`  Client built successfully: ${path.relative(ROOT_DIR, CLIENT_DIST)}`);
+    log(`  Client build id: ${BUILD_INFO.buildId}`);
+  }),
+
+  step("Build server", async () => {
+    log("Building @yep-anywhere/server (TypeScript compilation)...");
+    await execStep("corepack pnpm --filter @yep-anywhere/server build");
+
+    // Verify server dist exists
+    const serverDist = path.join(SERVER_PACKAGE, "dist");
+    if (!fs.existsSync(serverDist)) {
+      throw new Error(
+        `Server dist not found at ${serverDist} after build. TypeScript compilation may have failed.`,
+      );
+    }
+
+    log(`  Server built successfully: ${path.relative(ROOT_DIR, serverDist)}`);
+  }),
+]);
+for (const result of compilationResults) {
+  if (result.status === "rejected") throw result.reason;
+}
 
 // Create staging directory structure
-step("Create staging directory", () => {
+await step("Create staging directory", () => {
   log(
     `Creating staging directory at ${path.relative(ROOT_DIR, STAGING_DIR)}...`,
   );
@@ -288,7 +316,7 @@ step("Create staging directory", () => {
 });
 
 // Write build metadata for the running server to expose through /api/version.
-step("Write build metadata", () => {
+await step("Write build metadata", () => {
   fs.writeFileSync(
     path.join(STAGING_DIR, "build-info.json"),
     `${JSON.stringify(BUILD_INFO, null, 2)}\n`,
@@ -300,7 +328,7 @@ step("Write build metadata", () => {
 });
 
 // Copy server dist to staging
-step("Copy server dist to staging", () => {
+await step("Copy server dist to staging", () => {
   const stagingDist = path.join(STAGING_DIR, "dist");
   log(`Copying server dist to ${path.relative(ROOT_DIR, stagingDist)}...`);
   copyRecursive(SERVER_DIST, stagingDist);
@@ -310,7 +338,7 @@ step("Copy server dist to staging", () => {
 // Rewrite @yep-anywhere/shared imports to relative paths into bundled/
 // This eliminates the need for a postinstall symlink, which fails with some
 // package managers (Volta) and on platforms with limited symlink support (WSL).
-step("Rewrite @yep-anywhere/shared imports", () => {
+await step("Rewrite @yep-anywhere/shared imports", () => {
   const stagingDist = path.join(STAGING_DIR, "dist");
   const sharedEntry = path.join(
     STAGING_DIR,
@@ -348,7 +376,7 @@ step("Rewrite @yep-anywhere/shared imports", () => {
 
 // Copy shared dist into staging (for @yep-anywhere/shared imports)
 // We put it in 'bundled/' instead of 'node_modules/' because npm ignores node_modules
-step("Bundle shared into staging", () => {
+await step("Bundle shared into staging", () => {
   const bundledSharedPath = path.join(
     STAGING_DIR,
     "bundled/@yep-anywhere/shared",
@@ -382,7 +410,7 @@ step("Bundle shared into staging", () => {
 });
 
 // Copy client dist into staging
-step("Bundle client into staging", () => {
+await step("Bundle client into staging", () => {
   const stagingClientDist = path.join(STAGING_DIR, "client-dist");
   log(
     `Copying client dist to ${path.relative(ROOT_DIR, stagingClientDist)}...`,
@@ -406,7 +434,7 @@ step("Bundle client into staging", () => {
 // Pi loads this extension explicitly for every Yep-owned RPC process. It is
 // bundled as data (not installed into ~/.pi), keeping user configuration
 // untouched while making packaged and source runs behave identically.
-step("Bundle Pi RPC extension", () => {
+await step("Bundle Pi RPC extension", () => {
   for (const resource of PI_EXTENSION_RESOURCES) {
     const source = path.join(SERVER_PACKAGE, resource);
     const destination = path.join(STAGING_DIR, resource);
@@ -419,7 +447,7 @@ step("Bundle Pi RPC extension", () => {
   log("  Pi RPC extension bundled into staging");
 });
 
-step("Bundle Yep Feishu MCP", () => {
+await step("Bundle Yep Feishu MCP", () => {
   fs.cpSync(
     path.join(SERVER_PACKAGE, "resources/feishu"),
     path.join(STAGING_DIR, "resources/feishu"),
@@ -428,7 +456,7 @@ step("Bundle Yep Feishu MCP", () => {
 });
 
 // Generate the bundle package.json in staging without modifying the workspace.
-step("Generate bundle package.json", () => {
+await step("Generate bundle package.json", () => {
   log("Generating bundle package.json...");
 
   const sourcePackageJsonPath = path.join(SERVER_PACKAGE, "package.json");
@@ -498,7 +526,7 @@ step("Generate bundle package.json", () => {
 });
 
 // Copy README to staging
-step("Copy README to staging", () => {
+await step("Copy README to staging", () => {
   const readmeSrc = path.join(ROOT_DIR, "README.md");
   const readmeDest = path.join(STAGING_DIR, "README.md");
 
@@ -546,7 +574,7 @@ MIT
 // Validate everything that the running service needs before the stable path is
 // changed. In particular, this catches a client build that omitted favicon
 // files or failed to add a fresh favicon URL.
-step("Validate staged bundle", () => {
+await step("Validate staged bundle", () => {
   const requiredFiles = [
     ...PI_EXTENSION_RESOURCES,
     "build-info.json",
@@ -642,7 +670,7 @@ step("Validate staged bundle", () => {
 
 // Only after every build and validation step succeeds do we expose the new
 // directory at the stable path. A failed rename restores the previous bundle.
-step("Publish staged bundle", () => {
+await step("Publish staged bundle", () => {
   // Re-check immediately before the destructive cutover. A long build gives
   // another process time to create or redirect the configured output path.
   resolveBundleOutputDirectory(ROOT_DIR, PUBLISHED_DIR);
@@ -676,7 +704,7 @@ log("=".repeat(60));
 
 for (const result of results) {
   const status = result.success ? "✓" : "✗";
-  log(`${status} ${result.step}`);
+  log(`${status} ${result.step} (${(result.durationMs / 1000).toFixed(2)}s)`);
   if (result.error) {
     log(`  Error: ${result.error}`);
   }
