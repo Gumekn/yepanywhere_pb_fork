@@ -3,10 +3,13 @@
 @import "./tool-rows.css";
 
 /* ==========================================================================
-   CSS Design Tokens - Claude Anywhere Multi-Theme Support
+   CSS Design Tokens - Yep Anywhere Themes
    ========================================================================== */
 
 :root {
+  /* Compatibility for components still using the previous canvas token. */
+  --bg-primary: var(--bg-surface);
+
   /* Brand Colors (theme-agnostic) */
   --app-yep-green: #059669;
   --app-yep-green-dark: #047857;
@@ -58,31 +61,32 @@
 }
 
 /* ==========================================================================
-   Theme: Very Dark (default - current black style)
+   Theme: Very Dark (deeper canvas with the same surface hierarchy)
    ========================================================================== */
 [data-theme="verydark"] {
   color-scheme: dark;
 
   /* Backgrounds */
-  --bg-surface: #181818;
-  --bg-secondary: #1f1f1f;
-  --bg-tertiary: #252525;
-  --bg-hover: #2a2d2e;
-  --bg-code: #1f1f1f;
-  --bg-input: #2a2a2a;
+  --bg-surface: #0f0f10;
+  --bg-sidebar: #151517;
+  --bg-secondary: #1b1b1c;
+  --bg-tertiary: #232324;
+  --bg-hover: #2c2c2e;
+  --bg-code: #151517;
+  --bg-input: #232324;
   --bg-overlay: rgba(0, 0, 0, 0.5);
-  --bg-user-message: #3a3a3a;
+  --bg-user-message: #232324;
 
   /* Text Colors */
-  --text-primary: #cccccc;
-  --text-secondary: #b8b8b8;
-  --text-muted: #9d9d9d;
-  --text-dimmed: #666666;
+  --text-primary: #f3f4f5;
+  --text-secondary: #cfd3d6;
+  --text-muted: #adb2b8;
+  --text-dimmed: #81858c;
 
   /* Border Colors */
-  --border-color: #3c3c3c;
-  --border-subtle: #333333;
-  --border-input: #444444;
+  --border-color: rgba(255, 255, 255, 0.1);
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-input: rgba(255, 255, 255, 0.16);
 
   /* Semantic Colors */
   --link-color: #4daafc;
@@ -100,11 +104,11 @@
   --timeline-dot-error: #c74e39;
   --timeline-dot-warning: #e1c08d;
   --timeline-dot-working: #d97757;
-  --timeline-line-color: #3c3c3c;
+  --timeline-line-color: var(--border-subtle);
 
   /* Status Colors */
-  --status-badge-idle-bg: #333333;
-  --status-badge-idle-text: #888888;
+  --status-badge-idle-bg: var(--bg-tertiary);
+  --status-badge-idle-text: var(--text-muted);
   --status-badge-owned-bg: #1a3a1a;
   --status-badge-owned-text: #44ff44;
   --status-badge-external-bg: #3a3a1a;
@@ -131,31 +135,33 @@
 }
 
 /* ==========================================================================
-   Theme: Dark (greyish like claude.ai)
+   Theme: Dark / Auto (cool charcoal canvas, elevated controls)
    ========================================================================== */
-[data-theme="dark"] {
+[data-theme="dark"],
+[data-theme="auto"] {
   color-scheme: dark;
 
-  /* Backgrounds - lighter greys */
-  --bg-surface: #2f2f2f;
-  --bg-secondary: #363636;
-  --bg-tertiary: #3d3d3d;
-  --bg-hover: #454545;
-  --bg-code: #292929;
-  --bg-input: #3a3a3a;
+  /* Surface roles keep navigation, content and controls distinct. */
+  --bg-surface: #151517;
+  --bg-sidebar: #1b1b1c;
+  --bg-secondary: #232324;
+  --bg-tertiary: #2c2c2e;
+  --bg-hover: #353638;
+  --bg-code: #1b1b1c;
+  --bg-input: #2c2c2e;
   --bg-overlay: rgba(0, 0, 0, 0.5);
-  --bg-user-message: #484848;
+  --bg-user-message: #2c2c2e;
 
-  /* Text Colors - slightly brighter */
-  --text-primary: #e0e0e0;
-  --text-secondary: #c0c0c0;
-  --text-muted: #a0a0a0;
-  --text-dimmed: #707070;
+  /* Bright body text; secondary information stays readable on raised surfaces. */
+  --text-primary: #f9fafb;
+  --text-secondary: #cfd3d6;
+  --text-muted: #adb2b8;
+  --text-dimmed: #81858c;
 
   /* Border Colors */
-  --border-color: #4a4a4a;
-  --border-subtle: #444444;
-  --border-input: #555555;
+  --border-color: rgba(255, 255, 255, 0.1);
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-input: rgba(255, 255, 255, 0.16);
 
   /* Semantic Colors */
   --link-color: #5db5ff;
@@ -173,11 +179,11 @@
   --timeline-dot-error: #e05545;
   --timeline-dot-warning: #ebd09d;
   --timeline-dot-working: #d97757;
-  --timeline-line-color: #4a4a4a;
+  --timeline-line-color: var(--border-subtle);
 
   /* Status Colors */
-  --status-badge-idle-bg: #444444;
-  --status-badge-idle-text: #999999;
+  --status-badge-idle-bg: var(--bg-tertiary);
+  --status-badge-idle-text: var(--text-muted);
   --status-badge-owned-bg: #2a4a2a;
   --status-badge-owned-text: #55ff55;
   --status-badge-external-bg: #4a4a2a;
@@ -211,6 +217,7 @@
 
   /* Backgrounds - warm ivory tones */
   --bg-surface: #faf9f5;
+  --bg-sidebar: #faf9f5;
   --bg-secondary: #f5f4f0;
   --bg-tertiary: #eeede8;
   --bg-hover: #e8e7e2;
@@ -276,80 +283,13 @@
   --shiki-token-inserted: #22863a;
 }
 
-/* ==========================================================================
-   Theme: Auto (follows system preference)
-   ========================================================================== */
-[data-theme="auto"] {
-  color-scheme: light dark;
-
-  /* Default to dark (greyish) */
-  --bg-surface: #2f2f2f;
-  --bg-secondary: #363636;
-  --bg-tertiary: #3d3d3d;
-  --bg-hover: #454545;
-  --bg-code: #292929;
-  --bg-input: #3a3a3a;
-  --bg-overlay: rgba(0, 0, 0, 0.5);
-  --bg-user-message: #484848;
-
-  --text-primary: #e0e0e0;
-  --text-secondary: #c0c0c0;
-  --text-muted: #a0a0a0;
-  --text-dimmed: #707070;
-
-  --border-color: #4a4a4a;
-  --border-subtle: #444444;
-  --border-input: #555555;
-
-  --link-color: #5db5ff;
-  --error-color: #e05545;
-  --success-color: #7dd39a;
-  --warning-color: #ebd09d;
-  --warning-badge-bg: #c2410c;
-  --attention-color: #5db5ff;
-  --focus-border: #007acc;
-  --primary-color: #60a5fa;
-
-  --timeline-dot-default: #a0a0a0;
-  --timeline-dot-tool: #7dd39a;
-  --timeline-dot-error: #e05545;
-  --timeline-dot-warning: #ebd09d;
-  --timeline-dot-working: #d97757;
-  --timeline-line-color: #4a4a4a;
-
-  --status-badge-idle-bg: #444444;
-  --status-badge-idle-text: #999999;
-  --status-badge-owned-bg: #2a4a2a;
-  --status-badge-owned-text: #55ff55;
-  --status-badge-external-bg: #4a4a2a;
-  --status-badge-external-text: #ffff55;
-  --status-badge-running-bg: #4a3a2a;
-  --status-badge-running-text: #ffbb55;
-  --status-badge-input-bg: #2a3a5a;
-  --status-badge-input-text: #77bbff;
-
-  /* Shiki Syntax Highlighting (GitHub Dark inspired) */
-  --shiki-foreground: #e1e4e8;
-  --shiki-background: transparent;
-  --shiki-token-constant: #79b8ff;
-  --shiki-token-string: #9ecbff;
-  --shiki-token-comment: #6a737d;
-  --shiki-token-keyword: #f97583;
-  --shiki-token-parameter: #ffab70;
-  --shiki-token-function: #b392f0;
-  --shiki-token-string-expression: #85e89d;
-  --shiki-token-punctuation: #e1e4e8;
-  --shiki-token-link: #79b8ff;
-  --shiki-token-deleted: #f97583;
-  --shiki-token-inserted: #85e89d;
-}
-
 /* Auto theme: light mode override */
 @media (prefers-color-scheme: light) {
   [data-theme="auto"] {
     color-scheme: light;
 
     --bg-surface: #faf9f5;
+    --bg-sidebar: #faf9f5;
     --bg-secondary: #f5f4f0;
     --bg-tertiary: #eeede8;
     --bg-hover: #e8e7e2;
@@ -1615,7 +1555,7 @@ h2 {
 
 .session-inspector {
   color: var(--text-secondary);
-  background: var(--bg-surface);
+  background: var(--bg-sidebar);
 }
 
 .session-inspector--sidebar {
@@ -2374,7 +2314,7 @@ h2 {
   bottom: 0;
   width: 280px;
   max-width: 85vw;
-  background: var(--bg-surface);
+  background: var(--bg-sidebar);
   border-right: 1px solid var(--border-color);
   z-index: 101;
   display: flex;
@@ -2563,14 +2503,14 @@ h2 {
   padding: 0.25rem;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
+  background: color-mix(in srgb, var(--bg-sidebar) 92%, transparent);
   backdrop-filter: blur(8px);
 }
 
 .sidebar-bulk-toolbar.is-active {
   justify-content: space-between;
   border-color: var(--border-subtle);
-  background: color-mix(in srgb, var(--bg-surface) 96%, transparent);
+  background: color-mix(in srgb, var(--bg-sidebar) 96%, transparent);
 }
 
 .sidebar-bulk-toolbar__count {
@@ -14238,7 +14178,7 @@ button.context-usage-indicator--button:focus-visible {
 }
 
 .theme-preview-auto {
-  background: linear-gradient(135deg, #faf9f5 50%, #2f2f2f 50%);
+  background: linear-gradient(135deg, #faf9f5 50%, #151517 50%);
 }
 
 .theme-preview-light {
@@ -14246,11 +14186,11 @@ button.context-usage-indicator--button:focus-visible {
 }
 
 .theme-preview-dark {
-  background: #2f2f2f;
+  background: #151517;
 }
 
 .theme-preview-verydark {
-  background: #181818;
+  background: #0f0f10;
 }
 
 .onboarding-theme-label {

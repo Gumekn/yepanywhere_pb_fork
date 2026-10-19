@@ -4,8 +4,8 @@
   "description": "Access your AI agents from anywhere",
   "start_url": ".",
   "display": "standalone",
-  "background_color": "#1f1f1f",
-  "theme_color": "#1f1f1f",
+  "background_color": "#151517",
+  "theme_color": "#151517",
   "icons": [
     {
       "src": "icon-192.png",
