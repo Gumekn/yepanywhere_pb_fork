@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { type RefObject, useEffect, useRef, useState } from "react";
 import { Outlet, useOutletContext, useParams } from "react-router-dom";
 import { Sidebar } from "../components/Sidebar";
 import { useMobileViewport } from "../hooks/useMobileViewport";
@@ -6,12 +6,15 @@ import { setRecentProjectId } from "../hooks/useRecentProject";
 import { useSidebarPreference } from "../hooks/useSidebarPreference";
 import { useSidebarWidth } from "../hooks/useSidebarWidth";
 import { useViewportWidth } from "../hooks/useViewportWidth";
+import type { CurlPageDraft } from "../lib/curlDraft";
 
 export interface NavigationLayoutContext {
   /** Open the mobile sidebar */
   openSidebar: () => void;
   /** Whether we're in desktop mode (wide screen) */
   isWideScreen: boolean;
+  /** Keep request edits across sidebar navigation, without persisting API keys in the browser. */
+  curlDraft?: RefObject<CurlPageDraft | undefined>;
 }
 
 /**
@@ -19,6 +22,7 @@ export interface NavigationLayoutContext {
  * Renders the Sidebar once so it persists across route changes.
  */
 export function NavigationLayout() {
+  const curlDraft = useRef<CurlPageDraft | undefined>(undefined);
   // Extract sessionId from URL for highlighting in sidebar (works for session pages)
   const { sessionId, projectId } = useParams<{
     sessionId?: string;
@@ -68,6 +72,7 @@ export function NavigationLayout() {
   const context: NavigationLayoutContext = {
     openSidebar: () => setSidebarOpen(true),
     isWideScreen,
+    curlDraft,
   };
 
   // CSS variable for sidebar width

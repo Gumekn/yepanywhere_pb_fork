@@ -976,6 +976,13 @@ export function Sidebar({
               basePath={basePath}
             />
             <SidebarNavItem
+              to="/curl"
+              icon={SidebarIcons.curl}
+              label={t("curlTitle")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
+            <SidebarNavItem
               to="/settings"
               icon={SidebarIcons.settings}
               label={t("sidebarSettings")}

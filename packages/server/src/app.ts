@@ -84,6 +84,7 @@ import {
   createDefaultCodexTranscriptStoreSources,
 } from "./routes/codex-transcript.js";
 import { createConnectionsRoutes } from "./routes/connections.js";
+import { createCurlRoutes } from "./routes/curl.js";
 import { createDebugStreamingRoutes } from "./routes/debug-streaming.js";
 import {
   createDeployRoutes,
@@ -1611,6 +1612,11 @@ export function createApp(options: AppOptions): AppResult {
         cursorReaderFactory,
       }),
     );
+  }
+
+  // cURL requests use the same auth and custom-header middleware as other APIs.
+  if (options.dataDir) {
+    app.route("/api/curl", createCurlRoutes(options.dataDir));
   }
 
   // Reports routes (report document listing, reading, and uploads)

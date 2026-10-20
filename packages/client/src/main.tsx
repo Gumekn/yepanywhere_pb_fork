@@ -93,6 +93,9 @@ const TerminalPage = lazy(() =>
 const DshPage = lazy(() =>
   import("./pages/DshPage").then((module) => ({ default: module.DshPage })),
 );
+const CurlPage = lazy(() =>
+  import("./pages/CurlPage").then((module) => ({ default: module.CurlPage })),
+);
 const SettingsLayout = lazy(() =>
   import("./pages/settings").then((module) => ({
     default: module.SettingsLayout,
@@ -144,6 +147,7 @@ createRoot(rootElement).render(
                   <Route path="/archive" element={<ArchivePage />} />
                   <Route path="/search" element={<SearchPage />} />
                   <Route path="/reports" element={<ReportsPage />} />
+                  <Route path="/curl" element={<CurlPage />} />
                   <Route path="/agents" element={<AgentsPage />} />
                   <Route path="/inbox" element={<InboxPage />} />
                   <Route path="/settings" element={<SettingsLayout />} />

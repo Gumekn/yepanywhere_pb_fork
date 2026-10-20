@@ -571,6 +571,14 @@ export async function fetchJSON<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
+  return (await fetchResponse(path, options)).json();
+}
+
+/** Authenticated fetch shared by JSON endpoints and incremental response readers. */
+export async function fetchResponse(
+  path: string,
+  options?: RequestInit,
+): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Yep-Anywhere": "true",
@@ -636,7 +644,7 @@ export async function fetchJSON<T>(
     throw error;
   }
 
-  return res.json();
+  return res;
 }
 
 // Re-export upload functions
