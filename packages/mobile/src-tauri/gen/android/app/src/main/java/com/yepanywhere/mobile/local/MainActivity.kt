@@ -93,21 +93,25 @@ class MainActivity : TauriActivity() {
     // the soft keyboard pans the whole window upward — which on edge-to-
     // edge looks like the page slides under the status bar.
     //
-    // Native layout owns the bottom safe area; static-shim only pads the top
-    // and sides. The cross-origin app iframe cannot supply the missing bottom
-    // inset. IME already includes the navigation bar, so use the larger inset
-    // without subtracting or adding the navigation bar height.
+    // Only the keyboard shortens the WebView. The gesture/navigation bar
+    // stays over the page so the app background and scrolling content
+    // continue through it. A contrast scrim would paint a second band
+    // behind that bar. The shim reads the remaining bottom inset and
+    // forwards it into the cross-origin app, which pads fixed controls.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      window.isNavigationBarContrastEnforced = false
+    }
     val rootView = findViewById<android.view.View>(android.R.id.content)
     ViewCompat.setOnApplyWindowInsetsListener(rootView) { view, insets ->
       val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-      val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-      val bottomInset = maxOf(ime.bottom, systemBars.bottom)
+      val bottomInset = ime.bottom
       view.setPadding(0, 0, 0, bottomInset)
-      // The child WebView now occupies a shorter area. Forward insets relative
-      // to that area, otherwise newer WebViews apply the same bottom IME/nav
-      // inset again. Keep top/side insets for the shim's safe-area padding and
-      // keep dispatching updates (including keyboard hide), rather than
-      // returning CONSUMED and leaving stale viewport/safe-area state behind.
+      // The child WebView now occupies a shorter area while the keyboard is
+      // open. Forward insets relative to that area, otherwise newer WebViews
+      // apply the same bottom IME inset again. Keep top/side insets for the
+      // shim's safe-area padding and keep the navigation-bar inset when the
+      // keyboard is closed. Keep dispatching updates (including keyboard
+      // hide), rather than returning CONSUMED and leaving stale state behind.
       insets.inset(0, 0, 0, bottomInset)
     }
     ViewCompat.requestApplyInsets(rootView)

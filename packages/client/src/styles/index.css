@@ -58,6 +58,13 @@
   /* New Session form column. Mobile-first 600px is intentionally narrow;
      the desktop layout widens it (see the wide-screen media query). */
   --new-session-content-max-width: 600px;
+
+  /* Gesture/navigation inset. Browsers and PWAs use the real env(); the
+     Android shell overrides this because the cross-origin iframe cannot.
+     The reported inset is taller than the pill, so fixed controls only
+     keep a short clearance and the rest of the band stays in the page. */
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-bottom-clearance: min(1rem, var(--safe-area-bottom));
 }
 
 /* ==========================================================================
@@ -2240,7 +2247,7 @@ h2 {
 
 .session-inspector--drawer .session-inspector-content {
   overflow-y: auto;
-  padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+  padding-bottom: max(var(--space-3), var(--safe-area-bottom-clearance));
 }
 
 .session-inspector-tabs {
@@ -2321,7 +2328,7 @@ h2 {
   flex-direction: column;
   animation: slideIn 0.2s ease-out;
   padding-top: env(safe-area-inset-top, 0px);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-bottom: var(--safe-area-bottom-clearance);
 }
 
 @keyframes slideIn {
@@ -3651,6 +3658,23 @@ a.sidebar-nav-item {
   -webkit-overflow-scrolling: touch;
 }
 
+/* Scroll spacer, not a pinned inset: content can pass behind the gesture bar,
+   and the last item can still be scrolled clear of it. */
+.page-scroll-container::after,
+.curl-layout::after,
+.file-viewer-code::after {
+  content: "";
+  display: block;
+  height: var(--safe-area-bottom-clearance);
+  min-height: 0;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+.curl-layout::after {
+  grid-column: 1 / -1;
+}
+
 .page-content-inner {
   padding: 1rem;
 }
@@ -3658,6 +3682,7 @@ a.sidebar-nav-item {
 .session-input {
   flex-shrink: 0; /* Never shrink the input area */
   padding: 0.75rem 1rem;
+  padding-bottom: max(0.75rem, var(--safe-area-bottom-clearance));
   background: var(--bg-surface);
 }
 
@@ -3745,6 +3770,7 @@ a.sidebar-nav-item {
 
   .session-input {
     padding: 0.5rem 0.375rem;
+    padding-bottom: max(0.375rem, var(--safe-area-bottom-clearance));
   }
 }
 
@@ -3759,10 +3785,10 @@ a.sidebar-nav-item {
     left: 0;
     right: 0;
     bottom: 0;
-    /* Safe area insets for Tauri mobile (edge-to-edge) — keeps dark bg behind
-       status bar / nav bar while pushing content inside the safe area */
+    /* Top inset covers PWA status bars. The bottom gesture area stays inside
+       the page: scrolling content runs through it, and fixed bars pad themselves. */
     padding-top: env(safe-area-inset-top, 0px);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-bottom: 0;
   }
 
   .main-content-mobile,
@@ -4892,7 +4918,7 @@ a.sidebar-nav-item {
   overflow-y: auto;
   animation: slideUp 0.2s ease-out;
   box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.3);
-  padding-bottom: env(safe-area-inset-bottom, 0);
+  padding-bottom: var(--safe-area-bottom-clearance);
 }
 
 @keyframes slideUp {
@@ -5401,7 +5427,7 @@ a.sidebar-nav-item {
   flex-direction: column;
   gap: 6px;
   padding: 8px;
-  padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+  padding-bottom: max(8px, var(--safe-area-bottom-clearance));
   background: #151515;
   border-top: 1px solid #2a2a2a;
   -webkit-user-select: none;
@@ -5529,7 +5555,7 @@ a.sidebar-nav-item {
   .terminal-mobile-controls {
     gap: 5px;
     padding: 6px;
-    padding-bottom: max(6px, env(safe-area-inset-bottom, 0px));
+    padding-bottom: max(6px, var(--safe-area-bottom-clearance));
   }
 
   .terminal-key-row {
@@ -9110,7 +9136,7 @@ a.sidebar-nav-item {
   justify-content: space-between;
   gap: var(--space-2);
   padding: var(--space-3) var(--space-4);
-  padding-bottom: max(var(--space-3), env(safe-area-inset-bottom, 0px));
+  padding-bottom: max(var(--space-3), var(--safe-area-bottom-clearance));
   background: var(--bg-surface);
   border-top: 1px solid var(--border-color);
   box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.1);
@@ -13707,7 +13733,7 @@ button.context-usage-indicator--button:focus-visible {
   overflow-y: auto;
   animation: filterSlideUp 0.2s ease-out;
   box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.3);
-  padding-bottom: env(safe-area-inset-bottom, 0);
+  padding-bottom: var(--safe-area-bottom-clearance);
 }
 
 @keyframes filterSlideUp {

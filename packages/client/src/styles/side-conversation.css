@@ -31,7 +31,7 @@
   width: 100%;
   z-index: 100;
   padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
+  padding-bottom: 0;
   box-sizing: border-box;
 }
 .side-conversation-header,
@@ -129,6 +129,7 @@
 }
 .side-conversation-composer {
   padding: var(--space-3);
+  padding-bottom: max(var(--space-3), var(--safe-area-bottom-clearance, 0px));
   border-top: 1px solid var(--border-color);
 }
 .side-conversation-composer textarea {

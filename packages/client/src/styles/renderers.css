@@ -2830,7 +2830,7 @@ body.detail-panel-resizing {
 
   .modal-content {
     padding: 0;
-    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-bottom: var(--safe-area-bottom-clearance);
     /* Defensive background so any momentary render glitch doesn't show
        through to the overlay underneath. */
     background: var(--bg-surface);

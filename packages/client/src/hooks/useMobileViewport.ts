@@ -1,5 +1,38 @@
 import { useLayoutEffect } from "react";
 
+const SAFE_AREA_MESSAGE = "yep-anywhere:mobile-shell-safe-area";
+const GET_SAFE_AREA_MESSAGE = "yep-anywhere:mobile-shell-get-safe-area";
+
+/**
+ * The Android shell owns env(safe-area-inset-bottom); the cross-origin app
+ * does not. Apply the forwarded inset so fixed controls clear the gesture
+ * bar while page backgrounds continue behind it.
+ */
+export function installMobileSafeAreaInset(): () => void {
+  const root = document.documentElement;
+
+  const apply = (bottom: number) => {
+    if (!Number.isFinite(bottom) || bottom < 0) return;
+    root.style.setProperty("--safe-area-bottom", `${Math.round(bottom)}px`);
+  };
+
+  const onMessage = (event: MessageEvent) => {
+    const data = event.data as { type?: unknown; bottom?: unknown } | null;
+    if (!data || data.type !== SAFE_AREA_MESSAGE) return;
+    if (typeof data.bottom !== "number") return;
+    apply(data.bottom);
+  };
+
+  window.addEventListener("message", onMessage);
+  if (window.parent !== window) {
+    window.parent.postMessage({ type: GET_SAFE_AREA_MESSAGE }, "*");
+  }
+
+  return () => {
+    window.removeEventListener("message", onMessage);
+  };
+}
+
 /** Lock only the navigation document; nested message lists and inputs still scroll. */
 export function useMobileViewport(enabled: boolean) {
   useLayoutEffect(() => {

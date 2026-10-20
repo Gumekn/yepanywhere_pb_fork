@@ -1,6 +1,9 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useMobileViewport } from "../useMobileViewport";
+import {
+  installMobileSafeAreaInset,
+  useMobileViewport,
+} from "../useMobileViewport";
 
 describe("useMobileViewport", () => {
   let viewport: EventTarget & {
@@ -68,6 +71,32 @@ describe("useMobileViewport", () => {
     expect(
       document.documentElement.style.getPropertyValue("--app-viewport-height"),
     ).toBe("");
+  });
+
+  it("applies the shell gesture inset and ignores unrelated messages", () => {
+    const restore = installMobileSafeAreaInset();
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          data: { type: "yep-anywhere:mobile-shell-safe-area", bottom: 34.6 },
+        }),
+      );
+    });
+    expect(
+      document.documentElement.style.getPropertyValue("--safe-area-bottom"),
+    ).toBe("35px");
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          data: { type: "other", bottom: 8 },
+        }),
+      );
+    });
+    expect(
+      document.documentElement.style.getPropertyValue("--safe-area-bottom"),
+    ).toBe("35px");
+    restore();
+    document.documentElement.style.removeProperty("--safe-area-bottom");
   });
 
   it("uses the resized window without VisualViewport and ignores pinch reflow", () => {

@@ -120,9 +120,10 @@
          to the top-level document (this shim), NOT to cross-origin iframes, so
          the app inside cannot pad itself. We inset only the TOP (status bar)
          here in the shell and paint that strip with the embedded app's current
-         theme so it blends with the UI. MainActivity handles the full bottom
-         inset (keyboard or navigation bar) by resizing the native content area;
-         do not add bottom padding here, which would count that inset twice. */
+         theme so it blends with the UI. The bottom gesture bar stays over the
+         page: viewport.js forwards safe-area-inset-bottom into the iframe.
+         MainActivity shortens the WebView only while the keyboard is open.
+         Do not add bottom padding here, which would bring back an empty band. */
       body {
         position: fixed;
         top: var(--shell-viewport-top, 0px);

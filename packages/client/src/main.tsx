@@ -14,6 +14,7 @@ import {
 import { App } from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { initializeFontSize } from "./hooks/useFontSize";
+import { installMobileSafeAreaInset } from "./hooks/useMobileViewport";
 import { initializeTabSize } from "./hooks/useTabSize";
 import { initializeTheme } from "./hooks/useTheme";
 import { I18nProvider } from "./i18n";
@@ -111,6 +112,7 @@ function LegacyDeviceRedirect() {
 initializeTheme();
 initializeFontSize();
 initializeTabSize();
+installMobileSafeAreaInset();
 
 // SSE activity stream connection is managed by useActivityBusConnection hook
 // in App.tsx, which connects only when authenticated (or auth is disabled)
