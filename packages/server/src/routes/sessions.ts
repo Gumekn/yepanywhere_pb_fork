@@ -115,6 +115,7 @@ import { locateSession } from "../sessions/session-locator.js";
 import {
   deriveSessionRuntime,
   pendingInputTypeFromProcess,
+  pendingInputTypeFromRequest,
 } from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
 import { isUserPromptMessage } from "../sessions/user-prompt-message.js";
@@ -2394,11 +2395,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         : null;
     const pendingInputRequest =
       activePendingInputRequest ?? persistedPendingInputRequest;
-    const pendingInputType = pendingInputRequest
-      ? pendingInputRequest.type === "tool-approval"
-        ? "tool-approval"
-        : "user-question"
-      : livePendingInputType;
+    const pendingInputType =
+      pendingInputTypeFromRequest(pendingInputRequest) ?? livePendingInputType;
 
     // Override context usage with SDK-reported context window from live process
     // The reader uses hardcoded defaults; the process captures the real value at runtime

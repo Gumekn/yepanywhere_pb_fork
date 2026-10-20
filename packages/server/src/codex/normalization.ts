@@ -1,18 +1,14 @@
 import {
+  SHARED_RENDERER_TOOL_ALIASES,
   extractBashCommandFromInput,
+  lookupToolAlias,
   tokenizeShellCommand,
   unwrapShellLauncherCommand,
 } from "@yep-anywhere/shared";
 
 const CODEX_TOOL_NAME_ALIASES: Record<string, string> = {
+  ...SHARED_RENDERER_TOOL_ALIASES,
   exec: "CodexExec",
-  shell_command: "Bash",
-  exec_command: "Bash",
-  write_stdin: "WriteStdin",
-  update_plan: "UpdatePlan",
-  apply_patch: "Edit",
-  web_search_call: "WebSearch",
-  search_query: "WebSearch",
 };
 
 export interface CodexReadShellInfo {
@@ -423,11 +419,7 @@ export function canonicalizeCodexToolName(
   if (namespace) {
     return `${namespace}${name}`;
   }
-  return (
-    CODEX_TOOL_NAME_ALIASES[name] ??
-    CODEX_TOOL_NAME_ALIASES[name.toLowerCase()] ??
-    name
-  );
+  return lookupToolAlias(CODEX_TOOL_NAME_ALIASES, name);
 }
 
 interface CodexWebRunAction {

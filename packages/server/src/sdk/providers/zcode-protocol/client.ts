@@ -16,7 +16,7 @@
  *   - Spawn a ZCode `app-server` child process and wire stdio handlers.
  *   - Line-buffer stdout and dispatch each complete JSON line as one of:
  *       1. Response to our request (resolve pending promise).
- *       2. Server notification (enqueue onto `AsyncQueue`).
+ *       2. Server notification (enqueue onto the shared `AsyncQueue`).
  *       3. Server-to-client request (call registered handler, send response).
  *   - Bounded + plaintext stderr tail.
  *   - Per-request timeout, graceful close, and process-exit rejection of all
@@ -35,6 +35,7 @@ import type {
 import type { ZCodeErrorCode } from "@yep-anywhere/shared";
 
 import { getLogger } from "../../../logging/logger.js";
+import { AsyncQueue } from "../../../utils/async-queue.js";
 import type {
   ZCodePendingRequest,
   ZCodeProtocolClientConfig,
@@ -47,75 +48,6 @@ const log = getLogger().child({ component: "zcode-protocol-client" });
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_STDERR_BOUND = 64 * 1024; // 64 KiB
 const SHUTDOWN_GRACE_MS = 1_500;
-
-// =============================================================================
-// AsyncQueue — minimal notification buffer (AbortSignal-aware)
-// =============================================================================
-
-class AsyncQueue<T> {
-  private items: T[] = [];
-  private waiters: Array<{
-    resolve: (value: T) => void;
-    reject: (error: Error) => void;
-    signal?: AbortSignal;
-    onAbort?: () => void;
-  }> = [];
-  private closedError: Error | null = null;
-
-  push(item: T): void {
-    if (this.closedError) return;
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      if (waiter.signal && waiter.onAbort) {
-        waiter.signal.removeEventListener("abort", waiter.onAbort);
-      }
-      waiter.resolve(item);
-      return;
-    }
-    this.items.push(item);
-  }
-
-  close(error?: Error): void {
-    if (this.closedError) return;
-    this.closedError = error ?? new Error("Queue closed");
-    for (const waiter of this.waiters) {
-      if (waiter.signal && waiter.onAbort) {
-        waiter.signal.removeEventListener("abort", waiter.onAbort);
-      }
-      waiter.reject(this.closedError);
-    }
-    this.waiters = [];
-    this.items = [];
-  }
-
-  async shift(signal?: AbortSignal): Promise<T> {
-    if (this.items.length > 0) {
-      const item = this.items.shift();
-      if (item === undefined) throw new Error("Queue underflow");
-      return item;
-    }
-    if (this.closedError) throw this.closedError;
-
-    return await new Promise<T>((resolve, reject) => {
-      const waiter: {
-        resolve: (value: T) => void;
-        reject: (error: Error) => void;
-        signal?: AbortSignal;
-        onAbort?: () => void;
-      } = { resolve, reject, signal };
-
-      if (signal) {
-        const onAbort = () => {
-          this.waiters = this.waiters.filter((w) => w !== waiter);
-          reject(new Error("Operation aborted"));
-        };
-        waiter.onAbort = onAbort;
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-      this.waiters.push(waiter);
-    });
-  }
-}
 
 // =============================================================================
 // ZCodeProtocolClient

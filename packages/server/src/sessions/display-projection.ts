@@ -14,6 +14,8 @@ import {
   type SessionDisplayUserContent,
   type SessionQuestionPage,
   SessionQuestionPageSchema,
+  nonEmptyMessageId,
+  normalizeToolName,
 } from "@yep-anywhere/shared";
 import type { Message } from "../supervisor/types.js";
 import { isSyntheticUserPromptText } from "./user-prompt-classification.js";
@@ -757,9 +759,7 @@ function getMessageContent(message: Message): unknown {
 }
 
 function getMessageId(message: Message, index: number): string {
-  if (typeof message.uuid === "string" && message.uuid) return message.uuid;
-  if (typeof message.id === "string" && message.id) return message.id;
-  return `message:${index}`;
+  return nonEmptyMessageId(message) ?? `message:${index}`;
 }
 
 function projectUserMessageIdentity(message: Message): {
@@ -950,7 +950,7 @@ function projectSilentWaitKey(
   input: unknown,
   result: ToolResultSummary | undefined,
 ): { silentWaitKey?: string } {
-  const normalized = normalizedToolName(name);
+  const normalized = normalizeToolName(name);
   if (normalized !== "wait" && normalized !== "codexwait") return {};
   if (result && !result.isSilentWaitResult) return {};
   const inputRecord = isRecord(input) ? input : {};
@@ -1007,21 +1007,17 @@ function summarizeToolGroupStatus(
       : "running";
 }
 
-function normalizedToolName(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
 function isMutatingFileTool(name: string): boolean {
-  return MUTATING_FILE_TOOLS.has(normalizedToolName(name));
+  return MUTATING_FILE_TOOLS.has(normalizeToolName(name));
 }
 
 function isQuestionTool(name: string): boolean {
-  const normalized = normalizedToolName(name);
+  const normalized = normalizeToolName(name);
   return normalized === "question" || normalized === "askuserquestion";
 }
 
 function isPlanProgressTool(tool: ToolProjectionItem): boolean {
-  const normalized = normalizedToolName(tool.name);
+  const normalized = normalizeToolName(tool.name);
   if (normalized === "updateplan" || normalized === "todowrite") return true;
   return (
     normalized === "todolist" &&

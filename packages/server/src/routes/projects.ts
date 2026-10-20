@@ -34,6 +34,7 @@ import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { listSessionsAcrossProviders } from "../sessions/provider-resolution.js";
+import { pendingInputTypeFromRequest } from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
 import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
@@ -163,11 +164,7 @@ async function loadOwnedProcessViews(
         modeVersion: process.modeVersion,
         provider: process.provider,
         state: process.state,
-        pendingInputType: pendingRequest
-          ? pendingRequest.type === "tool-approval"
-            ? "tool-approval"
-            : "user-question"
-          : undefined,
+        pendingInputType: pendingInputTypeFromRequest(pendingRequest),
       };
     });
   }
@@ -183,11 +180,7 @@ async function loadOwnedProcessViews(
       modeVersion: process.modeVersion,
       provider: process.provider,
       state: process.state.type,
-      pendingInputType: pendingRequest
-        ? pendingRequest.type === "tool-approval"
-          ? "tool-approval"
-          : "user-question"
-        : undefined,
+      pendingInputType: pendingInputTypeFromRequest(pendingRequest),
     };
   });
 }

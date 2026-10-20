@@ -13,6 +13,12 @@ export {
   parseOpenedFiles,
   getFilename,
 } from "./ideMetadata.js";
+export { nonEmptyMessageId, stringMessageId } from "./message-id.js";
+export type { MessageIdentitySource } from "./message-id.js";
+export {
+  SHARED_RENDERER_TOOL_ALIASES,
+  lookupToolAlias,
+} from "./tool-name-aliases.js";
 
 export {
   FeishuAccountConfigSchema,

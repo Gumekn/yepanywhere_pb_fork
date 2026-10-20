@@ -1,6 +1,7 @@
 import { getSessionArchiveBlock } from "@yep-anywhere/shared";
 import type {
   AgentActivity,
+  PendingInputType,
   SessionRetryStatus,
   SessionRuntime,
 } from "@yep-anywhere/shared";
@@ -90,13 +91,19 @@ export function deriveSessionRuntime({
   };
 }
 
-export function pendingInputTypeFromProcess(
-  process: SessionRuntimeProcess | undefined | null,
-): "tool-approval" | "user-question" | undefined {
-  const request =
-    process?.pendingInputRequest ?? process?.getPendingInputRequest?.() ?? null;
+export function pendingInputTypeFromRequest(
+  request: { type: string } | null | undefined,
+): PendingInputType | undefined {
   if (!request) return undefined;
   return request.type === "tool-approval" ? "tool-approval" : "user-question";
+}
+
+export function pendingInputTypeFromProcess(
+  process: SessionRuntimeProcess | undefined | null,
+): PendingInputType | undefined {
+  const request =
+    process?.pendingInputRequest ?? process?.getPendingInputRequest?.() ?? null;
+  return pendingInputTypeFromRequest(request);
 }
 
 /** Request id of the pending input, for notification action round-trips. */

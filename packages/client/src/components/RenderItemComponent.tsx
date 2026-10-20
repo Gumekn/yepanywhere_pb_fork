@@ -1,3 +1,4 @@
+import { nonEmptyMessageId } from "@yep-anywhere/shared";
 import { memo, useCallback } from "react";
 import { useOptionalI18n } from "../i18n";
 import { getMessageId } from "../lib/mergeMessages";
@@ -29,13 +30,7 @@ interface Props {
 }
 
 function getMessageIdLike(message: Record<string, unknown>): string {
-  if (typeof message.uuid === "string" && message.uuid.length > 0) {
-    return message.uuid;
-  }
-  if (typeof message.id === "string" && message.id.length > 0) {
-    return message.id;
-  }
-  return "<missing>";
+  return nonEmptyMessageId(message) ?? "<missing>";
 }
 
 function summarizeSourceMessages(messages: RenderItem["sourceMessages"]) {

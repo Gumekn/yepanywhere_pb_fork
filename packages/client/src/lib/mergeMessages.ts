@@ -1,4 +1,4 @@
-import { orderByParentChain } from "@yep-anywhere/shared";
+import { nonEmptyMessageId, orderByParentChain } from "@yep-anywhere/shared";
 import type { ContentBlock, Message } from "../types";
 
 /**
@@ -10,12 +10,8 @@ const missingMessageIds = new WeakMap<Message, string>();
 let nextMissingMessageId = 0;
 
 export function getMessageId(m: Message): string {
-  if (typeof m.uuid === "string" && m.uuid.length > 0) {
-    return m.uuid;
-  }
-  if (typeof m.id === "string" && m.id.length > 0) {
-    return m.id;
-  }
+  const id = nonEmptyMessageId(m);
+  if (id) return id;
 
   let fallback = missingMessageIds.get(m);
   if (!fallback) {

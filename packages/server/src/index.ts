@@ -90,6 +90,7 @@ import {
 import { CURSOR_ACP_SESSIONS_DIR } from "./sessions/cursor-reader.js";
 import { PI_SESSIONS_DIR } from "./sessions/pi-files.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
+import { pendingInputTypeFromRequest } from "./sessions/session-runtime.js";
 import { ZCODE_DB_PATH } from "./sessions/zcode-db.js";
 import { TerminalService } from "./terminal/TerminalService.js";
 import { UploadManager } from "./uploads/manager.js";
@@ -981,11 +982,9 @@ async function startServer() {
         sessionId: process.sessionId,
         projectId: process.projectId,
         activity: process.state,
-        pendingInputType: process.pendingInputRequest
-          ? process.pendingInputRequest.type === "tool-approval"
-            ? "tool-approval"
-            : "user-question"
-          : undefined,
+        pendingInputType: pendingInputTypeFromRequest(
+          process.pendingInputRequest,
+        ),
         timestamp: new Date().toISOString(),
       });
     }

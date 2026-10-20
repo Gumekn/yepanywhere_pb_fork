@@ -1,3 +1,4 @@
+import { normalizeToolName } from "@yep-anywhere/shared";
 import type { ContentBlock, Message } from "../supervisor/types.js";
 import { isUserPromptMessage } from "./user-prompt-message.js";
 
@@ -449,10 +450,6 @@ function getMessageId(message: Message, index: number): string {
     message.uuid ??
     (typeof message.id === "string" ? message.id : `message:${index}`)
   );
-}
-
-function normalizeToolName(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function boundedOptionalString(

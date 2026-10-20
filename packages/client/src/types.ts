@@ -87,7 +87,7 @@ export type ContentBlock = AppContentBlock;
  *
  * This is a flexible structural type compatible with AppMessage entries.
  * Messages should have at least one of `uuid` or `id` for identification.
- * Use getMessageId(m) helper which returns `uuid ?? id` for lookups.
+ * Use getMessageId(m): non-empty uuid, then non-empty id, then a local fallback.
  *
  * Key fields:
  * - uuid: SDK message identifier (primary identifier)

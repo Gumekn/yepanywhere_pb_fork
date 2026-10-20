@@ -24,6 +24,7 @@ import { getAllProviders, getProvider } from "../sdk/providers/index.js";
 import { isProviderEnabled } from "../sdk/providers/policy.js";
 import type { AgentProvider } from "../sdk/providers/types.js";
 import type { ClaudeSDK, PermissionMode, UserMessage } from "../sdk/types.js";
+import { pendingInputTypeFromRequest } from "../sessions/session-runtime.js";
 import type {
   EventBus,
   ProcessStateEvent,
@@ -1475,13 +1476,10 @@ export class Supervisor {
       initialState.type === "in-turn" ||
       initialState.type === "waiting-input"
     ) {
-      // Convert InputRequest.type to PendingInputType if waiting for input at start
-      let pendingInputType: PendingInputType | undefined;
-      if (initialState.type === "waiting-input") {
-        const requestType = initialState.request.type;
-        pendingInputType =
-          requestType === "tool-approval" ? "tool-approval" : "user-question";
-      }
+      const pendingInputType =
+        initialState.type === "waiting-input"
+          ? pendingInputTypeFromRequest(initialState.request)
+          : undefined;
       this.emitAgentActivityChange(
         process.sessionId,
         process.projectId,
@@ -1618,16 +1616,10 @@ export class Supervisor {
           event.state.type === "hold" ||
           event.state.type === "terminated"
         ) {
-          // Convert InputRequest.type to PendingInputType when waiting for input
-          // "tool-approval" stays as-is, "question" or "choice" becomes "user-question"
-          let pendingInputType: PendingInputType | undefined;
-          if (event.state.type === "waiting-input") {
-            const requestType = event.state.request.type;
-            pendingInputType =
-              requestType === "tool-approval"
-                ? "tool-approval"
-                : "user-question";
-          }
+          const pendingInputType =
+            event.state.type === "waiting-input"
+              ? pendingInputTypeFromRequest(event.state.request)
+              : undefined;
           this.emitAgentActivityChange(
             process.sessionId,
             process.projectId,
