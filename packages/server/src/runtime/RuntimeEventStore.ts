@@ -219,17 +219,28 @@ export class RuntimeEventStore {
   }
 
   async replay(options: RuntimeReplayOptions): Promise<RuntimeEventRecord[]> {
+    if (
+      options.allProcesses &&
+      (!options.sessionId ||
+        options.processId !== undefined ||
+        options.afterSeq !== undefined)
+    )
+      throw new Error(
+        "Session history replay requires sessionId without processId or afterSeq",
+      );
     await this.initialize();
     const processId =
       options.processId ??
-      (options.sessionId
+      (options.sessionId && !options.allProcesses
         ? await this.findLatestProcessIdForSession(options.sessionId)
         : undefined);
-    const processIds = processId
-      ? [processId]
-      : options.sessionId
-        ? []
-        : await this.findProcessIdsForSession(undefined);
+    const processIds = options.allProcesses
+      ? await this.findProcessIdsForSession(options.sessionId)
+      : processId
+        ? [processId]
+        : options.sessionId
+          ? []
+          : await this.findProcessIdsForSession(undefined);
     const records = (
       await Promise.all(
         processIds.map(async (id) => [

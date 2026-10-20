@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { SideConversationRequestSchema } from "@yep-anywhere/shared";
 import { type Context, Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { pendingInputTypeFromRequest } from "../sessions/session-runtime.js";
 import type {
   CreateRuntimeSessionRequest,
   QueueRuntimeMessageRequest,
@@ -333,6 +334,9 @@ export function createRuntimeControlApp(
         processId: c.req.query("processId"),
         sessionId: c.req.query("sessionId"),
         afterSeq: afterSeq ? Number.parseInt(afterSeq, 10) : undefined,
+        ...(c.req.query("allProcesses") === "true"
+          ? { allProcesses: true }
+          : {}),
       }),
     });
   });
@@ -413,11 +417,9 @@ export function createRuntimeControlApp(
               sessionId: process.sessionId,
               projectId: process.projectId,
               activity: process.state,
-              pendingInputType: process.pendingInputRequest
-                ? process.pendingInputRequest.type === "tool-approval"
-                  ? "tool-approval"
-                  : "user-question"
-                : undefined,
+              pendingInputType: pendingInputTypeFromRequest(
+                process.pendingInputRequest,
+              ),
               retryStatus: process.retryStatus,
               timestamp,
             });

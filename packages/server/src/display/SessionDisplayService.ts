@@ -560,23 +560,41 @@ export class SessionDisplayService {
       );
     }
     await this.refresh(entry, true);
+    await this.recoverCursorHistory(entry);
+    this.poll(entry);
+    this.expire(entry);
+  }
+
+  private async recoverCursorHistory(entry: Entry): Promise<void> {
     if (
       entry.provider === "cursor" &&
       !entry.selection.branchId &&
       this.options.runtime.replay
     ) {
       try {
+        const records = await this.options.runtime.replay({
+          sessionId: entry.selection.sessionId,
+          allProcesses: true,
+        });
+        // Recover thoughts across generations, but keep runtime outcome replay
+        // scoped as before: an old failed process cannot fail a resumed turn.
         const process = await this.options.runtime.getProcessForSession(
           entry.selection.sessionId,
         );
-        const records = await this.options.runtime.replay({
-          sessionId: entry.selection.sessionId,
-          ...(process ? { processId: process.id } : {}),
-        });
+        const outcomeProcessId = process?.id ?? records.at(-1)?.processId;
         const failures = new Map<unknown, RecordValue>();
         const terminals = new Map<unknown, RecordValue>();
         const thoughts = new Map<string, RecordValue>();
         const pendingThoughts: RecordValue[] = [];
+        // Reuse lifecycle pairing on timing-only messages. Replaying whole
+        // tools here would replace native names/results and disturb grouping.
+        const toolTimings = new SessionDisplayReducer(entry.view, "cursor");
+        // Bind to the streamed message identity, then keep its text current.
+        // The first chunk may be just "底部", too short to match native history.
+        const anchors = new Map<
+          string,
+          { sourceId: string; text?: string; toolId?: string }
+        >();
         for (const record of records) {
           if (
             record.type !== "message" ||
@@ -585,7 +603,45 @@ export class SessionDisplayService {
             continue;
           const message = asRecord(record.data);
           if (!message) continue;
+          const content = messageContent(message);
+          if (Array.isArray(content)) {
+            const tools = content.flatMap<RecordValue>((value) => {
+              const block = asRecord(value);
+              if (block?.type === "tool_use" && typeof block.id === "string")
+                return [{ type: "tool_use", id: block.id }];
+              if (
+                block?.type === "tool_result" &&
+                typeof block.tool_use_id === "string"
+              )
+                return [
+                  {
+                    type: "tool_result",
+                    tool_use_id: block.tool_use_id,
+                    durationMs: block.durationMs,
+                  },
+                ];
+              return [];
+            });
+            if (tools.length)
+              toolTimings.message(
+                {
+                  ...message,
+                  timestamp: message.timestamp ?? record.timestamp,
+                  message: {
+                    role: asRecord(message.message)?.role ?? message.type,
+                    content: tools,
+                  },
+                },
+                true,
+              );
+          }
           this.rememberBody(entry, message);
+          if (isCursorUserPrompt(message) || message.type === "result") {
+            for (const thought of pendingThoughts) {
+              thought.cursorThinkingBefore ??= { fallback: true };
+            }
+            pendingThoughts.length = 0;
+          }
           if (
             isCursorThinkingOnly(message) &&
             typeof message.uuid === "string"
@@ -606,13 +662,27 @@ export class SessionDisplayService {
           } else {
             const anchor = cursorThinkingAnchor(message);
             if (anchor) {
+              const sourceId = message.uuid ?? message.id;
+              let bound = anchor;
+              if (typeof sourceId === "string") {
+                const existing = anchors.get(sourceId);
+                const current = existing ?? { sourceId };
+                Object.assign(current, anchor);
+                anchors.set(sourceId, current);
+                bound = current;
+              }
               for (const thought of pendingThoughts) {
-                if (thought.cursorThinkingBefore === undefined)
-                  thought.cursorThinkingBefore = anchor;
+                if (
+                  thought.cursorThinkingBefore === undefined &&
+                  thought.turnId === message.turnId
+                )
+                  thought.cursorThinkingBefore = bound;
               }
               pendingThoughts.length = 0;
             }
           }
+          if (record.processId && record.processId !== outcomeProcessId)
+            continue;
           const failure = cursorStreamError(messageContent(message));
           if (failure || message.type === "error")
             failures.set(message.turnId, {
@@ -660,14 +730,14 @@ export class SessionDisplayService {
         }
         // Thoughts already on screen were appended before this journal pass
         // could see what followed them. Rebuild so the new anchors apply.
+        entry.model?.restoreToolTimings(toolTimings.tools.values());
         if (anchorsChanged) await this.refresh(entry, true);
+        this.scheduleFlush(entry);
       } catch {
         // Native history remains usable during a runtime/journal outage.
         // On-demand reasoning can retry recovery when the connection returns.
       }
     }
-    this.poll(entry);
-    this.expire(entry);
   }
 
   private rememberBody(entry: Entry, message: RecordValue): RecordValue {
@@ -792,6 +862,13 @@ export class SessionDisplayService {
     compact: RecordValue,
   ): void {
     if (!isCursorTrackedMessage(compact, entry.provider)) return;
+    if (isCursorUserPrompt(compact) || compact.type === "result") {
+      for (const thoughtId of entry.cursorPendingThoughts) {
+        const thought = entry.overlay.get(thoughtId);
+        if (thought) thought.cursorThinkingBefore ??= { fallback: true };
+      }
+      entry.cursorPendingThoughts.length = 0;
+    }
     if (isCursorThinkingOnly(compact)) {
       if (
         compact.cursorThinkingBefore === undefined &&
@@ -805,7 +882,11 @@ export class SessionDisplayService {
       const bound = { ...anchor, sourceId: id };
       for (const thoughtId of entry.cursorPendingThoughts) {
         const thought = entry.overlay.get(thoughtId);
-        if (thought && thought.cursorThinkingBefore === undefined)
+        if (
+          thought &&
+          thought.turnId === compact.turnId &&
+          thought.cursorThinkingBefore === undefined
+        )
           thought.cursorThinkingBefore = bound;
       }
       entry.cursorPendingThoughts.length = 0;
@@ -1290,6 +1371,8 @@ export class SessionDisplayService {
       for (const message of entry.overlay.values()) {
         if (message.subtype === "turn_complete") model.message(message);
       }
+      if (page.provider === "cursor" && entry.model)
+        model.restoreToolTimings(entry.model.tools.values());
       entry.provider = page.provider;
       const controlState = asRecord(
         entry.controls.get("status") ?? entry.controls.get("connected"),
@@ -1712,8 +1795,10 @@ export class SessionDisplayService {
     const entry = await this.get(selection);
     if (reset) {
       entry.overlay.clear();
+      entry.cursorPendingThoughts.length = 0;
       entry.view = { ...entry.view, epoch: randomUUID() };
       await this.refresh(entry, true);
+      await this.recoverCursorHistory(entry);
     }
     this.flush(entry);
     if (!entry.snapshot) throw new Error("Display snapshot is not ready");
@@ -1900,12 +1985,9 @@ export class SessionDisplayService {
       !selection.branchId &&
       this.options.runtime.replay
     ) {
-      const process = await this.options.runtime.getProcessForSession(
-        selection.sessionId,
-      );
       const records = await this.options.runtime.replay({
         sessionId: selection.sessionId,
-        ...(process ? { processId: process.id } : {}),
+        allProcesses: true,
       });
       for (const record of records) {
         if (

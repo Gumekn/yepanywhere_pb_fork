@@ -434,6 +434,41 @@ describe("HttpRuntimeController", () => {
     await controller.shutdown();
   });
 
+  it("carries session-wide history recovery across the HTTP runtime boundary", async () => {
+    const eventsDir = path.join(
+      tmpdir(),
+      `http-runtime-history-${randomUUID()}`,
+    );
+    eventDirs.push(eventsDir);
+    const eventStore = new RuntimeEventStore({ eventsDir });
+    for (const [processId, sessionId, timestamp] of [
+      ["old", "session", "2026-10-20T06:28:00.000Z"],
+      ["new", "session", "2026-10-20T06:34:00.000Z"],
+      ["other", "another-session", "2026-10-20T06:35:00.000Z"],
+    ] as const)
+      await eventStore.append({
+        processId,
+        sessionId,
+        timestamp,
+        type: "message",
+        data: { uuid: processId },
+      });
+    const { controller } = createHarness({ eventStore });
+    expect(
+      (
+        await controller.replay({
+          sessionId: "session",
+          allProcesses: true,
+        })
+      ).map((event) => event.processId),
+    ).toEqual(["old", "new"]);
+    expect(
+      (await controller.replay({ sessionId: "session" })).map(
+        (event) => event.processId,
+      ),
+    ).toEqual(["new"]);
+  });
+
   it("matches embedded bounded replay for an offline result, error and completion", async () => {
     const eventsDir = path.join(
       tmpdir(),

@@ -133,6 +133,8 @@ export interface RuntimeReplayOptions {
   processId?: string;
   sessionId?: string;
   afterSeq?: number;
+  /** History recovery across generations; requires sessionId and no sequence cursor. */
+  allProcesses?: boolean;
 }
 
 export interface RuntimeQueueStatus extends RuntimeWorkerPoolStatus {

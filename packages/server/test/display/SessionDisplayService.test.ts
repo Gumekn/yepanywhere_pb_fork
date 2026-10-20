@@ -187,8 +187,8 @@ describe("SessionDisplayService", () => {
       "Complete body",
     );
     expect(replay).toHaveBeenCalledWith({
-      processId: "process",
       sessionId: selection.sessionId,
+      allProcesses: true,
     });
     expect(await service.reasoning(selection, "thinking:live:0")).toBe(
       "Complete body",
@@ -507,6 +507,409 @@ describe("SessionDisplayService", () => {
       "text:The answer",
     ]);
   });
+  it("recovers streamed text anchors and interleaves thoughts with their own tool batches", async () => {
+    const { service, source, runtime } = fixture();
+    const message = (uuid: string, content: unknown, turn = 1) => ({
+      type: "assistant",
+      uuid,
+      cursorTurnIndex: turn,
+      turnId: `cursor-turn-${turn}`,
+      message: { role: "assistant", content },
+    });
+    const thinking = (uuid: string, body: string, turn = 1) =>
+      message(uuid, [{ type: "thinking", thinking: body }], turn);
+    const call = (id: string) => ({
+      type: "tool_use",
+      id,
+      name: "Read",
+      input: { file_path: `${id}.txt` },
+    });
+    const intro = "底部这块没被用上，我先看截图和移动端布局，确认系统安全区。";
+    const first = thinking("thought-1", "Check the screenshot");
+    const second = thinking("thought-2", "Check the layout\nInspect the CSS.");
+    const third = thinking(
+      "thought-3",
+      "Check the layout\nInspect the viewport.",
+    );
+    const last = thinking("thought-4", "Explain the result");
+    const messages = [
+      {
+        ...message("native-user", "Optimize the layout"),
+        type: "user",
+        message: { role: "user", content: "Optimize the layout" },
+      },
+      message("native-intro", [{ type: "text", text: intro }, call("a")]),
+      message("native-b", [call("b"), call("c")]),
+      message("native-d", [call("d")]),
+      message("native-answer", "The answer"),
+    ] as Message[];
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages,
+      activity: "completed",
+      stamp: "1",
+    });
+    // These are cumulative ACP message shapes, including the two-character
+    // first chunk seen in the real session. No precomputed anchors in the input.
+    const records = [
+      first,
+      message("live-intro", "底部"),
+      message("live-intro", intro),
+      message("live-a", [call("a")]),
+      thinking("thought-2", "Check"),
+      second,
+      message("live-b", [call("b")]),
+      message("live-c", [call("c")]),
+      third,
+      message("live-d", [call("d")]),
+      last,
+      message("live-answer", "The"),
+      message("live-answer", "The answer"),
+    ].map((data) => ({
+      type: "message",
+      sessionId: selection.sessionId,
+      data,
+    }));
+    const replay = vi.fn(async () => records);
+    Object.assign(runtime, { replay });
+    const snapshot = await service.snapshot(selection);
+    expect(replay).toHaveBeenCalledWith({
+      sessionId: selection.sessionId,
+      allProcesses: true,
+    });
+    const expected = [
+      "question",
+      "thinking:Check the screenshot",
+      `text:${intro}`,
+      "tool_group",
+      "thinking:Check the layout\nInspect the CSS.",
+      "tool_group",
+      "thinking:Check the layout\nInspect the viewport.",
+      "tool_group",
+      "thinking:Explain the result",
+      "text:The answer",
+    ];
+    expect(displayNodeLabels(snapshot)).toEqual(expected);
+    const groups = snapshot.nodes.flatMap((node) =>
+      node.type === "segment" && node.segment.type === "tool_group"
+        ? [node.segment]
+        : [],
+    );
+    expect(groups.map((group) => group.count)).toEqual([1, 2, 1]);
+    expect(
+      (await service.group(selection, groups[1]?.id ?? "")).steps.map(
+        (step) => step.summary,
+      ),
+    ).toEqual(["b.txt", "c.txt"]);
+    expect(await service.reasoning(selection, "thinking:thought-2:0")).toBe(
+      "Check the layout\nInspect the CSS.",
+    );
+    // A forced native-history refresh must reproduce the same boundaries.
+    expect(displayNodeLabels(await service.snapshot(selection, true))).toEqual(
+      expected,
+    );
+  });
+
+  it("recovers earlier thoughts without replaying an old process failure into a resumed turn", async () => {
+    const { service, source, runtime } = fixture();
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        {
+          type: "user",
+          uuid: "user-1",
+          turnId: "cursor-turn-1",
+          message: { role: "user", content: "First question" },
+        },
+        {
+          type: "assistant",
+          uuid: "answer-1",
+          turnId: "cursor-turn-1",
+          message: { role: "assistant", content: "First answer" },
+        },
+        {
+          type: "user",
+          uuid: "user-2",
+          turnId: "cursor-turn-2",
+          message: { role: "user", content: "Continue" },
+        },
+      ] as Message[],
+      activity: "running",
+      stamp: "1",
+    });
+    Object.assign(runtime, {
+      replay: vi.fn(async () =>
+        [
+          {
+            type: "assistant",
+            uuid: "thought",
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "Earlier thought" }],
+            },
+          },
+          {
+            type: "error",
+            uuid: "error-1",
+            turnId: "cursor-turn-1",
+            error: "Old process failed",
+          },
+          { type: "result", turnId: "cursor-turn-1", is_error: true },
+        ].map((data) => ({
+          type: "message",
+          processId: "old-process",
+          sessionId: selection.sessionId,
+          data,
+        })),
+      ),
+    });
+    const snapshot = await service.snapshot(selection);
+    expect(displayNodeLabels(snapshot)).toEqual([
+      "question",
+      "thinking:Earlier thought",
+      "text:First answer",
+      "question",
+    ]);
+    expect(snapshot.activity.state).toBe("running");
+  });
+
+  it("keeps an unanchored thought in its own turn during journal recovery", async () => {
+    const { service, source, runtime } = fixture();
+    const prompt = (turn: number) => ({
+      type: "user",
+      uuid: `user-${turn}`,
+      turnId: `cursor-turn-${turn}`,
+      cursorTurnIndex: turn,
+      message: { role: "user", content: `Question ${turn}` },
+    });
+    const answer = (turn: number) => ({
+      type: "assistant",
+      uuid: `answer-${turn}`,
+      turnId: `cursor-turn-${turn}`,
+      cursorTurnIndex: turn,
+      message: { role: "assistant", content: `Answer ${turn}` },
+    });
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [prompt(1), answer(1), prompt(2), answer(2)] as Message[],
+      activity: "completed",
+      stamp: "1",
+    });
+    Object.assign(runtime, {
+      replay: vi.fn(async () =>
+        [
+          {
+            ...answer(1),
+            uuid: "thought",
+            message: {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "Earlier thought" }],
+            },
+          },
+          prompt(2),
+          answer(2),
+        ].map((data) => ({
+          type: "message",
+          sessionId: selection.sessionId,
+          data,
+        })),
+      ),
+    });
+    expect(displayNodeLabels(await service.snapshot(selection))).toEqual([
+      "question",
+      "thinking:Earlier thought",
+      "text:Answer 1",
+      "question",
+      "text:Answer 2",
+    ]);
+  });
+
+  it("recovers Cursor call timings without changing native tools or inventing missing intervals", async () => {
+    const { service, source, runtime } = fixture();
+    const message = (uuid: string, content: unknown[], turn = 1) => ({
+      type:
+        content[0] && (content[0] as { type: string }).type === "tool_result"
+          ? "user"
+          : "assistant",
+      uuid,
+      turnId: `cursor-turn-${turn}`,
+      cursorTurnIndex: turn,
+      message: { content },
+    });
+    const call = (id: string) => ({
+      type: "tool_use",
+      id,
+      name: "Bash",
+      input: { command: id },
+    });
+    const result = (id: string) => ({
+      type: "tool_result",
+      tool_use_id: id,
+      content: `Native ${id}`,
+      is_error: id === "slow",
+    });
+    const prompt = (turn: number) => ({
+      type: "user",
+      uuid: `user-${turn}`,
+      turnId: `cursor-turn-${turn}`,
+      message: { role: "user", content: `Question ${turn}` },
+    });
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        prompt(1),
+        ...["fast", "slow", "orphan", "untimed", "combined"].flatMap((id) => [
+          message(`native-call-${id}`, [call(id)]),
+          message(`native-result-${id}`, [result(id)]),
+        ]),
+        prompt(2),
+        message("native-call-2", [call("fast")], 2),
+        message("native-result-2", [result("fast")], 2),
+      ] as Message[],
+      activity: "completed",
+      stamp: "1",
+    });
+    const at = (seconds: number) =>
+      new Date(
+        Date.parse("2026-10-20T07:00:00Z") + seconds * 1_000,
+      ).toISOString();
+    const event = (seconds: number, data: Record<string, unknown>) => ({
+      type: "message",
+      sessionId: selection.sessionId,
+      timestamp: at(seconds),
+      data,
+    });
+    Object.assign(runtime, {
+      replay: vi.fn(async () => [
+        // The message timestamp wins over a delayed journal write.
+        event(10, {
+          ...message("live-fast", [{ ...call("fast"), name: "Execute" }]),
+          timestamp: at(0),
+        }),
+        event(0.5, message("live-slow", [call("slow")])),
+        // Input updates must not move the start time.
+        event(0.8, message("live-fast", [call("fast")])),
+        event(1, message("live-result-fast", [result("fast")])),
+        event(5, message("live-result-slow", [result("slow")])),
+        event(6, message("orphan-result", [result("orphan")])),
+        event(7, message("combined", [call("combined"), result("combined")])),
+        // Same raw ID in another turn must not borrow the first turn's start.
+        event(8, message("result-turn-2", [result("fast")], 2)),
+        // A replayed duplicate must not extend the completed interval.
+        event(9, message("duplicate-result", [result("fast")])),
+      ]),
+    });
+    const snapshot = await service.snapshot(selection);
+    const groups = snapshot.nodes.flatMap((node) =>
+      node.type === "segment" && node.segment.type === "tool_group"
+        ? [node.segment]
+        : [],
+    );
+    expect(groups[0]).toMatchObject({
+      count: 5,
+      failedCount: 1,
+      timedCount: 2,
+      durationMs: 5_500,
+    });
+    expect(groups[1]?.timedCount).toBeUndefined();
+    const steps = (await service.group(selection, groups[0]?.id ?? "")).steps;
+    expect(steps[0]).toMatchObject({
+      name: "Bash",
+      timestamp: at(0),
+      completedAt: at(1),
+    });
+    expect(steps[1]).toMatchObject({
+      status: "failed",
+      timestamp: at(0.5),
+      completedAt: at(5),
+    });
+    for (const step of steps.slice(2)) {
+      expect(step.completedAt).toBeUndefined();
+      expect(step.durationMs).toBeUndefined();
+    }
+    const reset = await service.snapshot(selection, true);
+    expect(
+      reset.nodes.flatMap((node) =>
+        node.type === "segment" && node.segment.type === "tool_group"
+          ? [node.segment.timedCount]
+          : [],
+      ),
+    ).toEqual([2, undefined]);
+  });
+
+  it("preserves live Cursor timing when untimed native history acknowledges the tool", async () => {
+    const { service, source, push } = fixture();
+    const nativePrompt = {
+      type: "user",
+      uuid: "native-user",
+      turnId: "cursor-turn-1",
+      cursorTurnIndex: 1,
+      message: { role: "user", content: "Run" },
+    };
+    const call = {
+      type: "assistant",
+      uuid: "live-call",
+      turnId: "cursor-turn-1",
+      cursorTurnIndex: 1,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "command",
+            name: "Bash",
+            input: { command: "ls" },
+          },
+        ],
+      },
+    };
+    const result = {
+      type: "user",
+      uuid: "live-result",
+      turnId: "cursor-turn-1",
+      cursorTurnIndex: 1,
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "command", content: "ok" },
+        ],
+      },
+    };
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [nativePrompt] as Message[],
+      activity: "running",
+      stamp: "1",
+    });
+    await service.subscribe(selection, vi.fn());
+    push("message", { ...call, timestamp: "2026-10-20T07:00:00Z" });
+    push("message", { ...result, timestamp: "2026-10-20T07:00:03Z" });
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        nativePrompt,
+        { ...call, uuid: "native-call" },
+        { ...result, uuid: "native-result" },
+      ] as Message[],
+      activity: "completed",
+      stamp: "2",
+    });
+    push("status", { state: "idle" });
+    await vi.waitFor(async () => {
+      const snapshot = await service.snapshot(selection);
+      expect(snapshot.activity.state).toBe("completed");
+      expect(
+        snapshot.nodes.find(
+          (node) =>
+            node.type === "segment" && node.segment.type === "tool_group",
+        ),
+      ).toMatchObject({
+        segment: { count: 1, timedCount: 1, durationMs: 3_000 },
+      });
+    });
+  });
+
   it("keeps the injected Cursor prompt until native history contains that user query", async () => {
     const { service, source, runtime } = fixture();
     let emit: (type: string, data: unknown) => void = () => {};

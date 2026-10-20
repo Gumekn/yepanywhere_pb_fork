@@ -648,6 +648,7 @@ export class HttpRuntimeController implements RuntimeController {
     const query = new URLSearchParams();
     if (options.processId) query.set("processId", options.processId);
     if (options.sessionId) query.set("sessionId", options.sessionId);
+    if (options.allProcesses) query.set("allProcesses", "true");
     if (options.afterSeq !== undefined) {
       query.set("afterSeq", String(options.afterSeq));
     }

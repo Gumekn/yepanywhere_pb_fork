@@ -66,6 +66,132 @@ function facts(snapshot: SessionDisplaySnapshot) {
   );
 }
 describe("SessionDisplayReducer", () => {
+  it.each([false, true])(
+    "splits recovered Cursor tools at thinking boundaries (reverse recovery: %s)",
+    (reverse) => {
+      const withTurn = (message: Record<string, unknown>) => ({
+        ...message,
+        codexTurnId: undefined,
+        turnId: "cursor-turn-1",
+        cursorTurnIndex: 1,
+      });
+      const thought = (id: string, callId: string) =>
+        withTurn({
+          uuid: id,
+          type: "assistant",
+          cursorThinkingBefore: { toolId: callId },
+          message: {
+            role: "assistant",
+            content: [{ type: "thinking", thinking: `Inspect ${callId}` }],
+          },
+        });
+      const thoughts = [
+        thought("thought-b", "b"),
+        thought("thought-d", "d"),
+      ] as const;
+      const native = [
+        withTurn(prompt),
+        ...["a", "b", "c", "d", "e"].flatMap((id) => [
+          withTurn(tool(id)),
+          withTurn(result(id)),
+        ]),
+        withTurn(reply("answer", "Done")),
+      ];
+      const model = new SessionDisplayReducer(view, "cursor");
+      model.restore(native as Message[]);
+      expect(groups(model.snapshot()).map((group) => group.count)).toEqual([5]);
+      for (const message of reverse ? [...thoughts].reverse() : thoughts)
+        model.message(message);
+      const snapshot = model.snapshot();
+      expect(SessionDisplaySnapshotSchema.safeParse(snapshot).success).toBe(
+        true,
+      );
+      expect(
+        snapshot.nodes.map((node) =>
+          node.type === "segment" ? node.segment.type : node.type,
+        ),
+      ).toEqual([
+        "question",
+        "tool_group",
+        "thinking",
+        "tool_group",
+        "thinking",
+        "tool_group",
+        "assistant_text",
+      ]);
+      const actualGroups = groups(snapshot);
+      expect(actualGroups.map((group) => group.count)).toEqual([1, 2, 2]);
+      expect(
+        actualGroups.map((group) =>
+          model.groupSteps(group.id)?.map((step) => step.id),
+        ),
+      ).toEqual(
+        [["a"], ["b", "c"], ["d", "e"]].map((ids) =>
+          ids.map((id) => displayToolId("cursor-turn-1", id)),
+        ),
+      );
+      for (const group of actualGroups) {
+        expect(group.displayMode).toBe("summary");
+        expect(
+          model
+            .groupSteps(group.id)
+            ?.every((step) => step.groupId === group.id),
+        ).toBe(true);
+      }
+      // The same boundaries encountered live choose the same group identities.
+      const live = new SessionDisplayReducer(view, "cursor");
+      for (const message of native) {
+        if (message.uuid === "b-turn") live.message(thoughts[0]);
+        if (message.uuid === "d-turn") live.message(thoughts[1]);
+        live.message(message);
+      }
+      expect(groups(live.snapshot()).map((group) => group.id)).toEqual(
+        actualGroups.map((group) => group.id),
+      );
+      // A later chunk updates its row; a late result updates its new group.
+      model.message({
+        ...thoughts[0],
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "Inspect b in more detail" }],
+        },
+      });
+      model.message(
+        withTurn({
+          ...result("c"),
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "c",
+                content: "Failed",
+                is_error: true,
+              },
+            ],
+          },
+        }),
+      );
+      expect(
+        groups(model.snapshot()).map((group) => group.failedCount),
+      ).toEqual([0, 1, 0]);
+      expect(
+        model
+          .snapshot()
+          .nodes.filter(
+            (node) =>
+              node.type === "segment" && node.segment.type === "thinking",
+          ),
+      ).toHaveLength(2);
+      const patch = model.commit(snapshot);
+      expect(patch).not.toBeNull();
+      if (!patch) throw new Error("Expected a display patch");
+      expect(applySessionDisplayPatch(snapshot, patch)).toEqual(
+        model.snapshot(),
+      );
+    },
+  );
+
   it("allows providers without native turn ids to stream again after a result", () => {
     const model = new SessionDisplayReducer(view, "claude");
     const text = (id: string) =>

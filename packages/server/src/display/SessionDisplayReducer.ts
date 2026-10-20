@@ -221,7 +221,47 @@ export class SessionDisplayReducer {
   }
 
   /**
-   * Put a recovered Cursor thought above the answer it preceded.
+   * Restore a reasoning boundary inside a previously coalesced tool group.
+   * Use the same first-call identity as live grouping so detail URLs and the
+   * client's expanded state survive a native-history refresh.
+   */
+  private splitGroupBefore(tool: DisplayToolRecord): number | undefined {
+    const group = this.groups.get(tool.step.groupId);
+    const index = group ? this.nodeIndices.get(group.id) : undefined;
+    if (!group || index === undefined) return undefined;
+    const position = group.tools.indexOf(tool.step.id);
+    if (position <= 0) return index;
+    const node = this.nodes[index];
+    if (!node) return undefined;
+    const tail: Group = {
+      id: tool.step.id.replace("dt2.", "dg2."),
+      runId: group.runId,
+      tools: group.tools.splice(position),
+      closed: group.closed,
+    };
+    group.closed = true;
+    this.groups.set(tail.id, tail);
+    for (const [position, id] of tail.tools.entries()) {
+      const moved = this.tools.get(id);
+      if (!moved) continue;
+      moved.position = position;
+      moved.step = {
+        ...moved.step,
+        groupId: tail.id,
+        version: moved.step.version + 1,
+      };
+    }
+    this.insertAt(index + 1, {
+      type: "segment",
+      id: tail.id,
+      turnId: node.turnId,
+      segment: this.groupSegment(tail),
+    });
+    return index + 1;
+  }
+
+  /**
+   * Put a recovered Cursor thought above the exact reply or tool it preceded.
    * A missed anchor still stays before that turn's last reply.
    */
   private findCursorThinkingIndex(
@@ -236,8 +276,8 @@ export class SessionDisplayReducer {
       const tool =
         this.tools.get(displayToolId(runId, placement.toolId)) ??
         (mapped ? this.tools.get(mapped) : undefined);
-      if (tool && (tool.runId === runId || tool.runId === this.currentRun)) {
-        const index = this.nodeIndices.get(tool.step.groupId);
+      if (tool && tool.runId === runId) {
+        const index = this.splitGroupBefore(tool);
         if (index !== undefined) return index;
       }
     }
@@ -927,6 +967,47 @@ export class SessionDisplayReducer {
           return [{ ...tool.step, preview: "" }];
         })
       : null;
+  }
+
+  /**
+   * Native Cursor history omits per-call timing. Carry verified lifecycle
+   * timestamps from live state or journal replay without replaying tool bodies,
+   * changing execution status, or creating calls missing from this timeline.
+   */
+  restoreToolTimings(records: Iterable<DisplayToolRecord>): void {
+    for (const { step: timing } of records) {
+      const tool = this.tools.get(timing.id);
+      if (!tool) continue;
+      const start = tool.step.timestamp ?? timing.timestamp;
+      const timestamp = Number.isFinite(Date.parse(start ?? ""))
+        ? start
+        : undefined;
+      const end = tool.step.completedAt ?? timing.completedAt;
+      const completedAt =
+        timestamp && Date.parse(end ?? "") > Date.parse(timestamp)
+          ? end
+          : undefined;
+      const duration = tool.step.durationMs ?? timing.durationMs;
+      const durationMs =
+        typeof duration === "number" &&
+        Number.isFinite(duration) &&
+        duration >= 0
+          ? duration
+          : undefined;
+      if (
+        tool.step.timestamp === timestamp &&
+        tool.step.completedAt === completedAt &&
+        tool.step.durationMs === durationMs
+      )
+        continue;
+      tool.step = {
+        ...tool.step,
+        ...(timestamp ? { timestamp } : {}),
+        ...(completedAt ? { completedAt } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        version: tool.step.version + 1,
+      };
+    }
   }
 
   private groupSegment(group: Group): GroupSegment {
