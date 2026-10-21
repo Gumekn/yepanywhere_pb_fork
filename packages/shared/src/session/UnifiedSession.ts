@@ -60,4 +60,10 @@ export type UnifiedSession =
   | { provider: "pi"; session: PiSessionContent }
   | { provider: "kimi"; session: KimiSessionContent }
   | { provider: "zcode"; session: ZCodeSessionContent }
-  | { provider: "cursor"; session: CursorSessionContent };
+  | { provider: "cursor"; session: CursorSessionContent }
+  /**
+   * MiniMax Code persists Pi-shaped AgentMessages in
+   * `~/.minimax/v2/sessions/.../messages.jsonl`; the reader adapts them into
+   * a linear Pi session so Pi's transcript projection can be reused.
+   */
+  | { provider: "mcode"; session: PiSessionContent };

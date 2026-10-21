@@ -653,12 +653,14 @@ export class Supervisor {
       await process.waitForSessionId(
         activeProvider.name === "codex"
           ? CODEX_SESSION_ID_TIMEOUT_MS
-          : activeProvider.name === "cursor"
+          : activeProvider.name === "cursor" || activeProvider.name === "mcode"
             ? CURSOR_SESSION_ID_TIMEOUT_MS
             : 5000,
         {
           strict:
-            activeProvider.name === "codex" || activeProvider.name === "cursor",
+            activeProvider.name === "codex" ||
+            activeProvider.name === "cursor" ||
+            activeProvider.name === "mcode",
         },
       );
     } catch (error) {
@@ -859,7 +861,8 @@ export class Supervisor {
     const requiresStrictSessionId =
       isForkedResume ||
       activeProvider.name === "codex" ||
-      activeProvider.name === "cursor";
+      activeProvider.name === "cursor" ||
+      activeProvider.name === "mcode";
 
     // A known Codex ID does not mean thread/resume succeeded. Wait for init
     // on ordinary resumes too, so writer-lock failures reach the HTTP caller
@@ -871,7 +874,8 @@ export class Supervisor {
           ? this.nativeForkSessionIdTimeoutMs
           : activeProvider.name === "codex"
             ? CODEX_SESSION_ID_TIMEOUT_MS
-            : activeProvider.name === "cursor"
+            : activeProvider.name === "cursor" ||
+                activeProvider.name === "mcode"
               ? CURSOR_SESSION_ID_TIMEOUT_MS
               : 5000;
         resolvedSessionId = await process.waitForSessionId(sessionIdTimeoutMs, {

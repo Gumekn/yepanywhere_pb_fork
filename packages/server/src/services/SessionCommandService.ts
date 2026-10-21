@@ -74,6 +74,7 @@ import { CodexSessionReader } from "../sessions/codex-reader.js";
 import { computeCodexRollbackNumTurns } from "../sessions/codex-rollback.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
 import {
   type ProviderResolutionDeps,
@@ -119,6 +120,7 @@ export interface SessionCommandServiceDeps {
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiSessionsDir?: string;
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   enabledProviders?: readonly string[];
 }
 
@@ -2337,6 +2339,7 @@ export class SessionCommandService {
       piReaderFactory: this.deps.piReaderFactory,
       kimiSessionsDir: this.deps.kimiSessionsDir,
       kimiReaderFactory: this.deps.kimiReaderFactory,
+      mcodeReaderFactory: this.deps.mcodeReaderFactory,
       zcodeDbPath: this.deps.zcodeDbPath,
       zcodeReaderFactory: this.deps.zcodeReaderFactory,
       sessionMetadataService: this.deps.sessionMetadataService,

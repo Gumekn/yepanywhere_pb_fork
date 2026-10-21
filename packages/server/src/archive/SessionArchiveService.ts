@@ -466,7 +466,9 @@ function normalizeArchiveProvider(
   provider: ProviderName | string | undefined,
 ): ArchiveProvider | null {
   const group = normalizeProviderGroup(provider);
-  return group === "gemini" ? null : group;
+  // Gemini and MiniMax Code own their stores (MiniMax Code shares its catalog
+  // with the desktop App); Yep never moves those files.
+  return group === "gemini" || group === "mcode" ? null : group;
 }
 
 function isSqliteArchiveProvider(

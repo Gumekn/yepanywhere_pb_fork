@@ -25,6 +25,7 @@
   --provider-kimi: #1783ff;
   --provider-zcode: #6366f1;
   --provider-cursor: #7c3aed;
+  --provider-mcode: #e5326b;
 
   /* Semantic Colors */
   --thinking-color: var(--app-claude-orange);
@@ -10322,6 +10323,10 @@ button.context-usage-indicator--button:focus-visible {
 
 .provider-option-dot.provider-cursor {
   background: var(--provider-cursor);
+}
+
+.provider-option-dot.provider-mcode {
+  background: var(--provider-mcode);
 }
 
 .provider-option-dot.provider-local {

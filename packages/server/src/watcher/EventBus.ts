@@ -24,7 +24,8 @@ export type WatchProvider =
   | "pi"
   | "kimi"
   | "zcode"
-  | "cursor";
+  | "cursor"
+  | "mcode";
 
 export interface FileChangeEvent {
   type: "file-change";

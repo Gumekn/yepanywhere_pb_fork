@@ -888,6 +888,13 @@ export class SessionIndexService implements ISessionIndexService {
 
     if (event.provider === "zcode") {
       this.markMatchingScopesDirty("zcode::");
+      return;
+    }
+
+    if (event.provider === "mcode") {
+      // MiniMax Code transcripts share one dated tree; the catalog cwd
+      // decides the project scope.
+      this.markMatchingScopesDirty("mcode::");
     }
   }
 

@@ -25,6 +25,7 @@ import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import { canonicalizeProjectPath, isAbsolutePath } from "../projects/paths.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
@@ -32,6 +33,7 @@ import type { RuntimeController } from "../runtime/types.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { listSessionsAcrossProviders } from "../sessions/provider-resolution.js";
 import { pendingInputTypeFromRequest } from "../sessions/session-runtime.js";
@@ -93,6 +95,8 @@ export interface ProjectsDeps {
   /** Kimi scanner for checking if a project has Kimi sessions */
   kimiScanner?: KimiSessionScanner;
   cursorScanner?: CursorSessionScanner;
+  mcodeScanner?: McodeSessionScanner;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   /** Kimi sessions directory */
   kimiSessionsDir?: string;
   /** Optional shared Kimi reader factory for cross-provider session lookups */
@@ -694,6 +698,7 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
         piScanner: deps.piScanner,
         kimiScanner: deps.kimiScanner,
         cursorScanner: deps.cursorScanner,
+        mcodeScanner: deps.mcodeScanner,
         codexSessionCatalog: deps.codexSessionCatalog,
       }),
     );
@@ -713,6 +718,7 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
           piReaderFactory: deps.piReaderFactory,
           kimiSessionsDir: deps.kimiSessionsDir,
           kimiReaderFactory: deps.kimiReaderFactory,
+          mcodeReaderFactory: deps.mcodeReaderFactory,
         },
         providerCatalog,
       ),

@@ -17,6 +17,8 @@ import {
   type ClientCapabilities,
   ClientSideConnection,
   type ContentBlock,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type InitializeResponse,
   type PromptResponse,
   type RequestPermissionRequest,
@@ -55,6 +57,15 @@ export type SessionUpdateCallback = (update: SessionNotification) => void;
 export type PermissionRequestCallback = (
   request: RequestPermissionRequest,
 ) => Promise<RequestPermissionResponse>;
+
+/**
+ * Callback for (unstable) form elicitation requests. Agents such as MiniMax
+ * Code use `elicitation/create` for structured multi-question prompts when the
+ * client advertises `elicitation.form`.
+ */
+export type ElicitationRequestCallback = (
+  request: CreateElicitationRequest,
+) => Promise<CreateElicitationResponse>;
 
 /**
  * ACP Client - manages connection to an ACP-compatible agent.
@@ -103,6 +114,7 @@ export class ACPClient {
   }
   private onSessionUpdate: SessionUpdateCallback | null = null;
   private onPermissionRequest: PermissionRequestCallback | null = null;
+  private onElicitationRequest: ElicitationRequestCallback | null = null;
   private onExtensionRequest:
     | ((
         method: string,
@@ -135,6 +147,14 @@ export class ACPClient {
   setPermissionRequestCallback(callback: PermissionRequestCallback): void {
     this.log.debug("Permission request callback registered");
     this.onPermissionRequest = callback;
+  }
+
+  /**
+   * Set callback for form elicitation requests. Only agents that saw
+   * `elicitation.form` in the client capabilities will send them.
+   */
+  setElicitationRequestCallback(callback: ElicitationRequestCallback): void {
+    this.onElicitationRequest = callback;
   }
 
   /**
@@ -206,6 +226,14 @@ export class ACPClient {
       sessionUpdate: async (params: SessionNotification) => {
         this.log.trace({ update: params }, "ACP session update");
         this.onSessionUpdate?.(params);
+      },
+      unstable_createElicitation: async (
+        params: CreateElicitationRequest,
+      ): Promise<CreateElicitationResponse> => {
+        if (this.onElicitationRequest) {
+          return this.onElicitationRequest(params);
+        }
+        return { action: "cancel" };
       },
       requestPermission: async (
         params: RequestPermissionRequest,
@@ -361,6 +389,12 @@ export class ACPClient {
     });
 
     this.log.debug({ result }, "ACP session resumed");
+    const configOptions = (
+      result as { configOptions?: SessionConfigOption[] | null } | undefined
+    )?.configOptions;
+    if (configOptions) {
+      this.sessionConfigOptions.set(sessionId, configOptions);
+    }
     return sessionId;
   }
 
@@ -477,6 +511,7 @@ export class ACPClient {
     this.connection = null;
     this.onSessionUpdate = null;
     this.onPermissionRequest = null;
+    this.onElicitationRequest = null;
     this.onExtensionRequest = null;
   }
 }

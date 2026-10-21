@@ -500,6 +500,23 @@ export function normalizeSession(
         ...summary,
         messages: convertKimiMessages(data.session),
       });
+    case "mcode": {
+      const precomputed = loaded.precomputedPiMessages;
+      const deferMedia =
+        options?.deferMedia ?? precomputed?.deferMedia ?? false;
+      const deferThinking =
+        options?.deferThinking ?? precomputed?.deferThinking ?? false;
+      const messages =
+        precomputed &&
+        precomputed.deferMedia === deferMedia &&
+        precomputed.deferThinking === deferThinking
+          ? precomputed.messages
+          : convertPiSession(data.session, {
+              deferMedia,
+              deferThinking,
+            }).messages;
+      return sanitizePublicNormalizedSession({ ...summary, messages });
+    }
     case "cursor": {
       let cursorTurnIndex = 0;
       return sanitizePublicNormalizedSession({

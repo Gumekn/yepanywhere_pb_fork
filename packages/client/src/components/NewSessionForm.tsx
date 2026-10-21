@@ -106,6 +106,7 @@ const NEW_SESSION_PROVIDER_ACCENTS = {
   kimi: "var(--provider-kimi)",
   zcode: "var(--provider-zcode)",
   cursor: "var(--provider-cursor)",
+  mcode: "var(--provider-mcode)",
 } satisfies Record<LiveProviderName, string>;
 
 export function getNewSessionProviderAccent(
@@ -520,12 +521,14 @@ export function NewSessionForm({
         : [],
     [selectedModelInfo, selectedProvider],
   );
+  // MiniMax Code folds its plain/thinking model variants into the same
+  // off + named-effort picker Kimi uses (see server mcode-models.ts).
+  const usesKimiStyleReasoning =
+    selectedProvider === "kimi" || selectedProvider === "mcode";
   const kimiReasoningEfforts = useMemo(
     () =>
-      selectedProvider === "kimi"
-        ? getModelReasoningEfforts(selectedModelInfo)
-        : [],
-    [selectedModelInfo, selectedProvider],
+      usesKimiStyleReasoning ? getModelReasoningEfforts(selectedModelInfo) : [],
+    [selectedModelInfo, usesKimiStyleReasoning],
   );
   const piReasoningEfforts = useMemo(
     () =>
@@ -543,7 +546,7 @@ export function NewSessionForm({
         )
       : undefined;
   const effectiveKimiReasoningEffort =
-    selectedProvider === "kimi" && kimiReasoningEfforts.length > 0
+    usesKimiStyleReasoning && kimiReasoningEfforts.length > 0
       ? resolveModelReasoningEffort(selectedModelInfo, kimiReasoningEffort)
       : undefined;
   const resolvedPiThinkingEffort =
@@ -556,7 +559,7 @@ export function NewSessionForm({
   const selectedReasoningEffort =
     selectedProvider === "codex" && thinkingMode === "on"
       ? effectiveCodexReasoningEffort
-      : selectedProvider === "kimi"
+      : usesKimiStyleReasoning
         ? effectiveKimiReasoningEffort
         : selectedProvider === "pi" && thinkingMode !== "off"
           ? resolvedPiThinkingEffort
@@ -687,7 +690,7 @@ export function NewSessionForm({
     setKimiReasoningEffort(selected[0] ?? null);
   }, []);
   const showKimiReasoningSelector =
-    selectedProvider === "kimi" && kimiReasoningOptions.length > 0;
+    usesKimiStyleReasoning && kimiReasoningOptions.length > 0;
 
   // Default to true for backwards compatibility with providers that don't set these flags
   const permissionModes = getProviderPermissionModes(
@@ -787,7 +790,7 @@ export function NewSessionForm({
         providerName === "pi" ? (savedDefaults?.llmGatewayKeyId ?? null) : null,
       );
       setKimiReasoningEffort(
-        providerName === "kimi"
+        providerName === "kimi" || providerName === "mcode"
           ? (savedDefaults?.reasoningEffort ?? null)
           : null,
       );
@@ -1760,7 +1763,8 @@ export function NewSessionForm({
   const reasoningEffortDefaultsMatch =
     selectedProvider === "codex" ||
     selectedProvider === "pi" ||
-    selectedProvider === "kimi"
+    selectedProvider === "kimi" ||
+    selectedProvider === "mcode"
       ? (savedProviderDefaults?.reasoningEffort ?? undefined) ===
         selectedReasoningEffort
       : true;

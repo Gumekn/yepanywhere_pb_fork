@@ -15,6 +15,10 @@ import type { ProjectScanner } from "../projects/scanner.js";
 import { cursorSessionIdFromWatchPath } from "../sessions/cursor-reader.js";
 import { parseCursorMetaJson } from "../sessions/cursor-store.js";
 import {
+  listMcodeSessionRecords,
+  mcodeSessionIdFromWatchPath,
+} from "../sessions/mcode-store.js";
+import {
   type PiSessionTailActivity,
   readPiSessionTailActivity,
 } from "../sessions/pi-files.js";
@@ -529,6 +533,11 @@ export class ExternalSessionTracker {
       return;
     }
 
+    if (event.provider === "mcode") {
+      await this.handleMcodeFileChange(event);
+      return;
+    }
+
     // Parse sessionId and projectId from path
     // Format: projects/<projectId>/<sessionId>.jsonl
     const parsed = this.parseSessionPath(event.relativePath);
@@ -622,6 +631,48 @@ export class ExternalSessionTracker {
     return Boolean(
       value && (value.startsWith("-") || /^[a-zA-Z]--/.test(value)),
     );
+  }
+
+  /**
+   * MiniMax Code transcripts change when the desktop App or a terminal mcode
+   * runs a turn. The catalog row supplies the cwd (project).
+   */
+  private async handleMcodeFileChange(event: FileChangeEvent): Promise<void> {
+    const sessionId = mcodeSessionIdFromWatchPath(path.dirname(event.path));
+    if (!sessionId) return;
+
+    const process = this.supervisor.getProcessForSession(sessionId);
+    const runtimeProcess = process
+      ? null
+      : await this.getRuntimeProcess?.(sessionId);
+    if (runtimeProcess) this.runtimeOwnedSessions.add(sessionId);
+    else this.runtimeOwnedSessions.delete(sessionId);
+
+    if (process || runtimeProcess) {
+      this.removeExternal(sessionId);
+      if (this.getSessionSummary) {
+        const getSessionSummary = this.getSessionSummary;
+        const projectId = process?.projectId ?? runtimeProcess?.projectId;
+        if (!projectId) return;
+        this.sessionParser.enqueue(sessionId, () =>
+          getSessionSummary(sessionId, projectId),
+        );
+      }
+      return;
+    }
+
+    if (this.isInAbortGracePeriod(sessionId)) return;
+
+    const record = (await listMcodeSessionRecords()).find(
+      (candidate) => candidate.sessionId === sessionId,
+    );
+    if (!record) return;
+
+    await this.handleUnownedSessionActivity(sessionId, {
+      provider: "mcode",
+      projectId: encodeProjectId(record.cwd),
+      sessionFilePath: record.messagesPath,
+    });
   }
 
   private async handleCursorFileChange(event: FileChangeEvent): Promise<void> {

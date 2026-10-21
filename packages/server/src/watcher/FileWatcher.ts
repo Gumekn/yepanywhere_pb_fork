@@ -308,6 +308,11 @@ export class FileWatcher {
         return /(?:^|\/)(?:store\.db(?:-wal)?|meta\.json)$/.test(relativePath)
           ? "session"
           : "other";
+      case "mcode":
+        // ~/.minimax/v2/sessions/YYYY/MM/DD/<time>-session_<b64>/messages.jsonl
+        return /(?:^|[\\/])messages\.jsonl$/.test(relativePath)
+          ? "session"
+          : "other";
     }
   }
 

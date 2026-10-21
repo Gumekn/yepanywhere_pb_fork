@@ -296,7 +296,7 @@ export function shouldRefreshSettledAuthoritativeSnapshot(
   expectedSessionId: string,
 ): boolean {
   return (
-    (provider === "pi" || provider === "kimi") &&
+    (provider === "pi" || provider === "kimi" || provider === "mcode") &&
     owner === "self" &&
     processState === "idle" &&
     eventSessionId === expectedSessionId
@@ -310,7 +310,7 @@ export function shouldRefreshSettledAuthoritativeSnapshot(
 function hasUncorrelatedPersistedIds(
   provider: Session["provider"] | undefined,
 ): boolean {
-  return provider === "pi" || provider === "kimi";
+  return provider === "pi" || provider === "kimi" || provider === "mcode";
 }
 
 /**
@@ -359,7 +359,7 @@ export function shouldDeferUncorrelatedPersistedSync(
   processState: ProcessState | undefined,
 ): boolean {
   return (
-    (provider === "pi" || provider === "kimi") &&
+    (provider === "pi" || provider === "kimi" || provider === "mcode") &&
     owner === "self" &&
     processState !== "idle"
   );
@@ -484,7 +484,8 @@ export function shouldRefreshFullPersistedSession(
     provider === "codex" ||
     provider === "codex-oss" ||
     provider === "pi" ||
-    provider === "kimi"
+    provider === "kimi" ||
+    provider === "mcode"
   );
 }
 
@@ -934,7 +935,7 @@ export function useSession(
   const scheduleAuthoritativeSnapshotRefresh = useCallback(() => {
     if (preferDisplayHistory) return;
     const provider = session?.provider;
-    if (provider !== "pi" && provider !== "kimi") {
+    if (provider !== "pi" && provider !== "kimi" && provider !== "mcode") {
       return;
     }
 
@@ -1358,7 +1359,9 @@ export function useSession(
           signalHistoryRewriteSync();
         }
         if (
-          (session?.provider === "pi" || session?.provider === "kimi") &&
+          (session?.provider === "pi" ||
+            session?.provider === "kimi" ||
+            session?.provider === "mcode") &&
           processState === "idle"
         ) {
           scheduleAuthoritativeSnapshotRefresh();
@@ -2155,7 +2158,11 @@ export function useSession(
         ) {
           // The stream will carry the active turn; idle/complete schedules the
           // authoritative replacement and retries until wire.jsonl catches up.
-        } else if (connectedProvider === "pi" || connectedProvider === "kimi") {
+        } else if (
+          connectedProvider === "pi" ||
+          connectedProvider === "kimi" ||
+          connectedProvider === "mcode"
+        ) {
           scheduleAuthoritativeSnapshotRefresh();
         } else if (!(isFirstConnectedEvent && isCodexProvider)) {
           fetchNewMessages();

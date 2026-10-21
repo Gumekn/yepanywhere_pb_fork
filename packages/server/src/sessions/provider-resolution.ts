@@ -10,6 +10,8 @@ import {
 import { collapseEditForkFamilies } from "./edit-fork-families.js";
 import { GeminiSessionReader } from "./gemini-reader.js";
 import { KimiSessionReader } from "./kimi-reader.js";
+import { McodeSessionReader } from "./mcode-reader.js";
+import { MCODE_SESSIONS_DIR } from "./mcode-store.js";
 import { PI_SESSIONS_DIR } from "./pi-files.js";
 import { PiSessionReader } from "./pi-reader.js";
 import {
@@ -28,6 +30,8 @@ export interface ProviderProjectCatalog {
   kimiPaths: Set<string>;
   zcodePaths: Set<string>;
   cursorPaths: Set<string>;
+  /** Optional so older catalog builders/tests remain valid. */
+  mcodePaths?: Set<string>;
   geminiHashToCwd?: Promise<Map<string, string>>;
   codexSessionsByPath?: Map<string, SessionSummary[]>;
 }
@@ -46,6 +50,8 @@ export interface ProviderResolutionDeps {
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
   cursorSessionsDir?: string;
   cursorReaderFactory?: (projectPath: string) => CursorSessionReader;
+  mcodeSessionsDir?: string;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   zcodeDbPath?: string;
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   allowStaleSessionCache?: boolean;
@@ -62,7 +68,15 @@ export interface SessionSource {
   provider: ProviderName;
   reader: ISessionReader;
   sessionDir: string;
-  kind: "primary" | "codex" | "gemini" | "pi" | "kimi" | "zcode" | "cursor";
+  kind:
+    | "primary"
+    | "codex"
+    | "gemini"
+    | "pi"
+    | "kimi"
+    | "zcode"
+    | "cursor"
+    | "mcode";
 }
 
 export interface ResolvedSessionSummary {
@@ -134,6 +148,20 @@ function mayHaveCursorSessions(
     provider === "kimi" ||
     provider === "zcode"
   );
+}
+
+function mayHaveMcodeSessions(
+  project: Project,
+  catalog?: ProviderProjectCatalog,
+): boolean {
+  if (catalog) {
+    return (
+      catalog.mcodePaths?.has(canonicalizeProjectPath(project.path)) ?? false
+    );
+  }
+  // Without a catalog, any non-mcode project may also hold MiniMax Code
+  // sessions; the reader filters by cwd, so a miss only costs one query.
+  return normalizeProviderGroup(project.provider) !== null;
 }
 
 function mayHaveZCodeSessions(
@@ -297,6 +325,9 @@ function buildCandidateGroups(
   if (mayHaveCursorSessions(project, catalog)) {
     pushGroup("cursor");
   }
+  if (mayHaveMcodeSessions(project, catalog)) {
+    pushGroup("mcode");
+  }
 
   return groups;
 }
@@ -322,7 +353,25 @@ function getSourceForGroup(
       return createZCodeSource(project, deps);
     case "cursor":
       return createCursorSource(project, deps);
+    case "mcode":
+      return createMcodeSource(project, deps);
   }
+}
+
+function createMcodeSource(
+  project: Project,
+  deps: ProviderResolutionDeps,
+): SessionSource {
+  const sessionsDir = deps.mcodeSessionsDir ?? MCODE_SESSIONS_DIR;
+  const reader =
+    deps.mcodeReaderFactory?.(project.path) ??
+    new McodeSessionReader({ sessionsDir, projectPath: project.path });
+  return {
+    provider: "mcode",
+    reader,
+    sessionDir: sessionsDir,
+    kind: "mcode",
+  };
 }
 
 function createCursorSource(

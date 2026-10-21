@@ -15,6 +15,7 @@ import {
   tryMapRemotePathToLocal,
 } from "../sdk/remote-path-mapping.js";
 import { CURSOR_ACP_SESSIONS_DIR } from "../sessions/cursor-reader.js";
+import { MCODE_SESSIONS_DIR } from "../sessions/mcode-store.js";
 import { PI_SESSIONS_DIR } from "../sessions/pi-files.js";
 import { ZCODE_DB_PATH } from "../sessions/zcode-db.js";
 import type { Project } from "../supervisor/types.js";
@@ -23,6 +24,7 @@ import { CODEX_SESSIONS_DIR, CodexSessionScanner } from "./codex-scanner.js";
 import { CursorSessionScanner } from "./cursor-scanner.js";
 import { GEMINI_TMP_DIR, GeminiSessionScanner } from "./gemini-scanner.js";
 import { KIMI_SESSIONS_DIR, KimiSessionScanner } from "./kimi-scanner.js";
+import { McodeSessionScanner } from "./mcode-scanner.js";
 import {
   CLAUDE_PROJECTS_DIR,
   canonicalizeProjectPath,
@@ -47,12 +49,18 @@ export interface ScannerOptions {
   piScanner?: PiSessionScanner | null; // shared provider scanner
   zcodeScanner?: ZCodeSessionScanner | null; // shared provider scanner
   cursorScanner?: CursorSessionScanner | null; // shared provider scanner
+  mcodeScanner?: McodeSessionScanner | null; // shared provider scanner
   enableCodex?: boolean; // whether to include Codex projects (default: true)
   enableGemini?: boolean; // whether to include Gemini projects (default: true)
   enableKimi?: boolean; // whether to include Kimi projects (default: true)
   enablePi?: boolean; // whether to include Pi projects (default: true)
   enableZCode?: boolean; // whether to include ZCode projects (default: true)
   enableCursor?: boolean; // whether to include Cursor ACP projects (default: true)
+  /**
+   * Whether to include MiniMax Code projects. Defaults to true only when a
+   * shared scanner is injected, so tests never read the real ~/.minimax DB.
+   */
+  enableMcode?: boolean;
   projectMetadataService?: ProjectMetadataService; // for persisting added projects
   /** Remote Claude executors whose shared stores should also be scanned. */
   remoteExecutors?: RemoteExecutorConfig[];
@@ -83,6 +91,7 @@ export class ProjectScanner {
   private piScanner: PiSessionScanner | null;
   private zcodeScanner: ZCodeSessionScanner | null;
   private cursorScanner: CursorSessionScanner | null;
+  private mcodeScanner: McodeSessionScanner | null;
   private enableCodex: boolean;
   private enableGemini: boolean;
   private enableKimi: boolean;
@@ -137,6 +146,10 @@ export class ProjectScanner {
     this.cursorScanner = this.enableCursor
       ? (options.cursorScanner ?? new CursorSessionScanner())
       : null;
+    this.mcodeScanner =
+      (options.enableMcode ?? Boolean(options.mcodeScanner))
+        ? (options.mcodeScanner ?? new McodeSessionScanner())
+        : null;
     this.projectMetadataService = options.projectMetadataService ?? null;
     this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? 5000);
 
@@ -393,6 +406,8 @@ export class ProjectScanner {
       this.zcodeScanner?.invalidateCache();
     } else if (event.provider === "cursor") {
       this.cursorScanner?.invalidateCache();
+    } else if (event.provider === "mcode") {
+      this.mcodeScanner?.invalidateCache();
     }
   }
 
@@ -735,6 +750,42 @@ export class ProjectScanner {
       }
     }
 
+    if (this.mcodeScanner) {
+      const mcodeProjects = await this.mcodeScanner.listProjects();
+      for (const mcodeProject of mcodeProjects) {
+        const projectPath = canonicalizeProjectPath(mcodeProject.path);
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasMcodeSessions = true;
+          existing.sessionCount += mcodeProject.sessionCount;
+          if (
+            mcodeProject.lastActivity &&
+            (!existing.lastActivity ||
+              mcodeProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = mcodeProject.lastActivity;
+          }
+          continue;
+        }
+        seenPaths.add(projectPath);
+        projects.push({
+          ...mcodeProject,
+          id: encodeProjectId(projectPath),
+          path: projectPath,
+          name: basename(projectPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
+          hasPiSessions: false,
+          hasKimiSessions: false,
+          hasZCodeSessions: false,
+          hasCursorSessions: false,
+          hasMcodeSessions: true,
+        });
+      }
+    }
+
     // Merge manually added projects (from ProjectMetadataService)
     if (this.projectMetadataService) {
       const addedProjects = this.projectMetadataService.getAllProjects();
@@ -907,6 +958,14 @@ export class ProjectScanner {
           provider = "cursor";
         }
       }
+
+      if (provider === "claude" && this.mcodeScanner) {
+        const mcodeSessions =
+          await this.mcodeScanner.getSessionsForProject(projectPath);
+        if (mcodeSessions.length > 0) {
+          provider = "mcode";
+        }
+      }
     }
 
     // Create a virtual project entry
@@ -925,6 +984,8 @@ export class ProjectScanner {
       sessionDir = ZCODE_DB_PATH;
     } else if (provider === "cursor") {
       sessionDir = CURSOR_ACP_SESSIONS_DIR;
+    } else if (provider === "mcode") {
+      sessionDir = MCODE_SESSIONS_DIR;
     } else {
       sessionDir = this.getClaudeSessionDirForProject(projectPath);
     }
@@ -941,6 +1002,7 @@ export class ProjectScanner {
       hasKimiSessions: provider === "kimi",
       hasZCodeSessions: provider === "zcode",
       hasCursorSessions: provider === "cursor",
+      hasMcodeSessions: provider === "mcode",
       activeOwnedCount: 0,
       activeExternalCount: 0,
       lastActivity: null,

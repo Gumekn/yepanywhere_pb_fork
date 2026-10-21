@@ -22,12 +22,14 @@ import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { CursorSessionReader } from "../sessions/cursor-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import { normalizeSession } from "../sessions/normalization.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { resolveSessionSources } from "../sessions/provider-resolution.js";
@@ -54,6 +56,8 @@ export interface SearchDeps {
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiScanner?: KimiSessionScanner;
   cursorScanner?: CursorSessionScanner;
+  mcodeScanner?: McodeSessionScanner;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   kimiSessionsDir?: string;
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
   cursorSessionsDir?: string;
@@ -175,6 +179,7 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       piScanner: deps.piScanner,
       kimiScanner: deps.kimiScanner,
       cursorScanner: deps.cursorScanner,
+      mcodeScanner: deps.mcodeScanner,
     });
 
     const resolutionDeps = {
@@ -188,6 +193,7 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       piReaderFactory: deps.piReaderFactory,
       kimiSessionsDir: deps.kimiSessionsDir,
       kimiReaderFactory: deps.kimiReaderFactory,
+      mcodeReaderFactory: deps.mcodeReaderFactory,
       cursorSessionsDir: deps.cursorSessionsDir,
       cursorReaderFactory: deps.cursorReaderFactory,
     };

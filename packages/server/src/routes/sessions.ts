@@ -64,6 +64,7 @@ import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import { canonicalizeProjectPath, encodeProjectId } from "../projects/paths.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
@@ -92,6 +93,7 @@ import { cloneClaudeSession, cloneCodexSession } from "../sessions/fork.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import { projectSessionInspectorMessages } from "../sessions/inspector-projection.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import {
   annotateBranchMessages,
   normalizeSession,
@@ -201,6 +203,8 @@ export interface SessionsDeps {
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiScanner?: KimiSessionScanner;
   cursorScanner?: CursorSessionScanner;
+  mcodeScanner?: McodeSessionScanner;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   kimiSessionsDir?: string;
   /** Optional shared Kimi reader factory for cross-provider session lookups */
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
@@ -659,6 +663,7 @@ function toProviderResolutionDeps(deps: SessionsDeps): ProviderResolutionDeps {
     piReaderFactory: deps.piReaderFactory,
     kimiSessionsDir: deps.kimiSessionsDir,
     kimiReaderFactory: deps.kimiReaderFactory,
+    mcodeReaderFactory: deps.mcodeReaderFactory,
     zcodeDbPath: deps.zcodeDbPath,
     zcodeReaderFactory: deps.zcodeReaderFactory,
   };
@@ -867,6 +872,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       piReaderFactory: deps.piReaderFactory,
       kimiSessionsDir: deps.kimiSessionsDir,
       kimiReaderFactory: deps.kimiReaderFactory,
+      mcodeReaderFactory: deps.mcodeReaderFactory,
     });
   const getCodexReader = (projectPath: string): CodexSessionReader | null =>
     deps.codexReaderFactory?.(projectPath) ??
@@ -2996,6 +3002,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         deps.scanner.invalidateCache();
         deps.codexScanner?.invalidateCache();
         deps.cursorScanner?.invalidateCache();
+        deps.mcodeScanner?.invalidateCache();
         emitArchiveFileEvents(deps, record, "delete");
         archiveResult = { physical: true, action: "archive", record };
       } catch (error) {
@@ -3008,6 +3015,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             action: "already_archived",
             record: deps.sessionArchiveService.getArchivedSession(sessionId),
           };
+        } else if (
+          error instanceof ArchiveError &&
+          error.code === "unsupported_provider" &&
+          target.provider === "mcode"
+        ) {
+          // MiniMax Code shares its store with the desktop App; Yep only
+          // hides the session through metadata and never moves its files.
         } else if (error instanceof ArchiveError) {
           return c.json(
             { error: error.message, code: error.code },
@@ -3026,6 +3040,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         deps.scanner.invalidateCache();
         deps.codexScanner?.invalidateCache();
         deps.cursorScanner?.invalidateCache();
+        deps.mcodeScanner?.invalidateCache();
         emitArchiveFileEvents(deps, record, "create");
         archiveResult = { physical: true, action: "restore", record };
       } catch (error) {

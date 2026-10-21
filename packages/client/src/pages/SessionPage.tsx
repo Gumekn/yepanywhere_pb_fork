@@ -206,6 +206,8 @@ function getApprovalAgentName(
       return "ZCode";
     case "cursor":
       return "Cursor";
+    case "mcode":
+      return "MiniMax Code";
     default:
       return "Claude";
   }

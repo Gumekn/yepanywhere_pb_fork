@@ -52,6 +52,7 @@ const PROVIDER_COLORS: Record<LiveProviderName, string> = {
   kimi: "var(--provider-kimi)", // Kimi KMBlue
   zcode: "var(--provider-zcode)", // ZCode
   cursor: "var(--provider-cursor)",
+  mcode: "var(--provider-mcode)",
 };
 
 const getSessionListTitle = (session: GlobalSessionItem): string | null =>

@@ -420,6 +420,11 @@ export class SessionContentIndexService {
 
     if (event.provider === "kimi") {
       this.markMatchingScopesDirty("kimi::");
+      return;
+    }
+
+    if (event.provider === "mcode") {
+      this.markMatchingScopesDirty("mcode::");
     }
   }
 

@@ -52,6 +52,27 @@ export function useProviderPermissionModeConfig(
     };
   }
 
+  if (provider === "mcode") {
+    return {
+      labels: {
+        ...genericLabels,
+        default: t("modeMcodeDefaultLabel"),
+        plan: t("modeMcodePlanLabel"),
+        auto: t("modeMcodeAutoLabel"),
+        bypassPermissions: t("modeMcodeFullAccessLabel"),
+      },
+      descriptions: {
+        ...genericDescriptions,
+        default: t("modeMcodeDefaultDescription"),
+        plan: t("modeMcodePlanDescription"),
+        auto: t("modeMcodeAutoDescription"),
+        bypassPermissions: t("modeMcodeFullAccessDescription"),
+      },
+      title: t("newSessionMcodePermissionTitle"),
+      description: t("newSessionMcodePermissionDescription"),
+    };
+  }
+
   if (provider === "cursor") {
     return {
       labels: {

@@ -88,6 +88,7 @@ import {
   ZCodeSessionChangeMonitor,
 } from "./services/index.js";
 import { CURSOR_ACP_SESSIONS_DIR } from "./sessions/cursor-reader.js";
+import { MCODE_SESSIONS_DIR } from "./sessions/mcode-store.js";
 import { PI_SESSIONS_DIR } from "./sessions/pi-files.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
 import { pendingInputTypeFromRequest } from "./sessions/session-runtime.js";
@@ -471,7 +472,7 @@ console.log(
 // Helper to create watcher if directory exists
 function createWatcherIfExists(
   watchDir: string,
-  provider: "claude" | "gemini" | "codex" | "pi" | "kimi" | "cursor",
+  provider: "claude" | "gemini" | "codex" | "pi" | "kimi" | "cursor" | "mcode",
   ensureDirectory = false,
   persistent = false,
   periodicRescanOverrideMs?: number,
@@ -560,6 +561,9 @@ createWatcherIfExists(
   true,
   process.platform === "darwin" || process.platform === "win32" ? 5_000 : 0,
 );
+if (isProviderEnabled("mcode", config.enabledProviders)) {
+  createWatcherIfExists(MCODE_SESSIONS_DIR, "mcode", false, true);
+}
 
 // When running without tsx watch (NO_BACKEND_RELOAD=true), start source watcher
 // to notify the UI when server code changes and needs manual reload

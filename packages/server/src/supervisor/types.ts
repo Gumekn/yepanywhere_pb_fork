@@ -62,6 +62,7 @@ export interface Project {
   hasKimiSessions?: boolean; // whether this project also has Kimi sessions
   hasZCodeSessions?: boolean; // whether this project also has ZCode sessions
   hasCursorSessions?: boolean; // whether this project also has Cursor ACP sessions
+  hasMcodeSessions?: boolean; // whether this project also has MiniMax Code sessions
   activeOwnedCount: number; // sessions owned by this server
   activeExternalCount: number; // sessions controlled by external processes
   lastActivity: string | null; // ISO timestamp of most recent session update

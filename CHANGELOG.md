@@ -8,6 +8,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 ## [Unreleased]
 
 ### Added
+- 新增 MiniMax Code provider（`mcode`）：通过本机 `mcode acp` 新建、续接和接管会话，列出 MiniMax Code CLI 与桌面 App 共享的 `~/.minimax` 会话（App 会话可直接继续）；支持实时文本与工具调用、Ask／Plan／Auto／完全访问权限模式、模型与推理强度选择、工具审批、多步骤问卷（`ask_user`）、中断与 steer。历史从 `messages.jsonl` 只读加载并复用 Pi 渲染，归档只隐藏不移动 MiniMax 文件；编辑／回退与会话分支暂不支持。
 - cURL 请求支持实时接收和展示流式响应：发送 JSON 时可切换 `stream: true`，SSE 支持 AI 文本、推理、工具参数和用量预览，并保留原始事件；取消、超时或连接中断保留已收到的内容，切换页面后可继续查看同一次请求。
 - 侧栏新增 cURL 请求页：支持粘贴命令、表单编辑 URL／Bearer API Key／请求头和请求体、服务端执行与取消，查看状态码、耗时及响应内容；服务端保存最近 100 条请求，可编辑、另存、搜索、删除和复用，支持 `--noproxy`、代理、重定向及中英文界面。
 - 设置页的「CLI 更新」支持 dsh：只跟随 npm 官方 latest 渠道（可能包含 RC），正确比较候选版本且不降级，更新当前实际使用的安装目录；提供单独的停止／启动 dsh Web 操作，停止前确认任务中断影响，运行期间拒绝覆盖安装，更新与启动互斥，更新完成后由用户启动新版。

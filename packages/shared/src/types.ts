@@ -7,6 +7,7 @@
  * - "pi": Pi coding agent via its JSONL RPC mode
  * - "kimi": Kimi Code CLI via Agent Client Protocol (`kimi acp`)
  * - "cursor": Cursor CLI via Agent Client Protocol (`agent acp`)
+ * - "mcode": MiniMax Code CLI via Agent Client Protocol (`mcode acp`)
  */
 export type ProviderName =
   | "claude"
@@ -18,7 +19,8 @@ export type ProviderName =
   | "pi"
   | "kimi"
   | "zcode"
-  | "cursor";
+  | "cursor"
+  | "mcode";
 
 /** Providers that can be registered or selected by the current product. */
 export type LiveProviderName = ProviderName;
@@ -42,6 +44,7 @@ export const ALL_PROVIDERS: readonly LiveProviderName[] = [
   "kimi",
   "zcode",
   "cursor",
+  "mcode",
 ] as const;
 
 /**
