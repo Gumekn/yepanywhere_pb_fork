@@ -244,6 +244,12 @@ export interface AgentProvider {
   readonly permissionModes?: readonly PermissionMode[];
   /** Whether this provider supports extended thinking toggle (default: true) */
   readonly supportsThinkingToggle: boolean;
+  /**
+   * Whether `thinking`, `effort` and `reasoningEffort` from StartSessionOptions
+   * shape the running process (default: true). Providers that encode reasoning
+   * in the model id ignore them, so a difference must not restart the process.
+   */
+  readonly usesReasoningLaunchSettings?: boolean;
   /** Whether this provider supports slash commands (default: false) */
   readonly supportsSlashCommands: boolean;
 

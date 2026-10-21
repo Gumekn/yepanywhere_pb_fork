@@ -162,6 +162,8 @@ export class CursorProvider implements AgentProvider {
   readonly supportsPermissionMode = true;
   readonly permissionModes = ["default", "plan", "bypassPermissions"] as const;
   readonly supportsThinkingToggle = false;
+  // Reasoning lives in the model id parameters (`reasoning_effort=...`).
+  readonly usesReasoningLaunchSettings = false;
   readonly supportsSlashCommands = false;
 
   async isInstalled(): Promise<boolean> {

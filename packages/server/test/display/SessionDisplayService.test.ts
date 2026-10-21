@@ -2379,6 +2379,81 @@ describe("SessionDisplayService", () => {
     ).value;
     expect(subscription.cleanup).not.toHaveBeenCalled();
   });
+  it("shows the prompt a replacement process was started with before the projection attached", async () => {
+    vi.useFakeTimers();
+    const { service, source, runtime, push } = fixture(1_000);
+    const firstTurn = [
+      {
+        uuid: "disk-user-1",
+        type: "user",
+        cursorTurnIndex: 1,
+        turnId: "cursor-turn-1",
+        message: { role: "user", content: "First question" },
+      },
+      {
+        uuid: "disk-answer-1",
+        type: "assistant",
+        cursorTurnIndex: 1,
+        turnId: "cursor-turn-1",
+        message: { role: "assistant", content: "First answer" },
+      },
+    ] as Message[];
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: firstTurn,
+      activity: "completed",
+      stamp: "1",
+    });
+    runtime.getProcessForSession.mockResolvedValue({
+      id: "process-a",
+    } as never);
+    await service.subscribe(selection, vi.fn());
+
+    // The old process exits (idle restart); a new one is started with the
+    // next prompt and buffers it before the projection resubscribes.
+    push("complete", {});
+    runtime.getProcessForSession.mockResolvedValue({
+      id: "process-b",
+    } as never);
+    runtime.subscribeSession.mockImplementation(async (_id, send) => {
+      send("message", {
+        isReplay: true,
+        isOptimistic: true,
+        type: "user",
+        uuid: "live-user-2",
+        cursorTurnIndex: 2,
+        turnId: "cursor-turn-2",
+        message: { role: "user", content: "Second question" },
+      });
+      return { cleanup: vi.fn() };
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const snapshot = await service.snapshot(selection);
+    const questions = snapshot.nodes.filter((node) => node.type === "question");
+    expect(questions).toHaveLength(2);
+    expect(JSON.stringify(questions[1])).toContain("Second question");
+  });
+  it("keeps treating replay as seen when resubscribing to the same process", async () => {
+    vi.useFakeTimers();
+    const { service, runtime, push } = fixture(1_000);
+    await service.subscribe(selection, vi.fn());
+    push("complete", {});
+    runtime.subscribeSession.mockImplementation(async (_id, send) => {
+      send("message", {
+        isReplay: true,
+        type: "user",
+        uuid: "replayed-user",
+        codexTurnId: "turn-2",
+        message: { role: "user", content: "Already seen" },
+      });
+      return { cleanup: vi.fn() };
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(runtime.subscribeSession).toHaveBeenCalledTimes(2);
+    const snapshot = await service.snapshot(selection);
+    expect(JSON.stringify(snapshot)).not.toContain("Already seen");
+  });
 });
 
 function required<T>(value: T | null | undefined): T {

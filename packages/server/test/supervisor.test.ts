@@ -1532,6 +1532,66 @@ describe("Supervisor", () => {
 
       await reasoningSupervisor.shutdown();
     });
+
+    it("does not restart Cursor for reasoning settings it never consumes", async () => {
+      const startSession = vi.fn(async (options: StartSessionOptions) => {
+        const sessionId = options.resumeSessionId ?? "cursor-session";
+        let aborted = false;
+        async function* iterator() {
+          yield { type: "system", subtype: "init", session_id: sessionId };
+          while (!aborted) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+        }
+        return {
+          iterator: iterator(),
+          queue: new MessageQueue(),
+          abort: () => {
+            aborted = true;
+          },
+        };
+      });
+      const provider: AgentProvider = {
+        name: "cursor",
+        displayName: "Cursor",
+        supportsPermissionMode: true,
+        supportsThinkingToggle: false,
+        supportsSlashCommands: false,
+        isInstalled: async () => true,
+        isAuthenticated: async () => true,
+        getAuthStatus: async () => ({
+          installed: true,
+          authenticated: true,
+          enabled: true,
+        }),
+        getAvailableModels: async () => [],
+        startSession,
+      };
+      const cursorSupervisor = new Supervisor({ provider, idleTimeoutMs: 100 });
+      const started = await cursorSupervisor.startSession(
+        "/tmp/cursor-session",
+        { text: "start" },
+      );
+      expect("id" in started).toBe(true);
+
+      // The client echoes its global thinking level and the displayed effort.
+      await expect(
+        cursorSupervisor.queueMessageToSession(
+          "cursor-session",
+          "/tmp/cursor-session",
+          { text: "next" },
+          undefined,
+          {
+            thinking: { type: "adaptive" },
+            effort: "medium",
+            reasoningEffort: "medium",
+          },
+        ),
+      ).resolves.toMatchObject({ success: true, restarted: false });
+      expect(startSession).toHaveBeenCalledTimes(1);
+
+      await cursorSupervisor.shutdown();
+    });
   });
 
   describe("eventBus integration", () => {

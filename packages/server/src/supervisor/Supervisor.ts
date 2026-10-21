@@ -77,6 +77,36 @@ export function getStaleInTurnThresholdMs(provider: ProviderName): number {
 }
 
 /**
+ * Which launch-time reasoning settings differ between a running process and a
+ * request. Only providers that consume them at launch can need a restart: the
+ * client always echoes its global thinking level and the session's displayed
+ * effort, which for a provider like Cursor never reached the process at all.
+ */
+function diffReasoningLaunchSettings(
+  process: Process,
+  modelSettings: ModelSettings | undefined,
+): {
+  thinkingChanged: boolean;
+  effortChanged: boolean;
+  reasoningEffortChanged: boolean;
+} {
+  if (getProvider(process.provider)?.usesReasoningLaunchSettings === false) {
+    return {
+      thinkingChanged: false,
+      effortChanged: false,
+      reasoningEffortChanged: false,
+    };
+  }
+  return {
+    thinkingChanged:
+      process.thinking?.type !== (modelSettings?.thinking?.type ?? undefined),
+    effortChanged: process.effort !== modelSettings?.effort,
+    reasoningEffortChanged:
+      process.requestedReasoningEffort !== modelSettings?.reasoningEffort,
+  };
+}
+
+/**
  * Model and thinking settings for a session.
  */
 export interface ModelSettings {
@@ -969,15 +999,8 @@ export class Supervisor {
           await existingProcess.abort();
           this.unregisterProcess(existingProcess);
         } else {
-          // Check if thinking/effort settings changed
-          const thinkingChanged =
-            existingProcess.thinking?.type !==
-            (modelSettings?.thinking?.type ?? undefined);
-          const effortChanged =
-            existingProcess.effort !== modelSettings?.effort;
-          const reasoningEffortChanged =
-            existingProcess.requestedReasoningEffort !==
-            modelSettings?.reasoningEffort;
+          const { thinkingChanged, effortChanged, reasoningEffortChanged } =
+            diffReasoningLaunchSettings(existingProcess, modelSettings);
 
           if (thinkingChanged || effortChanged || reasoningEffortChanged) {
             if (
@@ -1238,12 +1261,8 @@ export class Supervisor {
           };
     }
 
-    // Check if thinking/effort settings changed
-    const thinkingChanged =
-      process.thinking?.type !== (modelSettings?.thinking?.type ?? undefined);
-    const effortChanged = process.effort !== modelSettings?.effort;
-    const reasoningEffortChanged =
-      process.requestedReasoningEffort !== modelSettings?.reasoningEffort;
+    const { thinkingChanged, effortChanged, reasoningEffortChanged } =
+      diffReasoningLaunchSettings(process, modelSettings);
 
     if (thinkingChanged || effortChanged || reasoningEffortChanged) {
       if (

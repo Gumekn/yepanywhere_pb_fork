@@ -68,6 +68,11 @@ interface Entry {
   snapshot?: SessionDisplaySnapshot;
   listeners: Set<Emit>;
   sourceSubscription?: RuntimeSessionSubscription | null;
+  /**
+   * Runtime process whose events this entry has already observed, through the
+   * cold source read plus its live subscription.
+   */
+  sourceProcessId?: string;
   controller: AbortController;
   overlay: Map<string, RecordValue>;
   bootstrapReplay: Map<string, RecordValue>;
@@ -111,6 +116,12 @@ function asRecord(value: unknown): RecordValue | undefined {
 }
 function messageContent(message: RecordValue): unknown {
   return asRecord(message.message)?.content ?? message.content;
+}
+/** Deliver a replayed runtime message as one this projection has not seen. */
+function asLiveReplay(type: string, data: unknown): unknown {
+  const message = asRecord(data);
+  if (type !== "message" || message?.isReplay !== true) return data;
+  return { ...message, isReplay: false };
 }
 
 function isCursorTrackedMessage(
@@ -547,12 +558,13 @@ export class SessionDisplayService {
   private async initialize(entry: Entry): Promise<void> {
     // Attach before reading history. Subscription replay is kept on the server;
     // subsequent live events are overlaid after the cold source read.
-    if (
-      !entry.selection.branchId &&
-      (await this.options.runtime.getProcessForSession(
-        entry.selection.sessionId,
-      ))
-    ) {
+    const process = entry.selection.branchId
+      ? null
+      : await this.options.runtime.getProcessForSession(
+          entry.selection.sessionId,
+        );
+    if (process) {
+      entry.sourceProcessId = process.id;
       entry.sourceSubscription = await this.options.runtime.subscribeSession(
         entry.selection.sessionId,
         (type, data) => this.event(entry, type, data),
@@ -1709,20 +1721,36 @@ export class SessionDisplayService {
           )
         )
           await this.refresh(entry, false);
-        if (
-          !entry.sourceSubscription &&
-          !entry.selection.branchId &&
-          entry.listeners.size &&
-          (await this.options.runtime.getProcessForSession(
-            entry.selection.sessionId,
-          ))
-        ) {
-          entry.sourceSubscription =
-            await this.options.runtime.subscribeSession(
-              entry.selection.sessionId,
-              (type, data) => this.event(entry, type, data),
-              { signal: entry.controller.signal, displayProjection: true },
-            );
+        if (!entry.sourceSubscription && !entry.selection.branchId) {
+          const process = entry.listeners.size
+            ? await this.options.runtime.getProcessForSession(
+                entry.selection.sessionId,
+              )
+            : null;
+          if (process) {
+            // A different process started after this projection was built
+            // (idle resume, settings restart). Its buffered events, including
+            // the prompt it was started with, were emitted before this attach
+            // and are absent from native history that persists them late, so
+            // they are live news here. Resubscribing to the same process keeps
+            // treating replay as already-seen history.
+            const unseenProcess = process.id !== entry.sourceProcessId;
+            entry.sourceProcessId = process.id;
+            entry.sourceSubscription =
+              await this.options.runtime.subscribeSession(
+                entry.selection.sessionId,
+                (type, data) =>
+                  this.event(
+                    entry,
+                    type,
+                    unseenProcess ? asLiveReplay(type, data) : data,
+                  ),
+                { signal: entry.controller.signal, displayProjection: true },
+              );
+            // Reconcile the recovered events against what native history
+            // already persisted, instead of waiting for its next change.
+            if (unseenProcess) await this.refresh(entry, true);
+          }
         }
       } catch {
         this.emit(entry, "display-sync", { state: "retrying" });
