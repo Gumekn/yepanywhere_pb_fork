@@ -4,7 +4,7 @@ import { basename, dirname, join } from "node:path";
 import type { UrlProjectId } from "@yep-anywhere/shared";
 import type { ZCodeSessionInfo } from "../projects/zcode-scanner.js";
 import { CURSOR_ACP_SESSIONS_DIR } from "../sessions/cursor-reader.js";
-import { listMcodeSessionRecords } from "../sessions/mcode-store.js";
+import { findMcodeSessionRecord } from "../sessions/mcode-store.js";
 import { normalizeProviderGroup } from "../sessions/provider-groups.js";
 import type { Project } from "../supervisor/types.js";
 
@@ -472,9 +472,7 @@ export class FocusedSessionWatchManager {
       }
 
       if (provider === "mcode") {
-        const record = (await listMcodeSessionRecords()).find(
-          (candidate) => candidate.sessionId === target.sessionId,
-        );
+        const record = await findMcodeSessionRecord(target.sessionId);
         if (record && (await this.fileExists(record.messagesPath))) {
           return { filePath: record.messagesPath, provider };
         }

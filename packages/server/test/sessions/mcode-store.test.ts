@@ -5,6 +5,7 @@ import type { UrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, describe, expect, it } from "vitest";
 import { McodeSessionReader } from "../../src/sessions/mcode-reader.js";
 import {
+  findMcodeSessionRecord,
   listMcodeSessionRecords,
   mcodeSessionIdFromWatchPath,
   parseMcodeMessagesJsonl,
@@ -232,6 +233,19 @@ describe("MiniMax Code session store", () => {
     expect(records[0]?.messagesPath).toBe(
       join(store.sessionsDir, historyDirFor("mvs_root"), "messages.jsonl"),
     );
+
+    // The single-row lookup applies the same catalog filters.
+    expect(await findMcodeSessionRecord("mvs_root", store)).toEqual(records[0]);
+    for (const id of [
+      "mvs_task",
+      "mvs_hidden",
+      "mvs_archived",
+      "mvs_default",
+      "mvs_empty",
+      "mvs_missing",
+    ]) {
+      expect(await findMcodeSessionRecord(id, store)).toBeNull();
+    }
   });
 
   it("refuses history directories that escape the sessions root", () => {
@@ -359,6 +373,11 @@ describe("MiniMax Code session store", () => {
     expect(
       (session.entries[0] as { message: { content: unknown } }).message.content,
     ).toEqual([{ type: "text", text: "Q: Which planet?\nA: Mars" }]);
+
+    // Rows without a recorded range must not leak the XML envelope either.
+    expect(
+      readMcodeGenuineUserText({ content: [{ type: "text", text }] }),
+    ).toBe("Q: Which planet?\nA: Mars");
   });
 
   it("decodes session ids from watched history paths", () => {

@@ -15,7 +15,7 @@ import type { ProjectScanner } from "../projects/scanner.js";
 import { cursorSessionIdFromWatchPath } from "../sessions/cursor-reader.js";
 import { parseCursorMetaJson } from "../sessions/cursor-store.js";
 import {
-  listMcodeSessionRecords,
+  findMcodeSessionRecord,
   mcodeSessionIdFromWatchPath,
 } from "../sessions/mcode-store.js";
 import {
@@ -663,9 +663,7 @@ export class ExternalSessionTracker {
 
     if (this.isInAbortGracePeriod(sessionId)) return;
 
-    const record = (await listMcodeSessionRecords()).find(
-      (candidate) => candidate.sessionId === sessionId,
-    );
+    const record = await findMcodeSessionRecord(sessionId);
     if (!record) return;
 
     await this.handleUnownedSessionActivity(sessionId, {

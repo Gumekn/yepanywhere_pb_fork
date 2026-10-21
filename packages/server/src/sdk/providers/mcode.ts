@@ -40,6 +40,7 @@ import type { ModelInfo } from "@yep-anywhere/shared";
 import { getLogger } from "../../logging/logger.js";
 import {
   MCODE_DATA_DIR,
+  findMcodeSessionRecord,
   getMcodeTranscriptStats,
   listMcodeSessionRecords,
   summarizeMcodeQuestionnaireResponse,
@@ -1160,9 +1161,7 @@ async function waitForMcodeContinuation(
   answeredAt: number,
   signal: AbortSignal,
 ): Promise<void> {
-  const record = (await listMcodeSessionRecords()).find(
-    (candidate) => candidate.sessionId === sessionId,
-  );
+  const record = await findMcodeSessionRecord(sessionId);
   if (!record) return;
   const deadline = Date.now() + CONTINUATION_TIMEOUT_MS;
   let lastStamp = "";

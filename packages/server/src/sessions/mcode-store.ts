@@ -130,12 +130,54 @@ export interface McodeStoreOptions {
 }
 
 /**
- * List user-facing root conversations from the runtime catalog.
+ * Catalog filter for user-facing root conversations.
  *
  * Subagent (`task`), cron, peek and channel sessions, hidden/archived rows and
  * rows without a materialized history directory are excluded — they are not
  * resumable top-level conversations.
  */
+const MCODE_SESSION_SELECT = `SELECT session_id, workspace_dir, title, created_at_ms, updated_at_ms,
+                  status, is_default_workspace, history_relative_dir
+             FROM local_runtime_sessions
+            WHERE columnar_version = 3
+              AND archived = 0
+              AND visibility <> 'hidden'
+              AND session_kind = 'conversation'
+              AND parent_session_id IS NULL
+              AND history_relative_dir IS NOT NULL
+              AND workspace_dir IS NOT NULL`;
+
+async function toMcodeSessionRecord(
+  row: Record<string, unknown>,
+  sessionsDir: string,
+  includeDefault: boolean,
+): Promise<McodeSessionRecord | null> {
+  const sessionId = asString(row.session_id);
+  const cwd = asString(row.workspace_dir);
+  const relativeDir = asString(row.history_relative_dir);
+  if (!sessionId || !cwd || !relativeDir) return null;
+  if (!includeDefault && asNumber(row.is_default_workspace) === 1) return null;
+  const historyDir = resolveMcodeHistoryDir(relativeDir, sessionsDir);
+  if (!historyDir) return null;
+  const messagesPath = join(historyDir, "messages.jsonl");
+  // session/new materializes an empty transcript immediately; a session the
+  // user never prompted is not a conversation worth listing.
+  const stats = await getMcodeTranscriptStats(messagesPath);
+  if (!stats || stats.size === 0) return null;
+  const createdAtMs = asNumber(row.created_at_ms) ?? 0;
+  return {
+    sessionId,
+    cwd,
+    title: asString(row.title),
+    createdAtMs,
+    updatedAtMs: asNumber(row.updated_at_ms) ?? createdAtMs,
+    status: asString(row.status),
+    historyDir,
+    messagesPath,
+  };
+}
+
+/** List user-facing root conversations from the runtime catalog. */
 export async function listMcodeSessionRecords(
   options: McodeStoreOptions = {},
 ): Promise<McodeSessionRecord[]> {
@@ -146,50 +188,40 @@ export async function listMcodeSessionRecords(
     dbPath,
     [],
     (db) =>
-      db
-        .prepare(
-          `SELECT session_id, workspace_dir, title, created_at_ms, updated_at_ms,
-                  status, is_default_workspace, history_relative_dir
-             FROM local_runtime_sessions
-            WHERE columnar_version = 3
-              AND archived = 0
-              AND visibility <> 'hidden'
-              AND session_kind = 'conversation'
-              AND parent_session_id IS NULL
-              AND history_relative_dir IS NOT NULL
-              AND workspace_dir IS NOT NULL
-            ORDER BY updated_at_ms DESC`,
-        )
-        .all(),
+      db.prepare(`${MCODE_SESSION_SELECT} ORDER BY updated_at_ms DESC`).all(),
   );
 
   const records: McodeSessionRecord[] = [];
   for (const row of rows) {
-    const sessionId = asString(row.session_id);
-    const cwd = asString(row.workspace_dir);
-    const relativeDir = asString(row.history_relative_dir);
-    if (!sessionId || !cwd || !relativeDir) continue;
-    if (!includeDefault && asNumber(row.is_default_workspace) === 1) continue;
-    const historyDir = resolveMcodeHistoryDir(relativeDir, sessionsDir);
-    if (!historyDir) continue;
-    const messagesPath = join(historyDir, "messages.jsonl");
-    // session/new materializes an empty transcript immediately; a session the
-    // user never prompted is not a conversation worth listing.
-    const stats = await getMcodeTranscriptStats(messagesPath);
-    if (!stats || stats.size === 0) continue;
-    const createdAtMs = asNumber(row.created_at_ms) ?? 0;
-    records.push({
-      sessionId,
-      cwd,
-      title: asString(row.title),
-      createdAtMs,
-      updatedAtMs: asNumber(row.updated_at_ms) ?? createdAtMs,
-      status: asString(row.status),
-      historyDir,
-      messagesPath,
-    });
+    const record = await toMcodeSessionRecord(row, sessionsDir, includeDefault);
+    if (record) records.push(record);
   }
   return records;
+}
+
+/**
+ * Look up one conversation by id. Hot paths (file-change events, focused
+ * watches, continuation polling) use this instead of scanning the whole
+ * catalog, so their cost stays one indexed row plus one stat().
+ */
+export async function findMcodeSessionRecord(
+  sessionId: string,
+  options: McodeStoreOptions = {},
+): Promise<McodeSessionRecord | null> {
+  const dbPath = options.dbPath ?? MCODE_RUNTIME_DB_PATH;
+  const sessionsDir = options.sessionsDir ?? MCODE_SESSIONS_DIR;
+  const row = await withSqliteDatabase<Record<string, unknown> | undefined>(
+    dbPath,
+    undefined,
+    (db) =>
+      db.prepare(`${MCODE_SESSION_SELECT} AND session_id = ?`).get(sessionId),
+  );
+  if (!row) return null;
+  return toMcodeSessionRecord(
+    row,
+    sessionsDir,
+    includeDefaultWorkspaceSessions(),
+  );
 }
 
 export async function getMcodeTranscriptStats(
@@ -288,7 +320,12 @@ export function readMcodeGenuineUserText(
       return content.slice(startOffset, endOffset);
     }
   }
-  return stripGeneratedBlocks(joinedText(message.content));
+  // Without a recorded range a questionnaire answer would otherwise surface
+  // its raw `<questionnaire-response>` XML; keep only the readable summary.
+  const joined = joinedText(message.content);
+  return (
+    summarizeMcodeQuestionnaireResponse(joined) ?? stripGeneratedBlocks(joined)
+  );
 }
 
 export interface McodeTranscriptOptions {
