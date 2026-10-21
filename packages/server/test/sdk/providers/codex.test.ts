@@ -924,6 +924,9 @@ process.stdin.on("data", (chunk) => {
           rmSync(tempDir, { recursive: true, force: true });
         }
       },
+      // Spawns a fake app-server and runs two turns; the inner waitFor allows
+      // 10s, so the default 5s test timeout flakes on loaded CI runners.
+      20_000,
     );
 
     it.each([
