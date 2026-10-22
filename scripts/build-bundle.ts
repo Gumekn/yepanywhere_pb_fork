@@ -455,6 +455,14 @@ await step("Bundle Yep Feishu MCP", () => {
   );
 });
 
+await step("Bundle Codex model routing launcher", () => {
+  fs.cpSync(
+    path.join(SERVER_PACKAGE, "resources/codex-model-proxy"),
+    path.join(STAGING_DIR, "resources/codex-model-proxy"),
+    { recursive: true },
+  );
+});
+
 // Generate the bundle package.json in staging without modifying the workspace.
 await step("Generate bundle package.json", () => {
   log("Generating bundle package.json...");

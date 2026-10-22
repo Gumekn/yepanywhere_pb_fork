@@ -184,6 +184,9 @@ importers:
       http-proxy:
         specifier: ^1.18.1
         version: 1.18.1
+      https-proxy-agent:
+        specifier: 7.0.6
+        version: 7.0.6
       marked:
         specifier: ^17.0.1
         version: 17.0.4

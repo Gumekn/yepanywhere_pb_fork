@@ -7,6 +7,10 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ## [Unreleased]
 
+### Fixed
+- 新增 Codex 模型专用代理启动入口：仅将 OpenAI Responses 推理、压缩和摘要请求送往远端代理，MCP、命令工具和同源非推理接口使用本机网络；保留内置 provider、登录方式和流式/WebSocket 传输，避免通用代理环境导致内网飞书 MCP 初始化超时。
+- 修复经模型专用代理启动的 Codex 会话在任务已完成后仍一直显示运行中：代理启动器的转发模块首次处理请求时会触发 Node 初始化 `process.stdout`，把与 Codex 共享的协议 stdout 改为非阻塞；Codex 写出较大的事件（如飞书文档等大体积 MCP 结果）时遇到 `EAGAIN`，写线程随即退出，之后的事件和 `turn/completed` 都不再送达。启动器现在不会在协议 stdin/stdout 上打开句柄。
+
 ## [2026.10.0] - 2026-10-21
 
 ### Added
