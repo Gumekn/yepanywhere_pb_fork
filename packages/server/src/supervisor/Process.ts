@@ -61,6 +61,8 @@ export interface ProcessQueueMessageOptions {
   allowSteer?: boolean;
   /** Finish interrupting the active turn before admitting this input. */
   interruptBeforeSend?: boolean;
+  /** Internal: the active turn has ended, so admit the input as the next turn. */
+  turnEnded?: boolean;
 }
 
 /**
@@ -147,6 +149,11 @@ export interface ProcessConstructorOptions extends ProcessOptions {
    * Returns false when steering is unavailable and caller should enqueue.
    */
   steerFn?: (message: UserMessage) => Promise<AgentSteerResult>;
+  /**
+   * The provider reads queued input only after the active turn ends. Input
+   * sent during a turn is held as deferred so it is not published as started.
+   */
+  defersInputDuringTurn?: boolean;
   /** Capability-gated Codex app-server controls for this session. */
   codexControls?: CodexSessionControls;
   sideConversations?: SideConversationControl;
@@ -261,6 +268,7 @@ export class Process {
   private interruptFn: (() => Promise<void>) | null;
   /** Function to steer an active turn (provider-specific, currently Codex app-server) */
   private steerFn: ((message: UserMessage) => Promise<AgentSteerResult>) | null;
+  private readonly defersInputDuringTurn: boolean;
   readonly sideConversations?: SideConversationControl;
   private codexControls: CodexSessionControls | null;
 
@@ -369,6 +377,7 @@ export class Process {
     this.setMaxThinkingTokensFn = options.setMaxThinkingTokensFn ?? null;
     this.interruptFn = options.interruptFn ?? null;
     this.steerFn = options.steerFn ?? null;
+    this.defersInputDuringTurn = options.defersInputDuringTurn === true;
     this.codexControls = options.codexControls ?? null;
     this.sideConversations = options.sideConversations;
     this.supportedModelsFn = options.supportedModelsFn ?? null;
@@ -1307,6 +1316,29 @@ export class Process {
       return this.interruptAndQueueMessage(message);
     }
 
+    // A provider like Cursor only reads its queue once the active turn ends.
+    // Pushing there now would publish the prompt as if it had started, so the
+    // live turn's output renders under a question it does not answer until
+    // native history moves it back. Hold it visibly as deferred instead; it is
+    // admitted (and published) when the turn ends.
+    if (
+      this.messageQueue &&
+      this.defersInputDuringTurn &&
+      !this.steerFn &&
+      !options.turnEnded &&
+      this._state.type !== "idle"
+    ) {
+      if (
+        !message.tempId ||
+        !this.deferredQueue.some(
+          (entry) => entry.message.tempId === message.tempId,
+        )
+      ) {
+        this.deferMessage(message);
+      }
+      return { success: true, position: this.deferredQueue.length };
+    }
+
     // Create user message with UUID - this UUID will be used by both SSE and SDK
     const uuid = randomUUID();
     const messageWithUuid = { ...message, uuid };
@@ -1440,7 +1472,10 @@ export class Process {
       ]);
       // Re-check transport/queue liveness and force a fresh provider turn.
       // Never fall back to steer after an interrupt failure.
-      return await this.queueMessage(message, { allowSteer: false });
+      return await this.queueMessage(message, {
+        allowSteer: false,
+        turnEnded: true,
+      });
     } catch (error) {
       getLogger().warn(
         {
@@ -2504,7 +2539,10 @@ export class Process {
     const next = this.deferredQueue.shift();
     if (next) {
       this.emitDeferredQueueChange();
-      void this.queueMessage(next.message, { allowSteer: false })
+      void this.queueMessage(next.message, {
+        allowSteer: false,
+        turnEnded: true,
+      })
         .then((result) => {
           if (result.success || this._state.type === "terminated") return;
           getLogger().warn(

@@ -164,6 +164,8 @@ export class CursorProvider implements AgentProvider {
   readonly supportsThinkingToggle = false;
   // Reasoning lives in the model id parameters (`reasoning_effort=...`).
   readonly usesReasoningLaunchSettings = false;
+  // runSession reads the next prompt only after streamPrompt finishes.
+  readonly defersInputDuringTurn = true;
   readonly supportsSlashCommands = false;
 
   async isInstalled(): Promise<boolean> {

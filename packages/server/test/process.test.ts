@@ -268,6 +268,70 @@ describe("Process", () => {
       await process.abort();
     });
 
+    it("defers input sent during a turn until a queue-between-turns provider finishes it", async () => {
+      const queue = new MessageQueue();
+      let completeFirstTurn!: () => void;
+      const firstTurnGate = new Promise<void>((resolve) => {
+        completeFirstTurn = resolve;
+      });
+      let markFirstTurnStarted!: () => void;
+      const firstTurnStarted = new Promise<void>((resolve) => {
+        markFirstTurnStarted = resolve;
+      });
+      async function* cursorLikeIterator(): AsyncGenerator<SDKMessage> {
+        for await (const message of queue.generator()) {
+          yield { ...message, session_id: "sess-1" } as SDKMessage;
+          markFirstTurnStarted();
+          if (message.message?.content === "first") await firstTurnGate;
+          yield { type: "result", session_id: "sess-1" };
+        }
+      }
+      const process = new Process(cursorLikeIterator(), {
+        projectPath: "/test",
+        projectId: "proj-1",
+        sessionId: "sess-1",
+        provider: "cursor",
+        idleTimeoutMs: 60_000,
+        queue,
+        defersInputDuringTurn: true,
+      });
+      const prompts: string[] = [];
+      process.subscribe((event) => {
+        if (
+          event.type === "message" &&
+          event.message.type === "user" &&
+          event.message.isOptimistic === true
+        )
+          prompts.push(String(event.message.message?.content));
+      });
+
+      // Like a fresh session, the first prompt goes to the provider directly.
+      queue.push({ text: "first", uuid: "first-uuid" });
+      await firstTurnStarted;
+      await expect(
+        process.queueMessage({ text: "second", tempId: "temp-2" }),
+      ).resolves.toMatchObject({ success: true });
+      // Not published as started, not in the provider queue, but visible.
+      expect(prompts).toEqual([]);
+      expect(queue.depth).toBe(0);
+      expect(process.getDeferredQueueSummary()).toMatchObject([
+        { tempId: "temp-2", content: "second" },
+      ]);
+      // A retried POST does not queue it twice.
+      await process.queueMessage({ text: "second", tempId: "temp-2" });
+      expect(process.getDeferredQueueSummary()).toHaveLength(1);
+
+      completeFirstTurn();
+      await vi.waitFor(() => {
+        expect(prompts).toEqual(["second"]);
+      });
+      expect(process.getDeferredQueueSummary()).toHaveLength(0);
+      await vi.waitFor(() => {
+        expect(process.state.type).toBe("idle");
+      });
+      await process.abort();
+    });
+
     it("queues messages and returns position", async () => {
       const iterator = createMockIterator([
         { type: "system", session_id: "sess-1" },

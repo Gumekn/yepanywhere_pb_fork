@@ -250,6 +250,12 @@ export interface AgentProvider {
    * in the model id ignore them, so a difference must not restart the process.
    */
   readonly usesReasoningLaunchSettings?: boolean;
+  /**
+   * Whether input sent during a turn waits until that turn ends (no steering;
+   * the session loop reads its queue between turns). Such input is held as
+   * deferred instead of being published as an already-started prompt.
+   */
+  readonly defersInputDuringTurn?: boolean;
   /** Whether this provider supports slash commands (default: false) */
   readonly supportsSlashCommands: boolean;
 

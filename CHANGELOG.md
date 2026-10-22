@@ -8,6 +8,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 ## [Unreleased]
 
 ### Fixed
+- 修复 Cursor 在任务进行中追加消息后，当前任务的思考和工具调用闪现在新提问下方又被挪回上方，新提问下只剩「思考中」直到上一轮结束：Cursor 只在当前回合结束后才读取下一条输入，这类消息现在进入服务端排队并在队列中展示，当前回合结束后再作为新提问发出，当前任务的过程继续在原提问下实时展示。
 - 新增 Codex 模型专用代理启动入口：仅将 OpenAI Responses 推理、压缩和摘要请求送往远端代理，MCP、命令工具和同源非推理接口使用本机网络；保留内置 provider、登录方式和流式/WebSocket 传输，避免通用代理环境导致内网飞书 MCP 初始化超时。
 - 修复经模型专用代理启动的 Codex 会话在任务已完成后仍一直显示运行中：代理启动器的转发模块首次处理请求时会触发 Node 初始化 `process.stdout`，把与 Codex 共享的协议 stdout 改为非阻塞；Codex 写出较大的事件（如飞书文档等大体积 MCP 结果）时遇到 `EAGAIN`，写线程随即退出，之后的事件和 `turn/completed` 都不再送达。启动器现在不会在协议 stdin/stdout 上打开句柄。
 
