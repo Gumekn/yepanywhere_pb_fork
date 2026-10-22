@@ -28,6 +28,22 @@ describe("static frontend routes", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
+  it("answers unknown API paths with a JSON 404 instead of the SPA shell", async () => {
+    const routes = createStaticRoutes({ distPath: tempDir, basePath: "/yep" });
+    for (const url of ["/yep/api/dev/status", "/yep/api", "/yep/api/"]) {
+      const response = await routes.request(url);
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({
+        error: "Not found",
+        code: "API_NOT_FOUND",
+      });
+    }
+    // Client routes that merely start with "api" still get the shell.
+    const shell = await routes.request("/yep/apiary");
+    expect(shell.status).toBe(200);
+    expect(await shell.text()).toContain("app");
+  });
+
   it("serves Vite hashed assets with long browser and CDN cache headers", async () => {
     await writeFile(
       path.join(tempDir, "assets", "index-CREDb_As.js"),

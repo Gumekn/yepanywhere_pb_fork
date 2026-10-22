@@ -1,6 +1,9 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useReloadNotifications } from "../useReloadNotifications";
+import {
+  resetDevStatusAvailabilityForTests,
+  useReloadNotifications,
+} from "../useReloadNotifications";
 
 const mocks = vi.hoisted(() => ({
   listeners: new Map<string, (data: unknown) => void>(),
@@ -36,6 +39,31 @@ vi.mock("../../lib/activityBus", () => ({
 afterEach(() => {
   cleanup();
   mocks.listeners.clear();
+  resetDevStatusAvailabilityForTests();
+});
+
+describe("dev status availability", () => {
+  it("stops asking for /dev/status after the server answers 404", async () => {
+    mocks.fetchJSON.mockImplementation(async (path) => {
+      if (path === "/dev/status")
+        throw Object.assign(new Error("Not found"), { status: 404 });
+      return { activeWorkers: 0, queueLength: 0, hasActiveWork: false };
+    });
+    renderHook(() => useReloadNotifications());
+    await waitFor(() =>
+      expect(mocks.fetchJSON).toHaveBeenCalledWith("/status/workers"),
+    );
+    act(() => mocks.listeners.get("refresh")?.(undefined));
+    act(() => mocks.listeners.get("refresh")?.(undefined));
+    await waitFor(() =>
+      expect(
+        mocks.fetchJSON.mock.calls.filter(([p]) => p === "/status/workers"),
+      ).toHaveLength(3),
+    );
+    expect(
+      mocks.fetchJSON.mock.calls.filter(([p]) => p === "/dev/status"),
+    ).toHaveLength(1);
+  });
 });
 
 describe("reload runtime topology", () => {

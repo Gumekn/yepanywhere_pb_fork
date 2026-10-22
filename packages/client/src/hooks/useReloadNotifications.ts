@@ -29,6 +29,16 @@ interface DevStatus {
 }
 
 /**
+ * Production servers do not expose /dev/status and answer 404. Remember that
+ * for this page instead of asking again on every reconnect.
+ */
+let devStatusUnavailable = false;
+
+export function resetDevStatusAvailabilityForTests(): void {
+  devStatusUnavailable = false;
+}
+
+/**
  * Hook to manage reload notifications when running in manual reload mode.
  * Listens for source-change events via the global activityBus.
  */
@@ -81,18 +91,19 @@ export function useReloadNotifications() {
     }
 
     // Sync dev status
-    fetchJSON<DevStatus>("/dev/status")
-      .then((data) => {
-        setDevStatus(data);
-        setPendingReloads((prev) => ({
-          ...prev,
-          backend: data.backendDirty === true,
-        }));
-        applyRuntimeDirtyStatus(data);
-      })
-      .catch(() => {
-        // Ignore errors
-      });
+    if (!devStatusUnavailable)
+      fetchJSON<DevStatus>("/dev/status")
+        .then((data) => {
+          setDevStatus(data);
+          setPendingReloads((prev) => ({
+            ...prev,
+            backend: data.backendDirty === true,
+          }));
+          applyRuntimeDirtyStatus(data);
+        })
+        .catch((error: { status?: number }) => {
+          if (error?.status === 404) devStatusUnavailable = true;
+        });
 
     // Sync worker activity
     fetchJSON<WorkerActivityEvent>("/status/workers")
@@ -166,7 +177,11 @@ export function useReloadNotifications() {
 
   useEffect(() => {
     if (devStatus?.runtimeMode !== "external") return;
-    const interval = setInterval(syncFromServer, 2_000);
+    const interval = setInterval(() => {
+      // Visibility restore triggers a refresh through the activity bus.
+      if (typeof document !== "undefined" && document.hidden) return;
+      syncFromServer();
+    }, 2_000);
     return () => clearInterval(interval);
   }, [devStatus?.runtimeMode, syncFromServer]);
 
