@@ -361,25 +361,74 @@ export function handleSessionSubscribe(
               console.error("[WS] Error in session subscription:", err);
             },
           });
-  return subscribe.then((subscription) => {
-    if (subscriptions.get(subscriptionId) !== pendingCleanup) {
-      subscription?.cleanup();
-      return;
-    }
-    if (!subscription) {
+  return subscribe.then(
+    (subscription) => {
+      if (subscriptions.get(subscriptionId) !== pendingCleanup) {
+        subscription?.cleanup();
+        return;
+      }
+      if (!subscription) {
+        subscriptions.delete(subscriptionId);
+        send({
+          type: "response",
+          id: subscriptionId,
+          status: 404,
+          body: { error: "No active process for session" },
+        });
+        return;
+      }
+
+      subscriptions.set(subscriptionId, () => subscription.cleanup());
+      console.log(
+        `[WS] Subscribed to session ${sessionId} (${subscriptionId})`,
+      );
+    },
+    (error: unknown) => {
+      // Answer with the real status. A generic 500 makes clients treat a
+      // missing session as a transient failure and retry it indefinitely.
+      // Already unsubscribed (page left): nobody is waiting for the answer.
+      if (subscriptions.get(subscriptionId) !== pendingCleanup) return;
       subscriptions.delete(subscriptionId);
+      const status = subscriptionErrorStatus(error);
+      if (status >= 500)
+        console.error(
+          `[WS] Session subscription failed (${subscriptionId}):`,
+          error,
+        );
+      else
+        console.warn(
+          `[WS] Session subscription rejected (${status}, ${subscriptionId}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      const code = (error as { code?: unknown } | null)?.code;
       send({
         type: "response",
         id: subscriptionId,
-        status: 404,
-        body: { error: "No active process for session" },
+        status,
+        body: {
+          error:
+            status >= 500
+              ? "Internal server error"
+              : error instanceof Error
+                ? error.message
+                : String(error),
+          ...(typeof code === "string" ? { code } : {}),
+        },
       });
-      return;
-    }
+    },
+  );
+}
 
-    subscriptions.set(subscriptionId, () => subscription.cleanup());
-    console.log(`[WS] Subscribed to session ${sessionId} (${subscriptionId})`);
-  });
+/** HTTP-style status carried by route errors (e.g. SESSION_NOT_FOUND → 404). */
+function subscriptionErrorStatus(error: unknown): number {
+  const status = (error as { status?: unknown } | null)?.status;
+  return typeof status === "number" &&
+    Number.isInteger(status) &&
+    status >= 400 &&
+    status <= 599
+    ? status
+    : 500;
 }
 
 /**

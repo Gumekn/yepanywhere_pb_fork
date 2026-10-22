@@ -2,11 +2,16 @@ import type { SessionDisplaySubscriptionOptions } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type Subscription,
+  SubscriptionError,
   connectionManager,
   getWebSocketConnection,
   isNonRetryableError,
 } from "../lib/connection";
 import { isMobileShellDocument } from "../lib/nativePushBridge";
+
+/** Backoff for retrying one failed subscription on a healthy connection. */
+const SUBSCRIPTION_RETRY_BASE_MS = 1_000;
+const SUBSCRIPTION_RETRY_MAX_MS = 30_000;
 
 interface UseSessionStreamOptions {
   display?: SessionDisplaySubscriptionOptions;
@@ -60,6 +65,15 @@ export function useSessionStream(
   // True during intentional cleanup — suppresses reconnect in onClose handler
   const cleaningUpRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const subscriptionRetryRef = useRef<{
+    attempts: number;
+    timer: ReturnType<typeof setTimeout> | null;
+  }>({ attempts: 0, timer: null });
+  const clearSubscriptionRetry = useCallback(() => {
+    const retry = subscriptionRetryRef.current;
+    if (retry.timer !== null) clearTimeout(retry.timer);
+    retry.timer = null;
+  }, []);
 
   const connect = useCallback(() => {
     if (
@@ -96,6 +110,9 @@ export function useSessionStream(
 
     connectWithConnection(sessionId, getWebSocketConnection());
   }, [sessionId, displayKey]);
+
+  const connectRef = useRef(connect);
+  connectRef.current = connect;
 
   /**
    * Connect using the local WebSocket connection.
@@ -167,6 +184,7 @@ export function useSessionStream(
         },
         onOpen: () => {
           if (isStale()) return;
+          subscriptionRetryRef.current.attempts = 0;
           setConnected(true);
           connectionManager.markConnected();
           optionsRef.current.onOpen?.();
@@ -184,6 +202,26 @@ export function useSessionStream(
               "[useSessionStream] Non-retryable error, not reconnecting:",
               error.message,
             );
+            return;
+          }
+          // The server answered, so the shared socket is healthy. Retry only
+          // this subscription; reconnecting the whole transport would tear
+          // down every other subscription and loop on a persistent failure.
+          if (error instanceof SubscriptionError) {
+            const retry = subscriptionRetryRef.current;
+            const delay = Math.min(
+              SUBSCRIPTION_RETRY_MAX_MS,
+              SUBSCRIPTION_RETRY_BASE_MS * 2 ** retry.attempts,
+            );
+            retry.attempts += 1;
+            console.warn(
+              `[useSessionStream] Subscription failed (${error.status}); retrying in ${delay}ms`,
+            );
+            if (retry.timer !== null) clearTimeout(retry.timer);
+            retry.timer = setTimeout(() => {
+              retry.timer = null;
+              connectRef.current();
+            }, delay);
             return;
           }
           connectionManager.handleError(error);
@@ -213,6 +251,7 @@ export function useSessionStream(
   useEffect(() => {
     return connectionManager.on("stateChange", (state) => {
       if (state === "reconnecting" || state === "disconnected") {
+        clearSubscriptionRetry();
         // Proactively tear down the session subscription. Without this,
         // the "connected" stateChange can fire before the old subscription's
         // onClose, causing the !wsSubscriptionRef.current guard to skip
@@ -230,7 +269,7 @@ export function useSessionStream(
         connect();
       }
     });
-  }, [sessionId, connect]);
+  }, [sessionId, connect, clearSubscriptionRetry]);
 
   // Force reconnect (e.g., after process restart)
   const reconnect = useCallback(() => {
@@ -256,6 +295,8 @@ export function useSessionStream(
     connect();
 
     return () => {
+      clearSubscriptionRetry();
+      subscriptionRetryRef.current.attempts = 0;
       // Set flag BEFORE close() so onClose handler doesn't schedule a ghost reconnect
       cleaningUpRef.current = true;
       if (reconnectTimerRef.current !== null) {
@@ -269,7 +310,7 @@ export function useSessionStream(
       mountedSessionIdRef.current = null;
       cleaningUpRef.current = false;
     };
-  }, [connect]);
+  }, [connect, clearSubscriptionRetry]);
 
   return { connected, reconnect };
 }

@@ -165,4 +165,89 @@ describe("WebSocket handlers", () => {
     expect(subscriptions.has("sub-race")).toBe(false);
     expect(send).not.toHaveBeenCalled();
   });
+
+  describe("session subscription failures", () => {
+    function displayRejecting(error: unknown) {
+      return {
+        subscribe: vi.fn(async () => {
+          throw error;
+        }),
+      } as unknown as Parameters<typeof handleSessionSubscribe>[4];
+    }
+    const msg = {
+      type: "subscribe" as const,
+      subscriptionId: "sub-missing",
+      channel: "session" as const,
+      sessionId: "gone",
+      display: { projectId: "project" },
+    };
+
+    it("answers a missing session with its 404 instead of a generic 500", async () => {
+      const subscriptions = new Map<string, () => void>();
+      const send = vi.fn();
+      const notFound = Object.assign(new Error("Session not found"), {
+        status: 404,
+        code: "SESSION_NOT_FOUND",
+      });
+      await handleSessionSubscribe(
+        subscriptions,
+        msg,
+        send,
+        {} as RuntimeController,
+        displayRejecting(notFound),
+      );
+      expect(send).toHaveBeenCalledWith({
+        type: "response",
+        id: "sub-missing",
+        status: 404,
+        body: { error: "Session not found", code: "SESSION_NOT_FOUND" },
+      });
+      expect(subscriptions.has("sub-missing")).toBe(false);
+    });
+
+    it("hides internal errors behind a 500", async () => {
+      const send = vi.fn();
+      await handleSessionSubscribe(
+        new Map(),
+        msg,
+        send,
+        {} as RuntimeController,
+        displayRejecting(new Error("disk exploded at /secret/path")),
+      );
+      expect(send).toHaveBeenCalledWith({
+        type: "response",
+        id: "sub-missing",
+        status: 500,
+        body: { error: "Internal server error" },
+      });
+    });
+
+    it("stays silent when the client already unsubscribed", async () => {
+      const subscriptions = new Map<string, () => void>();
+      const send = vi.fn();
+      let reject!: (error: unknown) => void;
+      const display = {
+        subscribe: vi.fn(
+          () =>
+            new Promise((_resolve, rejectFn) => {
+              reject = rejectFn;
+            }),
+        ),
+      } as unknown as Parameters<typeof handleSessionSubscribe>[4];
+      const pending = handleSessionSubscribe(
+        subscriptions,
+        msg,
+        send,
+        {} as RuntimeController,
+        display,
+      );
+      handleUnsubscribe(subscriptions, {
+        type: "unsubscribe",
+        subscriptionId: "sub-missing",
+      });
+      reject(Object.assign(new Error("gone"), { status: 404 }));
+      await pending;
+      expect(send).not.toHaveBeenCalled();
+    });
+  });
 });
