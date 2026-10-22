@@ -39,7 +39,7 @@ export interface SessionDisplayTimingSink {
 }
 
 /** How the request was served from the display entry cache. */
-export type SessionDisplayCacheState = "hit" | "miss" | "wait";
+export type SessionDisplayCacheState = "hit" | "miss" | "wait" | "revived";
 
 export async function timed<T>(
   timing: SessionDisplayTimingSink | undefined,

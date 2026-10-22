@@ -508,6 +508,12 @@ export function compactDisplayMessage(message: RecordValue): RecordValue {
 export class SessionDisplayService {
   private source?: SessionDisplaySource;
   private entries = new Map<string, Entry>();
+  /**
+   * Settled, unobserved views kept after expiry (oldest first). Reviving one
+   * skips the history read when the source stamp is unchanged.
+   */
+  private dormant = new Map<string, { entry: Entry; bytes: number }>();
+  private dormantBytes = 0;
   constructor(
     private readonly options: {
       runtime: Pick<
@@ -519,6 +525,9 @@ export class SessionDisplayService {
       retentionMs?: number;
       maxEntries?: number;
       slowInitializeMs?: number;
+      /** Settled views kept after expiry; 0 disables dormancy. */
+      maxDormantEntries?: number;
+      maxDormantBytes?: number;
     },
   ) {}
 
@@ -548,10 +557,16 @@ export class SessionDisplayService {
       for (const [oldKey, candidate] of this.entries) {
         if (this.entries.size < max) break;
         if (candidate.snapshot && !candidate.listeners.size)
-          this.drop(oldKey, candidate);
+          this.sleep(oldKey, candidate);
       }
       if (this.entries.size >= max)
         throw new Error("Too many active session displays");
+      const sleeping = this.dormant.get(key);
+      if (sleeping) {
+        this.dormant.delete(key);
+        this.dormantBytes -= sleeping.bytes;
+        return this.revive(key, sleeping.entry, observer);
+      }
       entry = {
         selection,
         view: {
@@ -598,6 +613,127 @@ export class SessionDisplayService {
     observer?.onCacheState?.("hit");
     await entry.ready;
     return entry;
+  }
+
+  /**
+   * Re-activate a dormant view. Its projection is reused only when the source
+   * is provably unchanged: same stamp and still no runtime process. Otherwise
+   * the entry is reset and cold-initialized under a new epoch.
+   */
+  private async revive(
+    key: string,
+    entry: Entry,
+    observer?: SessionDisplayReadObserver,
+  ): Promise<Entry> {
+    entry.controller = new AbortController();
+    entry.initializing = true;
+    this.entries.set(key, entry);
+    const totals = new SessionDisplayPhaseTotals(observer?.timing);
+    const startedAt = performance.now();
+    let revived = false;
+    entry.ready = (async () => {
+      const [stamp, process] = await Promise.all([
+        this.requireSource().stamp(entry.selection, totals),
+        entry.selection.branchId
+          ? null
+          : timed(totals, "attach", () =>
+              this.options.runtime.getProcessForSession(
+                entry.selection.sessionId,
+              ),
+            ),
+      ]);
+      if (!process && stamp === entry.stamp && entry.snapshot) {
+        revived = true;
+        this.poll(entry);
+        this.expire(entry);
+        return;
+      }
+      this.reset(entry);
+      await this.initialize(entry, totals);
+    })()
+      .then(
+        () => {
+          if (!revived) this.logSlowInitialize(entry, totals, startedAt);
+        },
+        (error) => {
+          this.logSlowInitialize(entry, totals, startedAt, error);
+          this.drop(key, entry);
+          throw error;
+        },
+      )
+      .finally(() => {
+        entry.initializing = false;
+      });
+    try {
+      await entry.ready;
+    } finally {
+      observer?.onCacheState?.(revived ? "revived" : "miss");
+    }
+    return entry;
+  }
+
+  /** Forget every derived state so `initialize` starts from scratch. */
+  private reset(entry: Entry): void {
+    entry.view = { ...entry.view, epoch: randomUUID() };
+    entry.model = undefined;
+    entry.snapshot = undefined;
+    entry.stamp = undefined;
+    entry.provider = undefined;
+    entry.streamId = undefined;
+    entry.sourceProcessId = undefined;
+    entry.sourceSubscription = undefined;
+    entry.overlay.clear();
+    entry.bootstrapReplay.clear();
+    entry.controls.clear();
+    entry.details.clear();
+    entry.detailBytes = 0;
+    entry.cursorPendingThoughts = [];
+  }
+
+  /**
+   * Expire an unobserved view. Settled historical views without a live
+   * runtime subscription keep their projection in a bounded dormant cache;
+   * anything that may still change through live events is dropped.
+   */
+  private sleep(key: string, entry: Entry): void {
+    const maxEntries = this.options.maxDormantEntries ?? 32;
+    const state = entry.snapshot?.activity.state;
+    if (
+      maxEntries <= 0 ||
+      entry.listeners.size ||
+      entry.initializing ||
+      entry.refreshing ||
+      entry.sourceSubscription ||
+      !entry.snapshot ||
+      entry.stamp === undefined ||
+      !(
+        state === "completed" ||
+        state === "interrupted" ||
+        state === "failed" ||
+        state === "unknown"
+      )
+    ) {
+      this.drop(key, entry);
+      return;
+    }
+    this.drop(key, entry);
+    // Tool bodies are re-read from history on demand; keep only the projection.
+    entry.details.clear();
+    entry.detailBytes = 0;
+    const bytes = JSON.stringify(entry.snapshot).length * 2 + 4096;
+    const maxBytes = this.options.maxDormantBytes ?? 64 * 1024 * 1024;
+    if (bytes > maxBytes) return;
+    const previous = this.dormant.get(key);
+    if (previous) this.dormantBytes -= previous.bytes;
+    this.dormant.delete(key);
+    this.dormant.set(key, { entry, bytes });
+    this.dormantBytes += bytes;
+    for (const [oldKey, old] of this.dormant) {
+      if (this.dormant.size <= maxEntries && this.dormantBytes <= maxBytes)
+        break;
+      this.dormant.delete(oldKey);
+      this.dormantBytes -= old.bytes;
+    }
   }
 
   private logSlowInitialize(
@@ -1865,7 +2001,7 @@ export class SessionDisplayService {
     if (entry.expiry) clearTimeout(entry.expiry);
     if (entry.listeners.size) return;
     entry.expiry = setTimeout(
-      () => this.drop(this.key(entry.selection), entry),
+      () => this.sleep(this.key(entry.selection), entry),
       this.options.retentionMs ?? 30_000,
     );
     entry.expiry.unref?.();
@@ -1880,6 +2016,8 @@ export class SessionDisplayService {
   }
   dispose(): void {
     for (const [key, entry] of this.entries) this.drop(key, entry);
+    this.dormant.clear();
+    this.dormantBytes = 0;
   }
 
   async subscribe(
