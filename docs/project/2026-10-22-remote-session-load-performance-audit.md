@@ -120,7 +120,7 @@ Pi 会话 snapshot 的组成：549 个节点，其中 5 个 question、217 个 t
 | 3b | P0-3 `resolve` 慢：项目快照允许使用旧版本、runtimeState 去重、子阶段打点 | shell | 已部署（build `…-20261022062911`） |
 | 3c | P0-3 重启场景：持久化项目快照作为首次扫描前的种子 | shell | 已部署并验证 |
 | 4 | P1-1 / P1-2 订阅去重、订阅错误不再重连整条 WS、放宽 pong 超时 | shell + client | 已部署并验证 |
-| 5 | P1-3 / P1-4 冷启动预取、SW 预缓存、轮询修复、`/api` 返回 404 | client + shell | 待做 |
+| 5 | P1-3 / P1-4 冷启动预取、轮询修复、`/api` 返回 404；SW 预缓存不适用 | client + shell | 已实现，未部署 |
 | 6 | P2 按需处理 | – | 待做 |
 
 每一步完成后，用第 1 步的指标做前后对比，结果追加到下文"落地记录"。
@@ -379,6 +379,33 @@ Pi 会话 snapshot 的组成：549 个节点，其中 5 个 question、217 个 t
 - 先通过 HTTP 读取一个大 Pi 会话的视图（原始 274 KB），再带 `known` 订阅：服务端回复 `connected` 和 `display-current`，**线上 236 B**，没有完整 snapshot；之后的 `display-patch` 是该会话的实时更新。
 - 订阅一个不存在的会话：回复 `404 {"code":"SESSION_NOT_FOUND"}`，此前为通用 500。
 
+### 步骤 5：冷启动与轮询（2026-10-22，已实现，未部署）
+
+**更正 §3 P1-4。** 2 s 轮询只在 `/dev/status` 成功并返回 `runtimeMode: "external"` 时才启动，也就是只发生在开发服务上。生产环境中 `devStatus` 始终为 `null`，**不存在** 2 s 轮询。生产环境的实际情况是：挂载时，以及每次 activity 重连或刷新时，各请求一次不存在的 `/dev/status`，并拿到 `200 text/html`。
+
+**5a `/api` 未匹配路由。**
+
+- `createStaticRoutes` 去掉 basePath 后，对 `/api` 和 `/api/*` 返回 `404 {"code":"API_NOT_FOUND"}`，不再返回 SPA shell。`/apiary` 这类前端路由不受影响。
+- `useReloadNotifications`：`/dev/status` 返回 404 后，本页之后不再请求它；开发环境的 2 s 轮询在 `document.hidden` 时跳过。
+
+**5b 冷启动预取。**
+
+- 新增 `lib/sessionPrefetch.ts`。`main.tsx` 在渲染前，如果当前 URL 是 `/projects/:p/sessions/:s`（`?history=legacy` 除外），就立即发起 `display/view` 和 `metadata` 请求，并开始下载 `SessionPage` chunk。
+- `useProjectedSessionMessages` 首次挂载时取用预取结果：每个结果只用一次，按 project/session/branch 匹配，10 s 内有效；预取失败时退回正常读取，包括原有的 409 重试逻辑。
+- 预取的 HTTP 视图安装后，WS 订阅会带上 `known`，服务端只需回复 `display-current`，冷启动时也只传一份完整视图。
+- 公开的 `fetchSessionMetadata` 仍然不接受参数，避免被当作回调传参时误用。
+
+**5c SW 预缓存：不做。** 远程入口是 frp 的纯 TCP 转发（`http://<IP>:18022`），不是 secure context，浏览器不会注册 Service Worker，预缓存对远程访问没有任何收益。hashed 资源本来就带 1 年 immutable 缓存头。如果以后在前面加上 TLS 边缘，再考虑这一项。
+
+暂不做：把最近 1–2 个 snapshot 持久化到 IndexedDB，使 PWA 冷启动时立即显示旧内容。IndexedDB 不要求 secure context，可以作为后续可选项；需要定义容量上限，以及"旧内容 + 同步中"的展示方式。
+
+验证：`pnpm lint`、`pnpm typecheck` 通过；`pnpm test` 中 shared 514、client 1523、server 4360 个用例通过，2 个为原本就跳过的用例；客户端生产构建通过，`SessionPage` 仍是独立的 lazy chunk。新增：
+
+- static：未知 API 路径返回 404，`/apiary` 仍返回 shell；
+- reload：`/dev/status` 返回 404 后不再请求；
+- prefetch：路由解析、一次性取用、过期丢弃、非会话路由不预取、未取用的失败不会变成 unhandled rejection；
+- hook：使用预取结果，不再发起新的请求；预取失败时回退到正常读取。
+
 ## 7. 提交记录（2026-10-22）
 
 | commit | 内容 | 对应步骤 |
@@ -391,6 +418,8 @@ Pi 会话 snapshot 的组成：549 个节点，其中 5 个 question、217 个 t
 | `c00009ae3` | fix(ws): 会话订阅失败不再触发整条连接重连 | 4a |
 | `223663967` | perf(display): 打开会话时不再重复传输完整视图 | 4b |
 | `617952c34` | fix(connection): 放宽前台恢复时的心跳超时到 5 秒 | 4c |
+| `11f54a19a` | fix(api): 未匹配的 /api 路径返回 JSON 404 | 5a |
+| `a1ee01a41` | perf(client): 直接打开会话页时提前预取视图与元信息 | 5b |
 
 每个提交都在"HEAD + 该提交暂存内容"的隔离工作树上（其余改动临时 stash）跑过 `pnpm lint`、`pnpm typecheck` 和相关测试。全部提交之后，工作树与提交前逐字节一致。
 
@@ -403,4 +432,4 @@ Pi 会话 snapshot 的组成：549 个节点，其中 5 个 question、217 个 t
 | 打开会话时的项目查找 | 偶发约 300 ms | 0–0.1 ms |
 | 服务重启后首批打开会话 | 3.4–8.9 s | 0.63–0.78 s |
 
-下一步：步骤 4（订阅去重、重连收敛、订阅错误不再断开整条 WS），然后是步骤 5（客户端冷启动预取与 SW 预缓存、后台轮询修复、`/api` 未匹配路由返回 404）。
+步骤 1–5 均已落地，步骤 5 待部署后复测。可选后续：IndexedDB 持久化最近的 snapshot、Codex 历史 turn 只取 summary、web 进程内存归因（需授权做 heap snapshot）、重连后 `fetchPersistedSessionChanges` 的逐 provider 收敛。
