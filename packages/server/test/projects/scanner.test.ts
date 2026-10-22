@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -640,5 +640,133 @@ describe("ProjectScanner stale-tolerant lookup", () => {
       allowStale: true,
     });
     expect(t.codexScanner.listProjects).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ProjectScanner persisted snapshot seed", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(
+      dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
+    );
+  });
+
+  function codexProject(path: string) {
+    return {
+      id: encodeProjectId(path),
+      path,
+      name: path.split("/").at(-1) ?? path,
+      sessionCount: 1,
+      sessionDir: "/codex/sessions",
+      activeOwnedCount: 0,
+      activeExternalCount: 0,
+      lastActivity: "2025-01-01T00:00:00.000Z",
+      provider: "codex" as const,
+    };
+  }
+
+  /** Background persistence must finish before the temp dir is removed. */
+  async function waitForFreshSeed(cachePath: string, after: number) {
+    await vi.waitFor(async () => {
+      const seed = JSON.parse(await readFile(cachePath, "utf8"));
+      expect(seed).toMatchObject({
+        version: 1,
+        projects: [{ path: "/home/user/known" }],
+      });
+      expect(seed.savedAt).toBeGreaterThanOrEqual(after);
+    });
+    // The rename is followed by a chmod and a directory sync.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  function create(cachePath: string, block = false) {
+    let release: (() => void) | null = null;
+    const codexScanner = {
+      listProjects: vi.fn(async () => {
+        if (block)
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        return [codexProject("/home/user/known")];
+      }),
+      invalidateCache: vi.fn(),
+    } as unknown as CodexSessionScanner;
+    const scanner = new ProjectScanner({
+      projectsDir: join(tmpdir(), `seed-missing-${randomUUID()}`),
+      codexScanner,
+      enableCodex: true,
+      enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
+      enableCursor: false,
+      cacheTtlMs: 60_000,
+      snapshotCachePath: cachePath,
+    });
+    return { scanner, codexScanner, release: () => release?.() };
+  }
+
+  it("serves known projects from the previous run while the first scan runs", async () => {
+    const dir = join(tmpdir(), `scanner-seed-${randomUUID()}`);
+    dirs.push(dir);
+    const cachePath = join(dir, "project-snapshot.json");
+    const id = encodeProjectId("/home/user/known");
+
+    const first = create(cachePath);
+    await first.scanner.listProjects();
+    await vi.waitFor(async () =>
+      expect(
+        JSON.parse(await readFile(cachePath, "utf8")).projects,
+      ).toHaveLength(1),
+    );
+
+    // "Restart": the first scan is blocked, the persisted seed answers.
+    const second = create(cachePath, true);
+    const found = await second.scanner.getOrCreateProject(id, undefined, {
+      allowStale: true,
+    });
+    expect(found?.path).toBe("/home/user/known");
+    // Fresh lookups never use the seed.
+    let freshDone = false;
+    const fresh = second.scanner.getProject(id).then((project) => {
+      freshDone = true;
+      return project;
+    });
+    await vi.waitFor(() =>
+      expect(second.codexScanner.listProjects).toHaveBeenCalled(),
+    );
+    expect(freshDone).toBe(false);
+    const restartedAt = Date.now();
+    second.release();
+    expect((await fresh)?.path).toBe("/home/user/known");
+    await waitForFreshSeed(cachePath, restartedAt);
+  });
+
+  it("ignores corrupt, outdated or foreign seeds", async () => {
+    const dir = join(tmpdir(), `scanner-seed-bad-${randomUUID()}`);
+    dirs.push(dir);
+    await mkdir(dir, { recursive: true });
+    const cachePath = join(dir, "project-snapshot.json");
+    const id = encodeProjectId("/home/user/known");
+    for (const body of [
+      "not json",
+      JSON.stringify({ version: 99, savedAt: Date.now(), projects: [] }),
+      JSON.stringify({
+        version: 1,
+        savedAt: Date.now() - 2 * 24 * 60 * 60 * 1000,
+        projects: [codexProject("/home/user/known")],
+      }),
+    ]) {
+      await writeFile(cachePath, body);
+      const startedAt = Date.now();
+      const { scanner, codexScanner } = create(cachePath);
+      const found = await scanner.getOrCreateProject(id, undefined, {
+        allowStale: true,
+      });
+      // Fell through to a real scan, which then rewrites a valid seed.
+      expect(codexScanner.listProjects).toHaveBeenCalled();
+      expect(found?.path).toBe("/home/user/known");
+      await waitForFreshSeed(cachePath, startedAt);
+    }
   });
 });

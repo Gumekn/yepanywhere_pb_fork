@@ -534,6 +534,9 @@ export function createApp(options: AppOptions): AppResult {
     projectMetadataService: options.projectMetadataService,
     eventBus: options.eventBus,
     cacheTtlMs: options.projectScanCacheTtlMs,
+    snapshotCachePath: options.dataDir
+      ? join(options.dataDir, "indexes", "project-snapshot.json")
+      : undefined,
   });
   configureClaudeSessionFileObserver((update) => {
     scanner.invalidateCache();

@@ -1,4 +1,4 @@
-import { access, readdir, stat } from "node:fs/promises";
+import { access, readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -19,6 +19,7 @@ import { MCODE_SESSIONS_DIR } from "../sessions/mcode-store.js";
 import { PI_SESSIONS_DIR } from "../sessions/pi-files.js";
 import { ZCODE_DB_PATH } from "../sessions/zcode-db.js";
 import type { Project } from "../supervisor/types.js";
+import { atomicWriteText } from "../utils/atomic-json-file.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
 import { CODEX_SESSIONS_DIR, CodexSessionScanner } from "./codex-scanner.js";
 import { CursorSessionScanner } from "./cursor-scanner.js";
@@ -68,6 +69,12 @@ export interface ScannerOptions {
   eventBus?: EventBus;
   /** Project snapshot TTL in milliseconds (default: 5000) */
   cacheTtlMs?: number;
+  /**
+   * Where to persist the last project snapshot. After a restart it seeds
+   * stale-tolerant lookups until the first scan finishes; it never answers
+   * fresh lookups.
+   */
+  snapshotCachePath?: string;
 }
 
 interface ProjectSnapshot {
@@ -84,6 +91,9 @@ interface ClaudeSessionSource {
 
 /** Upper bound on how old a snapshot may be for stale-tolerant lookups. */
 const STALE_LOOKUP_MAX_AGE_MS = 60_000;
+/** Upper bound for a snapshot persisted before the last restart. */
+const PERSISTED_SEED_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const PERSISTED_SNAPSHOT_VERSION = 1;
 
 export interface ProjectLookupOptions {
   /** Accept a known project from the previous snapshot; see getStaleProject. */
@@ -114,8 +124,17 @@ export class ProjectScanner {
   private inFlightScan: Promise<ProjectSnapshot> | null = null;
   private inFlightScanGeneration: number | null = null;
   private unsubscribeEventBus: (() => void) | null = null;
+  private readonly snapshotCachePath?: string;
+  /** Previous-run projects; only used until the first scan completes. */
+  private seed: { byId: Map<string, Project>; savedAt: number } | null = null;
+  private seedLoad: Promise<void> | null = null;
+  private lastPersisted: string | null = null;
+  private lastPersistedAt = 0;
 
   constructor(options: ScannerOptions = {}) {
+    this.snapshotCachePath = options.snapshotCachePath;
+    if (this.snapshotCachePath)
+      this.seedLoad = this.loadSeed(this.snapshotCachePath);
     this.projectsDir = options.projectsDir ?? CLAUDE_PROJECTS_DIR;
     this.remoteExecutors = [...(options.remoteExecutors ?? [])];
     this.enableCodex = options.enableCodex ?? true;
@@ -306,7 +325,9 @@ export class ProjectScanner {
       .then((projects) => {
         const snapshot = this.buildSnapshot(projects);
         this.snapshot = snapshot;
+        this.seed = null;
         this.cacheDirty = this.cacheGeneration !== scanGeneration;
+        this.persistSnapshot(projects);
         return snapshot;
       })
       .finally(() => {
@@ -852,6 +873,51 @@ export class ProjectScanner {
     return projects;
   }
 
+  private async loadSeed(filePath: string): Promise<void> {
+    try {
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as {
+        version?: unknown;
+        savedAt?: unknown;
+        projects?: unknown;
+      };
+      if (
+        parsed.version !== PERSISTED_SNAPSHOT_VERSION ||
+        typeof parsed.savedAt !== "number" ||
+        !Array.isArray(parsed.projects)
+      )
+        return;
+      const byId = new Map<string, Project>();
+      for (const value of parsed.projects) {
+        const project = value as Partial<Project>;
+        if (typeof project?.id === "string" && typeof project.path === "string")
+          byId.set(project.id, project as Project);
+      }
+      // A scan that already finished is authoritative.
+      if (!this.snapshot) this.seed = { byId, savedAt: parsed.savedAt };
+    } catch {
+      // Missing or corrupt seed: the first lookup scans as before.
+    }
+  }
+
+  /** Best-effort; only rewrites when the project set changed. */
+  private persistSnapshot(projects: Project[]): void {
+    const filePath = this.snapshotCachePath;
+    if (!filePath) return;
+    const body = JSON.stringify(projects);
+    const now = Date.now();
+    // Unchanged projects are only re-stamped hourly so the seed stays usable.
+    if (body === this.lastPersisted && now - this.lastPersistedAt < 3_600_000)
+      return;
+    this.lastPersisted = body;
+    this.lastPersistedAt = now;
+    void atomicWriteText(
+      filePath,
+      `{"version":${PERSISTED_SNAPSHOT_VERSION},"savedAt":${now},"projects":${body}}\n`,
+    ).catch(() => {
+      this.lastPersisted = null;
+    });
+  }
+
   /**
    * A project from the last snapshot without waiting for a rescan.
    *
@@ -863,8 +929,17 @@ export class ProjectScanner {
    */
   private getStaleProject(projectId: string): Project | null {
     const snapshot = this.snapshot;
-    if (!snapshot || Date.now() - snapshot.timestamp > STALE_LOOKUP_MAX_AGE_MS)
-      return null;
+    if (!snapshot) {
+      const seeded = this.seed;
+      const project =
+        seeded && Date.now() - seeded.savedAt <= PERSISTED_SEED_MAX_AGE_MS
+          ? seeded.byId.get(projectId)
+          : undefined;
+      if (!project) return null;
+      void this.getSnapshot().catch(() => undefined);
+      return this.cloneProject(project);
+    }
+    if (Date.now() - snapshot.timestamp > STALE_LOOKUP_MAX_AGE_MS) return null;
     const project = snapshot.byId.get(projectId);
     if (!project) return null;
     const fresh =
@@ -891,6 +966,7 @@ export class ProjectScanner {
     options?: ProjectLookupOptions,
   ): Promise<Project | null> {
     if (options?.allowStale) {
+      if (this.seedLoad && !this.snapshot) await this.seedLoad;
       const stale = this.getStaleProject(projectId);
       if (stale) return stale;
     }
