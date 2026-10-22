@@ -117,6 +117,7 @@ export async function runAgentRuntimeOnly(
       eventBus,
       eventStore,
     );
+    void eventStore?.warmSessionIndex();
   }
 
   await controller.start();

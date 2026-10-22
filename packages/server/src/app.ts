@@ -421,9 +421,11 @@ export function createEmbeddedRuntimeEventStore(
   if (!dataDir || process.env.YEP_RUNTIME_EVENT_JOURNAL === "0") {
     return undefined;
   }
-  return new RuntimeEventStore({
+  const store = new RuntimeEventStore({
     eventsDir: join(dataDir, "runtime", "events"),
   });
+  void store.warmSessionIndex();
+  return store;
 }
 
 export function createApp(options: AppOptions): AppResult {

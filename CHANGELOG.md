@@ -11,6 +11,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - 新增会话打开耗时诊断：`display/view` 返回分阶段 `Server-Timing`（attach、resolve、stamp、read、reduce、replay、wait、total）和缓存命中状态 `displayCache`（hit／miss／wait），只含耗时与固定标记，不含路径或会话内容；服务端冷读达到 500 ms 或失败时写入 `session_display_cold_read` 日志；客户端每次打开会话记录一行 `[SessionLoad]`（是否命中缓存、连接状态、首个新快照到达及其来源、HTTP 往返和服务端阶段），开启开发者模式远程日志后可在客户端日志中查看。
 
 ### Fixed
+- 加快 Cursor 会话的冷打开（及服务重启后多个页面同时重连）：runtime 事件日志按会话建立增量索引，查找会话对应的进程不再每次读取并解析全部日志（本机 266 MB 日志上从约 0.8 s 降至约 1.5 ms，多个会话同时打开不再各扫一遍）；未变化的文件直接复用，追加只读新增部分，轮转与清理自动跟进；索引在 runtime 启动后于后台预热，冷建约 0.24 s。
 - 修复 Cursor 在任务进行中追加消息后，当前任务的思考和工具调用闪现在新提问下方又被挪回上方，新提问下只剩「思考中」直到上一轮结束：Cursor 只在当前回合结束后才读取下一条输入，这类消息现在进入服务端排队并在队列中展示，当前回合结束后再作为新提问发出，当前任务的过程继续在原提问下实时展示。
 - 新增 Codex 模型专用代理启动入口：仅将 OpenAI Responses 推理、压缩和摘要请求送往远端代理，MCP、命令工具和同源非推理接口使用本机网络；保留内置 provider、登录方式和流式/WebSocket 传输，避免通用代理环境导致内网飞书 MCP 初始化超时。
 - 修复经模型专用代理启动的 Codex 会话在任务已完成后仍一直显示运行中：代理启动器的转发模块首次处理请求时会触发 Node 初始化 `process.stdout`，把与 Codex 共享的协议 stdout 改为非阻塞；Codex 写出较大的事件（如飞书文档等大体积 MCP 结果）时遇到 `EAGAIN`，写线程随即退出，之后的事件和 `turn/completed` 都不再送达。启动器现在不会在协议 stdin/stdout 上打开句柄。

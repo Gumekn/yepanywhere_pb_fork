@@ -8,6 +8,10 @@ import {
   stat,
 } from "node:fs/promises";
 import path from "node:path";
+import {
+  RuntimeEventSessionIndex,
+  isJournalFileName,
+} from "./RuntimeEventSessionIndex.js";
 import type { RuntimeEventRecord, RuntimeReplayOptions } from "./types.js";
 
 export interface RuntimeEventStoreOptions {
@@ -59,9 +63,12 @@ export class RuntimeEventStore {
   private readonly states = new Map<string, Promise<ProcessFileState>>();
   private readonly writes = new Map<string, Promise<unknown>>();
   private initializePromise: Promise<void> | null = null;
+  /** Session-to-process lookup without re-parsing every retained journal. */
+  private readonly sessionIndex: RuntimeEventSessionIndex;
 
   constructor(options: RuntimeEventStoreOptions) {
     this.eventsDir = options.eventsDir;
+    this.sessionIndex = new RuntimeEventSessionIndex(options.eventsDir);
     this.maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     this.maxTotalBytes = options.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
     this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
@@ -75,6 +82,20 @@ export class RuntimeEventStore {
       })();
     }
     await this.initializePromise;
+  }
+
+  /**
+   * Build the session index in the background so the first session lookup
+   * after a restart (when every client reconnects at once) is not a full
+   * journal scan. Errors only mean the first lookup builds it instead.
+   */
+  warmSessionIndex(): Promise<void> {
+    return this.initialize()
+      .then(() => this.sessionIndex.snapshot())
+      .then(
+        () => undefined,
+        () => undefined,
+      );
   }
 
   /**
@@ -94,17 +115,13 @@ export class RuntimeEventStore {
     const names = await readdir(this.eventsDir);
     const files = (
       await Promise.all(
-        names
-          .filter(
-            (name) => name.endsWith(".jsonl") || name.endsWith(".jsonl.1"),
-          )
-          .map(async (name) => {
-            const filePath = path.join(this.eventsDir, name);
-            const info = await stat(filePath).catch(() => null);
-            return info
-              ? { filePath, size: info.size, mtimeMs: info.mtimeMs }
-              : null;
-          }),
+        names.filter(isJournalFileName).map(async (name) => {
+          const filePath = path.join(this.eventsDir, name);
+          const info = await stat(filePath).catch(() => null);
+          return info
+            ? { filePath, size: info.size, mtimeMs: info.mtimeMs }
+            : null;
+        }),
       )
     ).filter(
       (file): file is { filePath: string; size: number; mtimeMs: number } =>
@@ -204,6 +221,7 @@ export class RuntimeEventStore {
       if (state.size > 0 && state.size + lineBytes > this.maxFileBytes) {
         await rm(this.rotatedPath(input.processId), { force: true });
         await rename(currentPath, this.rotatedPath(input.processId));
+        this.sessionIndex.moved(currentPath, this.rotatedPath(input.processId));
         state.size = 0;
       }
 
@@ -264,67 +282,18 @@ export class RuntimeEventStore {
     });
   }
 
-  private async findLatestProcessIdForSession(
+  private findLatestProcessIdForSession(
     sessionId: string,
   ): Promise<string | undefined> {
-    const names = await readdir(this.eventsDir).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return [];
-        throw error;
-      },
-    );
-    const latestByProcess = new Map<
-      string,
-      { seq: number; timestamp: string }
-    >();
-    for (const name of names) {
-      if (!name.endsWith(".jsonl") && !name.endsWith(".jsonl.1")) continue;
-      const records = await this.readPath(path.join(this.eventsDir, name));
-      for (const record of records) {
-        if (record.sessionId !== sessionId) continue;
-        const current = latestByProcess.get(record.processId);
-        if (!current || record.seq > current.seq) {
-          latestByProcess.set(record.processId, {
-            seq: record.seq,
-            timestamp: record.timestamp,
-          });
-        }
-      }
-    }
-
-    let latest: { processId: string; timestamp: string } | undefined;
-    for (const [processId, record] of latestByProcess) {
-      if (
-        !latest ||
-        record.timestamp > latest.timestamp ||
-        (record.timestamp === latest.timestamp && processId > latest.processId)
-      ) {
-        latest = { processId, timestamp: record.timestamp };
-      }
-    }
-    return latest?.processId;
+    return this.sessionIndex.latestProcessIdForSession(sessionId);
   }
 
-  private async findProcessIdsForSession(
+  private findProcessIdsForSession(
     sessionId: string | undefined,
   ): Promise<string[]> {
-    const names = await readdir(this.eventsDir).catch(
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return [];
-        throw error;
-      },
-    );
-    const processIds = new Set<string>();
-    for (const name of names) {
-      if (!name.endsWith(".jsonl") && !name.endsWith(".jsonl.1")) continue;
-      const records = await this.readPath(path.join(this.eventsDir, name));
-      for (const record of records) {
-        if (!sessionId || record.sessionId === sessionId) {
-          processIds.add(record.processId);
-        }
-      }
-    }
-    return [...processIds];
+    return sessionId === undefined
+      ? this.sessionIndex.allProcessIds()
+      : this.sessionIndex.processIdsForSession(sessionId);
   }
 
   async flush(): Promise<void> {
