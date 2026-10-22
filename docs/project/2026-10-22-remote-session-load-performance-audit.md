@@ -119,7 +119,7 @@ Pi 会话 snapshot 的组成：549 个节点，其中 5 个 question、217 个 t
 | 3 | P0-2 保留紧凑 snapshot（休眠缓存）；Codex 历史 turn 只取 summary 暂缓 | shell | 休眠缓存已部署并验证 |
 | 3b | P0-3 `resolve` 慢：项目快照允许使用旧版本、runtimeState 去重、子阶段打点 | shell | 已部署（build `…-20261022062911`） |
 | 3c | P0-3 重启场景：持久化项目快照作为首次扫描前的种子 | shell | 已部署并验证 |
-| 4 | P1-1 / P1-2 订阅去重、重连收敛、放宽 pong 超时 | shell + client | 待做 |
+| 4 | P1-1 / P1-2 订阅去重、订阅错误不再重连整条 WS、放宽 pong 超时 | shell + client | 已部署并验证 |
 | 5 | P1-3 / P1-4 冷启动预取、SW 预缓存、轮询修复、`/api` 返回 404 | client + shell | 待做 |
 | 6 | P2 按需处理 | – | 待做 |
 
@@ -334,6 +334,51 @@ Pi 会话 snapshot 的组成：549 个节点，其中 5 个 question、217 个 t
 
 休眠缓存：对 4 个 provider 的已结束会话各打开一次（冷读 14–107 ms），等待 33 s 后再打开，全部返回 `displayCache=revived`，total 为 cursor 9.6 ms、pi 9.1 ms、codex 4.4 ms、mcode 20.3 ms，不读取历史。mcode 的耗时主要花在 stamp 检查上。
 
+### 步骤 4：订阅收敛（2026-10-22，已实现，未部署）
+
+**4a 订阅失败导致整条 WS 循环重连（缺陷）。** 链路如下：
+
+1. `SessionDisplayService.subscribe` 对已删除的会话抛出 `SESSION_NOT_FOUND`（404）。
+2. `routeClientMessageSafely` 把任何异常都回复为 500。
+3. 客户端 `useSessionStream` 收到 `SubscriptionError(500)`，判定为可重试，于是调用 `connectionManager.handleError`，**重连整条 WebSocket**，同一连接上的 activity 等订阅全部被拆掉。
+4. 重连成功后再次订阅，又得到 500，如此循环。由于每次连接本身都成功，退避不会增长，约每 2 s 一次。旧日志中有持续数小时、约 30 次/分钟的记录。
+
+修复：
+
+- 服务端 `handleSessionSubscribe` 自行捕获订阅错误，回复错误自带的 4xx 状态和 `code`；非 4xx 统一回复 500，且不透出内部信息。客户端已退订的，不再回复。
+- 客户端：`SubscriptionError` 说明服务端有应答、连接是好的，所以只重试该订阅（1 s × 2ⁿ，上限 30 s；`onOpen` 后重置；卸载或连接级重连时取消），4xx 照旧停止重试；只有传输层错误才交给 `connectionManager`。
+
+**4b 首屏视图传两份（P1-1）。**
+
+- shared：`SessionDisplaySubscriptionOptions.known?: {epoch, seq}`，新增 `SessionDisplayCurrent`。
+- 服务端：`subscribe(..., known)` 中，如果 known 与当前投影的 epoch 和 seq 都相同，发送 `display-current {view, seq}`，不再发送完整 `display-snapshot`；ws-handlers 会校验 known 的格式。
+- 客户端：`useProjectedSessionMessages` 导出 `displayKnownView`，`useSession` 把它放进 display 订阅参数。连接正常时，首次 HTTP `display/view` 推迟 `WS_SNAPSHOT_GRACE_MS`（1.5 s）；在此之前收到 WS snapshot 或匹配的 `display-current` 就取消 HTTP。marker 与本地视图不一致时，退回 `refreshSessionMessages`。连接断开时立即走 HTTP，行为与原来相同。
+- `[SessionLoad]` 新增 `freshSource: "ws-current"` 和 `viewSkipped`。
+- 兼容性：旧客户端不发 known，仍收到完整 snapshot；新客户端连旧服务端时会收到 snapshot，同样能取消 HTTP。
+- 预期：冷开（无缓存）少传一份完整 snapshot（大会话 gzip 后约 60–83 KB）；切回有缓存且服务端可恢复的会话时，只传一个约 100 B 的 marker。
+
+**4c pong 超时 2 s → 5 s**（`ConnectionManager` 默认值；2026-09-03 审计 P4-1）。
+
+暂不处理：`handleActivityReconnect` → `fetchPersistedSessionChanges` 在 WS 重连后仍会通过 HTTP 刷新一次。对 owned Pi/Kimi 会话它强制 `reset`，是针对"断线期间写入的尾部不可见"这一已知问题的修复，直接删掉不安全；改为依赖服务端订阅需要逐个 provider 验证，留待后续。
+
+验证：`pnpm lint`、`pnpm typecheck` 通过；`pnpm test` 中 shared 514、client 1514、server 4359 个用例通过，2 个为原本就跳过的用例。新增：
+
+- `test/routes/ws-handlers.test.ts`：404 原样返回、内部错误隐藏为 500、已退订时不回复；
+- `src/hooks/__tests__/useSessionStream.test.ts`：只重试该订阅、退避翻倍、成功后重置、卸载后取消、4xx 停止、传输错误交给 connectionManager；
+- `useProjectedSessionMessages.test.ts`（连接正常时）：WS 先到则跳过 HTTP、WS 迟到则回退 HTTP、接受匹配的 marker、epoch 不一致时重新获取；
+- 休眠测试：known 匹配时发 marker，seq 落后时发完整 snapshot；
+- tracer：WS-only 加载的报告；
+- ConnectionManager：默认 pong 超时为 5 s。
+
+部署档位：client + shell。`packages/shared` 只新增类型，产出的 JS 不变，但 hot-apply 按路径会把它归为 runtime 档。
+
+#### 步骤 4 部署后验证（2026-10-22，build `…-20261022074710`）
+
+用只读 WebSocket 探针连接 `/yep/api/ws`（解码 0x01 JSON / 0x03 gzip 二进制帧）：
+
+- 先通过 HTTP 读取一个大 Pi 会话的视图（原始 274 KB），再带 `known` 订阅：服务端回复 `connected` 和 `display-current`，**线上 236 B**，没有完整 snapshot；之后的 `display-patch` 是该会话的实时更新。
+- 订阅一个不存在的会话：回复 `404 {"code":"SESSION_NOT_FOUND"}`，此前为通用 500。
+
 ## 7. 提交记录（2026-10-22）
 
 | commit | 内容 | 对应步骤 |
@@ -343,6 +388,9 @@ Pi 会话 snapshot 的组成：549 个节点，其中 5 个 question、217 个 t
 | `5d2be1c2c` | perf(display): 打开会话时不再等待项目重扫 | 3b |
 | `dbf216d3d` | perf(projects): 持久化项目快照供重启后首次扫描前使用 | 3c |
 | `5273586bf` | perf(display): 已结束的会话视图过期后休眠复用 | 3 |
+| `c00009ae3` | fix(ws): 会话订阅失败不再触发整条连接重连 | 4a |
+| `223663967` | perf(display): 打开会话时不再重复传输完整视图 | 4b |
+| `617952c34` | fix(connection): 放宽前台恢复时的心跳超时到 5 秒 | 4c |
 
 每个提交都在"HEAD + 该提交暂存内容"的隔离工作树上（其余改动临时 stash）跑过 `pnpm lint`、`pnpm typecheck` 和相关测试。全部提交之后，工作树与提交前逐字节一致。
 
