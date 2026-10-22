@@ -726,6 +726,7 @@ export function useSession(
     messages,
     displayPage,
     displayActivity,
+    displayKnownView,
     handleDisplayEvent,
     displayQuestions,
     displayQuestionCoverage,
@@ -2298,7 +2299,15 @@ export function useSession(
     {
       onMessage: handleStreamMessage,
       onError: handleStreamError,
-      ...(preferDisplayHistory ? { display: { projectId, branchId } } : {}),
+      ...(preferDisplayHistory
+        ? {
+            display: {
+              projectId,
+              branchId,
+              ...(displayKnownView ? { known: displayKnownView } : {}),
+            },
+          }
+        : {}),
     },
   );
 

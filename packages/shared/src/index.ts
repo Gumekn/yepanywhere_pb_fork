@@ -826,6 +826,8 @@ export type {
   SessionDisplaySnapshot,
   SessionDisplayPatch,
   SessionDisplaySubscriptionOptions,
+  SessionDisplayKnownView,
+  SessionDisplayCurrent,
   SessionDisplayGroupPage,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,

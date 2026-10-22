@@ -183,4 +183,33 @@ describe("SessionDisplayService dormant views", () => {
     expect(t.source.stamp.mock.calls.length - stamps).toBe(1);
     expect(t.source.read).toHaveBeenCalledTimes(1);
   });
+
+  it("answers a subscriber holding the current projection with a marker", async () => {
+    vi.useFakeTimers();
+    const t = fixture();
+    const first = await open(t.service);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const known = { epoch: first.snapshot.view.epoch, seq: first.snapshot.seq };
+    const events: string[] = [];
+    const sub = await t.service.subscribe(
+      selection,
+      (type) => events.push(type),
+      undefined,
+      known,
+    );
+    expect(events).toContain("display-current");
+    expect(events).not.toContain("display-snapshot");
+    sub.cleanup();
+
+    const stale: string[] = [];
+    const other = await t.service.subscribe(
+      selection,
+      (type) => stale.push(type),
+      undefined,
+      { epoch: known.epoch, seq: known.seq - 1 },
+    );
+    expect(stale).toContain("display-snapshot");
+    expect(stale).not.toContain("display-current");
+    other.cleanup();
+  });
 });

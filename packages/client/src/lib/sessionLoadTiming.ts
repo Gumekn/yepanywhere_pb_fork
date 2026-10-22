@@ -9,7 +9,7 @@
  * Server-Timing tokens — no transcript content.
  */
 
-export type SessionLoadSource = "http" | "ws";
+export type SessionLoadSource = "http" | "ws" | "ws-current";
 
 export interface SessionLoadReport {
   /** Time since page navigation when the trace began (cold app start signal). */
@@ -25,6 +25,8 @@ export interface SessionLoadReport {
   viewMs?: number;
   viewStatus?: number;
   viewServerTiming?: string;
+  /** The HTTP read was not needed: WS delivered the projection first. */
+  viewSkipped?: boolean;
   metadataMs?: number;
   /** Trace ended by the cap rather than by both signals arriving. */
   timedOut?: boolean;
@@ -119,11 +121,20 @@ export class SessionLoadTracer {
 
   view(
     key: string,
-    result: { status?: number; serverTiming?: string | null },
+    result: {
+      status?: number;
+      serverTiming?: string | null;
+      skipped?: boolean;
+    },
   ): void {
     const trace = this.current(key);
     if (!trace || trace.viewSettled) return;
     trace.viewSettled = true;
+    if (result.skipped) {
+      trace.report.viewSkipped = true;
+      this.maybeFinish(trace);
+      return;
+    }
     trace.report.viewMs = this.elapsed(trace);
     if (result.status !== undefined) trace.report.viewStatus = result.status;
     const timing = compactServerTiming(result.serverTiming);

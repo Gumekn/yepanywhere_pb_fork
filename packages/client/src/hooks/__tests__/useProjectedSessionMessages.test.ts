@@ -1,7 +1,9 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { SessionDisplaySnapshot } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { connectionManager } from "../../lib/connection";
 import {
+  WS_SNAPSHOT_GRACE_MS,
   resetDisplaySnapshotCacheForTests,
   useProjectedSessionMessages,
 } from "../useProjectedSessionMessages";
@@ -475,5 +477,85 @@ describe("projected session messages", () => {
       await result.current.loadOlderMessages();
     });
     expect(api.getSessionDisplayView).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("projected session messages with a connected socket", () => {
+  beforeEach(() => {
+    vi.spyOn(connectionManager, "state", "get").mockReturnValue("connected");
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("skips the HTTP read when the WS snapshot arrives first", async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useProjectedSessionMessages(options));
+    expect(result.current.loading).toBe(true);
+    act(() =>
+      result.current.handleDisplayEvent("display-snapshot", snapshot(3)),
+    );
+    expect(result.current.loading).toBe(false);
+    expect(result.current.displayKnownView).toEqual({
+      epoch: snapshot().view.epoch,
+      seq: 3,
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(WS_SNAPSHOT_GRACE_MS * 2);
+    });
+    expect(api.getSessionDisplayView).not.toHaveBeenCalled();
+  });
+
+  it("falls back to HTTP when the WS answer is late", async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useProjectedSessionMessages(options));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(WS_SNAPSHOT_GRACE_MS);
+    });
+    expect(api.getSessionDisplayView).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+    expect(result.current.loading).toBe(false);
+  });
+
+  it("accepts a display-current marker for the cached projection", async () => {
+    vi.useFakeTimers();
+    // Seed the module cache through a first visit.
+    const first = renderHook(() => useProjectedSessionMessages(options));
+    act(() =>
+      first.result.current.handleDisplayEvent("display-snapshot", snapshot(5)),
+    );
+    first.unmount();
+    vi.mocked(api.getSessionDisplayView).mockClear();
+
+    const { result } = renderHook(() => useProjectedSessionMessages(options));
+    expect(result.current.displayKnownView).toEqual({
+      epoch: snapshot().view.epoch,
+      seq: 5,
+    });
+    act(() =>
+      result.current.handleDisplayEvent("display-current", {
+        view: snapshot().view,
+        seq: 5,
+      }),
+    );
+    expect(result.current.loading).toBe(false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(WS_SNAPSHOT_GRACE_MS * 2);
+    });
+    expect(api.getSessionDisplayView).not.toHaveBeenCalled();
+
+    // A marker for a different epoch means the cache is not current.
+    act(() =>
+      result.current.handleDisplayEvent("display-current", {
+        view: { ...snapshot().view, epoch: "other-epoch" },
+        seq: 1,
+      }),
+    );
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+    expect(api.getSessionDisplayView).toHaveBeenCalledTimes(1);
   });
 });

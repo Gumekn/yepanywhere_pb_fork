@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   ContextUsage,
   SessionDisplayActivity,
+  SessionDisplayCurrent,
   SessionDisplayGroupPage,
+  SessionDisplayKnownView,
   SessionDisplaySnapshot,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
@@ -2024,6 +2026,7 @@ export class SessionDisplayService {
     selection: DisplaySelection,
     emit: Emit,
     signal?: AbortSignal,
+    known?: SessionDisplayKnownView,
   ): Promise<{ cleanup(): void }> {
     const entry = await this.get(selection);
     if (signal?.aborted) return { cleanup() {} };
@@ -2042,7 +2045,19 @@ export class SessionDisplayService {
         ? { deferredMessages: deferredQueue.messages }
         : {}),
     });
-    emit("display-snapshot", entry.snapshot);
+    const snapshot = entry.snapshot;
+    if (
+      snapshot &&
+      known?.epoch === snapshot.view.epoch &&
+      known.seq === snapshot.seq
+    ) {
+      // The client already holds exactly this projection (cached or loaded
+      // over HTTP); skip re-sending the whole snapshot.
+      emit("display-current", {
+        view: snapshot.view,
+        seq: snapshot.seq,
+      } satisfies SessionDisplayCurrent);
+    } else emit("display-snapshot", snapshot);
     const contextUsage = entry.controls.get("display-context-usage");
     if (contextUsage) emit("display-context-usage", contextUsage);
     for (const [key, value] of entry.controls)

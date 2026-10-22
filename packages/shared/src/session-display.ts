@@ -431,9 +431,26 @@ export type SessionDisplaySnapshot = z.infer<
 >;
 export type SessionDisplayPatch = z.infer<typeof SessionDisplayPatchSchema>;
 
+/** Projection version a client already holds (snapshot view epoch + seq). */
+export interface SessionDisplayKnownView {
+  epoch: string;
+  seq: number;
+}
+
 export interface SessionDisplaySubscriptionOptions {
   projectId: string;
   branchId?: string;
+  /**
+   * When it matches the server's current projection, the subscription starts
+   * with a `display-current` marker instead of a full `display-snapshot`.
+   */
+  known?: SessionDisplayKnownView;
+}
+
+/** Payload of `display-current`: the subscriber's projection is current. */
+export interface SessionDisplayCurrent {
+  view: SessionDisplayView;
+  seq: number;
 }
 
 export interface SessionDisplayGroupPage {

@@ -1,6 +1,7 @@
 import {
   type ContextUsage,
   type SessionDisplayActivity,
+  type SessionDisplayKnownView,
   type SessionDisplayNode,
   SessionDisplayPatchSchema,
   type SessionDisplaySnapshot,
@@ -24,6 +25,12 @@ import type {
 import { contextUsageFromStatus } from "./useLegacySessionMessages";
 
 const snapshots = new DisplaySnapshotCache();
+/**
+ * With a connected socket, the WS subscription delivers the projection (or a
+ * `display-current` marker for a cached one). The HTTP read only runs if the
+ * WS answer has not arrived within this window, or when the socket is down.
+ */
+export const WS_SNAPSHOT_GRACE_MS = 1_500;
 export function resetDisplaySnapshotCacheForTests(): void {
   snapshots.clear();
 }
@@ -62,6 +69,8 @@ export function useProjectedSessionMessages(
 ): UseSessionMessagesResult & {
   handleDisplayEvent(type: string, data: unknown): void;
   displayActivity: SessionDisplayActivity | undefined;
+  /** Projection version to announce on the WS display subscription. */
+  displayKnownView: SessionDisplayKnownView | undefined;
 } {
   const { projectId, sessionId, branchId, enabled = true } = options;
   const key = `${projectId}\0${sessionId}\0${branchId ?? "active"}`;
@@ -107,6 +116,8 @@ export function useProjectedSessionMessages(
   >("unavailable");
   const refreshing = useRef<Promise<Session | null> | null>(null);
   const queuedPatches = useRef<unknown[]>([]);
+  /** Skips the deferred initial HTTP read once WS has delivered the view. */
+  const skipDeferredView = useRef<(() => void) | null>(null);
 
   const install = useCallback(
     (next: SessionDisplaySnapshot) => {
@@ -295,7 +306,39 @@ export function useProjectedSessionMessages(
         const parsed = SessionDisplaySnapshotSchema.safeParse(data);
         if (parsed.success) {
           install(parsed.data);
-          sessionLoadTracer.fresh(keyRef.current, "ws");
+          if (snapshotRef.current === parsed.data) {
+            skipDeferredView.current?.();
+            sessionLoadTracer.fresh(keyRef.current, "ws");
+          }
+        }
+      } else if (type === "display-current") {
+        const current = data as {
+          view?: {
+            sessionId?: unknown;
+            branchScopeId?: unknown;
+            epoch?: unknown;
+          };
+          seq?: unknown;
+        } | null;
+        const held = snapshotRef.current;
+        if (
+          current?.view?.sessionId !== sessionId ||
+          current.view.branchScopeId !== (branchId ?? "active")
+        )
+          return;
+        if (
+          held &&
+          held.view.epoch === current.view.epoch &&
+          typeof current.seq === "number" &&
+          held.seq >= current.seq
+        ) {
+          // The held (cached) projection is the server's current one.
+          setLoading(false);
+          skipDeferredView.current?.();
+          sessionLoadTracer.fresh(keyRef.current, "ws-current");
+        } else {
+          // Raced with a newer local state change; fetch the real snapshot.
+          void refreshSessionMessages().catch(() => {});
         }
       } else if (type === "display-patch") {
         const parsed = SessionDisplayPatchSchema.safeParse(data);
@@ -378,27 +421,45 @@ export function useProjectedSessionMessages(
         }
       }
     };
-    void loadSnapshot()
-      .then((next) => {
-        if (!cancelled) sessionLoadTracer.view(key, lastViewResponse);
-        if (
-          next &&
-          !cancelled &&
-          currentGeneration === generation.current &&
-          (!snapshotRef.current ||
-            snapshotRef.current.view.epoch === next.view.epoch)
-        ) {
-          install(SessionDisplaySnapshotSchema.parse(next));
-          sessionLoadTracer.fresh(key, "http");
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) sessionLoadTracer.view(key, lastViewResponse);
-        if (!cancelled && !snapshotRef.current) {
-          setLoading(false);
-          optionsRef.current.onLoadError?.(error);
-        }
-      });
+    let viewStarted = false;
+    let viewTimer: ReturnType<typeof setTimeout> | undefined;
+    const startView = () => {
+      if (viewStarted || cancelled) return;
+      viewStarted = true;
+      clearTimeout(viewTimer);
+      skipDeferredView.current = null;
+      void loadSnapshot()
+        .then((next) => {
+          if (!cancelled) sessionLoadTracer.view(key, lastViewResponse);
+          if (
+            next &&
+            !cancelled &&
+            currentGeneration === generation.current &&
+            (!snapshotRef.current ||
+              snapshotRef.current.view.epoch === next.view.epoch)
+          ) {
+            install(SessionDisplaySnapshotSchema.parse(next));
+            sessionLoadTracer.fresh(key, "http");
+          }
+        })
+        .catch((error) => {
+          if (!cancelled) sessionLoadTracer.view(key, lastViewResponse);
+          if (!cancelled && !snapshotRef.current) {
+            setLoading(false);
+            optionsRef.current.onLoadError?.(error);
+          }
+        });
+    };
+    if (connectionManager.state === "connected") {
+      skipDeferredView.current = () => {
+        if (viewStarted) return;
+        viewStarted = true;
+        clearTimeout(viewTimer);
+        skipDeferredView.current = null;
+        sessionLoadTracer.view(key, { skipped: true });
+      };
+      viewTimer = setTimeout(startView, WS_SNAPSHOT_GRACE_MS);
+    } else startView();
     void (async () => {
       let cursor: string | undefined;
       do {
@@ -426,6 +487,8 @@ export function useProjectedSessionMessages(
     });
     return () => {
       cancelled = true;
+      clearTimeout(viewTimer);
+      skipDeferredView.current = null;
       generation.current++;
       sessionLoadTracer.abandon(key);
     };
@@ -490,6 +553,15 @@ export function useProjectedSessionMessages(
           }
         : null,
     [snapshot, olderNodes, olderCursor],
+  );
+  const knownEpoch = snapshot?.view.epoch;
+  const knownSeq = snapshot?.seq;
+  const displayKnownView = useMemo(
+    () =>
+      knownEpoch !== undefined && knownSeq !== undefined
+        ? { epoch: knownEpoch, seq: knownSeq }
+        : undefined,
+    [knownEpoch, knownSeq],
   );
   const displayPage = useMemo(
     () => (combined ? sessionDisplaySnapshotPage(combined) : null),
@@ -585,6 +657,7 @@ export function useProjectedSessionMessages(
     displayQuestions,
     displayQuestionCoverage: coverage,
     displayActivity: snapshot?.activity,
+    displayKnownView,
     handleDisplayEvent,
     hydratedLiveTailDetailRef: null,
     agentContent,

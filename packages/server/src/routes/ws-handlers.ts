@@ -11,6 +11,7 @@ import { gzip } from "node:zlib";
 import type { HttpBindings } from "@hono/node-server";
 import type {
   RemoteClientMessage,
+  SessionDisplayKnownView,
   UrlProjectId,
   WireRequest,
   WireSubscribe,
@@ -351,6 +352,7 @@ export function handleSessionSubscribe(
           },
           sendEvent,
           pendingController.signal,
+          knownDisplayView(msg.display.known),
         )
       : msg.display
         ? Promise.reject(new Error("Session display protocol is unavailable"))
@@ -418,6 +420,19 @@ export function handleSessionSubscribe(
       });
     },
   );
+}
+
+/** Accept only a well-formed known view from the client. */
+function knownDisplayView(value: unknown): SessionDisplayKnownView | undefined {
+  const known = value as { epoch?: unknown; seq?: unknown } | null | undefined;
+  return typeof known?.epoch === "string" &&
+    known.epoch.length > 0 &&
+    known.epoch.length <= 128 &&
+    typeof known.seq === "number" &&
+    Number.isSafeInteger(known.seq) &&
+    known.seq >= 0
+    ? { epoch: known.epoch, seq: known.seq }
+    : undefined;
 }
 
 /** HTTP-style status carried by route errors (e.g. SESSION_NOT_FOUND → 404). */

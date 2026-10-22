@@ -73,6 +73,22 @@ describe("SessionLoadTracer", () => {
     expect(reports).toHaveLength(0);
   });
 
+  it("reports a WS-only load where the HTTP read was skipped", () => {
+    const { instance, reports, advance } = tracer();
+    instance.begin("a", { cached: true, transport: "connected" });
+    advance(15);
+    instance.fresh("a", "ws-current");
+    instance.view("a", { skipped: true });
+    expect(reports).toEqual([
+      expect.objectContaining({
+        freshMs: 15,
+        freshSource: "ws-current",
+        viewSkipped: true,
+      }),
+    ]);
+    expect(reports[0]?.viewMs).toBeUndefined();
+  });
+
   it("reports a partial trace when the cap elapses", () => {
     vi.useFakeTimers();
     const { instance, reports } = tracer();
