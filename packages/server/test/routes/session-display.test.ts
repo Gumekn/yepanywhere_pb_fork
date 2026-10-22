@@ -181,6 +181,50 @@ function createRoutes(
 }
 
 describe("session display routes", () => {
+  it("retries with a fresh project when a stale snapshot cannot locate the session", async () => {
+    const { getSession } = createRoutes(1);
+    const loaded = await getSession();
+    const emptyReader = {
+      getSessionSummary: vi.fn(async () => null),
+      getSession: vi.fn(async () => null),
+    };
+    const reader = {
+      getSessionSummary: vi.fn(async () => loaded.summary),
+      getSession: vi.fn(async () => loaded),
+    };
+    const getRuntimeState = vi.fn(async () => ({ toolsMayBeActive: false }));
+    const getOrCreateProject = vi.fn(
+      async (
+        _id: string,
+        _provider?: string,
+        options?: { allowStale?: boolean },
+      ) =>
+        options?.allowStale
+          ? { ...project(), provider: "pi" as const }
+          : project(),
+    );
+    const source = createSessionDisplaySource({
+      scanner: { getOrCreateProject },
+      providerResolution: {
+        readerFactory: () => reader as never,
+        piReaderFactory: () => emptyReader as never,
+      },
+      getRuntimeState,
+    });
+    const page = await source.read({
+      projectId: PROJECT_ID,
+      sessionId: SESSION_ID,
+    });
+    expect(page.messages.length).toBeGreaterThan(0);
+    // One runtime lookup per cold read; the stamp reuses the same state.
+    expect(getRuntimeState).toHaveBeenCalledTimes(1);
+    await source.read({ projectId: PROJECT_ID, sessionId: SESSION_ID });
+    expect(getRuntimeState).toHaveBeenCalledTimes(2);
+    expect(getOrCreateProject.mock.calls.map((call) => call[2])).toEqual([
+      { allowStale: true },
+      undefined,
+    ]);
+  });
   it.each<ProviderName>(["codex", "codex-oss", "gemini-acp"])(
     "loads an unpersisted %s session in a Pi project and picks up its history later",
     async (provider) => {

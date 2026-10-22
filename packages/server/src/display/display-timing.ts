@@ -14,6 +14,12 @@ export const SESSION_DISPLAY_TIMING_NAMES = [
   "attach",
   /** Project/provider/session resolution and runtime state. */
   "resolve",
+  /** Within `resolve`: project snapshot lookup. */
+  "project",
+  /** Within `resolve`: runtime process, bridge and pending-input state. */
+  "runtimeState",
+  /** Within `resolve`: session summary lookup across provider sources. */
+  "summary",
   /** Source revision stamp (file stats or summary). */
   "stamp",
   /** Provider history read and normalization. */

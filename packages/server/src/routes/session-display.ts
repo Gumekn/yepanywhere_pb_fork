@@ -758,29 +758,34 @@ export function createSessionDisplaySource(
   const resolve = (
     selection: DisplaySelection,
     timing?: SessionDisplayTimingSink,
-  ) => timed(timing, "resolve", () => resolveUntimed(selection));
-  const resolveUntimed = async (selection: DisplaySelection) => {
+  ) => timed(timing, "resolve", () => resolveUntimed(selection, timing));
+  const resolveUntimed = async (
+    selection: DisplaySelection,
+    timing?: SessionDisplayTimingSink,
+  ) => {
     const key = JSON.stringify([selection.projectId, selection.sessionId]);
-    let resolved = resolvedCache.get(key);
-    if (!resolved) {
-      resolved = await resolveDisplaySession(
+    const cached = resolvedCache.get(key);
+    if (!cached) {
+      // A fresh resolution already carries current runtime state.
+      const resolved = await resolveDisplaySession(
         deps,
         selection.projectId,
         selection.sessionId,
         true,
         true,
+        timing,
       );
       if (resolvedCache.size >= 32) {
         const first = resolvedCache.keys().next().value;
         if (first) resolvedCache.delete(first);
       }
       resolvedCache.set(key, resolved);
+      return resolved;
     }
-    return {
-      ...resolved,
-      runtime:
-        (await deps.getRuntimeState?.(resolved.sessionId)) ?? resolved.runtime,
-    };
+    const runtime = await timed(timing, "runtimeState", async () =>
+      deps.getRuntimeState?.(cached.sessionId),
+    );
+    return { ...cached, runtime: runtime ?? cached.runtime };
   };
   const stamp = async (
     selection: DisplaySelection,
@@ -849,8 +854,11 @@ export function createSessionDisplaySource(
   return {
     stamp,
     read: async (selection, opaqueCursor, timing) => {
+      // One resolution per read: the stamp derives from the same runtime state.
       const resolved = await resolve(selection, timing);
-      const sourceStamp = await stamp(selection, timing);
+      const sourceStamp = await timed(timing, "stamp", () =>
+        stampResolved(resolved),
+      );
       return timed(timing, "read", async () => {
         const cursor = decode(opaqueCursor);
         const codex =
@@ -1088,6 +1096,7 @@ async function resolveDisplaySession(
   requestedSessionId: string,
   includeRuntime = true,
   allowUnpersisted = false,
+  timing?: SessionDisplayTimingSink,
 ): Promise<ResolvedDisplaySession> {
   if (!isUrlProjectId(projectId)) {
     throw new SessionDisplayRouteError(
@@ -1096,7 +1105,13 @@ async function resolveDisplaySession(
       "Invalid project ID format",
     );
   }
-  const project = await deps.scanner.getOrCreateProject(projectId);
+  // A known project may come from the previous scanner snapshot; if its
+  // provider flags are too old to locate the session, retry fresh below.
+  let project = await timed(timing, "project", () =>
+    deps.scanner.getOrCreateProject(projectId, undefined, {
+      allowStale: true,
+    }),
+  );
   if (!project) {
     throw new SessionDisplayRouteError(
       404,
@@ -1107,19 +1122,34 @@ async function resolveDisplaySession(
   const sessionId =
     deps.getCanonicalSessionId?.(requestedSessionId) ?? requestedSessionId;
   const runtime = includeRuntime
-    ? ((await deps.getRuntimeState?.(sessionId)) ?? {
+    ? ((await timed(timing, "runtimeState", async () =>
+        deps.getRuntimeState?.(sessionId),
+      )) ?? {
         toolsMayBeActive: false,
       })
     : { toolsMayBeActive: false };
   const preferredProvider =
     runtime.provider ?? deps.getPersistedProvider?.(sessionId);
-  let resolved = await findSessionSummaryAcrossProviders(
-    project,
-    sessionId,
-    project.id,
-    deps.providerResolution,
-    preferredProvider,
-  );
+  const findSummary = (target: Project) =>
+    timed(timing, "summary", () =>
+      findSessionSummaryAcrossProviders(
+        target,
+        sessionId,
+        target.id,
+        deps.providerResolution,
+        preferredProvider,
+      ),
+    );
+  let resolved = await findSummary(project);
+  if (!resolved) {
+    const fresh = await timed(timing, "project", () =>
+      deps.scanner.getOrCreateProject(projectId),
+    );
+    if (fresh) {
+      project = fresh;
+      resolved = await findSummary(fresh);
+    }
+  }
   if (
     !resolved &&
     allowUnpersisted &&

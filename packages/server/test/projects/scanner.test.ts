@@ -544,3 +544,101 @@ describe("ProjectScanner shared Claude storage", () => {
     });
   });
 });
+
+describe("ProjectScanner stale-tolerant lookup", () => {
+  function setup() {
+    const project = (path: string) => ({
+      id: encodeProjectId(path),
+      path,
+      name: path.split("/").at(-1) ?? path,
+      sessionCount: 1,
+      sessionDir: "/codex/sessions",
+      activeOwnedCount: 0,
+      activeExternalCount: 0,
+      lastActivity: "2025-01-01T00:00:00.000Z",
+      provider: "codex" as const,
+    });
+    let projects = [project("/home/user/known")];
+    let release: (() => void) | null = null;
+    const codexScanner = {
+      listProjects: vi.fn(async () => {
+        if (release === null) return projects;
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return projects;
+      }),
+      invalidateCache: vi.fn(),
+    } as unknown as CodexSessionScanner;
+    const scanner = new ProjectScanner({
+      projectsDir: join(tmpdir(), `stale-lookup-${randomUUID()}`),
+      codexScanner,
+      enableCodex: true,
+      enableGemini: false,
+      enableKimi: false,
+      enablePi: false,
+      enableZCode: false,
+      enableCursor: false,
+      cacheTtlMs: 60_000,
+    });
+    return {
+      scanner,
+      codexScanner,
+      project,
+      setProjects: (next: ReturnType<typeof project>[]) => {
+        projects = next;
+      },
+      blockNextScan: () => {
+        release = () => {};
+      },
+      releaseScan: () => {
+        const resolve = release;
+        release = null;
+        resolve?.();
+      },
+    };
+  }
+
+  it("serves a known project from the old snapshot while rescanning", async () => {
+    const t = setup();
+    const known = t.project("/home/user/known");
+    await t.scanner.listProjects();
+    t.scanner.invalidateCache();
+    t.blockNextScan();
+
+    // The rescan is blocked, yet the lookup returns immediately.
+    const stale = await t.scanner.getOrCreateProject(known.id, undefined, {
+      allowStale: true,
+    });
+    expect(stale?.path).toBe("/home/user/known");
+    // A background rescan was started and is still blocked.
+    await vi.waitFor(() =>
+      expect(t.codexScanner.listProjects).toHaveBeenCalledTimes(2),
+    );
+
+    t.releaseScan();
+    await t.scanner.listProjects();
+  });
+
+  it("falls back to a fresh lookup for projects missing from the snapshot", async () => {
+    const t = setup();
+    await t.scanner.listProjects();
+    const added = t.project("/home/user/added");
+    t.setProjects([t.project("/home/user/known"), added]);
+    t.scanner.invalidateCache();
+    const found = await t.scanner.getOrCreateProject(added.id, undefined, {
+      allowStale: true,
+    });
+    expect(found?.path).toBe("/home/user/added");
+  });
+
+  it("does not rescan when the snapshot is still fresh", async () => {
+    const t = setup();
+    const known = t.project("/home/user/known");
+    await t.scanner.listProjects();
+    await t.scanner.getOrCreateProject(known.id, undefined, {
+      allowStale: true,
+    });
+    expect(t.codexScanner.listProjects).toHaveBeenCalledTimes(1);
+  });
+});

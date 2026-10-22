@@ -82,6 +82,14 @@ interface ClaudeSessionSource {
   executor?: RemoteExecutorConfig;
 }
 
+/** Upper bound on how old a snapshot may be for stale-tolerant lookups. */
+const STALE_LOOKUP_MAX_AGE_MS = 60_000;
+
+export interface ProjectLookupOptions {
+  /** Accept a known project from the previous snapshot; see getStaleProject. */
+  allowStale?: boolean;
+}
+
 export class ProjectScanner {
   private projectsDir: string;
   private remoteExecutors: RemoteExecutorConfig[];
@@ -844,6 +852,27 @@ export class ProjectScanner {
     return projects;
   }
 
+  /**
+   * A project from the last snapshot without waiting for a rescan.
+   *
+   * Rescans are frequent (every provider file change invalidates them) and
+   * cost a full provider catalog read. Lookups that only need a known
+   * project's path and provider flags may use the previous snapshot, bounded
+   * in age, while a refresh runs in the background. Unknown projects return
+   * null so the caller performs the normal, fresh lookup.
+   */
+  private getStaleProject(projectId: string): Project | null {
+    const snapshot = this.snapshot;
+    if (!snapshot || Date.now() - snapshot.timestamp > STALE_LOOKUP_MAX_AGE_MS)
+      return null;
+    const project = snapshot.byId.get(projectId);
+    if (!project) return null;
+    const fresh =
+      !this.cacheDirty && Date.now() - snapshot.timestamp < this.cacheTtlMs;
+    if (!fresh) void this.getSnapshot().catch(() => undefined);
+    return this.cloneProject(project);
+  }
+
   async getProject(projectId: string): Promise<Project | null> {
     const snapshot = await this.getSnapshot();
     const project = snapshot.byId.get(projectId);
@@ -859,7 +888,12 @@ export class ProjectScanner {
   async getOrCreateProject(
     projectId: string,
     preferredProvider?: ProviderName | string,
+    options?: ProjectLookupOptions,
   ): Promise<Project | null> {
+    if (options?.allowStale) {
+      const stale = this.getStaleProject(projectId);
+      if (stale) return stale;
+    }
     let resolvedProjectId = projectId;
 
     // First check if project already exists
