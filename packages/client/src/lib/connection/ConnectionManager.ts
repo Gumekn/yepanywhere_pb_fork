@@ -17,7 +17,11 @@ export interface ConnectionManagerConfig {
   staleThresholdMs?: number;
   /** Interval for checking stale connections (default: 10000ms) */
   staleCheckIntervalMs?: number;
-  /** Timeout waiting for pong response before forcing reconnect (default: 2000ms) */
+  /**
+   * Timeout waiting for pong response before forcing reconnect (default:
+   * 5000ms). Remote tunnels and mobile wake-ups routinely exceed 2s while the
+   * connection is still healthy; a false timeout reconnects every stream.
+   */
   pongTimeoutMs?: number;
   /** Injectable timer interface for testing */
   timers?: TimerInterface;
@@ -59,7 +63,7 @@ const DEFAULT_CONFIG = {
   jitterFactor: 0.3,
   staleThresholdMs: 45000,
   staleCheckIntervalMs: 10000,
-  pongTimeoutMs: 2000,
+  pongTimeoutMs: 5000,
 } as const;
 
 /**

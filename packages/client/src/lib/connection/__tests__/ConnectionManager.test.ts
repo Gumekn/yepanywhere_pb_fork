@@ -324,18 +324,18 @@ describe("ConnectionManager", () => {
       expect(sendPing).toHaveBeenCalledWith("1");
     });
 
-    it("default pong timeout is 2000ms", () => {
+    it("default pong timeout is 5000ms", () => {
       const { cm, reconnectFn, sendPing, timers, visibility } = setup();
       cm.start(reconnectFn, { sendPing });
 
       visibility.hide();
       visibility.show();
 
-      // Should still be connected at 1999ms
-      timers.advance(1999);
+      // A slow pong over a remote tunnel must not drop a healthy connection.
+      timers.advance(4999);
       expect(cm.state).toBe("connected");
 
-      // Should reconnect at 2000ms
+      // Should reconnect at 5000ms
       timers.advance(1);
       expect(cm.state).toBe("reconnecting");
     });
