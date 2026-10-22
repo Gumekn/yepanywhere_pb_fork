@@ -13,6 +13,7 @@ import {
   SESSION_DISPLAY_MAX_NOTICE_LENGTH,
   SessionDisplayNoticeSegmentSchema,
 } from "@yep-anywhere/shared";
+import { getLogger } from "../logging/logger.js";
 import type {
   RuntimeController,
   RuntimeSessionSubscription,
@@ -28,6 +29,20 @@ import {
   SessionDisplayReducer,
   decodeDisplayToolId,
 } from "./SessionDisplayReducer.js";
+import {
+  type SessionDisplayCacheState,
+  SessionDisplayPhaseTotals,
+  type SessionDisplayTimingSink,
+  timed,
+} from "./display-timing.js";
+
+/** Cold initializations at or above this duration are logged with phases. */
+const DEFAULT_SLOW_INITIALIZE_MS = 500;
+
+export interface SessionDisplayReadObserver {
+  timing?: SessionDisplayTimingSink;
+  onCacheState?(state: SessionDisplayCacheState): void;
+}
 
 export interface DisplaySelection {
   projectId: string;
@@ -50,8 +65,12 @@ export interface SessionDisplaySource {
   read(
     selection: DisplaySelection,
     cursor?: string,
+    timing?: SessionDisplayTimingSink,
   ): Promise<DisplaySourcePage>;
-  stamp(selection: DisplaySelection): Promise<string>;
+  stamp(
+    selection: DisplaySelection,
+    timing?: SessionDisplayTimingSink,
+  ): Promise<string>;
   detail(
     selection: DisplaySelection,
     runId: string,
@@ -64,6 +83,8 @@ interface Entry {
   selection: DisplaySelection;
   view: SessionDisplayView;
   ready: Promise<void>;
+  /** True until the first history read settles; later callers record `wait`. */
+  initializing?: boolean;
   model?: SessionDisplayReducer;
   snapshot?: SessionDisplaySnapshot;
   listeners: Set<Emit>;
@@ -497,6 +518,7 @@ export class SessionDisplayService {
       pollMs?: number;
       retentionMs?: number;
       maxEntries?: number;
+      slowInitializeMs?: number;
     },
   ) {}
 
@@ -515,7 +537,10 @@ export class SessionDisplayService {
       throw new Error("Session display source is not configured");
     return this.source;
   }
-  private async get(selection: DisplaySelection): Promise<Entry> {
+  private async get(
+    selection: DisplaySelection,
+    observer?: SessionDisplayReadObserver,
+  ): Promise<Entry> {
     const key = this.key(selection);
     let entry = this.entries.get(key);
     if (!entry) {
@@ -546,33 +571,89 @@ export class SessionDisplayService {
       };
       this.entries.set(key, entry);
       const current = entry;
-      entry.ready = this.initialize(current).catch((error) => {
-        this.drop(key, current);
-        throw error;
-      });
+      current.initializing = true;
+      observer?.onCacheState?.("miss");
+      const totals = new SessionDisplayPhaseTotals(observer?.timing);
+      const startedAt = performance.now();
+      entry.ready = this.initialize(current, totals)
+        .then(
+          () => this.logSlowInitialize(current, totals, startedAt),
+          (error) => {
+            this.logSlowInitialize(current, totals, startedAt, error);
+            this.drop(key, current);
+            throw error;
+          },
+        )
+        .finally(() => {
+          current.initializing = false;
+        });
+      await entry.ready;
+      return entry;
     }
+    if (entry.initializing) {
+      observer?.onCacheState?.("wait");
+      await timed(observer?.timing, "wait", () => entry.ready);
+      return entry;
+    }
+    observer?.onCacheState?.("hit");
     await entry.ready;
     return entry;
   }
 
-  private async initialize(entry: Entry): Promise<void> {
+  private logSlowInitialize(
+    entry: Entry,
+    totals: SessionDisplayPhaseTotals,
+    startedAt: number,
+    error?: unknown,
+  ): void {
+    const durationMs = performance.now() - startedAt;
+    if (
+      !error &&
+      durationMs < (this.options.slowInitializeMs ?? DEFAULT_SLOW_INITIALIZE_MS)
+    )
+      return;
+    getLogger().info(
+      {
+        event: "session_display_cold_read",
+        sessionId: entry.selection.sessionId,
+        branchScoped: Boolean(entry.selection.branchId),
+        provider: entry.provider ?? null,
+        durationMs: Math.round(durationMs),
+        phases: totals.rounded(),
+        nodeCount: entry.snapshot?.nodes.length ?? null,
+        attachedProcess: Boolean(entry.sourceProcessId),
+        failed: Boolean(error),
+        ...(error && typeof (error as { code?: unknown }).code === "string"
+          ? { errorCode: (error as { code: string }).code }
+          : {}),
+      },
+      "Session display cold read",
+    );
+  }
+
+  private async initialize(
+    entry: Entry,
+    timing?: SessionDisplayTimingSink,
+  ): Promise<void> {
     // Attach before reading history. Subscription replay is kept on the server;
     // subsequent live events are overlaid after the cold source read.
-    const process = entry.selection.branchId
-      ? null
-      : await this.options.runtime.getProcessForSession(
+    await timed(timing, "attach", async () => {
+      const process = entry.selection.branchId
+        ? null
+        : await this.options.runtime.getProcessForSession(
+            entry.selection.sessionId,
+          );
+      if (process) {
+        entry.sourceProcessId = process.id;
+        entry.sourceSubscription = await this.options.runtime.subscribeSession(
           entry.selection.sessionId,
+          (type, data) => this.event(entry, type, data),
+          { signal: entry.controller.signal, displayProjection: true },
         );
-    if (process) {
-      entry.sourceProcessId = process.id;
-      entry.sourceSubscription = await this.options.runtime.subscribeSession(
-        entry.selection.sessionId,
-        (type, data) => this.event(entry, type, data),
-        { signal: entry.controller.signal, displayProjection: true },
-      );
-    }
-    await this.refresh(entry, true);
-    await this.recoverCursorHistory(entry);
+      }
+    });
+    await this.refresh(entry, true, timing);
+    await timed(timing, "replay", () => this.recoverCursorHistory(entry));
     this.poll(entry);
     this.expire(entry);
   }
@@ -1274,162 +1355,175 @@ export class SessionDisplayService {
     }
   }
 
-  private refresh(entry: Entry, force: boolean): Promise<void> {
+  private refresh(
+    entry: Entry,
+    force: boolean,
+    timing?: SessionDisplayTimingSink,
+  ): Promise<void> {
     if (entry.refreshing) return entry.refreshing;
     const task = (async () => {
       const source = this.requireSource();
-      const stamp = await source.stamp(entry.selection);
+      const stamp = await source.stamp(entry.selection, timing);
       if (!force && stamp === entry.stamp) return;
-      const page = await source.read(entry.selection);
+      const page = await source.read(entry.selection, undefined, timing);
       if (entry.controller.signal.aborted) return;
-      if (page.provider === "cursor" && page.contextUsage) {
-        const usage = {
-          sessionId: entry.selection.sessionId,
-          branchId: entry.selection.branchId,
-          contextUsage: page.contextUsage,
-        };
-        const previous = entry.controls.get("display-context-usage");
-        if (JSON.stringify(previous) !== JSON.stringify(usage)) {
-          entry.controls.set("display-context-usage", usage);
-          this.emit(entry, "display-context-usage", usage);
-        }
-      }
-      if (page.provider === "cursor") {
-        // The CLI does not persist its error-text chunks to native history.
-        // Recover both new typed failures and older wrongly-completed turns.
-        const failedTurns = new Set<unknown>();
-        for (const [id, message] of entry.bootstrapReplay) {
-          const failure = cursorStreamError(messageContent(message));
-          if (message.type !== "error" && !failure) continue;
-          failedTurns.add(message.turnId);
-          entry.overlay.set(id, {
-            ...message,
-            type: "error",
-            message: undefined,
-            content: undefined,
-            role: undefined,
-            error: failure?.message ?? message.error,
-            errorCode: failure?.code ?? message.errorCode,
-          });
-        }
-        for (const [id, message] of entry.bootstrapReplay) {
-          if (message.type === "result" && failedTurns.has(message.turnId))
-            entry.overlay.set(id, {
-              ...message,
-              turnStatus: "failed",
-              is_error: true,
-            });
-        }
-        // Native history can contain tool or assistant rows before `<user_query>`
-        // is committed. Keep the injected prompt until that row is readable.
-        const promptedTurns = new Set<number>();
-        const promptTexts: string[] = [];
-        for (const message of page.messages) {
-          if (message.type !== "user") continue;
-          const body = cursorPromptBody(message);
-          if (!body) continue;
-          promptTexts.push(body);
-          if (typeof message.cursorTurnIndex === "number")
-            promptedTurns.add(message.cursorTurnIndex);
-        }
-        for (const [id, message] of entry.bootstrapReplay) {
-          if (!isCursorUserPrompt(message)) continue;
-          const index = message.cursorTurnIndex;
-          if (typeof index === "number" && promptedTurns.has(index)) continue;
-          const body = cursorPromptBody(message);
-          if (
-            typeof index !== "number" &&
-            promptTexts.some((native) => cursorPromptsMatch(native, body))
-          )
-            continue;
-          entry.overlay.set(id, message);
-        }
-      }
-      this.acknowledgePersisted(entry, page);
-      const model = new SessionDisplayReducer(entry.view, page.provider);
-      let restored = page.messages;
-      if (page.provider === "cursor") {
-        for (const message of entry.overlay.values()) {
-          if (isCursorUserPrompt(message))
-            restored = insertCursorPrompt(restored, message);
-        }
-      }
-      model.restore(restored, page.turnStatuses);
-      if (!page.messages.length)
-        for (const message of entry.bootstrapReplay.values())
-          model.message(message, true);
-      entry.bootstrapReplay.clear();
-      model.setRuntime(page.activity);
-      for (const message of entry.overlay.values()) {
-        if (message.subtype === "turn_complete") continue;
-        if (
-          page.provider === "pi" ||
-          page.provider === "kimi" ||
-          page.provider === "mcode"
-        ) {
-          if (message.type !== "system" && message.type !== "result") {
-            const content = messageContent(message);
-            const tools = Array.isArray(content)
-              ? content.filter((value) =>
-                  ["tool_use", "tool_result"].includes(
-                    String(asRecord(value)?.type),
-                  ),
-                )
-              : [];
-            if (tools.length)
-              model.message({
-                ...message,
-                message: { ...asRecord(message.message), content: tools },
-              });
-            continue;
-          }
-        }
-        model.message(message);
-      }
-      // Apply terminal facts after replaying prose. An older turn must not
-      // close a newer, not-yet-persisted turn in the same overlay.
-      for (const message of entry.overlay.values()) {
-        if (message.subtype === "turn_complete") model.message(message);
-      }
-      if (page.provider === "cursor" && entry.model)
-        model.restoreToolTimings(entry.model.tools.values());
-      entry.provider = page.provider;
-      const controlState = asRecord(
-        entry.controls.get("status") ?? entry.controls.get("connected"),
-      )?.state;
-      if (
-        (controlState === "hold" || controlState === "waiting-input") &&
-        !["completed", "interrupted", "failed"].includes(
-          model.snapshot().activity.state,
-        )
-      )
-        model.setRuntime(controlState);
-      entry.stamp = page.stamp;
-      const previous = entry.snapshot;
-      const previousTail = previous?.nodes.at(-1);
-      if (
-        previousTail &&
-        !model.snapshot().nodes.some((node) => node.id === previousTail.id)
-      ) {
-        // A rewrite (or a source window too far ahead to prove continuity)
-        // invalidates the view. Do not replay acknowledged, removed history.
-        entry.view = { ...entry.view, epoch: randomUUID() };
-        model.view = entry.view;
-      }
-      entry.model = model;
-      if (!previous || previous.view.epoch !== entry.view.epoch) {
-        entry.snapshot = model.snapshot(page.cursor);
-        this.emit(entry, "display-snapshot", entry.snapshot);
-      } else {
-        const patch = model.commit(previous);
-        entry.snapshot = model.snapshot(page.cursor);
-        if (patch) this.emit(entry, "display-patch", patch);
+      const reduceStartedAt = performance.now();
+      try {
+        this.applySourcePage(entry, page);
+      } finally {
+        timing?.add("reduce", performance.now() - reduceStartedAt);
       }
     })();
     entry.refreshing = task.finally(() => {
       entry.refreshing = undefined;
     });
     return entry.refreshing;
+  }
+
+  private applySourcePage(entry: Entry, page: DisplaySourcePage): void {
+    if (page.provider === "cursor" && page.contextUsage) {
+      const usage = {
+        sessionId: entry.selection.sessionId,
+        branchId: entry.selection.branchId,
+        contextUsage: page.contextUsage,
+      };
+      const previous = entry.controls.get("display-context-usage");
+      if (JSON.stringify(previous) !== JSON.stringify(usage)) {
+        entry.controls.set("display-context-usage", usage);
+        this.emit(entry, "display-context-usage", usage);
+      }
+    }
+    if (page.provider === "cursor") {
+      // The CLI does not persist its error-text chunks to native history.
+      // Recover both new typed failures and older wrongly-completed turns.
+      const failedTurns = new Set<unknown>();
+      for (const [id, message] of entry.bootstrapReplay) {
+        const failure = cursorStreamError(messageContent(message));
+        if (message.type !== "error" && !failure) continue;
+        failedTurns.add(message.turnId);
+        entry.overlay.set(id, {
+          ...message,
+          type: "error",
+          message: undefined,
+          content: undefined,
+          role: undefined,
+          error: failure?.message ?? message.error,
+          errorCode: failure?.code ?? message.errorCode,
+        });
+      }
+      for (const [id, message] of entry.bootstrapReplay) {
+        if (message.type === "result" && failedTurns.has(message.turnId))
+          entry.overlay.set(id, {
+            ...message,
+            turnStatus: "failed",
+            is_error: true,
+          });
+      }
+      // Native history can contain tool or assistant rows before `<user_query>`
+      // is committed. Keep the injected prompt until that row is readable.
+      const promptedTurns = new Set<number>();
+      const promptTexts: string[] = [];
+      for (const message of page.messages) {
+        if (message.type !== "user") continue;
+        const body = cursorPromptBody(message);
+        if (!body) continue;
+        promptTexts.push(body);
+        if (typeof message.cursorTurnIndex === "number")
+          promptedTurns.add(message.cursorTurnIndex);
+      }
+      for (const [id, message] of entry.bootstrapReplay) {
+        if (!isCursorUserPrompt(message)) continue;
+        const index = message.cursorTurnIndex;
+        if (typeof index === "number" && promptedTurns.has(index)) continue;
+        const body = cursorPromptBody(message);
+        if (
+          typeof index !== "number" &&
+          promptTexts.some((native) => cursorPromptsMatch(native, body))
+        )
+          continue;
+        entry.overlay.set(id, message);
+      }
+    }
+    this.acknowledgePersisted(entry, page);
+    const model = new SessionDisplayReducer(entry.view, page.provider);
+    let restored = page.messages;
+    if (page.provider === "cursor") {
+      for (const message of entry.overlay.values()) {
+        if (isCursorUserPrompt(message))
+          restored = insertCursorPrompt(restored, message);
+      }
+    }
+    model.restore(restored, page.turnStatuses);
+    if (!page.messages.length)
+      for (const message of entry.bootstrapReplay.values())
+        model.message(message, true);
+    entry.bootstrapReplay.clear();
+    model.setRuntime(page.activity);
+    for (const message of entry.overlay.values()) {
+      if (message.subtype === "turn_complete") continue;
+      if (
+        page.provider === "pi" ||
+        page.provider === "kimi" ||
+        page.provider === "mcode"
+      ) {
+        if (message.type !== "system" && message.type !== "result") {
+          const content = messageContent(message);
+          const tools = Array.isArray(content)
+            ? content.filter((value) =>
+                ["tool_use", "tool_result"].includes(
+                  String(asRecord(value)?.type),
+                ),
+              )
+            : [];
+          if (tools.length)
+            model.message({
+              ...message,
+              message: { ...asRecord(message.message), content: tools },
+            });
+          continue;
+        }
+      }
+      model.message(message);
+    }
+    // Apply terminal facts after replaying prose. An older turn must not
+    // close a newer, not-yet-persisted turn in the same overlay.
+    for (const message of entry.overlay.values()) {
+      if (message.subtype === "turn_complete") model.message(message);
+    }
+    if (page.provider === "cursor" && entry.model)
+      model.restoreToolTimings(entry.model.tools.values());
+    entry.provider = page.provider;
+    const controlState = asRecord(
+      entry.controls.get("status") ?? entry.controls.get("connected"),
+    )?.state;
+    if (
+      (controlState === "hold" || controlState === "waiting-input") &&
+      !["completed", "interrupted", "failed"].includes(
+        model.snapshot().activity.state,
+      )
+    )
+      model.setRuntime(controlState);
+    entry.stamp = page.stamp;
+    const previous = entry.snapshot;
+    const previousTail = previous?.nodes.at(-1);
+    if (
+      previousTail &&
+      !model.snapshot().nodes.some((node) => node.id === previousTail.id)
+    ) {
+      // A rewrite (or a source window too far ahead to prove continuity)
+      // invalidates the view. Do not replay acknowledged, removed history.
+      entry.view = { ...entry.view, epoch: randomUUID() };
+      model.view = entry.view;
+    }
+    entry.model = model;
+    if (!previous || previous.view.epoch !== entry.view.epoch) {
+      entry.snapshot = model.snapshot(page.cursor);
+      this.emit(entry, "display-snapshot", entry.snapshot);
+    } else {
+      const patch = model.commit(previous);
+      entry.snapshot = model.snapshot(page.cursor);
+      if (patch) this.emit(entry, "display-patch", patch);
+    }
   }
 
   private acknowledgePersisted(entry: Entry, page: DisplaySourcePage): void {
@@ -1827,14 +1921,17 @@ export class SessionDisplayService {
   async snapshot(
     selection: DisplaySelection,
     reset = false,
+    observer?: SessionDisplayReadObserver,
   ): Promise<SessionDisplaySnapshot> {
-    const entry = await this.get(selection);
+    const entry = await this.get(selection, observer);
     if (reset) {
       entry.overlay.clear();
       entry.cursorPendingThoughts.length = 0;
       entry.view = { ...entry.view, epoch: randomUUID() };
-      await this.refresh(entry, true);
-      await this.recoverCursorHistory(entry);
+      await this.refresh(entry, true, observer?.timing);
+      await timed(observer?.timing, "replay", () =>
+        this.recoverCursorHistory(entry),
+      );
     }
     this.flush(entry);
     if (!entry.snapshot) throw new Error("Display snapshot is not ready");
@@ -1843,16 +1940,27 @@ export class SessionDisplayService {
   async older(
     selection: DisplaySelection,
     cursor: string,
+    observer?: SessionDisplayReadObserver,
   ): Promise<SessionDisplaySnapshot> {
-    const entry = await this.get(selection);
+    const entry = await this.get(selection, observer);
     const view = entry.view;
-    const page = await this.requireSource().read(selection, cursor);
+    const page = await this.requireSource().read(
+      selection,
+      cursor,
+      observer?.timing,
+    );
     if (entry.view.epoch !== view.epoch)
       throw new Error("Display view changed while loading history");
+    const reduceStartedAt = performance.now();
     const model = new SessionDisplayReducer(view, page.provider);
     model.restore(page.messages, page.turnStatuses);
     if (!entry.snapshot) throw new Error("Display snapshot is not ready");
-    return { ...model.snapshot(page.cursor), seq: entry.snapshot.seq };
+    const snapshot = {
+      ...model.snapshot(page.cursor),
+      seq: entry.snapshot.seq,
+    };
+    observer?.timing?.add("reduce", performance.now() - reduceStartedAt);
+    return snapshot;
   }
   async group(
     selection: DisplaySelection,

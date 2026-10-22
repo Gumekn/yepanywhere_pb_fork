@@ -453,6 +453,58 @@ describe("session display routes", () => {
     }
   });
 
+  it("reports display view phases and cache state in Server-Timing", async () => {
+    const service = new SessionDisplayService({
+      runtime: {
+        getProcessForSession: vi.fn(),
+        subscribeSession: vi.fn(),
+      },
+    });
+    const snapshot = vi
+      .spyOn(service, "snapshot")
+      .mockImplementationOnce(async (_selection, _reset, observer) => {
+        observer?.onCacheState?.("miss");
+        observer?.timing?.add("read", 12.34);
+        return {
+          version: 1,
+          view: { sessionId: SESSION_ID, branchScopeId: "active", epoch: "e" },
+          seq: 1,
+          nodes: [],
+          activity: { state: "completed" },
+        } as never;
+      })
+      .mockImplementationOnce(async (_selection, _reset, observer) => {
+        observer?.onCacheState?.("wait");
+        throw new Error("boom");
+      });
+    const app = new Hono();
+    registerSessionDisplayRoutes(app, {
+      displayService: service,
+      scanner: { getOrCreateProject: vi.fn(async () => project()) },
+      providerResolution: { readerFactory: vi.fn() },
+    });
+    try {
+      const url = `/projects/${PROJECT_ID}/sessions/${SESSION_ID}/display/view?`;
+      const ok = await app.request(url);
+      expect(ok.status).toBe(200);
+      const header = ok.headers.get("server-timing") ?? "";
+      expect(header).toContain("read;dur=12.3");
+      expect(header).toMatch(/total;dur=\d/);
+      expect(header).toContain("displayCache;desc=miss");
+      // Values only: no session identifiers or paths leak into the header.
+      expect(header).not.toContain(SESSION_ID);
+
+      const failed = await app.request(url);
+      expect(failed.status).toBeGreaterThanOrEqual(400);
+      expect(failed.headers.get("server-timing")).toContain(
+        "displayCache;desc=wait",
+      );
+      expect(snapshot).toHaveBeenCalledTimes(2);
+    } finally {
+      service.dispose();
+    }
+  });
+
   it("annotates native Codex fork questions with cross-session alternatives", async () => {
     const summary: SessionSummary = {
       id: SESSION_ID,

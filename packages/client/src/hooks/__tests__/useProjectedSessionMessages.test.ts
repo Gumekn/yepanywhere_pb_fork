@@ -207,8 +207,16 @@ describe("projected session messages", () => {
       expect(result.current.displayPage?.sessionId).toBe("session");
       expect(onLoadError).not.toHaveBeenCalled();
       expect(api.getSessionDisplayView.mock.calls).toEqual([
-        ["project", "session", { branchId: undefined }],
-        ["project", "session", { branchId: undefined }],
+        [
+          "project",
+          "session",
+          { branchId: undefined, onResponse: expect.any(Function) },
+        ],
+        [
+          "project",
+          "session",
+          { branchId: undefined, onResponse: expect.any(Function) },
+        ],
       ]);
     },
   );

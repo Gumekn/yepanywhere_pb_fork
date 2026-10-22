@@ -1278,18 +1278,38 @@ export const api = {
     );
   },
 
-  getSessionDisplayView: (
+  getSessionDisplayView: async (
     projectId: string,
     sessionId: string,
-    options?: { branchId?: string; cursor?: string; reset?: boolean },
-  ) => {
+    options?: {
+      branchId?: string;
+      cursor?: string;
+      reset?: boolean;
+      /** Load diagnostics: status and the Server-Timing phase header. */
+      onResponse?: (info: {
+        status?: number;
+        serverTiming?: string | null;
+      }) => void;
+    },
+  ): Promise<SessionDisplaySnapshot> => {
     const params = new URLSearchParams();
     if (options?.branchId) params.set("branchId", options.branchId);
     if (options?.cursor) params.set("cursor", options.cursor);
     if (options?.reset) params.set("reset", "true");
-    return fetchJSON<SessionDisplaySnapshot>(
-      `/projects/${projectId}/sessions/${sessionId}/display/view?${params}`,
-    );
+    const path = `/projects/${projectId}/sessions/${sessionId}/display/view?${params}`;
+    if (!options?.onResponse) return fetchJSON<SessionDisplaySnapshot>(path);
+    let response: Response;
+    try {
+      response = await fetchResponse(path);
+    } catch (error) {
+      options.onResponse({ status: (error as { status?: number }).status });
+      throw error;
+    }
+    options.onResponse({
+      status: response.status,
+      serverTiming: response.headers.get("server-timing"),
+    });
+    return response.json() as Promise<SessionDisplaySnapshot>;
   },
   getSessionDisplayGroup: (
     projectId: string,

@@ -7,6 +7,9 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ## [Unreleased]
 
+### Added
+- 新增会话打开耗时诊断：`display/view` 返回分阶段 `Server-Timing`（attach、resolve、stamp、read、reduce、replay、wait、total）和缓存命中状态 `displayCache`（hit／miss／wait），只含耗时与固定标记，不含路径或会话内容；服务端冷读达到 500 ms 或失败时写入 `session_display_cold_read` 日志；客户端每次打开会话记录一行 `[SessionLoad]`（是否命中缓存、连接状态、首个新快照到达及其来源、HTTP 往返和服务端阶段），开启开发者模式远程日志后可在客户端日志中查看。
+
 ### Fixed
 - 修复 Cursor 在任务进行中追加消息后，当前任务的思考和工具调用闪现在新提问下方又被挪回上方，新提问下只剩「思考中」直到上一轮结束：Cursor 只在当前回合结束后才读取下一条输入，这类消息现在进入服务端排队并在队列中展示，当前回合结束后再作为新提问发出，当前任务的过程继续在原提问下实时展示。
 - 新增 Codex 模型专用代理启动入口：仅将 OpenAI Responses 推理、压缩和摘要请求送往远端代理，MCP、命令工具和同源非推理接口使用本机网络；保留内置 provider、登录方式和流式/WebSocket 传输，避免通用代理环境导致内网飞书 MCP 初始化超时。

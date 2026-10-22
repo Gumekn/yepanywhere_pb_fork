@@ -12,7 +12,9 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 import { extractCodexTurnContextUsage } from "../lib/codexMessageContext";
+import { connectionManager } from "../lib/connection";
 import { DisplaySnapshotCache } from "../lib/displaySnapshotCache";
+import { sessionLoadTracer } from "../lib/sessionLoadTiming";
 import type { Message, Session } from "../types";
 import type {
   AgentContentMap,
@@ -291,7 +293,10 @@ export function useProjectedSessionMessages(
         });
       } else if (type === "display-snapshot") {
         const parsed = SessionDisplaySnapshotSchema.safeParse(data);
-        if (parsed.success) install(parsed.data);
+        if (parsed.success) {
+          install(parsed.data);
+          sessionLoadTracer.fresh(keyRef.current, "ws");
+        }
       } else if (type === "display-patch") {
         const parsed = SessionDisplayPatchSchema.safeParse(data);
         if (
@@ -331,17 +336,28 @@ export function useProjectedSessionMessages(
     queuedPatches.current = [];
     refreshing.current = null;
     let cancelled = false;
-    void fetchSessionMetadata().catch((error) => {
-      if (!cancelled) optionsRef.current.onLoadError?.(error);
+    sessionLoadTracer.begin(key, {
+      cached: Boolean(cached),
+      transport: connectionManager.state,
     });
+    void fetchSessionMetadata()
+      .then(() => sessionLoadTracer.metadata(key))
+      .catch((error) => {
+        if (!cancelled) optionsRef.current.onLoadError?.(error);
+      });
     // A cold HTTP snapshot also supports transport startup failures. The WS
     // snapshot establishes the same view/sequence, so older HTTP replies lose.
+    let lastViewResponse: { status?: number; serverTiming?: string | null } =
+      {};
     const loadSnapshot = async () => {
       for (let attempt = 0; ; attempt++) {
         if (cancelled) return;
         try {
           return await api.getSessionDisplayView(projectId, sessionId, {
             branchId,
+            onResponse: (info) => {
+              lastViewResponse = info;
+            },
           });
         } catch (error) {
           if (cancelled || snapshotRef.current) return;
@@ -364,16 +380,20 @@ export function useProjectedSessionMessages(
     };
     void loadSnapshot()
       .then((next) => {
+        if (!cancelled) sessionLoadTracer.view(key, lastViewResponse);
         if (
           next &&
           !cancelled &&
           currentGeneration === generation.current &&
           (!snapshotRef.current ||
             snapshotRef.current.view.epoch === next.view.epoch)
-        )
+        ) {
           install(SessionDisplaySnapshotSchema.parse(next));
+          sessionLoadTracer.fresh(key, "http");
+        }
       })
       .catch((error) => {
+        if (!cancelled) sessionLoadTracer.view(key, lastViewResponse);
         if (!cancelled && !snapshotRef.current) {
           setLoading(false);
           optionsRef.current.onLoadError?.(error);
@@ -407,6 +427,7 @@ export function useProjectedSessionMessages(
     return () => {
       cancelled = true;
       generation.current++;
+      sessionLoadTracer.abandon(key);
     };
   }, [
     enabled,
