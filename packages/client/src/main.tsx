@@ -19,6 +19,7 @@ import { initializeTabSize } from "./hooks/useTabSize";
 import { initializeTheme } from "./hooks/useTheme";
 import { I18nProvider } from "./i18n";
 import { NavigationLayout } from "./layouts";
+import { startSessionPrefetch } from "./lib/sessionPrefetch";
 import { armSplashSafety } from "./lib/splash";
 import "./styles/index.css";
 
@@ -123,6 +124,13 @@ installMobileSafeAreaInset();
 // Get base URL for router (Vite sets this based on --base flag)
 // Remove trailing slash for BrowserRouter basename
 const basename = import.meta.env.BASE_URL.replace(/\/$/, "") || undefined;
+
+// Opened directly on a session (PWA relaunch, notification, reload): start the
+// first-paint reads and the session chunk now instead of after the router and
+// the lazy page have loaded.
+if (startSessionPrefetch(window.location, basename)) {
+  void import("./pages/SessionPage").catch(() => undefined);
+}
 
 const rootElement = document.getElementById("root");
 if (!rootElement) {

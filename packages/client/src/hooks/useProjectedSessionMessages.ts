@@ -16,6 +16,10 @@ import { extractCodexTurnContextUsage } from "../lib/codexMessageContext";
 import { connectionManager } from "../lib/connection";
 import { DisplaySnapshotCache } from "../lib/displaySnapshotCache";
 import { sessionLoadTracer } from "../lib/sessionLoadTiming";
+import {
+  takePrefetchedMetadata,
+  takePrefetchedView,
+} from "../lib/sessionPrefetch";
 import type { Message, Session } from "../types";
 import type {
   AgentContentMap,
@@ -154,50 +158,62 @@ export function useProjectedSessionMessages(
     [key, sessionId, branchId],
   );
 
-  const fetchSessionMetadata = useCallback(async () => {
-    const expected = keyRef.current;
-    const usageAtRequest = nativeContextUsageRef.current;
-    const data = await api.getSessionMetadata(projectId, sessionId);
-    if (keyRef.current !== expected) return;
-    const current = sessionRef.current;
-    const next = { ...current, ...data.session, ...configuration.current };
-    const streamedUsage = nativeContextUsageRef.current;
-    if (
-      streamedUsage?.key === expected &&
-      (streamedUsage !== usageAtRequest || !next.contextUsage)
-    )
-      next.contextUsage = streamedUsage.usage;
-    for (const name of [
-      "model",
-      "reasoningEffort",
-      "serviceTier",
-      "contextUsage",
-    ] as const) {
-      if (next[name] === undefined && current?.[name] !== undefined)
-        Object.assign(next, { [name]: current[name] });
-    }
-    sessionRef.current = next;
-    setSession(next);
-    optionsRef.current.onLoadComplete?.({
-      ...data,
-      session: next,
-      status: data.ownership,
-    });
-    if (!next.contextUsage)
-      void api
-        .getContextStatus(projectId, sessionId)
-        .then((status) => {
-          if (keyRef.current !== expected) return;
-          const contextUsage = contextUsageFromStatus(status);
-          if (contextUsage)
-            setSession((current) =>
-              current && !current.contextUsage
-                ? { ...current, contextUsage }
-                : current,
-            );
-        })
-        .catch(() => {});
-  }, [projectId, sessionId]);
+  const loadSessionMetadata = useCallback(
+    async (
+      /** An already-started read (cold-start prefetch) to apply instead. */
+      source?: ReturnType<typeof api.getSessionMetadata>,
+    ) => {
+      const expected = keyRef.current;
+      const usageAtRequest = nativeContextUsageRef.current;
+      const data = await (source ??
+        api.getSessionMetadata(projectId, sessionId));
+      if (keyRef.current !== expected) return;
+      const current = sessionRef.current;
+      const next = { ...current, ...data.session, ...configuration.current };
+      const streamedUsage = nativeContextUsageRef.current;
+      if (
+        streamedUsage?.key === expected &&
+        (streamedUsage !== usageAtRequest || !next.contextUsage)
+      )
+        next.contextUsage = streamedUsage.usage;
+      for (const name of [
+        "model",
+        "reasoningEffort",
+        "serviceTier",
+        "contextUsage",
+      ] as const) {
+        if (next[name] === undefined && current?.[name] !== undefined)
+          Object.assign(next, { [name]: current[name] });
+      }
+      sessionRef.current = next;
+      setSession(next);
+      optionsRef.current.onLoadComplete?.({
+        ...data,
+        session: next,
+        status: data.ownership,
+      });
+      if (!next.contextUsage)
+        void api
+          .getContextStatus(projectId, sessionId)
+          .then((status) => {
+            if (keyRef.current !== expected) return;
+            const contextUsage = contextUsageFromStatus(status);
+            if (contextUsage)
+              setSession((current) =>
+                current && !current.contextUsage
+                  ? { ...current, contextUsage }
+                  : current,
+              );
+          })
+          .catch(() => {});
+    },
+    [projectId, sessionId],
+  );
+  // Public form takes no argument, so it is safe to pass as a callback.
+  const fetchSessionMetadata = useCallback(
+    () => loadSessionMetadata(),
+    [loadSessionMetadata],
+  );
 
   const refreshSessionMessages = useCallback<
     UseSessionMessagesResult["refreshSessionMessages"]
@@ -383,7 +399,17 @@ export function useProjectedSessionMessages(
       cached: Boolean(cached),
       transport: connectionManager.state,
     });
-    void fetchSessionMetadata()
+    const prefetchedMetadata = takePrefetchedMetadata(
+      projectId,
+      sessionId,
+      branchId,
+    );
+    const prefetchedView = takePrefetchedView(projectId, sessionId, branchId);
+    void loadSessionMetadata(prefetchedMetadata)
+      .catch((error) =>
+        // A failed prefetch is retried once with a normal read.
+        prefetchedMetadata ? loadSessionMetadata() : Promise.reject(error),
+      )
       .then(() => sessionLoadTracer.metadata(key))
       .catch((error) => {
         if (!cancelled) optionsRef.current.onLoadError?.(error);
@@ -393,6 +419,15 @@ export function useProjectedSessionMessages(
     let lastViewResponse: { status?: number; serverTiming?: string | null } =
       {};
     const loadSnapshot = async () => {
+      if (prefetchedView) {
+        try {
+          const prefetched = await prefetchedView;
+          lastViewResponse = prefetched;
+          return prefetched.snapshot;
+        } catch {
+          // Fall through to the normal read and its conflict retries.
+        }
+      }
       for (let attempt = 0; ; attempt++) {
         if (cancelled) return;
         try {
@@ -450,7 +485,8 @@ export function useProjectedSessionMessages(
           }
         });
     };
-    if (connectionManager.state === "connected") {
+    // A prefetched read is already in flight and costs nothing to await.
+    if (!prefetchedView && connectionManager.state === "connected") {
       skipDeferredView.current = () => {
         if (viewStarted) return;
         viewStarted = true;
@@ -498,7 +534,7 @@ export function useProjectedSessionMessages(
     projectId,
     sessionId,
     branchId,
-    fetchSessionMetadata,
+    loadSessionMetadata,
     install,
   ]);
 

@@ -3,6 +3,10 @@ import type { SessionDisplaySnapshot } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { connectionManager } from "../../lib/connection";
 import {
+  resetSessionPrefetchForTests,
+  startSessionPrefetch,
+} from "../../lib/sessionPrefetch";
+import {
   WS_SNAPSHOT_GRACE_MS,
   resetDisplaySnapshotCacheForTests,
   useProjectedSessionMessages,
@@ -557,5 +561,45 @@ describe("projected session messages with a connected socket", () => {
       await vi.runOnlyPendingTimersAsync();
     });
     expect(api.getSessionDisplayView).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("projected session messages with a cold-start prefetch", () => {
+  afterEach(() => {
+    resetSessionPrefetchForTests();
+  });
+
+  it("uses the prefetched view and metadata instead of new reads", async () => {
+    api.getSessionDisplayView.mockResolvedValueOnce(snapshot(7));
+    expect(
+      startSessionPrefetch(
+        { pathname: "/projects/project/sessions/session", search: "" },
+        "",
+      ),
+    ).toBe(true);
+    expect(api.getSessionDisplayView).toHaveBeenCalledTimes(1);
+    expect(api.getSessionMetadata).toHaveBeenCalledTimes(1);
+
+    const { result } = renderHook(() => useProjectedSessionMessages(options));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.displayKnownView?.seq).toBe(7);
+    expect(api.getSessionDisplayView).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(result.current.session?.id).toBe("session"));
+    expect(api.getSessionMetadata).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to normal reads when the prefetch failed", async () => {
+    api.getSessionDisplayView.mockRejectedValueOnce(new Error("offline"));
+    api.getSessionMetadata.mockRejectedValueOnce(new Error("offline"));
+    startSessionPrefetch(
+      { pathname: "/projects/project/sessions/session", search: "" },
+      "",
+    );
+    const { result } = renderHook(() => useProjectedSessionMessages(options));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(api.getSessionDisplayView).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(api.getSessionMetadata).toHaveBeenCalledTimes(2),
+    );
   });
 });
