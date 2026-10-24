@@ -34,10 +34,12 @@ export function resolveCodexEventJournalMode(
  * Decide whether one event earns a durable journal record.
  *
  * This is a *storage* policy, not a transport or projection policy. A rejected
- * event is still serialized, still turned into an envelope, and still projected
- * into the live message stream exactly as before; it simply leaves no trace on
- * disk. That is the same split the 4510 bridge already makes, where deltas stay
- * on the wire but never enter its journal.
+ * event still becomes an envelope and is still projected into the live message
+ * stream; it simply leaves no trace on disk. The default envelope still carries
+ * a bounded payload, because shadow/primary projection reads it. Legacy callers
+ * pass `threadIdOnly` and skip that walk for deltas. That is the same split the
+ * 4510 bridge already makes, where deltas stay on the wire but never enter its
+ * journal.
  *
  * Why deltas are droppable: they are incremental fragments whose settled form
  * is already carried by the `item/completed` event we keep, and by the native

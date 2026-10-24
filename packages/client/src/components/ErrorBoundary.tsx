@@ -209,7 +209,8 @@ const styles: Record<string, React.CSSProperties> = {
     backgroundColor: "#1a1a2e",
     color: "#e4e4e7",
     fontFamily:
-      '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+      'var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif)',
+    fontSize: "var(--font-size-base, 13px)",
   },
   card: {
     maxWidth: "500px",
@@ -221,7 +222,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   title: {
     margin: "0 0 20px 0",
-    fontSize: "24px",
+    fontSize: "var(--font-size-title, 24px)",
     fontWeight: 600,
     color: "#f4f4f5",
   },
@@ -235,7 +236,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   versionHint: {
     margin: "8px 0 0 0",
-    fontSize: "14px",
+    fontSize: "var(--font-size-lg, 14px)",
     color: "#fde68a",
   },
   errorBox: {
@@ -246,7 +247,7 @@ const styles: Record<string, React.CSSProperties> = {
     overflow: "auto",
   },
   errorText: {
-    fontSize: "13px",
+    fontSize: "var(--font-size-base, 13px)",
     color: "#fca5a5",
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
@@ -263,17 +264,17 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "center",
   },
   versionLabel: {
-    fontSize: "14px",
+    fontSize: "var(--font-size-lg, 14px)",
     color: "#a1a1aa",
   },
   versionValue: {
-    fontSize: "14px",
-    fontFamily: "monospace",
+    fontSize: "var(--font-size-lg, 14px)",
+    fontFamily: "var(--font-mono, monospace)",
     color: "#e4e4e7",
   },
   updateHint: {
     margin: "12px 0 0 0",
-    fontSize: "13px",
+    fontSize: "var(--font-size-base, 13px)",
     color: "#a1a1aa",
   },
   actions: {
@@ -285,7 +286,7 @@ const styles: Record<string, React.CSSProperties> = {
     flex: 1,
     minWidth: "120px",
     padding: "12px 24px",
-    fontSize: "15px",
+    fontSize: "var(--font-size-reading, 15px)",
     fontWeight: 500,
     color: "#fff",
     backgroundColor: "#6366f1",
@@ -297,7 +298,7 @@ const styles: Record<string, React.CSSProperties> = {
     flex: 1,
     minWidth: "120px",
     padding: "12px 24px",
-    fontSize: "15px",
+    fontSize: "var(--font-size-reading, 15px)",
     fontWeight: 500,
     color: "#a1a1aa",
     backgroundColor: "transparent",

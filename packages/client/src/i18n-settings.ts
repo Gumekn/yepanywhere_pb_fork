@@ -63,18 +63,6 @@ export function getSettingsCategories(
       description: t("settingsAppearanceDescription"),
     },
     {
-      id: "model",
-      label: t("settingsModelTitle"),
-      icon: "🧠",
-      description: t("settingsModelDescription"),
-    },
-    {
-      id: "agent-context",
-      label: t("settingsAgentContextTitle"),
-      icon: "📋",
-      description: t("settingsAgentContextDescription"),
-    },
-    {
       id: "library",
       label: t("settingsLibraryTitle"),
       icon: "🗂️",
@@ -129,17 +117,6 @@ export function getSettingsCategories(
       description: t("settingsAboutDescription"),
     },
   ];
-}
-
-export function getEmulatorCategory(
-  t: (key: string) => string,
-): SettingsCategory {
-  return {
-    id: "emulator",
-    label: t("settingsEmulatorTitle"),
-    icon: "🤖",
-    description: t("settingsEmulatorDescription"),
-  };
 }
 
 export function getDevelopmentCategory(

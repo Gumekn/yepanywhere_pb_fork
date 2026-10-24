@@ -7,6 +7,7 @@ import type { ContextUsage, PermissionMode } from "../types";
 import { ContextStatusModal } from "./ContextStatusModal";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { ModeSelector } from "./ModeSelector";
+import { SideConversationButton } from "./SideConversationButton";
 import { SlashCommandButton } from "./SlashCommandButton";
 import { VoiceInputButton, type VoiceInputButtonRef } from "./VoiceInputButton";
 
@@ -58,6 +59,8 @@ export interface MessageInputToolbarProps {
   onInterruptSend?: () => void;
   /** Queue a deferred message. Only provided when agent is running. */
   onQueue?: () => void;
+  onOpenSideConversation?: () => void;
+  sideConversationOpen?: boolean;
   canSend?: boolean;
   disabled?: boolean;
 
@@ -100,6 +103,8 @@ export function MessageInputToolbar({
   onSend,
   onInterruptSend,
   onQueue,
+  onOpenSideConversation,
+  sideConversationOpen,
   canSend,
   disabled,
   pendingApproval,
@@ -211,7 +216,7 @@ export function MessageInputToolbar({
                     fill="var(--bg-primary, #1a1a2e)"
                     fontSize="8"
                     fontWeight="700"
-                    fontFamily="system-ui, sans-serif"
+                    fontFamily="var(--font-sans)"
                     stroke="none"
                   >
                     A
@@ -241,6 +246,12 @@ export function MessageInputToolbar({
               label={button.label}
             />
           ))}
+        {onOpenSideConversation && (
+          <SideConversationButton
+            onClick={onOpenSideConversation}
+            expanded={sideConversationOpen}
+          />
+        )}
         <ContextUsageIndicator
           usage={contextUsage}
           size={16}

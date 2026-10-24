@@ -77,6 +77,49 @@ describe("SessionIndexService", () => {
   });
 
   describe("cache hit", () => {
+    it.each(["failed", "interrupted"] as const)(
+      "preserves %s turn health and fork metadata during full validation",
+      async (lastTurnStatus) => {
+        await createSession("session-1", "Hello world");
+        const summary: SessionSummary = {
+          id: "session-1",
+          projectId: toUrlProjectId("/test/project"),
+          title: "Hello world",
+          fullTitle: "Hello world",
+          createdAt: "2026-10-15T00:00:00.000Z",
+          updatedAt: "2026-10-15T00:01:00.000Z",
+          messageCount: 2,
+          provider: "codex",
+          ownership: { owner: "none" },
+          lastTurnStatus,
+          lastErrorMessage:
+            lastTurnStatus === "failed" ? "Turn failed" : undefined,
+          interrupted: lastTurnStatus === "interrupted",
+          forkParentSessionId: "parent-session",
+        };
+        const readSummary = vi
+          .spyOn(reader, "getSessionSummary")
+          .mockResolvedValue(summary);
+
+        const initial = await service.getSessionsWithCache(
+          sessionDir,
+          projectId,
+          reader,
+        );
+        // The default validation interval is zero: this is another full scan,
+        // with unchanged file stats forcing the cached-summary branch.
+        const cached = await service.getSessionsWithCache(
+          sessionDir,
+          projectId,
+          reader,
+        );
+
+        expect(initial[0]).toEqual(summary);
+        expect(cached[0]).toEqual(summary);
+        expect(readSummary).toHaveBeenCalledTimes(1);
+      },
+    );
+
     it("returns cached data when mtime/size match", async () => {
       await createSession("session-1", "Hello world");
 

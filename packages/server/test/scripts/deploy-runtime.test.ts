@@ -1,5 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -70,6 +76,109 @@ const external = {
 };
 
 describe("deployment runtime wiring", () => {
+  it.each([
+    [false, false, false],
+    [true, false, false],
+    [false, true, false],
+    [false, false, true],
+  ])(
+    "refreshes launch definitions only for cutover: server=%s bridge=%s runtime=%s",
+    (server, bridge, runtime) => {
+      const source = readFileSync(
+        join(root, "scripts/redeploy-server.sh"),
+        "utf8",
+      );
+      const branch = source.slice(
+        source.indexOf("# Build-only runs can precede"),
+        source.indexOf("# ----- restart -----"),
+      );
+      const result = run(`
+DO_BUILD=true
+DO_RESTART=${server}
+RESTART_CODEX_BRIDGE=${bridge}
+RESTART_RUNTIME=${runtime}
+refresh_installed_bridge_launchagents() { echo bridge; }
+refresh_installed_runtime_launchagent() { echo runtime; }
+${branch}
+`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(
+        server || bridge || runtime ? "bridge\nruntime\n" : "",
+      );
+    },
+  );
+  it.each([
+    {
+      runtime: true,
+      server: false,
+      expected: ["--restart", "--restart-runtime", "--no-restart"],
+    },
+    {
+      runtime: true,
+      server: true,
+      expected: ["--restart", "--restart-runtime"],
+    },
+    { runtime: false, server: true, expected: ["--restart"] },
+    { runtime: false, server: false, expected: null },
+  ])(
+    "dispatches selected services safely: runtime=$runtime server=$server",
+    ({ runtime, server, expected }) => {
+      const source = readFileSync(join(root, "scripts/deploy.sh"), "utf8");
+      const dir = mkdtempSync(join(tmpdir(), "yep-deploy-dispatch-"));
+      dirs.push(dir);
+      mkdirSync(join(dir, "scripts"));
+      // Run the actual dispatch branch against an argument-printing fixture.
+      // No production deploy script, launchd, port, or service is executed.
+      writeFileSync(
+        join(dir, "scripts/redeploy-server.sh"),
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$@"\n',
+        { mode: 0o755 },
+      );
+      const helperStart = source.indexOf("server_args_contain() {");
+      const helper = source.slice(
+        helperStart,
+        source.indexOf("\n}", helperStart) + 2,
+      );
+      const guard = source.slice(
+        source.indexOf("if ! $DO_SERVER && ! $DO_CODEX_BRIDGE && ! $DO_APK"),
+        source.indexOf("\nacquire_deploy_lock\n"),
+      );
+      const dispatch = source.slice(
+        source.indexOf("if $DO_DEV_SERVER; then\n  start_dev_server"),
+        source.indexOf('\nif $DO_APK; then\n  log "Building/installing APK'),
+      );
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          `
+set -eu
+DO_SERVER=${server}
+DO_CODEX_BRIDGE=false
+DO_APK=false
+DO_DEV_SERVER=false
+ALLOW_YEP_SESSION_INTERRUPT=false
+SERVER_ARGS=(--restart ${runtime ? "--restart-runtime" : ""})
+log() { :; }
+warn() { :; }
+err() { printf '%s\\n' "$*" >&2; }
+${helper}
+${guard}
+${dispatch}
+`,
+        ],
+        { cwd: dir, encoding: "utf8" },
+      );
+      const failure = result.error?.message ?? result.stderr;
+      if (expected) {
+        expect(result.status, failure).toBe(0);
+        expect(result.stdout.trim().split("\n")).toEqual(expected);
+      } else {
+        expect(result.status, failure).toBe(2);
+        expect(result.stderr).toContain("Nothing to deploy");
+      }
+    },
+  );
   it("preserves installed external wiring without requiring another opt-in", () => {
     const result = run(printConfig, external);
     expect(result.status).toBe(0);

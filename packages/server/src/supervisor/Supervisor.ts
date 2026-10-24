@@ -20,10 +20,11 @@ import type {
 } from "@yep-anywhere/shared";
 import type { FeishuMcpConfig } from "../channels/feishu/user-auth/mcp-gateway.js";
 import { getLogger } from "../logging/logger.js";
-import { getProvider } from "../sdk/providers/index.js";
+import { getAllProviders, getProvider } from "../sdk/providers/index.js";
 import { isProviderEnabled } from "../sdk/providers/policy.js";
 import type { AgentProvider } from "../sdk/providers/types.js";
 import type { ClaudeSDK, PermissionMode, UserMessage } from "../sdk/types.js";
+import { pendingInputTypeFromRequest } from "../sessions/session-runtime.js";
 import type {
   EventBus,
   ProcessStateEvent,
@@ -44,6 +45,7 @@ import {
 } from "./WorkerQueue.js";
 import {
   DEFAULT_IDLE_PREEMPT_THRESHOLD_MS,
+  DEFAULT_RESIDENT_IDLE_TTL_MS,
   type ProcessEvent,
   type ProcessInfo,
   type ProcessOptions,
@@ -60,6 +62,8 @@ const TERMINATED_RETENTION_MS = 10 * 60 * 1000;
 
 /** How often to check for stale processes (60 seconds) */
 const STALE_CHECK_INTERVAL_MS = 60 * 1000;
+/** Cursor authenticates and starts ACP before it can return a native session ID. */
+const CURSOR_SESSION_ID_TIMEOUT_MS = 30_000;
 
 /** Default in-turn stale threshold for providers with frequent heartbeat/tool events. */
 const DEFAULT_STALE_IN_TURN_THRESHOLD_MS = 5 * 60 * 1000;
@@ -70,6 +74,36 @@ export function getStaleInTurnThresholdMs(provider: ProviderName): number {
   return provider === "codex" || provider === "codex-oss"
     ? CODEX_STALE_IN_TURN_THRESHOLD_MS
     : DEFAULT_STALE_IN_TURN_THRESHOLD_MS;
+}
+
+/**
+ * Which launch-time reasoning settings differ between a running process and a
+ * request. Only providers that consume them at launch can need a restart: the
+ * client always echoes its global thinking level and the session's displayed
+ * effort, which for a provider like Cursor never reached the process at all.
+ */
+function diffReasoningLaunchSettings(
+  process: Process,
+  modelSettings: ModelSettings | undefined,
+): {
+  thinkingChanged: boolean;
+  effortChanged: boolean;
+  reasoningEffortChanged: boolean;
+} {
+  if (getProvider(process.provider)?.usesReasoningLaunchSettings === false) {
+    return {
+      thinkingChanged: false,
+      effortChanged: false,
+      reasoningEffortChanged: false,
+    };
+  }
+  return {
+    thinkingChanged:
+      process.thinking?.type !== (modelSettings?.thinking?.type ?? undefined),
+    effortChanged: process.effort !== modelSettings?.effort,
+    reasoningEffortChanged:
+      process.requestedReasoningEffort !== modelSettings?.reasoningEffort,
+  };
 }
 
 /**
@@ -104,8 +138,6 @@ export interface ModelSettings {
   providerName?: ProviderName;
   /** Configured SSH host for Claude remote execution. */
   executor?: string;
-  /** Global instructions to append to system prompt (from server settings) */
-  globalInstructions?: string;
   /** Permission rules for tool filtering (deny/allow patterns) */
   permissions?: PermissionRules;
   /**
@@ -187,6 +219,11 @@ export interface SupervisorOptions {
   maxWorkers?: number;
   /** Idle threshold in milliseconds for preemption. Workers idle longer than this can be preempted. */
   idlePreemptThresholdMs?: number;
+  /**
+   * Release live provider processes that have been idle this long.
+   * 0 = keep idle resident processes forever. Default 60 minutes.
+   */
+  residentIdleTtlMs?: number;
   /** Maximum queue size. 0 = unlimited (default) */
   maxQueueSize?: number;
   /** Callback to persist executor when session ID is received (for remote execution resume) */
@@ -217,6 +254,7 @@ export class Supervisor {
   private eventBus?: EventBus;
   private maxWorkers: number;
   private idlePreemptThresholdMs: number;
+  private residentIdleTtlMs: number;
   private workerQueue: WorkerQueue;
   private onSessionExecutor?: OnSessionExecutorCallback;
   private onSessionIdChanged?: OnSessionIdChangedCallback;
@@ -241,6 +279,10 @@ export class Supervisor {
     this.maxWorkers = options.maxWorkers ?? 0; // 0 = unlimited
     this.idlePreemptThresholdMs =
       options.idlePreemptThresholdMs ?? DEFAULT_IDLE_PREEMPT_THRESHOLD_MS;
+    this.residentIdleTtlMs = Math.max(
+      0,
+      options.residentIdleTtlMs ?? DEFAULT_RESIDENT_IDLE_TTL_MS,
+    );
     this.workerQueue = new WorkerQueue({
       eventBus: options.eventBus,
       maxQueueSize: options.maxQueueSize,
@@ -256,15 +298,23 @@ export class Supervisor {
       ),
     );
     this.enabledProviders = options.enabledProviders;
-    this.staleCheckTimer = setInterval(
-      () => this.terminateStaleProcesses(),
-      STALE_CHECK_INTERVAL_MS,
-    );
+    this.staleCheckTimer = setInterval(() => {
+      this.terminateStaleProcesses();
+      void this.reclaimExpiredIdleProcesses();
+    }, STALE_CHECK_INTERVAL_MS);
     this.staleCheckTimer.unref(); // Don't keep process alive for cleanup
 
     if (!this.provider && !this.sdk) {
       throw new Error("Either provider or sdk must be provided");
     }
+  }
+
+  getAvailableProviderNames(): ProviderName[] {
+    return getAllProviders()
+      .filter((provider) =>
+        isProviderEnabled(provider.name, this.enabledProviders),
+      )
+      .map((provider) => provider.name);
   }
 
   private resolveProvider(modelSettings?: ModelSettings): AgentProvider | null {
@@ -502,7 +552,6 @@ export class Supervisor {
       codexEventProjectId: projectId,
       llmGatewayConfig: modelSettings?.llmGatewayConfig,
       executor: modelSettings?.executor,
-      globalInstructions: modelSettings?.globalInstructions,
       onToolApproval: async (toolName, input, opts) => {
         if (!processHolder.process) {
           return { behavior: "deny", message: "Process not ready" };
@@ -541,6 +590,7 @@ export class Supervisor {
       interrupt,
       steer,
       codexControls,
+      sideConversations,
       supportedModels,
       supportedCommands,
       setModel,
@@ -571,7 +621,9 @@ export class Supervisor {
       setMaxThinkingTokensFn: setMaxThinkingTokens,
       interruptFn: interrupt,
       steerFn: steer,
+      defersInputDuringTurn: activeProvider.defersInputDuringTurn === true,
       codexControls,
+      sideConversations,
       supportedModelsFn: supportedModels,
       supportedCommandsFn: supportedCommands,
       setModelFn: setModel,
@@ -600,8 +652,17 @@ export class Supervisor {
     // Wait for the real session ID from the provider
     try {
       await process.waitForSessionId(
-        activeProvider.name === "codex" ? CODEX_SESSION_ID_TIMEOUT_MS : 5000,
-        { strict: activeProvider.name === "codex" },
+        activeProvider.name === "codex"
+          ? CODEX_SESSION_ID_TIMEOUT_MS
+          : activeProvider.name === "cursor" || activeProvider.name === "mcode"
+            ? CURSOR_SESSION_ID_TIMEOUT_MS
+            : 5000,
+        {
+          strict:
+            activeProvider.name === "codex" ||
+            activeProvider.name === "cursor" ||
+            activeProvider.name === "mcode",
+        },
       );
     } catch (error) {
       await process.abort();
@@ -692,7 +753,6 @@ export class Supervisor {
       codexEventProjectId: projectId,
       llmGatewayConfig: modelSettings?.llmGatewayConfig,
       executor: modelSettings?.executor,
-      globalInstructions: modelSettings?.globalInstructions,
       resumeSessionAt: modelSettings?.resumeSessionAt,
       rollbackNumTurns: modelSettings?.rollbackNumTurns,
       onToolApproval: async (toolName, input, opts) => {
@@ -729,6 +789,7 @@ export class Supervisor {
       interrupt,
       steer,
       codexControls,
+      sideConversations,
       supportedModels,
       supportedCommands,
       setModel,
@@ -758,7 +819,9 @@ export class Supervisor {
       setMaxThinkingTokensFn: setMaxThinkingTokens,
       interruptFn: interrupt,
       steerFn: steer,
+      defersInputDuringTurn: activeProvider.defersInputDuringTurn === true,
       codexControls,
+      sideConversations,
       supportedModelsFn: supportedModels,
       supportedCommandsFn: supportedCommands,
       setModelFn: setModel,
@@ -798,7 +861,10 @@ export class Supervisor {
       Boolean(resumeSessionId && modelSettings?.rollbackNumTurns);
     const isForkedResume = isCrossSessionEditFork || isCodexFork;
     const requiresStrictSessionId =
-      isForkedResume || activeProvider.name === "codex";
+      isForkedResume ||
+      activeProvider.name === "codex" ||
+      activeProvider.name === "cursor" ||
+      activeProvider.name === "mcode";
 
     // A known Codex ID does not mean thread/resume succeeded. Wait for init
     // on ordinary resumes too, so writer-lock failures reach the HTTP caller
@@ -810,7 +876,10 @@ export class Supervisor {
           ? this.nativeForkSessionIdTimeoutMs
           : activeProvider.name === "codex"
             ? CODEX_SESSION_ID_TIMEOUT_MS
-            : 5000;
+            : activeProvider.name === "cursor" ||
+                activeProvider.name === "mcode"
+              ? CURSOR_SESSION_ID_TIMEOUT_MS
+              : 5000;
         resolvedSessionId = await process.waitForSessionId(sessionIdTimeoutMs, {
           strict: requiresStrictSessionId,
         });
@@ -830,6 +899,7 @@ export class Supervisor {
       process,
       !resumeSessionId || isForkedResume,
       isForkedResume ? undefined : resumeSessionId,
+      isForkedResume ? resumeSessionId : undefined,
     );
 
     return process;
@@ -935,15 +1005,8 @@ export class Supervisor {
           await existingProcess.abort();
           this.unregisterProcess(existingProcess);
         } else {
-          // Check if thinking/effort settings changed
-          const thinkingChanged =
-            existingProcess.thinking?.type !==
-            (modelSettings?.thinking?.type ?? undefined);
-          const effortChanged =
-            existingProcess.effort !== modelSettings?.effort;
-          const reasoningEffortChanged =
-            existingProcess.requestedReasoningEffort !==
-            modelSettings?.reasoningEffort;
+          const { thinkingChanged, effortChanged, reasoningEffortChanged } =
+            diffReasoningLaunchSettings(existingProcess, modelSettings);
 
           if (thinkingChanged || effortChanged || reasoningEffortChanged) {
             if (
@@ -1177,6 +1240,10 @@ export class Supervisor {
           error:
             "Finish the current task before changing Feishu authorization.",
         };
+      // Capture provenance before aborting: create-only Codex threads may not
+      // have a rollout yet when the first message installs Feishu MCP access.
+      const allowMissingRolloutReplacement =
+        process.provider === "codex" && process.isUnmaterializedSession;
       await process.abort();
       this.unregisterProcess(process);
       const next = await this.resumeSession(
@@ -1185,7 +1252,12 @@ export class Supervisor {
         message,
         permissionMode,
         modelSettings,
-        admission,
+        {
+          ...admission,
+          ...(allowMissingRolloutReplacement
+            ? { allowMissingRolloutReplacement: true }
+            : {}),
+        },
       );
       return "id" in next
         ? { success: true, process: next, restarted: true }
@@ -1195,12 +1267,8 @@ export class Supervisor {
           };
     }
 
-    // Check if thinking/effort settings changed
-    const thinkingChanged =
-      process.thinking?.type !== (modelSettings?.thinking?.type ?? undefined);
-    const effortChanged = process.effort !== modelSettings?.effort;
-    const reasoningEffortChanged =
-      process.requestedReasoningEffort !== modelSettings?.reasoningEffort;
+    const { thinkingChanged, effortChanged, reasoningEffortChanged } =
+      diffReasoningLaunchSettings(process, modelSettings);
 
     if (thinkingChanged || effortChanged || reasoningEffortChanged) {
       if (
@@ -1387,6 +1455,7 @@ export class Supervisor {
     process: Process,
     isNewSession: boolean,
     resumedSessionId?: string,
+    forkParentSessionId?: string,
   ): void {
     const log = getLogger();
     log.info(
@@ -1416,7 +1485,7 @@ export class Supervisor {
 
     // Emit session created event for new sessions
     if (isNewSession) {
-      this.emitSessionCreated(process, ownership);
+      this.emitSessionCreated(process, ownership, forkParentSessionId);
       this.scheduleInitialSessionReconciliation(
         process.sessionId,
         process.projectId,
@@ -1432,13 +1501,10 @@ export class Supervisor {
       initialState.type === "in-turn" ||
       initialState.type === "waiting-input"
     ) {
-      // Convert InputRequest.type to PendingInputType if waiting for input at start
-      let pendingInputType: PendingInputType | undefined;
-      if (initialState.type === "waiting-input") {
-        const requestType = initialState.request.type;
-        pendingInputType =
-          requestType === "tool-approval" ? "tool-approval" : "user-question";
-      }
+      const pendingInputType =
+        initialState.type === "waiting-input"
+          ? pendingInputTypeFromRequest(initialState.request)
+          : undefined;
       this.emitAgentActivityChange(
         process.sessionId,
         process.projectId,
@@ -1575,16 +1641,10 @@ export class Supervisor {
           event.state.type === "hold" ||
           event.state.type === "terminated"
         ) {
-          // Convert InputRequest.type to PendingInputType when waiting for input
-          // "tool-approval" stays as-is, "question" or "choice" becomes "user-question"
-          let pendingInputType: PendingInputType | undefined;
-          if (event.state.type === "waiting-input") {
-            const requestType = event.state.request.type;
-            pendingInputType =
-              requestType === "tool-approval"
-                ? "tool-approval"
-                : "user-question";
-          }
+          const pendingInputType =
+            event.state.type === "waiting-input"
+              ? pendingInputTypeFromRequest(event.state.request)
+              : undefined;
           this.emitAgentActivityChange(
             process.sessionId,
             process.projectId,
@@ -1748,6 +1808,7 @@ export class Supervisor {
   private emitSessionCreated(
     process: Process,
     ownership: SessionOwnership,
+    forkParentSessionId?: string,
   ): void {
     if (!this.eventBus) return;
 
@@ -1755,6 +1816,7 @@ export class Supervisor {
     const optimistic = this.buildOptimisticSessionSeed(process);
     const session: SessionSummary = {
       id: process.sessionId,
+      ...(forkParentSessionId ? { forkParentSessionId } : {}),
       projectId: process.projectId,
       title: optimistic.title,
       fullTitle: optimistic.fullTitle,
@@ -1982,6 +2044,82 @@ export class Supervisor {
         `stale: no SDK messages for ${Math.round(silentMs / 1000)}s`,
       );
     }
+  }
+
+  /**
+   * Release resident provider processes that stayed idle past the TTL.
+   *
+   * Process.startIdleTimer keeps live processes owned on purpose so a session
+   * stays warm between turns. Without an upper bound every session ever opened
+   * keeps its provider process (e.g. one Codex app-server each) until the
+   * runtime restarts. Only plain `idle` processes are eligible: in-turn,
+   * waiting-input and hold states are never reclaimed.
+   */
+  async reclaimExpiredIdleProcesses(now = Date.now()): Promise<number> {
+    if (this.isShuttingDown || this.residentIdleTtlMs <= 0) return 0;
+
+    const expired: Process[] = [];
+    for (const process of this.processes.values()) {
+      if (process.state.type !== "idle") continue;
+      if (this.preemptingProcessIds.has(process.id)) continue;
+      if (process.getDeferredQueueSummary().length > 0) continue;
+      const idleMs = now - process.state.since.getTime();
+      if (idleMs < this.residentIdleTtlMs) continue;
+      expired.push(process);
+    }
+
+    let reclaimed = 0;
+    for (const process of expired) {
+      // State may have changed while earlier reclaims were awaiting exit.
+      if (
+        this.isShuttingDown ||
+        this.processes.get(process.id) !== process ||
+        process.state.type !== "idle" ||
+        this.preemptingProcessIds.has(process.id)
+      ) {
+        continue;
+      }
+
+      const idleMs = now - process.state.since.getTime();
+      this.preemptingProcessIds.add(process.id);
+      try {
+        getLogger().info(
+          {
+            event: "idle_resident_reclaimed",
+            sessionId: process.sessionId,
+            processId: process.id,
+            projectId: process.projectId,
+            provider: process.provider,
+            idleMs,
+            residentIdleTtlMs: this.residentIdleTtlMs,
+            processAlive: process.isProcessAlive,
+          },
+          `Releasing idle provider process: ${process.sessionId} (idle ${Math.round(idleMs / 60_000)}m)`,
+        );
+        // Same grace handling as an explicit abort, so files written while the
+        // provider shuts down are not mistaken for an external session.
+        this.emitSessionAborted(process.sessionId, process.projectId);
+        await process.abort();
+        if (this.processes.get(process.id) === process) {
+          this.unregisterProcess(process);
+        }
+        reclaimed += 1;
+      } catch (error) {
+        getLogger().warn(
+          {
+            event: "idle_resident_reclaim_failed",
+            sessionId: process.sessionId,
+            processId: process.id,
+            provider: process.provider,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          `Failed to release idle provider process: ${process.sessionId}`,
+        );
+      } finally {
+        this.preemptingProcessIds.delete(process.id);
+      }
+    }
+    return reclaimed;
   }
 
   // ============ Worker Pool Methods ============

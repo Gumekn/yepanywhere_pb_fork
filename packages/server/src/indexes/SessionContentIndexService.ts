@@ -413,8 +413,18 @@ export class SessionContentIndexService {
       return;
     }
 
+    if (event.provider === "cursor") {
+      this.markMatchingScopesDirty("cursor::");
+      return;
+    }
+
     if (event.provider === "kimi") {
       this.markMatchingScopesDirty("kimi::");
+      return;
+    }
+
+    if (event.provider === "mcode") {
+      this.markMatchingScopesDirty("mcode::");
     }
   }
 

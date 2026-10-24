@@ -22,6 +22,7 @@ import type { NotificationService } from "../notifications/NotificationService.j
 import { decodeProjectId } from "../projects/paths.js";
 import type { RuntimeController } from "../runtime/types.js";
 import type { ConnectedBrowsersService } from "../services/ConnectedBrowsersService.js";
+import { pendingInputTypeFromRequest } from "../sessions/session-runtime.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
 import type { InputRequest } from "../supervisor/types.js";
 import type {
@@ -270,8 +271,8 @@ export class PushNotifier {
     if (existing && existing.requestId === request.id) {
       return;
     }
-    const inputType =
-      request.type === "tool-approval" ? "tool-approval" : "user-question";
+    const inputType = pendingInputTypeFromRequest(request);
+    if (!inputType) return;
 
     // Check if this notification type is enabled in settings
     const settingKey =

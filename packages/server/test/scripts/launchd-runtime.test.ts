@@ -154,171 +154,196 @@ describe("LaunchAgent runtime isolation", () => {
     expect(readFileSync(join(runtimeDir, "keep.txt"), "utf8")).toBe("preserve");
   });
 
-  it("loads deploy env credentials into a no-start server plist", () => {
-    const installScript = join(repoRoot, "scripts/install-launchagents.sh");
-    copyFileSync(
-      join(workspaceRoot, "scripts/install-launchagents.sh"),
-      installScript,
-    );
-    chmodSync(installScript, 0o755);
-    // The installer sources the shared deploy-env loader so a standalone
-    // reinstall still picks up .env.deploy.local credentials.
-    const libDir = join(repoRoot, "scripts/lib");
-    mkdirSync(libDir, { recursive: true });
-    copyFileSync(
-      join(workspaceRoot, "scripts/lib/deploy-env.sh"),
-      join(libDir, "deploy-env.sh"),
-    );
-    copyFileSync(
-      join(workspaceRoot, "scripts/lib/deploy-lock.sh"),
-      join(libDir, "deploy-lock.sh"),
-    );
-    copyFileSync(
-      join(workspaceRoot, "scripts/lib/deploy-runtime.sh"),
-      join(libDir, "deploy-runtime.sh"),
-    );
-    writeFileSync(
-      join(repoRoot, ".env.deploy.local"),
-      [
-        "ALLOWED_HOSTS=ignored.example",
-        "SESSION_TITLE_LLM_API_KEY=fixture-title-key-from-file",
-        "YEP_LLM_GATEWAY_API_KEY=fixture-gateway-key-from-file",
-        "CUSTOM_GATEWAY_KEY=fixture-extra-key-from-file",
-        // Extra Pi gateway channels reference their key by env var name, so
-        // this value itself carries no credential.
-        "YEP_LLM_GATEWAYS=aitl=https://fixture.example/v1|CUSTOM_GATEWAY_KEY",
-        // Empty is meaningful: show the gateway's complete model catalog.
-        "YEP_LLM_GATEWAY_MODELS=",
-        `YEP_FCM_SERVICE_ACCOUNT_JSON='{"project_id":"fixture-project"}'`,
-      ].join("\n"),
-    );
-    const fakeNode = join(fakeBin, "node");
-    const fakeCodex = join(fakeBin, "codex");
-    executable(
-      fakeNode,
-      `#!/usr/bin/env bash\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
-    );
-    executable(fakeCodex, "#!/usr/bin/env bash\nexit 0\n");
+  it.each(["explicit", "nvm", "path"])(
+    "loads deploy env credentials with %s Node selection into a no-start server plist",
+    (nodeSelection) => {
+      const installScript = join(repoRoot, "scripts/install-launchagents.sh");
+      copyFileSync(
+        join(workspaceRoot, "scripts/install-launchagents.sh"),
+        installScript,
+      );
+      chmodSync(installScript, 0o755);
+      // The installer sources the shared deploy-env loader so a standalone
+      // reinstall still picks up .env.deploy.local credentials.
+      const libDir = join(repoRoot, "scripts/lib");
+      mkdirSync(libDir, { recursive: true });
+      copyFileSync(
+        join(workspaceRoot, "scripts/lib/deploy-env.sh"),
+        join(libDir, "deploy-env.sh"),
+      );
+      copyFileSync(
+        join(workspaceRoot, "scripts/lib/deploy-lock.sh"),
+        join(libDir, "deploy-lock.sh"),
+      );
+      copyFileSync(
+        join(workspaceRoot, "scripts/lib/deploy-runtime.sh"),
+        join(libDir, "deploy-runtime.sh"),
+      );
+      writeFileSync(
+        join(repoRoot, ".env.deploy.local"),
+        [
+          "ALLOWED_HOSTS=ignored.example",
+          "SESSION_TITLE_LLM_API_KEY=fixture-title-key-from-file",
+          "YEP_LLM_GATEWAY_API_KEY=fixture-gateway-key-from-file",
+          "CUSTOM_GATEWAY_KEY=fixture-extra-key-from-file",
+          // Extra Pi gateway channels reference their key by env var name, so
+          // this value itself carries no credential.
+          "YEP_LLM_GATEWAYS=aitl=https://fixture.example/v1|CUSTOM_GATEWAY_KEY",
+          // Empty is meaningful: show the gateway's complete model catalog.
+          "YEP_LLM_GATEWAY_MODELS=",
+          `YEP_FCM_SERVICE_ACCOUNT_JSON='{"project_id":"fixture-project"}'`,
+        ].join("\n"),
+      );
+      const fakeNode = join(fakeBin, "node");
+      const fakeCodex = join(fakeBin, "codex");
+      executable(
+        fakeNode,
+        `#!/usr/bin/env bash\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
+      );
+      executable(fakeCodex, "#!/usr/bin/env bash\nexit 0\n");
 
-    // Keep credentials inherited from the developer environment from masking
-    // whether the standalone installer loaded this sandbox's deploy env file.
-    const parentEnv = { ...process.env };
-    for (const key of [
-      "YEP_DEPLOY_ENV_FILE",
-      "YEP_FCM_SERVICE_ACCOUNT_FILE",
-      "YEP_FCM_SERVICE_ACCOUNT_JSON",
-      "GOOGLE_APPLICATION_CREDENTIALS",
-      "SESSION_TITLE_LLM_API_KEY",
-      "LLM_API_KEY",
-      "YEP_LLM_GATEWAY_API_KEY",
-      "CUSTOM_GATEWAY_KEY",
-      "YEP_LLM_GATEWAYS",
-      "YEP_LLM_GATEWAY_MODELS",
-      "YEP_DEPLOY_ENV_FILE_PRECEDENCE",
-      "YEP_REPORTS_DIR",
-      "RESEARCH_TASKS_DIR",
-    ]) {
-      delete parentEnv[key];
-    }
-    const installEnv = {
-      ...parentEnv,
-      ALLOWED_HOSTS: "example.test,127.0.0.1",
-      HOME: homeDir,
-      PATH: `${fakeBin}:/usr/bin:/bin`,
-      YEP_CODEX_PATH: fakeCodex,
-      YEP_LAUNCHD_NODE: fakeNode,
-      YEP_LAUNCHD_RUNTIME_DIR: runtimeDir,
-    };
-    const result = spawnSync(
-      "/bin/bash",
-      [installScript, "--server-only", "--no-start"],
-      {
-        encoding: "utf8",
-        env: installEnv,
-      },
-    );
-
-    expect(result.status, result.stderr).toBe(0);
-    const plistPath = join(
-      homeDir,
-      "Library/LaunchAgents/com.yueyuan.yepanywhere.server.plist",
-    );
-    const plist = readFileSync(plistPath, "utf8");
-    expect(plist).toContain(`<string>${runtimeDir}</string>`);
-    expect(plist).toContain(
-      `<string>${join(runtimeDir, "dist/cli.js")}</string>`,
-    );
-    expect(plist).toContain("<key>YEP_REPORTS_DIR</key>");
-    expect(plist).toContain(
-      `<string>${join(dirname(repoRoot), "research_tasks")}</string>`,
-    );
-    expect(plist).toContain("<key>ALLOWED_HOSTS</key>");
-    expect(plist).toContain("<string>example.test,127.0.0.1</string>");
-    expect(plist).toContain("<key>YEP_CODEX_PATH</key>");
-    expect(plist).toContain(`<string>${fakeCodex}</string>`);
-    expect(plist).toContain("<key>SESSION_TITLE_LLM_API_KEY</key>");
-    expect(plist).toContain("<string>fixture-title-key-from-file</string>");
-    expect(plist).toContain("<key>YEP_LLM_GATEWAY_API_KEY</key>");
-    expect(plist).toContain("<string>fixture-gateway-key-from-file</string>");
-    expect(plist).toContain("<key>YEP_LLM_GATEWAYS</key>");
-    expect(plist).toContain(
-      "<string>aitl=https://fixture.example/v1|CUSTOM_GATEWAY_KEY</string>",
-    );
-    expect(plist.match(/<key>CUSTOM_GATEWAY_KEY<\/key>/g)).toHaveLength(1);
-    expect(plist).toContain("<string>fixture-extra-key-from-file</string>");
-    expect(plist).toMatch(
-      /<key>YEP_LLM_GATEWAY_MODELS<\/key>\s*<string><\/string>/,
-    );
-    expect(plist).toContain("<key>YEP_FCM_SERVICE_ACCOUNT_JSON</key>");
-    expect(plist).toContain("fixture-project");
-    expect(readFileSync(join(runtimeDir, "marker.txt"), "utf8")).toBe("first");
-    expect(statSync(plistPath).mode & 0o777).toBe(0o600);
-    expect(
-      statSync(join(homeDir, ".yep-anywhere/logs/server-launchd.out.log"))
-        .mode & 0o777,
-    ).toBe(0o600);
-    const serverStdoutLog = join(
-      homeDir,
-      ".yep-anywhere/logs/server-launchd.out.log",
-    );
-    writeFileSync(serverStdoutLog, "oversized fixture log");
-
-    const filePrecedenceResult = spawnSync(
-      "/bin/bash",
-      [installScript, "--server-only", "--no-start"],
-      {
-        encoding: "utf8",
-        env: {
-          ...installEnv,
-          YEP_DEPLOY_ENV_FILE_PRECEDENCE: "true",
-          YEP_LAUNCHD_LOG_MAX_BYTES: "1",
+      // Keep credentials inherited from the developer environment from masking
+      // whether the standalone installer loaded this sandbox's deploy env file.
+      const parentEnv = { ...process.env };
+      for (const key of [
+        "YEP_DEPLOY_ENV_FILE",
+        "YEP_FCM_SERVICE_ACCOUNT_FILE",
+        "YEP_FCM_SERVICE_ACCOUNT_JSON",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "SESSION_TITLE_LLM_API_KEY",
+        "LLM_API_KEY",
+        "YEP_LLM_GATEWAY_API_KEY",
+        "CUSTOM_GATEWAY_KEY",
+        "YEP_LLM_GATEWAYS",
+        "YEP_LLM_GATEWAY_MODELS",
+        "YEP_DEPLOY_ENV_FILE_PRECEDENCE",
+        "YEP_REPORTS_DIR",
+        "RESEARCH_TASKS_DIR",
+      ]) {
+        delete parentEnv[key];
+      }
+      let selectedNode = fakeNode;
+      if (nodeSelection === "nvm") {
+        selectedNode = join(homeDir, ".nvm/versions/node/v22.22.2/bin/node");
+        mkdirSync(dirname(selectedNode), { recursive: true });
+        copyFileSync(fakeNode, selectedNode);
+        // A global package's own bin/node must never become the runtime.
+        const nestedNode = join(
+          homeDir,
+          ".nvm/versions/node/v22.22.2/lib/node_modules/fixture/bin/node",
+        );
+        mkdirSync(dirname(nestedNode), { recursive: true });
+        executable(nestedNode, "#!/bin/sh\nexit 42\n");
+        const nonExecutable = join(homeDir, ".nvm/versions/node/v99/bin/node");
+        mkdirSync(dirname(nonExecutable), { recursive: true });
+        writeFileSync(nonExecutable, "not executable");
+      }
+      // Fail if selection regresses to a recursive scan, even on a tiny fixture.
+      executable(join(fakeBin, "find"), "#!/bin/sh\nexit 42\n");
+      const installEnv = {
+        ...parentEnv,
+        ALLOWED_HOSTS: "example.test,127.0.0.1",
+        HOME: homeDir,
+        PATH: `${fakeBin}:/usr/bin:/bin`,
+        YEP_CODEX_PATH: fakeCodex,
+        YEP_LAUNCHD_NODE: nodeSelection === "explicit" ? fakeNode : "",
+        NVM_BIN: "",
+        YEP_LAUNCHD_RUNTIME_DIR: runtimeDir,
+      };
+      const result = spawnSync(
+        "/bin/bash",
+        [installScript, "--server-only", "--no-start"],
+        {
+          encoding: "utf8",
+          env: installEnv,
         },
-      },
-    );
-    expect(filePrecedenceResult.status).toBe(0);
-    expect(readFileSync(plistPath, "utf8")).toContain(
-      "<string>ignored.example</string>",
-    );
-    expect(readFileSync(`${serverStdoutLog}.1`, "utf8")).toBe(
-      "oversized fixture log",
-    );
+      );
 
-    const configuredReportsDir = "fixtures/custom-reports";
-    const overrideResult = spawnSync(
-      "/bin/bash",
-      [installScript, "--server-only", "--no-start"],
-      {
-        encoding: "utf8",
-        env: {
-          ...installEnv,
-          YEP_REPORTS_DIR: configuredReportsDir,
+      expect(result.status, result.stderr).toBe(0);
+      const plistPath = join(
+        homeDir,
+        "Library/LaunchAgents/com.yueyuan.yepanywhere.server.plist",
+      );
+      const plist = readFileSync(plistPath, "utf8");
+      expect(plist).toContain(`<string>${selectedNode}</string>`);
+      expect(plist).toContain(`<string>${runtimeDir}</string>`);
+      expect(plist).toContain(
+        `<string>${join(runtimeDir, "dist/cli.js")}</string>`,
+      );
+      expect(plist).toContain("<key>YEP_REPORTS_DIR</key>");
+      expect(plist).toContain(
+        `<string>${join(dirname(repoRoot), "research_tasks")}</string>`,
+      );
+      expect(plist).toContain("<key>ALLOWED_HOSTS</key>");
+      expect(plist).toContain("<string>example.test,127.0.0.1</string>");
+      expect(plist).toContain("<key>YEP_CODEX_PATH</key>");
+      expect(plist).toContain(`<string>${fakeCodex}</string>`);
+      expect(plist).toContain("<key>SESSION_TITLE_LLM_API_KEY</key>");
+      expect(plist).toContain("<string>fixture-title-key-from-file</string>");
+      expect(plist).toContain("<key>YEP_LLM_GATEWAY_API_KEY</key>");
+      expect(plist).toContain("<string>fixture-gateway-key-from-file</string>");
+      expect(plist).toContain("<key>YEP_LLM_GATEWAYS</key>");
+      expect(plist).toContain(
+        "<string>aitl=https://fixture.example/v1|CUSTOM_GATEWAY_KEY</string>",
+      );
+      expect(plist.match(/<key>CUSTOM_GATEWAY_KEY<\/key>/g)).toHaveLength(1);
+      expect(plist).toContain("<string>fixture-extra-key-from-file</string>");
+      expect(plist).toMatch(
+        /<key>YEP_LLM_GATEWAY_MODELS<\/key>\s*<string><\/string>/,
+      );
+      expect(plist).toContain("<key>YEP_FCM_SERVICE_ACCOUNT_JSON</key>");
+      expect(plist).toContain("fixture-project");
+      expect(readFileSync(join(runtimeDir, "marker.txt"), "utf8")).toBe(
+        "first",
+      );
+      expect(statSync(plistPath).mode & 0o777).toBe(0o600);
+      expect(
+        statSync(join(homeDir, ".yep-anywhere/logs/server-launchd.out.log"))
+          .mode & 0o777,
+      ).toBe(0o600);
+      const serverStdoutLog = join(
+        homeDir,
+        ".yep-anywhere/logs/server-launchd.out.log",
+      );
+      writeFileSync(serverStdoutLog, "oversized fixture log");
+
+      const filePrecedenceResult = spawnSync(
+        "/bin/bash",
+        [installScript, "--server-only", "--no-start"],
+        {
+          encoding: "utf8",
+          env: {
+            ...installEnv,
+            YEP_DEPLOY_ENV_FILE_PRECEDENCE: "true",
+            YEP_LAUNCHD_LOG_MAX_BYTES: "1",
+          },
         },
-      },
-    );
-    expect(overrideResult.status).toBe(0);
-    const overriddenPlist = readFileSync(plistPath, "utf8");
-    expect(overriddenPlist).toContain(
-      `<string>${repoRoot}/${configuredReportsDir}</string>`,
-    );
-  });
+      );
+      expect(filePrecedenceResult.status).toBe(0);
+      expect(readFileSync(plistPath, "utf8")).toContain(
+        "<string>ignored.example</string>",
+      );
+      expect(readFileSync(`${serverStdoutLog}.1`, "utf8")).toBe(
+        "oversized fixture log",
+      );
+
+      const configuredReportsDir = "fixtures/custom-reports";
+      const overrideResult = spawnSync(
+        "/bin/bash",
+        [installScript, "--server-only", "--no-start"],
+        {
+          encoding: "utf8",
+          env: {
+            ...installEnv,
+            YEP_REPORTS_DIR: configuredReportsDir,
+          },
+        },
+      );
+      expect(overrideResult.status).toBe(0);
+      const overriddenPlist = readFileSync(plistPath, "utf8");
+      expect(overriddenPlist).toContain(
+        `<string>${repoRoot}/${configuredReportsDir}</string>`,
+      );
+    },
+  );
 });

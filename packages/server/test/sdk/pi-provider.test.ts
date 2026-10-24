@@ -17,7 +17,6 @@ append({
   args: process.argv.slice(2),
   agentDir: process.env.PI_CODING_AGENT_DIR,
   hasGatewayKey: Boolean(process.env.YEP_PI_LLM_API_KEY),
-  globalInstructions: config.globalInstructions,
   providers: config.providers.map((provider) => ({
     id: provider.id,
     baseUrl: provider.config.baseUrl,
@@ -199,7 +198,6 @@ describe("PiProvider RPC integration", () => {
       // Dynamically registered Pi models clamp xhigh to high because they do
       // not define an xhigh thinkingLevelMap.
       reasoningEffort: "xhigh",
-      globalInstructions: "Follow the global test policy.",
       onToolApproval: approval,
     });
 
@@ -254,7 +252,6 @@ describe("PiProvider RPC integration", () => {
     const startup = log[0] as {
       args: string[];
       agentDir: string;
-      globalInstructions: string;
       providers: Array<{
         id: string;
         baseUrl: string;
@@ -267,7 +264,6 @@ describe("PiProvider RPC integration", () => {
       }>;
     };
     expect(startup.agentDir).toBe(agentDir);
-    expect(startup.globalInstructions).toBe("Follow the global test policy.");
     expect(startup.args).toEqual(
       expect.arrayContaining([
         "--mode",

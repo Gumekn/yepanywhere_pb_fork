@@ -484,7 +484,7 @@ runtime_dependencies_installed() {
 }
 
 install_runtime_dependencies() {
-  local npm_registry
+  local npm_registry started_at=$SECONDS
   npm_registry="$(deploy_npm_registry)"
   log "Installing runtime dependencies in dist/npm-package ..."
   dim "npm registry: ${npm_registry}"
@@ -494,6 +494,7 @@ install_runtime_dependencies() {
     run_deploy_npm_direct install --omit=dev --no-audit --no-fund --prefer-offline
   )
   chmod +x "$REPO_ROOT"/dist/npm-package/node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true
+  log "Runtime dependencies installed in $((SECONDS - started_at))s."
 }
 
 sync_launchd_runtime_if_installed() {
@@ -507,7 +508,9 @@ sync_launchd_runtime_if_installed() {
   fi
 
   log "Syncing the LaunchAgent runtime from the new bundle ..."
+  local started_at=$SECONDS
   YEP_LAUNCHD_RUNTIME_DIR="$LAUNCHD_RUNTIME_DIR" "$SCRIPT_DIR/sync-launchd-runtime.sh"
+  log "LaunchAgent runtime synced in $((SECONDS - started_at))s."
 }
 
 refresh_installed_bridge_launchagents() {
@@ -627,7 +630,9 @@ fi
 if $DO_RESTART || $RESTART_CODEX_BRIDGE || $RESTART_RUNTIME; then
   ensure_bundle_ready
 fi
-if $DO_BUILD || $DO_RESTART || $RESTART_CODEX_BRIDGE; then
+# Build-only runs can precede a second invocation for the actual cutover.
+# Refresh launch definitions once, when a process is actually being restarted.
+if $DO_RESTART || $RESTART_CODEX_BRIDGE || $RESTART_RUNTIME; then
   refresh_installed_bridge_launchagents
   refresh_installed_runtime_launchagent
 fi

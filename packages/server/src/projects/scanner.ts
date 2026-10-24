@@ -1,4 +1,4 @@
-import { access, readdir, stat } from "node:fs/promises";
+import { access, readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -14,13 +14,18 @@ import {
   tryMapLocalPathToRemote,
   tryMapRemotePathToLocal,
 } from "../sdk/remote-path-mapping.js";
+import { CURSOR_ACP_SESSIONS_DIR } from "../sessions/cursor-reader.js";
+import { MCODE_SESSIONS_DIR } from "../sessions/mcode-store.js";
 import { PI_SESSIONS_DIR } from "../sessions/pi-files.js";
 import { ZCODE_DB_PATH } from "../sessions/zcode-db.js";
 import type { Project } from "../supervisor/types.js";
+import { atomicWriteText } from "../utils/atomic-json-file.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
 import { CODEX_SESSIONS_DIR, CodexSessionScanner } from "./codex-scanner.js";
+import { CursorSessionScanner } from "./cursor-scanner.js";
 import { GEMINI_TMP_DIR, GeminiSessionScanner } from "./gemini-scanner.js";
 import { KIMI_SESSIONS_DIR, KimiSessionScanner } from "./kimi-scanner.js";
+import { McodeSessionScanner } from "./mcode-scanner.js";
 import {
   CLAUDE_PROJECTS_DIR,
   canonicalizeProjectPath,
@@ -44,11 +49,19 @@ export interface ScannerOptions {
   kimiScanner?: KimiSessionScanner | null; // shared provider scanner
   piScanner?: PiSessionScanner | null; // shared provider scanner
   zcodeScanner?: ZCodeSessionScanner | null; // shared provider scanner
+  cursorScanner?: CursorSessionScanner | null; // shared provider scanner
+  mcodeScanner?: McodeSessionScanner | null; // shared provider scanner
   enableCodex?: boolean; // whether to include Codex projects (default: true)
   enableGemini?: boolean; // whether to include Gemini projects (default: true)
   enableKimi?: boolean; // whether to include Kimi projects (default: true)
   enablePi?: boolean; // whether to include Pi projects (default: true)
   enableZCode?: boolean; // whether to include ZCode projects (default: true)
+  enableCursor?: boolean; // whether to include Cursor ACP projects (default: true)
+  /**
+   * Whether to include MiniMax Code projects. Defaults to true only when a
+   * shared scanner is injected, so tests never read the real ~/.minimax DB.
+   */
+  enableMcode?: boolean;
   projectMetadataService?: ProjectMetadataService; // for persisting added projects
   /** Remote Claude executors whose shared stores should also be scanned. */
   remoteExecutors?: RemoteExecutorConfig[];
@@ -56,6 +69,12 @@ export interface ScannerOptions {
   eventBus?: EventBus;
   /** Project snapshot TTL in milliseconds (default: 5000) */
   cacheTtlMs?: number;
+  /**
+   * Where to persist the last project snapshot. After a restart it seeds
+   * stale-tolerant lookups until the first scan finishes; it never answers
+   * fresh lookups.
+   */
+  snapshotCachePath?: string;
 }
 
 interface ProjectSnapshot {
@@ -70,6 +89,17 @@ interface ClaudeSessionSource {
   executor?: RemoteExecutorConfig;
 }
 
+/** Upper bound on how old a snapshot may be for stale-tolerant lookups. */
+const STALE_LOOKUP_MAX_AGE_MS = 60_000;
+/** Upper bound for a snapshot persisted before the last restart. */
+const PERSISTED_SEED_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const PERSISTED_SNAPSHOT_VERSION = 1;
+
+export interface ProjectLookupOptions {
+  /** Accept a known project from the previous snapshot; see getStaleProject. */
+  allowStale?: boolean;
+}
+
 export class ProjectScanner {
   private projectsDir: string;
   private remoteExecutors: RemoteExecutorConfig[];
@@ -78,11 +108,14 @@ export class ProjectScanner {
   private kimiScanner: KimiSessionScanner | null;
   private piScanner: PiSessionScanner | null;
   private zcodeScanner: ZCodeSessionScanner | null;
+  private cursorScanner: CursorSessionScanner | null;
+  private mcodeScanner: McodeSessionScanner | null;
   private enableCodex: boolean;
   private enableGemini: boolean;
   private enableKimi: boolean;
   private enablePi: boolean;
   private enableZCode: boolean;
+  private enableCursor: boolean;
   private projectMetadataService: ProjectMetadataService | null;
   private cacheTtlMs: number;
   private cacheDirty = true;
@@ -91,8 +124,17 @@ export class ProjectScanner {
   private inFlightScan: Promise<ProjectSnapshot> | null = null;
   private inFlightScanGeneration: number | null = null;
   private unsubscribeEventBus: (() => void) | null = null;
+  private readonly snapshotCachePath?: string;
+  /** Previous-run projects; only used until the first scan completes. */
+  private seed: { byId: Map<string, Project>; savedAt: number } | null = null;
+  private seedLoad: Promise<void> | null = null;
+  private lastPersisted: string | null = null;
+  private lastPersistedAt = 0;
 
   constructor(options: ScannerOptions = {}) {
+    this.snapshotCachePath = options.snapshotCachePath;
+    if (this.snapshotCachePath)
+      this.seedLoad = this.loadSeed(this.snapshotCachePath);
     this.projectsDir = options.projectsDir ?? CLAUDE_PROJECTS_DIR;
     this.remoteExecutors = [...(options.remoteExecutors ?? [])];
     this.enableCodex = options.enableCodex ?? true;
@@ -100,6 +142,7 @@ export class ProjectScanner {
     this.enableKimi = options.enableKimi ?? true;
     this.enablePi = options.enablePi ?? true;
     this.enableZCode = options.enableZCode ?? true;
+    this.enableCursor = options.enableCursor ?? true;
     this.codexScanner = this.enableCodex
       ? (options.codexScanner ??
         new CodexSessionScanner({
@@ -127,6 +170,13 @@ export class ProjectScanner {
     this.zcodeScanner = this.enableZCode
       ? (options.zcodeScanner ?? new ZCodeSessionScanner())
       : null;
+    this.cursorScanner = this.enableCursor
+      ? (options.cursorScanner ?? new CursorSessionScanner())
+      : null;
+    this.mcodeScanner =
+      (options.enableMcode ?? Boolean(options.mcodeScanner))
+        ? (options.mcodeScanner ?? new McodeSessionScanner())
+        : null;
     this.projectMetadataService = options.projectMetadataService ?? null;
     this.cacheTtlMs = Math.max(0, options.cacheTtlMs ?? 5000);
 
@@ -275,7 +325,9 @@ export class ProjectScanner {
       .then((projects) => {
         const snapshot = this.buildSnapshot(projects);
         this.snapshot = snapshot;
+        this.seed = null;
         this.cacheDirty = this.cacheGeneration !== scanGeneration;
+        this.persistSnapshot(projects);
         return snapshot;
       })
       .finally(() => {
@@ -381,6 +433,10 @@ export class ProjectScanner {
       this.piScanner?.invalidateCache();
     } else if (event.provider === "zcode") {
       this.zcodeScanner?.invalidateCache();
+    } else if (event.provider === "cursor") {
+      this.cursorScanner?.invalidateCache();
+    } else if (event.provider === "mcode") {
+      this.mcodeScanner?.invalidateCache();
     }
   }
 
@@ -683,6 +739,78 @@ export class ProjectScanner {
           hasPiSessions: false,
           hasKimiSessions: false,
           hasZCodeSessions: true,
+          hasCursorSessions: false,
+        });
+      }
+    }
+
+    if (this.cursorScanner) {
+      const cursorProjects = await this.cursorScanner.listProjects();
+      for (const cursorProject of cursorProjects) {
+        const projectPath = canonicalizeProjectPath(cursorProject.path);
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasCursorSessions = true;
+          existing.sessionCount += cursorProject.sessionCount;
+          if (
+            cursorProject.lastActivity &&
+            (!existing.lastActivity ||
+              cursorProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = cursorProject.lastActivity;
+          }
+          continue;
+        }
+        seenPaths.add(projectPath);
+        projects.push({
+          ...cursorProject,
+          id: encodeProjectId(projectPath),
+          path: projectPath,
+          name: basename(projectPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
+          hasPiSessions: false,
+          hasKimiSessions: false,
+          hasZCodeSessions: false,
+          hasCursorSessions: true,
+        });
+      }
+    }
+
+    if (this.mcodeScanner) {
+      const mcodeProjects = await this.mcodeScanner.listProjects();
+      for (const mcodeProject of mcodeProjects) {
+        const projectPath = canonicalizeProjectPath(mcodeProject.path);
+        const existing = projects.find(
+          (project) => canonicalizeProjectPath(project.path) === projectPath,
+        );
+        if (existing) {
+          existing.hasMcodeSessions = true;
+          existing.sessionCount += mcodeProject.sessionCount;
+          if (
+            mcodeProject.lastActivity &&
+            (!existing.lastActivity ||
+              mcodeProject.lastActivity > existing.lastActivity)
+          ) {
+            existing.lastActivity = mcodeProject.lastActivity;
+          }
+          continue;
+        }
+        seenPaths.add(projectPath);
+        projects.push({
+          ...mcodeProject,
+          id: encodeProjectId(projectPath),
+          path: projectPath,
+          name: basename(projectPath),
+          hasCodexSessions: false,
+          hasGeminiSessions: false,
+          hasPiSessions: false,
+          hasKimiSessions: false,
+          hasZCodeSessions: false,
+          hasCursorSessions: false,
+          hasMcodeSessions: true,
         });
       }
     }
@@ -745,6 +873,81 @@ export class ProjectScanner {
     return projects;
   }
 
+  private async loadSeed(filePath: string): Promise<void> {
+    try {
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as {
+        version?: unknown;
+        savedAt?: unknown;
+        projects?: unknown;
+      };
+      if (
+        parsed.version !== PERSISTED_SNAPSHOT_VERSION ||
+        typeof parsed.savedAt !== "number" ||
+        !Array.isArray(parsed.projects)
+      )
+        return;
+      const byId = new Map<string, Project>();
+      for (const value of parsed.projects) {
+        const project = value as Partial<Project>;
+        if (typeof project?.id === "string" && typeof project.path === "string")
+          byId.set(project.id, project as Project);
+      }
+      // A scan that already finished is authoritative.
+      if (!this.snapshot) this.seed = { byId, savedAt: parsed.savedAt };
+    } catch {
+      // Missing or corrupt seed: the first lookup scans as before.
+    }
+  }
+
+  /** Best-effort; only rewrites when the project set changed. */
+  private persistSnapshot(projects: Project[]): void {
+    const filePath = this.snapshotCachePath;
+    if (!filePath) return;
+    const body = JSON.stringify(projects);
+    const now = Date.now();
+    // Unchanged projects are only re-stamped hourly so the seed stays usable.
+    if (body === this.lastPersisted && now - this.lastPersistedAt < 3_600_000)
+      return;
+    this.lastPersisted = body;
+    this.lastPersistedAt = now;
+    void atomicWriteText(
+      filePath,
+      `{"version":${PERSISTED_SNAPSHOT_VERSION},"savedAt":${now},"projects":${body}}\n`,
+    ).catch(() => {
+      this.lastPersisted = null;
+    });
+  }
+
+  /**
+   * A project from the last snapshot without waiting for a rescan.
+   *
+   * Rescans are frequent (every provider file change invalidates them) and
+   * cost a full provider catalog read. Lookups that only need a known
+   * project's path and provider flags may use the previous snapshot, bounded
+   * in age, while a refresh runs in the background. Unknown projects return
+   * null so the caller performs the normal, fresh lookup.
+   */
+  private getStaleProject(projectId: string): Project | null {
+    const snapshot = this.snapshot;
+    if (!snapshot) {
+      const seeded = this.seed;
+      const project =
+        seeded && Date.now() - seeded.savedAt <= PERSISTED_SEED_MAX_AGE_MS
+          ? seeded.byId.get(projectId)
+          : undefined;
+      if (!project) return null;
+      void this.getSnapshot().catch(() => undefined);
+      return this.cloneProject(project);
+    }
+    if (Date.now() - snapshot.timestamp > STALE_LOOKUP_MAX_AGE_MS) return null;
+    const project = snapshot.byId.get(projectId);
+    if (!project) return null;
+    const fresh =
+      !this.cacheDirty && Date.now() - snapshot.timestamp < this.cacheTtlMs;
+    if (!fresh) void this.getSnapshot().catch(() => undefined);
+    return this.cloneProject(project);
+  }
+
   async getProject(projectId: string): Promise<Project | null> {
     const snapshot = await this.getSnapshot();
     const project = snapshot.byId.get(projectId);
@@ -760,7 +963,13 @@ export class ProjectScanner {
   async getOrCreateProject(
     projectId: string,
     preferredProvider?: ProviderName | string,
+    options?: ProjectLookupOptions,
   ): Promise<Project | null> {
+    if (options?.allowStale) {
+      if (this.seedLoad && !this.snapshot) await this.seedLoad;
+      const stale = this.getStaleProject(projectId);
+      if (stale) return stale;
+    }
     let resolvedProjectId = projectId;
 
     // First check if project already exists
@@ -851,6 +1060,22 @@ export class ProjectScanner {
           provider = "zcode";
         }
       }
+
+      if (provider === "claude" && this.cursorScanner) {
+        const cursorSessions =
+          await this.cursorScanner.getSessionsForProject(projectPath);
+        if (cursorSessions.length > 0) {
+          provider = "cursor";
+        }
+      }
+
+      if (provider === "claude" && this.mcodeScanner) {
+        const mcodeSessions =
+          await this.mcodeScanner.getSessionsForProject(projectPath);
+        if (mcodeSessions.length > 0) {
+          provider = "mcode";
+        }
+      }
     }
 
     // Create a virtual project entry
@@ -867,6 +1092,10 @@ export class ProjectScanner {
       sessionDir = KIMI_SESSIONS_DIR;
     } else if (provider === "zcode") {
       sessionDir = ZCODE_DB_PATH;
+    } else if (provider === "cursor") {
+      sessionDir = CURSOR_ACP_SESSIONS_DIR;
+    } else if (provider === "mcode") {
+      sessionDir = MCODE_SESSIONS_DIR;
     } else {
       sessionDir = this.getClaudeSessionDirForProject(projectPath);
     }
@@ -882,6 +1111,8 @@ export class ProjectScanner {
       hasPiSessions: provider === "pi",
       hasKimiSessions: provider === "kimi",
       hasZCodeSessions: provider === "zcode",
+      hasCursorSessions: provider === "cursor",
+      hasMcodeSessions: provider === "mcode",
       activeOwnedCount: 0,
       activeExternalCount: 0,
       lastActivity: null,

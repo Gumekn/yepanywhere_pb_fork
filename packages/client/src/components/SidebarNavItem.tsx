@@ -7,6 +7,35 @@ import { ThinkingIndicator } from "./ThinkingIndicator";
  * Extracted to avoid duplication across components.
  */
 export const SidebarIcons = {
+  curl: (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M4 7h15l-4-4M20 17H5l4 4M20 7l-5 4M4 17l5-4" />
+    </svg>
+  ),
+  dsh: (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      aria-hidden="true"
+    >
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 9h18M9 9v11M13 13l3 2-3 2" />
+    </svg>
+  ),
   inbox: (
     <svg
       width="16"
@@ -198,22 +227,6 @@ export const SidebarIcons = {
     >
       <circle cx="12" cy="12" r="10" />
       <polyline points="12 6 12 12 16 14" />
-    </svg>
-  ),
-  emulator: (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <rect x="5" y="2" width="14" height="20" rx="2" ry="2" />
-      <line x1="12" y1="18" x2="12" y2="18" />
     </svg>
   ),
   terminal: (

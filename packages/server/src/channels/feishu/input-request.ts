@@ -113,6 +113,7 @@ export function buildFeishuResolvedInputCard(input: {
       | "acceptForSession"
       | "acceptWithExecpolicyAmendment"
       | "applyNetworkPolicyAmendment"
+      | "allow_always"
       | "decline"
       | "cancel"
       | "answer";
@@ -130,7 +131,9 @@ export function buildFeishuResolvedInputCard(input: {
             ? "命令策略已应用"
             : input.nativeDecision?.kind === "applyNetworkPolicyAmendment"
               ? "网络策略已应用"
-              : "本 Session 已允许"
+              : input.nativeDecision?.kind === "allow_always"
+                ? "已始终允许"
+                : "本 Session 已允许"
           : "已允许"
     : input.status === "cancelled"
       ? "操作已取消"
@@ -258,6 +261,8 @@ function buildApprovalCard(
 
 function persistentApprovalLabel(kind: ToolApprovalPersistenceKind): string {
   switch (kind) {
+    case "provider-policy":
+      return "始终允许";
     case "command-policy":
       return "应用命令策略";
     case "network-policy":

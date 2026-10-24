@@ -7,8 +7,7 @@
  * messages so they ride the existing encrypted JSON envelope without any
  * changes to the binary framing layer.
  *
- * Routing pattern mirrors `DeviceClientMessage` / `DeviceServerMessage`:
- * messages are added to the `RemoteClientMessage` / `YepMessage` unions and
+ * Messages are added to the `RemoteClientMessage` / `YepMessage` unions and
  * dispatched by `ws-message-router.ts`.
  */
 

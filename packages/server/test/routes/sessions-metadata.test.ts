@@ -959,6 +959,7 @@ describe("Sessions metadata route", () => {
         title: "Stable family",
         fullTitle: "Stable family full title",
         forkParentSessionId: root.id,
+        forkFamilySessionIds: expect.arrayContaining([root.id, child.id]),
         branchState,
         codexBranchState: branchState,
       },
@@ -976,6 +977,56 @@ describe("Sessions metadata route", () => {
       undefined,
     );
   });
+
+  it.each([260_000, undefined])(
+    "returns Cursor native context without guessing a window (%s tokens)",
+    async (inputTokens) => {
+      const project = { ...createProject(), provider: "cursor" as const };
+      const contextUsage =
+        inputTokens === undefined
+          ? undefined
+          : {
+              inputTokens,
+              contextWindow: 256_000,
+              percentage: 101.6,
+              categories: [
+                {
+                  id: "conversation",
+                  name: "Conversation",
+                  tokens: inputTokens,
+                },
+              ],
+            };
+      const summary = {
+        ...createSummary(),
+        provider: "cursor" as const,
+        model: "grok-4.7[reasoning=xhigh]",
+        contextUsage,
+      };
+      const routes = createSessionsRoutes({
+        supervisor: {} as SessionsDeps["supervisor"],
+        runtimeController: {
+          getProcessSnapshotForSession: vi.fn(async () => null),
+        } as unknown as NonNullable<SessionsDeps["runtimeController"]>,
+        scanner: {
+          getOrCreateProject: vi.fn(async () => project),
+        } as unknown as SessionsDeps["scanner"],
+        readerFactory: vi.fn(() => ({}) as ISessionReader),
+        sessionIndexService: {
+          getSessionSummaryWithCache: vi.fn(async () => summary),
+        } as unknown as NonNullable<SessionsDeps["sessionIndexService"]>,
+      });
+      const response = await routes.request(
+        `/projects/${project.id}/sessions/${summary.id}/context-status`,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        source: "native",
+        model: summary.model,
+        ...(contextUsage ? { contextUsage } : {}),
+      });
+    },
+  );
 
   it("uses the shared summary index for a missing Codex context meter", async () => {
     const project = createProject();

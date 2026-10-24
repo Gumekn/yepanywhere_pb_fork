@@ -17,10 +17,13 @@ import {
   type ClientCapabilities,
   ClientSideConnection,
   type ContentBlock,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type InitializeResponse,
   type PromptResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
+  type SessionConfigOption,
   type SessionNotification,
   type SetSessionConfigOptionResponse,
   ndJsonStream,
@@ -56,6 +59,15 @@ export type PermissionRequestCallback = (
 ) => Promise<RequestPermissionResponse>;
 
 /**
+ * Callback for (unstable) form elicitation requests. Agents such as MiniMax
+ * Code use `elicitation/create` for structured multi-question prompts when the
+ * client advertises `elicitation.form`.
+ */
+export type ElicitationRequestCallback = (
+  request: CreateElicitationRequest,
+) => Promise<CreateElicitationResponse>;
+
+/**
  * ACP Client - manages connection to an ACP-compatible agent.
  *
  * Usage:
@@ -72,6 +84,8 @@ export class ACPClient {
   private process: ChildProcess | null = null;
   private connection: ClientSideConnection | null = null;
   private log = getLogger();
+  /** Latest config options reported by the agent, keyed by session id. */
+  private sessionConfigOptions = new Map<string, SessionConfigOption[]>();
 
   /** OS PID of the spawned ACP agent child process */
   get pid(): number | undefined {
@@ -100,6 +114,22 @@ export class ACPClient {
   }
   private onSessionUpdate: SessionUpdateCallback | null = null;
   private onPermissionRequest: PermissionRequestCallback | null = null;
+  private onElicitationRequest: ElicitationRequestCallback | null = null;
+  private onExtensionRequest:
+    | ((
+        method: string,
+        params: Record<string, unknown>,
+      ) => Promise<Record<string, unknown>>)
+    | null = null;
+
+  setExtensionRequestCallback(
+    callback: (
+      method: string,
+      params: Record<string, unknown>,
+    ) => Promise<Record<string, unknown>>,
+  ): void {
+    this.onExtensionRequest = callback;
+  }
 
   /**
    * Set callback for session update notifications.
@@ -117,6 +147,14 @@ export class ACPClient {
   setPermissionRequestCallback(callback: PermissionRequestCallback): void {
     this.log.debug("Permission request callback registered");
     this.onPermissionRequest = callback;
+  }
+
+  /**
+   * Set callback for form elicitation requests. Only agents that saw
+   * `elicitation.form` in the client capabilities will send them.
+   */
+  setElicitationRequestCallback(callback: ElicitationRequestCallback): void {
+    this.onElicitationRequest = callback;
   }
 
   /**
@@ -176,9 +214,26 @@ export class ACPClient {
       "Creating ACP client handlers",
     );
     return {
+      extMethod: async (method, params) => {
+        if (this.onExtensionRequest)
+          return this.onExtensionRequest(method, params);
+        throw new Error(`Unsupported ACP extension: ${method}`);
+      },
+      extNotification: async (method, params) => {
+        if (this.onExtensionRequest)
+          await this.onExtensionRequest(method, params);
+      },
       sessionUpdate: async (params: SessionNotification) => {
         this.log.trace({ update: params }, "ACP session update");
         this.onSessionUpdate?.(params);
+      },
+      unstable_createElicitation: async (
+        params: CreateElicitationRequest,
+      ): Promise<CreateElicitationResponse> => {
+        if (this.onElicitationRequest) {
+          return this.onElicitationRequest(params);
+        }
+        return { action: "cancel" };
       },
       requestPermission: async (
         params: RequestPermissionRequest,
@@ -230,6 +285,39 @@ export class ACPClient {
   }
 
   /**
+   * Authenticate with a method advertised by `initialize`.
+   * Cursor CLI expects `cursor_login` after `agent login` or `CURSOR_API_KEY`.
+   */
+  async authenticate(methodId: string): Promise<void> {
+    if (!this.connection) {
+      throw new Error("ACPClient not connected. Call connect() first.");
+    }
+    this.log.debug({ methodId }, "Authenticating ACP connection");
+    await this.connection.authenticate({ methodId });
+  }
+
+  /** Call a provider's advertised ACP extension without creating a session. */
+  async requestExtension(
+    method: string,
+    params: Record<string, unknown> = {},
+  ): Promise<unknown> {
+    if (!this.connection) {
+      throw new Error("ACPClient not connected. Call connect() first.");
+    }
+    return this.connection.extMethod(method, params);
+  }
+
+  /**
+   * Cancel the active prompt for a session. The agent decides how much of the
+   * in-flight turn to keep.
+   */
+  async cancel(sessionId: string): Promise<void> {
+    if (!this.connection) return;
+    this.log.debug({ sessionId }, "Cancelling ACP session prompt");
+    await this.connection.cancel({ sessionId });
+  }
+
+  /**
    * Create a new session with the agent.
    * Returns the session ID.
    */
@@ -246,6 +334,9 @@ export class ACPClient {
     });
 
     this.log.debug({ sessionId: result.sessionId }, "ACP session created");
+    if (result.configOptions) {
+      this.sessionConfigOptions.set(result.sessionId, result.configOptions);
+    }
     return result.sessionId;
   }
 
@@ -260,11 +351,24 @@ export class ACPClient {
 
     this.log.debug({ sessionId, cwd }, "Loading existing ACP session");
 
-    await this.connection.loadSession({
+    const result = await this.connection.loadSession({
       sessionId,
       cwd,
       mcpServers: [],
     });
+    if (result?.configOptions) {
+      this.sessionConfigOptions.set(sessionId, result.configOptions);
+    }
+  }
+
+  /**
+   * Config options last reported for a session (from new/load or the latest
+   * set_config_option response). Undefined when the agent never reported any.
+   */
+  getSessionConfigOptions(
+    sessionId: string,
+  ): SessionConfigOption[] | undefined {
+    return this.sessionConfigOptions.get(sessionId);
   }
 
   /**
@@ -285,6 +389,12 @@ export class ACPClient {
     });
 
     this.log.debug({ result }, "ACP session resumed");
+    const configOptions = (
+      result as { configOptions?: SessionConfigOption[] | null } | undefined
+    )?.configOptions;
+    if (configOptions) {
+      this.sessionConfigOptions.set(sessionId, configOptions);
+    }
     return sessionId;
   }
 
@@ -324,11 +434,13 @@ export class ACPClient {
       { sessionId, configId, value },
       "Setting ACP session config option",
     );
-    return this.connection.setSessionConfigOption({
+    const result = await this.connection.setSessionConfigOption({
       sessionId,
       configId,
       value,
     });
+    this.sessionConfigOptions.set(sessionId, result.configOptions);
+    return result;
   }
 
   /**
@@ -399,5 +511,7 @@ export class ACPClient {
     this.connection = null;
     this.onSessionUpdate = null;
     this.onPermissionRequest = null;
+    this.onElicitationRequest = null;
+    this.onExtensionRequest = null;
   }
 }

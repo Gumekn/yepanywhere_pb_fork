@@ -3,11 +3,14 @@ import {
   getDisplayBashCommandFromInput,
   isCodexLikeBashInput,
 } from "../../lib/bashCommand";
+import { getToolTiming } from "../../lib/toolTiming";
+import type { Message } from "../../types";
 import type { ToolResultData } from "../../types/renderItems";
 import { toolRegistry } from "../renderers/tools";
 import type { RenderContext } from "../renderers/types";
 import { getToolSummary } from "../tools/summaries";
 import { LiveOutputPreview } from "./LiveOutputPreview";
+import { ToolDuration } from "./ToolDuration";
 import { ToolRenderErrorBoundary } from "./ToolRenderErrorBoundary";
 
 interface Props {
@@ -15,6 +18,7 @@ interface Props {
   toolName: string;
   toolInput: unknown;
   toolResult?: ToolResultData;
+  sourceMessages?: Message[];
   status: "pending" | "complete" | "error" | "aborted";
   sessionProvider?: string;
   /** Live streaming output preview while the tool is still running. */
@@ -30,11 +34,17 @@ const ToolCallRowContent = memo(function ToolCallRowContent({
   toolName,
   toolInput,
   toolResult,
+  sourceMessages,
   status,
   sessionProvider,
   partialOutput,
   detailOnly,
 }: Props) {
+  const timing = useMemo(
+    () => getToolTiming(id, sourceMessages),
+    [id, sourceMessages],
+  );
+
   // Create a minimal render context for tool renderers
   const renderContext: RenderContext = useMemo(
     () => ({
@@ -166,6 +176,7 @@ const ToolCallRowContent = memo(function ToolCallRowContent({
   if (hasInlineRenderer) {
     return (
       <div className="tool-inline timeline-item">
+        <ToolDuration {...timing} running={status === "pending"} />
         {toolRegistry.renderInline(
           toolName,
           toolInput,
@@ -221,6 +232,7 @@ const ToolCallRowContent = memo(function ToolCallRowContent({
           </span>
         ) : null}
 
+        <ToolDuration {...timing} running={status === "pending"} />
         {!isNonExpandable && (
           <span className="expand-chevron" aria-hidden="true">
             {expanded ? "▾" : "▸"}

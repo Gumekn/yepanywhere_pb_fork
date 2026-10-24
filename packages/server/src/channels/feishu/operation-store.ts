@@ -28,6 +28,7 @@ export interface FeishuNativeDecisionDescriptor {
     | "acceptForSession"
     | "acceptWithExecpolicyAmendment"
     | "applyNetworkPolicyAmendment"
+    | "allow_always"
     | "decline"
     | "cancel"
     | "answer";
@@ -100,6 +101,7 @@ const NativeDecisionSchema = z.object({
     "acceptForSession",
     "acceptWithExecpolicyAmendment",
     "applyNetworkPolicyAmendment",
+    "allow_always",
     "decline",
     "cancel",
     "answer",

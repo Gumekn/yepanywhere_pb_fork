@@ -8,6 +8,7 @@ import {
 import type { ProviderInfo, SessionQuestion } from "@yep-anywhere/shared";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SubagentDetailContext } from "../../contexts/SubagentDetailContext";
 import * as fileIndexHook from "../../hooks/useSessionFileIndex";
 import { I18nProvider } from "../../i18n";
 import { UI_KEYS } from "../../lib/storageKeys";
@@ -30,6 +31,8 @@ vi.mock("../../hooks/useGitStatus", () => ({
   }),
 }));
 
+const openAgent = vi.fn();
+
 function renderInspector(
   provider: ProviderName,
   messages: Message[],
@@ -40,17 +43,19 @@ function renderInspector(
   return render(
     <MemoryRouter>
       <I18nProvider>
-        <SessionInspector
-          presentation="sidebar"
-          onClose={onClose}
-          messages={messages}
-          userQuestions={userQuestions}
-          projectId="project-1"
-          sessionId="session-1"
-          provider={provider}
-          status={{ owner: "none" }}
-          onSelectMessage={vi.fn()}
-        />
+        <SubagentDetailContext.Provider value={{ openAgent, statuses: {} }}>
+          <SessionInspector
+            presentation="sidebar"
+            onClose={onClose}
+            messages={messages}
+            userQuestions={userQuestions}
+            projectId="project-1"
+            sessionId="session-1"
+            provider={provider}
+            status={{ owner: "none" }}
+            onSelectMessage={vi.fn()}
+          />
+        </SubagentDetailContext.Provider>
       </I18nProvider>
     </MemoryRouter>,
   );
@@ -613,13 +618,17 @@ describe("SessionInspector", () => {
       },
     ]);
 
-    const link = screen.getByRole("link", { name: /\/root\/worker/i });
-    expect(link.getAttribute("href")).toBe(
-      "/projects/project-1/sessions/child-thread",
-    );
+    const link = screen.getByRole("button", { name: /\/root\/worker/i });
+    expect(link.getAttribute("href")).toBeNull();
+    fireEvent.click(link);
+    expect(openAgent).toHaveBeenCalledWith({
+      agentId: "child-thread",
+      parentSessionId: "session-1",
+      name: "/root/worker",
+    });
     expect(link.textContent).toContain("interrupted");
     expect(
-      screen.getAllByRole("link", { name: /\/root\/worker/i }),
+      screen.getAllByRole("button", { name: /\/root\/worker/i }),
     ).toHaveLength(1);
   });
 
@@ -628,7 +637,7 @@ describe("SessionInspector", () => {
     { kinds: ["started", "completed", "interacted"], status: "completed" },
     { kinds: ["started", "interrupted", "interacted"], status: "interrupted" },
     { kinds: ["interacted"], status: "status unknown" },
-    { kinds: ["started", "completed", "started"], status: "running" },
+    { kinds: ["started", "completed", "started"], status: "started" },
   ])("preserves subagent lifecycle for $kinds", ({ kinds, status }) => {
     renderInspector(
       "codex",
@@ -646,8 +655,10 @@ describe("SessionInspector", () => {
         },
       })),
     );
-    const link = screen.getByRole("link", { name: /worker|child-thread/ });
-    expect(link.textContent).toContain(status);
+    const link = screen.getByRole("button", { name: /worker|child-thread/ });
+    expect(link.textContent).toContain(
+      status === "completed" ? "turn finished" : status,
+    );
     if (kinds.length > 1) expect(link.textContent).toContain("/root/worker");
   });
 
@@ -689,10 +700,14 @@ describe("SessionInspector", () => {
       },
     ]);
 
-    const link = screen.getByRole("link", { name: /child-status-only/i });
-    expect(link.getAttribute("href")).toBe(
-      "/projects/project-1/sessions/child-status-only",
-    );
+    const link = screen.getByRole("button", { name: /child-status-only/i });
+    expect(link.getAttribute("href")).toBeNull();
+    fireEvent.click(link);
+    expect(openAgent).toHaveBeenCalledWith({
+      agentId: "child-status-only",
+      parentSessionId: "session-1",
+      name: "child-status-only",
+    });
     expect(link.textContent).toContain("failed");
     expect(link.textContent).not.toContain("completed");
   });

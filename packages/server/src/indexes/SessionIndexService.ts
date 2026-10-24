@@ -24,6 +24,7 @@ import {
 } from "@yep-anywhere/shared";
 import { getLogger } from "../logging/logger.js";
 import { isRetiredProviderName } from "../sdk/providers/policy.js";
+import { cursorSessionIdFromWatchPath } from "../sessions/cursor-reader.js";
 import type { ISessionReader, SessionFileEntry } from "../sessions/types.js";
 import type { SessionSummary } from "../supervisor/types.js";
 import type { EventBus, FileChangeEvent } from "../watcher/index.js";
@@ -605,6 +606,21 @@ export class SessionIndexService implements ISessionIndexService {
     this.dirtySessionsByDir.delete(scopeKey);
   }
 
+  /** Refresh one already indexed Cursor session instead of every project scope. */
+  private markIndexedCursorSessionDirty(sessionId: string): boolean {
+    let marked = false;
+    for (const [scopeKey, index] of this.indexCache) {
+      if (!scopeKey.startsWith("cursor::") || !index.sessions[sessionId]) {
+        continue;
+      }
+      const current = this.dirtySessionsByDir.get(scopeKey) ?? new Set();
+      current.add(sessionId);
+      this.dirtySessionsByDir.set(scopeKey, current);
+      marked = true;
+    }
+    return marked;
+  }
+
   /**
    * Mark a modified Pi session dirty in every loaded Pi scope that already
    * indexes it. Pi names files `<timestamp>_<sessionId>.jsonl`; the filename is
@@ -835,6 +851,19 @@ export class SessionIndexService implements ISessionIndexService {
       return;
     }
 
+    if (event.provider === "cursor") {
+      const sessionId = cursorSessionIdFromWatchPath(event.path);
+      if (
+        sessionId &&
+        event.changeType === "modify" &&
+        this.markIndexedCursorSessionDirty(sessionId)
+      ) {
+        return;
+      }
+      this.markMatchingScopesDirty("cursor::");
+      return;
+    }
+
     if (event.provider === "pi") {
       // Pi sessions share one native tree and are filtered by header cwd. An
       // append to an already indexed session only needs that one entry
@@ -859,6 +888,13 @@ export class SessionIndexService implements ISessionIndexService {
 
     if (event.provider === "zcode") {
       this.markMatchingScopesDirty("zcode::");
+      return;
+    }
+
+    if (event.provider === "mcode") {
+      // MiniMax Code transcripts share one dated tree; the catalog cwd
+      // decides the project scope.
+      this.markMatchingScopesDirty("mcode::");
     }
   }
 
@@ -1014,29 +1050,7 @@ export class SessionIndexService implements ISessionIndexService {
         ) {
           if (cached.isEmpty || isRetiredProviderName(cached.provider))
             continue;
-          summaries.push({
-            id: sessionId,
-            projectId,
-            title: cached.title,
-            fullTitle: cached.fullTitle,
-            createdAt: cached.createdAt,
-            updatedAt: cached.updatedAt,
-            messageCount: cached.messageCount,
-            userQuestions: cached.userQuestions,
-            userQuestionCoverage: cached.userQuestionCoverage,
-            ownership: { owner: "none" },
-            contextUsage: cached.contextUsage,
-            cumulativeUsage: cached.cumulativeUsage,
-            compactCount: cached.compactCount,
-            compactEvents: cached.compactEvents,
-            provider: cached.provider ?? DEFAULT_PROVIDER,
-            model: cached.model,
-            reasoningEffort: cached.reasoningEffort,
-            serviceTier: cached.serviceTier,
-            originator: cached.originator,
-            source: cached.source,
-            createdBy: cached.createdBy,
-          });
+          summaries.push(this.cachedToSummary(sessionId, cached, projectId));
         } else {
           cacheMisses.push({ sessionId, mtime, size });
         }

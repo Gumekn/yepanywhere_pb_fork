@@ -6,16 +6,6 @@
  */
 
 import type { OriginMetadata } from "./connection.js";
-import type {
-  DeviceICECandidate,
-  DeviceICECandidateEvent,
-  DeviceSessionState,
-  DeviceStreamProfileEvent,
-  DeviceStreamStart,
-  DeviceStreamStop,
-  DeviceWebRTCAnswer,
-  DeviceWebRTCOffer,
-} from "./devices.js";
 import type { SessionDisplaySubscriptionOptions } from "./session-display.js";
 import type {
   TerminalClose,
@@ -248,11 +238,6 @@ export type RemoteClientMessage =
   | WireUploadEnd
   | ClientCapabilities
   | ClientPing
-  // Device bridge signaling
-  | DeviceStreamStart
-  | DeviceStreamStop
-  | DeviceWebRTCAnswer
-  | DeviceICECandidate
   // Remote terminal
   | TerminalOpen
   | TerminalInput
@@ -267,11 +252,6 @@ export type YepMessage =
   | WireUploadComplete
   | WireUploadError
   | ServerPong
-  // Device bridge signaling
-  | DeviceWebRTCOffer
-  | DeviceICECandidateEvent
-  | DeviceSessionState
-  | DeviceStreamProfileEvent
   // Remote terminal
   | TerminalOpened
   | TerminalOutput

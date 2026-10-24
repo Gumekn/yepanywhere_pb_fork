@@ -11,7 +11,7 @@ const source = readFileSync(
 describe("APK shell viewport", () => {
   it("resizes the iframe container and clears outer panning independently of the iframe", () => {
     const dom = new JSDOM(
-      "<!doctype html><html><body><iframe></iframe></body></html>",
+      '<!doctype html><html><body><iframe id="app-frame"></iframe></body></html>',
       { runScripts: "outside-only" },
     );
     try {
@@ -23,6 +23,9 @@ describe("APK shell viewport", () => {
       });
       Object.defineProperty(window, "visualViewport", { value: viewport });
       window.scrollTo = vi.fn();
+      const frame = window.document.querySelector("iframe");
+      if (!frame?.contentWindow) throw new Error("missing app frame");
+      const postMessage = vi.spyOn(frame.contentWindow, "postMessage");
       window.eval(source);
       const root = window.document.documentElement;
       expect(root.style.getPropertyValue("--shell-viewport-height")).toBe(
@@ -40,6 +43,21 @@ describe("APK shell viewport", () => {
       viewport.dispatchEvent(new window.Event("resize"));
       expect(root.style.getPropertyValue("--shell-viewport-height")).toBe(
         "800px",
+      );
+      expect(postMessage).toHaveBeenCalledWith(
+        { type: "yep-anywhere:mobile-shell-safe-area", bottom: 0 },
+        "*",
+      );
+      postMessage.mockClear();
+      window.dispatchEvent(
+        new window.MessageEvent("message", {
+          source: frame.contentWindow,
+          data: { type: "yep-anywhere:mobile-shell-get-safe-area" },
+        }),
+      );
+      expect(postMessage).toHaveBeenCalledWith(
+        { type: "yep-anywhere:mobile-shell-safe-area", bottom: 0 },
+        "*",
       );
     } finally {
       dom.window.close();

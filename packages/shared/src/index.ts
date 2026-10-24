@@ -1,3 +1,5 @@
+export { collapseEditForkFamilies } from "./edit-fork-families.js";
+export type { CollapsibleForkFamilyMember } from "./edit-fork-families.js";
 export {
   CodexAsyncMessageSchema,
   readCodexAsyncMessage,
@@ -11,6 +13,12 @@ export {
   parseOpenedFiles,
   getFilename,
 } from "./ideMetadata.js";
+export { nonEmptyMessageId, stringMessageId } from "./message-id.js";
+export type { MessageIdentitySource } from "./message-id.js";
+export {
+  SHARED_RENDERER_TOOL_ALIASES,
+  lookupToolAlias,
+} from "./tool-name-aliases.js";
 
 export {
   FeishuAccountConfigSchema,
@@ -386,6 +394,8 @@ export type {
   UnifiedSession,
   ClaudeSessionFile,
   CodexSessionContent,
+  CursorSessionContent,
+  CursorTranscriptMessage,
   SessionLocation,
   SessionLocationSource,
   SessionLocateResponse,
@@ -482,6 +492,7 @@ export type {
   CodexSessionMetaEntry,
   CodexMessagePhase,
   CodexMessagePayload,
+  CodexInterAgentMessagePayload,
   CodexReasoningPayload,
   CodexFunctionCallPayload,
   CodexFunctionCallOutputPayload,
@@ -694,25 +705,6 @@ export type {
   ZCodeStoredPart,
 } from "./zcode-schema/session.js";
 
-// Device bridge streaming types (for device bridge remote control)
-export type {
-  DeviceAction,
-  DeviceInfo,
-  DeviceState,
-  DeviceType,
-  DeviceStreamStart,
-  DeviceStreamStop,
-  DeviceWebRTCAnswer,
-  DeviceICECandidate,
-  DeviceClientMessage,
-  DeviceWebRTCOffer,
-  DeviceICECandidateEvent,
-  DeviceSessionState,
-  DeviceStreamProfileEvent,
-  DeviceServerMessage,
-  RTCIceCandidateInit,
-} from "./devices.js";
-
 // Remote terminal types (for remote shell sessions)
 export type {
   TerminalOpen,
@@ -834,11 +826,19 @@ export type {
   SessionDisplaySnapshot,
   SessionDisplayPatch,
   SessionDisplaySubscriptionOptions,
+  SessionDisplayKnownView,
+  SessionDisplayCurrent,
   SessionDisplayGroupPage,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
 } from "./session-display.js";
 export * from "./feishu-user-auth.js";
+export type {
+  HarnessId,
+  HarnessUpdateBlockReason,
+  HarnessUpdateInfo,
+  HarnessUpdateJob,
+} from "./harness-updates.js";
 export {
   extractBashCommandFromInput,
   getShellLauncherPrefixLength,
@@ -862,3 +862,11 @@ export {
   type SessionFileContentRef,
   type SessionFileOperationStats,
 } from "./session-file-operation.js";
+
+export * from "./side-conversations.js";
+export type {
+  CursorAccountResponse,
+  CursorModelConfigOption,
+  CursorUsage,
+} from "./cursor.js";
+export * from "./curl.js";

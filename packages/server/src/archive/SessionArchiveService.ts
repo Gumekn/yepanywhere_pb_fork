@@ -1,8 +1,11 @@
 import {
   copyFile,
+  cp,
   mkdir,
+  mkdtemp,
   readFile,
   rename,
+  rm,
   stat,
   unlink,
   writeFile,
@@ -15,11 +18,19 @@ import { normalizeProviderGroup } from "../sessions/provider-groups.js";
 import { withWritableSqliteDatabase } from "../sqlite/query.js";
 import type { Project, SessionSummary } from "../supervisor/types.js";
 
-export type ArchiveProvider = "claude" | "codex" | "pi" | "kimi" | "zcode";
+export type ArchiveProvider =
+  | "claude"
+  | "codex"
+  | "pi"
+  | "kimi"
+  | "zcode"
+  | "cursor";
 type PersistedArchiveProvider = ArchiveProvider | "opencode";
 export type ArchiveReason = "manual" | "auto";
 
 export interface ArchivedFileRecord {
+  /** Cursor owns a whole SQLite session directory, including WAL and metadata. */
+  directory?: boolean;
   kind: "session" | "agent-session" | "agent-meta";
   originalPath: string;
   archivePath: string;
@@ -326,6 +337,27 @@ export class SessionArchiveService {
       provider,
       sanitizePathPart(sessionId),
     );
+    if (provider === "cursor") {
+      if (
+        basename(sessionFilePath) !== "store.db" ||
+        basename(dirname(sessionFilePath)) !== sessionId
+      ) {
+        throw new ArchiveError(
+          "archive_failed",
+          "Cursor session directory does not match the requested session",
+        );
+      }
+      return [
+        {
+          ...(await createArchivedFileRecord(
+            "session",
+            dirname(sessionFilePath),
+            archiveSessionDir,
+          )),
+          directory: true,
+        },
+      ];
+    }
     const primary = await createArchivedFileRecord(
       "session",
       sessionFilePath,
@@ -434,8 +466,9 @@ function normalizeArchiveProvider(
   provider: ProviderName | string | undefined,
 ): ArchiveProvider | null {
   const group = normalizeProviderGroup(provider);
-  // Gemini sessions have no archive support.
-  return group === "gemini" ? null : group;
+  // Gemini and MiniMax Code own their stores (MiniMax Code shares its catalog
+  // with the desktop App); Yep never moves those files.
+  return group === "gemini" || group === "mcode" ? null : group;
 }
 
 function isSqliteArchiveProvider(
@@ -584,8 +617,24 @@ async function moveFile(from: string, to: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "EXDEV") {
       throw error;
     }
-    await copyFile(from, to);
-    await unlink(from);
+    if ((await stat(from)).isDirectory()) {
+      const staging = await mkdtemp(join(dirname(to), ".archive-copy-"));
+      try {
+        const stagedDirectory = join(staging, "session");
+        await cp(from, stagedDirectory, {
+          recursive: true,
+          force: false,
+          errorOnExist: true,
+        });
+        await rename(stagedDirectory, to);
+      } finally {
+        await rm(staging, { recursive: true, force: true });
+      }
+      await rm(from, { recursive: true });
+    } else {
+      await copyFile(from, to);
+      await unlink(from);
+    }
   }
 }
 
@@ -593,7 +642,7 @@ async function fileExists(filePath: string | undefined): Promise<boolean> {
   if (!filePath) return false;
   try {
     const stats = await stat(filePath);
-    return stats.isFile();
+    return stats.isFile() || stats.isDirectory();
   } catch {
     return false;
   }

@@ -268,6 +268,48 @@ describe("HttpRuntimeController", () => {
     });
   });
 
+  it("runs Cursor prepare inside the resident runtime", async () => {
+    const prepareCursorSession = vi.fn(async () => undefined);
+    const discardCursorPrepare = vi.fn(async () => undefined);
+    const warmCursorAuth = vi.fn(async () => undefined);
+    const app = createRuntimeControlApp({
+      controller: {
+        prepareCursorSession,
+        discardCursorPrepare,
+        warmCursorAuth,
+      } as unknown as RuntimeController,
+      token: "runtime-test-token",
+    });
+    const controller = new HttpRuntimeController({
+      baseUrl: "http://runtime.test",
+      token: "runtime-test-token",
+      fetch: (input, init) =>
+        app.fetch(input instanceof Request ? input : new Request(input, init)),
+    });
+
+    await controller.prepareCursorSession({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+      permissionMode: "plan",
+    });
+    await controller.discardCursorPrepare({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+    });
+    await controller.warmCursorAuth("auto");
+
+    expect(prepareCursorSession).toHaveBeenCalledWith({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+      permissionMode: "plan",
+    });
+    expect(discardCursorPrepare).toHaveBeenCalledWith({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+    });
+    expect(warmCursorAuth).toHaveBeenCalledWith("auto");
+  });
+
   it("round-trips immediate admission without entering the external runtime queue", async () => {
     const { controller } = createHarness({ maxWorkers: 1 });
     await controller.start();
@@ -390,6 +432,41 @@ describe("HttpRuntimeController", () => {
       sessionId,
     });
     await controller.shutdown();
+  });
+
+  it("carries session-wide history recovery across the HTTP runtime boundary", async () => {
+    const eventsDir = path.join(
+      tmpdir(),
+      `http-runtime-history-${randomUUID()}`,
+    );
+    eventDirs.push(eventsDir);
+    const eventStore = new RuntimeEventStore({ eventsDir });
+    for (const [processId, sessionId, timestamp] of [
+      ["old", "session", "2026-10-20T06:28:00.000Z"],
+      ["new", "session", "2026-10-20T06:34:00.000Z"],
+      ["other", "another-session", "2026-10-20T06:35:00.000Z"],
+    ] as const)
+      await eventStore.append({
+        processId,
+        sessionId,
+        timestamp,
+        type: "message",
+        data: { uuid: processId },
+      });
+    const { controller } = createHarness({ eventStore });
+    expect(
+      (
+        await controller.replay({
+          sessionId: "session",
+          allProcesses: true,
+        })
+      ).map((event) => event.processId),
+    ).toEqual(["old", "new"]);
+    expect(
+      (await controller.replay({ sessionId: "session" })).map(
+        (event) => event.processId,
+      ),
+    ).toEqual(["new"]);
   });
 
   it("matches embedded bounded replay for an offline result, error and completion", async () => {

@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SessionMetadataProvider } from "../../contexts/SessionMetadataContext";
+import { SubagentDetailContext } from "../../contexts/SubagentDetailContext";
 import { I18nProvider } from "../../i18n";
 import { mergeStreamMessage } from "../../lib/mergeMessages";
 import type { Message } from "../../types";
@@ -53,6 +55,60 @@ describe("RenderItemComponent edit availability", () => {
   afterEach(() => {
     cleanup();
     window.localStorage.clear();
+  });
+
+  it("passes original attachment metadata together with the editable prompt and identity", () => {
+    const path =
+      "/api/projects/cHJvamVjdA/sessions/session-1/upload/123e4567-e89b-12d3-a456-426614174000_shot.png";
+    const onEdit = renderPrompt(
+      {
+        uuid: "image-message",
+        parentUuid: "previous-message",
+        type: "user",
+        _source: "jsonl",
+        message: {
+          role: "user",
+          content: `before @[shot.png] after\n\nUser uploaded files:\n- shot.png (1 KB, image/png): ${path}`,
+        },
+      },
+      "codex",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /edit/i }));
+    expect(onEdit).toHaveBeenCalledWith({
+      uuid: "image-message",
+      parentUuid: "previous-message",
+      text: "before @[shot.png] after",
+      attachments: [
+        { originalName: "shot.png", size: "1 KB", mimeType: "image/png", path },
+      ],
+    });
+  });
+
+  it("allows editing a persisted image-only prompt", () => {
+    const onEdit = renderPrompt(
+      {
+        uuid: "image-only",
+        type: "user",
+        _source: "jsonl",
+        message: {
+          role: "user",
+          content: [
+            { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+          ],
+        },
+      },
+      "codex",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /edit/i }));
+    expect(onEdit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "",
+        uuid: "image-only",
+        attachments: [
+          expect.objectContaining({ previewUrl: "data:image/png;base64,AAAA" }),
+        ],
+      }),
+    );
   });
 
   it("does not accidentally expose edit for unsupported providers", () => {
@@ -177,8 +233,8 @@ describe("RenderItemComponent provider-native items", () => {
     });
 
     expect(screen.getAllByText("child-thread").length).toBeGreaterThan(0);
-    expect(screen.getByText("completed")).not.toBeNull();
-    expect(screen.getByText("Review complete")).not.toBeNull();
+    expect(screen.getByText("turn finished")).not.toBeNull();
+    expect(screen.queryByText("Review complete")).toBeNull();
   });
 
   it("renders lowercase Codex subagent activity kinds", () => {
@@ -195,49 +251,64 @@ describe("RenderItemComponent provider-native items", () => {
       sourceMessages: [],
     });
 
-    expect(screen.getByText("Interrupted", { exact: false })).not.toBeNull();
+    expect(screen.getByText("Task interrupted")).not.toBeNull();
     expect(screen.getByText("/root/worker", { exact: false })).not.toBeNull();
   });
 
   it.each(["en", "zh-CN"])(
-    "shows completed agent identity and a child conversation link in %s",
+    "shows completed agent identity and opens its details within the parent in %s",
     async (locale) => {
+      const openAgent = vi.fn();
       window.localStorage.setItem("yep-anywhere-locale", locale);
       render(
         <MemoryRouter>
           <I18nProvider>
-            <RenderItemComponent
-              item={{
-                type: "codex_native_item",
-                id: "activity-completed",
-                projectId: "project-1",
-                lifecycle: "completed",
-                threadItem: {
-                  type: "subAgentActivity",
-                  kind: "completed",
-                  agentThreadId: "child-thread",
-                  agentPath: "/root/reviewer",
-                },
-                sourceMessages: [],
-              }}
-              isStreaming={false}
-              thinkingExpanded={false}
-              toggleThinkingExpanded={() => {}}
-            />
+            <SessionMetadataProvider
+              projectId="project-1"
+              projectPath={null}
+              sessionId="parent-thread"
+            >
+              <SubagentDetailContext.Provider
+                value={{ openAgent, statuses: {} }}
+              >
+                <RenderItemComponent
+                  item={{
+                    type: "codex_native_item",
+                    id: "activity-completed",
+                    projectId: "project-1",
+                    lifecycle: "completed",
+                    threadItem: {
+                      type: "subAgentActivity",
+                      kind: "completed",
+                      agentThreadId: "child-thread",
+                      agentPath: "/root/reviewer",
+                    },
+                    sourceMessages: [],
+                  }}
+                  isStreaming={false}
+                  thinkingExpanded={false}
+                  toggleThinkingExpanded={() => {}}
+                />
+              </SubagentDetailContext.Provider>
+            </SessionMetadataProvider>
           </I18nProvider>
         </MemoryRouter>,
       );
       expect(
         await screen.findByText(
-          locale === "en"
-            ? "/root/reviewer completed a task"
-            : "子智能体 /root/reviewer 已完成一轮任务",
+          locale === "en" ? "Turn finished" : "本轮已结束",
         ),
       ).not.toBeNull();
-      const link = screen.getByRole("link", { name: /\/root\/reviewer/ });
-      expect(link.getAttribute("href")).toBe(
-        "/projects/project-1/sessions/child-thread",
-      );
+      expect(screen.getByText("reviewer")).not.toBeNull();
+      const action = screen.getByRole("button", { name: /\/root\/reviewer/ });
+      fireEvent.click(action);
+      expect(openAgent).toHaveBeenCalledWith({
+        agentId: "child-thread",
+        parentSessionId: "parent-thread",
+        name: "/root/reviewer",
+        status: "completed",
+      });
+      expect(screen.queryByRole("link")).toBeNull();
     },
   );
 

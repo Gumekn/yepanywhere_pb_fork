@@ -1,4 +1,4 @@
-import { orderByParentChain } from "@yep-anywhere/shared";
+import { nonEmptyMessageId, orderByParentChain } from "@yep-anywhere/shared";
 import type { ContentBlock, Message } from "../types";
 
 /**
@@ -10,12 +10,8 @@ const missingMessageIds = new WeakMap<Message, string>();
 let nextMissingMessageId = 0;
 
 export function getMessageId(m: Message): string {
-  if (typeof m.uuid === "string" && m.uuid.length > 0) {
-    return m.uuid;
-  }
-  if (typeof m.id === "string" && m.id.length > 0) {
-    return m.id;
-  }
+  const id = nonEmptyMessageId(m);
+  if (id) return id;
 
   let fallback = missingMessageIds.get(m);
   if (!fallback) {
@@ -442,6 +438,23 @@ export function mergeMessage(
   }
 
   const existingSource = existing._source ?? "sdk";
+  const wasPlaceholder =
+    existing._isStreaming || existing._isStreamingPlaceholder;
+  const isPlaceholder =
+    incoming._isStreaming || incoming._isStreamingPlaceholder;
+  if (!wasPlaceholder && isPlaceholder && existing.type === "assistant")
+    return existing;
+  if (wasPlaceholder && !isPlaceholder && incomingSource === "sdk") {
+    // This is the authoritative body for a temporary stream, not another
+    // incremental block snapshot. Retaining the draft would duplicate prose.
+    return {
+      ...incoming,
+      _source: "sdk",
+      _isStreaming: false,
+      _isStreamingPlaceholder: false,
+      _streamingBlockIndex: undefined,
+    };
+  }
 
   // If incoming is JSONL, it's authoritative - use it as base
   if (incomingSource === "jsonl") {
@@ -460,12 +473,21 @@ export function mergeMessage(
       ...existing,
       ...mergedContent,
       _source: "jsonl",
+      ...(existing._isStreaming || existing._isStreamingPlaceholder
+        ? {
+            _isStreaming: false,
+            _isStreamingPlaceholder: false,
+            _streamingBlockIndex: undefined,
+          }
+        : {}),
     };
     return structurallyEquivalent(existing, merged) ? existing : merged;
   }
 
   // If incoming is SDK and existing is JSONL, keep JSONL (it's authoritative)
   if (existingSource === "jsonl") {
+    if (incoming._isStreaming || incoming._isStreamingPlaceholder)
+      return existing;
     // Keep the persisted envelope while carrying forward richer live fields on
     // the same block. This is also used by Codex semantic reconciliation when
     // stream and JSONL copies have different message IDs but the same tool ID.

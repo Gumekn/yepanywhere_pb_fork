@@ -4,7 +4,7 @@
  * Rather than re-implementing per-provider JSONL parsing, we extract text from
  * the *normalized* `Message[]` that every provider's reader already produces via
  * `normalizeSession()`. This keeps a single extraction path, guarantees the
- * emitted `messageId` matches what the client renders (`uuid ?? id`), and only
+ * emitted `messageId` keeps a blank string identity (`stringMessageId`), and only
  * runs on cache miss (a session file actually changed).
  *
  * We deliberately index only user/assistant *natural language* text:
@@ -14,6 +14,7 @@
  * low-value blobs that would bloat the index).
  */
 
+import { stringMessageId } from "@yep-anywhere/shared";
 import type { ContentBlock, Message } from "../supervisor/types.js";
 
 /** Hard cap on indexed text per message to bound index size. */
@@ -47,12 +48,9 @@ export interface TextMatch {
   matchLength: number;
 }
 
-/** Resolve the canonical message id the same way the client does. */
+/** Blank strings stay. This is not the client's non-empty session identity. */
 function messageId(message: Message): string {
-  const uuid = typeof message.uuid === "string" ? message.uuid : undefined;
-  const id =
-    typeof message.id === "string" ? (message.id as string) : undefined;
-  return uuid ?? id ?? "";
+  return stringMessageId(message) ?? "";
 }
 
 /** Resolve a best-effort role string for display. */

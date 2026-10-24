@@ -1,5 +1,7 @@
 import {
+  type ContextUsage,
   type SessionDisplayActivity,
+  type SessionDisplayKnownView,
   type SessionDisplayNode,
   SessionDisplayPatchSchema,
   type SessionDisplaySnapshot,
@@ -11,7 +13,13 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api/client";
 import { extractCodexTurnContextUsage } from "../lib/codexMessageContext";
+import { connectionManager } from "../lib/connection";
 import { DisplaySnapshotCache } from "../lib/displaySnapshotCache";
+import { sessionLoadTracer } from "../lib/sessionLoadTiming";
+import {
+  takePrefetchedMetadata,
+  takePrefetchedView,
+} from "../lib/sessionPrefetch";
 import type { Message, Session } from "../types";
 import type {
   AgentContentMap,
@@ -21,6 +29,12 @@ import type {
 import { contextUsageFromStatus } from "./useLegacySessionMessages";
 
 const snapshots = new DisplaySnapshotCache();
+/**
+ * With a connected socket, the WS subscription delivers the projection (or a
+ * `display-current` marker for a cached one). The HTTP read only runs if the
+ * WS answer has not arrived within this window, or when the socket is down.
+ */
+export const WS_SNAPSHOT_GRACE_MS = 1_500;
 export function resetDisplaySnapshotCacheForTests(): void {
   snapshots.clear();
 }
@@ -59,6 +73,8 @@ export function useProjectedSessionMessages(
 ): UseSessionMessagesResult & {
   handleDisplayEvent(type: string, data: unknown): void;
   displayActivity: SessionDisplayActivity | undefined;
+  /** Projection version to announce on the WS display subscription. */
+  displayKnownView: SessionDisplayKnownView | undefined;
 } {
   const { projectId, sessionId, branchId, enabled = true } = options;
   const key = `${projectId}\0${sessionId}\0${branchId ?? "active"}`;
@@ -76,6 +92,10 @@ export function useProjectedSessionMessages(
   const [session, setSession] = useState<Session | null>(null);
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const nativeContextUsageRef = useRef<{
+    key: string;
+    usage: ContextUsage;
+  } | null>(null);
   const configuration = useRef<
     Partial<
       Pick<Session, "provider" | "model" | "reasoningEffort" | "serviceTier">
@@ -100,6 +120,8 @@ export function useProjectedSessionMessages(
   >("unavailable");
   const refreshing = useRef<Promise<Session | null> | null>(null);
   const queuedPatches = useRef<unknown[]>([]);
+  /** Skips the deferred initial HTTP read once WS has delivered the view. */
+  const skipDeferredView = useRef<(() => void) | null>(null);
 
   const install = useCallback(
     (next: SessionDisplaySnapshot) => {
@@ -136,43 +158,62 @@ export function useProjectedSessionMessages(
     [key, sessionId, branchId],
   );
 
-  const fetchSessionMetadata = useCallback(async () => {
-    const expected = keyRef.current;
-    const data = await api.getSessionMetadata(projectId, sessionId);
-    if (keyRef.current !== expected) return;
-    const current = sessionRef.current;
-    const next = { ...current, ...data.session, ...configuration.current };
-    for (const name of [
-      "model",
-      "reasoningEffort",
-      "serviceTier",
-      "contextUsage",
-    ] as const) {
-      if (next[name] === undefined && current?.[name] !== undefined)
-        Object.assign(next, { [name]: current[name] });
-    }
-    sessionRef.current = next;
-    setSession(next);
-    optionsRef.current.onLoadComplete?.({
-      ...data,
-      session: next,
-      status: data.ownership,
-    });
-    if (!next.contextUsage)
-      void api
-        .getContextStatus(projectId, sessionId)
-        .then((status) => {
-          if (keyRef.current !== expected) return;
-          const contextUsage = contextUsageFromStatus(status);
-          if (contextUsage)
-            setSession((current) =>
-              current && !current.contextUsage
-                ? { ...current, contextUsage }
-                : current,
-            );
-        })
-        .catch(() => {});
-  }, [projectId, sessionId]);
+  const loadSessionMetadata = useCallback(
+    async (
+      /** An already-started read (cold-start prefetch) to apply instead. */
+      source?: ReturnType<typeof api.getSessionMetadata>,
+    ) => {
+      const expected = keyRef.current;
+      const usageAtRequest = nativeContextUsageRef.current;
+      const data = await (source ??
+        api.getSessionMetadata(projectId, sessionId));
+      if (keyRef.current !== expected) return;
+      const current = sessionRef.current;
+      const next = { ...current, ...data.session, ...configuration.current };
+      const streamedUsage = nativeContextUsageRef.current;
+      if (
+        streamedUsage?.key === expected &&
+        (streamedUsage !== usageAtRequest || !next.contextUsage)
+      )
+        next.contextUsage = streamedUsage.usage;
+      for (const name of [
+        "model",
+        "reasoningEffort",
+        "serviceTier",
+        "contextUsage",
+      ] as const) {
+        if (next[name] === undefined && current?.[name] !== undefined)
+          Object.assign(next, { [name]: current[name] });
+      }
+      sessionRef.current = next;
+      setSession(next);
+      optionsRef.current.onLoadComplete?.({
+        ...data,
+        session: next,
+        status: data.ownership,
+      });
+      if (!next.contextUsage)
+        void api
+          .getContextStatus(projectId, sessionId)
+          .then((status) => {
+            if (keyRef.current !== expected) return;
+            const contextUsage = contextUsageFromStatus(status);
+            if (contextUsage)
+              setSession((current) =>
+                current && !current.contextUsage
+                  ? { ...current, contextUsage }
+                  : current,
+              );
+          })
+          .catch(() => {});
+    },
+    [projectId, sessionId],
+  );
+  // Public form takes no argument, so it is safe to pass as a callback.
+  const fetchSessionMetadata = useCallback(
+    () => loadSessionMetadata(),
+    [loadSessionMetadata],
+  );
 
   const refreshSessionMessages = useCallback<
     UseSessionMessagesResult["refreshSessionMessages"]
@@ -182,18 +223,18 @@ export function useProjectedSessionMessages(
       const expected = keyRef.current;
       const expectedEpoch = snapshotRef.current?.view.epoch;
       const task = (async () => {
-        await fetchSessionMetadata();
-        if (keyRef.current !== expected) return null;
         const targetBranch =
           refreshOptions?.branchId === null
             ? undefined
             : (refreshOptions?.branchId ?? branchId);
-        const next = SessionDisplaySnapshotSchema.parse(
-          await api.getSessionDisplayView(projectId, sessionId, {
+        const [, display] = await Promise.all([
+          fetchSessionMetadata(),
+          api.getSessionDisplayView(projectId, sessionId, {
             branchId: targetBranch,
             reset: refreshOptions?.replaceMessages,
           }),
-        );
+        ]);
+        const next = SessionDisplaySnapshotSchema.parse(display);
         if (keyRef.current !== expected) return null;
         if (
           snapshotRef.current?.view.epoch !== expectedEpoch &&
@@ -251,9 +292,70 @@ export function useProjectedSessionMessages(
   const handleDisplayEvent = useCallback(
     (type: string, data: unknown) => {
       if (!enabled) return;
-      if (type === "display-snapshot") {
+      if (type === "display-context-usage") {
+        const update = data as {
+          sessionId?: string;
+          branchId?: string;
+          contextUsage?: ContextUsage;
+        } | null;
+        const usage = update?.contextUsage;
+        if (
+          update?.sessionId !== sessionId ||
+          update?.branchId !== branchId ||
+          !usage ||
+          !Number.isFinite(usage.inputTokens) ||
+          usage.inputTokens < 0 ||
+          !Number.isFinite(usage.percentage) ||
+          !usage.contextWindow ||
+          !Number.isFinite(usage.contextWindow) ||
+          usage.contextWindow < 0
+        )
+          return;
+        nativeContextUsageRef.current = { key: keyRef.current, usage };
+        setSession((current) => {
+          if (!current) return current;
+          const next = { ...current, contextUsage: usage };
+          sessionRef.current = next;
+          return next;
+        });
+      } else if (type === "display-snapshot") {
         const parsed = SessionDisplaySnapshotSchema.safeParse(data);
-        if (parsed.success) install(parsed.data);
+        if (parsed.success) {
+          install(parsed.data);
+          if (snapshotRef.current === parsed.data) {
+            skipDeferredView.current?.();
+            sessionLoadTracer.fresh(keyRef.current, "ws");
+          }
+        }
+      } else if (type === "display-current") {
+        const current = data as {
+          view?: {
+            sessionId?: unknown;
+            branchScopeId?: unknown;
+            epoch?: unknown;
+          };
+          seq?: unknown;
+        } | null;
+        const held = snapshotRef.current;
+        if (
+          current?.view?.sessionId !== sessionId ||
+          current.view.branchScopeId !== (branchId ?? "active")
+        )
+          return;
+        if (
+          held &&
+          held.view.epoch === current.view.epoch &&
+          typeof current.seq === "number" &&
+          held.seq >= current.seq
+        ) {
+          // The held (cached) projection is the server's current one.
+          setLoading(false);
+          skipDeferredView.current?.();
+          sessionLoadTracer.fresh(keyRef.current, "ws-current");
+        } else {
+          // Raced with a newer local state change; fetch the real snapshot.
+          void refreshSessionMessages().catch(() => {});
+        }
       } else if (type === "display-patch") {
         const parsed = SessionDisplayPatchSchema.safeParse(data);
         if (
@@ -293,28 +395,107 @@ export function useProjectedSessionMessages(
     queuedPatches.current = [];
     refreshing.current = null;
     let cancelled = false;
-    void fetchSessionMetadata().catch((error) => {
-      if (!cancelled) optionsRef.current.onLoadError?.(error);
+    sessionLoadTracer.begin(key, {
+      cached: Boolean(cached),
+      transport: connectionManager.state,
     });
+    const prefetchedMetadata = takePrefetchedMetadata(
+      projectId,
+      sessionId,
+      branchId,
+    );
+    const prefetchedView = takePrefetchedView(projectId, sessionId, branchId);
+    void loadSessionMetadata(prefetchedMetadata)
+      .catch((error) =>
+        // A failed prefetch is retried once with a normal read.
+        prefetchedMetadata ? loadSessionMetadata() : Promise.reject(error),
+      )
+      .then(() => sessionLoadTracer.metadata(key))
+      .catch((error) => {
+        if (!cancelled) optionsRef.current.onLoadError?.(error);
+      });
     // A cold HTTP snapshot also supports transport startup failures. The WS
     // snapshot establishes the same view/sequence, so older HTTP replies lose.
-    void api
-      .getSessionDisplayView(projectId, sessionId, { branchId })
-      .then((next) => {
-        if (
-          !cancelled &&
-          currentGeneration === generation.current &&
-          (!snapshotRef.current ||
-            snapshotRef.current.view.epoch === next.view.epoch)
-        )
-          install(SessionDisplaySnapshotSchema.parse(next));
-      })
-      .catch((error) => {
-        if (!cancelled && !snapshotRef.current) {
-          setLoading(false);
-          optionsRef.current.onLoadError?.(error);
+    let lastViewResponse: { status?: number; serverTiming?: string | null } =
+      {};
+    const loadSnapshot = async () => {
+      if (prefetchedView) {
+        try {
+          const prefetched = await prefetchedView;
+          lastViewResponse = prefetched;
+          return prefetched.snapshot;
+        } catch {
+          // Fall through to the normal read and its conflict retries.
         }
-      });
+      }
+      for (let attempt = 0; ; attempt++) {
+        if (cancelled) return;
+        try {
+          return await api.getSessionDisplayView(projectId, sessionId, {
+            branchId,
+            onResponse: (info) => {
+              lastViewResponse = info;
+            },
+          });
+        } catch (error) {
+          if (cancelled || snapshotRef.current) return;
+          const { status, code } = error as { status?: number; code?: string };
+          if (
+            status !== 409 ||
+            (code !== "SESSION_DISPLAY_STALE" &&
+              code !== "SESSION_DISPLAY_CHANGED") ||
+            attempt >= 2
+          )
+            throw error;
+          // A new cursor-free read can recover a changing source. Do not turn
+          // a transient read conflict into a permanent whole-page error.
+          await new Promise((resolve) =>
+            setTimeout(resolve, 150 * (attempt + 1)),
+          );
+          if (snapshotRef.current) return;
+        }
+      }
+    };
+    let viewStarted = false;
+    let viewTimer: ReturnType<typeof setTimeout> | undefined;
+    const startView = () => {
+      if (viewStarted || cancelled) return;
+      viewStarted = true;
+      clearTimeout(viewTimer);
+      skipDeferredView.current = null;
+      void loadSnapshot()
+        .then((next) => {
+          if (!cancelled) sessionLoadTracer.view(key, lastViewResponse);
+          if (
+            next &&
+            !cancelled &&
+            currentGeneration === generation.current &&
+            (!snapshotRef.current ||
+              snapshotRef.current.view.epoch === next.view.epoch)
+          ) {
+            install(SessionDisplaySnapshotSchema.parse(next));
+            sessionLoadTracer.fresh(key, "http");
+          }
+        })
+        .catch((error) => {
+          if (!cancelled) sessionLoadTracer.view(key, lastViewResponse);
+          if (!cancelled && !snapshotRef.current) {
+            setLoading(false);
+            optionsRef.current.onLoadError?.(error);
+          }
+        });
+    };
+    // A prefetched read is already in flight and costs nothing to await.
+    if (!prefetchedView && connectionManager.state === "connected") {
+      skipDeferredView.current = () => {
+        if (viewStarted) return;
+        viewStarted = true;
+        clearTimeout(viewTimer);
+        skipDeferredView.current = null;
+        sessionLoadTracer.view(key, { skipped: true });
+      };
+      viewTimer = setTimeout(startView, WS_SNAPSHOT_GRACE_MS);
+    } else startView();
     void (async () => {
       let cursor: string | undefined;
       do {
@@ -342,7 +523,10 @@ export function useProjectedSessionMessages(
     });
     return () => {
       cancelled = true;
+      clearTimeout(viewTimer);
+      skipDeferredView.current = null;
       generation.current++;
+      sessionLoadTracer.abandon(key);
     };
   }, [
     enabled,
@@ -350,7 +534,7 @@ export function useProjectedSessionMessages(
     projectId,
     sessionId,
     branchId,
-    fetchSessionMetadata,
+    loadSessionMetadata,
     install,
   ]);
 
@@ -405,6 +589,15 @@ export function useProjectedSessionMessages(
           }
         : null,
     [snapshot, olderNodes, olderCursor],
+  );
+  const knownEpoch = snapshot?.view.epoch;
+  const knownSeq = snapshot?.seq;
+  const displayKnownView = useMemo(
+    () =>
+      knownEpoch !== undefined && knownSeq !== undefined
+        ? { epoch: knownEpoch, seq: knownSeq }
+        : undefined,
+    [knownEpoch, knownSeq],
   );
   const displayPage = useMemo(
     () => (combined ? sessionDisplaySnapshotPage(combined) : null),
@@ -500,6 +693,7 @@ export function useProjectedSessionMessages(
     displayQuestions,
     displayQuestionCoverage: coverage,
     displayActivity: snapshot?.activity,
+    displayKnownView,
     handleDisplayEvent,
     hydratedLiveTailDetailRef: null,
     agentContent,

@@ -597,6 +597,16 @@ describe("extractSessionIdFromFileEvent", () => {
       }),
     ).toBe("session_186997d7-2289-4e62-993c-c97c703ded86");
   });
+
+  it("decodes MiniMax Code's base64url session directory", () => {
+    expect(
+      extractSessionIdFromFileEvent({
+        provider: "mcode",
+        relativePath:
+          "2026/10/20/12-16-57-980-session_bXZzXzA4NDE1OTg0YzNjOTRjOWY4NDc4MWNkY2YzYzQzNDZm/messages.jsonl",
+      }),
+    ).toBe("mvs_08415984c3c94c9f84781cdcf3c4346f");
+  });
 });
 
 describe("extractKimiAgentIdFromFileEvent", () => {

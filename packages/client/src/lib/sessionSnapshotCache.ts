@@ -167,7 +167,7 @@ function sanitizeMessage(message: Message): Message {
   };
 }
 
-function estimateStructuralBytes(
+export function estimateStructuralBytes(
   values: readonly unknown[],
   limit: number,
 ): number {

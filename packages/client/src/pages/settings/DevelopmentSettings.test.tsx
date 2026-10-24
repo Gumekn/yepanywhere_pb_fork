@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   updateServerSetting: vi.fn(),
   uploadNativeLogs: vi.fn(),
   unsafeToRestart: false,
+  runtimeMode: "external" as "external" | "embedded",
   version: null as { current: string; capabilities: string[] } | null,
 }));
 
@@ -54,7 +55,11 @@ vi.mock("../../hooks/useReloadNotifications", () => ({
     connected: true,
     reloadBackend: mocks.reloadBackend,
     unsafeToRestart: mocks.unsafeToRestart,
-    workerActivity: { activeWorkers: mocks.unsafeToRestart ? 2 : 0 },
+    runtimeMode: mocks.runtimeMode,
+    workerActivity: {
+      activeWorkers: mocks.unsafeToRestart ? 2 : 0,
+      runtimeMode: mocks.runtimeMode,
+    },
   }),
 }));
 vi.mock("../../hooks/useSchemaValidation", () => ({
@@ -89,6 +94,7 @@ describe("DevelopmentSettings", () => {
     localStorage.clear();
     mocks.version = null;
     mocks.unsafeToRestart = false;
+    mocks.runtimeMode = "external";
     mocks.getDeploymentStatus.mockResolvedValue({
       available: true,
       actions: [],
@@ -160,10 +166,89 @@ describe("DevelopmentSettings", () => {
           action: "server",
           restartTargets: {
             codexBridge: true,
+            runtime: false,
           },
         }),
       );
     });
+  });
+
+  it.each(["server", "services-restart"] as const)(
+    "explicitly includes runtime in %s and warns before sending",
+    async (action) => {
+      mocks.version = { current: "2026.9.0", capabilities: ["deployment"] };
+      const job = {
+        id: "runtime-job",
+        action,
+        args: [],
+        command: "fixture",
+        status: "running",
+        startedAt: "2026-10-13T01:00:00Z",
+        updatedAt: "2026-10-13T01:00:00Z",
+      };
+      mocks.startDeployment.mockResolvedValue({ job });
+      mocks.getDeploymentJob.mockResolvedValue({ job });
+      render(
+        <MemoryRouter>
+          <DevelopmentSettings />
+        </MemoryRouter>,
+      );
+      const runtime = await screen.findByRole("checkbox", {
+        name: "deploymentRestartTargetRuntime",
+      });
+      expect((runtime as HTMLInputElement).checked).toBe(false);
+      expect(screen.queryByText("deploymentRuntimeRestartWarning")).toBeNull();
+      fireEvent.click(runtime);
+      expect(screen.getByRole("status").textContent).toBe(
+        "deploymentRuntimeRestartWarning",
+      );
+      if (action === "services-restart")
+        fireEvent.click(
+          screen.getByRole("checkbox", {
+            name: "deploymentRestartTargetServer",
+          }),
+        );
+      const button = screen.getByRole("button", {
+        name:
+          action === "server"
+            ? "deploymentRedeployServer"
+            : "deploymentRestartSelected",
+      });
+      await waitFor(() =>
+        expect((button as HTMLButtonElement).disabled).toBe(false),
+      );
+      fireEvent.click(button);
+      await waitFor(() =>
+        expect(mocks.startDeployment).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action,
+            restartTargets:
+              action === "server"
+                ? { codexBridge: false, runtime: true }
+                : { server: false, codexBridge: false, runtime: true },
+          }),
+        ),
+      );
+      expect((runtime as HTMLInputElement).disabled).toBe(true);
+    },
+  );
+
+  it("hides the separate runtime target when the runtime is embedded", async () => {
+    mocks.version = { current: "2026.9.0", capabilities: ["deployment"] };
+    mocks.runtimeMode = "embedded";
+    render(
+      <MemoryRouter>
+        <DevelopmentSettings />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("checkbox", {
+      name: "deploymentRestartTargetServer",
+    });
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "deploymentRestartTargetRuntime",
+      }),
+    ).toBeNull();
   });
 
   it("queues a dev cutover without forcing active session interruption", async () => {

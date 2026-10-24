@@ -32,6 +32,10 @@ export const SessionDisplayToolStepSchema = z
     truncated: z.boolean(),
     version: z.number().int().nonnegative(),
     timestamp: z.string().optional(),
+    /** Time this call returned a result; absent when no reliable end is known. */
+    completedAt: z.string().optional(),
+    /** Provider-reported duration, independent of absolute event timestamps. */
+    durationMs: z.number().finite().nonnegative().optional(),
   })
   .strict();
 export type SessionDisplayToolStep = z.infer<
@@ -134,6 +138,9 @@ export const SessionDisplayToolGroupSegmentSchema = z
     runningCount: z.number().int().nonnegative().optional(),
     unknownCount: z.number().int().nonnegative().optional(),
     interruptedCount: z.number().int().nonnegative().optional(),
+    /** Sum of known per-call durations; parallel calls count separately. */
+    durationMs: z.number().finite().nonnegative().optional(),
+    timedCount: z.number().int().nonnegative().optional(),
     steps: z.array(SessionDisplayToolStepSchema).optional(),
     version: z.number().int().nonnegative().optional(),
     timestamp: TimestampSchema.optional(),
@@ -209,17 +216,49 @@ export const SessionDisplayNoticeSegmentSchema = z
       "goal",
       "plan",
       "subagent",
+      "inter_agent_message",
+      "agent_wait",
       "provider_event",
     ]),
     title: z.string().max(512).optional(),
     message: z.string().max(SESSION_DISPLAY_MAX_NOTICE_LENGTH).optional(),
     status: z.string().max(64).optional(),
+    agentWait: z
+      .object({
+        type: z.literal("agentWait"),
+        id: z.string().min(1).max(512),
+        status: z.enum(["running", "completed", "interrupted", "failed"]),
+        startedAt: TimestampSchema.optional(),
+        completedAt: TimestampSchema.optional(),
+        durationMs: z.number().nonnegative().optional(),
+        outcome: z
+          .enum(["message", "timeout", "user_input", "unknown"])
+          .optional(),
+      })
+      .strict()
+      .optional(),
     /** Identity only: task bodies and results stay in the child conversation. */
     subagent: z
       .object({
         kind: z.string().max(64),
+        eventId: z.string().min(1).max(512).optional(),
+        operation: z.enum(["followup_task", "send_message"]).optional(),
         agentThreadId: z.string().min(1).max(512).optional(),
         agentPath: z.string().min(1).max(512).optional(),
+      })
+      .strict()
+      .optional(),
+    /** Sanitized agent communication; encrypted payloads are never exposed. */
+    interAgentMessage: z
+      .object({
+        type: z.literal("interAgentMessage"),
+        id: z.string().min(1).max(512),
+        kind: z.enum(["task", "message", "result"]),
+        sender: z.string().max(512),
+        recipient: z.string().max(512),
+        text: z.string().max(SESSION_DISPLAY_MAX_NOTICE_LENGTH).optional(),
+        encrypted: z.boolean(),
+        truncated: z.boolean().optional(),
       })
       .strict()
       .optional(),
@@ -392,9 +431,26 @@ export type SessionDisplaySnapshot = z.infer<
 >;
 export type SessionDisplayPatch = z.infer<typeof SessionDisplayPatchSchema>;
 
+/** Projection version a client already holds (snapshot view epoch + seq). */
+export interface SessionDisplayKnownView {
+  epoch: string;
+  seq: number;
+}
+
 export interface SessionDisplaySubscriptionOptions {
   projectId: string;
   branchId?: string;
+  /**
+   * When it matches the server's current projection, the subscription starts
+   * with a `display-current` marker instead of a full `display-snapshot`.
+   */
+  known?: SessionDisplayKnownView;
+}
+
+/** Payload of `display-current`: the subscriber's projection is current. */
+export interface SessionDisplayCurrent {
+  view: SessionDisplayView;
+  seq: number;
 }
 
 export interface SessionDisplayGroupPage {

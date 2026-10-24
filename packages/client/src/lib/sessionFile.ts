@@ -23,6 +23,22 @@ export function extractSessionIdFromFileEvent(
     }
   }
 
+  // MiniMax Code: <YYYY>/<MM>/<DD>/<time>-session_<base64url(id)>/messages.jsonl
+  if (event.provider === "mcode") {
+    const dir = pathParts.at(-2) ?? "";
+    const encoded = /session_([A-Za-z0-9_-]+)$/.exec(dir)?.[1];
+    if (!encoded) return null;
+    try {
+      const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+      const decoded = atob(
+        base64.padEnd(Math.ceil(base64.length / 4) * 4, "="),
+      );
+      return /^mvs_[A-Za-z0-9]+$/.test(decoded) ? decoded : null;
+    } catch {
+      return null;
+    }
+  }
+
   let base = filename;
   if (base.endsWith(".jsonl")) {
     base = base.slice(0, -6);

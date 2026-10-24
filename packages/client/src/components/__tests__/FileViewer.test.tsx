@@ -158,19 +158,65 @@ describe("FileViewer", () => {
       name: "Copy full text",
     });
 
+    const copyPath = screen.getByRole("button", {
+      name: "Copy full path",
+    });
+
     fireEvent.click(copyTitle);
     expect(
       await screen.findByRole("button", { name: "Title copied!" }),
     ).toBeTruthy();
     expect(writeText).toHaveBeenNthCalledWith(1, "notes.md");
+    expect(copyPath.getAttribute("aria-label")).toBe("Copy full path");
     expect(copyFullText.getAttribute("aria-label")).toBe("Copy full text");
+
+    fireEvent.click(copyPath);
+    expect(
+      await screen.findByRole("button", { name: "Full path copied!" }),
+    ).toBeTruthy();
+    expect(writeText).toHaveBeenNthCalledWith(2, "/workspace/docs/notes.md");
 
     fireEvent.click(copyFullText);
     expect(
       await screen.findByRole("button", { name: "Full text copied!" }),
     ).toBeTruthy();
-    expect(writeText).toHaveBeenNthCalledWith(2, "hello world\n");
+    expect(writeText).toHaveBeenNthCalledWith(3, "hello world\n");
     expect(screen.getByRole("button", { name: "Title copied!" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Full path copied!" }),
+    ).toBeTruthy();
+  });
+
+  it("copies the preview path when the file has no absolute path", async () => {
+    getFile.mockResolvedValueOnce({
+      metadata: {
+        path: "docs/notes.md",
+        size: 12,
+        mimeType: "text/markdown",
+        isText: true,
+      },
+      content: "hello world\n",
+      rawUrl: "/api/projects/project-1/files/raw",
+    });
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: true,
+    });
+
+    renderViewer();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Copy full path" }),
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Full path copied!" }),
+    ).toBeTruthy();
+    expect(writeText).toHaveBeenCalledWith("docs/notes.md");
   });
 
   it("copies through the synchronous fallback in an insecure context", async () => {

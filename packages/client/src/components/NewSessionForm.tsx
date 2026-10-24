@@ -17,8 +17,6 @@ import {
 } from "@yep-anywhere/shared";
 import {
   type CSSProperties,
-  type ChangeEvent,
-  type ClipboardEvent,
   type KeyboardEvent,
   useCallback,
   useEffect,
@@ -28,8 +26,8 @@ import {
 } from "react";
 import { useNavigate } from "react-router-dom";
 import { type UploadedFile, api } from "../api/client";
-import { ENTER_SENDS_MESSAGE } from "../constants";
 import { useToastContext } from "../contexts/ToastContext";
+import { useComposerDocument } from "../hooks/useComposerDocument";
 import { useConnection } from "../hooks/useConnection";
 import { useDraftPersistence } from "../hooks/useDraftPersistence";
 import { useLlmGatewayKeys } from "../hooks/useLlmGatewayKeys";
@@ -52,20 +50,16 @@ import { useServerSettings } from "../hooks/useServerSettings";
 import { useI18n } from "../i18n";
 import { getAgentCommandConfigs } from "../lib/agentCommands";
 import {
-  countAttachmentTokens,
-  deleteAttachmentTokenAtCaret,
-  hasAttachmentToken,
-  insertAttachmentToken,
-  matchTokenToAttachment,
-  removeAttachmentToken,
-  sanitizeAttachmentTokenName,
-} from "../lib/attachmentTokens";
-import { readClipboardUserInput } from "../lib/clipboard";
-import {
   getModelReasoningEfforts,
   resolveModelReasoningEffort,
 } from "../lib/codexReasoning";
-import { hasCoarsePointer } from "../lib/deviceDetection";
+import { handleComposerSubmitKey } from "../lib/composerKeyboard";
+import { getPreferredCursorModelId } from "../lib/cursorModels";
+import {
+  clearLegacySessionPrefill,
+  getLegacySessionPrefill,
+} from "../lib/legacySessionPrefill";
+import { updateNewSessionLayout } from "../lib/newSessionLayout";
 import {
   getProviderPermissionModes,
   normalizeProviderPermissionMode,
@@ -76,12 +70,18 @@ import {
   shouldRestoreHistoricalEditAfterFailure,
 } from "../lib/sessionBranching";
 import type { PermissionMode, SessionNavigationState } from "../types";
+import {
+  AttachmentComposer,
+  type AttachmentComposerHandle,
+} from "./AttachmentComposer";
 import { AttachmentPreviewModal } from "./AttachmentPreviewModal";
 import { CodexAccountSelect } from "./CodexAccountSelect";
 import { CodexUsageCard } from "./CodexUsageCard";
-import { ComposerTokenHighlight } from "./ComposerTokenHighlight";
+import { ComposerAttachmentCard } from "./ComposerAttachmentCard";
+import { CursorAccountCard } from "./CursorAccountCard";
+import { CursorModelSelect } from "./CursorModelSelect";
 import { FilterDropdown, type FilterOption } from "./FilterDropdown";
-import { clearFabPrefill, getFabPrefill } from "./FloatingActionButton";
+import { NewSessionSetupSkeleton } from "./NewSessionSkeleton";
 import { PiGatewayKeySelect } from "./PiGatewayKeySelect";
 import { SlashCommandButton } from "./SlashCommandButton";
 import { VoiceInputButton, type VoiceInputButtonRef } from "./VoiceInputButton";
@@ -104,6 +104,8 @@ const NEW_SESSION_PROVIDER_ACCENTS = {
   pi: "var(--provider-pi)",
   kimi: "var(--provider-kimi)",
   zcode: "var(--provider-zcode)",
+  cursor: "var(--provider-cursor)",
+  mcode: "var(--provider-mcode)",
 } satisfies Record<LiveProviderName, string>;
 
 export function getNewSessionProviderAccent(
@@ -340,6 +342,8 @@ export function NewSessionForm({
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [previewFileId, setPreviewFileId] = useState<string | null>(null);
   const pendingFilesRef = useRef<PendingFile[]>(pendingFiles);
+  const removedPendingFilesRef = useRef(new Map<string, PendingFile>());
+  const pendingFileOrderRef = useRef<string[]>([]);
   pendingFilesRef.current = pendingFiles;
   const [isStarting, setIsStarting] = useState(false);
   const [startRetryBlockedMessage, setStartRetryBlockedMessage] = useState<
@@ -359,6 +363,9 @@ export function NewSessionForm({
   > | null>(null);
   const [zcodeMcpLoading, setZcodeMcpLoading] = useState(false);
   const [zcodeMcpError, setZcodeMcpError] = useState<string | null>(null);
+  const [cursorCatalog, setCursorCatalog] = useState<ModelInfo[] | null>(null);
+  const [cursorCatalogLoading, setCursorCatalogLoading] = useState(false);
+  const cursorPrepareKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (selectedProvider !== "zcode") return;
@@ -390,7 +397,10 @@ export function NewSessionForm({
   // route changes, cancelled drafts, and failed starts that unmount the form.
   useEffect(
     () => () => {
-      for (const pendingFile of pendingFilesRef.current) {
+      for (const pendingFile of [
+        ...pendingFilesRef.current,
+        ...removedPendingFilesRef.current.values(),
+      ]) {
         if (pendingFile.previewUrl) {
           URL.revokeObjectURL(pendingFile.previewUrl);
         }
@@ -403,7 +413,7 @@ export function NewSessionForm({
   const [showUnavailableProviders, setShowUnavailableProviders] =
     useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<AttachmentComposerHandle>(null);
   const voiceButtonRef = useRef<VoiceInputButtonRef>(null);
   const hasInitializedDefaultsRef = useRef(false);
   // Thinking toggle state
@@ -422,7 +432,11 @@ export function NewSessionForm({
   const { showToast } = useToastContext();
 
   // Fetch available providers
-  const { providers, loading: providersLoading } = useProviders();
+  const {
+    providers,
+    loading: providersLoading,
+    refetch: refetchProviders,
+  } = useProviders();
   const {
     settings,
     isLoading: settingsLoading,
@@ -459,7 +473,16 @@ export function NewSessionForm({
     untrusted: t("newSessionZcodeMcpStatusUntrusted"),
   };
   // Get models and capabilities for the currently selected provider.
-  const availableModels: ModelInfo[] = selectedProviderInfo?.models ?? [];
+  // A cold Cursor catalog must not block the shared provider list, so the
+  // form loads it only after Cursor is selected and the list is still empty.
+  const listedModels = selectedProviderInfo?.models ?? [];
+  const availableModels: ModelInfo[] =
+    selectedProvider === "cursor" &&
+    listedModels.length === 0 &&
+    cursorCatalog &&
+    cursorCatalog.length > 0
+      ? cursorCatalog
+      : listedModels;
   const selectedModelInfo = availableModels.find(
     (model) => model.id === selectedModel,
   );
@@ -489,12 +512,14 @@ export function NewSessionForm({
         : [],
     [selectedModelInfo, selectedProvider],
   );
+  // MiniMax Code folds its plain/thinking model variants into the same
+  // off + named-effort picker Kimi uses (see server mcode-models.ts).
+  const usesKimiStyleReasoning =
+    selectedProvider === "kimi" || selectedProvider === "mcode";
   const kimiReasoningEfforts = useMemo(
     () =>
-      selectedProvider === "kimi"
-        ? getModelReasoningEfforts(selectedModelInfo)
-        : [],
-    [selectedModelInfo, selectedProvider],
+      usesKimiStyleReasoning ? getModelReasoningEfforts(selectedModelInfo) : [],
+    [selectedModelInfo, usesKimiStyleReasoning],
   );
   const piReasoningEfforts = useMemo(
     () =>
@@ -512,7 +537,7 @@ export function NewSessionForm({
         )
       : undefined;
   const effectiveKimiReasoningEffort =
-    selectedProvider === "kimi" && kimiReasoningEfforts.length > 0
+    usesKimiStyleReasoning && kimiReasoningEfforts.length > 0
       ? resolveModelReasoningEffort(selectedModelInfo, kimiReasoningEffort)
       : undefined;
   const resolvedPiThinkingEffort =
@@ -525,7 +550,7 @@ export function NewSessionForm({
   const selectedReasoningEffort =
     selectedProvider === "codex" && thinkingMode === "on"
       ? effectiveCodexReasoningEffort
-      : selectedProvider === "kimi"
+      : usesKimiStyleReasoning
         ? effectiveKimiReasoningEffort
         : selectedProvider === "pi" && thinkingMode !== "off"
           ? resolvedPiThinkingEffort
@@ -656,7 +681,7 @@ export function NewSessionForm({
     setKimiReasoningEffort(selected[0] ?? null);
   }, []);
   const showKimiReasoningSelector =
-    selectedProvider === "kimi" && kimiReasoningOptions.length > 0;
+    usesKimiStyleReasoning && kimiReasoningOptions.length > 0;
 
   // Default to true for backwards compatibility with providers that don't set these flags
   const permissionModes = getProviderPermissionModes(
@@ -693,6 +718,7 @@ export function NewSessionForm({
   const applyProviderSelection = useCallback(
     (provider: ProviderInfo, savedDefaults?: NewSessionProviderDefaults) => {
       const providerName = provider.name;
+      updateNewSessionLayout({ provider: providerName });
       const models = provider.models ?? [];
       const savedGatewayConfig = savedDefaults?.llmGatewayConfig;
       // Codex saved defaults store the bare model slug plus a separate model
@@ -710,19 +736,24 @@ export function NewSessionForm({
           : undefined;
 
       const preferredModel =
-        providerName === "pi"
-          ? getPreferredGatewayModelId(
+        providerName === "cursor"
+          ? getPreferredCursorModelId(
               models,
-              savedGatewayConfig?.model ??
-                savedDefaults?.model ??
-                provider.currentModel,
+              savedDefaults?.model ?? provider.currentModel,
             )
-          : getPreferredModelId(
-              models,
-              codexPreferredModel ??
-                savedDefaults?.model ??
-                provider.currentModel,
-            );
+          : providerName === "pi"
+            ? getPreferredGatewayModelId(
+                models,
+                savedGatewayConfig?.model ??
+                  savedDefaults?.model ??
+                  provider.currentModel,
+              )
+            : getPreferredModelId(
+                models,
+                codexPreferredModel ??
+                  savedDefaults?.model ??
+                  provider.currentModel,
+              );
 
       setSelectedProvider(providerName);
       setMode(
@@ -749,7 +780,7 @@ export function NewSessionForm({
         providerName === "pi" ? (savedDefaults?.llmGatewayKeyId ?? null) : null,
       );
       setKimiReasoningEffort(
-        providerName === "kimi"
+        providerName === "kimi" || providerName === "mcode"
           ? (savedDefaults?.reasoningEffort ?? null)
           : null,
       );
@@ -1098,12 +1129,12 @@ export function NewSessionForm({
     }
   }, [autoFocus]);
 
-  // Check for FAB pre-fill on mount (when coming from FloatingActionButton)
+  // Recover a pending draft handoff from clients with the retired floating composer.
   useEffect(() => {
-    const prefill = getFabPrefill();
+    const prefill = getLegacySessionPrefill();
     if (prefill) {
       setMessage(prefill);
-      clearFabPrefill();
+      clearLegacySessionPrefill();
       // Focus and move cursor to end
       if (textareaRef.current) {
         textareaRef.current.focus();
@@ -1112,28 +1143,7 @@ export function NewSessionForm({
     }
   }, [setMessage]);
 
-  /** Restores the caret after React has flushed the new textarea value. */
-  const setCaretSoon = (position: number) => {
-    const apply = () => {
-      const el = textareaRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(position, position);
-    };
-    if (typeof requestAnimationFrame === "function") {
-      requestAnimationFrame(apply);
-    } else {
-      setTimeout(apply, 0);
-    }
-  };
-
-  const addPendingFiles = (
-    files: File[],
-    baseMessage?: string,
-    baseCursor?: number,
-  ) => {
-    if (files.length === 0) return;
-
+  const addPendingFiles = (files: File[], beforeAttachmentId?: string) => {
     const newPendingFiles: PendingFile[] = files.map((file) => ({
       id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       file,
@@ -1141,56 +1151,81 @@ export function NewSessionForm({
         ? URL.createObjectURL(file)
         : undefined,
     }));
-    setPendingFiles((prev) => [...prev, ...newPendingFiles]);
-
-    // Drop an inline token at the caret so the prompt records where each file
-    // belongs relative to the typed text.
-    const textarea = textareaRef.current;
-    let nextMessage = baseMessage ?? textarea?.value ?? message;
-    let nextCursor =
-      baseCursor ?? textarea?.selectionStart ?? nextMessage.length;
-    // Pasted Yep clipboard payloads already carry `@[name]` inside the copied
-    // text; reuse those tokens instead of appending duplicates.
-    const consumed = new Map<string, number>();
-    for (const pendingFile of newPendingFiles) {
-      const name = sanitizeAttachmentTokenName(pendingFile.file.name);
-      const used = consumed.get(name) ?? 0;
-      consumed.set(name, used + 1);
-      if (countAttachmentTokens(nextMessage, name) > used) continue;
-      const inserted = insertAttachmentToken(
-        nextMessage,
-        nextCursor,
-        pendingFile.file.name,
-      );
-      nextMessage = inserted.text;
-      nextCursor = inserted.cursor;
-    }
-
-    setInterimTranscript("");
-    setMessage(nextMessage);
-    setCaretSoon(nextCursor);
+    const order = pendingFileOrderRef.current;
+    const anchorIndex = beforeAttachmentId
+      ? order.indexOf(beforeAttachmentId)
+      : -1;
+    order.splice(
+      anchorIndex < 0 ? order.length : anchorIndex,
+      0,
+      ...newPendingFiles.map((file) => file.id),
+    );
+    setPendingFiles((prev) =>
+      [...prev, ...newPendingFiles].sort(
+        (left, right) => order.indexOf(left.id) - order.indexOf(right.id),
+      ),
+    );
   };
 
-  const handleFileSelect = (e: ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files?.length) return;
-
-    addPendingFiles(Array.from(files));
-    e.target.value = ""; // Reset for re-selection
+  const removePendingFiles = (ids: string[]) => {
+    if (ids.length === 0) return;
+    for (const file of pendingFilesRef.current) {
+      if (ids.includes(file.id))
+        removedPendingFilesRef.current.set(file.id, file);
+    }
+    setPendingFiles((prev) => prev.filter((file) => !ids.includes(file.id)));
   };
 
-  const handleRemoveFile = (id: string) => {
-    const file = pendingFilesRef.current.find((f) => f.id === id);
-    if (file?.previewUrl) {
-      URL.revokeObjectURL(file.previewUrl);
-    }
-    if (file) {
-      const textarea = textareaRef.current;
-      const currentValue = textarea?.value ?? message;
-      setMessage(removeAttachmentToken(currentValue, file.file.name));
-    }
-    setPendingFiles((prev) => prev.filter((f) => f.id !== id));
-  };
+  const {
+    composerAttachments,
+    detachedAttachments: detachedPendingFiles,
+    handleChange,
+    handleFileSelect,
+    handlePaste,
+    removeAttachment: handleRemoveFile,
+  } = useComposerDocument({
+    value: displayText,
+    editorRef: textareaRef,
+    attachments: pendingFiles,
+    describeAttachment: (pending) => {
+      const progress = isStarting ? uploadProgress[pending.id] : undefined;
+      return {
+        id: pending.id,
+        name: pending.file.name,
+        mimeType: pending.file.type,
+        previewUrl: pending.previewUrl,
+        pending: !!progress,
+        progress: progress
+          ? progress.total > 0
+            ? (progress.uploaded / progress.total) * 100
+            : 0
+          : undefined,
+      };
+    },
+    disabled: isStarting,
+    onAttach: addPendingFiles,
+    onRemove: removePendingFiles,
+    onRestore: (ids) => {
+      const restored = ids.flatMap((id) => {
+        const file = removedPendingFilesRef.current.get(id);
+        if (!file) return [];
+        removedPendingFilesRef.current.delete(id);
+        return [file];
+      });
+      if (restored.length > 0)
+        setPendingFiles((prev) =>
+          [...prev, ...restored].sort(
+            (left, right) =>
+              pendingFileOrderRef.current.indexOf(left.id) -
+              pendingFileOrderRef.current.indexOf(right.id),
+          ),
+        );
+    },
+    onTextChange: (value) => {
+      setInterimTranscript("");
+      setMessage(value);
+    },
+  });
 
   const handleModeSelect = (selectedMode: PermissionMode) => {
     setMode(selectedMode);
@@ -1257,6 +1292,74 @@ export function NewSessionForm({
         selectedModelForRequest ??
         undefined)
       : selectedModelForRequest;
+
+  const cursorListedCount =
+    providers.find((provider) => provider.name === "cursor")?.models?.length ??
+    0;
+  useEffect(() => {
+    if (selectedProvider !== "cursor" || cursorListedCount > 0) return;
+    let cancelled = false;
+    setCursorCatalogLoading(true);
+    api
+      .getProvider("cursor", { fresh: true })
+      .then((result) => {
+        if (cancelled) return;
+        setCursorCatalog(result.provider.models ?? []);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setCursorCatalogLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProvider, cursorListedCount]);
+
+  useEffect(() => {
+    const discard = (key: string | null) => {
+      if (!key) return;
+      const splitAt = key.indexOf("\0");
+      void api
+        .discardCursorSession({
+          projectId: key.slice(0, splitAt),
+          model: key.slice(splitAt + 1) || undefined,
+        })
+        .catch(() => undefined);
+    };
+    if (selectedProvider !== "cursor" || !projectId || !modelForRequest) {
+      discard(cursorPrepareKeyRef.current);
+      cursorPrepareKeyRef.current = null;
+      return;
+    }
+    const key = `${projectId}\0${modelForRequest}`;
+    if (cursorPrepareKeyRef.current && cursorPrepareKeyRef.current !== key) {
+      discard(cursorPrepareKeyRef.current);
+    }
+    cursorPrepareKeyRef.current = key;
+    void api
+      .prepareCursorSession({
+        projectId,
+        model: modelForRequest,
+        permissionMode: mode,
+      })
+      .catch(() => undefined);
+  }, [mode, modelForRequest, projectId, selectedProvider]);
+
+  useEffect(
+    () => () => {
+      const key = cursorPrepareKeyRef.current;
+      cursorPrepareKeyRef.current = null;
+      if (!key) return;
+      const splitAt = key.indexOf("\0");
+      void api
+        .discardCursorSession({
+          projectId: key.slice(0, splitAt),
+          model: key.slice(splitAt + 1) || undefined,
+        })
+        .catch(() => undefined);
+    },
+    [],
+  );
   // Native Codex tiers outside the shared enum (e.g. ultra) travel only in
   // reasoningEffort; never send an unrelated shared thinking level alongside.
   const thinkingForRequest =
@@ -1355,6 +1458,7 @@ export function NewSessionForm({
       !hasContent ||
       isStarting ||
       startRetryBlockedMessage ||
+      selectedProviderInfo?.unavailableReason ||
       hasGatewayConfigError
     ) {
       return;
@@ -1521,8 +1625,14 @@ export function NewSessionForm({
       // Show user-visible error message
       let errorMessage = t("newSessionStartError");
       if (err instanceof Error) {
+        const code = (err as Error & { code?: string }).code;
         // Check for specific error types
-        if (err.message.includes("Queue is full")) {
+        if (code === "runtime-update-required") {
+          errorMessage = t("cursorRuntimeUpdateRequired");
+          void refetchProviders();
+        } else if (code === "runtime-unavailable") {
+          errorMessage = t("cursorRuntimeUnavailable");
+        } else if (err.message.includes("Queue is full")) {
           errorMessage = t("newSessionServerBusy");
         } else if (err.message.includes("503")) {
           errorMessage = t("newSessionServerCapacity");
@@ -1550,114 +1660,13 @@ export function NewSessionForm({
     }
   };
 
-  const handleKeyDown = (e: KeyboardEvent) => {
-    // Attachment tokens delete as one unit, like a chip would.
-    if (
-      (e.key === "Backspace" || e.key === "Delete") &&
-      !e.metaKey &&
-      !e.ctrlKey &&
-      !e.altKey
-    ) {
-      const textarea = textareaRef.current;
-      const deletion = textarea
-        ? deleteAttachmentTokenAtCaret(
-            textarea.value,
-            textarea.selectionStart,
-            textarea.selectionEnd,
-            e.key === "Backspace" ? "backward" : "forward",
-            pendingFileNames,
-          )
-        : null;
-      if (deletion) {
-        e.preventDefault();
-        setInterimTranscript("");
-        setMessage(deletion.text);
-        setCaretSoon(deletion.cursor);
-        const removed = matchTokenToAttachment(
-          pendingFiles,
-          (candidate) => candidate.file.name,
-          deletion.name,
-          0,
-        );
-        if (removed) {
-          if (removed.previewUrl) URL.revokeObjectURL(removed.previewUrl);
-          setPendingFiles((prev) => prev.filter((f) => f.id !== removed.id));
-        }
-        return;
-      }
-    }
-
-    if (e.key === "Enter") {
-      // Skip Enter during IME composition (e.g. Chinese/Japanese/Korean input)
-      if (e.nativeEvent.isComposing) return;
-
-      // On mobile (touch devices), Enter adds newline - must use send button
-      // On desktop, Enter sends message, Shift/Ctrl+Enter adds newline
-      const isMobile = hasCoarsePointer();
-
-      // If voice recording is active, Enter submits (on any device)
-      if (voiceButtonRef.current?.isListening) {
-        e.preventDefault();
-        handleStartSession();
-        return;
-      }
-
-      if (isMobile) {
-        // Mobile: Enter always adds newline, send button required
-        return;
-      }
-
-      if (ENTER_SENDS_MESSAGE) {
-        if (e.ctrlKey || e.shiftKey) return;
-        e.preventDefault();
-        handleStartSession();
-      } else {
-        if (e.ctrlKey || e.shiftKey) {
-          e.preventDefault();
-          handleStartSession();
-        }
-      }
-    }
-  };
-
-  const handlePaste = (e: ClipboardEvent) => {
-    const copiedInput = readClipboardUserInput(e.clipboardData);
-    if (copiedInput && copiedInput.images.length > 0) {
-      e.preventDefault();
-
-      const textarea = textareaRef.current;
-      const currentValue = textarea?.value ?? message;
-      const start = textarea?.selectionStart ?? currentValue.length;
-      const end = textarea?.selectionEnd ?? start;
-
-      let baseMessage = currentValue;
-      let baseCursor = start;
-      if (copiedInput.text) {
-        baseMessage = `${currentValue.slice(0, start)}${copiedInput.text}${currentValue.slice(end)}`;
-        baseCursor = start + copiedInput.text.length;
-      }
-
-      addPendingFiles(copiedInput.images, baseMessage, baseCursor);
-      return;
-    }
-
-    const items = e.clipboardData?.items;
-    if (!items) return;
-
-    const files: File[] = [];
-    for (const item of items) {
-      if (item.kind === "file") {
-        const file = item.getAsFile();
-        if (file) {
-          files.push(file);
-        }
-      }
-    }
-
-    if (files.length > 0) {
-      e.preventDefault();
-      addPendingFiles(files);
-    }
+  const handleKeyDown = (event: KeyboardEvent) => {
+    handleComposerSubmitKey(event, {
+      onSubmit: () => {
+        void handleStartSession();
+      },
+      isListening: voiceButtonRef.current?.isListening,
+    });
   };
 
   // Voice input handlers
@@ -1724,27 +1733,6 @@ export function NewSessionForm({
   );
 
   const hasContent = message.trim() || pendingFiles.length > 0;
-  const pendingFileNames = pendingFiles.map((pf) => pf.file.name);
-  // Files referenced inline in the prompt are rendered as tokens; only the
-  // remaining ones still need a chip below the composer.
-  const detachedPendingFiles = pendingFiles.filter(
-    (pf) => !hasAttachmentToken(displayText, pf.file.name),
-  );
-  const hasInlineTokens = pendingFileNames.some((name) =>
-    hasAttachmentToken(displayText, name),
-  );
-
-  const handleTokenClick = (name: string, occurrence: number) => {
-    const pendingFile = matchTokenToAttachment(
-      pendingFiles,
-      (candidate) => candidate.file.name,
-      name,
-      occurrence,
-    );
-    if (!pendingFile) return;
-    setPreviewFileId(pendingFile.id);
-  };
-
   const previewFile = previewFileId
     ? pendingFiles.find((pf) => pf.id === previewFileId)
     : undefined;
@@ -1765,7 +1753,8 @@ export function NewSessionForm({
   const reasoningEffortDefaultsMatch =
     selectedProvider === "codex" ||
     selectedProvider === "pi" ||
-    selectedProvider === "kimi"
+    selectedProvider === "kimi" ||
+    selectedProvider === "mcode"
       ? (savedProviderDefaults?.reasoningEffort ?? undefined) ===
         selectedReasoningEffort
       : true;
@@ -1856,27 +1845,19 @@ export function NewSessionForm({
   const inputArea = (
     <>
       <div className="new-session-composer">
-        {hasInlineTokens && (
-          <ComposerTokenHighlight
-            textareaRef={textareaRef}
-            text={displayText}
-            names={pendingFileNames}
-            onTokenClick={handleTokenClick}
-          />
-        )}
-        <textarea
+        <AttachmentComposer
           ref={textareaRef}
           value={displayText}
-          onChange={(e) => {
-            setInterimTranscript("");
-            setMessage(e.target.value);
-          }}
+          attachments={composerAttachments}
+          onPreview={setPreviewFileId}
+          onRemove={handleRemoveFile}
+          onChange={handleChange}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
           placeholder={resolvedPlaceholder}
           disabled={isStarting}
           rows={rows}
-          className={`new-session-form-textarea${hasInlineTokens ? " has-token-mirror" : ""}`}
+          className="new-session-form-textarea"
         />
       </div>
       <div className="new-session-form-toolbar">
@@ -1976,7 +1957,7 @@ export function NewSessionForm({
                       fill="var(--bg-primary, #1a1a2e)"
                       fontSize="8"
                       fontWeight="700"
-                      fontFamily="system-ui, sans-serif"
+                      fontFamily="var(--font-sans)"
                       stroke="none"
                     >
                       A
@@ -1993,6 +1974,7 @@ export function NewSessionForm({
           disabled={
             isStarting ||
             Boolean(startRetryBlockedMessage) ||
+            Boolean(selectedProviderInfo?.unavailableReason) ||
             !hasContent ||
             hasGatewayConfigError
           }
@@ -2066,50 +2048,27 @@ export function NewSessionForm({
         </div>
       )}
       {detachedPendingFiles.length > 0 && (
-        <div className="pending-files-list">
+        <div className="attachment-list">
           {detachedPendingFiles.map((pf) => {
-            const progress = uploadProgress[pf.id];
+            const progress = isStarting ? uploadProgress[pf.id] : undefined;
             return (
-              <div key={pf.id} className="pending-file-chip">
-                {pf.previewUrl && (
-                  <img
-                    src={pf.previewUrl}
-                    alt=""
-                    className="pending-file-preview"
-                  />
-                )}
-                <div className="pending-file-info">
-                  <span className="pending-file-name">{pf.file.name}</span>
-                  <span className="pending-file-size">
-                    {progress
-                      ? `${Math.round((progress.uploaded / progress.total) * 100)}%`
-                      : formatSize(pf.file.size)}
-                  </span>
-                </div>
-                {!isStarting && (
-                  <button
-                    type="button"
-                    className="pending-file-remove"
-                    onClick={() => handleRemoveFile(pf.id)}
-                    aria-label={t("newSessionRemoveFile", {
-                      name: pf.file.name,
-                    })}
-                  >
-                    <svg
-                      width="14"
-                      height="14"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      aria-hidden="true"
-                    >
-                      <line x1="18" y1="6" x2="6" y2="18" />
-                      <line x1="6" y1="6" x2="18" y2="18" />
-                    </svg>
-                  </button>
-                )}
-              </div>
+              <ComposerAttachmentCard
+                key={pf.id}
+                attachment={{
+                  id: pf.id,
+                  name: pf.file.name,
+                  mimeType: pf.file.type,
+                  previewUrl: pf.previewUrl,
+                }}
+                detail={
+                  progress
+                    ? `${Math.round((progress.uploaded / progress.total) * 100)}%`
+                    : formatSize(pf.file.size)
+                }
+                disabled={isStarting}
+                onPreview={setPreviewFileId}
+                onRemove={handleRemoveFile}
+              />
             );
           })}
         </div>
@@ -2132,6 +2091,14 @@ export function NewSessionForm({
         data-provider={selectedProvider ?? undefined}
         style={newSessionThemeStyle}
       >
+        {selectedProviderInfo?.unavailableReason && (
+          <p role="status" className="cursor-account-notice">
+            {selectedProviderInfo.unavailableReason ===
+            "runtime-update-required"
+              ? t("cursorRuntimeUpdateRequired")
+              : t("cursorRuntimeUnavailable")}
+          </p>
+        )}
         {inputArea}
       </div>
     );
@@ -2149,6 +2116,11 @@ export function NewSessionForm({
         <p className="new-session-subtitle">{t("newSessionHeaderSubtitle")}</p>
       </div>
 
+      {!selectedProvider && (providersLoading || settingsLoading) && (
+        <NewSessionSetupSkeleton
+          provider={settings?.newSessionDefaults?.provider}
+        />
+      )}
       {selectedProvider === "codex" && (
         <CodexAccountSelect
           value={selectedCodexAccountId}
@@ -2157,6 +2129,13 @@ export function NewSessionForm({
         />
       )}
       {selectedProvider === "codex" && <CodexUsageCard />}
+      {selectedProvider === "cursor" && (
+        <CursorAccountCard
+          providerInfo={selectedProviderInfo}
+          unavailableReason={selectedProviderInfo?.unavailableReason}
+          onRefresh={refetchProviders}
+        />
+      )}
       {selectedProvider === "pi" && (
         <PiGatewayKeySelect
           value={selectedLlmGatewayKeyId}
@@ -2209,7 +2188,24 @@ export function NewSessionForm({
       )}
 
       {/* Model / Thinking Selection */}
+      {selectedProvider === "cursor" && availableModels.length > 0 && (
+        <CursorModelSelect
+          models={availableModels}
+          value={selectedModel}
+          onChange={setSelectedModel}
+          accentColor={selectedProviderAccent}
+          disabled={isStarting}
+        />
+      )}
+      {selectedProvider === "cursor" &&
+        availableModels.length === 0 &&
+        cursorCatalogLoading && (
+          <p className="new-session-model-section">
+            {t("cursorModelsLoading")}
+          </p>
+        )}
       {selectedProvider &&
+        selectedProvider !== "cursor" &&
         (modelOptions.length > 0 ||
           supportsThinkingToggle ||
           showKimiReasoningSelector) && (

@@ -3,7 +3,7 @@ import {
   SessionDisplaySnapshotSchema,
   applySessionDisplayPatch,
 } from "@yep-anywhere/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   SessionDisplayReducer,
   displayToolId,
@@ -66,6 +66,214 @@ function facts(snapshot: SessionDisplaySnapshot) {
   );
 }
 describe("SessionDisplayReducer", () => {
+  it.each([false, true])(
+    "splits recovered Cursor tools at thinking boundaries (reverse recovery: %s)",
+    (reverse) => {
+      const withTurn = (message: Record<string, unknown>) => ({
+        ...message,
+        codexTurnId: undefined,
+        turnId: "cursor-turn-1",
+        cursorTurnIndex: 1,
+      });
+      const thought = (id: string, callId: string) =>
+        withTurn({
+          uuid: id,
+          type: "assistant",
+          cursorThinkingBefore: { toolId: callId },
+          message: {
+            role: "assistant",
+            content: [{ type: "thinking", thinking: `Inspect ${callId}` }],
+          },
+        });
+      const thoughts = [
+        thought("thought-b", "b"),
+        thought("thought-d", "d"),
+      ] as const;
+      const native = [
+        withTurn(prompt),
+        ...["a", "b", "c", "d", "e"].flatMap((id) => [
+          withTurn(tool(id)),
+          withTurn(result(id)),
+        ]),
+        withTurn(reply("answer", "Done")),
+      ];
+      const model = new SessionDisplayReducer(view, "cursor");
+      model.restore(native as Message[]);
+      expect(groups(model.snapshot()).map((group) => group.count)).toEqual([5]);
+      for (const message of reverse ? [...thoughts].reverse() : thoughts)
+        model.message(message);
+      const snapshot = model.snapshot();
+      expect(SessionDisplaySnapshotSchema.safeParse(snapshot).success).toBe(
+        true,
+      );
+      expect(
+        snapshot.nodes.map((node) =>
+          node.type === "segment" ? node.segment.type : node.type,
+        ),
+      ).toEqual([
+        "question",
+        "tool_group",
+        "thinking",
+        "tool_group",
+        "thinking",
+        "tool_group",
+        "assistant_text",
+      ]);
+      const actualGroups = groups(snapshot);
+      expect(actualGroups.map((group) => group.count)).toEqual([1, 2, 2]);
+      expect(
+        actualGroups.map((group) =>
+          model.groupSteps(group.id)?.map((step) => step.id),
+        ),
+      ).toEqual(
+        [["a"], ["b", "c"], ["d", "e"]].map((ids) =>
+          ids.map((id) => displayToolId("cursor-turn-1", id)),
+        ),
+      );
+      for (const group of actualGroups) {
+        expect(group.displayMode).toBe("summary");
+        expect(
+          model
+            .groupSteps(group.id)
+            ?.every((step) => step.groupId === group.id),
+        ).toBe(true);
+      }
+      // The same boundaries encountered live choose the same group identities.
+      const live = new SessionDisplayReducer(view, "cursor");
+      for (const message of native) {
+        if (message.uuid === "b-turn") live.message(thoughts[0]);
+        if (message.uuid === "d-turn") live.message(thoughts[1]);
+        live.message(message);
+      }
+      expect(groups(live.snapshot()).map((group) => group.id)).toEqual(
+        actualGroups.map((group) => group.id),
+      );
+      // A later chunk updates its row; a late result updates its new group.
+      model.message({
+        ...thoughts[0],
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "Inspect b in more detail" }],
+        },
+      });
+      model.message(
+        withTurn({
+          ...result("c"),
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "c",
+                content: "Failed",
+                is_error: true,
+              },
+            ],
+          },
+        }),
+      );
+      expect(
+        groups(model.snapshot()).map((group) => group.failedCount),
+      ).toEqual([0, 1, 0]);
+      expect(
+        model
+          .snapshot()
+          .nodes.filter(
+            (node) =>
+              node.type === "segment" && node.segment.type === "thinking",
+          ),
+      ).toHaveLength(2);
+      const patch = model.commit(snapshot);
+      expect(patch).not.toBeNull();
+      if (!patch) throw new Error("Expected a display patch");
+      expect(applySessionDisplayPatch(snapshot, patch)).toEqual(
+        model.snapshot(),
+      );
+    },
+  );
+
+  it("allows providers without native turn ids to stream again after a result", () => {
+    const model = new SessionDisplayReducer(view, "claude");
+    const text = (id: string) =>
+      model.message({
+        uuid: id,
+        type: "assistant",
+        _isStreaming: true,
+        _isStreamingPlaceholder: true,
+        message: { role: "assistant", content: id },
+      });
+    text("first");
+    model.message({ type: "result", uuid: "result" });
+    model.message({
+      type: "user",
+      uuid: "next-question",
+      message: { role: "user", content: "Next" },
+    });
+    text("second");
+    const texts = model
+      .snapshot()
+      .nodes.flatMap((n) =>
+        n.type === "segment" && n.segment.type === "assistant_text"
+          ? [n.segment]
+          : [],
+      );
+    expect(texts).toMatchObject([
+      { content: "first", streaming: false },
+      { content: "second", streaming: true },
+    ]);
+  });
+
+  it.each(["followup_task", "send_message"])(
+    "retains %s identity through compact live messages and a cold restore",
+    (operation) => {
+      const call = {
+        ...tool("call-1"),
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call-1",
+              name: `collaboration.${operation}`,
+              input: { target: "review", message: "Check this" },
+            },
+          ],
+        },
+      };
+      const activity = {
+        uuid: "activity",
+        type: "system",
+        subtype: "codex_native_item",
+        codexTurnId: "turn",
+        codexThreadItem: {
+          type: "subAgentActivity",
+          id: "call-1",
+          kind: "interacted",
+          agentThreadId: "child",
+          agentPath: "/root/review",
+        },
+      };
+      const live = new SessionDisplayReducer(view, "codex");
+      for (const message of [prompt, call, activity])
+        live.message(compactDisplayMessage(message));
+      const cold = new SessionDisplayReducer(view, "codex");
+      cold.restore([prompt, call, activity] as Message[]);
+      for (const model of [live, cold]) {
+        const notice = model
+          .snapshot()
+          .nodes.find(
+            (node) => node.type === "segment" && node.segment.type === "notice",
+          );
+        expect(notice).toMatchObject({
+          segment: {
+            kind: "subagent",
+            subagent: { operation, kind: "interacted" },
+          },
+        });
+      }
+    },
+  );
+
   it.each(["completed", "failed", "interrupted"])(
     "projects compaction progress and clears it on %s",
     (outcome) => {
@@ -206,8 +414,8 @@ describe("SessionDisplayReducer", () => {
     ).toMatchObject([{ name: "Edit", status: "failed" }]);
   });
 
-  it("retires a stranded tool call once a later batch settles, on any provider", () => {
-    // Generic safety net for the case no provider can close on its own: a
+  it("retires a stranded tool call once a later sequential batch settles", () => {
+    // Safety net for a sequential provider that cannot close on its own: a
     // stream that dies mid tool call leaves a step nothing will ever answer.
     const call = (uuid: string, ids: string[]) => ({
       uuid,
@@ -259,6 +467,42 @@ describe("SessionDisplayReducer", () => {
       ["next", "completed"],
     ]);
   });
+
+  it.each(["codex", "codex-oss"])(
+    "keeps %s background commands running across later completed batches and history reads",
+    (provider) => {
+      const events = [prompt, tool("slow"), tool("fast"), result("fast")];
+      for (const replay of [false, true]) {
+        const model = new SessionDisplayReducer(view, provider);
+        if (replay) model.restore(events as Message[]);
+        else for (const event of events) model.message(event);
+        expect(model.snapshot().activity.runningCount).toBe(1);
+        expect(
+          model.tools.get(displayToolId("turn", "slow"))?.step,
+        ).toMatchObject({ name: "Bash", status: "running" });
+        model.message(result("slow"));
+        expect(model.snapshot().activity.runningCount).toBe(0);
+        expect(
+          model.tools.get(displayToolId("turn", "slow"))?.step.status,
+        ).toBe("completed");
+      }
+    },
+  );
+
+  it.each(["completed", "failed", "interrupted"])(
+    "settles an unfinished Codex background command when its turn is %s",
+    (turnStatus) => {
+      const model = new SessionDisplayReducer(view, "codex");
+      for (const event of [prompt, tool("slow"), tool("fast"), result("fast")])
+        model.message(event);
+      expect(model.snapshot().activity.runningCount).toBe(1);
+      model.message({ ...terminal, turnStatus });
+      expect(model.snapshot().activity.runningCount).toBe(0);
+      expect(model.tools.get(displayToolId("turn", "slow"))?.step.status).toBe(
+        turnStatus === "interrupted" ? "interrupted" : "unknown",
+      );
+    },
+  );
 
   it("leaves a parallel batch alone while only part of it has answered", () => {
     // Calls issued together may answer in any order, so a settled sibling says
@@ -436,34 +680,43 @@ describe("SessionDisplayReducer", () => {
     expect(required(groups(model.snapshot())[0]).count).toBe(1);
   });
   it("reconstructs the same facts at every entry point and deduplicates replay", () => {
-    const events = [
-      prompt,
-      tool("a"),
-      result("a"),
-      reply("p1", "Continue"),
-      tool("b"),
-      reply("p2", "Almost done"),
-      result("b"),
-      tool("c"),
-      result("c"),
-      reply("final", "Done", "final_answer"),
-      terminal,
-    ];
-    const uninterrupted = new SessionDisplayReducer(view, "codex");
-    uninterrupted.setRuntime("running");
-    for (const event of events) uninterrupted.message(event);
-    for (let cut = 0; cut <= events.length; cut++) {
-      const reopened = new SessionDisplayReducer(view, "codex");
-      reopened.setRuntime("running");
-      reopened.restore(events.slice(0, cut) as Message[]);
-      for (const event of events.slice(cut)) reopened.message(event);
-      expect(facts(reopened.snapshot()), `entry at ${cut}`).toEqual(
-        facts(uninterrupted.snapshot()),
-      );
-      const beforeReplay = reopened.snapshot();
-      for (const event of events)
-        reopened.message({ ...event, isReplay: true });
-      expect(facts(reopened.snapshot())).toEqual(facts(beforeReplay));
+    // Live steps without a source timestamp take their start from the wall
+    // clock. A millisecond boundary otherwise gives one entry point a duration
+    // the uninterrupted snapshot does not have.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    try {
+      const events = [
+        prompt,
+        tool("a"),
+        result("a"),
+        reply("p1", "Continue"),
+        tool("b"),
+        reply("p2", "Almost done"),
+        result("b"),
+        tool("c"),
+        result("c"),
+        reply("final", "Done", "final_answer"),
+        terminal,
+      ];
+      const uninterrupted = new SessionDisplayReducer(view, "codex");
+      uninterrupted.setRuntime("running");
+      for (const event of events) uninterrupted.message(event);
+      for (let cut = 0; cut <= events.length; cut++) {
+        const reopened = new SessionDisplayReducer(view, "codex");
+        reopened.setRuntime("running");
+        reopened.restore(events.slice(0, cut) as Message[]);
+        for (const event of events.slice(cut)) reopened.message(event);
+        expect(facts(reopened.snapshot()), `entry at ${cut}`).toEqual(
+          facts(uninterrupted.snapshot()),
+        );
+        const beforeReplay = reopened.snapshot();
+        for (const event of events)
+          reopened.message({ ...event, isReplay: true });
+        expect(facts(reopened.snapshot())).toEqual(facts(beforeReplay));
+      }
+    } finally {
+      vi.useRealTimers();
     }
   });
   it("uses the same native text identity for delta, committed text and a cold snapshot", () => {
@@ -541,6 +794,124 @@ describe("SessionDisplayReducer", () => {
       displayToolId("turn", "a"),
     );
   });
+  it("reports cumulative timing for parallel calls even after the group is collapsed", () => {
+    const model = new SessionDisplayReducer(view, "codex");
+    model.message(prompt, true);
+    for (const id of ["a", "b"])
+      model.message({ ...tool(id), timestamp: "2026-01-01T00:00:00Z" }, true);
+    model.message({ ...result("a"), timestamp: "2026-01-01T00:00:10Z" }, true);
+    model.message({ ...result("b"), timestamp: "2026-01-01T00:00:20Z" }, true);
+    model.message(reply("done", "Done", "final_answer"), true);
+    expect(groups(model.snapshot())[0]).toMatchObject({
+      count: 2,
+      durationMs: 30_000,
+      timedCount: 2,
+      displayMode: "summary",
+    });
+    expect(groups(model.snapshot())[0]).not.toHaveProperty("steps");
+  });
+
+  it("aggregates native durations beyond the visible step limit and reports partial coverage", () => {
+    const model = new SessionDisplayReducer(view, "codex");
+    model.message(prompt, true);
+    for (let i = 0; i < 55; i++) {
+      const id = `timed-${i}`;
+      model.message(tool(id), true);
+      const r = result(id);
+      model.message(
+        compactDisplayMessage({
+          ...r,
+          message: {
+            ...r.message,
+            content: [
+              {
+                ...required(r.message.content[0]),
+                durationMs: i === 0 ? 0 : 100,
+              },
+            ],
+          },
+        }),
+        true,
+      );
+    }
+    model.message(tool("no-timing"), true);
+    model.message(result("no-timing"), true);
+    expect(groups(model.snapshot())[0]).toMatchObject({
+      count: 56,
+      durationMs: 5400,
+      timedCount: 55,
+    });
+    expect(groups(model.snapshot())[0]?.steps).toHaveLength(50);
+    model.message(reply("done", "Done", "final_answer"), true);
+    expect(groups(model.snapshot())[0]).toMatchObject({
+      durationMs: 5400,
+      timedCount: 55,
+      displayMode: "summary",
+    });
+  });
+
+  it("retains each call's own completion time across replay and duplicate results", () => {
+    const events = [
+      prompt,
+      { ...tool("slow"), timestamp: "2026-01-02T10:00:00Z" },
+      { ...tool("fast"), timestamp: "2026-01-02T10:00:01Z" },
+      { ...result("fast"), timestamp: "2026-01-02T10:00:03Z" },
+      { ...result("slow"), timestamp: "2026-01-02T10:00:12Z" },
+    ];
+    for (const replay of [false, true]) {
+      const model = new SessionDisplayReducer(view, "codex");
+      for (const event of events)
+        model.message(compactDisplayMessage(event), replay);
+      const groupId = required(groups(model.snapshot())[0]).id;
+      expect(
+        model.groupSteps(groupId)?.map((s) => [s.timestamp, s.completedAt]),
+      ).toEqual([
+        ["2026-01-02T10:00:00Z", "2026-01-02T10:00:12Z"],
+        ["2026-01-02T10:00:01Z", "2026-01-02T10:00:03Z"],
+      ]);
+      model.message({
+        ...result("slow"),
+        timestamp: "2026-01-02T10:01:00Z",
+        isReplay: true,
+      });
+      expect(model.groupSteps(groupId)?.[0]?.completedAt).toBe(
+        "2026-01-02T10:00:12Z",
+      );
+      expect(
+        SessionDisplaySnapshotSchema.safeParse(model.snapshot()).success,
+      ).toBe(true);
+    }
+  });
+
+  it("keeps failure timing and does not invent timing for orphan or untimed historical results", () => {
+    const model = new SessionDisplayReducer(view, "claude");
+    model.message(prompt, true);
+    model.message(
+      { ...tool("failed"), timestamp: "2026-01-02T10:00:00Z" },
+      true,
+    );
+    const failed = result("failed");
+    failed.message.content[0] = {
+      ...required(failed.message.content[0]),
+      is_error: true,
+    } as (typeof failed.message.content)[0];
+    model.message({ ...failed, timestamp: "2026-01-02T10:00:03Z" }, true);
+    model.message(
+      { ...result("orphan"), timestamp: "2026-01-02T10:00:05Z" },
+      true,
+    );
+    model.message(tool("untimed"), true);
+    model.message(result("untimed"), true);
+    const steps = [...model.tools.values()].map((t) => t.step);
+    expect(steps[0]).toMatchObject({
+      status: "failed",
+      completedAt: "2026-01-02T10:00:03Z",
+    });
+    expect(steps[1]?.timestamp).toBeUndefined();
+    expect(steps[1]?.completedAt).toBeUndefined();
+    expect(steps[2]?.completedAt).toBeUndefined();
+  });
+
   it("stamps a start time on live steps and never invents one on replay", () => {
     const live = new SessionDisplayReducer(view, "codex");
     live.message(prompt);

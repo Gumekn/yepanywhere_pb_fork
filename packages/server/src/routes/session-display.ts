@@ -33,6 +33,12 @@ import type {
   SessionDisplayService,
   SessionDisplaySource,
 } from "../display/SessionDisplayService.js";
+import {
+  SESSION_DISPLAY_TIMING_NAMES,
+  type SessionDisplayCacheState,
+  type SessionDisplayTimingSink,
+  timed,
+} from "../display/display-timing.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import { getSessionFileOperationStore } from "../session-files/codex-operations.js";
 import {
@@ -88,6 +94,7 @@ import type {
   Session,
   SessionSummary,
 } from "../supervisor/types.js";
+import { ServerTimingRecorder } from "./server-timing.js";
 
 const DISPLAY_READER_MESSAGE_PAGE = 200;
 const DISPLAY_ACTIVE_READER_MESSAGE_PAGE = 1_000;
@@ -178,17 +185,35 @@ export function registerSessionDisplayRoutes(
     routes.get(
       "/projects/:projectId/sessions/:sessionId/display/view",
       async (c) => {
+        const startedAt = performance.now();
+        const timing = new ServerTimingRecorder(SESSION_DISPLAY_TIMING_NAMES);
+        let cacheState: SessionDisplayCacheState | undefined;
+        const observer = {
+          timing,
+          onCacheState: (state: SessionDisplayCacheState) => {
+            cacheState = state;
+          },
+        };
+        const applyTiming = () => {
+          timing.set("total", performance.now() - startedAt);
+          c.header(
+            "Server-Timing",
+            `${timing.headerValue()}${cacheState ? `, displayCache;desc=${cacheState}` : ""}`,
+          );
+        };
         try {
           const cursor = c.req.query("cursor");
-          return c.json(
-            cursor
-              ? await service.older(selection(c), cursor)
-              : await service.snapshot(
-                  selection(c),
-                  c.req.query("reset") === "true",
-                ),
-          );
+          const body = cursor
+            ? await service.older(selection(c), cursor, observer)
+            : await service.snapshot(
+                selection(c),
+                c.req.query("reset") === "true",
+                observer,
+              );
+          applyTiming();
+          return c.json(body);
         } catch (error) {
+          applyTiming();
           return displayErrorResponse(c, error);
         }
       },
@@ -730,31 +755,46 @@ export function createSessionDisplaySource(
   deps: SessionDisplayRoutesDeps,
 ): SessionDisplaySource {
   const resolvedCache = new Map<string, ResolvedDisplaySession>();
-  const resolve = async (selection: DisplaySelection) => {
+  const resolve = (
+    selection: DisplaySelection,
+    timing?: SessionDisplayTimingSink,
+  ) => timed(timing, "resolve", () => resolveUntimed(selection, timing));
+  const resolveUntimed = async (
+    selection: DisplaySelection,
+    timing?: SessionDisplayTimingSink,
+  ) => {
     const key = JSON.stringify([selection.projectId, selection.sessionId]);
-    let resolved = resolvedCache.get(key);
-    if (!resolved) {
-      resolved = await resolveDisplaySession(
+    const cached = resolvedCache.get(key);
+    if (!cached) {
+      // A fresh resolution already carries current runtime state.
+      const resolved = await resolveDisplaySession(
         deps,
         selection.projectId,
         selection.sessionId,
         true,
         true,
+        timing,
       );
       if (resolvedCache.size >= 32) {
         const first = resolvedCache.keys().next().value;
         if (first) resolvedCache.delete(first);
       }
       resolvedCache.set(key, resolved);
+      return resolved;
     }
-    return {
-      ...resolved,
-      runtime:
-        (await deps.getRuntimeState?.(resolved.sessionId)) ?? resolved.runtime,
-    };
+    const runtime = await timed(timing, "runtimeState", async () =>
+      deps.getRuntimeState?.(cached.sessionId),
+    );
+    return { ...cached, runtime: runtime ?? cached.runtime };
   };
-  const stamp = async (selection: DisplaySelection) => {
-    const resolved = await resolve(selection);
+  const stamp = async (
+    selection: DisplaySelection,
+    timing?: SessionDisplayTimingSink,
+  ) => {
+    const resolved = await resolve(selection, timing);
+    return timed(timing, "stamp", () => stampResolved(resolved));
+  };
+  const stampResolved = async (resolved: ResolvedDisplaySession) => {
     let stats = await resolved.source.reader.getSessionFileStats?.(
       resolved.sessionId,
     );
@@ -813,145 +853,152 @@ export function createSessionDisplaySource(
   };
   return {
     stamp,
-    read: async (selection, opaqueCursor) => {
-      const resolved = await resolve(selection);
-      const sourceStamp = await stamp(selection);
-      const cursor = decode(opaqueCursor);
-      const codex =
-        resolved.source.provider === "codex" ||
-        resolved.source.provider === "codex-oss";
-      if (
-        codex &&
-        deps.codexAppServerHistoryReader &&
-        (!cursor || cursor.source === "native")
-      ) {
-        const native =
-          await deps.codexAppServerHistoryReader.getSemanticTurnsPage(
-            resolved.sessionId,
-            resolved.project.id,
-            resolved.project.path,
-            {
-              limit: SESSION_DISPLAY_INITIAL_TURN_LIMIT,
-              itemsView: "full",
-              cursor: cursor?.cursor,
-              toolsMayBeActive: !cursor && resolved.runtime.toolsMayBeActive,
-            },
-          );
-        if (native.kind === "loaded") {
-          const turnStatuses = { ...native.turnStatuses };
-          const turnStarts = native.messages.flatMap((message) => {
-            if (message.type !== "user" || !message.timestamp) return [];
-            const timestamp = Date.parse(message.timestamp);
-            return Number.isFinite(timestamp) ? [timestamp] : [];
-          });
-          if (native.inferredLatestTurnId)
-            delete turnStatuses[native.inferredLatestTurnId];
-          const branch = await deps.getBranchState?.(
-            resolved.project,
-            resolved.sessionId,
-            native.summary,
-            selection.branchId,
-          );
-          return {
-            provider: native.provider,
-            messages: branch
-              ? annotateBranchMessages(native.messages, branch, {
-                  includeCodexAlias: true,
-                })
-              : native.messages,
-            turnStatuses,
-            ...(!cursor && native.turnStatuses && turnStarts.length > 0
-              ? {
-                  codexTurnWindow: {
-                    turnIds: Object.keys(native.turnStatuses),
-                    from: Math.min(...turnStarts),
-                    before: Math.max(...turnStarts),
-                  },
-                }
-              : {}),
-            activity: activity(
-              resolved,
-              native.inferredLatestTurnId
-                ? undefined
-                : native.summary.lastTurnStatus,
-            ),
-            stamp: sourceStamp,
-            ...(native.nextCursor
-              ? { cursor: encode("native", native.nextCursor) }
-              : {}),
-          };
+    read: async (selection, opaqueCursor, timing) => {
+      // One resolution per read: the stamp derives from the same runtime state.
+      const resolved = await resolve(selection, timing);
+      const sourceStamp = await timed(timing, "stamp", () =>
+        stampResolved(resolved),
+      );
+      return timed(timing, "read", async () => {
+        const cursor = decode(opaqueCursor);
+        const codex =
+          resolved.source.provider === "codex" ||
+          resolved.source.provider === "codex-oss";
+        if (
+          codex &&
+          deps.codexAppServerHistoryReader &&
+          (!cursor || cursor.source === "native")
+        ) {
+          const native =
+            await deps.codexAppServerHistoryReader.getSemanticTurnsPage(
+              resolved.sessionId,
+              resolved.project.id,
+              resolved.project.path,
+              {
+                limit: SESSION_DISPLAY_INITIAL_TURN_LIMIT,
+                itemsView: "full",
+                cursor: cursor?.cursor,
+                toolsMayBeActive: !cursor && resolved.runtime.toolsMayBeActive,
+              },
+            );
+          if (native.kind === "loaded") {
+            const turnStatuses = { ...native.turnStatuses };
+            const turnStarts = native.messages.flatMap((message) => {
+              if (message.type !== "user" || !message.timestamp) return [];
+              const timestamp = Date.parse(message.timestamp);
+              return Number.isFinite(timestamp) ? [timestamp] : [];
+            });
+            if (native.inferredLatestTurnId)
+              delete turnStatuses[native.inferredLatestTurnId];
+            const branch = await deps.getBranchState?.(
+              resolved.project,
+              resolved.sessionId,
+              native.summary,
+              selection.branchId,
+            );
+            return {
+              provider: native.provider,
+              messages: branch
+                ? annotateBranchMessages(native.messages, branch, {
+                    includeCodexAlias: true,
+                  })
+                : native.messages,
+              turnStatuses,
+              ...(!cursor && native.turnStatuses && turnStarts.length > 0
+                ? {
+                    codexTurnWindow: {
+                      turnIds: Object.keys(native.turnStatuses),
+                      from: Math.min(...turnStarts),
+                      before: Math.max(...turnStarts),
+                    },
+                  }
+                : {}),
+              activity: activity(
+                resolved,
+                native.inferredLatestTurnId
+                  ? undefined
+                  : native.summary.lastTurnStatus,
+              ),
+              stamp: sourceStamp,
+              ...(native.nextCursor
+                ? { cursor: encode("native", native.nextCursor) }
+                : {}),
+            };
+          }
         }
-      }
-      const loaded = await resolved.source.reader.getSession(
-        resolved.sessionId,
-        resolved.project.id,
-        undefined,
-        {
-          branchId: selection.branchId,
-          maxMessages: 5_000,
-          beforeMessageId:
-            cursor?.source === "reader" ? cursor.cursor : undefined,
-          includeOrphans: false,
+        const loaded = await resolved.source.reader.getSession(
+          resolved.sessionId,
+          resolved.project.id,
+          undefined,
+          {
+            branchId: selection.branchId,
+            maxMessages: 5_000,
+            beforeMessageId:
+              cursor?.source === "reader" ? cursor.cursor : undefined,
+            includeOrphans: false,
+            deferMedia: true,
+            deferThinking: true,
+          },
+        );
+        if (!loaded && resolved.runtime.toolsMayBeActive && !cursor)
+          return {
+            provider: resolved.source.provider,
+            messages: [],
+            activity: activity(resolved),
+            stamp: sourceStamp,
+          };
+        if (!loaded) throw sessionNotFoundError();
+        const session = normalizeSession(loaded, {
           deferMedia: true,
           deferThinking: true,
-        },
-      );
-      if (!loaded && resolved.runtime.toolsMayBeActive && !cursor)
+        });
+        // Some provider readers return their entire native tree. Apply semantic
+        // paging here too, with an append-stable question anchor rather than a
+        // whole-file revision or an arbitrary tool-message cutoff.
+        let end = session.messages.length;
+        if (cursor?.source === "reader" && !loaded.paginationApplied) {
+          const found = session.messages.findIndex(
+            (message) => (message.uuid ?? message.id) === cursor.cursor,
+          );
+          if (found < 0) throw staleDisplayError();
+          end = found;
+        }
+        const prompts = session.messages
+          .slice(0, end)
+          .flatMap((message, index) =>
+            isUserPromptMessage(message) ? [index] : [],
+          );
+        const start =
+          prompts.length > SESSION_DISPLAY_INITIAL_TURN_LIMIT
+            ? (prompts[prompts.length - SESSION_DISPLAY_INITIAL_TURN_LIMIT] ??
+              0)
+            : 0;
+        const selectedMessages = session.messages.slice(start, end);
+        const firstQuestion = selectedMessages.find(isUserPromptMessage);
+        const next =
+          start > 0
+            ? (firstQuestion?.uuid ?? firstQuestion?.id)
+            : loaded.pagination?.hasOlderMessages
+              ? loaded.pagination.truncatedBeforeMessageId
+              : undefined;
+        const statuses = loaded.summary.lastTurnStatus;
         return {
           provider: resolved.source.provider,
-          messages: [],
-          activity: activity(resolved),
+          messages: selectedMessages,
+          contextUsage: session.contextUsage,
+          ...(!resolved.runtime.toolsMayBeActive &&
+          (statuses === "completed" ||
+            statuses === "failed" ||
+            statuses === "interrupted")
+            ? { turnStatuses: { session: statuses } }
+            : {}),
+          activity: activity(resolved, statuses),
           stamp: sourceStamp,
+          ...(typeof next === "string" && next
+            ? { cursor: encode("reader", next) }
+            : {}),
         };
-      if (!loaded) throw sessionNotFoundError();
-      const session = normalizeSession(loaded, {
-        deferMedia: true,
-        deferThinking: true,
       });
-      // Some provider readers return their entire native tree. Apply semantic
-      // paging here too, with an append-stable question anchor rather than a
-      // whole-file revision or an arbitrary tool-message cutoff.
-      let end = session.messages.length;
-      if (cursor?.source === "reader" && !loaded.paginationApplied) {
-        const found = session.messages.findIndex(
-          (message) => (message.uuid ?? message.id) === cursor.cursor,
-        );
-        if (found < 0) throw staleDisplayError();
-        end = found;
-      }
-      const prompts = session.messages
-        .slice(0, end)
-        .flatMap((message, index) =>
-          isUserPromptMessage(message) ? [index] : [],
-        );
-      const start =
-        prompts.length > SESSION_DISPLAY_INITIAL_TURN_LIMIT
-          ? (prompts[prompts.length - SESSION_DISPLAY_INITIAL_TURN_LIMIT] ?? 0)
-          : 0;
-      const selectedMessages = session.messages.slice(start, end);
-      const firstQuestion = selectedMessages.find(isUserPromptMessage);
-      const next =
-        start > 0
-          ? (firstQuestion?.uuid ?? firstQuestion?.id)
-          : loaded.pagination?.hasOlderMessages
-            ? loaded.pagination.truncatedBeforeMessageId
-            : undefined;
-      const statuses = loaded.summary.lastTurnStatus;
-      return {
-        provider: resolved.source.provider,
-        messages: selectedMessages,
-        ...(!resolved.runtime.toolsMayBeActive &&
-        (statuses === "completed" ||
-          statuses === "failed" ||
-          statuses === "interrupted")
-          ? { turnStatuses: { session: statuses } }
-          : {}),
-        activity: activity(resolved, statuses),
-        stamp: sourceStamp,
-        ...(typeof next === "string" && next
-          ? { cursor: encode("reader", next) }
-          : {}),
-      };
     },
     reasoning: async (selection, id) => {
       const resolved = await resolve(selection);
@@ -1000,7 +1047,22 @@ export function createSessionDisplaySource(
           resolved.project.path,
           runId,
         );
-        if (native.kind === "loaded") messages = native.messages;
+        if (native.kind === "loaded") {
+          // Raw code-mode calls can appear in the rollout projection without
+          // a matching native item. A successful native read is not enough:
+          // the explicitly requested tool must actually be present.
+          const selected = rawId
+            ? selectSessionDisplayToolMessages(native.messages, [rawId])
+            : native.messages;
+          const hasInvocation = selected.some((message) => {
+            const content = message.message?.content ?? message.content;
+            return (
+              Array.isArray(content) &&
+              content.some((block) => block.type === "tool_use")
+            );
+          });
+          if (!rawId || hasInvocation) messages = selected;
+        }
       }
       if (!messages) {
         const loaded = await resolved.source.reader.getSession(
@@ -1034,6 +1096,7 @@ async function resolveDisplaySession(
   requestedSessionId: string,
   includeRuntime = true,
   allowUnpersisted = false,
+  timing?: SessionDisplayTimingSink,
 ): Promise<ResolvedDisplaySession> {
   if (!isUrlProjectId(projectId)) {
     throw new SessionDisplayRouteError(
@@ -1042,7 +1105,13 @@ async function resolveDisplaySession(
       "Invalid project ID format",
     );
   }
-  const project = await deps.scanner.getOrCreateProject(projectId);
+  // A known project may come from the previous scanner snapshot; if its
+  // provider flags are too old to locate the session, retry fresh below.
+  let project = await timed(timing, "project", () =>
+    deps.scanner.getOrCreateProject(projectId, undefined, {
+      allowStale: true,
+    }),
+  );
   if (!project) {
     throw new SessionDisplayRouteError(
       404,
@@ -1053,19 +1122,34 @@ async function resolveDisplaySession(
   const sessionId =
     deps.getCanonicalSessionId?.(requestedSessionId) ?? requestedSessionId;
   const runtime = includeRuntime
-    ? ((await deps.getRuntimeState?.(sessionId)) ?? {
+    ? ((await timed(timing, "runtimeState", async () =>
+        deps.getRuntimeState?.(sessionId),
+      )) ?? {
         toolsMayBeActive: false,
       })
     : { toolsMayBeActive: false };
   const preferredProvider =
     runtime.provider ?? deps.getPersistedProvider?.(sessionId);
-  let resolved = await findSessionSummaryAcrossProviders(
-    project,
-    sessionId,
-    project.id,
-    deps.providerResolution,
-    preferredProvider,
-  );
+  const findSummary = (target: Project) =>
+    timed(timing, "summary", () =>
+      findSessionSummaryAcrossProviders(
+        target,
+        sessionId,
+        target.id,
+        deps.providerResolution,
+        preferredProvider,
+      ),
+    );
+  let resolved = await findSummary(project);
+  if (!resolved) {
+    const fresh = await timed(timing, "project", () =>
+      deps.scanner.getOrCreateProject(projectId),
+    );
+    if (fresh) {
+      project = fresh;
+      resolved = await findSummary(fresh);
+    }
+  }
   if (
     !resolved &&
     allowUnpersisted &&

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { encodeProjectId } from "../../src/projects/paths.js";
 import { createProvidersRoutes } from "../../src/routes/providers.js";
+import type { RuntimeController } from "../../src/runtime/types.js";
 import { getAllProviders, getProvider } from "../../src/sdk/providers/index.js";
 import type { AgentProvider } from "../../src/sdk/providers/types.js";
 import { ZCodeProtocolError } from "../../src/sdk/providers/zcode-protocol/types.js";
@@ -14,6 +15,103 @@ function deferred() {
 }
 
 describe("provider routes", () => {
+  it("serves Cursor account usage and flags a runtime that predates Cursor", async () => {
+    const getCursorAccount = vi.fn(async () => ({
+      installed: true,
+      authenticated: true,
+      user: { email: "cursor@example.com" },
+      usage: null,
+    }));
+    const provider = {
+      name: "cursor",
+      displayName: "Cursor",
+      getAuthStatus: async () => ({
+        installed: true,
+        authenticated: true,
+        enabled: true,
+        user: { email: "cursor@example.com" },
+      }),
+      getAvailableModels: async () => [],
+    } as unknown as AgentProvider;
+    const app = createProvidersRoutes({
+      providers: [provider],
+      getCursorAccount,
+      runtimeController: {
+        mode: "external",
+        getStatus: async () => ({ protocolVersion: 6 }),
+      } as unknown as RuntimeController,
+    });
+    const info = await (await app.request("/cursor")).json();
+    expect(info.provider).toMatchObject({
+      authenticated: true,
+      user: { email: "cursor@example.com" },
+      unavailableReason: "runtime-update-required",
+    });
+    const account = await app.request("/cursor/account?fresh=1");
+    expect(account.status).toBe(200);
+    expect(getCursorAccount).toHaveBeenCalledWith({ fresh: true });
+    const prepareCursorSession = vi.fn(async () => undefined);
+    const discardCursorPrepare = vi.fn(async () => undefined);
+    const warmCursorAuth = vi.fn(async () => undefined);
+    const projectId = encodeProjectId("/tmp/cursor-prepare");
+    const forwarded = createProvidersRoutes({
+      runtimeController: {
+        mode: "external",
+        prepareCursorSession,
+        discardCursorPrepare,
+        warmCursorAuth,
+      } as unknown as RuntimeController,
+    });
+    expect(
+      (
+        await forwarded.request("/cursor/prepare", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            projectId,
+            model: "auto",
+            permissionMode: "plan",
+          }),
+        })
+      ).status,
+    ).toBe(200);
+    expect(prepareCursorSession).toHaveBeenCalledWith({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+      permissionMode: "plan",
+    });
+    expect(
+      (
+        await forwarded.request("/cursor/prepare/discard", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ projectId, model: "auto" }),
+        })
+      ).status,
+    ).toBe(200);
+    expect(discardCursorPrepare).toHaveBeenCalledWith({
+      cwd: "/tmp/cursor-prepare",
+      model: "auto",
+    });
+    expect(
+      (
+        await forwarded.request("/cursor/warm", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "auto" }),
+        })
+      ).status,
+    ).toBe(200);
+    await vi.waitFor(() => expect(warmCursorAuth).toHaveBeenCalledWith("auto"));
+    expect(
+      (
+        await createProvidersRoutes({
+          enabledProviders: ["pi"],
+          getCursorAccount,
+        }).request("/cursor/account")
+      ).status,
+    ).toBe(404);
+  });
   it("retires Claude SSH from discovery while preserving history lookup", () => {
     expect(getAllProviders().map((provider) => provider.name)).not.toContain(
       "claude",

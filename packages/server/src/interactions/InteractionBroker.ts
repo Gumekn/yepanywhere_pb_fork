@@ -1636,7 +1636,29 @@ function allowedDecisions(request: InputRequest): NativeDecisionDescriptor[] {
       { id: "decline", scope: "once", tone: "danger" },
     ];
   }
-  const available = asRecord(request.toolInput)?.availableDecisions;
+  const toolInput = asRecord(request.toolInput);
+  if (
+    toolInput?.approvalKind === "acp_tool_call" &&
+    Array.isArray(toolInput.acpPermissionOptions)
+  ) {
+    return toolInput.acpPermissionOptions
+      .flatMap((option): NativeDecisionDescriptor[] => {
+        const value = asRecord(option);
+        const id = truncate(readString(value?.optionId), 512);
+        const kind = readString(value?.kind);
+        return id && kind
+          ? [
+              {
+                id,
+                scope: kind.endsWith("_always") ? "persistent" : "once",
+                tone: kind.startsWith("reject") ? "danger" : "primary",
+              },
+            ]
+          : [];
+      })
+      .slice(0, 50);
+  }
+  const available = toolInput?.availableDecisions;
   const ids = Array.isArray(available)
     ? available.flatMap((value) => {
         const id = truncate(readString(value), 512);

@@ -2,7 +2,6 @@ import type { HttpBindings } from "@hono/node-server";
 import type { Context, Hono } from "hono";
 import type { WSEvents } from "hono/ws";
 import type { WebSocket as RawWebSocket } from "ws";
-import type { DeviceBridgeService } from "../device/DeviceBridgeService.js";
 import type { SessionDisplayService } from "../display/SessionDisplayService.js";
 import { isAllowedOrigin } from "../middleware/allowed-hosts.js";
 import type { RuntimeController } from "../runtime/types.js";
@@ -19,7 +18,6 @@ import {
   type WsHandlerDeps,
   type WsUploadState,
   cleanupConnectionState,
-  cleanupDeviceSessions,
   cleanupSubscriptions,
   cleanupTerminalAttachments,
   cleanupUploads,
@@ -55,8 +53,6 @@ export interface WsRoutesDeps {
   browserProfileService?: BrowserProfileService;
   /** Focused session watch manager for per-session targeted file watching (optional) */
   focusedSessionWatchManager?: FocusedSessionWatchManager;
-  /** Emulator bridge service for Android emulator streaming (optional) */
-  deviceBridgeService?: DeviceBridgeService;
   /** Terminal service for remote shell sessions (optional) */
   terminalService?: TerminalService;
 }
@@ -85,7 +81,6 @@ export function createWsRoutes(
     connectedBrowsers,
     browserProfileService,
     focusedSessionWatchManager,
-    deviceBridgeService,
     terminalService,
   } = deps;
 
@@ -101,7 +96,6 @@ export function createWsRoutes(
     connectedBrowsers,
     browserProfileService,
     focusedSessionWatchManager,
-    deviceBridgeService,
     terminalService,
   };
 
@@ -123,8 +117,6 @@ export function createWsRoutes(
     const subscriptions = new Map<string, () => void>();
     // Track active uploads for this connection
     const uploads = new Map<string, WsUploadState>();
-    // Track active emulator streaming sessions for this connection
-    const deviceSessions = new Set<string>();
     // Per-connection identifier for terminal attachments (used to detach all
     // terminals on disconnect; server-owned PTY keeps running for reattach).
     const terminalAttachId = `attach-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -197,7 +189,6 @@ export function createWsRoutes(
             evt.data,
             handlerDeps,
             {},
-            deviceSessions,
             terminalAttachId,
           ).catch((err) => {
             console.error("[WS] Unexpected error:", err);
@@ -213,9 +204,6 @@ export function createWsRoutes(
         cleanupUploads(uploads, uploadManager).catch((err) => {
           console.error("[WS] Error cleaning up uploads:", err);
         });
-
-        // Clean up emulator streaming sessions
-        cleanupDeviceSessions(deviceSessions, deviceBridgeService);
 
         // Detach (but don't kill) any terminals attached over this connection
         cleanupTerminalAttachments(terminalAttachId, terminalService);

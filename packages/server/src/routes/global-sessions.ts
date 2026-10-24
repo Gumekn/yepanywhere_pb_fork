@@ -31,14 +31,17 @@ import type { SessionIndexService } from "../indexes/index.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
+import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RuntimeController } from "../runtime/types.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { listSessionsAcrossProviders } from "../sessions/provider-resolution.js";
 import {
@@ -101,6 +104,9 @@ export interface GlobalSessionsDeps {
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   /** Kimi scanner for checking if a project has Kimi sessions */
   kimiScanner?: KimiSessionScanner;
+  cursorScanner?: CursorSessionScanner;
+  mcodeScanner?: McodeSessionScanner;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   /** Kimi sessions directory */
   kimiSessionsDir?: string;
   /** Optional shared Kimi reader factory for cross-provider session lookups */
@@ -126,6 +132,8 @@ function isLiveAnyBridgeSessionView(
 }
 
 export interface GlobalSessionItem {
+  forkParentSessionId?: string;
+  forkFamilySessionIds?: string[];
   // From cache (cheap)
   id: string;
   title: string | null;
@@ -398,6 +406,7 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
   const listSessionsForProject = async (
     project: Project,
     providerCatalog: Awaited<ReturnType<typeof buildProviderProjectCatalog>>,
+    bridgeSessions: SessionSummary[] = [],
   ): Promise<SessionSummary[]> => {
     return listSessionsAcrossProviders(
       project,
@@ -414,9 +423,11 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         piReaderFactory: deps.piReaderFactory,
         kimiSessionsDir: deps.kimiSessionsDir,
         kimiReaderFactory: deps.kimiReaderFactory,
+        mcodeReaderFactory: deps.mcodeReaderFactory,
         allowStaleSessionCache: true,
       },
       providerCatalog,
+      bridgeSessions,
     );
   };
 
@@ -429,14 +440,25 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       geminiScanner: deps.geminiScanner,
       piScanner: deps.piScanner,
       kimiScanner: deps.kimiScanner,
+      cursorScanner: deps.cursorScanner,
+      mcodeScanner: deps.mcodeScanner,
       codexSessionCatalog: deps.codexSessionCatalog,
     });
     const seenSessionIds = new Set<string>();
+    const statsBridgeSessionViews = await listBridgeSessionViews(deps);
 
     for (const project of projects) {
-      const sessions = await listSessionsForProject(project, providerCatalog);
+      const sessions = await listSessionsForProject(
+        project,
+        providerCatalog,
+        statsBridgeSessionViews
+          .filter((item) => item.session.projectId === project.id)
+          .map((item) => item.session),
+      );
       for (const session of sessions) {
         seenSessionIds.add(session.id);
+        for (const id of session.forkFamilySessionIds ?? [])
+          seenSessionIds.add(id);
         const metadata = deps.sessionMetadataService?.getMetadata(session.id);
         const isArchived = metadata?.isArchived ?? session.isArchived ?? false;
         const isStarred = metadata?.isStarred ?? session.isStarred ?? false;
@@ -455,7 +477,6 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
       }
     }
 
-    const statsBridgeSessionViews = await listBridgeSessionViews(deps);
     for (const item of statsBridgeSessionViews) {
       if (seenSessionIds.has(item.session.id)) continue;
       const metadata = deps.sessionMetadataService?.getMetadata(
@@ -633,6 +654,8 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         geminiScanner: deps.geminiScanner,
         piScanner: deps.piScanner,
         kimiScanner: deps.kimiScanner,
+        cursorScanner: deps.cursorScanner,
+        mcodeScanner: deps.mcodeScanner,
         codexSessionCatalog: deps.codexSessionCatalog,
       }),
     );
@@ -659,11 +682,19 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
         break;
       }
 
-      const sessions = await listSessionsForProject(project, providerCatalog);
+      const sessions = await listSessionsForProject(
+        project,
+        providerCatalog,
+        bridgeSessionViews
+          .filter((item) => item.session.projectId === project.id)
+          .map((item) => item.session),
+      );
 
       // Enrich each session
       for (const session of sessions) {
         knownSessionIds.add(session.id);
+        for (const id of session.forkFamilySessionIds ?? [])
+          knownSessionIds.add(id);
 
         // Get session metadata
         const metadata = deps.sessionMetadataService?.getMetadata(session.id);
@@ -775,6 +806,8 @@ export function createGlobalSessionsRoutes(deps: GlobalSessionsDeps): Hono {
 
         const item: GlobalSessionItem = {
           id: session.id,
+          forkParentSessionId: session.forkParentSessionId,
+          forkFamilySessionIds: session.forkFamilySessionIds,
           title: session.title,
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,

@@ -21,6 +21,7 @@ const api = vi.hoisted(() => ({
 vi.mock("../../../api/client", () => ({ api }));
 vi.mock("../../../i18n", () => ({
   useI18n: () => ({ t: (key: string) => key }),
+  useOptionalI18n: () => ({ t: (key: string) => key }),
 }));
 vi.mock("../ToolCallRow", () => ({
   ToolCallRow: ({ detailOnly }: { detailOnly?: boolean }) => (
@@ -73,6 +74,52 @@ afterEach(() => {
 });
 
 describe("ProjectedToolGroupRow", () => {
+  it("shows group timing alongside status counts without loading collapsed details", () => {
+    const value = item("collapsed-duration", "summary", false);
+    value.group = {
+      ...value.group,
+      count: 4,
+      failedCount: 1,
+      status: "mixed",
+      durationMs: 12000,
+      timedCount: 4,
+    } as typeof value.group;
+    render(<ProjectedToolGroupRow item={value} />);
+    expect(screen.getByTestId("tool-group-duration").textContent).toBe(
+      "sessionToolGroupDuration",
+    );
+    expect(screen.getByText("sessionDisplayToolsCompleted")).toBeDefined();
+    expect(screen.getByText("sessionToolGroupFailedCount")).toBeDefined();
+    expect(api.getSessionDisplayGroup).not.toHaveBeenCalled();
+    expect(api.getSessionDisplayTool).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "filters lazily loaded coordination steps only on the main timeline: %s",
+    async (mainTimeline) => {
+      api.getSessionDisplayGroup.mockResolvedValue({
+        steps: [
+          {
+            ...step,
+            id: "send",
+            name: "collaboration.send_message",
+            summary: "send a private message",
+          },
+          step,
+        ],
+      });
+      const group = {
+        ...item(`filter-${mainTimeline}`, "summary", false),
+        mainTimeline,
+      };
+      render(<ProjectedToolGroupRow item={group} sessionProvider="codex" />);
+      fireEvent.click(screen.getByRole("button", { expanded: false }));
+      await waitFor(() => expect(screen.getByText("pnpm test")).toBeDefined());
+      if (mainTimeline)
+        expect(screen.queryByText("send a private message")).toBeNull();
+      else expect(screen.getByText("send a private message")).toBeDefined();
+    },
+  );
   it("does not fetch dynamic content for a collapsed running tool", async () => {
     vi.useFakeTimers();
     render(
@@ -519,7 +566,7 @@ describe("ProjectedToolGroupRow", () => {
     expect(api.getSessionDisplayTool).toHaveBeenCalledTimes(1);
   });
 
-  it("ticks an elapsed badge for a running step and drops it once finished", async () => {
+  it("ticks a running step then retains its recorded duration without a timer", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-02T10:00:30.000Z"));
     const timestamp = "2026-01-02T10:00:00.000Z";
@@ -541,12 +588,80 @@ describe("ProjectedToolGroupRow", () => {
 
     rerender(
       <ProjectedToolStepRow
-        step={{ ...step, status: "completed", timestamp }}
+        step={{
+          ...step,
+          status: "completed",
+          timestamp,
+          completedAt: "2026-01-02T10:01:12.000Z",
+        }}
         projectId="project"
         sessionId="elapsed"
       />,
     );
+    expect(screen.getByTestId("display-step-elapsed").textContent).toBe(
+      "1m12s",
+    );
+    expect(vi.getTimerCount()).toBe(0);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(screen.getByTestId("display-step-elapsed").textContent).toBe(
+      "1m12s",
+    );
+  });
+
+  it.each(["completed", "failed"] as const)(
+    "shows recorded %s duration in old history",
+    (status) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-10-19T00:00:00Z"));
+      render(
+        <ProjectedToolStepRow
+          step={{
+            ...step,
+            status,
+            timestamp: "2024-01-01T00:00:00Z",
+            completedAt: "2024-01-01T00:00:00.250Z",
+          }}
+          projectId="project"
+          sessionId="old-duration"
+        />,
+      );
+      expect(screen.getByTestId("display-step-elapsed").textContent).toBe(
+        "<1s",
+      );
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it.each([
+    undefined,
+    "invalid",
+    "2026-01-02T10:00:00Z",
+    "2026-01-02T09:59:00Z",
+  ])("does not guess a duration from an unreliable end (%s)", (completedAt) => {
+    render(
+      <ProjectedToolStepRow
+        step={{ ...step, timestamp: "2026-01-02T10:00:00Z", completedAt }}
+        projectId="project"
+        sessionId="missing-end"
+      />,
+    );
     expect(screen.queryByTestId("display-step-elapsed")).toBeNull();
+  });
+
+  it("uses native duration even when historical messages have no per-tool timestamps", () => {
+    render(
+      <ProjectedToolStepRow
+        step={{ ...step, durationMs: 2500 }}
+        projectId="project"
+        sessionId="native-duration"
+      />,
+    );
+    expect(screen.getByTestId("display-step-elapsed").textContent).toBe("2s");
+    expect(screen.getByTestId("display-step-elapsed").title).toBe(
+      "sessionDisplayStepNativeDuration",
+    );
   });
 
   it("omits the elapsed badge when the step has no start timestamp", () => {

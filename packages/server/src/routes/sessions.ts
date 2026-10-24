@@ -1,5 +1,6 @@
 import { stat } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { SideConversationRequestSchema } from "@yep-anywhere/shared";
 import {
   ALL_PERMISSION_MODES,
   type ContextCompactEvent,
@@ -60,8 +61,10 @@ import { getLogger } from "../logging/logger.js";
 import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
+import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
 import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
+import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import { canonicalizeProjectPath, encodeProjectId } from "../projects/paths.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
@@ -90,6 +93,7 @@ import { cloneClaudeSession, cloneCodexSession } from "../sessions/fork.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import { projectSessionInspectorMessages } from "../sessions/inspector-projection.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import {
   annotateBranchMessages,
   normalizeSession,
@@ -113,6 +117,7 @@ import { locateSession } from "../sessions/session-locator.js";
 import {
   deriveSessionRuntime,
   pendingInputTypeFromProcess,
+  pendingInputTypeFromRequest,
 } from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
 import { isUserPromptMessage } from "../sessions/user-prompt-message.js";
@@ -197,10 +202,13 @@ export interface SessionsDeps {
   piReaderFactory?: (projectPath: string) => PiSessionReader;
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiScanner?: KimiSessionScanner;
+  cursorScanner?: CursorSessionScanner;
+  mcodeScanner?: McodeSessionScanner;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   kimiSessionsDir?: string;
   /** Optional shared Kimi reader factory for cross-provider session lookups */
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
-  /** ServerSettingsService for reading global instructions */
+  /** Server-wide settings service */
   serverSettingsService?: ServerSettingsService;
   /** ModelInfoService for context window lookups */
   modelInfoService?: ModelInfoService;
@@ -655,6 +663,7 @@ function toProviderResolutionDeps(deps: SessionsDeps): ProviderResolutionDeps {
     piReaderFactory: deps.piReaderFactory,
     kimiSessionsDir: deps.kimiSessionsDir,
     kimiReaderFactory: deps.kimiReaderFactory,
+    mcodeReaderFactory: deps.mcodeReaderFactory,
     zcodeDbPath: deps.zcodeDbPath,
     zcodeReaderFactory: deps.zcodeReaderFactory,
   };
@@ -750,13 +759,15 @@ function emitArchiveFileEvents(
   if (!deps.eventBus) return;
 
   const providerRoot =
-    record.provider === "codex"
-      ? deps.codexSessionsDir
-      : record.provider === "pi"
-        ? deps.piSessionsDir
-        : record.provider === "kimi"
-          ? deps.kimiSessionsDir
-          : deps.claudeProjectsDir;
+    record.provider === "cursor"
+      ? dirname(record.files[0]?.originalPath ?? "")
+      : record.provider === "codex"
+        ? deps.codexSessionsDir
+        : record.provider === "pi"
+          ? deps.piSessionsDir
+          : record.provider === "kimi"
+            ? deps.kimiSessionsDir
+            : deps.claudeProjectsDir;
   if (!providerRoot) return;
 
   for (const file of record.files) {
@@ -764,8 +775,15 @@ function emitArchiveFileEvents(
     deps.eventBus.emit({
       type: "file-change",
       provider: record.provider,
-      path: file.originalPath,
-      relativePath: relative(providerRoot, file.originalPath),
+      path: file.directory
+        ? join(file.originalPath, "store.db")
+        : file.originalPath,
+      relativePath: relative(
+        providerRoot,
+        file.directory
+          ? join(file.originalPath, "store.db")
+          : file.originalPath,
+      ),
       changeType,
       timestamp: new Date().toISOString(),
       fileType: "session",
@@ -854,6 +872,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       piReaderFactory: deps.piReaderFactory,
       kimiSessionsDir: deps.kimiSessionsDir,
       kimiReaderFactory: deps.kimiReaderFactory,
+      mcodeReaderFactory: deps.mcodeReaderFactory,
     });
   const getCodexReader = (projectPath: string): CodexSessionReader | null =>
     deps.codexReaderFactory?.(projectPath) ??
@@ -890,6 +909,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         id: summary.id,
         forkParentSessionId: summary.forkParentSessionId,
         createdAt: summary.createdAt,
+        updatedAt: summary.updatedAt,
         provider: summary.provider,
       });
     }
@@ -915,6 +935,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         forkTargetMessageId:
           existing?.forkTargetMessageId ?? metadata.forkTargetMessageId,
         createdAt: existing?.createdAt,
+        updatedAt: existing?.updatedAt,
         provider: existing?.provider ?? metadata.provider,
       });
     }
@@ -930,6 +951,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       forkTargetMessageId:
         current?.forkTargetMessageId ?? currentMetadata?.forkTargetMessageId,
       createdAt: current?.createdAt ?? currentSummary.createdAt,
+      updatedAt: current?.updatedAt ?? currentSummary.updatedAt,
       provider: current?.provider ?? currentSummary.provider,
     });
     return historyReader.getForkBranchState(
@@ -1081,6 +1103,43 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       // apply the complete persisted augmentation pipeline, not Markdown only.
       await augmentPersistedSessionMessages(agentSession.messages);
 
+      return c.json(agentSession);
+    },
+  );
+
+  // Resolve the provider through the root conversation, then read only a
+  // verified descendant. A child itself is absent from top-level summaries.
+  routes.get(
+    "/projects/:projectId/sessions/:sessionId/agent-tree/:agentId",
+    async (c) => {
+      const projectId = c.req.param("projectId");
+      if (!isUrlProjectId(projectId)) {
+        return c.json({ error: "Invalid project ID format" }, 400);
+      }
+      const project = await deps.scanner.getOrCreateProject(projectId);
+      if (!project) return c.json({ error: "Project not found" }, 404);
+
+      const rootSessionId = c.req.param("sessionId");
+      const reader = await resolveReaderForSession(
+        deps,
+        project,
+        rootSessionId,
+      );
+      const agentSession = await reader.getAgentSessionInTree?.(
+        c.req.param("agentId"),
+        rootSessionId,
+        {
+          includeInheritedContext:
+            c.req.query("includeInheritedContext") === "true",
+        },
+      );
+      if (!agentSession) {
+        return c.json({ error: "Agent session not found" }, 404);
+      }
+      await augmentPersistedSessionMessages(agentSession.messages);
+      if (agentSession.inheritedMessages) {
+        await augmentPersistedSessionMessages(agentSession.inheritedMessages);
+      }
       return c.json(agentSession);
     },
   );
@@ -1246,6 +1305,14 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         parentSessionId: sessionSummary?.parentSessionId,
         forkParentSessionId:
           metadata?.forkParentSessionId ?? sessionSummary?.forkParentSessionId,
+        forkFamilySessionIds: forkBranchState
+          ? [
+              ...new Set([
+                sessionId,
+                ...forkBranchState.branches.map((branch) => branch.sessionId),
+              ]),
+            ]
+          : undefined,
         model: process?.model ?? metadata?.model ?? sessionSummary?.model,
         reasoningEffort:
           process?.reasoningEffort ?? sessionSummary?.reasoningEffort,
@@ -1423,6 +1490,17 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         process?.provider ??
         project.provider;
       const model = sessionSummary?.model;
+
+      if (providerName === "cursor") {
+        // Cursor saves its native window and category estimates in store.db.
+        // Do not substitute a model heuristic or Claude's larger-window tier.
+        const payload: ContextStatusResponse = {
+          source: "native",
+          model: model ?? process?.model,
+          contextUsage: sessionSummary?.contextUsage,
+        };
+        return c.json(payload);
+      }
 
       const summaryWindow = sessionSummary?.contextUsage?.contextWindow;
       const cachedWindow = deps.modelInfoService?.getCachedContextWindow(
@@ -2323,11 +2401,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         : null;
     const pendingInputRequest =
       activePendingInputRequest ?? persistedPendingInputRequest;
-    const pendingInputType = pendingInputRequest
-      ? pendingInputRequest.type === "tool-approval"
-        ? "tool-approval"
-        : "user-question"
-      : livePendingInputType;
+    const pendingInputType =
+      pendingInputTypeFromRequest(pendingInputRequest) ?? livePendingInputType;
 
     // Override context usage with SDK-reported context window from live process
     // The reader uses hardcoded defaults; the process captures the real value at runtime
@@ -2476,6 +2551,21 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       body,
     });
     return c.json(result.body, result.status);
+  });
+
+  // Dedicated control endpoint: never resume, steer, queue, or acquire parent ownership.
+  routes.post("/sessions/:sessionId/side-conversation", async (c) => {
+    const parsed = SideConversationRequestSchema.safeParse(
+      await c.req.json().catch(() => null),
+    );
+    if (!parsed.success)
+      return c.json({ error: "Invalid side conversation request" }, 400);
+    return c.json(
+      (await runtimeController.sideConversation?.(
+        c.req.param("sessionId"),
+        parsed.data,
+      )) ?? { supported: false, reason: "unsupported" },
+    );
   });
 
   // POST /api/sessions/:sessionId/messages - Queue message
@@ -2916,6 +3006,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         });
         deps.scanner.invalidateCache();
         deps.codexScanner?.invalidateCache();
+        deps.cursorScanner?.invalidateCache();
+        deps.mcodeScanner?.invalidateCache();
         emitArchiveFileEvents(deps, record, "delete");
         archiveResult = { physical: true, action: "archive", record };
       } catch (error) {
@@ -2928,6 +3020,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
             action: "already_archived",
             record: deps.sessionArchiveService.getArchivedSession(sessionId),
           };
+        } else if (
+          error instanceof ArchiveError &&
+          error.code === "unsupported_provider" &&
+          target.provider === "mcode"
+        ) {
+          // MiniMax Code shares its store with the desktop App; Yep only
+          // hides the session through metadata and never moves its files.
         } else if (error instanceof ArchiveError) {
           return c.json(
             { error: error.message, code: error.code },
@@ -2945,6 +3044,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           await deps.sessionArchiveService.restoreSession(sessionId);
         deps.scanner.invalidateCache();
         deps.codexScanner?.invalidateCache();
+        deps.cursorScanner?.invalidateCache();
+        deps.mcodeScanner?.invalidateCache();
         emitArchiveFileEvents(deps, record, "create");
         archiveResult = { physical: true, action: "restore", record };
       } catch (error) {

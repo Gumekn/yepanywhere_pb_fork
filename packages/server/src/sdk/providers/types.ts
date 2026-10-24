@@ -11,6 +11,7 @@ import type {
   SlashCommand,
 } from "@yep-anywhere/shared";
 import type { FeishuMcpConfig } from "../../channels/feishu/user-auth/mcp-gateway.js";
+import type { SideConversationControl } from "../../side-conversations/session.js";
 import type { MessageQueue } from "../messageQueue.js";
 import type { CanUseTool, SDKMessage, UserMessage } from "../types.js";
 import type { CodexSessionControls } from "./codex-controls.js";
@@ -114,8 +115,6 @@ export interface StartSessionOptions {
   onRetryStatus?: (status: SessionRetryStatus | undefined) => void;
   /** Configured SSH host for Claude remote execution. */
   executor?: string;
-  /** Global instructions to append to system prompt (from server settings) */
-  globalInstructions?: string;
 }
 
 /**
@@ -123,6 +122,7 @@ export interface StartSessionOptions {
  * This is the common interface all providers must return.
  */
 export interface AgentSession {
+  sideConversations?: SideConversationControl;
   /** Async iterator yielding SDK messages */
   iterator: AsyncIterableIterator<SDKMessage>;
   /** Message queue for sending messages to the agent */
@@ -244,6 +244,18 @@ export interface AgentProvider {
   readonly permissionModes?: readonly PermissionMode[];
   /** Whether this provider supports extended thinking toggle (default: true) */
   readonly supportsThinkingToggle: boolean;
+  /**
+   * Whether `thinking`, `effort` and `reasoningEffort` from StartSessionOptions
+   * shape the running process (default: true). Providers that encode reasoning
+   * in the model id ignore them, so a difference must not restart the process.
+   */
+  readonly usesReasoningLaunchSettings?: boolean;
+  /**
+   * Whether input sent during a turn waits until that turn ends (no steering;
+   * the session loop reads its queue between turns). Such input is held as
+   * deferred instead of being published as an already-started prompt.
+   */
+  readonly defersInputDuringTurn?: boolean;
   /** Whether this provider supports slash commands (default: false) */
   readonly supportsSlashCommands: boolean;
 

@@ -1,6 +1,5 @@
 import type { SessionDisplaySubscriptionOptions } from "@yep-anywhere/shared";
 import type {
-  DeviceServerMessage,
   RemoteClientMessage,
   TerminalServerMessage,
   UploadedFile,
@@ -208,17 +207,10 @@ export interface Connection {
 
   /**
    * Send a raw protocol message (bypassing REST).
-   * Used for emulator signaling messages.
+   * Used for remote terminal messages.
    * Optional - only WebSocket-based connections support this.
    */
   sendMessage?(msg: RemoteClientMessage): void;
-
-  /**
-   * Register a handler for emulator signaling messages from the server.
-   * Returns an unsubscribe function.
-   * Optional - only WebSocket-based connections support this.
-   */
-  onDeviceMessage?(handler: (msg: DeviceServerMessage) => void): () => void;
 
   /**
    * Register a handler for terminal output and lifecycle messages from the

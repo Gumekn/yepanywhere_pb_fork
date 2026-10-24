@@ -51,6 +51,8 @@ const PROVIDER_COLORS: Record<LiveProviderName, string> = {
   pi: "var(--provider-pi)",
   kimi: "var(--provider-kimi)", // Kimi KMBlue
   zcode: "var(--provider-zcode)", // ZCode
+  cursor: "var(--provider-cursor)",
+  mcode: "var(--provider-mcode)",
 };
 
 const getSessionListTitle = (session: GlobalSessionItem): string | null =>
@@ -769,16 +771,15 @@ export function GlobalSessionsPage() {
                 </button>
               </form>
               <div className="filter-dropdowns">
-                {projectOptions.length > 0 && (
-                  <FilterDropdown
-                    label={t("inboxFilterProject")}
-                    options={projectOptions}
-                    selected={projectFilter ? [projectFilter] : []}
-                    onChange={handleProjectFilter}
-                    multiSelect={false}
-                    placeholder={t("globalSessionsFilterProjectPlaceholder")}
-                  />
-                )}
+                <FilterDropdown
+                  label={t("inboxFilterProject")}
+                  options={projectOptions}
+                  selected={projectFilter ? [projectFilter] : []}
+                  onChange={handleProjectFilter}
+                  multiSelect={false}
+                  placeholder={t("globalSessionsFilterProjectPlaceholder")}
+                  disabled={projectOptions.length === 0 && !projectFilter}
+                />
                 <FilterDropdown
                   label={t("globalSessionsFilterStatus")}
                   options={statusOptions}
@@ -786,24 +787,26 @@ export function GlobalSessionsPage() {
                   onChange={setStatusFilters}
                   placeholder={t("globalSessionsFilterStatusPlaceholder")}
                 />
-                {providerOptions.length > 1 && (
-                  <FilterDropdown
-                    label={t("globalSessionsFilterProvider")}
-                    options={providerOptions}
-                    selected={providerFilters}
-                    onChange={setProviderFilters}
-                    placeholder={t("globalSessionsFilterProviderPlaceholder")}
-                  />
-                )}
-                {executorOptions.length > 1 && (
-                  <FilterDropdown
-                    label={t("globalSessionsFilterExecutor")}
-                    options={executorOptions}
-                    selected={executorFilters}
-                    onChange={setExecutorFilters}
-                    placeholder={t("globalSessionsFilterMachinePlaceholder")}
-                  />
-                )}
+                <FilterDropdown
+                  label={t("globalSessionsFilterProvider")}
+                  options={providerOptions}
+                  selected={providerFilters}
+                  onChange={setProviderFilters}
+                  placeholder={t("globalSessionsFilterProviderPlaceholder")}
+                  disabled={
+                    providerOptions.length === 0 && providerFilters.length === 0
+                  }
+                />
+                <FilterDropdown
+                  label={t("globalSessionsFilterExecutor")}
+                  options={executorOptions}
+                  selected={executorFilters}
+                  onChange={setExecutorFilters}
+                  placeholder={t("globalSessionsFilterMachinePlaceholder")}
+                  disabled={
+                    executorOptions.length === 0 && executorFilters.length === 0
+                  }
+                />
                 <FilterDropdown
                   label={t("globalSessionsFilterAge")}
                   options={ageOptions}

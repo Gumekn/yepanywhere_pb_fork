@@ -1,0 +1,267 @@
+{
+  "models": [
+    {
+      "value": "default",
+      "name": "Auto",
+      "configOptions": []
+    },
+    {
+      "value": "grok-4.7",
+      "name": "Grok 4.7",
+      "configOptions": [
+        {
+          "id": "context",
+          "name": "Context",
+          "description": "Context size the model has available.",
+          "category": "model_config",
+          "type": "select",
+          "currentValue": "256k",
+          "options": [
+            {
+              "value": "256k",
+              "name": "256K"
+            },
+            {
+              "value": "500k",
+              "name": "500K"
+            }
+          ]
+        },
+        {
+          "id": "reasoning_effort",
+          "name": "Effort",
+          "description": "Controls how much reasoning effort the model uses before responding.",
+          "category": "thought_level",
+          "type": "select",
+          "currentValue": "high",
+          "options": [
+            {
+              "value": "low",
+              "name": "Low"
+            },
+            {
+              "value": "medium",
+              "name": "Medium"
+            },
+            {
+              "value": "high",
+              "name": "High"
+            },
+            {
+              "value": "xhigh",
+              "name": "Extra High"
+            }
+          ]
+        },
+        {
+          "id": "fast",
+          "name": "Fast",
+          "description": "Significantly faster but consumes more usage",
+          "category": "model_config",
+          "type": "select",
+          "currentValue": "true",
+          "options": [
+            {
+              "value": "false",
+              "name": "Off"
+            },
+            {
+              "value": "true",
+              "name": "Fast\u200b\u200b"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "value": "composer-2.5",
+      "name": "Composer 2.5",
+      "configOptions": [
+        {
+          "id": "fast",
+          "name": "Fast",
+          "description": "Significantly faster but consumes more usage",
+          "category": "model_config",
+          "type": "select",
+          "currentValue": "true",
+          "options": [
+            {
+              "value": "false",
+              "name": "Off"
+            },
+            {
+              "value": "true",
+              "name": "Fast"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "value": "claude-opus-5",
+      "name": "Claude Opus 5",
+      "configOptions": [
+        {
+          "id": "thinking",
+          "name": "Thinking",
+          "description": "Does the model use thinking to generate its response?",
+          "category": "thought_level",
+          "type": "select",
+          "currentValue": "true",
+          "options": [
+            {
+              "value": "false",
+              "name": "Off"
+            },
+            {
+              "value": "true",
+              "name": "On"
+            }
+          ]
+        },
+        {
+          "id": "context",
+          "name": "Context",
+          "description": "Context size the model has available.",
+          "category": "model_config",
+          "type": "select",
+          "currentValue": "300k",
+          "options": [
+            {
+              "value": "300k",
+              "name": "300K"
+            },
+            {
+              "value": "1m",
+              "name": "1M"
+            }
+          ]
+        },
+        {
+          "id": "effort",
+          "name": "Effort",
+          "description": "Effort the model uses to generate its response.",
+          "category": "thought_level",
+          "type": "select",
+          "currentValue": "high",
+          "options": [
+            {
+              "value": "low",
+              "name": "Low"
+            },
+            {
+              "value": "medium",
+              "name": "Medium"
+            },
+            {
+              "value": "high",
+              "name": "High"
+            },
+            {
+              "value": "xhigh",
+              "name": "Extra High"
+            },
+            {
+              "value": "max",
+              "name": "Max"
+            }
+          ]
+        },
+        {
+          "id": "fast",
+          "name": "Fast",
+          "description": "2x more expensive, but significantly faster speeds.",
+          "category": "model_config",
+          "type": "select",
+          "currentValue": "false",
+          "options": [
+            {
+              "value": "false",
+              "name": "Off"
+            },
+            {
+              "value": "true",
+              "name": "Fast"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "value": "gpt-5.6-sol",
+      "name": "GPT-5.6 Sol",
+      "configOptions": [
+        {
+          "id": "context",
+          "name": "Context",
+          "description": "Context size the model has available.",
+          "category": "model_config",
+          "type": "select",
+          "currentValue": "272k",
+          "options": [
+            {
+              "value": "272k",
+              "name": "272K"
+            },
+            {
+              "value": "1m",
+              "name": "1M"
+            }
+          ]
+        },
+        {
+          "id": "reasoning",
+          "name": "Reasoning",
+          "description": "Reasoning effort the model uses to generate its response.",
+          "category": "thought_level",
+          "type": "select",
+          "currentValue": "medium",
+          "options": [
+            {
+              "value": "none",
+              "name": "None"
+            },
+            {
+              "value": "low",
+              "name": "Low"
+            },
+            {
+              "value": "medium",
+              "name": "Medium"
+            },
+            {
+              "value": "high",
+              "name": "High"
+            },
+            {
+              "value": "xhigh",
+              "name": "Extra High"
+            },
+            {
+              "value": "max",
+              "name": "Max"
+            }
+          ]
+        },
+        {
+          "id": "fast",
+          "name": "Fast",
+          "description": "2x more expensive, but faster speeds.",
+          "category": "model_config",
+          "type": "select",
+          "currentValue": "false",
+          "options": [
+            {
+              "value": "false",
+              "name": "Off"
+            },
+            {
+              "value": "true",
+              "name": "Fast"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

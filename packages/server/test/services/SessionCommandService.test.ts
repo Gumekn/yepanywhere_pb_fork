@@ -77,6 +77,87 @@ function createService(
 }
 
 describe("SessionCommandService runtime boundary", () => {
+  it.each(["start", "create", "resume"] as const)(
+    "returns a recoverable error before %s reaches an old Cursor runtime",
+    async (flow) => {
+      const projectPath = mkdtempSync(join(tmpdir(), "cursor-runtime-"));
+      try {
+        const projectId = encodeProjectId(projectPath);
+        const project = {
+          id: projectId,
+          path: projectPath,
+          sessionDir: projectPath,
+          provider: "cursor",
+        } as Project;
+        const launch = vi.fn();
+        const service = new SessionCommandService({
+          runtimeController: {
+            mode: "external",
+            getStatus: async () => ({ protocolVersion: 6 }),
+            startSession: launch,
+            createSession: launch,
+            resumeSession: launch,
+          } as unknown as RuntimeController,
+          scanner: {
+            getOrCreateProject: async () => project,
+          } as unknown as ProjectScanner,
+          readerFactory: () =>
+            ({
+              getSessionSummary: async () => ({
+                id: "session",
+                provider: "cursor",
+              }),
+            }) as unknown as ISessionReader,
+          sessionInteractionService: interactionService(),
+        });
+        const input = {
+          projectId,
+          sessionId: "session",
+          body: {
+            provider: "cursor" as const,
+            model: "auto",
+            message: "hello",
+          },
+        };
+        const result = await service[flow](input);
+        expect(result).toMatchObject({
+          ok: false,
+          status: 503,
+          body: { code: "runtime-update-required" },
+        });
+        expect(launch).not.toHaveBeenCalled();
+      } finally {
+        rmSync(projectPath, { recursive: true, force: true });
+      }
+    },
+  );
+  it("rejects reserved side commands before touching main lifecycle or queue", async () => {
+    const queueMessage = vi.fn();
+    const resumeSession = vi.fn();
+    const startSession = vi.fn();
+    const service = createService({
+      queueMessage,
+      resumeSession,
+      startSession,
+    });
+    for (const message of ["/side why?", "/btw", "/yep:side-v1 {}"]) {
+      const body = { message, provider: "codex" as const };
+      expect((await service.start({ projectId: "unused", body })).status).toBe(
+        400,
+      );
+      expect(
+        (await service.resume({ projectId: "unused", sessionId: "main", body }))
+          .status,
+      ).toBe(400);
+      expect((await service.queue({ sessionId: "main", body })).status).toBe(
+        400,
+      );
+    }
+    expect(queueMessage).not.toHaveBeenCalled();
+    expect(resumeSession).not.toHaveBeenCalled();
+    expect(startSession).not.toHaveBeenCalled();
+  });
+
   it("preserves trusted Feishu MCP configuration when sending into a resident process", async () => {
     const queueMessage = vi.fn(async () => ({
       success: true,

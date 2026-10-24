@@ -46,9 +46,52 @@ describe("ServerSettingsService", () => {
       version: number;
       settings: Record<string, unknown>;
     };
-    expect(persisted.version).toBe(5);
+    expect(persisted.version).toBe(6);
     expect(persisted.settings).not.toHaveProperty("ollamaUrl");
     expect(persisted.settings).not.toHaveProperty("remoteExecutors");
+  });
+
+  it("retires device and prompt settings without changing active preferences", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "yep-settings-retired-"));
+    dataDirs.push(dataDir);
+    const settingsPath = join(dataDir, "server-settings.json");
+    const activeSettings = {
+      serviceWorkerEnabled: false,
+      allowedHosts: "localhost,example.test",
+      lifecycleWebhooksEnabled: true,
+      lifecycleWebhookDryRun: false,
+      lifecycleWebhookUrl: "https://example.test/events",
+      newSessionDefaults: {
+        provider: "codex",
+        model: "gpt-6-astra",
+        reasoningEffort: "xhigh",
+        byProvider: {
+          codex: { model: "gpt-6-astra", reasoningEffort: "xhigh" },
+        },
+      },
+    };
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        version: 5,
+        settings: {
+          ...activeSettings,
+          globalInstructions: "Retired prompt",
+          deviceBridgeEnabled: true,
+          chromeOsHosts: ["lab-device"],
+        },
+      }),
+    );
+
+    const service = new ServerSettingsService({ dataDir });
+    await service.initialize();
+    expect(service.getSettings()).toEqual(activeSettings);
+    const persisted = JSON.parse(await readFile(settingsPath, "utf-8"));
+    expect(persisted).toEqual({ version: 6, settings: activeSettings });
+
+    const reloaded = new ServerSettingsService({ dataDir });
+    await reloaded.initialize();
+    expect(reloaded.getSettings()).toEqual(activeSettings);
   });
 
   it("preserves and normalizes mapped remote executors", async () => {
@@ -101,7 +144,7 @@ describe("ServerSettingsService", () => {
     const persisted = JSON.parse(await readFile(settingsPath, "utf-8")) as {
       version: number;
     };
-    expect(persisted.version).toBe(5);
+    expect(persisted.version).toBe(6);
   });
 
   it("migrates legacy new-session defaults into a provider-specific entry", async () => {
@@ -150,6 +193,6 @@ describe("ServerSettingsService", () => {
     const persisted = JSON.parse(await readFile(settingsPath, "utf-8")) as {
       version: number;
     };
-    expect(persisted.version).toBe(5);
+    expect(persisted.version).toBe(6);
   });
 });

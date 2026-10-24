@@ -78,6 +78,17 @@ export {
   type ZCodeProviderConfig,
 } from "./zcode.js";
 
+import { cursorProvider } from "./cursor.js";
+export { CursorProvider, cursorProvider } from "./cursor.js";
+
+// MiniMax Code provider (uses `mcode acp`; shares ~/.minimax with the App)
+import { mcodeProvider } from "./mcode.js";
+export {
+  McodeProvider,
+  mcodeProvider,
+  type McodeProviderConfig,
+} from "./mcode.js";
+
 /**
  * Get all active provider instances exposed by the provider catalog.
  *
@@ -94,6 +105,8 @@ export function getAllProviders(): AgentProvider[] {
     piProvider,
     kimiProvider,
     zcodeProvider,
+    cursorProvider,
+    mcodeProvider,
   ];
 }
 
@@ -122,6 +135,10 @@ export function getProvider(name: ProviderName | string): AgentProvider | null {
       return kimiProvider;
     case "zcode":
       return zcodeProvider;
+    case "cursor":
+      return cursorProvider;
+    case "mcode":
+      return mcodeProvider;
     default:
       return null;
   }

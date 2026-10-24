@@ -55,6 +55,10 @@ import {
   parseKimiReadMediaOutput,
 } from "@yep-anywhere/shared";
 import {
+  CodexAgentWaitTracker,
+  codexAgentWaitMessage,
+} from "../codex/agent-wait.js";
+import {
   isCodexCorrelationDebugEnabled,
   logCodexCorrelationDebug,
   summarizeCodexNormalizedMessage,
@@ -74,6 +78,10 @@ import {
 } from "../codex/image-generation.js";
 import { codexImagePreviewUrl } from "../codex/image-preview.js";
 import {
+  normalizeCodexInterAgentMessage,
+  readCodexInterAgentMessageIdentity,
+} from "../codex/inter-agent-message.js";
+import {
   type CodexToolCallContext,
   canonicalizeCodexToolName,
   deriveCodexWebRunInvocation,
@@ -88,6 +96,7 @@ import {
   collectCodexResponseUserClientIds,
 } from "../codex/user-message-identity.js";
 import { normalizeKimiToolInput } from "../kimi/tool-input.js";
+import type { ThreadItem } from "../sdk/providers/codex-protocol/generated/v2/ThreadItem.js";
 import type {
   ContentBlock,
   Message,
@@ -491,6 +500,77 @@ export function normalizeSession(
         ...summary,
         messages: convertKimiMessages(data.session),
       });
+    case "mcode": {
+      const precomputed = loaded.precomputedPiMessages;
+      const deferMedia =
+        options?.deferMedia ?? precomputed?.deferMedia ?? false;
+      const deferThinking =
+        options?.deferThinking ?? precomputed?.deferThinking ?? false;
+      const messages =
+        precomputed &&
+        precomputed.deferMedia === deferMedia &&
+        precomputed.deferThinking === deferThinking
+          ? precomputed.messages
+          : convertPiSession(data.session, {
+              deferMedia,
+              deferThinking,
+            }).messages;
+      return sanitizePublicNormalizedSession({ ...summary, messages });
+    }
+    case "cursor": {
+      let cursorTurnIndex = 0;
+      return sanitizePublicNormalizedSession({
+        ...summary,
+        messages: data.session.messages.map((message) => {
+          if (message.role === "user") cursorTurnIndex += 1;
+          const turnId = `cursor-turn-${cursorTurnIndex}`;
+          if (message.role === "compaction") {
+            return {
+              type: "system",
+              subtype: "compact_boundary",
+              uuid: message.id,
+              cursorTurnIndex,
+              turnId,
+              content: message.text || "Context compacted",
+            };
+          }
+          if (message.blocks) {
+            const role = message.role === "assistant" ? "assistant" : "user";
+            return {
+              type: role,
+              uuid: message.id,
+              cursorTurnIndex,
+              turnId,
+              message: { role, content: message.blocks },
+            };
+          }
+          if (message.role === "user") {
+            return {
+              type: "user",
+              uuid: message.id,
+              cursorTurnIndex,
+              turnId,
+              message: { role: "user", content: message.text },
+            };
+          }
+          const content = message.reasoning
+            ? [
+                { type: "thinking" as const, thinking: message.reasoning },
+                ...(message.text
+                  ? [{ type: "text" as const, text: message.text }]
+                  : []),
+              ]
+            : message.text;
+          return {
+            type: "assistant",
+            uuid: message.id,
+            cursorTurnIndex,
+            turnId,
+            message: { role: "assistant", content },
+          };
+        }),
+      });
+    }
     case "zcode": {
       const messages = convertZCodeMessages(data.session);
       return sanitizePublicNormalizedSession({
@@ -1332,6 +1412,107 @@ interface CodexContextSnapshotOptions {
   directEditCallIds?: ReadonlySet<string>;
   responseImageGenerationIds?: ReadonlySet<string>;
   imageGenerationEndIds?: ReadonlySet<string>;
+  /** Child transcripts have no native overlay; root sessions keep their existing overlay. */
+  includeNativeCollaborationItems?: boolean;
+}
+
+type NativeCodexCollaborationItem = Extract<
+  ThreadItem,
+  { type: "subAgentActivity" | "collabAgentToolCall" }
+>;
+type NativeCodexAgentState = NonNullable<
+  Extract<ThreadItem, { type: "collabAgentToolCall" }>["agentsStates"][string]
+>;
+
+function normalizeCodexCollaborationState(
+  value: unknown,
+): NativeCodexAgentState | null {
+  // Core AgentStatus is a serde snake_case enum; payload-bearing variants
+  // serialize as { completed: string | null } / { errored: string }.
+  if (value === "pending_init") return { status: "pendingInit", message: null };
+  if (value === "not_found") return { status: "notFound", message: null };
+  if (value === "running" || value === "interrupted" || value === "shutdown") {
+    return { status: value, message: null };
+  }
+  if (!isRecord(value)) return null;
+  if (value.completed === null || typeof value.completed === "string") {
+    return { status: "completed", message: value.completed };
+  }
+  if (typeof value.errored === "string") {
+    return { status: "errored", message: value.errored };
+  }
+  return null;
+}
+
+/** Mirror core TurnItem -> app-server ThreadItem for persisted collaboration. */
+function normalizeCodexCollaborationItem(
+  value: unknown,
+): NativeCodexCollaborationItem | null {
+  if (!isRecord(value) || typeof value.id !== "string" || !value.id)
+    return null;
+  if (value.type === "SubAgentActivity") {
+    if (
+      (value.kind !== "started" &&
+        value.kind !== "interacted" &&
+        value.kind !== "interrupted" &&
+        value.kind !== "completed") ||
+      typeof value.agent_thread_id !== "string" ||
+      !value.agent_thread_id ||
+      typeof value.agent_path !== "string"
+    )
+      return null;
+    return {
+      type: "subAgentActivity",
+      id: value.id,
+      kind: value.kind,
+      agentThreadId: value.agent_thread_id,
+      agentPath: value.agent_path,
+    };
+  }
+  if (value.type !== "CollabAgentToolCall") return null;
+  const tools = {
+    spawn_agent: "spawnAgent",
+    send_input: "sendInput",
+    resume_agent: "resumeAgent",
+    wait: "wait",
+    close_agent: "closeAgent",
+  } as const;
+  if (
+    typeof value.tool !== "string" ||
+    !Object.hasOwn(tools, value.tool) ||
+    (value.status !== "in_progress" &&
+      value.status !== "completed" &&
+      value.status !== "failed" &&
+      value.status !== "interrupted") ||
+    typeof value.sender_thread_id !== "string"
+  )
+    return null;
+  const agentsStates: Record<string, NativeCodexAgentState> = {};
+  if (isRecord(value.agents_states)) {
+    for (const [threadId, state] of Object.entries(value.agents_states)) {
+      const normalized = normalizeCodexCollaborationState(state);
+      if (normalized) agentsStates[threadId] = normalized;
+    }
+  }
+  return {
+    type: "collabAgentToolCall",
+    id: value.id,
+    tool: tools[value.tool as keyof typeof tools],
+    status: value.status === "in_progress" ? "inProgress" : value.status,
+    senderThreadId: value.sender_thread_id,
+    receiverThreadIds: Array.isArray(value.receiver_thread_ids)
+      ? value.receiver_thread_ids.filter(
+          (id): id is string => typeof id === "string",
+        )
+      : [],
+    prompt: typeof value.prompt === "string" ? value.prompt : null,
+    model: typeof value.model === "string" ? value.model : null,
+    reasoningEffort:
+      typeof value.reasoning_effort === "string"
+        ? value.reasoning_effort
+        : null,
+    agentsStates,
+  };
 }
 
 function isCodexTokenCountImmediatelyAfterCompaction(
@@ -1461,6 +1642,8 @@ export function convertCodexEntries(
     ),
   );
   const emittedAsyncIds = new Set<string>();
+  const emittedInterAgentIds = new Set<string>();
+  const nativeCollaborationIndices = new Map<string, number>();
   const toolCallContexts = new Map<string, CodexToolCallContext>();
   const externalToolCalls: PendingExternalCodexToolCall[] = [];
   const responseItemImageGenerationIds =
@@ -1474,10 +1657,31 @@ export function convertCodexEntries(
     contextOptions.patchApplyCallIds ?? new Set(patchApplyEndByCallId.keys());
   const directEditCallIds =
     contextOptions.directEditCallIds ?? collectCodexDirectEditCallIds(entries);
+  const waitTracker = new CodexAgentWaitTracker();
+  const waitByEntry = new Map<number, string>();
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (!entry) continue;
+    const wait = waitTracker.observe(entry);
+    if (wait) waitByEntry.set(index, wait.item.id);
+  }
+  const waits = new Map(
+    waitTracker.values().map((wait) => [wait.item.id, wait]),
+  );
+  const emittedWaitIds = new Set<string>();
 
   for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
     const entry = entries[entryIndex];
     if (!entry) continue;
+    const waitId = waitByEntry.get(entryIndex);
+    if (waitId) {
+      const wait = waits.get(waitId);
+      if (wait && !emittedWaitIds.has(waitId)) {
+        messages.push(codexAgentWaitMessage(wait, sessionId));
+        emittedWaitIds.add(waitId);
+      }
+      continue;
+    }
 
     // Identity is anchored to the entry, not to how far into this array we are,
     // so a tail read of the same rollout produces the same ids.
@@ -1518,6 +1722,20 @@ export function convertCodexEntries(
         responseUserClientIds.get(entry),
       );
       for (const msg of convertedMessages) {
+        if (
+          msg.type === "system" &&
+          msg.subtype === "codex_native_item" &&
+          isRecord(msg.codexThreadItem) &&
+          msg.codexThreadItem.type === "interAgentMessage"
+        ) {
+          msg.codexThreadId = sessionId;
+          const identity = readCodexInterAgentMessageIdentity(entry.payload);
+          if (identity?.id) {
+            const key = `${identity.turnId ?? ""}:${identity.id}`;
+            if (emittedInterAgentIds.has(key)) continue;
+            emittedInterAgentIds.add(key);
+          }
+        }
         if (
           entry.payload.type === "function_call" &&
           canonicalizeCodexToolName(entry.payload.name).split(".").pop() ===
@@ -1591,6 +1809,45 @@ export function convertCodexEntries(
     } else if (entry.type === "event_msg") {
       if (entry.payload.type === "item_completed") {
         const item = entry.payload.item as Record<string, unknown>;
+        const nativeItem = contextOptions.includeNativeCollaborationItems
+          ? normalizeCodexCollaborationItem(item)
+          : null;
+        if (nativeItem) {
+          const operation = toolCallContexts
+            .get(nativeItem.id)
+            ?.toolName.split(".")
+            .pop();
+          const projectedItem =
+            nativeItem.type === "subAgentActivity" &&
+            (operation === "followup_task" || operation === "send_message")
+              ? { ...nativeItem, operation }
+              : nativeItem;
+          const turnId = getCodexEventPayloadTurnId(entry.payload);
+          const key = `${turnId ?? ""}:${nativeItem.type}:${nativeItem.id}`;
+          const previousIndex = nativeCollaborationIndices.get(key);
+          if (previousIndex !== undefined) {
+            const previous = messages[previousIndex];
+            if (previous)
+              messages[previousIndex] = {
+                ...previous,
+                codexThreadItem: projectedItem,
+              };
+          } else {
+            nativeCollaborationIndices.set(key, messages.length);
+            messages.push({
+              uuid: `codex-native:${sessionId}:${key}`,
+              type: "system",
+              subtype: "codex_native_item",
+              timestamp: entry.timestamp,
+              codexThreadId: sessionId,
+              ...(turnId ? { codexTurnId: turnId } : {}),
+              codexThreadItemId: nativeItem.id,
+              codexThreadItemLifecycle: "completed",
+              codexThreadItem: projectedItem,
+            });
+          }
+          continue;
+        }
         const id = typeof item?.id === "string" ? item.id : undefined;
         const asyncMessage = id
           ? readCodexAsyncMessage(asyncItems.get(id))
@@ -1871,6 +2128,8 @@ function getCodexResponsePayloadCallId(
 function getCodexResponsePayloadItemId(
   payload: CodexResponseItemEntry["payload"],
 ): string | undefined {
+  const communication = readCodexInterAgentMessageIdentity(payload);
+  if (communication) return communication.id;
   switch (payload.type) {
     case "message":
     case "reasoning":
@@ -1894,6 +2153,8 @@ function getCodexResponsePayloadItemId(
 function getCodexResponsePayloadTurnId(
   payload: CodexResponseItemEntry["payload"],
 ): string | undefined {
+  const communication = readCodexInterAgentMessageIdentity(payload);
+  if (communication) return communication.turnId;
   if (payload.type !== "message" && payload.type !== "reasoning") {
     return undefined;
   }
@@ -1906,6 +2167,10 @@ function getCodexResponseCorrelationKey(
   const itemId = getCodexResponsePayloadItemId(payload);
   const turnId = getCodexResponsePayloadTurnId(payload);
   if (!itemId || !turnId) return undefined;
+
+  if (readCodexInterAgentMessageIdentity(payload)) {
+    return `codex:${turnId}:inter-agent-message:${itemId}`;
+  }
 
   if (payload.type === "message" && payload.role === "assistant") {
     return `codex:${turnId}:agent-message:${itemId}`;
@@ -2176,6 +2441,19 @@ function convertCodexResponseItem(
 ): Message | Message[] | null {
   const payload = entry.payload;
   const uuid = `codex-${anchor}`;
+
+  const communication = normalizeCodexInterAgentMessage(payload, uuid);
+  if (communication) {
+    return {
+      uuid,
+      type: "system",
+      subtype: "codex_native_item",
+      timestamp: entry.timestamp,
+      codexThreadItemId: communication.id,
+      codexThreadItemLifecycle: "completed",
+      codexThreadItem: communication,
+    };
+  }
 
   switch (payload.type) {
     case "message":

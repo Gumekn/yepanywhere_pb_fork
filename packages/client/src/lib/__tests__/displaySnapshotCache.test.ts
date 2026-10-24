@@ -1,6 +1,7 @@
 import type { SessionDisplaySnapshot } from "@yep-anywhere/shared";
 import { afterEach, expect, it, vi } from "vitest";
 import { DisplaySnapshotCache } from "../displaySnapshotCache";
+import { estimateStructuralBytes } from "../sessionSnapshotCache";
 
 const snapshot = (seq = 0): SessionDisplaySnapshot => ({
   version: 2,
@@ -11,21 +12,23 @@ const snapshot = (seq = 0): SessionDisplaySnapshot => ({
 });
 afterEach(() => vi.restoreAllMocks());
 
-it("only serializes the changed session, including eviction", () => {
+it("accounts for the changed session without serializing it", () => {
   const cache = new DisplaySnapshotCache();
   for (let i = 0; i < 5; i++) cache.set(String(i), snapshot());
   const stringify = vi.spyOn(JSON, "stringify");
   for (let i = 0; i < 100; i++) cache.set("0", snapshot(i));
-  expect(stringify).toHaveBeenCalledTimes(100);
   cache.set("new", snapshot());
-  expect(stringify).toHaveBeenCalledTimes(101);
+  expect(stringify).not.toHaveBeenCalled();
   expect(cache.has("1")).toBe(false);
   expect(cache.has("0")).toBe(true);
+  expect(cache.get("0")).toEqual(snapshot(99));
 });
 
 it("subtracts replacement bytes and evicts by last write, not read", () => {
   const value = snapshot();
-  const cache = new DisplaySnapshotCache(JSON.stringify(value).length * 2 * 2);
+  const cache = new DisplaySnapshotCache(
+    estimateStructuralBytes([value], Number.POSITIVE_INFINITY) * 2,
+  );
   cache.set("a", value);
   cache.set("b", value);
   cache.set("a", value);
@@ -38,7 +41,7 @@ it("subtracts replacement bytes and evicts by last write, not read", () => {
 
 it("evicts oversized entries and clears byte accounting", () => {
   const value = snapshot();
-  const budget = JSON.stringify(value).length * 2;
+  const budget = estimateStructuralBytes([value], Number.POSITIVE_INFINITY);
   const cache = new DisplaySnapshotCache(budget);
   cache.set("a", value);
   cache.clear();

@@ -135,6 +135,40 @@ describe("RuntimeEventStore", () => {
     ]);
   });
 
+  it("recovers all generations only for an explicitly requested session history", async () => {
+    const store = new RuntimeEventStore({ eventsDir: testDir });
+    for (const [processId, sessionId, timestamp] of [
+      ["proc-old", "session", "2026-10-20T06:28:00.000Z"],
+      ["proc-new", "session", "2026-10-20T06:34:00.000Z"],
+      ["proc-other", "other-session", "2026-10-20T06:35:00.000Z"],
+    ] as const) {
+      await store.append({
+        processId,
+        sessionId,
+        timestamp,
+        type: "message",
+        data: { uuid: processId },
+      });
+    }
+    await expect(
+      store.replay({ sessionId: "session", allProcesses: true }),
+    ).resolves.toMatchObject([
+      { processId: "proc-old", seq: 1 },
+      { processId: "proc-new", seq: 1 },
+    ]);
+    await expect(store.replay({ sessionId: "session" })).resolves.toMatchObject(
+      [{ processId: "proc-new", seq: 1 }],
+    );
+    for (const options of [
+      {},
+      { sessionId: "session", afterSeq: 1 },
+      { sessionId: "session", processId: "proc-old" },
+    ])
+      await expect(
+        store.replay({ ...options, allProcesses: true }),
+      ).rejects.toThrow("Session history replay requires");
+  });
+
   it("keeps the previous segment readable after rotation", async () => {
     const store = new RuntimeEventStore({
       eventsDir: testDir,

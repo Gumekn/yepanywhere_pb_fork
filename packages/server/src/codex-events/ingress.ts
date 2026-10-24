@@ -11,10 +11,13 @@ import {
   type CodexEventJournalMode,
   shouldJournalCodexEvent,
 } from "./journal-mode.js";
+import { CODEX_EVENT_DELTA_METHODS } from "./journal-retention.js";
 import { type CodexPayloadOptions, serializeCodexPayload } from "./payload.js";
 import { reduceCodexEvent, reduceCodexEvents } from "./reducer.js";
 import type { CodexEventStore } from "./store.js";
 import {
+  CODEX_EVENT_SCHEMA_NAME,
+  CODEX_EVENT_SCHEMA_VERSION,
   type CanonicalCodexSessionState,
   type CodexCallId,
   type CodexEventEnvelope,
@@ -30,6 +33,18 @@ export interface CodexNativeNotification {
   params?: unknown;
   /** Top-level app-server envelope timestamp, not part of params. */
   emittedAtMs?: number;
+}
+
+export interface CodexNotificationIngestOptions {
+  /**
+   * Skip payload serialization for a delta this journal mode will not retain.
+   *
+   * Legacy live projection reads the raw notification. The returned envelope
+   * only needs `threadId`, so child-thread traffic can still be filtered.
+   * The flag is ignored when the event is actually journaled (`full`, or any
+   * non-delta), which keeps shadow/primary payloads and journal bytes intact.
+   */
+  threadIdOnly?: boolean;
 }
 
 export interface CodexEventIngressOptions {
@@ -149,7 +164,16 @@ export class CodexEventIngress {
 
   async ingestNotification(
     notification: CodexNativeNotification,
+    options?: CodexNotificationIngestOptions,
   ): Promise<CodexEventEnvelope> {
+    if (
+      options?.threadIdOnly &&
+      this.canSkipDeltaPayload(notification.method)
+    ) {
+      // No persist lock: this envelope is not sequenced, indexed, or reduced.
+      // `eventCounter` is only advanced synchronously, between awaits.
+      return this.ephemeralDeltaEnvelope(notification);
+    }
     const payload = safePayload(notification.method, notification.params, {
       workspaceRoot: this.workspaceRoot,
     });
@@ -370,6 +394,54 @@ export class CodexEventIngress {
     };
   }
 
+  /**
+   * Deltas are the high-frequency case. Lifecycle and minimal modes already
+   * refuse to journal them; legacy projection never reads the serialized
+   * copy. Shadow and primary omit `threadIdOnly`, so they still pay for it.
+   */
+  private canSkipDeltaPayload(method: string): boolean {
+    return (
+      CODEX_EVENT_DELTA_METHODS.has(method) &&
+      !shouldJournalCodexEvent(this.journalMode, {
+        method,
+        direction: "server_notification",
+      })
+    );
+  }
+
+  private ephemeralDeltaEnvelope(
+    notification: CodexNativeNotification,
+  ): CodexEventEnvelope {
+    const eventId = `${this.connectionId}:${++this.eventCounter}`;
+    const threadId = readNotificationThreadId(notification.params);
+    const receivedAtMs = this.now();
+    return {
+      schema: {
+        name: CODEX_EVENT_SCHEMA_NAME,
+        version: CODEX_EVENT_SCHEMA_VERSION,
+      },
+      eventId,
+      provider: "codex",
+      runtime: structuredClone(this.runtime),
+      ...(this.projectId === undefined ? {} : { projectId: this.projectId }),
+      ...(this.accountId === undefined ? {} : { accountId: this.accountId }),
+      sessionId: this.sessionId,
+      ...(threadId === undefined ? {} : { threadId }),
+      correlationId: threadId ?? eventId,
+      method: notification.method,
+      direction: "server_notification",
+      phase: "observed",
+      ...(notification.emittedAtMs === undefined
+        ? {}
+        : { appServerEmittedAtMs: notification.emittedAtMs }),
+      receivedAtMs,
+      persistedAtMs: receivedAtMs,
+      sequence: 0,
+      payload: { safety: "safe", data: null },
+      source: { connectionId: this.connectionId, replay: false },
+    };
+  }
+
   private async persist(
     input: Omit<
       Parameters<typeof createCodexEventDraft>[0],
@@ -563,6 +635,25 @@ function readString(
   return typeof candidate === "string" && candidate.length > 0
     ? candidate
     : undefined;
+}
+
+/**
+ * Same thread identity `createCodexEventDraft` reads off a serialized payload:
+ * top-level `threadId`, otherwise `thread.id`. Other fields are not visited.
+ */
+function readNotificationThreadId(params: unknown): string | undefined {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    return undefined;
+  }
+  const record = params as Record<string, unknown>;
+  const direct = record.threadId;
+  if (typeof direct === "string" && direct.length > 0) return direct;
+  const thread = record.thread;
+  if (thread === null || typeof thread !== "object" || Array.isArray(thread)) {
+    return undefined;
+  }
+  const nested = (thread as Record<string, unknown>).id;
+  return typeof nested === "string" && nested.length > 0 ? nested : undefined;
 }
 
 function readNestedId(

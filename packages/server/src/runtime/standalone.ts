@@ -102,6 +102,7 @@ export async function runAgentRuntimeOnly(
       eventBus,
       maxWorkers: config.maxWorkers,
       idlePreemptThresholdMs: config.idlePreemptThresholdMs,
+      residentIdleTtlMs: config.residentIdleTtlMs,
       maxQueueSize: config.maxQueueSize,
       enabledProviders: config.enabledProviders,
     });
@@ -116,6 +117,7 @@ export async function runAgentRuntimeOnly(
       eventBus,
       eventStore,
     );
+    void eventStore?.warmSessionIndex();
   }
 
   await controller.start();

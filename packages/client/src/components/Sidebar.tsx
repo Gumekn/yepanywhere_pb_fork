@@ -1,5 +1,5 @@
 import { SLASH_COMMAND_SESSION_KIND } from "@yep-anywhere/shared";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { GlobalSessionItem } from "../api/client";
@@ -111,15 +111,97 @@ function groupSessionsByProject(
 
   const groups = Array.from(groupsByProject.values());
 
-  // Keep pins first, then sort each project's sessions by activity. Group order
-  // itself stays in hook (insertion) order so an active session's project does
-  // not jump under the pointer during high-frequency live updates.
+  // Pins stay first within their project; project order follows the newest
+  // session timestamp even when the hook updates existing sessions in place.
   for (const group of groups) {
     group.sessions.sort(compareSessionsByPinAndUpdatedAt);
   }
 
-  return groups;
+  return groups.sort(
+    (a, b) =>
+      new Date(b.latestUpdatedAt).getTime() -
+      new Date(a.latestUpdatedAt).getTime(),
+  );
 }
+
+interface SidebarSessionItemProps {
+  session: GlobalSessionItem;
+  showProjectName: boolean;
+  basePath: string;
+  isCurrent: boolean;
+  hasDraft: boolean;
+  isSelected: boolean;
+  isSelectionMode: boolean;
+  onSelect: (sessionId: string, selected: boolean) => void;
+  onSelectForArchive: (sessionId: string) => void;
+  onNavigate: () => void;
+}
+
+// Keep callbacks inside this boundary so a sibling's live event does not
+// render every visible card. Selection, drafts and navigation remain reactive.
+const SidebarSessionItem = memo(function SidebarSessionItem({
+  session,
+  showProjectName,
+  basePath,
+  isCurrent,
+  hasDraft,
+  isSelected,
+  isSelectionMode,
+  onSelect,
+  onSelectForArchive,
+  onNavigate,
+}: SidebarSessionItemProps) {
+  return (
+    <SessionListItem
+      sessionId={session.id}
+      projectId={session.projectId}
+      title={getSessionListTitle(session)}
+      fullTitle={getSessionListTitle(session)}
+      updatedAt={session.updatedAt}
+      provider={session.provider}
+      model={session.model}
+      reasoningEffort={session.reasoningEffort}
+      serviceTier={session.serviceTier}
+      createdBy={session.createdBy}
+      originator={session.originator}
+      sessionSource={session.source}
+      status={session.ownership}
+      runtime={session.runtime}
+      pendingInputType={session.pendingInputType}
+      hasUnread={session.hasUnread}
+      interrupted={session.interrupted}
+      lastTurnStatus={session.lastTurnStatus}
+      lastErrorMessage={session.lastErrorMessage}
+      retryStatus={session.retryStatus}
+      isPinned={session.isStarred}
+      isArchived={session.isArchived}
+      mode="compact"
+      isCurrent={isCurrent}
+      activity={session.activity}
+      showProjectName={showProjectName}
+      projectName={session.projectName}
+      basePath={basePath}
+      messageCount={session.messageCount}
+      cumulativeUsage={session.cumulativeUsage}
+      compactCount={session.compactCount}
+      compactEvents={session.compactEvents}
+      hasDraft={hasDraft}
+      isSelected={isSelected}
+      isSelectionMode={isSelectionMode}
+      onSelect={isSelectionMode ? onSelect : undefined}
+      onSelectForArchive={() => {
+        onSelectForArchive(session.id);
+      }}
+      onNavigate={() => {
+        if (isSelectionMode) {
+          onSelect(session.id, !isSelected);
+          return;
+        }
+        onNavigate();
+      }}
+    />
+  );
+});
 
 interface SidebarProps {
   isOpen: boolean;
@@ -190,6 +272,8 @@ export function Sidebar({
     refetch: refetchProjects,
   } = useRecentProjects({
     enabled: shouldLoadSessionLists,
+    // Group counts/activity come from the session cards, not project snapshots.
+    liveUpdates: false,
   });
   const newSessionProjectId = resolvePreferredProjectId(
     projects,
@@ -244,31 +328,19 @@ export function Sidebar({
   useEffect(() => {
     if (!shouldLoadSessionLists) return;
 
-    const unsubscribeMetadata = activityBus.on(
-      "session-metadata-changed",
-      (event) => {
-        if (
-          event.archived !== undefined ||
-          event.pinned !== undefined ||
-          event.starred !== undefined
-        ) {
-          void refetchSessionLists();
-        }
-      },
-    );
+    // useGlobalSessions already reconciles sessions once on reconnect/refresh.
     const unsubscribeReconnect = activityBus.on("reconnect", () => {
-      void refetchSessionLists();
+      void refetchProjects();
     });
     const unsubscribeRefresh = activityBus.on("refresh", () => {
-      void refetchSessionLists();
+      void refetchProjects();
     });
 
     return () => {
-      unsubscribeMetadata();
       unsubscribeReconnect();
       unsubscribeRefresh();
     };
-  }, [refetchSessionLists, shouldLoadSessionLists]);
+  }, [refetchProjects, shouldLoadSessionLists]);
 
   const handleTouchStart = (e: React.TouchEvent) => {
     touchStartX.current = e.touches[0]?.clientX ?? null;
@@ -362,8 +434,7 @@ export function Sidebar({
   // Sessions updated in the last 24 hours, plus every pinned session. An old
   // pin is elevated into its project's recent card instead of living in a
   // second, independently maintained collection.
-  // Keep the hook-provided order stable so high-frequency live updates don't
-  // move an active session back under the user's pointer while browsing.
+  // Ordering is applied after grouping by each project's latest activity.
   const recentSessions = useMemo(() => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const isWithinLastDay = (date: Date) => date.getTime() >= oneDayAgo;
@@ -376,7 +447,6 @@ export function Sidebar({
   }, [globalSessions]);
 
   // Older sessions (unpinned, non-archived, NOT in last 24 hours).
-  // Preserve stable ordering here for the same reason as recentSessions.
   const olderSessions = useMemo(() => {
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const isOlderThanOneDay = (date: Date) => date.getTime() < oneDayAgo;
@@ -547,7 +617,13 @@ export function Sidebar({
       ...allOlderProjectGroups,
     ]
       .filter((group) =>
-        group.sessions.some((session) => session.id === currentSessionId),
+        group.sessions.some(
+          (session) =>
+            session.id === currentSessionId ||
+            (currentSessionId !== undefined &&
+              (session.forkFamilySessionIds?.includes(currentSessionId) ??
+                false)),
+        ),
       )
       .map((group) => group.key);
 
@@ -581,59 +657,34 @@ export function Sidebar({
     });
   };
 
+  const handleSelectForArchive = useCallback(
+    (sessionId: string) => {
+      setIsSelectionMode(true);
+      handleSelectSession(sessionId, true);
+    },
+    [handleSelectSession],
+  );
+
   const renderSessionListItem = (
     session: GlobalSessionItem,
     showProjectName: boolean,
   ) => (
-    <SessionListItem
+    <SidebarSessionItem
       key={session.id}
-      sessionId={session.id}
-      projectId={session.projectId}
-      title={getSessionListTitle(session)}
-      fullTitle={getSessionListTitle(session)}
-      updatedAt={session.updatedAt}
-      provider={session.provider}
-      model={session.model}
-      reasoningEffort={session.reasoningEffort}
-      serviceTier={session.serviceTier}
-      createdBy={session.createdBy}
-      originator={session.originator}
-      sessionSource={session.source}
-      status={session.ownership}
-      runtime={session.runtime}
-      pendingInputType={session.pendingInputType}
-      hasUnread={session.hasUnread}
-      interrupted={session.interrupted}
-      lastTurnStatus={session.lastTurnStatus}
-      lastErrorMessage={session.lastErrorMessage}
-      retryStatus={session.retryStatus}
-      isPinned={session.isStarred}
-      isArchived={session.isArchived}
-      mode="compact"
-      isCurrent={session.id === currentSessionId}
-      activity={session.activity}
+      session={session}
       showProjectName={showProjectName}
-      projectName={session.projectName}
       basePath={basePath}
-      messageCount={session.messageCount}
-      cumulativeUsage={session.cumulativeUsage}
-      compactCount={session.compactCount}
-      compactEvents={session.compactEvents}
+      isCurrent={
+        session.id === currentSessionId ||
+        (currentSessionId !== undefined &&
+          (session.forkFamilySessionIds?.includes(currentSessionId) ?? false))
+      }
       hasDraft={drafts.has(session.id)}
       isSelected={selectedSessionIds.has(session.id)}
       isSelectionMode={isSelectionMode}
-      onSelect={isSelectionMode ? handleSelectSession : undefined}
-      onSelectForArchive={() => {
-        setIsSelectionMode(true);
-        handleSelectSession(session.id, true);
-      }}
-      onNavigate={() => {
-        if (isSelectionMode) {
-          handleSelectSession(session.id, !selectedSessionIds.has(session.id));
-          return;
-        }
-        onNavigate();
-      }}
+      onSelect={handleSelectSession}
+      onSelectForArchive={handleSelectForArchive}
+      onNavigate={onNavigate}
     />
   );
 
@@ -642,7 +693,11 @@ export function Sidebar({
       {groups.map((group) => {
         const isExpanded = expandedProjectGroups.has(group.key);
         const isCurrentGroup = group.sessions.some(
-          (session) => session.id === currentSessionId,
+          (session) =>
+            session.id === currentSessionId ||
+            (currentSessionId !== undefined &&
+              (session.forkFamilySessionIds?.includes(currentSessionId) ??
+                false)),
         );
         const runningLabel = t("agentsRunning");
         const unreadLabel = t("globalSessionsStatusUnread");
@@ -910,6 +965,20 @@ export function Sidebar({
               to="/terminal"
               icon={SidebarIcons.terminal}
               label={t("sidebarTerminal")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
+            <SidebarNavItem
+              to="/dsh"
+              icon={SidebarIcons.dsh}
+              label={t("sidebarDsh")}
+              onClick={onNavigate}
+              basePath={basePath}
+            />
+            <SidebarNavItem
+              to="/curl"
+              icon={SidebarIcons.curl}
+              label={t("curlTitle")}
               onClick={onNavigate}
               basePath={basePath}
             />

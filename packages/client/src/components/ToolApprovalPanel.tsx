@@ -144,14 +144,17 @@ export function ToolApprovalPanel({
   const isScopedMcpApproval = mcpApprovalScopes.length > 0;
   const isPermissionsApproval = approvalKind === "permissions";
   const usesProviderPersistentApproval =
-    approvalKind === "command_execution" || approvalKind === "file_change";
+    approvalKind === "command_execution" ||
+    approvalKind === "file_change" ||
+    approvalKind === "acp_tool_call";
   const approvalPersistence = getToolApprovalPersistence(request.toolInput);
   const canApproveMcpForSession = mcpApprovalScopes.includes("session");
   const canApproveMcpAlways = mcpApprovalScopes.includes("always");
   const canApprovePersistently =
     !isScopedMcpApproval &&
     !isPermissionsApproval &&
-    (isEditTool || approvalPersistence !== undefined);
+    ((approvalKind !== "acp_tool_call" && isEditTool) ||
+      approvalPersistence !== undefined);
   const canDenyWithFeedback =
     Boolean(onDenyWithFeedback) &&
     supportsToolApprovalFeedback(request.toolInput, request.source);
@@ -249,6 +252,16 @@ export function ToolApprovalPanel({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (submitting || !armed) return;
+      if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+      const editableTarget =
+        e.target instanceof HTMLElement
+          ? e.target.closest(
+              'input, textarea, select, [contenteditable]:not([contenteditable="false"])',
+            )
+          : null;
+      // Historical editing can coexist with an approval. Typing there must
+      // never make a permission decision for the waiting tool.
+      if (editableTarget && editableTarget !== feedbackInputRef.current) return;
 
       // Don't handle shortcuts when typing in feedback
       if (showFeedback) {
@@ -516,6 +529,13 @@ export function ToolApprovalPanel({
             )}
           </div>
 
+          {isExitPlanMode(request.toolName) &&
+            getString(asRecord(request.toolInput)?.plan) && (
+              <pre className="tool-approval-plan-content">
+                {getString(asRecord(request.toolInput)?.plan)}
+              </pre>
+            )}
+
           <div className="tool-approval-options">
             {isPermissionsApproval ? (
               <>
@@ -683,7 +703,9 @@ export function ToolApprovalPanel({
                           ? t("toolApprovalApplyCommandPolicy")
                           : approvalPersistence?.kind === "network-policy"
                             ? t("toolApprovalApplyNetworkPolicy")
-                            : t("toolApprovalAllowForSession")
+                            : approvalPersistence?.kind === "provider-policy"
+                              ? t("toolApprovalAlwaysAllow")
+                              : t("toolApprovalAllowForSession")
                         : t("toolApprovalYesDontAsk")}
                     </span>
                   </button>

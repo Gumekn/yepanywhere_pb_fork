@@ -89,7 +89,7 @@ main.session-messages {
 </head>
 <body class="${escapeHtml(bodyClasses)}">
 ${clone.outerHTML}
-<footer style="text-align:center;padding:2rem 0 1rem;opacity:0.5;font-size:12px;pointer-events:auto;user-select:auto;">
+<footer style="text-align:center;padding:2rem 0 1rem;opacity:0.5;font-size:var(--font-size-sm);pointer-events:auto;user-select:auto;">
 Shared from <a href="https://yepanywhere.com" style="pointer-events:auto">Yep Anywhere</a>
 </footer>
 </body>

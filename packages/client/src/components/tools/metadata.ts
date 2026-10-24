@@ -1,3 +1,8 @@
+import {
+  SHARED_RENDERER_TOOL_ALIASES,
+  lookupToolAlias,
+} from "@yep-anywhere/shared";
+
 /** Pure tool identity and summary contracts; no renderer imports. */
 export interface ToolSummaryMethods {
   getUseSummary?: (input: unknown) => string;
@@ -9,10 +14,9 @@ export interface ToolSummaryMethods {
 }
 
 const TOOL_NAME_ALIASES: Record<string, string> = {
+  ...SHARED_RENDERER_TOOL_ALIASES,
   bash: "Bash",
   shell: "Bash",
-  shell_command: "Bash",
-  exec_command: "Bash",
   read: "Read",
   write: "Write",
   edit: "Edit",
@@ -20,12 +24,7 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
   grep: "Grep",
   todowrite: "TodoWrite",
   todo: "TodoWrite",
-  write_stdin: "WriteStdin",
   wait: "CodexWait",
-  update_plan: "UpdatePlan",
-  apply_patch: "Edit",
-  web_search_call: "WebSearch",
-  search_query: "WebSearch",
   websearch: "WebSearch",
   webrun: "WebSearch", // codex web.run (namespace "web" + name "run")
   web__run: "WebSearch", // codex code-mode nested web.run
@@ -41,9 +40,5 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
 };
 
 export function canonicalizeToolName(toolName: string): string {
-  return (
-    TOOL_NAME_ALIASES[toolName] ??
-    TOOL_NAME_ALIASES[toolName.toLowerCase()] ??
-    toolName
-  );
+  return lookupToolAlias(TOOL_NAME_ALIASES, toolName);
 }

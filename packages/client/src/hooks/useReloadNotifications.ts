@@ -29,6 +29,16 @@ interface DevStatus {
 }
 
 /**
+ * Production servers do not expose /dev/status and answer 404. Remember that
+ * for this page instead of asking again on every reconnect.
+ */
+let devStatusUnavailable = false;
+
+export function resetDevStatusAvailabilityForTests(): void {
+  devStatusUnavailable = false;
+}
+
+/**
  * Hook to manage reload notifications when running in manual reload mode.
  * Listens for source-change events via the global activityBus.
  */
@@ -49,6 +59,14 @@ export function useReloadNotifications() {
   });
   const runtimeDirtyGenerationRef = useRef<string | null>(null);
   const dismissedRuntimeGenerationRef = useRef<string | null>(null);
+
+  const applyWorkerActivity = useCallback((data: WorkerActivityEvent) => {
+    setWorkerActivity((prev) => ({
+      ...data,
+      // Count-only events must not hide the production runtime selector.
+      runtimeMode: data.runtimeMode ?? prev.runtimeMode,
+    }));
+  }, []);
 
   const applyRuntimeDirtyStatus = useCallback((data: DevStatus) => {
     const generation =
@@ -73,46 +91,35 @@ export function useReloadNotifications() {
     }
 
     // Sync dev status
-    fetchJSON<DevStatus>("/dev/status")
-      .then((data) => {
-        setDevStatus(data);
-        if (data && !data.backendDirty) {
-          setPendingReloads((prev) => ({ ...prev, backend: false }));
-        }
-        applyRuntimeDirtyStatus(data);
-      })
-      .catch(() => {
-        // Ignore errors
-      });
+    if (!devStatusUnavailable)
+      fetchJSON<DevStatus>("/dev/status")
+        .then((data) => {
+          setDevStatus(data);
+          setPendingReloads((prev) => ({
+            ...prev,
+            backend: data.backendDirty === true,
+          }));
+          applyRuntimeDirtyStatus(data);
+        })
+        .catch((error: { status?: number }) => {
+          if (error?.status === 404) devStatusUnavailable = true;
+        });
 
     // Sync worker activity
     fetchJSON<WorkerActivityEvent>("/status/workers")
       .then((data) => {
-        if (data) setWorkerActivity(data);
+        if (data) applyWorkerActivity(data);
       })
       .catch(() => {
         // Ignore errors
       });
-  }, [applyRuntimeDirtyStatus]);
+  }, [applyRuntimeDirtyStatus, applyWorkerActivity]);
 
-  // Check if server is in dev mode and get persisted dirty state
+  // Production does not expose /dev/status. Always load /status/workers too,
+  // even when the shared activity connection was established before mounting.
   useEffect(() => {
-    if (window.location.pathname === "/login") {
-      return;
-    }
-
-    fetchJSON<DevStatus>("/dev/status")
-      .then((data) => {
-        setDevStatus(data);
-        if (data.backendDirty) {
-          setPendingReloads((prev) => ({ ...prev, backend: true }));
-        }
-        applyRuntimeDirtyStatus(data);
-      })
-      .catch(() => {
-        setDevStatus(null);
-      });
-  }, [applyRuntimeDirtyStatus]);
+    syncFromServer();
+  }, [syncFromServer]);
 
   // Subscribe to events from the bus
   useEffect(() => {
@@ -134,9 +141,7 @@ export function useReloadNotifications() {
     );
 
     unsubscribers.push(
-      activityBus.on("worker-activity-changed", (data: WorkerActivityEvent) => {
-        setWorkerActivity(data);
-      }),
+      activityBus.on("worker-activity-changed", applyWorkerActivity),
     );
 
     // On reconnect, sync state from server
@@ -159,7 +164,7 @@ export function useReloadNotifications() {
         unsub();
       }
     };
-  }, [syncFromServer]);
+  }, [syncFromServer, applyWorkerActivity]);
 
   // Sync connected state with bus
   useEffect(() => {
@@ -170,16 +175,13 @@ export function useReloadNotifications() {
     return () => clearInterval(interval);
   }, []);
 
-  // Initial sync when dev mode is detected
-  useEffect(() => {
-    if (devStatus?.noBackendReload || devStatus?.noFrontendReload) {
-      syncFromServer();
-    }
-  }, [devStatus, syncFromServer]);
-
   useEffect(() => {
     if (devStatus?.runtimeMode !== "external") return;
-    const interval = setInterval(syncFromServer, 2_000);
+    const interval = setInterval(() => {
+      // Visibility restore triggers a refresh through the activity bus.
+      if (typeof document !== "undefined" && document.hidden) return;
+      syncFromServer();
+    }, 2_000);
     return () => clearInterval(interval);
   }, [devStatus?.runtimeMode, syncFromServer]);
 
@@ -265,6 +267,9 @@ export function useReloadNotifications() {
     devStatus?.noFrontendReload ||
     devStatus?.runtimeMode === "external";
 
+  // The worker endpoint is available in production; dev status is a fallback.
+  const runtimeMode = workerActivity.runtimeMode ?? devStatus?.runtimeMode;
+
   return {
     isManualReloadMode,
     pendingReloads,
@@ -276,8 +281,8 @@ export function useReloadNotifications() {
     dismiss,
     dismissAll,
     workerActivity,
-    unsafeToRestart:
-      workerActivity.hasActiveWork && workerActivity.runtimeMode !== "external",
+    runtimeMode,
+    unsafeToRestart: workerActivity.hasActiveWork && runtimeMode !== "external",
     unsafeToReloadRuntime: workerActivity.hasActiveWork,
   };
 }

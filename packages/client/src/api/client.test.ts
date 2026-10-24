@@ -24,12 +24,12 @@ describe("api.updateServerSettings", () => {
 
   it("serializes undefined setting values as null so clears reach the server", async () => {
     await api.updateServerSettings({
-      globalInstructions: undefined,
+      allowedHosts: undefined,
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [, request] = fetchMock.mock.calls[0] ?? [];
-    expect(request?.body).toBe(JSON.stringify({ globalInstructions: null }));
+    expect(request?.body).toBe(JSON.stringify({ allowedHosts: null }));
   });
 });
 

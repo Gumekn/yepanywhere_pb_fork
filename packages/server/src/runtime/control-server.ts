@@ -1,6 +1,8 @@
 import { timingSafeEqual } from "node:crypto";
+import { SideConversationRequestSchema } from "@yep-anywhere/shared";
 import { type Context, Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { pendingInputTypeFromRequest } from "../sessions/session-runtime.js";
 import type {
   CreateRuntimeSessionRequest,
   QueueRuntimeMessageRequest,
@@ -53,6 +55,25 @@ export function createRuntimeControlApp(
   app.put("/provider-settings", async (c) => {
     const body = await c.req.json<RuntimeProviderSettings>();
     await controller.updateProviderSettings(body);
+    return c.json({ ok: true });
+  });
+  app.post("/cursor/prepare", async (c) => {
+    const body = await c.req.json<{
+      cwd: string;
+      model?: string;
+      permissionMode?: RuntimePermissionModeRequest["mode"];
+    }>();
+    await controller.prepareCursorSession(body);
+    return c.json({ ok: true });
+  });
+  app.post("/cursor/prepare/discard", async (c) => {
+    const body = await c.req.json<{ cwd: string; model?: string }>();
+    await controller.discardCursorPrepare(body);
+    return c.json({ ok: true });
+  });
+  app.post("/cursor/warm", async (c) => {
+    const body = await c.req.json<{ model?: string }>();
+    await controller.warmCursorAuth(body.model);
     return c.json({ ok: true });
   });
   app.get("/processes", async (c) =>
@@ -164,6 +185,19 @@ export function createRuntimeControlApp(
         ...body,
         sessionId: c.req.param("sessionId"),
       }),
+    );
+  });
+  app.post("/sessions/:sessionId/side-conversation", async (c) => {
+    const parsed = SideConversationRequestSchema.safeParse(
+      await c.req.json().catch(() => null),
+    );
+    if (!parsed.success)
+      return c.json({ error: "Invalid side conversation request" }, 400);
+    return c.json(
+      (await controller.sideConversation?.(
+        c.req.param("sessionId"),
+        parsed.data,
+      )) ?? { supported: false, reason: "unsupported" },
     );
   });
   app.post("/sessions/:sessionId/codex-control", async (c) => {
@@ -300,6 +334,9 @@ export function createRuntimeControlApp(
         processId: c.req.query("processId"),
         sessionId: c.req.query("sessionId"),
         afterSeq: afterSeq ? Number.parseInt(afterSeq, 10) : undefined,
+        ...(c.req.query("allProcesses") === "true"
+          ? { allProcesses: true }
+          : {}),
       }),
     });
   });
@@ -317,16 +354,105 @@ export function createRuntimeControlApp(
 
     return streamSSE(c, async (stream) => {
       let writeChain = Promise.resolve();
-      writer = (event) => {
-        writeChain = writeChain.then(() =>
-          stream.writeSSE({ data: JSON.stringify({ event }) }),
-        );
+      let finished = false;
+      let finishStream!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        finishStream = () => {
+          finished = true;
+          resolve();
+        };
+      });
+      stream.onAbort(finishStream);
+      const enqueue = (write: () => Promise<unknown>) => {
+        writeChain = writeChain
+          .then(async () => {
+            if (!finished) await write();
+          })
+          .catch(finishStream);
         return writeChain;
       };
-      for (const event of buffered.splice(0)) await writer(event);
-      await new Promise<void>((resolve) => stream.onAbort(resolve));
-      await writeChain.catch(() => {});
-      subscription.cleanup();
+      const writeEvent = (event: unknown) =>
+        enqueue(() => stream.writeSSE({ data: JSON.stringify({ event }) }));
+      // Activity can be silent for an entire long turn. Flush headers now and
+      // keep the HTTP stream alive independently of session message traffic.
+      const heartbeat = setInterval(() => {
+        void enqueue(() => stream.write(": heartbeat\n\n"));
+      }, 15_000);
+      heartbeat.unref();
+      try {
+        await enqueue(() => stream.write(": connected\n\n"));
+        if (c.req.query("reconcile") === "true") {
+          // Subscribe before reading snapshots, then drain buffered changes so
+          // a turn ending during reconciliation cannot disappear in the gap.
+          const [processes, terminated, activity] = await Promise.all([
+            controller.listProcessSnapshots(),
+            controller.listRecentlyTerminatedProcesses(),
+            controller.getWorkerActivity(),
+          ]);
+          const timestamp = new Date().toISOString();
+          const liveIds = new Set(
+            processes.map((process) => process.sessionId),
+          );
+          await writeEvent({
+            type: "worker-activity-changed",
+            ...activity,
+            timestamp,
+          });
+          for (const process of processes) {
+            await writeEvent({
+              type: "session-status-changed",
+              sessionId: process.sessionId,
+              projectId: process.projectId,
+              ownership: {
+                owner: "self",
+                processId: process.id,
+                permissionMode: process.permissionMode,
+                modeVersion: process.modeVersion,
+              },
+              activity: process.state,
+              timestamp,
+            });
+            await writeEvent({
+              type: "process-state-changed",
+              sessionId: process.sessionId,
+              projectId: process.projectId,
+              activity: process.state,
+              pendingInputType: pendingInputTypeFromRequest(
+                process.pendingInputRequest,
+              ),
+              retryStatus: process.retryStatus,
+              timestamp,
+            });
+          }
+          for (const process of terminated) {
+            if (liveIds.has(process.sessionId)) continue;
+            await writeEvent({
+              type: "session-status-changed",
+              sessionId: process.sessionId,
+              projectId: process.projectId,
+              ownership: { owner: "none" },
+              timestamp,
+            });
+          }
+          for (const process of processes) {
+            await writeEvent({
+              type: "session-updated",
+              sessionId: process.sessionId,
+              projectId: process.projectId,
+              timestamp,
+            });
+          }
+        }
+        // Set the writer synchronously with draining the buffer: newly arriving
+        // events are appended to the same write chain after buffered events.
+        for (const event of buffered.splice(0)) void writeEvent(event);
+        writer = writeEvent;
+        await closed;
+      } finally {
+        clearInterval(heartbeat);
+        writer = null;
+        subscription.cleanup();
+      }
     });
   });
 

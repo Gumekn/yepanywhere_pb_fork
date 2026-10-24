@@ -428,8 +428,12 @@ describe("Supervisor", () => {
         startSession,
         getAvailableModels: async () => [],
       };
+      const events: BusEvent[] = [];
+      const eventBus = new EventBus();
+      eventBus.subscribe((event) => events.push(event));
       const providerSupervisor = new Supervisor({
         provider,
+        eventBus,
         idleTimeoutMs: 100,
       });
 
@@ -460,6 +464,15 @@ describe("Supervisor", () => {
         (process as { id: string }).id,
       );
 
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "session-created",
+          session: expect.objectContaining({
+            id: "sess-123-fork",
+            forkParentSessionId: "sess-123",
+          }),
+        }),
+      );
       aborted = true;
       await providerSupervisor.abortProcess((process as { id: string }).id);
     });
@@ -924,6 +937,129 @@ describe("Supervisor", () => {
     });
   });
 
+  describe("resident idle TTL", () => {
+    function createResidentProvider() {
+      const aborts: string[] = [];
+      const startSession = vi.fn(async (options: StartSessionOptions) => {
+        const sessionId = options.resumeSessionId ?? "unexpected-session";
+        let aborted = false;
+        async function* iterator() {
+          yield { type: "system", subtype: "init", session_id: sessionId };
+          while (!aborted) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+        }
+        return {
+          iterator: iterator(),
+          queue: new MessageQueue(),
+          abort: () => {
+            aborted = true;
+            aborts.push(sessionId);
+          },
+          isProcessAlive: () => !aborted,
+        };
+      });
+      return { provider: createCodexTestProvider(startSession), aborts };
+    }
+
+    async function resumeIdle(target: Supervisor, sessionId: string) {
+      const process = await target.resumeSession(
+        sessionId,
+        "/tmp/test",
+        undefined,
+        undefined,
+        undefined,
+        { requireImmediate: true },
+      );
+      const proc = process as {
+        id: string;
+        state: { type: string };
+        setHold(enabled: boolean): void;
+      };
+      expect(proc.state.type).toBe("idle");
+      return proc;
+    }
+
+    it("releases a live provider process once it is idle past the TTL", async () => {
+      const { provider, aborts } = createResidentProvider();
+      const eventBus = new EventBus();
+      const events: BusEvent[] = [];
+      eventBus.subscribe((event) => events.push(event));
+      const target = new Supervisor({
+        provider,
+        eventBus,
+        idleTimeoutMs: 100,
+        residentIdleTtlMs: 60_000,
+      });
+
+      try {
+        await resumeIdle(target, "sess-ttl");
+
+        await expect(
+          target.reclaimExpiredIdleProcesses(Date.now() + 30_000),
+        ).resolves.toBe(0);
+        expect(target.getProcessForSession("sess-ttl")).toBeDefined();
+
+        await expect(
+          target.reclaimExpiredIdleProcesses(Date.now() + 61_000),
+        ).resolves.toBe(1);
+        expect(aborts).toEqual(["sess-ttl"]);
+        expect(target.getProcessForSession("sess-ttl")).toBeUndefined();
+        expect(target.getAllProcesses()).toHaveLength(0);
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "session-aborted",
+            sessionId: "sess-ttl",
+          }),
+        );
+      } finally {
+        await target.shutdown();
+      }
+    });
+
+    it("never releases held processes", async () => {
+      const { provider, aborts } = createResidentProvider();
+      const target = new Supervisor({
+        provider,
+        idleTimeoutMs: 100,
+        residentIdleTtlMs: 60_000,
+      });
+
+      try {
+        const process = await resumeIdle(target, "sess-held");
+        process.setHold(true);
+
+        await expect(
+          target.reclaimExpiredIdleProcesses(Date.now() + 10 * 60_000),
+        ).resolves.toBe(0);
+        expect(aborts).toEqual([]);
+        expect(target.getProcessForSession("sess-held")?.id).toBe(process.id);
+      } finally {
+        await target.shutdown();
+      }
+    });
+
+    it("keeps idle processes forever when the TTL is 0", async () => {
+      const { provider, aborts } = createResidentProvider();
+      const target = new Supervisor({
+        provider,
+        idleTimeoutMs: 100,
+        residentIdleTtlMs: 0,
+      });
+
+      try {
+        await resumeIdle(target, "sess-forever");
+        await expect(
+          target.reclaimExpiredIdleProcesses(Date.now() + 24 * 60 * 60_000),
+        ).resolves.toBe(0);
+        expect(aborts).toEqual([]);
+        expect(target.getProcessForSession("sess-forever")).toBeDefined();
+      } finally {
+        await target.shutdown();
+      }
+    });
+  });
+
   describe("worker admission", () => {
     it("rejects immediate-only starts before queue admission", async () => {
       let invocation = 0;
@@ -1118,6 +1254,83 @@ describe("Supervisor", () => {
   });
 
   describe("queue propagation", () => {
+    it.each([
+      { providerName: "codex", createOnly: true, replaces: true },
+      { providerName: "codex", createOnly: false, replaces: false },
+      { providerName: "pi", createOnly: true, replaces: false },
+    ] as const)(
+      "preserves empty-thread provenance on Feishu MCP restart: $providerName / $createOnly",
+      async ({ providerName, createOnly, replaces }) => {
+        const startSession = vi.fn(async (options: StartSessionOptions) => {
+          let aborted = false;
+          async function* iterator() {
+            yield {
+              type: "system",
+              subtype: "init",
+              session_id: options.resumeSessionId ?? "feishu-empty",
+            };
+            if (options.initialMessage) {
+              yield { type: "result", session_id: "feishu-empty" };
+            }
+            while (!aborted) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+          }
+          return {
+            iterator: iterator(),
+            queue: new MessageQueue(),
+            abort: () => {
+              aborted = true;
+            },
+          };
+        });
+        const local = new Supervisor({
+          provider:
+            providerName === "codex"
+              ? createCodexTestProvider(startSession)
+              : createPiTestProvider(startSession),
+          idleTimeoutMs: 60_000,
+        });
+        try {
+          const started = createOnly
+            ? await local.createSession("/tmp/feishu-empty")
+            : await local.startSession("/tmp/feishu-empty", {
+                text: "previous turn",
+              });
+          if (!("id" in started)) throw new Error("Expected process");
+          await vi.waitFor(() => expect(started.state.type).toBe("idle"));
+          const feishuMcpConfig = {
+            command: "node",
+            args: ["connector.mjs"],
+            env: {},
+            enabled: true,
+            tool_timeout_sec: 240,
+          };
+          await expect(
+            local.queueMessageToSession(
+              "feishu-empty",
+              "/tmp/feishu-empty",
+              { text: "first Feishu task" },
+              undefined,
+              { feishuMcpConfig },
+              { requireImmediate: true },
+            ),
+          ).resolves.toMatchObject({ success: true, restarted: true });
+          expect(startSession).toHaveBeenCalledTimes(2);
+          expect(startSession.mock.calls[1]?.[0]).toMatchObject({
+            resumeSessionId: "feishu-empty",
+            initialMessage: { text: "first Feishu task" },
+            feishuMcpConfig,
+          });
+          expect(
+            startSession.mock.calls[1]?.[0].allowMissingRolloutReplacement,
+          ).toBe(replaces ? true : undefined);
+        } finally {
+          await local.shutdown();
+        }
+      },
+    );
+
     it("preserves model settings when a queued session starts later", async () => {
       let aborted = false;
       const startSession = vi.fn(
@@ -1318,6 +1531,66 @@ describe("Supervisor", () => {
       expect(reasoningSupervisor.getQueueInfo()).toHaveLength(0);
 
       await reasoningSupervisor.shutdown();
+    });
+
+    it("does not restart Cursor for reasoning settings it never consumes", async () => {
+      const startSession = vi.fn(async (options: StartSessionOptions) => {
+        const sessionId = options.resumeSessionId ?? "cursor-session";
+        let aborted = false;
+        async function* iterator() {
+          yield { type: "system", subtype: "init", session_id: sessionId };
+          while (!aborted) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+        }
+        return {
+          iterator: iterator(),
+          queue: new MessageQueue(),
+          abort: () => {
+            aborted = true;
+          },
+        };
+      });
+      const provider: AgentProvider = {
+        name: "cursor",
+        displayName: "Cursor",
+        supportsPermissionMode: true,
+        supportsThinkingToggle: false,
+        supportsSlashCommands: false,
+        isInstalled: async () => true,
+        isAuthenticated: async () => true,
+        getAuthStatus: async () => ({
+          installed: true,
+          authenticated: true,
+          enabled: true,
+        }),
+        getAvailableModels: async () => [],
+        startSession,
+      };
+      const cursorSupervisor = new Supervisor({ provider, idleTimeoutMs: 100 });
+      const started = await cursorSupervisor.startSession(
+        "/tmp/cursor-session",
+        { text: "start" },
+      );
+      expect("id" in started).toBe(true);
+
+      // The client echoes its global thinking level and the displayed effort.
+      await expect(
+        cursorSupervisor.queueMessageToSession(
+          "cursor-session",
+          "/tmp/cursor-session",
+          { text: "next" },
+          undefined,
+          {
+            thinking: { type: "adaptive" },
+            effort: "medium",
+            reasoningEffort: "medium",
+          },
+        ),
+      ).resolves.toMatchObject({ success: true, restarted: false });
+      expect(startSession).toHaveBeenCalledTimes(1);
+
+      await cursorSupervisor.shutdown();
     });
   });
 

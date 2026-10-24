@@ -1025,8 +1025,8 @@ else
   done
 fi
 
-if ! $DO_SERVER && ! $DO_CODEX_BRIDGE && ! $DO_APK; then
-  err "Nothing to deploy: 8022 server, 4510 bridge, and APK are all disabled."
+if ! $DO_SERVER && ! $DO_CODEX_BRIDGE && ! $DO_APK && ! server_args_contain "--restart-runtime"; then
+  err "Nothing to deploy: web/API server, Codex bridge, agent runtime, and APK are all disabled."
   exit 2
 fi
 
@@ -1066,11 +1066,11 @@ if ! $DO_DEV_SERVER; then
   check_local_media_preflight
 fi
 
-if $DO_DEV_SERVER || { $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE; }; }; then
+if $DO_DEV_SERVER || { $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE || server_args_contain "--restart-runtime"; }; }; then
   ensure_pnpm
 fi
 
-if $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE; }; then
+if $RUN_CHECKS && { $DO_SERVER || $DO_CODEX_BRIDGE || server_args_contain "--restart-runtime"; }; then
   log "Running preflight checks ..."
   pnpm lint
   pnpm typecheck
@@ -1083,7 +1083,7 @@ fi
 
 if $DO_DEV_SERVER; then
   start_dev_server
-elif $DO_SERVER || $DO_CODEX_BRIDGE; then
+elif $DO_SERVER || $DO_CODEX_BRIDGE || server_args_contain "--restart-runtime"; then
   log "Deploying server services ..."
   if ! $DO_SERVER; then
     SERVER_ARGS+=(--no-restart)

@@ -15,10 +15,12 @@ import type {
   ContextCumulativeUsage,
   ContextStatusResponse,
   ContextUsage,
-  DeviceInfo,
   EnrichedRecentEntry,
   FileContentResponse,
   GitStatusInfo,
+  HarnessId,
+  HarnessUpdateInfo,
+  HarnessUpdateJob,
   LlmGatewaySessionConfig,
   NewSessionDefaults,
   PendingInputType,
@@ -159,6 +161,8 @@ export interface InboxResponse {
  * An item in the global sessions list.
  */
 export interface GlobalSessionItem {
+  forkParentSessionId?: string;
+  forkFamilySessionIds?: string[];
   id: string;
   title: string | null;
   createdAt: string;
@@ -317,10 +321,17 @@ export interface SearchResponse {
   searchDurationMs: number;
 }
 
-export type ArchiveProvider = "claude" | "codex" | "pi" | "kimi" | "zcode";
+export type ArchiveProvider =
+  | "claude"
+  | "codex"
+  | "pi"
+  | "kimi"
+  | "zcode"
+  | "cursor";
 export type ArchiveReason = "manual" | "auto";
 
 export interface ArchivedFileRecord {
+  directory?: boolean;
   kind: "session" | "agent-session" | "agent-meta";
   originalPath: string;
   archivePath: string;
@@ -574,6 +585,14 @@ export async function fetchJSON<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
+  return (await fetchResponse(path, options)).json();
+}
+
+/** Authenticated fetch shared by JSON endpoints and incremental response readers. */
+export async function fetchResponse(
+  path: string,
+  options?: RequestInit,
+): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Yep-Anywhere": "true",
@@ -639,7 +658,7 @@ export async function fetchJSON<T>(
     throw error;
   }
 
-  return res.json();
+  return res;
 }
 
 // Re-export upload functions
@@ -670,16 +689,6 @@ export interface VersionInfo {
   resumeProtocolVersion?: number;
   /** Feature capabilities supported by the server. Undefined on older servers. */
   capabilities?: string[];
-  /** Device bridge availability and update state. Undefined on older servers. */
-  deviceBridgeState?:
-    | "available"
-    | "downloadable"
-    | "update-available"
-    | "unavailable";
-  /** Installed managed bridge binary version when known. */
-  deviceBridgeVersion?: string | null;
-  /** Latest bridge release version when known. */
-  latestDeviceBridgeVersion?: string | null;
 }
 
 export interface ServerInfo {
@@ -825,6 +834,7 @@ export interface StartDeploymentRequest {
 export interface DeploymentRestartTargets {
   server?: boolean;
   codexBridge?: boolean;
+  runtime?: boolean;
 }
 
 export interface GetVersionOptions {
@@ -982,12 +992,26 @@ async function loadReportImageFile(
 }
 
 export const api = {
+  sideConversation: (
+    sessionId: string,
+    request: import("@yep-anywhere/shared").SideConversationRequest,
+  ) =>
+    fetchJSON<import("@yep-anywhere/shared").SideConversationResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/side-conversation`,
+      { method: "POST", body: JSON.stringify(request) },
+    ),
   // Version API
   getVersion: (options?: GetVersionOptions) =>
     fetchJSON<VersionInfo>(options?.fresh ? "/version?fresh=1" : "/version"),
 
   // Server info API (host/port binding for Local Access settings)
   getServerInfo: () => fetchJSON<ServerInfo>("/server-info"),
+  getCursorAccount: (options?: { fresh?: boolean }) =>
+    fetchJSON<import("@yep-anywhere/shared").CursorAccountResponse>(
+      options?.fresh
+        ? "/providers/cursor/account?fresh=1"
+        : "/providers/cursor/account",
+    ),
 
   getCodexUsage: (options?: { fresh?: boolean }) =>
     fetchJSON<CodexUsageResponse>(
@@ -1137,12 +1161,61 @@ export const api = {
     ),
 
   // Provider API
+  launchDshWeb: () =>
+    fetchJSON<{ url: string }>("/dsh/launch", { method: "POST" }),
+
+  stopDshWeb: () =>
+    fetchJSON<{ stopped: true }>("/dsh/stop", {
+      method: "POST",
+      body: JSON.stringify({ confirm: true }),
+    }),
+
+  getHarnessUpdates: () =>
+    fetchJSON<{ harnesses: HarnessUpdateInfo[] }>("/harness-updates"),
+
+  checkHarnessUpdate: (id: HarnessId) =>
+    fetchJSON<{ harness: HarnessUpdateInfo }>(
+      `/harness-updates/${encodeURIComponent(id)}/check`,
+      { method: "POST" },
+    ),
+
+  updateHarness: (id: HarnessId) =>
+    fetchJSON<{ job: HarnessUpdateJob }>(
+      `/harness-updates/${encodeURIComponent(id)}/update`,
+      { method: "POST" },
+    ),
+
   getProviders: () => fetchJSON<{ providers: ProviderInfo[] }>("/providers"),
 
   getProvider: (name: ProviderName, options?: { fresh?: boolean }) =>
     fetchJSON<{ provider: ProviderInfo }>(
       `/providers/${encodeURIComponent(name)}${options?.fresh ? "?fresh=1" : ""}`,
     ),
+
+  prepareCursorSession: (body: {
+    projectId: string;
+    model?: string;
+    permissionMode?: string;
+  }) =>
+    fetchJSON<{ ok: true }>("/providers/cursor/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  discardCursorSession: (body: { projectId: string; model?: string }) =>
+    fetchJSON<{ ok: true }>("/providers/cursor/prepare/discard", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  warmCursorSession: (body: { model?: string }) =>
+    fetchJSON<{ ok: true }>("/providers/cursor/warm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
 
   /**
    * Read-only ZCode MCP server status snapshot for a project's workspace.
@@ -1219,18 +1292,38 @@ export const api = {
     );
   },
 
-  getSessionDisplayView: (
+  getSessionDisplayView: async (
     projectId: string,
     sessionId: string,
-    options?: { branchId?: string; cursor?: string; reset?: boolean },
-  ) => {
+    options?: {
+      branchId?: string;
+      cursor?: string;
+      reset?: boolean;
+      /** Load diagnostics: status and the Server-Timing phase header. */
+      onResponse?: (info: {
+        status?: number;
+        serverTiming?: string | null;
+      }) => void;
+    },
+  ): Promise<SessionDisplaySnapshot> => {
     const params = new URLSearchParams();
     if (options?.branchId) params.set("branchId", options.branchId);
     if (options?.cursor) params.set("cursor", options.cursor);
     if (options?.reset) params.set("reset", "true");
-    return fetchJSON<SessionDisplaySnapshot>(
-      `/projects/${projectId}/sessions/${sessionId}/display/view?${params}`,
-    );
+    const path = `/projects/${projectId}/sessions/${sessionId}/display/view?${params}`;
+    if (!options?.onResponse) return fetchJSON<SessionDisplaySnapshot>(path);
+    let response: Response;
+    try {
+      response = await fetchResponse(path);
+    } catch (error) {
+      options.onResponse({ status: (error as { status?: number }).status });
+      throw error;
+    }
+    options.onResponse({
+      status: response.status,
+      serverTiming: response.headers.get("server-timing"),
+    });
+    return response.json() as Promise<SessionDisplaySnapshot>;
   },
   getSessionDisplayGroup: (
     projectId: string,
@@ -1473,6 +1566,17 @@ export const api = {
   getAgentSession: (projectId: string, sessionId: string, agentId: string) =>
     fetchJSON<AgentSession>(
       `/projects/${projectId}/sessions/${sessionId}/agents/${agentId}`,
+    ),
+
+  /** Read a descendant only after the server verifies its root thread tree. */
+  getAgentSessionInTree: (
+    projectId: string,
+    rootSessionId: string,
+    agentId: string,
+    options?: { includeInheritedContext?: boolean },
+  ) =>
+    fetchJSON<AgentSession>(
+      `/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(rootSessionId)}/agent-tree/${encodeURIComponent(agentId)}${options?.includeInheritedContext ? "?includeInheritedContext=true" : ""}`,
     ),
 
   /**
@@ -2343,50 +2447,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ html, title }),
     }),
-
-  // Device bridge API
-  getDevices: () => fetchJSON<DeviceInfo[]>("/devices"),
-
-  startDevice: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/start`, {
-      method: "POST",
-    }),
-
-  stopDevice: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/stop`, {
-      method: "POST",
-    }),
-
-  downloadDeviceBridge: () =>
-    fetchJSON<{
-      ok: boolean;
-      path?: string;
-      binaryPath?: string;
-      apkPath?: string;
-      error?: string;
-    }>("/devices/bridge/download", { method: "POST" }),
-
-  // Legacy aliases (kept while UI naming is still emulator-centric)
-  getEmulators: () => fetchJSON<DeviceInfo[]>("/devices"),
-
-  startEmulator: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/start`, {
-      method: "POST",
-    }),
-
-  stopEmulator: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/devices/${encodeURIComponent(id)}/stop`, {
-      method: "POST",
-    }),
-
-  downloadEmulatorBridge: () =>
-    fetchJSON<{
-      ok: boolean;
-      path?: string;
-      binaryPath?: string;
-      apkPath?: string;
-      error?: string;
-    }>("/devices/bridge/download", { method: "POST" }),
 };
 
 export interface RemoteExecutorTestResult {
@@ -2415,14 +2475,8 @@ export interface ServerSettings {
   serviceWorkerEnabled: boolean;
   /** Remote-only Claude Code executors and path mappings. */
   remoteExecutors?: RemoteExecutorConfig[];
-  /** SSH host aliases for ChromeOS device bridge targets */
-  chromeOsHosts?: string[];
   /** Allowed hostnames for host/origin validation. "*" = allow all, comma-separated = specific hosts. */
   allowedHosts?: string;
-  /** Free-form instructions appended to the system prompt for all sessions */
-  globalInstructions?: string;
-  /** Whether the device bridge (emulator/device streaming) feature is enabled */
-  deviceBridgeEnabled?: boolean;
   /** Defaults applied when opening the new session form */
   newSessionDefaults?: NewSessionDefaults;
   /** Whether lifecycle webhook delivery is enabled */

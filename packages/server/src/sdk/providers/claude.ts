@@ -725,13 +725,7 @@ export class ClaudeProvider implements AgentProvider {
               ? "default"
               : (options.permissionMode ?? DEFAULT_PERMISSION_MODE),
           canUseTool,
-          systemPrompt: options.globalInstructions
-            ? {
-                type: "preset",
-                preset: "claude_code",
-                append: options.globalInstructions,
-              }
-            : { type: "preset", preset: "claude_code" },
+          systemPrompt: { type: "preset", preset: "claude_code" },
           settingSources: ["user", "project", "local"],
           includePartialMessages: true,
           model: options.model,

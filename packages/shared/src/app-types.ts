@@ -17,6 +17,7 @@ import type {
   UserEntry,
 } from "./claude-sdk-schema/types.js";
 import type {
+  ContextCategoryEntry,
   ContextCompactEvent,
   ContextCumulativeUsage,
 } from "./context-status.js";
@@ -121,6 +122,12 @@ export interface AppMessageExtensions {
    * Only set during active streaming; cleared when message is complete.
    */
   _isStreaming?: boolean;
+
+  /** Transient stream copy awaiting an authoritative assistant message. */
+  _isStreamingPlaceholder?: boolean;
+
+  /** Content block currently receiving deltas; other blocks are already closed. */
+  _streamingBlockIndex?: number;
 
   /**
    * True if this message is from a Task subagent.
@@ -274,6 +281,8 @@ export interface ContextUsage {
   percentage: number;
   /** Context window size used to compute percentage */
   contextWindow?: number;
+  /** Provider-reported categories for this context snapshot, when available. */
+  categories?: ContextCategoryEntry[];
   /** Output tokens generated in the last response (optional - may not be available) */
   outputTokens?: number;
   /** Cache read tokens (tokens served from cache) */
@@ -816,6 +825,8 @@ export interface AppSessionSummary {
   parentSessionId?: string;
   /** Source session when this session is a source-preserving edit fork. */
   forkParentSessionId?: string;
+  /** Native branch members collapsed into this conversation in lists. */
+  forkFamilySessionIds?: string[];
   // Model used for this session (resolved, not "default")
   model?: string;
   // Provider-specific reasoning effort for this session (e.g. "max", "xhigh")
@@ -982,6 +993,10 @@ export interface SubagentDescriptor {
  */
 export interface AgentSession {
   messages: AppMessage[];
+  /** Whether the child snapshot contains separately readable inherited context. */
+  hasInheritedContext?: boolean;
+  /** Included only when inherited context is explicitly requested. */
+  inheritedMessages?: AppMessage[];
   status: AgentStatus;
   /** Resolved subagent type/profile (e.g. `explore`), when known. */
   agentType?: string;

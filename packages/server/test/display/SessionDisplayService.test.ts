@@ -13,6 +13,17 @@ import {
 } from "../../src/display/SessionDisplayService.js";
 import type { Message } from "../../src/supervisor/types.js";
 const selection = { projectId: "project", sessionId: "session" };
+function displayNodeLabels(snapshot: SessionDisplaySnapshot): string[] {
+  return snapshot.nodes.map((node) => {
+    if (node.type === "question") return "question";
+    if (node.type !== "segment") return node.type;
+    if (node.segment.type === "thinking")
+      return `thinking:${node.segment.content}`;
+    if (node.segment.type === "assistant_text")
+      return `text:${node.segment.content}`;
+    return node.segment.type;
+  });
+}
 const services: SessionDisplayService[] = [];
 afterEach(() => {
   for (const service of services.splice(0)) service.dispose();
@@ -57,6 +68,1232 @@ function fixture(pollMs = 60_000) {
   };
 }
 describe("SessionDisplayService", () => {
+  it("streams and replays Cursor context snapshots even when only usage changes", async () => {
+    vi.useFakeTimers();
+    const { service, source } = fixture(1_000);
+    const initial = {
+      ...(await source.read()),
+      provider: "cursor",
+      contextUsage: {
+        inputTokens: 196_533,
+        contextWindow: 256_000,
+        percentage: 76.8,
+      },
+    };
+    source.read.mockResolvedValue(initial);
+    const events = vi.fn();
+    const subscription = await service.subscribe(selection, events);
+    expect(events).toHaveBeenCalledWith("display-context-usage", {
+      sessionId: selection.sessionId,
+      contextUsage: initial.contextUsage,
+    });
+    events.mockClear();
+    // The prompt text is unchanged; a new root contains post-compaction usage.
+    const contextUsage = {
+      inputTokens: 20_000,
+      contextWindow: 256_000,
+      percentage: 7.8,
+    };
+    source.stamp.mockResolvedValue("2");
+    source.read.mockResolvedValue({ ...initial, stamp: "2", contextUsage });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(events).toHaveBeenCalledWith("display-context-usage", {
+      sessionId: selection.sessionId,
+      contextUsage,
+    });
+    events.mockClear();
+    source.stamp.mockResolvedValue("3");
+    source.read.mockResolvedValue({ ...initial, stamp: "3", contextUsage });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(
+      events.mock.calls.filter(([type]) => type === "display-context-usage"),
+    ).toHaveLength(0);
+    subscription.cleanup();
+    const reconnected = vi.fn();
+    await service.subscribe(selection, reconnected);
+    expect(reconnected).toHaveBeenCalledWith("display-context-usage", {
+      sessionId: selection.sessionId,
+      contextUsage,
+    });
+  });
+
+  it("loads full streamed reasoning from the live body cache without looking up an unrelated native ID", async () => {
+    const { service, source, push } = fixture();
+    const page = await source.read();
+    source.read.mockResolvedValue({ ...page, provider: "cursor" });
+    await service.subscribe(selection, vi.fn());
+    const content = "A complete streamed thought. ".repeat(80);
+    push("message", {
+      type: "assistant",
+      uuid: "live-thought",
+      turnId: "turn",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: content }],
+      },
+    });
+    expect(await service.reasoning(selection, "thinking:live-thought:0")).toBe(
+      content,
+    );
+    push("message", {
+      type: "result",
+      uuid: "done",
+      turnId: "turn",
+      turnStatus: "completed",
+    });
+    expect(await service.reasoning(selection, "thinking:live-thought:0")).toBe(
+      content,
+    );
+  });
+
+  it("recovers Cursor reasoning after a shell restart using the exact journal message identity", async () => {
+    const { service, source, runtime } = fixture();
+    const page = await source.read();
+    source.read.mockResolvedValue({ ...page, provider: "cursor" });
+    const replay = vi.fn(async () => [
+      {
+        type: "message",
+        sessionId: "another-session",
+        data: {
+          uuid: "live",
+          message: {
+            content: [{ type: "thinking", thinking: "Wrong session" }],
+          },
+        },
+      },
+      {
+        type: "message",
+        sessionId: selection.sessionId,
+        data: {
+          uuid: "live",
+          type: "assistant",
+          message: { content: [{ type: "thinking", thinking: "First chunk" }] },
+        },
+      },
+      {
+        type: "message",
+        sessionId: selection.sessionId,
+        data: {
+          uuid: "live",
+          type: "assistant",
+          message: {
+            content: [{ type: "thinking", thinking: "Complete body" }],
+          },
+        },
+      },
+    ]);
+    Object.assign(runtime, { replay });
+    expect(await service.reasoning(selection, "thinking:live:0")).toBe(
+      "Complete body",
+    );
+    expect(replay).toHaveBeenCalledWith({
+      sessionId: selection.sessionId,
+      allProcesses: true,
+    });
+    expect(await service.reasoning(selection, "thinking:live:0")).toBe(
+      "Complete body",
+    );
+    expect(replay).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a Cursor backend error even after hundreds of streamed thinking updates", async () => {
+    const { service, source, runtime } = fixture();
+    const page = await source.read();
+    source.read.mockResolvedValue({ ...page, provider: "cursor" });
+    runtime.subscribeSession.mockImplementation(async (_id, emit) => {
+      for (let index = 0; index < 600; index++)
+        emit("message", {
+          isReplay: true,
+          type: "assistant",
+          uuid: "thought",
+          turnId: "turn",
+          message: {
+            content: [{ type: "thinking", thinking: `Chunk ${index}` }],
+          },
+        });
+      emit("message", {
+        isReplay: true,
+        type: "assistant",
+        uuid: "failure",
+        turnId: "turn",
+        message: {
+          content: "\n\nError: RetriableError: [resource_exhausted] Error",
+        },
+      });
+      emit("message", {
+        isReplay: true,
+        type: "result",
+        uuid: "end",
+        turnId: "turn",
+        turnStatus: "completed",
+      });
+      return { cleanup: vi.fn() };
+    });
+    const snapshot = await service.snapshot(selection);
+    expect(JSON.stringify(snapshot)).toContain("resource_exhausted");
+    expect(snapshot.activity.state).toBe("failed");
+  });
+  it("reconciles Cursor replies by native turn without erasing an identical later reply", async () => {
+    const { service, source, push } = fixture();
+    const first: Message[] = [
+      {
+        uuid: "disk-user-1",
+        type: "user",
+        cursorTurnIndex: 1,
+        turnId: "cursor-turn-1",
+        message: { role: "user", content: "Repeat" },
+      },
+      {
+        uuid: "disk-answer-1",
+        type: "assistant",
+        cursorTurnIndex: 1,
+        turnId: "cursor-turn-1",
+        message: { role: "assistant", content: "Same answer" },
+      },
+    ];
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: first,
+      activity: "running",
+      stamp: "1",
+    });
+    await service.subscribe(selection, vi.fn());
+    push("message", {
+      uuid: "live-user-2",
+      type: "user",
+      cursorTurnIndex: 2,
+      turnId: "cursor-turn-2",
+      message: { role: "user", content: "Repeat" },
+    });
+    push("message", {
+      uuid: "live-thought-2",
+      type: "assistant",
+      cursorTurnIndex: 2,
+      turnId: "cursor-turn-2",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "Transient thought" }],
+      },
+    });
+    push("message", {
+      uuid: "live-answer-2",
+      type: "assistant",
+      cursorTurnIndex: 2,
+      turnId: "cursor-turn-2",
+      message: { role: "assistant", content: "Same answer" },
+    });
+    push("message", {
+      uuid: "cursor-result-2",
+      type: "result",
+      cursorTurnIndex: 2,
+      turnId: "cursor-turn-2",
+      turnStatus: "completed",
+    });
+    push("status", { state: "idle" });
+    await vi.waitFor(async () => {
+      const snapshot = await service.snapshot(selection);
+      expect(
+        snapshot.nodes.filter(
+          (n) => n.type === "segment" && n.segment.type === "assistant_text",
+        ),
+      ).toHaveLength(2);
+    });
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        ...first,
+        {
+          uuid: "disk-user-2",
+          type: "user",
+          cursorTurnIndex: 2,
+          turnId: "cursor-turn-2",
+          message: { role: "user", content: "Repeat" },
+        },
+        {
+          uuid: "disk-answer-2",
+          type: "assistant",
+          cursorTurnIndex: 2,
+          turnId: "cursor-turn-2",
+          message: { role: "assistant", content: "Same answer" },
+        },
+      ],
+      activity: "unknown",
+      stamp: "2",
+    });
+    push("status", { state: "idle" });
+    await vi.waitFor(async () => {
+      const snapshot = await service.snapshot(selection);
+      expect(
+        snapshot.nodes.filter(
+          (n) => n.type === "segment" && n.segment.type === "assistant_text",
+        ),
+      ).toHaveLength(2);
+      expect(JSON.stringify(snapshot)).toContain("disk-answer-2");
+      expect(JSON.stringify(snapshot)).not.toContain("live-answer-2");
+      expect(JSON.stringify(snapshot)).toContain("Transient thought");
+      expect(snapshot.activity.state).toBe("completed");
+      const labels = displayNodeLabels(snapshot);
+      const thoughtAt = labels.indexOf("thinking:Transient thought");
+      const answers = labels.flatMap((label, index) =>
+        label === "text:Same answer" ? [index] : [],
+      );
+      expect(thoughtAt).toBeGreaterThan(answers[0] ?? -1);
+      expect(thoughtAt).toBeLessThan(answers[1] ?? -1);
+    });
+  });
+  it("restores Cursor thinking from the runtime journal when native history has none", async () => {
+    const { service, source, runtime } = fixture();
+    runtime.getProcessForSession.mockResolvedValue(null);
+    (runtime as { replay: (query: unknown) => Promise<unknown[]> }).replay =
+      vi.fn(async () => [
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "journal-thought",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "thinking", thinking: "Kept from the journal" },
+              ],
+            },
+          },
+        },
+      ]);
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        {
+          uuid: "disk-user",
+          type: "user",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "user", content: "Explain" },
+        },
+        {
+          uuid: "disk-answer",
+          type: "assistant",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "assistant", content: "The answer" },
+        },
+      ],
+      activity: "unknown",
+      stamp: "1",
+    });
+    await service.subscribe(selection, vi.fn());
+    const snapshot = await service.snapshot(selection);
+    expect(JSON.stringify(snapshot)).toContain("Kept from the journal");
+    expect(JSON.stringify(snapshot)).toContain("The answer");
+    const labels = displayNodeLabels(snapshot);
+    expect(labels.indexOf("thinking:Kept from the journal")).toBeLessThan(
+      labels.indexOf("text:The answer"),
+    );
+  });
+  it("places recovered Cursor thoughts before the reply or tool that followed them", async () => {
+    const { service, source, runtime } = fixture();
+    runtime.getProcessForSession.mockResolvedValue(null);
+    (runtime as { replay: (query: unknown) => Promise<unknown[]> }).replay =
+      vi.fn(async () => [
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "thought-before-tool",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "Before the tool" }],
+            },
+          },
+        },
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "live-tool",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "tool-1",
+                  name: "Read",
+                  input: { path: "README.md" },
+                },
+              ],
+            },
+          },
+        },
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "thought-before-answer",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "Before the answer" }],
+            },
+          },
+        },
+        {
+          type: "message",
+          sessionId: selection.sessionId,
+          data: {
+            type: "assistant",
+            uuid: "live-answer",
+            cursorTurnIndex: 1,
+            turnId: "cursor-turn-1",
+            message: { role: "assistant", content: "The answer" },
+          },
+        },
+      ]);
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        {
+          uuid: "disk-user",
+          type: "user",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "user", content: "Explain" },
+        },
+        {
+          uuid: "disk-tool",
+          type: "assistant",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "tool-1",
+                name: "Read",
+                input: { path: "README.md" },
+              },
+            ],
+          },
+        },
+        {
+          uuid: "disk-answer",
+          type: "assistant",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "assistant", content: "The answer" },
+        },
+      ],
+      activity: "unknown",
+      stamp: "1",
+    });
+    await service.subscribe(selection, vi.fn());
+    const snapshot = await service.snapshot(selection);
+    expect(displayNodeLabels(snapshot)).toEqual([
+      "question",
+      "thinking:Before the tool",
+      "tool_group",
+      "thinking:Before the answer",
+      "text:The answer",
+    ]);
+  });
+  it("recovers streamed text anchors and interleaves thoughts with their own tool batches", async () => {
+    const { service, source, runtime } = fixture();
+    const message = (uuid: string, content: unknown, turn = 1) => ({
+      type: "assistant",
+      uuid,
+      cursorTurnIndex: turn,
+      turnId: `cursor-turn-${turn}`,
+      message: { role: "assistant", content },
+    });
+    const thinking = (uuid: string, body: string, turn = 1) =>
+      message(uuid, [{ type: "thinking", thinking: body }], turn);
+    const call = (id: string) => ({
+      type: "tool_use",
+      id,
+      name: "Read",
+      input: { file_path: `${id}.txt` },
+    });
+    const intro = "底部这块没被用上，我先看截图和移动端布局，确认系统安全区。";
+    const first = thinking("thought-1", "Check the screenshot");
+    const second = thinking("thought-2", "Check the layout\nInspect the CSS.");
+    const third = thinking(
+      "thought-3",
+      "Check the layout\nInspect the viewport.",
+    );
+    const last = thinking("thought-4", "Explain the result");
+    const messages = [
+      {
+        ...message("native-user", "Optimize the layout"),
+        type: "user",
+        message: { role: "user", content: "Optimize the layout" },
+      },
+      message("native-intro", [{ type: "text", text: intro }, call("a")]),
+      message("native-b", [call("b"), call("c")]),
+      message("native-d", [call("d")]),
+      message("native-answer", "The answer"),
+    ] as Message[];
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages,
+      activity: "completed",
+      stamp: "1",
+    });
+    // These are cumulative ACP message shapes, including the two-character
+    // first chunk seen in the real session. No precomputed anchors in the input.
+    const records = [
+      first,
+      message("live-intro", "底部"),
+      message("live-intro", intro),
+      message("live-a", [call("a")]),
+      thinking("thought-2", "Check"),
+      second,
+      message("live-b", [call("b")]),
+      message("live-c", [call("c")]),
+      third,
+      message("live-d", [call("d")]),
+      last,
+      message("live-answer", "The"),
+      message("live-answer", "The answer"),
+    ].map((data) => ({
+      type: "message",
+      sessionId: selection.sessionId,
+      data,
+    }));
+    const replay = vi.fn(async () => records);
+    Object.assign(runtime, { replay });
+    const snapshot = await service.snapshot(selection);
+    expect(replay).toHaveBeenCalledWith({
+      sessionId: selection.sessionId,
+      allProcesses: true,
+    });
+    const expected = [
+      "question",
+      "thinking:Check the screenshot",
+      `text:${intro}`,
+      "tool_group",
+      "thinking:Check the layout\nInspect the CSS.",
+      "tool_group",
+      "thinking:Check the layout\nInspect the viewport.",
+      "tool_group",
+      "thinking:Explain the result",
+      "text:The answer",
+    ];
+    expect(displayNodeLabels(snapshot)).toEqual(expected);
+    const groups = snapshot.nodes.flatMap((node) =>
+      node.type === "segment" && node.segment.type === "tool_group"
+        ? [node.segment]
+        : [],
+    );
+    expect(groups.map((group) => group.count)).toEqual([1, 2, 1]);
+    expect(
+      (await service.group(selection, groups[1]?.id ?? "")).steps.map(
+        (step) => step.summary,
+      ),
+    ).toEqual(["b.txt", "c.txt"]);
+    expect(await service.reasoning(selection, "thinking:thought-2:0")).toBe(
+      "Check the layout\nInspect the CSS.",
+    );
+    // A forced native-history refresh must reproduce the same boundaries.
+    expect(displayNodeLabels(await service.snapshot(selection, true))).toEqual(
+      expected,
+    );
+  });
+
+  it("recovers earlier thoughts without replaying an old process failure into a resumed turn", async () => {
+    const { service, source, runtime } = fixture();
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        {
+          type: "user",
+          uuid: "user-1",
+          turnId: "cursor-turn-1",
+          message: { role: "user", content: "First question" },
+        },
+        {
+          type: "assistant",
+          uuid: "answer-1",
+          turnId: "cursor-turn-1",
+          message: { role: "assistant", content: "First answer" },
+        },
+        {
+          type: "user",
+          uuid: "user-2",
+          turnId: "cursor-turn-2",
+          message: { role: "user", content: "Continue" },
+        },
+      ] as Message[],
+      activity: "running",
+      stamp: "1",
+    });
+    Object.assign(runtime, {
+      replay: vi.fn(async () =>
+        [
+          {
+            type: "assistant",
+            uuid: "thought",
+            turnId: "cursor-turn-1",
+            message: {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "Earlier thought" }],
+            },
+          },
+          {
+            type: "error",
+            uuid: "error-1",
+            turnId: "cursor-turn-1",
+            error: "Old process failed",
+          },
+          { type: "result", turnId: "cursor-turn-1", is_error: true },
+        ].map((data) => ({
+          type: "message",
+          processId: "old-process",
+          sessionId: selection.sessionId,
+          data,
+        })),
+      ),
+    });
+    const snapshot = await service.snapshot(selection);
+    expect(displayNodeLabels(snapshot)).toEqual([
+      "question",
+      "thinking:Earlier thought",
+      "text:First answer",
+      "question",
+    ]);
+    expect(snapshot.activity.state).toBe("running");
+  });
+
+  it("keeps an unanchored thought in its own turn during journal recovery", async () => {
+    const { service, source, runtime } = fixture();
+    const prompt = (turn: number) => ({
+      type: "user",
+      uuid: `user-${turn}`,
+      turnId: `cursor-turn-${turn}`,
+      cursorTurnIndex: turn,
+      message: { role: "user", content: `Question ${turn}` },
+    });
+    const answer = (turn: number) => ({
+      type: "assistant",
+      uuid: `answer-${turn}`,
+      turnId: `cursor-turn-${turn}`,
+      cursorTurnIndex: turn,
+      message: { role: "assistant", content: `Answer ${turn}` },
+    });
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [prompt(1), answer(1), prompt(2), answer(2)] as Message[],
+      activity: "completed",
+      stamp: "1",
+    });
+    Object.assign(runtime, {
+      replay: vi.fn(async () =>
+        [
+          {
+            ...answer(1),
+            uuid: "thought",
+            message: {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "Earlier thought" }],
+            },
+          },
+          prompt(2),
+          answer(2),
+        ].map((data) => ({
+          type: "message",
+          sessionId: selection.sessionId,
+          data,
+        })),
+      ),
+    });
+    expect(displayNodeLabels(await service.snapshot(selection))).toEqual([
+      "question",
+      "thinking:Earlier thought",
+      "text:Answer 1",
+      "question",
+      "text:Answer 2",
+    ]);
+  });
+
+  it("recovers Cursor call timings without changing native tools or inventing missing intervals", async () => {
+    const { service, source, runtime } = fixture();
+    const message = (uuid: string, content: unknown[], turn = 1) => ({
+      type:
+        content[0] && (content[0] as { type: string }).type === "tool_result"
+          ? "user"
+          : "assistant",
+      uuid,
+      turnId: `cursor-turn-${turn}`,
+      cursorTurnIndex: turn,
+      message: { content },
+    });
+    const call = (id: string) => ({
+      type: "tool_use",
+      id,
+      name: "Bash",
+      input: { command: id },
+    });
+    const result = (id: string) => ({
+      type: "tool_result",
+      tool_use_id: id,
+      content: `Native ${id}`,
+      is_error: id === "slow",
+    });
+    const prompt = (turn: number) => ({
+      type: "user",
+      uuid: `user-${turn}`,
+      turnId: `cursor-turn-${turn}`,
+      message: { role: "user", content: `Question ${turn}` },
+    });
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        prompt(1),
+        ...["fast", "slow", "orphan", "untimed", "combined"].flatMap((id) => [
+          message(`native-call-${id}`, [call(id)]),
+          message(`native-result-${id}`, [result(id)]),
+        ]),
+        prompt(2),
+        message("native-call-2", [call("fast")], 2),
+        message("native-result-2", [result("fast")], 2),
+      ] as Message[],
+      activity: "completed",
+      stamp: "1",
+    });
+    const at = (seconds: number) =>
+      new Date(
+        Date.parse("2026-10-20T07:00:00Z") + seconds * 1_000,
+      ).toISOString();
+    const event = (seconds: number, data: Record<string, unknown>) => ({
+      type: "message",
+      sessionId: selection.sessionId,
+      timestamp: at(seconds),
+      data,
+    });
+    Object.assign(runtime, {
+      replay: vi.fn(async () => [
+        // The message timestamp wins over a delayed journal write.
+        event(10, {
+          ...message("live-fast", [{ ...call("fast"), name: "Execute" }]),
+          timestamp: at(0),
+        }),
+        event(0.5, message("live-slow", [call("slow")])),
+        // Input updates must not move the start time.
+        event(0.8, message("live-fast", [call("fast")])),
+        event(1, message("live-result-fast", [result("fast")])),
+        event(5, message("live-result-slow", [result("slow")])),
+        event(6, message("orphan-result", [result("orphan")])),
+        event(7, message("combined", [call("combined"), result("combined")])),
+        // Same raw ID in another turn must not borrow the first turn's start.
+        event(8, message("result-turn-2", [result("fast")], 2)),
+        // A replayed duplicate must not extend the completed interval.
+        event(9, message("duplicate-result", [result("fast")])),
+      ]),
+    });
+    const snapshot = await service.snapshot(selection);
+    const groups = snapshot.nodes.flatMap((node) =>
+      node.type === "segment" && node.segment.type === "tool_group"
+        ? [node.segment]
+        : [],
+    );
+    expect(groups[0]).toMatchObject({
+      count: 5,
+      failedCount: 1,
+      timedCount: 2,
+      durationMs: 5_500,
+    });
+    expect(groups[1]?.timedCount).toBeUndefined();
+    const steps = (await service.group(selection, groups[0]?.id ?? "")).steps;
+    expect(steps[0]).toMatchObject({
+      name: "Bash",
+      timestamp: at(0),
+      completedAt: at(1),
+    });
+    expect(steps[1]).toMatchObject({
+      status: "failed",
+      timestamp: at(0.5),
+      completedAt: at(5),
+    });
+    for (const step of steps.slice(2)) {
+      expect(step.completedAt).toBeUndefined();
+      expect(step.durationMs).toBeUndefined();
+    }
+    const reset = await service.snapshot(selection, true);
+    expect(
+      reset.nodes.flatMap((node) =>
+        node.type === "segment" && node.segment.type === "tool_group"
+          ? [node.segment.timedCount]
+          : [],
+      ),
+    ).toEqual([2, undefined]);
+  });
+
+  it("preserves live Cursor timing when untimed native history acknowledges the tool", async () => {
+    const { service, source, push } = fixture();
+    const nativePrompt = {
+      type: "user",
+      uuid: "native-user",
+      turnId: "cursor-turn-1",
+      cursorTurnIndex: 1,
+      message: { role: "user", content: "Run" },
+    };
+    const call = {
+      type: "assistant",
+      uuid: "live-call",
+      turnId: "cursor-turn-1",
+      cursorTurnIndex: 1,
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "command",
+            name: "Bash",
+            input: { command: "ls" },
+          },
+        ],
+      },
+    };
+    const result = {
+      type: "user",
+      uuid: "live-result",
+      turnId: "cursor-turn-1",
+      cursorTurnIndex: 1,
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "command", content: "ok" },
+        ],
+      },
+    };
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [nativePrompt] as Message[],
+      activity: "running",
+      stamp: "1",
+    });
+    await service.subscribe(selection, vi.fn());
+    push("message", { ...call, timestamp: "2026-10-20T07:00:00Z" });
+    push("message", { ...result, timestamp: "2026-10-20T07:00:03Z" });
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        nativePrompt,
+        { ...call, uuid: "native-call" },
+        { ...result, uuid: "native-result" },
+      ] as Message[],
+      activity: "completed",
+      stamp: "2",
+    });
+    push("status", { state: "idle" });
+    await vi.waitFor(async () => {
+      const snapshot = await service.snapshot(selection);
+      expect(snapshot.activity.state).toBe("completed");
+      expect(
+        snapshot.nodes.find(
+          (node) =>
+            node.type === "segment" && node.segment.type === "tool_group",
+        ),
+      ).toMatchObject({
+        segment: { count: 1, timedCount: 1, durationMs: 3_000 },
+      });
+    });
+  });
+
+  it("keeps the injected Cursor prompt until native history contains that user query", async () => {
+    const { service, source, runtime } = fixture();
+    let emit: (type: string, data: unknown) => void = () => {};
+    const tool = {
+      uuid: "disk-tool",
+      type: "assistant",
+      cursorTurnIndex: 1,
+      turnId: "cursor-turn-1",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "tool-1",
+            name: "Read",
+            input: { path: "README.md" },
+          },
+        ],
+      },
+    } satisfies Message;
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [tool],
+      activity: "running",
+      stamp: "1",
+    });
+    runtime.subscribeSession.mockImplementation(async (_id, send) => {
+      emit = send;
+      send("message", {
+        isReplay: true,
+        type: "user",
+        uuid: "live-user",
+        message: { role: "user", content: "详细审核一下该项目" },
+      });
+      return { cleanup: vi.fn() };
+    });
+    await service.subscribe(selection, vi.fn());
+    const first = await service.snapshot(selection);
+    const questions = first.nodes.filter((node) => node.type === "question");
+    const toolAt = first.nodes.findIndex(
+      (node) => node.type === "segment" && node.segment.type === "tool_group",
+    );
+    expect(questions).toHaveLength(1);
+    const question = questions[0];
+    if (!question) throw new Error("Expected question node");
+    expect(JSON.stringify(question)).toContain("详细审核一下该项目");
+    expect(JSON.stringify(question)).toContain("live-user");
+    expect(toolAt).toBeGreaterThan(first.nodes.indexOf(question));
+
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: [
+        {
+          uuid: "disk-user",
+          type: "user",
+          cursorTurnIndex: 1,
+          turnId: "cursor-turn-1",
+          message: { role: "user", content: "详细审核一下该项目" },
+        },
+        tool,
+      ],
+      activity: "running",
+      stamp: "2",
+    });
+    emit("status", { state: "idle" });
+    await vi.waitFor(async () => {
+      const next = await service.snapshot(selection);
+      const settled = next.nodes.filter((node) => node.type === "question");
+      expect(settled).toHaveLength(1);
+      expect(JSON.stringify(settled[0])).toContain("disk-user");
+      expect(JSON.stringify(settled)).not.toContain("live-user");
+    });
+  });
+  it.each([
+    "tool",
+    "progress",
+    "retry",
+    "idle",
+    "hold",
+    "waiting-input",
+    "completed",
+    "failed",
+    "interrupted",
+  ])(
+    "closes transient prose on %s and does not revive it on refresh/reconnect",
+    async (boundary) => {
+      vi.useFakeTimers();
+      const { service, source, push } = fixture(10);
+      const initial = await source.read();
+      await service.subscribe(selection, vi.fn());
+      const delta = (text: string) =>
+        push("message", {
+          type: "stream_event",
+          uuid: "draft-turn",
+          codexTurnId: "turn",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text },
+          },
+        });
+      delta("Partial text worth keeping");
+      const texts = (snapshot: SessionDisplaySnapshot) =>
+        snapshot.nodes.flatMap((n) =>
+          n.type === "segment" && n.segment.type === "assistant_text"
+            ? [n.segment]
+            : [],
+        );
+      expect(texts(await service.snapshot(selection))[0]?.streaming).toBe(true);
+      if (boundary === "tool")
+        push("message", {
+          type: "assistant",
+          uuid: "tool-turn",
+          codexTurnId: "turn",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "call",
+                name: "Bash",
+                input: { command: "pwd" },
+              },
+            ],
+          },
+        });
+      else if (boundary === "progress")
+        push("message", {
+          type: "assistant",
+          uuid: "next-turn",
+          codexTurnId: "turn",
+          codexMessagePhase: "commentary",
+          message: { role: "assistant", content: "Replacement progress" },
+        });
+      else if (boundary === "retry")
+        push("retry-status", {
+          retryStatus: { attempt: 1, message: "Retrying" },
+        });
+      else if (["idle", "hold", "waiting-input"].includes(boundary))
+        push("status", { state: boundary });
+      else
+        push("message", {
+          type: "system",
+          subtype: "turn_complete",
+          codexTurnId: "turn",
+          turnStatus: boundary,
+        });
+      delta(" late token");
+      expect(texts(await service.snapshot(selection))[0]).toMatchObject({
+        content: "Partial text worth keeping",
+        streaming: false,
+      });
+      source.read.mockResolvedValue({ ...initial, stamp: "2" });
+      source.stamp.mockResolvedValue("2");
+      await vi.advanceTimersByTimeAsync(25);
+      const reconnect = vi.fn();
+      await service.subscribe(selection, reconnect);
+      const snapshot = reconnect.mock.calls.find(
+        ([type]) => type === "display-snapshot",
+      )?.[1];
+      expect(texts(snapshot)[0]).toMatchObject({
+        content: "Partial text worth keeping",
+        streaming: false,
+      });
+    },
+  );
+
+  it("keeps stream blocks separate and closes each block without waiting for the assistant commit", async () => {
+    const { service, source, push } = fixture();
+    source.read.mockResolvedValue({
+      ...(await source.read()),
+      provider: "claude",
+    });
+    await service.subscribe(selection, vi.fn());
+    const emit = (event: Record<string, unknown>) =>
+      push("message", { type: "stream_event", uuid: "event", event });
+    emit({ type: "message_start", message: { id: "claude-message" } });
+    for (const [index, text] of ["First", "Second"].entries()) {
+      emit({
+        type: "content_block_start",
+        index,
+        content_block: { type: "text", text: "" },
+      });
+      emit({
+        type: "content_block_delta",
+        index,
+        delta: { type: "text_delta", text },
+      });
+      emit({ type: "content_block_stop", index });
+    }
+    emit({ type: "message_stop" });
+    const texts = (await service.snapshot(selection)).nodes.flatMap((n) =>
+      n.type === "segment" && n.segment.type === "assistant_text"
+        ? [n.segment]
+        : [],
+    );
+    expect(texts).toMatchObject([
+      { content: "First", streaming: false },
+      { content: "Second", streaming: false },
+    ]);
+  });
+
+  it("keeps a newer turn streaming when a late terminal event or delta arrives for the old turn", async () => {
+    const { service, push } = fixture();
+    await service.subscribe(selection, vi.fn());
+    const delta = (turn: string, id: string) =>
+      push("message", {
+        type: "stream_event",
+        uuid: `${id}-${turn}`,
+        codexTurnId: turn,
+        event: {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: id },
+        },
+      });
+    delta("turn", "old");
+    push("message", {
+      type: "system",
+      subtype: "turn_complete",
+      codexTurnId: "turn",
+      turnStatus: "interrupted",
+    });
+    delta("new-turn", "new");
+    push("message", {
+      type: "system",
+      subtype: "turn_complete",
+      codexTurnId: "turn",
+      turnStatus: "interrupted",
+    });
+    delta("turn", "unknown-late-item");
+    const texts = (await service.snapshot(selection)).nodes.flatMap((n) =>
+      n.type === "segment" && n.segment.type === "assistant_text"
+        ? [n.segment]
+        : [],
+    );
+    expect(texts).toMatchObject([
+      { content: "old", streaming: false },
+      { content: "new", streaming: true },
+    ]);
+  });
+
+  it("retires a superseded draft once its replacement progress is persisted, while the turn is still running", async () => {
+    vi.useFakeTimers();
+    const { service, source, push } = fixture(10);
+    const initial = await source.read();
+    await service.subscribe(selection, vi.fn());
+    push("message", {
+      type: "stream_event",
+      uuid: "draft-turn",
+      codexTurnId: "turn",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "Abandoned wording" },
+      },
+    });
+    const replacement: Message = {
+      type: "assistant",
+      uuid: "replacement-turn",
+      codexTurnId: "turn",
+      codexCorrelationKey: "codex:turn:agent-message:replacement",
+      codexMessagePhase: "commentary",
+      message: { role: "assistant", content: "Actual progress" },
+    };
+    push("message", replacement);
+    expect(JSON.stringify((await service.snapshot(selection)).nodes)).toContain(
+      "Abandoned wording",
+    );
+    source.read.mockResolvedValue({
+      ...initial,
+      messages: [...initial.messages, replacement],
+      stamp: "2",
+    });
+    source.stamp.mockResolvedValue("2");
+    await vi.advanceTimersByTimeAsync(25);
+    const snapshot = await service.snapshot(selection);
+    expect(snapshot.activity.state).toBe("running");
+    expect(JSON.stringify(snapshot.nodes)).not.toContain("Abandoned wording");
+    expect(JSON.stringify(snapshot.nodes)).toContain("Actual progress");
+  });
+
+  it("ignores stale catch-up text after a live stop or a persisted completion", async () => {
+    const { service, source, push } = fixture();
+    source.read.mockResolvedValue({
+      ...(await source.read()),
+      messages: [
+        {
+          uuid: "persisted-turn",
+          type: "assistant",
+          codexTurnId: "turn",
+          codexCorrelationKey: "codex:turn:agent-message:persisted",
+          message: { role: "assistant", content: "Final" },
+        },
+      ] as Message[],
+    });
+    await service.subscribe(selection, vi.fn());
+    push("display-text-catchup", {
+      messageId: "persisted-turn",
+      text: "Partial",
+    });
+    push("message", {
+      type: "stream_event",
+      uuid: "draft-turn",
+      codexTurnId: "turn",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "Draft" },
+      },
+    });
+    push("status", { state: "hold" });
+    push("display-text-catchup", { messageId: "draft-turn", text: "Draft" });
+    const texts = (await service.snapshot(selection)).nodes.flatMap((n) =>
+      n.type === "segment" && n.segment.type === "assistant_text"
+        ? [n.segment]
+        : [],
+    );
+    expect(texts).toMatchObject([
+      { content: "Final", streaming: false },
+      { content: "Draft", streaming: false },
+    ]);
+  });
+
+  it.each(["interAgentMessage", "subAgentActivity"])(
+    "acknowledges persisted %s despite different live and rollout message ids",
+    async (itemType) => {
+      vi.useFakeTimers();
+      const { service, source, push } = fixture(10);
+      const initial = await source.read();
+      await service.subscribe(selection, vi.fn());
+      const native: Message = {
+        uuid: "live-native",
+        type: "system",
+        subtype: "codex_native_item",
+        codexThreadId: "session",
+        codexTurnId: "turn",
+        codexThreadItemLifecycle: "completed",
+        codexThreadItem:
+          itemType === "interAgentMessage"
+            ? {
+                type: itemType,
+                id: "mail-id",
+                kind: "result",
+                sender: "/root/review",
+                recipient: "/root",
+                text: "Review complete",
+                encrypted: false,
+              }
+            : {
+                type: itemType,
+                id: "child-complete",
+                kind: "completed",
+                agentThreadId: "child",
+                agentPath: "/root/review",
+              },
+      };
+      push("message", native);
+      expect(
+        (await service.snapshot(selection)).nodes.filter(
+          (node) => node.type === "segment",
+        ),
+      ).toHaveLength(1);
+      source.read.mockResolvedValue({
+        ...initial,
+        messages: [...initial.messages, { ...native, uuid: "rollout-native" }],
+        stamp: "2",
+      });
+      source.stamp.mockResolvedValue("2");
+      await vi.advanceTimersByTimeAsync(30);
+      expect(
+        (await service.snapshot(selection)).nodes.filter(
+          (node) => node.type === "segment",
+        ),
+      ).toHaveLength(1);
+      // A later history rewrite must not resurrect the acknowledged overlay.
+      source.read.mockResolvedValue({ ...initial, stamp: "3" });
+      source.stamp.mockResolvedValue("3");
+      await vi.advanceTimersByTimeAsync(30);
+      expect(
+        (await service.snapshot(selection)).nodes.filter(
+          (node) => node.type === "segment",
+        ),
+      ).toHaveLength(0);
+    },
+  );
+
   it.each(["completed", "failed", "interrupted"] as const)(
     "retains an id-less Codex %s notification while history lags",
     async (outcome) => {
@@ -187,7 +1424,7 @@ describe("SessionDisplayService", () => {
       await vi.advanceTimersByTimeAsync(11);
       expect(texts(await service.snapshot(selection))).toContainEqual({
         content: "Original answer cut off",
-        streaming: true,
+        streaming: false,
       });
 
       delta("next", "next-turn", "Next turn in progress");
@@ -391,15 +1628,14 @@ describe("SessionDisplayService", () => {
       ]);
       const groupId = displayToolId("turn", "slow").replace("dt2.", "dg2.");
       const snapshot = await service.snapshot(selection);
-      // "slow" never got a result while every later batch settled, so the
-      // projection retires it as `unknown` instead of spinning forever. It
-      // still belongs to the group and still counts toward its total.
+      // A Codex command can remain in the background across later batches.
+      // It stays in its original group until its own result arrives.
       expect(snapshot.nodes.find((node) => node.id === groupId)).toMatchObject({
         segment: {
           count,
           displayMode: "summary",
-          runningCount: 0,
-          unknownCount: 1,
+          runningCount: 1,
+          unknownCount: 0,
         },
       });
       const first = await service.group(selection, groupId);
@@ -415,7 +1651,7 @@ describe("SessionDisplayService", () => {
       ]);
       expect(steps.every((step) => step.groupId === groupId)).toBe(true);
       expect(steps[0]).toMatchObject({
-        status: "unknown",
+        status: "running",
         summary: "run slow",
       });
       expect(earlier?.nextCursor).toBeUndefined();
@@ -429,8 +1665,7 @@ describe("SessionDisplayService", () => {
         groupId,
         String(count > 50 ? 5 : count),
       );
-      // A late result always wins: retiring a stranded step is a display
-      // decision, never a refusal to accept the real outcome.
+      // Completion updates the same group even after it has collapsed.
       expect(updated.steps[0]).toMatchObject({ status: "completed" });
       expect(updated.total).toBe(count);
       expect(source.detail).not.toHaveBeenCalled();
@@ -472,6 +1707,83 @@ describe("SessionDisplayService", () => {
     expect(earlier.nextCursor).toBeUndefined();
     expect(source.detail).toHaveBeenCalledWith(selection, "older-turn");
   });
+  it.each([
+    ["Bash", false],
+    ["Bash", true],
+    ["CodexExec", false],
+  ] as const)(
+    "preserves %s invocation metadata across output deltas and source refreshes (replay=%s)",
+    async (name, isReplay) => {
+      vi.useFakeTimers();
+      const { service, source, push } = fixture(10);
+      const initial = await source.read();
+      const script = 'text(await tools.exec_command({cmd:"pnpm test"}));';
+      const input = name === "Bash" ? { command: "pnpm test" } : { script };
+      const invocation = {
+        uuid: "command-turn",
+        type: "assistant",
+        codexTurnId: "turn",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "command",
+              name,
+              input,
+              status: "in_progress",
+            },
+          ],
+        },
+      };
+      await service.subscribe(selection, vi.fn());
+      push("message", { ...invocation, isReplay });
+      push("message", {
+        ...invocation,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "command", partialOutput: "first output" },
+          ],
+        },
+      });
+      source.read.mockResolvedValue({ ...initial, stamp: "2" });
+      source.stamp.mockResolvedValue("2");
+      await vi.advanceTimersByTimeAsync(25);
+      expect(source.read).toHaveBeenCalledTimes(3);
+      const snapshot = await service.snapshot(selection);
+      const groupId = displayToolId("turn", "command").replace("dt2.", "dg2.");
+      expect(snapshot.activity.runningCount).toBe(1);
+      expect((await service.group(selection, groupId)).steps).toMatchObject([
+        {
+          name,
+          status: "running",
+          summary: name === "Bash" ? "pnpm test" : script,
+        },
+      ]);
+      expect(
+        await service.output(selection, displayToolId("turn", "command")),
+      ).toMatchObject({
+        status: "running",
+        output: "first output",
+      });
+      const detail = await service.detail(
+        selection,
+        displayToolId("turn", "command"),
+      );
+      expect(detail.messages[0]?.message?.content).toMatchObject([
+        { type: "tool_use", name, input, status: "in_progress" },
+      ]);
+    },
+  );
+
+  it("reports unavailable tool details instead of returning a blank successful response", async () => {
+    const { service } = fixture();
+    await expect(
+      service.detail(selection, displayToolId("turn", "missing")),
+    ).rejects.toThrow("Tool invocation is unavailable");
+  });
+
   it("retains per-call image previews in the compact live tool replay", () => {
     const message = {
       type: "assistant",
@@ -1066,6 +2378,81 @@ describe("SessionDisplayService", () => {
       runtime.subscribeSession.mock.results[0],
     ).value;
     expect(subscription.cleanup).not.toHaveBeenCalled();
+  });
+  it("shows the prompt a replacement process was started with before the projection attached", async () => {
+    vi.useFakeTimers();
+    const { service, source, runtime, push } = fixture(1_000);
+    const firstTurn = [
+      {
+        uuid: "disk-user-1",
+        type: "user",
+        cursorTurnIndex: 1,
+        turnId: "cursor-turn-1",
+        message: { role: "user", content: "First question" },
+      },
+      {
+        uuid: "disk-answer-1",
+        type: "assistant",
+        cursorTurnIndex: 1,
+        turnId: "cursor-turn-1",
+        message: { role: "assistant", content: "First answer" },
+      },
+    ] as Message[];
+    source.read.mockResolvedValue({
+      provider: "cursor",
+      messages: firstTurn,
+      activity: "completed",
+      stamp: "1",
+    });
+    runtime.getProcessForSession.mockResolvedValue({
+      id: "process-a",
+    } as never);
+    await service.subscribe(selection, vi.fn());
+
+    // The old process exits (idle restart); a new one is started with the
+    // next prompt and buffers it before the projection resubscribes.
+    push("complete", {});
+    runtime.getProcessForSession.mockResolvedValue({
+      id: "process-b",
+    } as never);
+    runtime.subscribeSession.mockImplementation(async (_id, send) => {
+      send("message", {
+        isReplay: true,
+        isOptimistic: true,
+        type: "user",
+        uuid: "live-user-2",
+        cursorTurnIndex: 2,
+        turnId: "cursor-turn-2",
+        message: { role: "user", content: "Second question" },
+      });
+      return { cleanup: vi.fn() };
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const snapshot = await service.snapshot(selection);
+    const questions = snapshot.nodes.filter((node) => node.type === "question");
+    expect(questions).toHaveLength(2);
+    expect(JSON.stringify(questions[1])).toContain("Second question");
+  });
+  it("keeps treating replay as seen when resubscribing to the same process", async () => {
+    vi.useFakeTimers();
+    const { service, runtime, push } = fixture(1_000);
+    await service.subscribe(selection, vi.fn());
+    push("complete", {});
+    runtime.subscribeSession.mockImplementation(async (_id, send) => {
+      send("message", {
+        isReplay: true,
+        type: "user",
+        uuid: "replayed-user",
+        codexTurnId: "turn-2",
+        message: { role: "user", content: "Already seen" },
+      });
+      return { cleanup: vi.fn() };
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(runtime.subscribeSession).toHaveBeenCalledTimes(2);
+    const snapshot = await service.snapshot(selection);
+    expect(JSON.stringify(snapshot)).not.toContain("Already seen");
   });
 });
 

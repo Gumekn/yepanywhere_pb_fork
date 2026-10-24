@@ -76,6 +76,10 @@ export interface RuntimeStatus extends RuntimeWorkerActivity {
   mode: RuntimeMode;
   protocolVersion: number;
   processCount: number;
+  /** Providers recognized and enabled by this running runtime (not the shell's files). */
+  availableProviders?: ProviderName[];
+  /** Integration versions loaded by the resident process, independent of web builds. */
+  providerVersions?: Partial<Record<ProviderName, number>>;
 }
 
 /**
@@ -129,6 +133,8 @@ export interface RuntimeReplayOptions {
   processId?: string;
   sessionId?: string;
   afterSeq?: number;
+  /** History recovery across generations; requires sessionId and no sequence cursor. */
+  allProcesses?: boolean;
 }
 
 export interface RuntimeQueueStatus extends RuntimeWorkerPoolStatus {
@@ -211,6 +217,10 @@ export interface RuntimeProviderSettings {
 }
 
 export interface RuntimeController {
+  sideConversation?(
+    sessionId: string,
+    request: import("@yep-anywhere/shared").SideConversationRequest,
+  ): Promise<import("@yep-anywhere/shared").SideConversationResponse>;
   readonly mode: RuntimeMode;
 
   start(): Promise<void>;
@@ -237,6 +247,17 @@ export interface RuntimeController {
   resumeSession(
     input: ResumeRuntimeSessionRequest,
   ): Promise<RuntimeSessionStartResponse>;
+  /**
+   * Cursor prepare/warm state is in-memory and only useful in the process that
+   * later claims it. External mode must run these inside the resident runtime.
+   */
+  prepareCursorSession(input: {
+    cwd: string;
+    model?: string;
+    permissionMode?: PermissionMode;
+  }): Promise<void>;
+  discardCursorPrepare(input: { cwd: string; model?: string }): Promise<void>;
+  warmCursorAuth(model?: string): Promise<void>;
   queueMessage(
     input: QueueRuntimeMessageRequest,
   ): Promise<RuntimeQueueMessageResponse>;

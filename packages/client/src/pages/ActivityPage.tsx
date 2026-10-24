@@ -182,7 +182,7 @@ export function ActivityPage() {
               background: connected ? "#4f4" : "#f44",
             }}
           />
-          <span style={{ fontSize: "0.875rem", color: "#888" }}>
+          <span style={{ fontSize: "var(--font-size-sm)", color: "#888" }}>
             {connected
               ? t("activityConnected" as never)
               : t("activityDisconnected" as never)}
@@ -212,7 +212,7 @@ export function ActivityPage() {
             border: "1px solid #444",
             borderRadius: "8px",
             color: "inherit",
-            fontSize: "1rem",
+            fontSize: "var(--font-size-base)",
           }}
         />
         <button
@@ -249,7 +249,7 @@ export function ActivityPage() {
             onClick={() => toggleTypeFilter(type)}
             style={{
               padding: "0.5rem 0.75rem",
-              fontSize: "0.875rem",
+              fontSize: "var(--font-size-sm)",
               background: typeFilters.has(type) ? "#4a4aff" : "#333",
               border: typeFilters.has(type)
                 ? "1px solid #5a5aff"
@@ -265,7 +265,7 @@ export function ActivityPage() {
             onClick={() => setTypeFilters(new Set())}
             style={{
               padding: "0.5rem 0.75rem",
-              fontSize: "0.875rem",
+              fontSize: "var(--font-size-sm)",
               background: "#444",
             }}
           >
@@ -280,7 +280,7 @@ export function ActivityPage() {
           display: "flex",
           gap: "2rem",
           marginBottom: "1rem",
-          fontSize: "0.875rem",
+          fontSize: "var(--font-size-sm)",
           color: "#888",
         }}
       >
@@ -315,7 +315,7 @@ export function ActivityPage() {
               <h3
                 style={{
                   color: "#888",
-                  fontSize: "0.875rem",
+                  fontSize: "var(--font-size-sm)",
                   marginBottom: "0.5rem",
                 }}
               >
@@ -339,8 +339,8 @@ export function ActivityPage() {
                       gridTemplateColumns: "80px 24px 100px 1fr",
                       gap: "0.75rem",
                       alignItems: "center",
-                      fontFamily: "monospace",
-                      fontSize: "0.875rem",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "var(--font-size-sm)",
                     }}
                   >
                     <span style={{ color: "#666" }}>
@@ -359,7 +359,7 @@ export function ActivityPage() {
                     <span
                       style={{
                         color: "#888",
-                        fontSize: "0.75rem",
+                        fontSize: "var(--font-size-xs)",
                         background: "#333",
                         padding: "0.25rem 0.5rem",
                         borderRadius: "4px",

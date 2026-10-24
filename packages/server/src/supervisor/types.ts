@@ -26,6 +26,13 @@ import type { PermissionMode, SDKMessage } from "../sdk/types.js";
 // Constants
 export const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 export const DEFAULT_IDLE_PREEMPT_THRESHOLD_MS = 10 * 1000; // 10 seconds - workers idle longer than this can be preempted
+/**
+ * Resident provider processes (Codex app-server, Claude CLI, Pi RPC, ...)
+ * stay owned while they are alive. Once a session has been idle this long its
+ * provider process is released; the next message resumes it cold.
+ * 0 disables the cap.
+ */
+export const DEFAULT_RESIDENT_IDLE_TTL_MS = 60 * 60 * 1000; // 60 minutes
 
 // Re-export path utilities for backward compatibility
 // See packages/server/src/projects/paths.ts for full documentation on encoding schemes
@@ -54,6 +61,8 @@ export interface Project {
   hasPiSessions?: boolean; // whether this project also has Pi sessions
   hasKimiSessions?: boolean; // whether this project also has Kimi sessions
   hasZCodeSessions?: boolean; // whether this project also has ZCode sessions
+  hasCursorSessions?: boolean; // whether this project also has Cursor ACP sessions
+  hasMcodeSessions?: boolean; // whether this project also has MiniMax Code sessions
   activeOwnedCount: number; // sessions owned by this server
   activeExternalCount: number; // sessions controlled by external processes
   lastActivity: string | null; // ISO timestamp of most recent session update
@@ -139,6 +148,8 @@ export interface SessionSummary {
    * `forked_from_id`; other providers may use Yep metadata.
    */
   forkParentSessionId?: string;
+  /** Native branch members collapsed into this conversation in lists. */
+  forkFamilySessionIds?: string[];
   /** Model used for this session (extracted from JSONL, e.g. "claude-opus-4-5-20251101") */
   model?: string;
   /** Provider-specific reasoning effort (e.g. Claude "max", Codex "xhigh") */

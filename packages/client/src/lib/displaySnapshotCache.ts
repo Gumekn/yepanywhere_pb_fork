@@ -1,4 +1,5 @@
 import type { SessionDisplaySnapshot } from "@yep-anywhere/shared";
+import { estimateStructuralBytes } from "./sessionSnapshotCache";
 
 /** Snapshots are immutable. Account only for the replaced entry on each patch. */
 export class DisplaySnapshotCache {
@@ -22,9 +23,9 @@ export class DisplaySnapshotCache {
   }
 
   set(key: string, snapshot: SessionDisplaySnapshot): void {
-    // Keep the existing UTF-16 JSON estimate and write-recency eviction policy.
-    // Measure first so a failed serialization cannot corrupt the accounting.
-    const bytes = JSON.stringify(snapshot).length * 2;
+    // Eviction accounting only. The stored snapshot is the same object the
+    // caller passed in. Stop once the estimate already exceeds the budget.
+    const bytes = estimateStructuralBytes([snapshot], this.maxBytes);
     this.bytes -= this.entries.get(key)?.bytes ?? 0;
     this.entries.delete(key);
     this.entries.set(key, { snapshot, bytes });

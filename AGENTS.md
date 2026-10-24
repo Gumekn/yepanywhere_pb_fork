@@ -9,6 +9,10 @@
 - 如果用户明确要求英文，或需要与上游英文接口/文档保持一致，可以改用英文。
 - 客户端界面只维护英文（`en`）和简体中文（`zh-CN`）两套语言。新增或修改界面文案时同步更新这两个语言包；除非用户明确要求扩大产品语言范围，否则不要新增或维护其他 locale。
 
+## 本机 shell
+
+这台 Mac 上的 agent 会话（Cursor 和 Codex CLI）都使用 zsh，没有 `~/.bash_profile`。直接在当前 zsh 会话里执行命令，不要 `source ~/.bash_profile`，也不要改用 bash。如果另一条规则要求第一次执行终端命令前 source 该文件，以本节为准。
+
 ## Codex CLI 行为
 
 - 除非用户明确要求 UI/browser/vibe test，或明确说要使用 Chrome/Browser 工具，否则不要主动使用浏览器自动化、Chrome DevTools、Browser Use、Playwright、截图检查或 in-app browser 工具。
@@ -40,7 +44,9 @@ Yep Anywhere 是一个面向移动端优先的 coding agent 监督器。核心�
 
 涉及 ZCode（zcode provider、app-server 协议、session fork/attachments/mcp/bridge）改动时，协议事实一律以本机真实 CLI（`/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`）的只读探测和 bundle 源码为准，不要凭印象实现；所有 params schema 都是 strict，改任何请求结构前先用临时 app-server 探测（参考 `scripts/smoke-zcode-app-server.ts` 的写法）。实现入口：`packages/server/src/sdk/providers/zcode*`、`packages/server/src/sessions/zcode-*`、`packages/shared/src/zcode-schema/`、`packages/server/src/zcode-bridge/`。ZCode bridge 采用 hook 插件（`packages/server/resources/zcode-plugin/`），需用户手动运行 `scripts/install-zcode-yep-plugin.sh` 安装后才生效；不要代替用户安装（会改写 `~/.zcode` 配置）。read-only smoke：`pnpm test:zcode-app-server-smoke -- --read-only --summary`；会发起模型请求或写诊断 session 的 smoke 必须先取得用户明确授权。
 
-Android 模拟器/真机和 ChromeOS streaming 是产品功能，但不是默认验证路径。只有在用户要求，或任务直接涉及 device-bridge/mobile-shell 行为时，才使用 adb、emulator、APK 安装、ChromeOS testbed 或设备 streaming 流程。
+涉及 MiniMax Code（`mcode` provider、`mcode acp`、`~/.minimax` 会话目录/transcript、App 会话接管）改动时，协议事实以本机真实 CLI（`mcode`，npm 包 `@minimax/code`）和 `references/minimax/` 为准；ACP 服务端行为看 `references/minimax/pretty/run-acp-command.js`，存储/权限看 `references/minimax/app/mavis/`。CLI 与桌面 App 共用 `~/.minimax`，Yep 只读其数据库与 transcript，不要写入。实现入口：`packages/server/src/sdk/providers/mcode*.ts`、`packages/server/src/sessions/mcode-*.ts`、`packages/server/src/projects/mcode-scanner.ts`。真实联调脚本 `scripts/smoke-mcode-provider.ts` 会发起模型请求，需用户授权。说明见 `docs/project/mcode.md`。
+
+设备桥接与 Android／ChromeOS 远程串流功能已移除；手机客户端、浏览器设备管理和通知仍保留。只有用户要求，或任务直接涉及 mobile-shell 行为时，才使用 adb、emulator 或 APK 安装流程。
 
 ## 端口与 Profile
 
@@ -64,7 +70,7 @@ PORT=4000 YEP_ANYWHERE_PROFILE=dev pnpm dev
 - `YEP_ANYWHERE_PROFILE`：创建 `~/.yep-anywhere-{profile}/`。
 - `YEP_ANYWHERE_DATA_DIR`：显式覆盖数据目录。
 - `CLAUDE_CONFIG_DIR`：Claude Code 配置/session 根目录，默认 `~/.claude`。
-- `ENABLED_PROVIDERS`：逗号分隔的 provider allowlist。有效值包括 `claude`、`claude-ollama`、`codex`、`codex-oss`、`gemini`、`gemini-acp`、`pi`、`kimi`、`zcode`。
+- `ENABLED_PROVIDERS`：逗号分隔的 provider allowlist。有效值包括 `claude`、`claude-ollama`、`codex`、`codex-oss`、`gemini`、`gemini-acp`、`pi`、`kimi`、`zcode`、`mcode`。
 - `VOICE_INPUT=false`：在服务端禁用语音输入按钮。
 - `YEP_RUNTIME_EXTERNAL=true`：部署时把 agent runtime 拆成独立进程（见下面的热叠加章节）。
 - `YEP_RUNTIME_MODE`：`embedded`（默认）或 `external`，运行时形态。
@@ -181,6 +187,13 @@ curl -X PUT http://localhost:3401/log/level -d '{"console": "debug"}'
 ```
 
 除非用户明确同意重启，否则避免调用 `POST /reload`。
+
+## 客户端字体与字号
+
+- 字体栈和字号只在 `packages/client/src/styles/typography.css` 定义；普通 UI 使用 `--font-sans`，代码/路径使用 `--font-mono`，字号使用已定义的 `--font-size-*` 或继承。
+- 新页面、侧栏、弹窗默认继承统一正文；不要自行写 px/rem/em 字号、拼接另一套字体栈、重定义字号变量或用局部倍数制造新字号。React 内联样式也遵守同样规则。
+- 用户字号由 `useFontSize` 单独调整根比例，不再对各 token 重复写像素值。移动输入框使用 `--font-size-input`；终端、SVG 和启动画面的有限例外见 [字体约束](docs/project/typography.md)。
+- 修改 UI 后运行 `pnpm lint:typography`；此检查也属于 `pnpm lint` 和客户端构建。新增字号角色应更新唯一入口和说明，不应绕开检查。
 
 ## 类型系统
 

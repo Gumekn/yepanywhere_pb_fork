@@ -11,10 +11,12 @@ import {
   type SessionDisplayView,
 } from "@yep-anywhere/shared";
 import { renderSafeMarkdown } from "../augments/safe-markdown.js";
+import { isCodexAgentWaitTool } from "../codex/agent-wait.js";
 import { normalizeCodexToolInvocation } from "../codex/normalization.js";
 import {
   buildSessionDisplayProjection,
   extractToolPaths,
+  getCodexSubagentOperation,
   isCheckTool,
 } from "../sessions/display-projection.js";
 import type { Message } from "../supervisor/types.js";
@@ -34,9 +36,9 @@ export interface DisplayToolRecord {
   position: number;
   /**
    * Identity of the assistant message that requested the call. Calls sharing a
-   * batch were issued together and may finish in any order; calls in different
-   * batches are strictly sequential, because a model only emits the next batch
-   * after it has seen the results of the previous one.
+   * batch were issued together and may finish in any order. Sequential
+   * providers use this to detect abandoned calls; Codex command lifecycles
+   * can outlive the model's tool response and span multiple batches.
    */
   batch: string;
 }
@@ -88,12 +90,47 @@ function outputText(value: unknown): string {
       .join("\n");
   return "";
 }
+interface CursorThinkingPlacement {
+  text?: string;
+  toolId?: string;
+  fallback?: boolean;
+  section?: string;
+}
+
+function cursorTextsMatch(native: string, live: string): boolean {
+  const left = native.trim();
+  const right = live.trim();
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (Math.min(left.length, right.length) < 24) return false;
+  return left.includes(right) || right.includes(left);
+}
+
+function readCursorThinkingPlacement(
+  message: RecordValue,
+): CursorThinkingPlacement | undefined {
+  const raw = record(message.cursorThinkingBefore);
+  if (!raw) return undefined;
+  const text = string(raw.text);
+  const toolId = string(raw.toolId);
+  const fallback = raw.fallback === true;
+  if (!text && !toolId && !fallback) return undefined;
+  const turnId = string(message.turnId);
+  return {
+    ...(text ? { text } : {}),
+    ...(toolId ? { toolId } : {}),
+    ...(fallback ? { fallback: true } : {}),
+    ...(turnId ? { section: `turn:${turnId}` } : {}),
+  };
+}
+
 function toolSummary(input: unknown): string {
   const args = record(input);
   if (!args) return typeof input === "string" ? input.slice(0, 1_024) : "";
   for (const key of [
     "command",
     "cmd",
+    "script",
     "file_path",
     "path",
     "url",
@@ -128,6 +165,8 @@ export class SessionDisplayReducer {
   private currentSection = "preamble";
   private currentGroup: string | undefined;
   private streamingId: string | undefined;
+  private streamingTexts = new Map<string, string>();
+  private endedRuns = new Set<string>();
   private runtime: SessionDisplayActivity["state"] = "unknown";
   private compactionRun: string | undefined;
   private seq = 0;
@@ -139,6 +178,13 @@ export class SessionDisplayReducer {
 
   get currentRunId(): string {
     return this.currentRun;
+  }
+  isRunEnded(runId: string): boolean {
+    return this.endedRuns.has(runId);
+  }
+  isMessageCommitted(messageId: string): boolean {
+    const id = this.aliases.get(`${messageId}:0`);
+    return id !== undefined && this.committed.has(id);
   }
   get currentQuestionId(): string | undefined {
     for (let i = this.nodes.length - 1; i >= 0; i--) {
@@ -166,7 +212,101 @@ export class SessionDisplayReducer {
     } else this.nodes[index] = node;
   }
 
+  private insertAt(index: number, node: SessionDisplayNode): void {
+    this.nodes.splice(index, 0, node);
+    for (let cursor = index; cursor < this.nodes.length; cursor += 1) {
+      const current = this.nodes[cursor];
+      if (current) this.nodeIndices.set(current.id, cursor);
+    }
+  }
+
+  /**
+   * Restore a reasoning boundary inside a previously coalesced tool group.
+   * Use the same first-call identity as live grouping so detail URLs and the
+   * client's expanded state survive a native-history refresh.
+   */
+  private splitGroupBefore(tool: DisplayToolRecord): number | undefined {
+    const group = this.groups.get(tool.step.groupId);
+    const index = group ? this.nodeIndices.get(group.id) : undefined;
+    if (!group || index === undefined) return undefined;
+    const position = group.tools.indexOf(tool.step.id);
+    if (position <= 0) return index;
+    const node = this.nodes[index];
+    if (!node) return undefined;
+    const tail: Group = {
+      id: tool.step.id.replace("dt2.", "dg2."),
+      runId: group.runId,
+      tools: group.tools.splice(position),
+      closed: group.closed,
+    };
+    group.closed = true;
+    this.groups.set(tail.id, tail);
+    for (const [position, id] of tail.tools.entries()) {
+      const moved = this.tools.get(id);
+      if (!moved) continue;
+      moved.position = position;
+      moved.step = {
+        ...moved.step,
+        groupId: tail.id,
+        version: moved.step.version + 1,
+      };
+    }
+    this.insertAt(index + 1, {
+      type: "segment",
+      id: tail.id,
+      turnId: node.turnId,
+      segment: this.groupSegment(tail),
+    });
+    return index + 1;
+  }
+
+  /**
+   * Put a recovered Cursor thought above the exact reply or tool it preceded.
+   * A missed anchor still stays before that turn's last reply.
+   */
+  private findCursorThinkingIndex(
+    placement: CursorThinkingPlacement,
+  ): number | undefined {
+    const section = placement.section ?? this.currentSection;
+    const runId = section.startsWith("turn:")
+      ? section.slice("turn:".length)
+      : this.currentRun;
+    if (placement.toolId) {
+      const mapped = this.rawToolIds.get(placement.toolId);
+      const tool =
+        this.tools.get(displayToolId(runId, placement.toolId)) ??
+        (mapped ? this.tools.get(mapped) : undefined);
+      if (tool && tool.runId === runId) {
+        const index = this.splitGroupBefore(tool);
+        if (index !== undefined) return index;
+      }
+    }
+    if (placement.text) {
+      for (let index = 0; index < this.nodes.length; index += 1) {
+        const node = this.nodes[index];
+        if (
+          node?.type === "segment" &&
+          node.segment.type === "assistant_text" &&
+          node.turnId === section &&
+          cursorTextsMatch(node.segment.content, placement.text)
+        )
+          return index;
+      }
+    }
+    for (let index = this.nodes.length - 1; index >= 0; index -= 1) {
+      const node = this.nodes[index];
+      if (
+        node?.type === "segment" &&
+        node.segment.type === "assistant_text" &&
+        node.turnId === section
+      )
+        return index;
+    }
+    return undefined;
+  }
+
   setRuntime(state: SessionDisplayActivity["state"]): void {
+    if (state !== "running" && state !== "unknown") this.stopStreaming();
     if (["completed", "interrupted", "failed"].includes(state))
       this.compactionRun = undefined;
     const last = this.nodes.at(-1);
@@ -179,6 +319,18 @@ export class SessionDisplayReducer {
       ![...this.tools.values()].some((t) => t.step.status === "running")
         ? "finishing"
         : state;
+  }
+
+  /** Closing presentation never discards partial text or commits it as an answer. */
+  stopStreaming(runId?: string, exceptId?: string): void {
+    for (const [id, run] of this.streamingTexts) {
+      if (id === exceptId || (runId && run !== runId)) continue;
+      const index = this.nodeIndices.get(id);
+      const node = index === undefined ? undefined : this.nodes[index];
+      if (node?.type === "segment" && node.segment.type === "assistant_text")
+        this.put({ ...node, segment: { ...node.segment, streaming: false } });
+      this.streamingTexts.delete(id);
+    }
   }
 
   private closeBefore(id: string): void {
@@ -198,6 +350,10 @@ export class SessionDisplayReducer {
   }
 
   private closeRun(runId: string, status: SessionDisplayTurnStatus): void {
+    if (status !== "running") {
+      this.endedRuns.add(runId);
+      this.stopStreaming(runId);
+    }
     if (this.compactionRun === runId && status !== "running")
       this.compactionRun = undefined;
     for (const group of this.groups.values())
@@ -226,18 +382,25 @@ export class SessionDisplayReducer {
     thinking = false,
     deferred = false,
     asyncMessage?: CodexAsyncMessage,
+    provisional = false,
+    placement?: CursorThinkingPlacement,
   ): void {
     if (!text.trim()) return;
     if (streaming && this.committed.has(id)) return;
     const old = this.nodeIndices.get(id);
+    if (old === undefined) this.stopStreaming(this.currentRun, id);
+    const active = streaming && !this.endedRuns.has(this.currentRun);
+    if (active && !thinking) this.streamingTexts.set(id, this.currentRun);
+    else this.streamingTexts.delete(id);
     if (old === undefined) this.currentGroup = undefined;
-    this.put({
+    const section =
+      old === undefined
+        ? (placement?.section ?? this.currentSection)
+        : (this.nodes[old]?.turnId ?? this.currentSection);
+    const node: SessionDisplayNode = {
       type: "segment",
       id,
-      turnId:
-        old === undefined
-          ? this.currentSection
-          : (this.nodes[old]?.turnId ?? this.currentSection),
+      turnId: section,
       segment: thinking
         ? {
             type: "thinking",
@@ -251,7 +414,7 @@ export class SessionDisplayReducer {
             type: "assistant_text",
             id,
             content: text,
-            streaming,
+            streaming: active,
             ...(asyncMessage ? { asyncMessage } : {}),
             phase: asyncMessage
               ? "text"
@@ -262,8 +425,15 @@ export class SessionDisplayReducer {
                   : "text",
             ...(timestamp ? { timestamp } : {}),
           },
-    });
-    if (!streaming && !this.committed.has(id)) {
+    };
+    if (old === undefined && placement && thinking) {
+      const at = this.findCursorThinkingIndex(placement);
+      if (at !== undefined) {
+        const turnId = this.nodes[at]?.turnId ?? section;
+        this.insertAt(at, { ...node, turnId });
+      } else this.put(node);
+    } else this.put(node);
+    if (!streaming && !provisional && !this.committed.has(id)) {
       this.committed.add(id);
       this.closeBefore(id);
       if (
@@ -286,8 +456,15 @@ export class SessionDisplayReducer {
     if (!rawId) return;
     const id = displayToolId(runId, rawId);
     let tool = this.tools.get(id);
+    if (!tool) this.stopStreaming(runId);
     if (!replay && !tool && this.runtime !== "hold") this.runtime = "running";
     const originalName = string(block.name) ?? tool?.step.name ?? "Tool";
+    // Codex projects mailbox waits as agentWait notices with the same call id.
+    if (
+      (this.provider === "codex" || this.provider === "codex-oss") &&
+      isCodexAgentWaitTool(originalName)
+    )
+      return;
     const normalized =
       block.input !== undefined &&
       (this.provider === "codex" || this.provider === "codex-oss")
@@ -397,7 +574,10 @@ export class SessionDisplayReducer {
           }
         : {}),
       ...(completed && !(replay && tool.step.status !== "running")
-        ? { status: "completed" as const }
+        ? {
+            status: "completed" as const,
+            completedAt: this.completionTimestamp(tool, timestamp, replay),
+          }
         : {}),
     };
     if (JSON.stringify(nextStep) !== JSON.stringify(tool.step))
@@ -415,14 +595,40 @@ export class SessionDisplayReducer {
     tool.check ||= isCheckTool(input);
   }
 
-  private result(block: RecordValue, runId: string): void {
+  private completionTimestamp(
+    tool: DisplayToolRecord,
+    timestamp: string | undefined,
+    replay: boolean,
+  ): string | undefined {
+    if (tool.step.completedAt) return tool.step.completedAt;
+    const end =
+      timestamp ??
+      (!replay && tool.step.status === "running"
+        ? new Date().toISOString()
+        : undefined);
+    const startMs = Date.parse(tool.step.timestamp ?? "");
+    const endMs = Date.parse(end ?? "");
+    // Identical timestamps often mean a whole call was persisted in one
+    // message. They do not establish a zero-duration execution.
+    return Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs
+      ? end
+      : undefined;
+  }
+
+  private result(
+    block: RecordValue,
+    runId: string,
+    timestamp?: string,
+    replay = false,
+  ): void {
     const rawId = string(block.tool_use_id);
     if (!rawId) return;
     let id = displayToolId(runId, rawId);
     if (!this.tools.has(id)) id = this.rawToolIds.get(rawId) ?? id;
     let tool = this.tools.get(id);
     if (!tool) {
-      this.tool({ id: rawId }, runId);
+      // A result without its call cannot establish when execution started.
+      this.tool({ id: rawId }, runId, undefined, true);
       tool = this.tools.get(displayToolId(runId, rawId));
     }
     if (!tool) return;
@@ -430,6 +636,12 @@ export class SessionDisplayReducer {
     const nextStep: SessionDisplayToolStep = {
       ...tool.step,
       status: block.is_error === true ? "failed" : "completed",
+      completedAt: this.completionTimestamp(tool, timestamp, replay),
+      ...(typeof block.durationMs === "number" &&
+      Number.isFinite(block.durationMs) &&
+      block.durationMs >= 0
+        ? { durationMs: block.durationMs }
+        : {}),
       preview: text.slice(-SESSION_DISPLAY_STEP_PREVIEW_LIMIT),
       truncated:
         text.length > SESSION_DISPLAY_STEP_PREVIEW_LIMIT ||
@@ -527,11 +739,23 @@ export class SessionDisplayReducer {
     }
     if (message.type === "stream_event") {
       if (replay) return; // Completed snapshots/replayed message bodies are authoritative.
+      if (runId && this.endedRuns.has(runId)) return;
       const event = record(message.event);
       if (event?.type === "message_start") {
+        if (!runId) this.endedRuns.delete(this.currentRun);
+        this.stopStreaming();
         this.streamingId = string(record(event.message)?.id) ?? rawId;
         if (runId) this.currentRun = runId;
       }
+      if (
+        event?.type === "content_block_stop" ||
+        event?.type === "message_stop"
+      ) {
+        this.stopStreaming(runId);
+        if (event.type === "message_stop") this.streamingId = undefined;
+        return;
+      }
+      if (event?.type === "content_block_start") this.stopStreaming(runId);
       const delta = record(event?.delta);
       if (
         event?.type === "content_block_delta" &&
@@ -539,7 +763,9 @@ export class SessionDisplayReducer {
         typeof delta.text === "string"
       ) {
         if (runId) this.currentRun = runId;
-        const streamId = this.streamingId ?? rawId;
+        const streamId = message.codexTurnId
+          ? rawId
+          : (this.streamingId ?? rawId);
         if (!streamId) return;
         const blockIndex =
           typeof event.index === "number" &&
@@ -604,6 +830,8 @@ export class SessionDisplayReducer {
         return;
       }
       const startsNewRun = !replay && runId && runId !== this.currentRun;
+      if (!runId) this.endedRuns.delete("session");
+      this.stopStreaming();
       this.currentRun = runId ?? "session";
       this.currentSection = `turn:${runId ?? rawId}`;
       this.currentGroup = undefined;
@@ -622,10 +850,21 @@ export class SessionDisplayReducer {
     if (runId) this.currentRun = runId;
     const effectiveRun = runId ?? this.currentRun;
     if (message.type === "system" || message.type === "kimi_goal") {
+      const nativeItem = record(message.codexThreadItem);
+      const nativeId = string(nativeItem?.id);
+      const collaborationTool =
+        nativeItem?.type === "subAgentActivity" && nativeId
+          ? this.tools.get(displayToolId(effectiveRun, nativeId))
+          : undefined;
+      const operation = getCodexSubagentOperation(collaborationTool?.step.name);
+      const projectedMessage =
+        operation && nativeItem
+          ? { ...message, codexThreadItem: { ...nativeItem, operation } }
+          : message;
       const projection = buildSessionDisplayProjection({
         sessionId: this.view.sessionId,
         revision: "display-v2",
-        messages: [message as Message],
+        messages: [projectedMessage as Message],
         questionCoverage: "partial",
         provider: this.provider,
       });
@@ -656,20 +895,26 @@ export class SessionDisplayReducer {
               (rawId && this.aliases.get(`${rawId}:${index}`)) ||
               textIdentity(rawId ?? identity, index);
             if (rawId) this.aliases.set(`${rawId}:${index}`, id);
+            if (typeof nested?.id === "string")
+              this.aliases.set(`${nested.id}:${index}`, id);
             this.text(
               id,
               block.text,
-              message._isStreaming === true,
+              message._isStreaming === true &&
+                index ===
+                  (message._streamingBlockIndex ?? textBlocks.length - 1),
               message.codexMessagePhase,
               timestamp,
               false,
               false,
               message.codexAsyncMessage as CodexAsyncMessage | undefined,
+              message._isStreaming === true ||
+                message._isStreamingPlaceholder === true,
             );
           } else if (
             block.type === "thinking" &&
             typeof block.thinking === "string" &&
-            this.provider === "pi"
+            (this.provider === "pi" || this.provider === "cursor")
           ) {
             this.text(
               `thinking:${identity}:${index}`,
@@ -679,6 +924,11 @@ export class SessionDisplayReducer {
               timestamp,
               true,
               block.deferred === true,
+              undefined,
+              false,
+              this.provider === "cursor"
+                ? readCursorThinkingPlacement(message)
+                : undefined,
             );
           } else if (block.type === "tool_use") {
             this.tool(block, effectiveRun, timestamp, replay, identity);
@@ -689,7 +939,8 @@ export class SessionDisplayReducer {
     for (const block of blocks) {
       if (block.type === "tool_use" && role !== "assistant")
         this.tool(block, effectiveRun, timestamp, replay, rawId ?? undefined);
-      else if (block.type === "tool_result") this.result(block, effectiveRun);
+      else if (block.type === "tool_result")
+        this.result(block, effectiveRun, timestamp, replay);
     }
     if (message.type === "error" && message.willRetry !== true) {
       const id = `error:${rawId ?? effectiveRun}`;
@@ -718,10 +969,62 @@ export class SessionDisplayReducer {
       : null;
   }
 
+  /**
+   * Native Cursor history omits per-call timing. Carry verified lifecycle
+   * timestamps from live state or journal replay without replaying tool bodies,
+   * changing execution status, or creating calls missing from this timeline.
+   */
+  restoreToolTimings(records: Iterable<DisplayToolRecord>): void {
+    for (const { step: timing } of records) {
+      const tool = this.tools.get(timing.id);
+      if (!tool) continue;
+      const start = tool.step.timestamp ?? timing.timestamp;
+      const timestamp = Number.isFinite(Date.parse(start ?? ""))
+        ? start
+        : undefined;
+      const end = tool.step.completedAt ?? timing.completedAt;
+      const completedAt =
+        timestamp && Date.parse(end ?? "") > Date.parse(timestamp)
+          ? end
+          : undefined;
+      const duration = tool.step.durationMs ?? timing.durationMs;
+      const durationMs =
+        typeof duration === "number" &&
+        Number.isFinite(duration) &&
+        duration >= 0
+          ? duration
+          : undefined;
+      if (
+        tool.step.timestamp === timestamp &&
+        tool.step.completedAt === completedAt &&
+        tool.step.durationMs === durationMs
+      )
+        continue;
+      tool.step = {
+        ...tool.step,
+        ...(timestamp ? { timestamp } : {}),
+        ...(completedAt ? { completedAt } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        version: tool.step.version + 1,
+      };
+    }
+  }
+
   private groupSegment(group: Group): GroupSegment {
     const tools = this.groupSteps(group.id) ?? [];
     const running = tools.filter((t) => t.status === "running");
     const failed = tools.filter((t) => t.status === "failed");
+    let durationMs = 0;
+    let timedCount = 0;
+    for (const tool of tools) {
+      if (tool.status === "running") continue;
+      const elapsed =
+        tool.durationMs ??
+        Date.parse(tool.completedAt ?? "") - Date.parse(tool.timestamp ?? "");
+      if (!Number.isFinite(elapsed) || elapsed < 0) continue;
+      durationMs += elapsed;
+      timedCount++;
+    }
     const paths = new Set<string>();
     let checks = 0;
     for (const id of group.tools) {
@@ -736,6 +1039,7 @@ export class SessionDisplayReducer {
       detailRef: group.id,
       count: tools.length,
       failedCount: failed.length,
+      ...(timedCount > 0 ? { durationMs, timedCount } : {}),
       runningCount: running.length,
       unknownCount: tools.filter((t) => t.status === "unknown").length,
       interruptedCount: tools.filter((t) => t.status === "interrupted").length,
@@ -771,20 +1075,23 @@ export class SessionDisplayReducer {
    *
    * A step normally ends on its `tool_result`, or on a terminal turn status via
    * `closeRun`. Neither arrives when a provider stream dies mid tool call: Pi
-   * persists the half-built call from a broken upstream stream, and Codex loses
-   * a turn outright when its app-server or bridge restarts before
-   * `turn_complete`. Providers without native turn ids (Pi, Kimi) make this
+   * persists the half-built call from a broken upstream stream.
+   * Providers without native turn ids (Pi, Kimi) make this
    * worse, because every run collapses onto `session` and `closeRun` can only
    * fire once the whole session goes idle. The orphan then spins as a bogus
    * "still running" row for the rest of the session.
    *
-   * Tool batches are strictly sequential: a model only requests the next batch
+   * On sequential providers a model only requests the next batch
    * after it has seen the results of the previous one. So any running step from
    * a batch older than the newest settled step is dead, not pending. Steps
    * inside one batch are never judged against each other, which leaves a
    * genuinely in-flight parallel batch (some done, some still working) alone.
    */
   private reapStrandedTools(): void {
+    // Codex exec_command can yield a process id while the command keeps
+    // running. Later calls completing says nothing about that process; only
+    // its own result or a terminal turn may settle the display step.
+    if (this.provider === "codex" || this.provider === "codex-oss") return;
     let lastSettled = -1;
     for (let index = this.toolOrder.length - 1; index >= 0; index--) {
       if (this.toolOrder[index]?.step.status !== "running") {

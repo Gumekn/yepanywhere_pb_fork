@@ -15,9 +15,12 @@ import {
 import { parseRemoteExecutorConfigs } from "../sdk/remote-executor-config.js";
 import type { OhMyRouterThroughputBenchmark } from "./OhMyRouterBenchmarkService.js";
 
-const CURRENT_VERSION = 5;
+const CURRENT_VERSION = 6;
 
-const LEGACY_CLAUDE_SETTING_KEYS = [
+const RETIRED_SETTING_KEYS = [
+  "globalInstructions",
+  "deviceBridgeEnabled",
+  "chromeOsHosts",
   "ollamaUrl",
   "ollamaSystemPrompt",
   "ollamaUseFullSystemPrompt",
@@ -27,16 +30,10 @@ const LEGACY_CLAUDE_SETTING_KEYS = [
 export interface ServerSettings {
   /** Whether clients should register the service worker (for push notifications) */
   serviceWorkerEnabled: boolean;
-  /** SSH host aliases for ChromeOS device-bridge targets */
-  chromeOsHosts?: string[];
   /** Remote-only Claude Code executors and shared-directory path mappings. */
   remoteExecutors?: RemoteExecutorConfig[];
   /** Allowed hostnames for host/origin validation. "*" = allow all, comma-separated = specific hosts. */
   allowedHosts?: string;
-  /** Free-form instructions appended to the system prompt for all sessions */
-  globalInstructions?: string;
-  /** Whether the device bridge (emulator/device streaming) feature is enabled */
-  deviceBridgeEnabled?: boolean;
   /** Defaults applied when opening the new session form */
   newSessionDefaults?: NewSessionDefaults;
   /** Whether lifecycle webhook delivery is enabled */
@@ -76,7 +73,7 @@ function migrateSettings(settings: unknown): {
   const cleaned = { ...source };
   let changed = false;
 
-  for (const key of LEGACY_CLAUDE_SETTING_KEYS) {
+  for (const key of RETIRED_SETTING_KEYS) {
     if (key in cleaned) {
       delete cleaned[key];
       changed = true;

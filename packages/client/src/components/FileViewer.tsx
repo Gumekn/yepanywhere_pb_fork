@@ -30,7 +30,7 @@ function FileViewerCopyAction({
   label: string;
   copiedLabel: string;
   failedLabel: string;
-  kind: "title" | "content";
+  kind: "title" | "path" | "content";
 }) {
   const [feedback, setFeedback] = useState<CopyFeedback>(null);
 
@@ -78,6 +78,8 @@ function FileViewerCopyAction({
         <CopyFailedIcon />
       ) : kind === "title" ? (
         <CopyTitleIcon />
+      ) : kind === "path" ? (
+        <CopyPathIcon />
       ) : (
         <CopyIcon />
       )}
@@ -902,6 +904,13 @@ export const FileViewer = memo(function FileViewer({
           failedLabel={t("fileViewerTitleCopyFailed" as never)}
           kind="title"
         />
+        <FileViewerCopyAction
+          value={displayPath}
+          label={t("fileViewerCopyPath" as never)}
+          copiedLabel={t("fileViewerPathCopied" as never)}
+          failedLabel={t("fileViewerPathCopyFailed" as never)}
+          kind="path"
+        />
         {content !== undefined && (
           <FileViewerCopyAction
             value={content}
@@ -1068,6 +1077,26 @@ function CopyTitleIcon() {
       <rect x="5" y="5" width="9" height="9" rx="1.5" />
       <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2H3.5A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" />
       <path d="M7.25 8h4.5M9.5 8v3.75" />
+    </svg>
+  );
+}
+
+function CopyPathIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="5" y="5" width="9" height="9" rx="1.5" />
+      <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2H3.5A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" />
+      <path d="M11.25 7.75 8.25 12.25" />
     </svg>
   );
 }

@@ -15,7 +15,11 @@ function isRecord(value: unknown): value is JsonRecord {
 export const PI_ABANDONED_TOOL_RESULT_TEXT =
   "Tool call was abandoned: the assistant stream ended before the request was complete, so the tool never ran.";
 
-/** Map Pi's built-in tool names onto Yep's existing rich renderers. */
+/**
+ * Map Pi's built-in tool names onto Yep's existing rich renderers.
+ * This is not `SHARED_RENDERER_TOOL_ALIASES`: `ls` and `find` become `Glob`,
+ * while Codex names such as `shell_command` stay unchanged.
+ */
 export function canonicalizePiToolName(name: string): string {
   switch (name.toLowerCase()) {
     case "bash":

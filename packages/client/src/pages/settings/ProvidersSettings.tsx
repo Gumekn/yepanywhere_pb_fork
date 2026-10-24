@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { type OhMyRouterThroughputStatus, api } from "../../api/client";
+import { SettingsListSkeleton } from "../../components/SettingsSkeleton";
+import { Skeleton } from "../../components/Skeleton";
 import { useProviders } from "../../hooks/useProviders";
 import { useI18n } from "../../i18n";
 import { getAllProviders } from "../../providers/registry";
+import { HarnessUpdates } from "./HarnessUpdates";
 
 function formatMilliseconds(value: number | undefined): string {
   if (value === undefined) return "—";
@@ -69,7 +72,10 @@ function OhMyRouterThroughputBenchmark() {
       </p>
 
       {loading ? (
-        <p className="settings-hint">{t("ohmyrouterBenchmarkLoading")}</p>
+        <SettingsListSkeleton
+          label={t("ohmyrouterBenchmarkLoading")}
+          rows={1}
+        />
       ) : !status?.available ? (
         <p className="settings-hint">
           {t("ohmyrouterBenchmarkUnavailable", {
@@ -161,7 +167,8 @@ function OhMyRouterThroughputBenchmark() {
 
 export function ProvidersSettings() {
   const { t } = useI18n();
-  const { providers: serverProviders } = useProviders();
+  const { providers: serverProviders, loading: providersLoading } =
+    useProviders();
 
   // Merge server detection status with client-side metadata
   const registeredProviders = getAllProviders();
@@ -178,6 +185,7 @@ export function ProvidersSettings() {
 
   return (
     <>
+      <HarnessUpdates />
       <section className="settings-section">
         <h2>{t("providersSectionTitle")}</h2>
         <p className="settings-section-description">
@@ -189,7 +197,9 @@ export function ProvidersSettings() {
               <div className="settings-item-info">
                 <div className="settings-item-header">
                   <strong>{provider.displayName}</strong>
-                  {provider.installed ? (
+                  {providersLoading ? (
+                    <Skeleton width="5em" />
+                  ) : provider.installed ? (
                     <span className="settings-status-badge settings-status-detected">
                       {t("providersDetected")}
                     </span>

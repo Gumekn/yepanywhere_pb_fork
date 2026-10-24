@@ -1,6 +1,6 @@
 /**
  * useRemoteTerminal — connect to a server-side PTY over the existing WS
- * connection. Mirrors the shape of useEmulatorStream:
+ * connection:
  * - Resolves a WS-capable Connection (the plain WebSocketConnection).
  * - Sends `terminal_open` on mount and `terminal_close` on unmount (close
  *   only detaches; the server keeps the PTY alive for reattach).

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { createCodexSideConversation } from "../../side-conversations/codex.js";
+import { SideConversationSession } from "../../side-conversations/session.js";
 /**
  * Codex Provider implementation using codex app-server JSON-RPC.
  *
@@ -44,6 +46,10 @@ import {
   resolveCodexEventProjectionMode,
 } from "../../codex-events/index.js";
 import {
+  CodexAgentWaitTracker,
+  codexAgentWaitMessage,
+} from "../../codex/agent-wait.js";
+import {
   isCodexCorrelationDebugEnabled,
   logCodexCorrelationDebug,
   summarizeCodexNormalizedMessage,
@@ -72,6 +78,10 @@ import {
 } from "../../codex/image-generation.js";
 import { codexImagePreviewUrl } from "../../codex/image-preview.js";
 import {
+  normalizeCodexInterAgentMessage,
+  readCodexInterAgentMessageIdentity,
+} from "../../codex/inter-agent-message.js";
+import {
   getCodexMcpAppServerArgs,
   resolveCodexMcpThreadProfile,
 } from "../../codex/mcp-profile.js";
@@ -95,6 +105,7 @@ import {
   GeneratedArtifactMaterializer,
   UploadManager,
 } from "../../uploads/index.js";
+import { AsyncQueue } from "../../utils/async-queue.js";
 import { findCodexCliPath, whichCommand } from "../cli-detection.js";
 import { logSDKMessage } from "../messageLogger.js";
 import { MessageQueue, getUserPromptProjection } from "../messageQueue.js";
@@ -399,6 +410,10 @@ interface CodexTurnRuntimeState {
   threadId: string;
   activeTurnId: string | null;
   ready: boolean;
+  model?: string;
+  modelProvider?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
 }
 
 type CodexMessagePhase = "commentary" | "final_answer";
@@ -579,86 +594,12 @@ interface CodexAppServerWebSocketTransport {
   headers?: Record<string, string>;
 }
 
-class AsyncQueue<T> {
-  private items: T[] = [];
-  private waiters: Array<{
-    resolve: (value: T) => void;
-    reject: (error: Error) => void;
-    signal?: AbortSignal;
-    onAbort?: () => void;
-  }> = [];
-  private closedError: Error | null = null;
-
-  push(item: T): void {
-    if (this.closedError) return;
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      if (waiter.signal && waiter.onAbort) {
-        waiter.signal.removeEventListener("abort", waiter.onAbort);
-      }
-      waiter.resolve(item);
-      return;
-    }
-    this.items.push(item);
-  }
-
-  close(error?: Error): void {
-    if (this.closedError) return;
-    this.closedError = error ?? new Error("Queue closed");
-    for (const waiter of this.waiters) {
-      if (waiter.signal && waiter.onAbort) {
-        waiter.signal.removeEventListener("abort", waiter.onAbort);
-      }
-      waiter.reject(this.closedError);
-    }
-    this.waiters = [];
-    this.items = [];
-  }
-
-  async shift(signal?: AbortSignal): Promise<T> {
-    if (this.items.length > 0) {
-      const item = this.items.shift();
-      if (item === undefined) {
-        throw new Error("Queue underflow");
-      }
-      return item;
-    }
-
-    if (this.closedError) {
-      throw this.closedError;
-    }
-
-    return await new Promise<T>((resolve, reject) => {
-      const waiter: {
-        resolve: (value: T) => void;
-        reject: (error: Error) => void;
-        signal?: AbortSignal;
-        onAbort?: () => void;
-      } = { resolve, reject, signal };
-
-      if (signal) {
-        const onAbort = () => {
-          this.waiters = this.waiters.filter((w) => w !== waiter);
-          reject(new Error("Operation aborted"));
-        };
-        waiter.onAbort = onAbort;
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-
-      this.waiters.push(waiter);
-    });
-  }
-
-  drain(): T[] {
-    return this.items.splice(0, this.items.length);
-  }
-}
-
 type AppServerRequestHandler = (
   request: JsonRpcServerRequest,
 ) => Promise<unknown>;
 
 interface AppServerRequestMetadata {
+  isolated?: boolean;
   clientMessageId?: string;
 }
 
@@ -746,6 +687,85 @@ export class CodexAppServerClient {
     }
   >();
   private readonly notifications = new AsyncQueue<JsonRpcNotification>();
+  private readonly isolatedThreads = new Map<
+    string,
+    { notify(method: string, params: unknown): void; close(): void }
+  >();
+  private readonly retiredIsolatedThreads = new Set<string>();
+  private isolatedNotificationsOnly = false;
+
+  /** Standalone side clients have no main notification consumer. */
+  useIsolatedNotificationsOnly(): void {
+    this.isolatedNotificationsOnly = true;
+  }
+
+  isolateThread(
+    id: string,
+    notify: (method: string, params: unknown) => void,
+    close: () => void,
+  ): () => void {
+    this.isolatedThreads.set(id, { notify, close });
+    return () => {
+      this.isolatedThreads.delete(id);
+      this.retiredIsolatedThreads.add(id);
+    };
+  }
+
+  async requestIsolated<T>(method: string, params: unknown): Promise<T> {
+    if (
+      [...this.pendingRequests.values()].filter(
+        (pending) => pending.metadata?.isolated,
+      ).length >= 8
+    )
+      throw new Error("Codex side channel is waiting for previous requests.");
+    let expired = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const response = this.requestOnceTracked<T>(method, params, {
+      isolated: true,
+    }).then(async ({ result }) => {
+      // A timed-out fork may still complete. Discard only its child, never the source.
+      if (expired && (method === "thread/fork" || method === "thread/start")) {
+        const thread = asRecord(asRecord(result)?.thread);
+        if (
+          thread?.ephemeral === true &&
+          typeof thread.id === "string" &&
+          thread.id !== asRecord(params)?.threadId
+        ) {
+          this.retiredIsolatedThreads.add(thread.id);
+          void this.requestIsolated("thread/unsubscribe", {
+            threadId: thread.id,
+          }).catch(() => {});
+        }
+      }
+      return result;
+    });
+    try {
+      return await Promise.race([
+        response,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            expired = true;
+            reject(new Error(`Codex side request timed out: ${method}`));
+          }, 30_000);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private closeIsolatedThreads(): void {
+    for (const sink of this.isolatedThreads.values()) {
+      try {
+        sink.close();
+      } catch {
+        /* Side observers cannot fail the parent. */
+      }
+    }
+    this.isolatedThreads.clear();
+  }
+
   private onServerRequest: AppServerRequestHandler | null = null;
   private eventObserver: AppServerEventObserver | null = null;
   private inboundObservationTail: Promise<void> = Promise.resolve();
@@ -813,8 +833,11 @@ export class CodexAppServerClient {
 
     this.process = child;
 
-    child.stdout?.on("data", (chunk: Buffer) => {
-      this.stdoutBuffer += chunk.toString("utf-8");
+    // Pipe chunks may split UTF-8 characters; decode across chunks before
+    // framing JSON lines (also used by the read-only history client).
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      this.stdoutBuffer += chunk;
       const lines = this.stdoutBuffer.split("\n");
       this.stdoutBuffer = lines.pop() ?? "";
       for (const raw of lines) {
@@ -824,8 +847,9 @@ export class CodexAppServerClient {
       }
     });
 
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const stderr = chunk.toString("utf-8").trim();
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      const stderr = chunk.trim();
       if (stderr) {
         this.stderrBuffer = `${this.stderrBuffer}${stderr}\n`.slice(
           -MAX_APP_SERVER_STDERR_LENGTH,
@@ -947,6 +971,23 @@ export class CodexAppServerClient {
         };
         const observer = this.eventObserver;
         this.enqueueInboundObservation(async () => {
+          const id = asRecord(request.params)?.threadId;
+          if (
+            typeof id === "string" &&
+            (this.isolatedThreads.has(id) ||
+              this.retiredIsolatedThreads.has(id))
+          ) {
+            this.sendRaw({
+              jsonrpc: "2.0",
+              id: request.id,
+              error: {
+                code: -32601,
+                message:
+                  "Interactive and external tools are unavailable in this read-only side conversation.",
+              },
+            });
+            return;
+          }
           await observer?.onServerRequest(request);
           this.handleServerRequest(request);
         });
@@ -966,6 +1007,22 @@ export class CodexAppServerClient {
       }
       const observer = this.eventObserver;
       this.enqueueInboundObservation(async () => {
+        const params = asRecord(notification.params);
+        const id = params?.threadId ?? asRecord(params?.thread)?.id;
+        if (
+          typeof id === "string" &&
+          (this.isolatedThreads.has(id) || this.retiredIsolatedThreads.has(id))
+        ) {
+          try {
+            this.isolatedThreads
+              .get(id)
+              ?.notify(notification.method, notification.params);
+          } catch {
+            /* Isolate side rendering failures. */
+          }
+          return;
+        }
+        if (this.isolatedNotificationsOnly) return;
         const canonicalEvent =
           await observer?.onServerNotification(notification);
         this.notifications.push({
@@ -983,7 +1040,7 @@ export class CodexAppServerClient {
       if (!pending) {
         return;
       }
-      const observer = this.eventObserver;
+      const observer = pending.metadata?.isolated ? null : this.eventObserver;
       this.enqueueInboundObservation(async () => {
         if (this.pendingRequests.get(id) !== pending) return;
         this.pendingRequests.delete(id);
@@ -1154,7 +1211,7 @@ export class CodexAppServerClient {
     }
 
     const id = this.nextRequestId++;
-    await this.eventObserver?.onClientRequest({
+    await (metadata?.isolated ? null : this.eventObserver)?.onClientRequest({
       requestId: id,
       method,
       params,
@@ -1207,6 +1264,7 @@ export class CodexAppServerClient {
     if (this.closed) return Promise.resolve();
     this.closed = true;
 
+    this.closeIsolatedThreads();
     const closeError = new Error("Codex app-server client closed");
     this.closeError = closeError;
     for (const pending of this.pendingRequests.values()) {
@@ -1233,6 +1291,7 @@ export class CodexAppServerClient {
   private handleProcessClose(error: Error): void {
     if (this.closed) return;
     this.closed = true;
+    this.closeIsolatedThreads();
     const capturedStderr = this.stderrBuffer.trim();
     const processError = capturedStderr
       ? new Error(
@@ -1286,6 +1345,10 @@ export class CodexAppServerClient {
  * Codex Provider implementation using app-server JSON-RPC.
  */
 export class CodexProvider implements AgentProvider {
+  private readonly waitTrackers = new WeakMap<
+    Map<string, CodexToolCallContext>,
+    CodexAgentWaitTracker
+  >();
   readonly name = "codex" as const;
   readonly displayName = "Codex";
   readonly supportsPermissionMode = true;
@@ -1372,6 +1435,150 @@ export class CodexProvider implements AgentProvider {
               : {}),
           })
         : new InMemoryCodexEventStore());
+  }
+
+  private readonly bridgeSides = new Map<
+    string,
+    { control: SideConversationSession; touched: number }
+  >();
+
+  hasBridgeSideConversation(sessionId: string): boolean {
+    return this.bridgeSides.has(sessionId);
+  }
+
+  async disposeBridgeSideConversations(): Promise<void> {
+    await Promise.all(
+      [...this.bridgeSides.values()].map((entry) =>
+        entry.control.dispose("Runtime stopped."),
+      ),
+    );
+    this.bridgeSides.clear();
+  }
+
+  /** Fork an observed bridge thread without resuming it or taking over its writer. */
+  async bridgeSideConversation(
+    sessionId: string,
+    request: import("@yep-anywhere/shared").SideConversationRequest,
+  ): Promise<import("@yep-anywhere/shared").SideConversationResponse> {
+    let entry = this.bridgeSides.get(sessionId);
+    if (!entry) {
+      const target = await this.resolveBridgeExecutionTarget({
+        resumeSessionId: sessionId,
+        cwd: process.cwd(),
+      });
+      if (!target) return { supported: false, reason: "not_ready" };
+      const concurrent = this.bridgeSides.get(sessionId);
+      if (concurrent) return concurrent.control.execute(request);
+      // A capability read must not connect a second client or start a provider.
+      if (request.action === "get") return { supported: true };
+      if (request.action !== "create")
+        return { supported: false, reason: "not_ready" };
+      for (const [id, retained] of this.bridgeSides) {
+        if (
+          !retained.control.isOpen ||
+          Date.now() - retained.touched > 30 * 60_000
+        ) {
+          void retained.control.dispose();
+          this.bridgeSides.delete(id);
+        }
+      }
+      if (this.bridgeSides.size >= 16)
+        return {
+          supported: true,
+          error:
+            "Too many retained side conversations. End an existing one first.",
+        };
+      const control = new SideConversationSession({
+        ready: () => true,
+        parentId: () => sessionId,
+        create: async (context, emit) => {
+          const currentTarget = await this.resolveBridgeExecutionTarget({
+            resumeSessionId: sessionId,
+            cwd: process.cwd(),
+          });
+          if (!currentTarget)
+            throw new Error("The main bridge session is no longer available.");
+          const client = new CodexAppServerClient(
+            "codex-bridge",
+            process.cwd(),
+            {},
+            [],
+            { kind: "websocket", ...currentTarget },
+          );
+          try {
+            client.useIsolatedNotificationsOnly();
+            await client.connect();
+            await client.requestIsolated("initialize", {
+              clientInfo: { name: "yep-side-chat", version: "1" },
+              capabilities: null,
+            });
+            client.notify("initialized");
+            const parent = await client.requestIsolated<{
+              thread: { id: string; cwd: string; modelProvider?: string };
+            }>("thread/read", { threadId: sessionId, includeTurns: false });
+            if (parent.thread.id !== sessionId || !parent.thread.cwd)
+              throw new Error(
+                "The bridge did not identify the parent workspace.",
+              );
+            const bridgeConfig = this.bridgeExecution;
+            if (!bridgeConfig) throw new Error("Bridge configuration changed.");
+            const viewResponse = await fetch(
+              `${bridgeConfig.controlUrl}/sessions/${encodeURIComponent(sessionId)}/view`,
+              {
+                headers: currentTarget.headers,
+                signal: AbortSignal.timeout(
+                  bridgeConfig.requestTimeoutMs ?? 3_000,
+                ),
+              },
+            );
+            if (!viewResponse.ok)
+              throw new Error("Cannot read the main thread's model settings.");
+            const view = (await viewResponse.json()) as {
+              sessionView?: {
+                session?: {
+                  model?: string;
+                  reasoningEffort?: string;
+                  serviceTier?: string;
+                };
+              };
+            };
+            const settings = view.sessionView?.session;
+            if (!settings?.model)
+              throw new Error(
+                "The bridge has not identified the main thread's model yet.",
+              );
+            const side = await createCodexSideConversation({
+              client,
+              parentId: sessionId,
+              cwd: parent.thread.cwd,
+              model: settings.model,
+              reasoningEffort: settings.reasoningEffort,
+              serviceTier: settings.serviceTier,
+              modelProvider: parent.thread.modelProvider,
+              context,
+              emit,
+            });
+            return {
+              ...side,
+              close: async () => {
+                try {
+                  await side.close();
+                } finally {
+                  await client.closeAndWait();
+                }
+              },
+            };
+          } catch (error) {
+            await client.closeAndWait();
+            throw error;
+          }
+        },
+      });
+      entry = { control, touched: Date.now() };
+      this.bridgeSides.set(sessionId, entry);
+    }
+    entry.touched = Date.now();
+    return entry.control.execute(request);
   }
 
   /** Configure the production singleton after environment config is loaded. */
@@ -1740,8 +1947,9 @@ export class CodexProvider implements AgentProvider {
         );
       }, MODEL_LIST_TIMEOUT_MS);
 
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdoutBuffer += chunk.toString("utf-8");
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdoutBuffer += chunk;
         const lines = stdoutBuffer.split("\n");
         stdoutBuffer = lines.pop() ?? "";
         for (const raw of lines) {
@@ -1751,8 +1959,9 @@ export class CodexProvider implements AgentProvider {
         }
       });
 
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderrChunks.push(chunk.toString("utf-8"));
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderrChunks.push(chunk);
       });
 
       child.on("error", (error) => {
@@ -1968,6 +2177,24 @@ export class CodexProvider implements AgentProvider {
     }
 
     let activeClient: CodexAppServerClient | null = null;
+    const sideConversations = new SideConversationSession({
+      ready: () => runtimeState.ready && (activeClient?.isAlive() ?? false),
+      parentId: () => runtimeState.threadId,
+      create: (context, emit) => {
+        if (!activeClient) throw new Error("Codex is not ready");
+        return createCodexSideConversation({
+          client: activeClient,
+          parentId: runtimeState.threadId,
+          cwd: options.cwd,
+          model: runtimeState.model,
+          modelProvider: runtimeState.modelProvider,
+          reasoningEffort: runtimeState.reasoningEffort,
+          serviceTier: runtimeState.serviceTier,
+          context,
+          emit,
+        });
+      },
+    });
     const iterator = this.runSession(
       options,
       queue,
@@ -1981,7 +2208,9 @@ export class CodexProvider implements AgentProvider {
     return {
       iterator,
       queue,
+      sideConversations,
       abort: () => {
+        void sideConversations.dispose("The parent provider stopped.");
         abortController.abort();
         activeClient?.close();
       },
@@ -3326,6 +3555,14 @@ export class CodexProvider implements AgentProvider {
           : {}),
       });
       const activeEventIngress = eventIngress;
+      // Legacy projection consumes the raw notification. Deltas that lifecycle
+      // (or minimal) will not journal only need a thread id for the child-thread
+      // filter. Shadow and primary still serialize, because they project from
+      // the envelope. Full retention ignores the flag inside ingress.
+      const notificationIngestOptions =
+        projectionMode === "legacy"
+          ? { threadIdOnly: true as const }
+          : undefined;
       for (const update of startupRetryUpdates) {
         await activeEventIngress.ingestClientRetry({
           requestId: update.requestId,
@@ -3388,10 +3625,17 @@ export class CodexProvider implements AgentProvider {
               notification,
             );
           }
-          return await activeEventIngress.ingestNotification(notification);
+          return await activeEventIngress.ingestNotification(
+            notification,
+            notificationIngestOptions,
+          );
         },
       });
 
+      runtimeState.model = threadResult.model;
+      runtimeState.modelProvider = threadResult.modelProvider;
+      runtimeState.reasoningEffort = threadResult.reasoningEffort ?? undefined;
+      runtimeState.serviceTier = threadResult.serviceTier ?? undefined;
       runtimeState.ready = true;
 
       // The app-server returns the provider it actually bound the thread to;
@@ -3443,7 +3687,6 @@ export class CodexProvider implements AgentProvider {
       );
 
       const messageGen = queue.generator();
-      let isFirstMessage = !options.resumeSessionId || forkStartedFresh;
       startupStage = "turn-runtime";
 
       // Native controls (including /compact) start turns without enqueuing a
@@ -3478,7 +3721,10 @@ export class CodexProvider implements AgentProvider {
           if (appServer.isClosed) queue.close();
           const event =
             raw.canonicalEvent ??
-            (await activeEventIngress.ingestNotification(raw));
+            (await activeEventIngress.ingestNotification(
+              raw,
+              notificationIngestOptions,
+            ));
           if (event.threadId && event.threadId !== sessionId) continue;
           const notification =
             projectionMode === "primary"
@@ -3541,19 +3787,10 @@ export class CodexProvider implements AgentProvider {
         if (next.input.done) break;
         const message = next.input.value;
 
-        let { internalPrompt, publicPrompt } = getUserPromptProjection(message);
+        const { internalPrompt, publicPrompt } =
+          getUserPromptProjection(message);
         if (!internalPrompt) {
           continue;
-        }
-
-        // Prepend global instructions to the first message of new sessions
-        if (isFirstMessage && options.globalInstructions) {
-          const prefix = `[Global context]\n${options.globalInstructions}\n\n---\n\n`;
-          internalPrompt = `${prefix}${internalPrompt}`;
-          publicPrompt = `${prefix}${publicPrompt}`;
-          isFirstMessage = false;
-        } else {
-          isFirstMessage = false;
         }
 
         const turnStartParams: TurnStartParams = {
@@ -3719,7 +3956,10 @@ export class CodexProvider implements AgentProvider {
           if (appServer.isClosed) queue.close();
           const canonicalEvent =
             rawNotification.canonicalEvent ??
-            (await activeEventIngress.ingestNotification(rawNotification));
+            (await activeEventIngress.ingestNotification(
+              rawNotification,
+              notificationIngestOptions,
+            ));
           const canonicalNotification =
             activeEventIngress.notificationFromEvent(canonicalEvent);
 
@@ -4649,6 +4889,48 @@ export class CodexProvider implements AgentProvider {
   ): SDKMessage[] {
     const threadId = asRecord(notification.params)?.threadId;
     if (typeof threadId === "string" && threadId !== sessionId) return [];
+    if (
+      ["rawResponseItem/completed", "item/started", "item/completed"].includes(
+        notification.method,
+      )
+    ) {
+      const params = asRecord(notification.params);
+      const item = asRecord(params?.item);
+      if (params && item) {
+        let tracker = this.waitTrackers.get(customToolContexts);
+        if (!tracker) {
+          tracker = new CodexAgentWaitTracker();
+          this.waitTrackers.set(customToolContexts, tracker);
+        }
+        const wait = tracker.observe({
+          type:
+            notification.method === "rawResponseItem/completed"
+              ? "response_item"
+              : "event_msg",
+          payload:
+            notification.method === "rawResponseItem/completed"
+              ? item
+              : {
+                  ...params,
+                  type:
+                    notification.method === "item/started"
+                      ? "item_started"
+                      : "item_completed",
+                },
+          ...(typeof params.turnId === "string"
+            ? { turnId: params.turnId }
+            : {}),
+          timestamp: new Date().toISOString(),
+        });
+        if (wait)
+          return [
+            {
+              ...codexAgentWaitMessage(wait, sessionId),
+              session_id: sessionId,
+            } as SDKMessage,
+          ];
+      }
+    }
     switch (notification.method) {
       case "thread/tokenUsage/updated": {
         const usage = this.extractTurnUsage(notification.params);
@@ -4674,6 +4956,24 @@ export class CodexProvider implements AgentProvider {
         const params = this.asTurnCompletedNotification(notification.params);
         const turnId = params?.turn.id ?? null;
         const turnStatus = params?.turn.status ?? "completed";
+        const waitMessages = (
+          this.waitTrackers
+            .get(customToolContexts)
+            ?.finishTurn(
+              turnId ?? undefined,
+              turnStatus === "failed"
+                ? "failed"
+                : turnStatus === "interrupted"
+                  ? "interrupted"
+                  : "completed",
+            ) ?? []
+        ).map(
+          (wait) =>
+            ({
+              ...codexAgentWaitMessage(wait, sessionId),
+              session_id: sessionId,
+            }) as SDKMessage,
+        );
         if (turnId) {
           const keyPrefix = `${turnId}\0`;
           for (const key of commandOutputBuffers.keys()) {
@@ -4716,6 +5016,7 @@ export class CodexProvider implements AgentProvider {
           const codexError = retryExhausted ? retryCause : classifiedError;
           if (turnId) retryableErrorsByTurnId.delete(turnId);
           return [
+            ...waitMessages,
             {
               type: "error",
               session_id: sessionId,
@@ -4728,7 +5029,7 @@ export class CodexProvider implements AgentProvider {
           ];
         }
         if (turnId) retryableErrorsByTurnId.delete(turnId);
-        return [message];
+        return [...waitMessages, message];
       }
 
       case "error": {
@@ -5079,6 +5380,15 @@ export class CodexProvider implements AgentProvider {
     event: CodexEventEnvelope,
     sessionId: string,
   ): SDKMessage[] {
+    if (
+      messages.some(
+        (message) =>
+          asRecord(
+            (message as unknown as Record<string, unknown>).codexThreadItem,
+          )?.type === "agentWait",
+      )
+    )
+      return messages;
     if (event.method !== "item/started" && event.method !== "item/completed") {
       return messages;
     }
@@ -5140,6 +5450,30 @@ export class CodexProvider implements AgentProvider {
     if (!turnId || !record.item || typeof record.item !== "object") return [];
 
     const item = record.item as Record<string, unknown>;
+    const communicationIdentity = readCodexInterAgentMessageIdentity(item);
+    if (communicationIdentity) {
+      const communication = normalizeCodexInterAgentMessage(
+        item,
+        `live-${randomUUID()}`,
+      );
+      if (!communication) return [];
+      const messageTurnId = communicationIdentity.turnId ?? turnId;
+      return [
+        withCodexTimestamp({
+          type: "system",
+          subtype: "codex_native_item",
+          session_id: sessionId,
+          uuid: `codex-inter-agent:${sessionId}:${messageTurnId}:${communication.id}`,
+          turnId: messageTurnId,
+          codexThreadId: sessionId,
+          codexTurnId: messageTurnId,
+          codexThreadItemId: communication.id,
+          codexThreadItemLifecycle: "completed",
+          codexCorrelationKey: `codex:${messageTurnId}:inter-agent-message:${communication.id}`,
+          codexThreadItem: communication,
+        } as SDKMessage),
+      ];
+    }
     const type = this.getOptionalString(item.type);
     const callId = this.getOptionalString(item.call_id);
     if (!callId) return [];

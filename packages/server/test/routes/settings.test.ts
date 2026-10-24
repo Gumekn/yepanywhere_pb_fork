@@ -412,70 +412,24 @@ describe("Settings Routes", () => {
       expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
     });
 
-    it("accepts clearing globalInstructions with null", async () => {
-      settings = {
-        ...settings,
-        globalInstructions: "Existing instructions",
-      };
-
+    it("ignores retired settings while preserving supported updates", async () => {
       const routes = createSettingsRoutes({
         serverSettingsService: mockServerSettingsService,
       });
-
       const response = await routes.request("/", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          globalInstructions: null,
+          globalInstructions: "Retired prompt",
+          deviceBridgeEnabled: true,
+          chromeOsHosts: ["lab-device"],
+          serviceWorkerEnabled: false,
         }),
       });
-
       expect(response.status).toBe(200);
-      const json = await response.json();
-      expect(json.settings.globalInstructions).toBeUndefined();
       expect(mockServerSettingsService.updateSettings).toHaveBeenCalledWith({
-        globalInstructions: undefined,
+        serviceWorkerEnabled: false,
       });
-    });
-
-    it("accepts and normalizes valid aliases in chromeOsHosts setting", async () => {
-      const routes = createSettingsRoutes({
-        serverSettingsService: mockServerSettingsService,
-      });
-
-      const response = await routes.request("/", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chromeOsHosts: ["  chromeroot  ", "lab-book", "", " "],
-        }),
-      });
-
-      expect(response.status).toBe(200);
-      const json = await response.json();
-      expect(json.settings.chromeOsHosts).toEqual(["chromeroot", "lab-book"]);
-      expect(mockServerSettingsService.updateSettings).toHaveBeenCalledWith({
-        chromeOsHosts: ["chromeroot", "lab-book"],
-      });
-    });
-
-    it("rejects invalid aliases in chromeOsHosts setting", async () => {
-      const routes = createSettingsRoutes({
-        serverSettingsService: mockServerSettingsService,
-      });
-
-      const response = await routes.request("/", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chromeOsHosts: ["chromeroot", "-oProxyCommand=touch_/tmp/pwned"],
-        }),
-      });
-
-      expect(response.status).toBe(400);
-      const json = await response.json();
-      expect(json.error).toContain("Invalid ChromeOS host alias");
-      expect(mockServerSettingsService.updateSettings).not.toHaveBeenCalled();
     });
 
     it("accepts lifecycle webhook settings", async () => {

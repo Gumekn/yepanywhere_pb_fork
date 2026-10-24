@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Message } from "../../types";
 import { usePendingMessages } from "../usePendingMessages";
 import type { DeferredMessage } from "../useSession";
@@ -13,6 +13,49 @@ function userMessage(content: string, tempId?: string): Message {
 }
 
 describe("usePendingMessages", () => {
+  it("confirms only the echoed tempId when two submissions have identical text", () => {
+    const messages: Message[] = [];
+    const { result, rerender } = renderHook(
+      ({ messages }) => usePendingMessages(messages),
+      { initialProps: { messages } },
+    );
+    let first = "";
+    let second = "";
+    act(() => {
+      first = result.current.addPendingMessage("same text");
+      second = result.current.addPendingMessage("same text");
+    });
+    const echo = userMessage("same text", second);
+    act(() => result.current.confirmPendingMessage(echo));
+    expect(result.current.pendingMessages.map((m) => m.tempId)).toEqual([
+      first,
+    ]);
+    // A later snapshot of the same echo must not consume the other submission.
+    rerender({ messages: [echo] });
+    expect(result.current.pendingMessages.map((m) => m.tempId)).toEqual([
+      first,
+    ]);
+  });
+
+  it("confirms one content echo and releases its submission history", () => {
+    const messages = [{ ...userMessage("earlier"), uuid: "historical" }];
+    const { result } = renderHook(() => usePendingMessages(messages));
+    act(() => {
+      result.current.addPendingMessage("same text");
+      result.current.addPendingMessage("same text");
+    });
+    const [first, second] = result.current.pendingMessages;
+    // Observe resource release without replacing the real Map or hook state.
+    const deleted = vi.spyOn(Map.prototype, "delete");
+    try {
+      act(() => result.current.confirmPendingMessage(userMessage("same text")));
+      expect(result.current.pendingMessages).toEqual([second]);
+      expect(deleted).toHaveBeenCalledWith(first?.tempId);
+    } finally {
+      deleted.mockRestore();
+    }
+  });
+
   it("clears an optimistic message when the server queues it before the HTTP response", () => {
     const messages: Message[] = [];
     const { result, rerender } = renderHook(

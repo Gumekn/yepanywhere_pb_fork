@@ -8,14 +8,14 @@
     <link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
     <link rel="manifest" href="/manifest.json" />
-    <meta name="theme-color" content="#1a1a2e" />
+    <meta name="theme-color" content="#151517" />
     <style>
-      /* Critical CSS to prevent flash of white background - only html, body/root handled by main CSS */
-      html { background-color: #181818; }
-      html[data-theme="light"] { background-color: #faf9f5; }
-      html[data-theme="dark"] { background-color: #2f2f2f; }
+      /* Paint the selected canvas before the application stylesheet arrives. */
+      html { --boot-bg: #151517; --boot-fg: #cfd3d6; color-scheme: dark; background-color: var(--boot-bg); }
+      html[data-theme="light"] { --boot-bg: #faf9f5; --boot-fg: #555; color-scheme: light; }
+      html[data-theme="verydark"] { --boot-bg: #0f0f10; }
       @media (prefers-color-scheme: light) {
-        html:not([data-theme]) { background-color: #faf9f5; }
+        html:not([data-theme]), html[data-theme="auto"] { --boot-bg: #faf9f5; --boot-fg: #555; color-scheme: light; }
       }
 
       /* Inline splash — see remote.html for rationale. */
@@ -28,14 +28,12 @@
         align-items: center;
         justify-content: center;
         gap: 16px;
-        background: #181818;
-        color: #b8b8b8;
+        background: var(--boot-bg);
+        color: var(--boot-fg);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         transition: opacity 0.35s ease-out;
         pointer-events: auto;
       }
-      html[data-theme="light"] #splash { background: #faf9f5; color: #555; }
-      html[data-theme="dark"] #splash { background: #2f2f2f; color: #b8b8b8; }
       html[data-mobile-shell="true"] #splash { display: none; }
       #splash.is-hiding { opacity: 0; pointer-events: none; }
       #splash-spinner {
@@ -99,9 +97,11 @@
           );
         }
 
-        var stored = localStorage.getItem('yep-anywhere-theme');
-        var theme = stored || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'verydark');
+        var stored;
+        try { stored = localStorage.getItem('yep-anywhere-theme'); } catch (_) {}
+        var theme = ['auto', 'light', 'dark', 'verydark'].includes(stored) ? stored : 'auto';
         document.documentElement.setAttribute('data-theme', theme);
+        document.querySelector('meta[name="theme-color"]').content = getComputedStyle(document.documentElement).getPropertyValue('--boot-bg').trim();
       })();
     </script>
   </head>

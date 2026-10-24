@@ -140,7 +140,6 @@ interface MessageRouteHandlers {
     msg: RemoteClientMessage & { type: "upload_end" },
   ) => Promise<void>;
   onPing: (msg: RemoteClientMessage & { type: "ping" }) => Promise<void> | void;
-  onDeviceMessage?: (msg: RemoteClientMessage) => Promise<void> | void;
   onTerminalMessage?: (msg: RemoteClientMessage) => Promise<void> | void;
 }
 
@@ -154,11 +153,6 @@ function getMessageId(msg: RemoteClientMessage): string | undefined {
     case "upload_chunk":
     case "upload_end":
       return msg.uploadId;
-    case "device_stream_start":
-    case "device_stream_stop":
-    case "device_webrtc_answer":
-    case "device_ice_candidate":
-      return (msg as { sessionId?: string }).sessionId;
     case "terminal_open":
     case "terminal_input":
     case "terminal_resize":
@@ -199,16 +193,6 @@ export async function routeClientMessageSafely(
         break;
       case "ping":
         await handlers.onPing(msg);
-        break;
-      case "device_stream_start":
-      case "device_stream_stop":
-      case "device_webrtc_answer":
-      case "device_ice_candidate":
-        if (handlers.onDeviceMessage) {
-          await handlers.onDeviceMessage(msg);
-        } else {
-          console.warn("[WS] Device message received but no handler");
-        }
         break;
       case "terminal_open":
       case "terminal_input":

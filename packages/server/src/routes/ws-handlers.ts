@@ -11,6 +11,7 @@ import { gzip } from "node:zlib";
 import type { HttpBindings } from "@hono/node-server";
 import type {
   RemoteClientMessage,
+  SessionDisplayKnownView,
   UrlProjectId,
   WireRequest,
   WireSubscribe,
@@ -27,7 +28,6 @@ import {
   encodeCompressedJsonFrame,
 } from "@yep-anywhere/shared";
 import type { Hono } from "hono";
-import type { DeviceBridgeService } from "../device/DeviceBridgeService.js";
 import type { SessionDisplayService } from "../display/SessionDisplayService.js";
 import { getLogger } from "../logging/logger.js";
 import { WS_INTERNAL_AUTHENTICATED } from "../middleware/internal-auth.js";
@@ -136,8 +136,6 @@ export interface WsHandlerDeps {
   browserProfileService?: BrowserProfileService;
   /** Focused session watch manager for per-session targeted file watching (optional) */
   focusedSessionWatchManager?: FocusedSessionWatchManager;
-  /** Emulator bridge service for Android emulator streaming (optional) */
-  deviceBridgeService?: DeviceBridgeService;
   /** Terminal service for remote shell sessions (optional) */
   terminalService?: TerminalService;
 }
@@ -354,6 +352,7 @@ export function handleSessionSubscribe(
           },
           sendEvent,
           pendingController.signal,
+          knownDisplayView(msg.display.known),
         )
       : msg.display
         ? Promise.reject(new Error("Session display protocol is unavailable"))
@@ -364,25 +363,87 @@ export function handleSessionSubscribe(
               console.error("[WS] Error in session subscription:", err);
             },
           });
-  return subscribe.then((subscription) => {
-    if (subscriptions.get(subscriptionId) !== pendingCleanup) {
-      subscription?.cleanup();
-      return;
-    }
-    if (!subscription) {
+  return subscribe.then(
+    (subscription) => {
+      if (subscriptions.get(subscriptionId) !== pendingCleanup) {
+        subscription?.cleanup();
+        return;
+      }
+      if (!subscription) {
+        subscriptions.delete(subscriptionId);
+        send({
+          type: "response",
+          id: subscriptionId,
+          status: 404,
+          body: { error: "No active process for session" },
+        });
+        return;
+      }
+
+      subscriptions.set(subscriptionId, () => subscription.cleanup());
+      console.log(
+        `[WS] Subscribed to session ${sessionId} (${subscriptionId})`,
+      );
+    },
+    (error: unknown) => {
+      // Answer with the real status. A generic 500 makes clients treat a
+      // missing session as a transient failure and retry it indefinitely.
+      // Already unsubscribed (page left): nobody is waiting for the answer.
+      if (subscriptions.get(subscriptionId) !== pendingCleanup) return;
       subscriptions.delete(subscriptionId);
+      const status = subscriptionErrorStatus(error);
+      if (status >= 500)
+        console.error(
+          `[WS] Session subscription failed (${subscriptionId}):`,
+          error,
+        );
+      else
+        console.warn(
+          `[WS] Session subscription rejected (${status}, ${subscriptionId}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      const code = (error as { code?: unknown } | null)?.code;
       send({
         type: "response",
         id: subscriptionId,
-        status: 404,
-        body: { error: "No active process for session" },
+        status,
+        body: {
+          error:
+            status >= 500
+              ? "Internal server error"
+              : error instanceof Error
+                ? error.message
+                : String(error),
+          ...(typeof code === "string" ? { code } : {}),
+        },
       });
-      return;
-    }
+    },
+  );
+}
 
-    subscriptions.set(subscriptionId, () => subscription.cleanup());
-    console.log(`[WS] Subscribed to session ${sessionId} (${subscriptionId})`);
-  });
+/** Accept only a well-formed known view from the client. */
+function knownDisplayView(value: unknown): SessionDisplayKnownView | undefined {
+  const known = value as { epoch?: unknown; seq?: unknown } | null | undefined;
+  return typeof known?.epoch === "string" &&
+    known.epoch.length > 0 &&
+    known.epoch.length <= 128 &&
+    typeof known.seq === "number" &&
+    Number.isSafeInteger(known.seq) &&
+    known.seq >= 0
+    ? { epoch: known.epoch, seq: known.seq }
+    : undefined;
+}
+
+/** HTTP-style status carried by route errors (e.g. SESSION_NOT_FOUND → 404). */
+function subscriptionErrorStatus(error: unknown): number {
+  const status = (error as { status?: unknown } | null)?.status;
+  return typeof status === "number" &&
+    Number.isInteger(status) &&
+    status >= 400 &&
+    status <= 599
+    ? status
+    : 500;
 }
 
 /**
@@ -873,7 +934,6 @@ export async function handleMessage(
   data: unknown,
   deps: WsHandlerDeps,
   options: HandleMessageOptions,
-  deviceSessions?: Set<string>,
   terminalAttachId?: string,
 ): Promise<void> {
   const { app, baseUrl, runtimeController, eventBus, uploadManager } = deps;
@@ -931,29 +991,6 @@ export async function handleMessage(
       onUploadEnd: async (uploadEndMsg) =>
         handleUploadEnd(uploads, uploadEndMsg, send, uploadManager),
       onPing: async (pingMsg) => send({ type: "pong", id: pingMsg.id }),
-      onDeviceMessage: deps.deviceBridgeService
-        ? (() => {
-            const bridge = deps.deviceBridgeService;
-            return async (emulatorMsg: RemoteClientMessage) => {
-              switch (emulatorMsg.type) {
-                case "device_stream_start":
-                  deviceSessions?.add(emulatorMsg.sessionId);
-                  await bridge.startStream(emulatorMsg, send);
-                  break;
-                case "device_stream_stop":
-                  deviceSessions?.delete(emulatorMsg.sessionId);
-                  bridge.stopStream(emulatorMsg);
-                  break;
-                case "device_webrtc_answer":
-                  bridge.handleAnswer(emulatorMsg);
-                  break;
-                case "device_ice_candidate":
-                  bridge.handleICE(emulatorMsg);
-                  break;
-              }
-            };
-          })()
-        : undefined,
       onTerminalMessage:
         deps.terminalService && terminalAttachId
           ? (() => {
@@ -990,30 +1027,6 @@ export async function handleMessage(
   }
 
   await routeClientMessage(parsed as RemoteClientMessage);
-}
-
-/**
- * Clean up emulator streaming sessions on connection close.
- */
-export function cleanupDeviceSessions(
-  deviceSessions: Set<string>,
-  deviceBridgeService?: DeviceBridgeService,
-): void {
-  if (!deviceBridgeService || deviceSessions.size === 0) return;
-  for (const sessionId of deviceSessions) {
-    try {
-      deviceBridgeService.stopStream({
-        type: "device_stream_stop",
-        sessionId,
-      });
-    } catch (err) {
-      console.error(
-        `[WS] Error cleaning up emulator session ${sessionId}:`,
-        err,
-      );
-    }
-  }
-  deviceSessions.clear();
 }
 
 /**

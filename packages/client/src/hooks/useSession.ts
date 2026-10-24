@@ -10,6 +10,7 @@ import { api } from "../api/client";
 import { getMessageId } from "../lib/mergeMessages";
 import { type AgentTask, findAgentTasks } from "../lib/pendingTasks";
 import { normalizeProviderPermissionMode } from "../lib/providerPermissionModes";
+import { SeenActivityThrottle } from "../lib/seenActivityThrottle";
 import { extractSessionIdFromFileEvent } from "../lib/sessionFile";
 import { generateUUID } from "../lib/uuid";
 import type {
@@ -300,7 +301,7 @@ export function shouldRefreshSettledAuthoritativeSnapshot(
   expectedSessionId: string,
 ): boolean {
   return (
-    (provider === "pi" || provider === "kimi") &&
+    (provider === "pi" || provider === "kimi" || provider === "mcode") &&
     owner === "self" &&
     processState === "idle" &&
     eventSessionId === expectedSessionId
@@ -314,7 +315,7 @@ export function shouldRefreshSettledAuthoritativeSnapshot(
 function hasUncorrelatedPersistedIds(
   provider: Session["provider"] | undefined,
 ): boolean {
-  return provider === "pi" || provider === "kimi";
+  return provider === "pi" || provider === "kimi" || provider === "mcode";
 }
 
 /**
@@ -363,7 +364,7 @@ export function shouldDeferUncorrelatedPersistedSync(
   processState: ProcessState | undefined,
 ): boolean {
   return (
-    (provider === "pi" || provider === "kimi") &&
+    (provider === "pi" || provider === "kimi" || provider === "mcode") &&
     owner === "self" &&
     processState !== "idle"
   );
@@ -488,7 +489,8 @@ export function shouldRefreshFullPersistedSession(
     provider === "codex" ||
     provider === "codex-oss" ||
     provider === "pi" ||
-    provider === "kimi"
+    provider === "kimi" ||
+    provider === "mcode"
   );
 }
 
@@ -513,35 +515,6 @@ export function isToolUseOnlyAssistantMessage(
       block !== null &&
       (block as { type?: unknown }).type === "tool_use",
   );
-}
-
-function extractUserMessageText(
-  sdkMessage: Record<string, unknown>,
-): string | null {
-  const message = sdkMessage.message as
-    | { content?: unknown; role?: unknown }
-    | undefined;
-  const content = message?.content;
-
-  if (typeof content === "string") {
-    const trimmed = content.trim();
-    return trimmed.length > 0 ? trimmed : null;
-  }
-
-  if (Array.isArray(content)) {
-    const textParts = content
-      .map((block) => {
-        if (!block || typeof block !== "object") return "";
-        const text = (block as { text?: unknown }).text;
-        return typeof text === "string" ? text : "";
-      })
-      .filter((part) => part.length > 0);
-    if (textParts.length === 0) return null;
-    const joined = textParts.join("\n").trim();
-    return joined.length > 0 ? joined : null;
-  }
-
-  return null;
 }
 
 export function useSession(
@@ -607,6 +580,20 @@ export function useSession(
   const [lastStreamActivityAt, setLastStreamActivityAt] = useState<
     string | null
   >(null);
+  // Live turn clock above; seen-marking is coalesced to about one second.
+  const [seenStreamActivityAt, setSeenStreamActivityAt] = useState<
+    string | null
+  >(null);
+  const seenActivityThrottleRef = useRef<SeenActivityThrottle | null>(null);
+  if (!seenActivityThrottleRef.current) {
+    seenActivityThrottleRef.current = new SeenActivityThrottle((iso) => {
+      setSeenStreamActivityAt(iso);
+    });
+  }
+  const noteStreamActivity = useCallback((iso: string) => {
+    setLastStreamActivityAt(iso);
+    seenActivityThrottleRef.current?.note(iso);
+  }, []);
 
   // Deferred messages queue - messages queued server-side waiting for agent's turn to end
   const [deferredMessages, setDeferredMessages] = useState<DeferredMessage[]>(
@@ -642,7 +629,10 @@ export function useSession(
   // biome-ignore lint/correctness/useExhaustiveDependencies: effect intentionally runs on session switches
   useEffect(() => {
     hasHandledConnectedEventRef.current = false;
+    setError(null);
     setLastStreamActivityAt(null);
+    setSeenStreamActivityAt(null);
+    seenActivityThrottleRef.current?.reset();
     setIsCompacting(false);
     setTurnHealth(null);
     setHistoryRewriteRequest(null);
@@ -651,6 +641,12 @@ export function useSession(
       historyRewriteTimerRef.current = null;
     }
   }, [sessionId]);
+
+  useEffect(() => {
+    return () => {
+      seenActivityThrottleRef.current?.reset();
+    };
+  }, []);
 
   // Slash commands available for this session (from init message)
   const [slashCommands, setSlashCommands] = useState<string[]>([]);
@@ -735,6 +731,7 @@ export function useSession(
     messages,
     displayPage,
     displayActivity,
+    displayKnownView,
     handleDisplayEvent,
     displayQuestions,
     displayQuestionCoverage,
@@ -778,6 +775,14 @@ export function useSession(
     onLoadComplete: handleLoadComplete,
     onLoadError: handleLoadError,
   });
+
+  // A WS snapshot or later refresh can recover after the initial HTTP load
+  // failed. Once both metadata and the transcript are ready, retire its error.
+  useEffect(() => {
+    if (session && !loading && (!preferDisplayHistory || displayPage)) {
+      setError(null);
+    }
+  }, [session, loading, preferDisplayHistory, displayPage]);
 
   const lastPrunedActiveWindowRevisionRef = useRef(0);
   useEffect(() => {
@@ -910,7 +915,7 @@ export function useSession(
   );
   const {
     pendingMessages,
-    setPendingMessages,
+    confirmPendingMessage,
     addPendingMessage,
     removePendingMessage,
     updatePendingMessage,
@@ -936,7 +941,7 @@ export function useSession(
   const scheduleAuthoritativeSnapshotRefresh = useCallback(() => {
     if (preferDisplayHistory) return;
     const provider = session?.provider;
-    if (provider !== "pi" && provider !== "kimi") {
+    if (provider !== "pi" && provider !== "kimi" && provider !== "mcode") {
       return;
     }
 
@@ -1360,7 +1365,9 @@ export function useSession(
           signalHistoryRewriteSync();
         }
         if (
-          (session?.provider === "pi" || session?.provider === "kimi") &&
+          (session?.provider === "pi" ||
+            session?.provider === "kimi" ||
+            session?.provider === "mcode") &&
           processState === "idle"
         ) {
           scheduleAuthoritativeSnapshotRefresh();
@@ -1704,6 +1711,7 @@ export function useSession(
   const {
     handleStreamEvent,
     clearStreaming,
+    finishStreaming,
     cleanup: cleanupStreaming,
   } = useStreamingContent({
     onUpdateMessage: handleStreamingUpdate,
@@ -1722,13 +1730,26 @@ export function useSession(
   }, [cleanupStreaming]);
 
   const clearStreamingPlaceholders = useCallback(
-    (options?: { agentId?: string; allAgents?: boolean; main?: boolean }) => {
-      clearStreaming();
+    (options?: {
+      agentId?: string;
+      allAgents?: boolean;
+      main?: boolean;
+      turnId?: string;
+    }) => {
+      clearStreaming(options ?? {});
 
       const shouldClearMain = options?.main ?? !options?.agentId;
       if (shouldClearMain) {
         setMessages((prev) => {
-          const filtered = prev.filter((m) => !m._isStreaming);
+          const filtered = prev.filter(
+            (m) =>
+              (!m._isStreaming && !m._isStreamingPlaceholder) ||
+              Boolean(
+                options?.turnId &&
+                  m.codexTurnId &&
+                  m.codexTurnId !== options.turnId,
+              ),
+          );
           return filtered.length === prev.length ? prev : filtered;
         });
       }
@@ -1742,7 +1763,15 @@ export function useSession(
         for (const [currentAgentId, existing] of Object.entries(prev)) {
           if (agentId && currentAgentId !== agentId) continue;
 
-          const filtered = existing.messages.filter((m) => !m._isStreaming);
+          const filtered = existing.messages.filter(
+            (m) =>
+              (!m._isStreaming && !m._isStreamingPlaceholder) ||
+              Boolean(
+                options?.turnId &&
+                  m.codexTurnId &&
+                  m.codexTurnId !== options.turnId,
+              ),
+          );
           if (filtered.length === existing.messages.length) continue;
 
           if (!next) next = { ...prev };
@@ -1759,7 +1788,7 @@ export function useSession(
   const handleStreamMessage = useCallback(
     (data: { eventType: string; [key: string]: unknown }) => {
       if (data.eventType.startsWith("display-")) {
-        setLastStreamActivityAt(new Date().toISOString());
+        noteStreamActivity(new Date().toISOString());
         const { eventType, ...payload } = data;
         handleDisplayEvent(eventType, payload);
         const activity = payload.activity as
@@ -1784,7 +1813,7 @@ export function useSession(
         // Track stream activity for engagement tracking
         // This ensures sessions are marked as "seen" even when receiving
         // subagent content (which doesn't update parent session file mtime)
-        setLastStreamActivityAt(new Date().toISOString());
+        noteStreamActivity(new Date().toISOString());
 
         // The message event contains the SDK message directly
         // Pass through all fields without stripping
@@ -1825,6 +1854,27 @@ export function useSession(
           }
         }
 
+        if (
+          (msgType === "assistant" &&
+            isToolUseOnlyAssistantMessage(sdkMessage)) ||
+          msgType === "result" ||
+          msgType === "error" ||
+          sdkMessage.subtype === "turn_complete"
+        ) {
+          const agentId = sdkMessage.isSubagent
+            ? ((sdkMessage.parentToolUseId ?? sdkMessage.agentId) as
+                | string
+                | undefined)
+            : undefined;
+          finishStreaming({
+            agentId,
+            turnId:
+              typeof sdkMessage.codexTurnId === "string"
+                ? sdkMessage.codexTurnId
+                : undefined,
+          });
+        }
+
         // For assistant messages, clear the matching streaming placeholder.
         // Skip pure tool_use messages: they don't represent the final form of
         // any streamed text/thinking, so clearing here would erase still-shown
@@ -1837,17 +1887,29 @@ export function useSession(
           // Use parentToolUseId as the routing key (it's the Task tool_use id)
           const isSubagentMsg =
             sdkMessage.isSubagent &&
-            typeof sdkMessage.parentToolUseId === "string";
+            (typeof sdkMessage.parentToolUseId === "string" ||
+              typeof sdkMessage.agentId === "string");
           const msgAgentId = isSubagentMsg
-            ? (sdkMessage.parentToolUseId as string)
+            ? ((sdkMessage.parentToolUseId ?? sdkMessage.agentId) as string)
             : undefined;
 
           if (msgAgentId) {
             // Remove streaming placeholders from this agent's content.
-            clearStreamingPlaceholders({ agentId: msgAgentId });
+            clearStreamingPlaceholders({
+              agentId: msgAgentId,
+              turnId:
+                typeof sdkMessage.codexTurnId === "string"
+                  ? sdkMessage.codexTurnId
+                  : undefined,
+            });
           } else {
             // Remove streaming placeholder messages from main messages.
-            clearStreamingPlaceholders();
+            clearStreamingPlaceholders({
+              turnId:
+                typeof sdkMessage.codexTurnId === "string"
+                  ? sdkMessage.codexTurnId
+                  : undefined,
+            });
           }
         }
 
@@ -1920,24 +1982,13 @@ export function useSession(
           // Let the message be added to show the completed compaction indicator
         }
 
-        // Handle tempId for pending message resolution
-        // When server echoes back tempId, remove from pending queue
-        const tempId = sdkMessage.tempId as string | undefined;
-        if (msgType === "user" && tempId) {
-          removePendingMessage(tempId);
-        } else if (msgType === "user") {
-          // Fallback for providers that omit tempId on user echo:
-          // clear one matching optimistic pending message by content.
-          const incomingText = extractUserMessageText(sdkMessage);
-          if (incomingText) {
-            setPendingMessages((prev) => {
-              const idx = prev.findIndex(
-                (p) => p.content.trim() === incomingText,
-              );
-              if (idx === -1) return prev;
-              return prev.filter((_, i) => i !== idx);
-            });
-          }
+        // Share identity, history guards and cleanup with snapshot reconciliation.
+        if (
+          msgType === "user" &&
+          sdkMessage.isSubagent !== true &&
+          sdkMessage.isSidechain !== true
+        ) {
+          confirmPendingMessage(incoming);
         }
 
         // Route subagent messages to agentContent instead of main messages
@@ -1945,9 +1996,11 @@ export function useSession(
         // Use parentToolUseId as the routing key (it's the Task tool_use id)
         if (
           sdkMessage.isSubagent &&
-          typeof sdkMessage.parentToolUseId === "string"
+          (typeof sdkMessage.parentToolUseId === "string" ||
+            typeof sdkMessage.agentId === "string")
         ) {
-          const agentId = sdkMessage.parentToolUseId;
+          const agentId = (sdkMessage.parentToolUseId ??
+            sdkMessage.agentId) as string;
 
           // Capture toolUseId → agentId mapping on first subagent message
           // This allows TaskRenderer to access agentContent immediately
@@ -1978,8 +2031,11 @@ export function useSession(
           signalHistoryRewriteSync();
         }
         if (statusData.state === "idle") {
+          finishStreaming();
           scheduleAuthoritativeSnapshotRefresh();
         }
+        if (statusData.state === "hold" || statusData.state === "waiting-input")
+          finishStreaming();
         // Capture pending input request when waiting for user input
         if (statusData.state === "waiting-input" && statusData.request) {
           setPendingInputRequest(statusData.request);
@@ -2006,7 +2062,7 @@ export function useSession(
         setDeferredMessages(deferredData.messages ?? []);
       } else if (data.eventType === "complete") {
         setIsCompacting(false);
-        clearStreamingPlaceholders({ main: true, allAgents: true });
+        finishStreaming();
         setProcessState("idle");
         setStatus({ owner: "none" });
         setPendingInputRequest(null);
@@ -2014,7 +2070,7 @@ export function useSession(
         scheduleAuthoritativeSnapshotRefresh();
       } else if (data.eventType === "error") {
         setIsCompacting(false);
-        clearStreamingPlaceholders({ main: true, allAgents: true });
+        finishStreaming();
       } else if (data.eventType === "connected") {
         // Sync state and permission mode from connected event
         const connectedData = data as {
@@ -2108,7 +2164,11 @@ export function useSession(
         ) {
           // The stream will carry the active turn; idle/complete schedules the
           // authoritative replacement and retries until wire.jsonl catches up.
-        } else if (connectedProvider === "pi" || connectedProvider === "kimi") {
+        } else if (
+          connectedProvider === "pi" ||
+          connectedProvider === "kimi" ||
+          connectedProvider === "mcode"
+        ) {
           scheduleAuthoritativeSnapshotRefresh();
         } else if (!(isFirstConnectedEvent && isCodexProvider)) {
           fetchNewMessages();
@@ -2162,9 +2222,11 @@ export function useSession(
         const pendingData = data as {
           eventType: string;
           html: string;
+          messageId?: string;
         };
         streamingMarkdownCallbacks?.onPending?.({
           html: pendingData.html,
+          messageId: pendingData.messageId,
         });
       } else if (data.eventType === "session-id-changed") {
         // Handle session ID change (temp ID → real SDK ID)
@@ -2193,8 +2255,8 @@ export function useSession(
       sessionId,
       handleStreamEvent,
       clearStreamingPlaceholders,
-      removePendingMessage,
-      setPendingMessages,
+      finishStreaming,
+      confirmPendingMessage,
       streamingMarkdownCallbacks,
       handleStreamMessageEvent,
       handleStreamSubagentMessage,
@@ -2208,6 +2270,7 @@ export function useSession(
       handleDisplayEvent,
       displayActivity?.state,
       fetchSessionMetadata,
+      noteStreamActivity,
     ],
   );
 
@@ -2241,7 +2304,15 @@ export function useSession(
     {
       onMessage: handleStreamMessage,
       onError: handleStreamError,
-      ...(preferDisplayHistory ? { display: { projectId, branchId } } : {}),
+      ...(preferDisplayHistory
+        ? {
+            display: {
+              projectId,
+              branchId,
+              ...(displayKnownView ? { known: displayKnownView } : {}),
+            },
+          }
+        : {}),
     },
   );
 
@@ -2336,7 +2407,8 @@ export function useSession(
     connected,
     sessionWatchConnected,
     sessionUpdatesConnected,
-    lastStreamActivityAt, // Last stream message timestamp for engagement tracking
+    lastStreamActivityAt, // Live stream clock for the turn timer
+    seenStreamActivityAt, // Coalesced clock for marking the session seen
     setStatus,
     setProcessState,
     setPermissionMode,

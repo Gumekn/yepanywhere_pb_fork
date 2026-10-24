@@ -30,6 +30,7 @@ export function useSessionMessages(options: UseSessionMessagesOptions) {
     : {
         ...legacy,
         displayActivity: undefined,
+        displayKnownView: undefined,
         handleDisplayEvent: (_type: string, _data: unknown) => {},
       };
 }

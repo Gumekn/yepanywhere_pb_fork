@@ -1,5 +1,6 @@
 import { useBrowserNotifications } from "../hooks/useBrowserNotifications";
 import { useI18n } from "../i18n";
+import { SettingsItem } from "./ui/SettingsItem";
 
 /**
  * Toggle component for browser notification permission.
@@ -26,24 +27,18 @@ export function BrowserNotificationToggle() {
   // Not supported in this browser (desktop but old browser)
   if (!isSupported) {
     return (
-      <div className="settings-item">
-        <div className="settings-item-info">
-          <strong>Desktop Notifications</strong>
-          <p>{t("browserToggleUnsupported")}</p>
-        </div>
-      </div>
+      <SettingsItem title="Desktop Notifications">
+        <p>{t("browserToggleUnsupported")}</p>
+      </SettingsItem>
     );
   }
 
   // Permission denied - user must change in browser settings
   if (isDenied) {
     return (
-      <div className="settings-item">
-        <div className="settings-item-info">
-          <strong>{t("browserToggleTitle")}</strong>
-          <p className="settings-warning">{t("browserToggleBlocked")}</p>
-        </div>
-      </div>
+      <SettingsItem title={t("browserToggleTitle")}>
+        <p className="settings-warning">{t("browserToggleBlocked")}</p>
+      </SettingsItem>
     );
   }
 
@@ -58,47 +53,52 @@ export function BrowserNotificationToggle() {
 
     return (
       <>
-        <div className="settings-item">
-          <div className="settings-item-info">
-            <strong>{t("browserToggleTitle")}</strong>
-            <p>{t("browserToggleEnabled")}</p>
-          </div>
-          <span className="settings-badge settings-badge-success">
-            {t("browserToggleEnabledBadge")}
-          </span>
-        </div>
-        <div className="settings-item">
-          <div className="settings-item-info">
-            <strong>{t("browserToggleTestTitle")}</strong>
-            <p>{t("browserToggleTestDescription")}</p>
-          </div>
-          <button
-            type="button"
-            className="settings-button"
-            onClick={handleTest}
-          >
-            {t("pushToggleSendTest")}
-          </button>
-        </div>
+        <SettingsItem
+          title={t("browserToggleTitle")}
+          action={
+            <span className="settings-badge settings-badge-success">
+              {t("browserToggleEnabledBadge")}
+            </span>
+          }
+        >
+          <p>{t("browserToggleEnabled")}</p>
+        </SettingsItem>
+        <SettingsItem
+          title={t("browserToggleTestTitle")}
+          action={
+            <button
+              type="button"
+              className="settings-button"
+              onClick={handleTest}
+            >
+              {t("pushToggleSendTest")}
+            </button>
+          }
+        >
+          <p>{t("browserToggleTestDescription")}</p>
+        </SettingsItem>
       </>
     );
   }
 
   // Permission not yet requested (default state)
   return (
-    <div className="settings-item">
-      <div className="settings-item-info">
-        <strong>{t("browserToggleTitle")}</strong>
-        <p>{t("browserToggleDescription")}</p>
-      </div>
-      <button
-        type="button"
-        className="settings-button"
-        onClick={requestPermission}
-        disabled={isRequesting}
-      >
-        {isRequesting ? t("browserToggleRequesting") : t("browserToggleEnable")}
-      </button>
-    </div>
+    <SettingsItem
+      title={t("browserToggleTitle")}
+      action={
+        <button
+          type="button"
+          className="settings-button"
+          onClick={requestPermission}
+          disabled={isRequesting}
+        >
+          {isRequesting
+            ? t("browserToggleRequesting")
+            : t("browserToggleEnable")}
+        </button>
+      }
+    >
+      <p>{t("browserToggleDescription")}</p>
+    </SettingsItem>
   );
 }

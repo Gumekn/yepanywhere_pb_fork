@@ -181,6 +181,50 @@ function createRoutes(
 }
 
 describe("session display routes", () => {
+  it("retries with a fresh project when a stale snapshot cannot locate the session", async () => {
+    const { getSession } = createRoutes(1);
+    const loaded = await getSession();
+    const emptyReader = {
+      getSessionSummary: vi.fn(async () => null),
+      getSession: vi.fn(async () => null),
+    };
+    const reader = {
+      getSessionSummary: vi.fn(async () => loaded.summary),
+      getSession: vi.fn(async () => loaded),
+    };
+    const getRuntimeState = vi.fn(async () => ({ toolsMayBeActive: false }));
+    const getOrCreateProject = vi.fn(
+      async (
+        _id: string,
+        _provider?: string,
+        options?: { allowStale?: boolean },
+      ) =>
+        options?.allowStale
+          ? { ...project(), provider: "pi" as const }
+          : project(),
+    );
+    const source = createSessionDisplaySource({
+      scanner: { getOrCreateProject },
+      providerResolution: {
+        readerFactory: () => reader as never,
+        piReaderFactory: () => emptyReader as never,
+      },
+      getRuntimeState,
+    });
+    const page = await source.read({
+      projectId: PROJECT_ID,
+      sessionId: SESSION_ID,
+    });
+    expect(page.messages.length).toBeGreaterThan(0);
+    // One runtime lookup per cold read; the stamp reuses the same state.
+    expect(getRuntimeState).toHaveBeenCalledTimes(1);
+    await source.read({ projectId: PROJECT_ID, sessionId: SESSION_ID });
+    expect(getRuntimeState).toHaveBeenCalledTimes(2);
+    expect(getOrCreateProject.mock.calls.map((call) => call[2])).toEqual([
+      { allowStale: true },
+      undefined,
+    ]);
+  });
   it.each<ProviderName>(["codex", "codex-oss", "gemini-acp"])(
     "loads an unpersisted %s session in a Pi project and picks up its history later",
     async (provider) => {
@@ -244,6 +288,90 @@ describe("session display routes", () => {
       expect((await source.read(selection)).messages).toEqual(
         loaded.projectedMessages,
       );
+    },
+  );
+
+  it.each(["present", "missing", "result-only"])(
+    "resolves raw CodexExec details when the native invocation is %s",
+    async (nativeState) => {
+      const { getSession } = createRoutes(1);
+      const loaded = await getSession();
+      const script = 'text(await tools.exec_command({cmd:"pwd"}));';
+      const invocation: Message = {
+        uuid: "exec-call",
+        type: "assistant",
+        codexTurnId: "turn",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "raw-call",
+              name: "CodexExec",
+              input: { script },
+            },
+          ],
+        },
+      };
+      const result: Message = {
+        uuid: "exec-result",
+        type: "user",
+        codexTurnId: "turn",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "raw-call",
+              content: "Script completed\nOutput:\n/project",
+            },
+          ],
+        },
+      };
+      const rawMessages = [invocation, result];
+      const reader = {
+        getSession: vi.fn(async () => ({
+          ...loaded,
+          projectedMessages: rawMessages,
+        })),
+        getSessionSummary: vi.fn(async () => loaded.summary),
+      };
+      const getSemanticTurn = vi.fn(async () => ({
+        kind: "loaded" as const,
+        revision: "revision",
+        messages:
+          nativeState === "present"
+            ? rawMessages
+            : nativeState === "result-only"
+              ? [result]
+              : buildMessages(1),
+      }));
+      const source = createSessionDisplaySource({
+        scanner: {
+          getOrCreateProject: vi.fn(async () => ({
+            ...project(),
+            provider: "codex" as const,
+          })),
+        },
+        providerResolution: {
+          readerFactory: () => reader as never,
+          codexReaderFactory: () => reader as never,
+        },
+        codexAppServerHistoryReader: {
+          getSemanticTurn,
+          getSemanticTurnsPage: vi.fn(),
+        },
+      });
+      const detail = await source.detail(
+        { projectId: PROJECT_ID, sessionId: SESSION_ID },
+        "turn",
+        "raw-call",
+      );
+      expect(detail).toEqual(rawMessages);
+      expect(reader.getSession).toHaveBeenCalledTimes(
+        nativeState === "present" ? 0 : 1,
+      );
+      expect(getSemanticTurn).toHaveBeenCalledOnce();
     },
   );
 
@@ -364,6 +492,58 @@ describe("session display routes", () => {
         "same",
       );
       expect(detail).not.toHaveBeenCalled();
+    } finally {
+      service.dispose();
+    }
+  });
+
+  it("reports display view phases and cache state in Server-Timing", async () => {
+    const service = new SessionDisplayService({
+      runtime: {
+        getProcessForSession: vi.fn(),
+        subscribeSession: vi.fn(),
+      },
+    });
+    const snapshot = vi
+      .spyOn(service, "snapshot")
+      .mockImplementationOnce(async (_selection, _reset, observer) => {
+        observer?.onCacheState?.("miss");
+        observer?.timing?.add("read", 12.34);
+        return {
+          version: 1,
+          view: { sessionId: SESSION_ID, branchScopeId: "active", epoch: "e" },
+          seq: 1,
+          nodes: [],
+          activity: { state: "completed" },
+        } as never;
+      })
+      .mockImplementationOnce(async (_selection, _reset, observer) => {
+        observer?.onCacheState?.("wait");
+        throw new Error("boom");
+      });
+    const app = new Hono();
+    registerSessionDisplayRoutes(app, {
+      displayService: service,
+      scanner: { getOrCreateProject: vi.fn(async () => project()) },
+      providerResolution: { readerFactory: vi.fn() },
+    });
+    try {
+      const url = `/projects/${PROJECT_ID}/sessions/${SESSION_ID}/display/view?`;
+      const ok = await app.request(url);
+      expect(ok.status).toBe(200);
+      const header = ok.headers.get("server-timing") ?? "";
+      expect(header).toContain("read;dur=12.3");
+      expect(header).toMatch(/total;dur=\d/);
+      expect(header).toContain("displayCache;desc=miss");
+      // Values only: no session identifiers or paths leak into the header.
+      expect(header).not.toContain(SESSION_ID);
+
+      const failed = await app.request(url);
+      expect(failed.status).toBeGreaterThanOrEqual(400);
+      expect(failed.headers.get("server-timing")).toContain(
+        "displayCache;desc=wait",
+      );
+      expect(snapshot).toHaveBeenCalledTimes(2);
     } finally {
       service.dispose();
     }

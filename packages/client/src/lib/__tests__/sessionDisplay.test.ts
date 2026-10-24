@@ -7,6 +7,180 @@ import {
 } from "../sessionDisplay";
 
 describe("buildSessionDisplayRenderItems", () => {
+  it("adds the edit switcher when lineage arrives after a cached display snapshot", () => {
+    const branches = ["original", "edited"].map((id, index) => ({
+      id,
+      sessionId: id === "original" ? "root" : "child",
+      parentId: "shared",
+      prompt: id,
+      title: id,
+      depth: 2,
+      index,
+      siblingIndex: index + 1,
+      siblingCount: 2,
+      isActive: id === "edited",
+      provider: "codex" as const,
+    }));
+    const items = buildSessionDisplayRenderItems(
+      {
+        sessionId: "child",
+        revision: "cached-before-fork",
+        turns: [
+          {
+            id: "turn:edited",
+            question: { messageId: "edited", content: "edited" },
+            segments: [],
+          },
+        ],
+      },
+      {
+        projectId: "project",
+        formatNotice: () => "notice",
+        branchState: {
+          sessionId: "child",
+          provider: "codex",
+          activeBranchId: "edited",
+          selectedBranchId: "edited",
+          branches,
+        },
+      },
+    );
+    expect(items[0]).toMatchObject({
+      type: "user_prompt",
+      sourceMessages: [
+        {
+          branch: {
+            branchId: "edited",
+            siblingCount: 2,
+            alternatives: branches,
+          },
+        },
+      ],
+    });
+  });
+  it("maps a timed main-agent wait notice to its native renderer", () => {
+    const items = buildSessionDisplayRenderItems(
+      {
+        sessionId: "parent",
+        revision: "r1",
+        turns: [
+          {
+            id: "turn:t1",
+            question: null,
+            segments: [
+              {
+                type: "notice",
+                id: "wait-row",
+                kind: "agent_wait",
+                agentWait: {
+                  type: "agentWait",
+                  id: "wait-call",
+                  status: "completed",
+                  startedAt: "2026-10-08T01:00:00Z",
+                  completedAt: "2026-10-08T01:00:03Z",
+                  durationMs: 3000,
+                  outcome: "message",
+                },
+              },
+            ],
+          },
+        ],
+      },
+      { projectId: "project", formatNotice: () => "notice" },
+    );
+    expect(items[0]).toMatchObject({
+      type: "codex_native_item",
+      threadId: "parent",
+      turnId: "t1",
+      lifecycle: "completed",
+      threadItem: { type: "agentWait", id: "wait-call", durationMs: 3000 },
+    });
+  });
+  it("collapses start/completion notices on the display-page path and retains native event ids", () => {
+    const items = buildSessionDisplayRenderItems(
+      {
+        sessionId: "parent",
+        revision: "r1",
+        turns: [
+          {
+            id: "turn:parent-1",
+            question: null,
+            segments: ["started", "completed"].map((kind) => ({
+              type: "notice" as const,
+              id: `display-${kind}`,
+              kind: "subagent" as const,
+              subagent: {
+                kind,
+                eventId: `native-${kind}`,
+                agentThreadId: "child",
+                agentPath: "/root/reviewer",
+              },
+            })),
+          },
+        ],
+      },
+      { projectId: "project", formatNotice: () => "notice" },
+    );
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      id: "display-started",
+      threadId: "parent",
+      turnId: "parent-1",
+      threadItem: { kind: "completed", id: "native-started" },
+      subagentActivity: {
+        events: [
+          {
+            id: "display-started",
+            nativeId: "native-started",
+            kind: "started",
+          },
+          {
+            id: "display-completed",
+            nativeId: "native-completed",
+            kind: "completed",
+          },
+        ],
+      },
+    });
+  });
+
+  it("keeps a standalone assignment visible in a child display page", () => {
+    const items = buildSessionDisplayRenderItems(
+      {
+        sessionId: "child",
+        revision: "r1",
+        turns: [
+          {
+            id: "turn:child-1",
+            question: null,
+            segments: [
+              {
+                type: "notice",
+                id: "task-row",
+                kind: "inter_agent_message",
+                interAgentMessage: {
+                  type: "interAgentMessage",
+                  id: "task",
+                  kind: "task",
+                  sender: "/root",
+                  recipient: "/root/reviewer",
+                  encrypted: true,
+                },
+              },
+            ],
+          },
+        ],
+      },
+      { projectId: "project", formatNotice: () => "notice" },
+    );
+    expect(items[0]).toMatchObject({
+      type: "codex_native_item",
+      lifecycle: "completed",
+      threadId: "child",
+      threadItem: { type: "interAgentMessage", kind: "task", encrypted: true },
+    });
+  });
+
   it("maps lightweight turns without reconstructing hidden tool messages", () => {
     const page: SessionDisplayPage = {
       sessionId: "session-1",

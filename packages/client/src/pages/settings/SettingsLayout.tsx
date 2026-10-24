@@ -1,25 +1,20 @@
-import { useNavigate, useParams } from "react-router-dom";
+import { Navigate, useNavigate, useParams } from "react-router-dom";
 import { PageHeader } from "../../components/PageHeader";
 import { useRemoteBasePath } from "../../hooks/useRemoteBasePath";
-import { useVersion } from "../../hooks/useVersion";
 import { useI18n } from "../../i18n";
 import {
   getDevelopmentCategory,
-  getEmulatorCategory,
   getSettingsCategories,
 } from "../../i18n-settings";
 import { useNavigationLayout } from "../../layouts";
 import { AboutSettings } from "./AboutSettings";
-import { AgentContextSettings } from "./AgentContextSettings";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { DevelopmentSettings } from "./DevelopmentSettings";
 import { DevicesSettings } from "./DevicesSettings";
-import { EmulatorSettings } from "./EmulatorSettings";
 import { FeishuAuthorizationSettings } from "./FeishuAuthorizationSettings";
 import { LibrarySettings } from "./LibrarySettings";
 import { LifecycleWebhooksSettings } from "./LifecycleWebhooksSettings";
 import { LocalAccessSettings } from "./LocalAccessSettings";
-import { ModelSettings } from "./ModelSettings";
 import { NotificationsSettings } from "./NotificationsSettings";
 import { ProvidersSettings } from "./ProvidersSettings";
 import { SourceControlSettings } from "./SourceControlSettings";
@@ -29,8 +24,6 @@ import type { SettingsCategory } from "./types";
 const CATEGORY_COMPONENTS: Record<string, React.ComponentType> = {
   "feishu-authorization": FeishuAuthorizationSettings,
   appearance: AppearanceSettings,
-  model: ModelSettings,
-  "agent-context": AgentContextSettings,
   library: LibrarySettings,
   notifications: NotificationsSettings,
   webhooks: LifecycleWebhooksSettings,
@@ -38,7 +31,6 @@ const CATEGORY_COMPONENTS: Record<string, React.ComponentType> = {
   "local-access": LocalAccessSettings,
   providers: ProvidersSettings,
   "source-control": SourceControlSettings,
-  emulator: EmulatorSettings,
   about: AboutSettings,
   development: DevelopmentSettings,
 };
@@ -78,27 +70,13 @@ export function SettingsLayout() {
   const navigate = useNavigate();
   const basePath = useRemoteBasePath();
   const { openSidebar, isWideScreen } = useNavigationLayout();
-  const { version: versionInfo } = useVersion();
-  const capabilities = versionInfo?.capabilities ?? [];
-
-  // Build the list of categories, conditionally including emulator and dev
-  const categories: SettingsCategory[] = [
+  const categories = [
     ...getSettingsCategories((key) => t(key as never)),
+    getDevelopmentCategory((key) => t(key as never)),
   ];
-  if (
-    capabilities.includes("deviceBridge") ||
-    capabilities.includes("deviceBridge-download") ||
-    capabilities.includes("deviceBridge-available")
-  ) {
-    // Insert before "about"
-    const aboutIndex = categories.findIndex((c) => c.id === "about");
-    categories.splice(
-      aboutIndex >= 0 ? aboutIndex : categories.length,
-      0,
-      getEmulatorCategory((key) => t(key as never)),
-    );
+  if (category && !categories.some((item) => item.id === category)) {
+    return <Navigate to={`${basePath}/settings`} replace />;
   }
-  categories.push(getDevelopmentCategory((key) => t(key as never)));
 
   // On wide screen, default to first category if none selected
   const effectiveCategory =

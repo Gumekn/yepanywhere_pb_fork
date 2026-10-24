@@ -51,13 +51,10 @@
     "test:codex-history-read-smoke": "tsx --conditions source scripts/smoke-codex-history-read.ts --read-only --summary",
     "test:zcode-app-server-smoke": "tsx --conditions source scripts/smoke-zcode-app-server.ts",
     "test:e2e:ui": "corepack pnpm --filter client test:e2e:ui",
-    "test:e2e:android": "corepack pnpm --filter client test:e2e:android",
-    "test:e2e:android:soak": "corepack pnpm --filter client test:e2e:android:soak",
-    "test:e2e:emulator:apk": "corepack pnpm --filter client test:e2e:emulator:apk",
-    "test:e2e:emulator:apk:adaptive": "corepack pnpm --filter client test:e2e:emulator:apk:adaptive",
-    "test:e2e:chromeos": "corepack pnpm --filter client test:e2e:chromeos",
     "test:e2e:sdk": "corepack pnpm --filter server test:e2e",
-    "lint": "biome check .",
+    "lint": "corepack pnpm lint:typography && biome check .",
+    "lint:typography": "node scripts/check-typography.mjs",
+    "test:typography": "node --test scripts/check-typography.test.mjs",
     "format": "biome format --write .",
     "prepare": "husky",
     "postinstall": "node scripts/postinstall.mjs",
@@ -67,6 +64,7 @@
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
     "husky": "^9.1.7",
+    "postcss": "8.5.8",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   },
@@ -85,5 +83,5 @@
     }
   },
   "dependencies": {},
-  "version": "2026.9.1"
+  "version": "2026.10.0"
 }

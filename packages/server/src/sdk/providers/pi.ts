@@ -1,12 +1,7 @@
-import {
-  type ChildProcessWithoutNullStreams,
-  exec,
-  spawn,
-} from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import type {
   ContextStatusSdkPayload,
   LlmGatewayRequestProtocol,
@@ -45,7 +40,9 @@ import {
   canonicalizePiToolName,
   normalizePiToolInput,
 } from "../../sessions/pi-tools.js";
-import { whichCommand } from "../cli-detection.js";
+import { PI_SIDE_COMMAND, PiSideChannel } from "../../side-conversations/pi.js";
+import { SideConversationSession } from "../../side-conversations/session.js";
+import { findPiCliPath } from "../cli-detection.js";
 import {
   MessageQueue,
   buildUserPromptProjection,
@@ -70,7 +67,6 @@ import type {
   StartSessionOptions,
 } from "./types.js";
 
-const execAsync = promisify(exec);
 const PI_APPROVAL_TITLE_PREFIX = "__YEP_PI_TOOL_APPROVAL__:";
 // Live tool output relayed by the Yep extension through Pi's `ui.notify`
 // channel; see packages/server/resources/pi-yep-extension.mjs.
@@ -152,6 +148,7 @@ interface PiModelCatalog {
 }
 
 interface PiRuntimeRef {
+  sideChannel?: PiSideChannel;
   client?: PiRpcClient;
   models: ModelInfo[];
   /** Yep-facing (channel-qualified) model id -> routing information. */
@@ -194,7 +191,6 @@ interface PiStreamState {
 }
 
 interface PiExtensionProviderConfig {
-  globalInstructions?: string;
   providers: Array<{
     id: string;
     config: {
@@ -389,7 +385,6 @@ function applyPiSessionModelConfig(
 function buildPiExtensionConfig(
   routes: Map<string, PiModelRoute>,
   models: ModelInfo[],
-  globalInstructions?: string,
 ): PiExtensionProviderConfig {
   const modelsById = new Map(models.map((model) => [model.id, model]));
   const providers: PiExtensionProviderConfig["providers"] = [];
@@ -470,9 +465,6 @@ function buildPiExtensionConfig(
 
   return {
     providers,
-    ...(globalInstructions?.trim()
-      ? { globalInstructions: globalInstructions.trim() }
-      : {}),
   };
 }
 
@@ -563,7 +555,10 @@ class PiRpcClient {
   >();
   private nextId = 1;
 
-  constructor(private readonly timeoutMs: number) {}
+  constructor(
+    private readonly timeoutMs: number,
+    private readonly sideChannel?: PiSideChannel,
+  ) {}
 
   start(
     command: string,
@@ -642,6 +637,7 @@ class PiRpcClient {
   }
 
   close(): void {
+    this.sideChannel?.close();
     this.events.end();
     const child = this.child;
     if (!child) return;
@@ -688,10 +684,11 @@ class PiRpcClient {
       }
       return;
     }
-    this.events.push(value);
+    if (!this.sideChannel?.accept(value)) this.events.push(value);
   }
 
   private finish(error?: Error): void {
+    this.sideChannel?.close();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error ?? new Error("Pi RPC process exited"));
@@ -930,6 +927,15 @@ export class PiProvider implements AgentProvider {
       if (!runtime.client) throw new Error("Pi RPC is not initialized yet");
       return runtime.client;
     };
+    const sideChannel = new PiSideChannel((command) =>
+      requireClient().send(command),
+    );
+    runtime.sideChannel = sideChannel;
+    const sideConversations = new SideConversationSession({
+      ready: () => Boolean(runtime.sessionId && runtime.client?.isAlive()),
+      parentId: () => runtime.sessionId ?? "",
+      create: (context, emit) => sideChannel.create(context, emit),
+    });
     const routeModel = async (
       requestedModelId: string,
       preferredProtocol?: LlmGatewayRequestProtocol,
@@ -967,6 +973,7 @@ export class PiProvider implements AgentProvider {
     return {
       iterator,
       queue,
+      sideConversations,
       abort: () => {
         abortController.abort();
         queue.close();
@@ -998,7 +1005,12 @@ export class PiProvider implements AgentProvider {
         const data = isRecord(response.data) ? response.data : {};
         const commands = Array.isArray(data.commands) ? data.commands : [];
         return commands.flatMap((command): SlashCommand[] => {
-          if (!isRecord(command) || typeof command.name !== "string") return [];
+          if (
+            !isRecord(command) ||
+            typeof command.name !== "string" ||
+            command.name === PI_SIDE_COMMAND
+          )
+            return [];
           return [
             {
               name: command.name,
@@ -1210,11 +1222,7 @@ export class PiProvider implements AgentProvider {
       ]) {
         delete childEnv[key];
       }
-      const extensionConfig = buildPiExtensionConfig(
-        runtime.routes,
-        models,
-        options.globalInstructions,
-      );
+      const extensionConfig = buildPiExtensionConfig(runtime.routes, models);
       childEnv.YEP_PI_LLM_API_KEYS = JSON.stringify(
         Object.fromEntries(
           extensionConfig.providers.flatMap((provider) => {
@@ -1259,7 +1267,9 @@ export class PiProvider implements AgentProvider {
       childEnv.PI_CODING_AGENT_DIR = this.agentDir;
       childEnv.PI_SKIP_VERSION_CHECK = "1";
 
-      const client = new PiRpcClient(this.timeout);
+      if (runtime.sideChannel)
+        childEnv.YEP_PI_SIDE_TOKEN = runtime.sideChannel.token;
+      const client = new PiRpcClient(this.timeout, runtime.sideChannel);
       runtime.client = client;
       client.start(piPath, args, options.cwd, childEnv);
 
@@ -2009,27 +2019,7 @@ export class PiProvider implements AgentProvider {
   }
 
   private async findPiPath(): Promise<string | null> {
-    if (this.configuredPath && existsSync(this.configuredPath)) {
-      return this.configuredPath;
-    }
-    for (const path of [
-      process.env.YEP_PI_PATH,
-      "/opt/homebrew/bin/pi",
-      "/usr/local/bin/pi",
-      join(homedir(), ".local", "bin", "pi"),
-      join(homedir(), "bin", "pi"),
-    ]) {
-      if (path && existsSync(path)) return path;
-    }
-    try {
-      const { stdout } = await execAsync(whichCommand("pi"), {
-        encoding: "utf8",
-      });
-      const path = stdout.split("\n")[0]?.trim();
-      return path && existsSync(path) ? path : null;
-    } catch {
-      return null;
-    }
+    return findPiCliPath(this.configuredPath);
   }
 }
 

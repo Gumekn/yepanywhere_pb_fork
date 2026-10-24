@@ -3,9 +3,15 @@ import type { ISessionIndexService } from "../indexes/types.js";
 import { canonicalizeProjectPath } from "../projects/paths.js";
 import type { Project, SessionSummary } from "../supervisor/types.js";
 import { CodexSessionReader } from "./codex-reader.js";
+import {
+  CURSOR_ACP_SESSIONS_DIR,
+  CursorSessionReader,
+} from "./cursor-reader.js";
 import { collapseEditForkFamilies } from "./edit-fork-families.js";
 import { GeminiSessionReader } from "./gemini-reader.js";
 import { KimiSessionReader } from "./kimi-reader.js";
+import { McodeSessionReader } from "./mcode-reader.js";
+import { MCODE_SESSIONS_DIR } from "./mcode-store.js";
 import { PI_SESSIONS_DIR } from "./pi-files.js";
 import { PiSessionReader } from "./pi-reader.js";
 import {
@@ -23,6 +29,9 @@ export interface ProviderProjectCatalog {
   piPaths: Set<string>;
   kimiPaths: Set<string>;
   zcodePaths: Set<string>;
+  cursorPaths: Set<string>;
+  /** Optional so older catalog builders/tests remain valid. */
+  mcodePaths?: Set<string>;
   geminiHashToCwd?: Promise<Map<string, string>>;
   codexSessionsByPath?: Map<string, SessionSummary[]>;
 }
@@ -39,6 +48,10 @@ export interface ProviderResolutionDeps {
   piReaderFactory?: (projectPath: string) => PiSessionReader;
   kimiSessionsDir?: string;
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  cursorSessionsDir?: string;
+  cursorReaderFactory?: (projectPath: string) => CursorSessionReader;
+  mcodeSessionsDir?: string;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   zcodeDbPath?: string;
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   allowStaleSessionCache?: boolean;
@@ -55,7 +68,15 @@ export interface SessionSource {
   provider: ProviderName;
   reader: ISessionReader;
   sessionDir: string;
-  kind: "primary" | "codex" | "gemini" | "pi" | "kimi" | "zcode";
+  kind:
+    | "primary"
+    | "codex"
+    | "gemini"
+    | "pi"
+    | "kimi"
+    | "zcode"
+    | "cursor"
+    | "mcode";
 }
 
 export interface ResolvedSessionSummary {
@@ -109,6 +130,38 @@ function mayHavePiSessions(
   }
   const provider = normalizeProviderGroup(project.provider);
   return provider === "claude" || provider === "codex" || provider === "gemini";
+}
+
+function mayHaveCursorSessions(
+  project: Project,
+  catalog?: ProviderProjectCatalog,
+): boolean {
+  if (catalog) {
+    return catalog.cursorPaths.has(canonicalizeProjectPath(project.path));
+  }
+  const provider = normalizeProviderGroup(project.provider);
+  return (
+    provider === "claude" ||
+    provider === "codex" ||
+    provider === "gemini" ||
+    provider === "pi" ||
+    provider === "kimi" ||
+    provider === "zcode"
+  );
+}
+
+function mayHaveMcodeSessions(
+  project: Project,
+  catalog?: ProviderProjectCatalog,
+): boolean {
+  if (catalog) {
+    return (
+      catalog.mcodePaths?.has(canonicalizeProjectPath(project.path)) ?? false
+    );
+  }
+  // Without a catalog, any non-mcode project may also hold MiniMax Code
+  // sessions; the reader filters by cwd, so a miss only costs one query.
+  return normalizeProviderGroup(project.provider) !== null;
 }
 
 function mayHaveZCodeSessions(
@@ -269,6 +322,12 @@ function buildCandidateGroups(
   if (mayHaveZCodeSessions(project, catalog)) {
     pushGroup("zcode");
   }
+  if (mayHaveCursorSessions(project, catalog)) {
+    pushGroup("cursor");
+  }
+  if (mayHaveMcodeSessions(project, catalog)) {
+    pushGroup("mcode");
+  }
 
   return groups;
 }
@@ -292,7 +351,46 @@ function getSourceForGroup(
       return createKimiSource(project, deps);
     case "zcode":
       return createZCodeSource(project, deps);
+    case "cursor":
+      return createCursorSource(project, deps);
+    case "mcode":
+      return createMcodeSource(project, deps);
   }
+}
+
+function createMcodeSource(
+  project: Project,
+  deps: ProviderResolutionDeps,
+): SessionSource {
+  const sessionsDir = deps.mcodeSessionsDir ?? MCODE_SESSIONS_DIR;
+  const reader =
+    deps.mcodeReaderFactory?.(project.path) ??
+    new McodeSessionReader({ sessionsDir, projectPath: project.path });
+  return {
+    provider: "mcode",
+    reader,
+    sessionDir: sessionsDir,
+    kind: "mcode",
+  };
+}
+
+function createCursorSource(
+  project: Project,
+  deps: ProviderResolutionDeps,
+): SessionSource {
+  const sessionsDir = deps.cursorSessionsDir ?? CURSOR_ACP_SESSIONS_DIR;
+  const reader =
+    deps.cursorReaderFactory?.(project.path) ??
+    new CursorSessionReader({
+      sessionsDir,
+      projectPath: project.path,
+    });
+  return {
+    provider: "cursor",
+    reader,
+    sessionDir: sessionsDir,
+    kind: "cursor",
+  };
 }
 
 function getSessionSources(
@@ -406,6 +504,7 @@ export async function listSessionsAcrossProviders(
   project: Project,
   deps: ProviderResolutionDeps,
   catalog?: ProviderProjectCatalog,
+  additionalSessions: readonly SessionSummary[] = [],
 ): Promise<SessionSummary[]> {
   const sessions: SessionSummary[] = [];
   const seenSessionIds = new Set<string>();
@@ -424,10 +523,17 @@ export async function listSessionsAcrossProviders(
     }
   }
 
+  // Bridge rows arrive independently of the persisted catalog. Collapse only
+  // after merging them, retaining hidden member ids for later live updates.
+  for (const session of additionalSessions) {
+    if (seenSessionIds.has(session.id)) continue;
+    seenSessionIds.add(session.id);
+    sessions.push(session);
+  }
   sessions.sort(
     (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
   );
-  return sessions;
+  return collapseEditForkFamilies(applyForkLineageMetadata(sessions, deps));
 }
 
 export async function findSessionSummaryAcrossProviders(

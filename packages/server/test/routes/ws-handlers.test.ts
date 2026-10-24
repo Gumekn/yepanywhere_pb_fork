@@ -7,8 +7,11 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import {
   type WSAdapter,
+  type WsHandlerDeps,
+  cleanupTerminalAttachments,
   createConnectionState,
   createSendFn,
+  handleMessage,
   handleSessionSubscribe,
   handleUnsubscribe,
 } from "../../src/routes/ws-handlers.js";
@@ -48,6 +51,37 @@ async function waitForFrames(sent: SentFrame[], count: number): Promise<void> {
 }
 
 describe("WebSocket handlers", () => {
+  it("preserves terminal attachment routing and detachment", async () => {
+    const send = vi.fn();
+    const terminalService = { handleMessage: vi.fn(), detachAll: vi.fn() };
+    const message = {
+      type: "terminal_open",
+      terminalId: "terminal-1",
+      cols: 80,
+      rows: 24,
+    };
+    const ws: WSAdapter = { send: vi.fn(), close: vi.fn() };
+    const deps = { terminalService } as unknown as WsHandlerDeps;
+    await handleMessage(
+      ws,
+      new Map(),
+      new Map(),
+      createConnectionState(),
+      send,
+      JSON.stringify(message),
+      deps,
+      {},
+      "attachment-1",
+    );
+    expect(terminalService.handleMessage).toHaveBeenCalledWith(
+      message,
+      "attachment-1",
+      send,
+    );
+    cleanupTerminalAttachments("attachment-1", deps.terminalService);
+    expect(terminalService.detachAll).toHaveBeenCalledWith("attachment-1");
+  });
+
   it("keeps outbound frame order while compressing large JSON asynchronously", async () => {
     const sent: SentFrame[] = [];
     const ws: WSAdapter = {
@@ -130,5 +164,90 @@ describe("WebSocket handlers", () => {
     expect(cleanup).toHaveBeenCalledTimes(1);
     expect(subscriptions.has("sub-race")).toBe(false);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  describe("session subscription failures", () => {
+    function displayRejecting(error: unknown) {
+      return {
+        subscribe: vi.fn(async () => {
+          throw error;
+        }),
+      } as unknown as Parameters<typeof handleSessionSubscribe>[4];
+    }
+    const msg = {
+      type: "subscribe" as const,
+      subscriptionId: "sub-missing",
+      channel: "session" as const,
+      sessionId: "gone",
+      display: { projectId: "project" },
+    };
+
+    it("answers a missing session with its 404 instead of a generic 500", async () => {
+      const subscriptions = new Map<string, () => void>();
+      const send = vi.fn();
+      const notFound = Object.assign(new Error("Session not found"), {
+        status: 404,
+        code: "SESSION_NOT_FOUND",
+      });
+      await handleSessionSubscribe(
+        subscriptions,
+        msg,
+        send,
+        {} as RuntimeController,
+        displayRejecting(notFound),
+      );
+      expect(send).toHaveBeenCalledWith({
+        type: "response",
+        id: "sub-missing",
+        status: 404,
+        body: { error: "Session not found", code: "SESSION_NOT_FOUND" },
+      });
+      expect(subscriptions.has("sub-missing")).toBe(false);
+    });
+
+    it("hides internal errors behind a 500", async () => {
+      const send = vi.fn();
+      await handleSessionSubscribe(
+        new Map(),
+        msg,
+        send,
+        {} as RuntimeController,
+        displayRejecting(new Error("disk exploded at /secret/path")),
+      );
+      expect(send).toHaveBeenCalledWith({
+        type: "response",
+        id: "sub-missing",
+        status: 500,
+        body: { error: "Internal server error" },
+      });
+    });
+
+    it("stays silent when the client already unsubscribed", async () => {
+      const subscriptions = new Map<string, () => void>();
+      const send = vi.fn();
+      let reject!: (error: unknown) => void;
+      const display = {
+        subscribe: vi.fn(
+          () =>
+            new Promise((_resolve, rejectFn) => {
+              reject = rejectFn;
+            }),
+        ),
+      } as unknown as Parameters<typeof handleSessionSubscribe>[4];
+      const pending = handleSessionSubscribe(
+        subscriptions,
+        msg,
+        send,
+        {} as RuntimeController,
+        display,
+      );
+      handleUnsubscribe(subscriptions, {
+        type: "unsubscribe",
+        subscriptionId: "sub-missing",
+      });
+      reject(Object.assign(new Error("gone"), { status: 404 }));
+      await pending;
+      expect(send).not.toHaveBeenCalled();
+    });
   });
 });

@@ -13,7 +13,7 @@ const themeLabels: Record<Theme, string> = {
 export const THEMES: Theme[] = ["auto", "light", "dark", "verydark"];
 
 const MOBILE_SHELL_THEME_MESSAGE = "yep-anywhere:mobile-shell-theme";
-let mobileShellThemeListenerInstalled = false;
+let themeListenerInstalled = false;
 
 export function getThemeLabel(theme: Theme): string {
   return themeLabels[theme];
@@ -47,14 +47,29 @@ function syncMobileShellTheme(theme: Theme): void {
   );
 }
 
-function installMobileShellThemeListener(): void {
-  if (mobileShellThemeListenerInstalled || !isMobileShellFrame()) return;
-  mobileShellThemeListenerInstalled = true;
+function syncThemeColor(): void {
+  const root = document.documentElement;
+  const styles = getComputedStyle(root);
+  const color =
+    styles.getPropertyValue("--bg-surface").trim() ||
+    styles.getPropertyValue("--boot-bg").trim();
+  const meta = document.querySelector<HTMLMetaElement>(
+    'meta[name="theme-color"]',
+  );
+  if (meta && color) meta.content = color;
+}
+
+function installThemeListener(): void {
+  if (themeListenerInstalled) return;
+  themeListenerInstalled = true;
 
   const mediaQuery = window.matchMedia("(prefers-color-scheme: light)");
   const handleChange = () => {
     const theme = loadTheme();
-    if (theme === "auto") syncMobileShellTheme(theme);
+    if (theme === "auto") {
+      syncThemeColor();
+      syncMobileShellTheme(theme);
+    }
   };
   if (typeof mediaQuery.addEventListener === "function") {
     mediaQuery.addEventListener("change", handleChange);
@@ -66,6 +81,7 @@ function installMobileShellThemeListener(): void {
 function applyTheme(theme: Theme) {
   const root = document.documentElement;
   root.setAttribute("data-theme", theme);
+  syncThemeColor();
   syncMobileShellTheme(theme);
 }
 
@@ -106,7 +122,7 @@ export function useTheme() {
  */
 export function initializeTheme() {
   const theme = loadTheme();
-  installMobileShellThemeListener();
+  installThemeListener();
   applyTheme(theme);
 }
 

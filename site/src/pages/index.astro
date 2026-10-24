@@ -10,13 +10,6 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 >
   <Header activePage="home" />
 
-  <div class="announcement">
-    <div class="announcement-content">
-      <span class="announcement-badge">New</span>
-      <p>Stream and control Android devices from your phone. <a href="/remote-device-control">See how it works</a></p>
-    </div>
-  </div>
-
   <main>
     <section class="hero">
       <div class="container">
@@ -153,10 +146,6 @@ import BaseLayout from "../layouts/BaseLayout.astro";
           <div class="feature-card">
             <h3>Claude Code + Codex</h3>
             <p>Full support for both Claude Code and Codex CLI. Start sessions, approve tools, and view diffs — same workflow for both providers.</p>
-          </div>
-          <div class="feature-card">
-            <h3>Remote device control</h3>
-            <p>Stream Android emulators and devices to your phone over WebRTC. Touch input, nav buttons, adaptive quality. Spot-check builds without walking to your desk. <a href="/remote-device-control">Learn more</a>.</p>
           </div>
           <div class="feature-card">
             <h3>Voice input</h3>
@@ -549,48 +538,6 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 
   .faq-item a {
     color: var(--accent);
-  }
-
-  /* Announcement Banner */
-  .announcement {
-    background: linear-gradient(90deg, var(--accent) 0%, var(--accent-hover) 100%);
-    padding: 12px 24px;
-    text-align: center;
-  }
-
-  .announcement-content {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-
-  .announcement-badge {
-    background: rgba(255, 255, 255, 0.2);
-    color: white;
-    padding: 4px 10px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .announcement p {
-    color: white;
-    font-size: 15px;
-    font-weight: 500;
-  }
-
-  .announcement a {
-    color: white;
-    text-decoration: underline;
-    font-weight: 600;
-  }
-
-  .announcement a:hover {
-    text-decoration: none;
   }
 
   /* Mobile */

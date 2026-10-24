@@ -11,6 +11,8 @@ const LIVE_PROVIDER_NAMES = new Set([
   "pi",
   "kimi",
   "zcode",
+  "cursor",
+  "mcode",
 ]);
 
 export function isRetiredProviderName(value: unknown): value is "opencode" {

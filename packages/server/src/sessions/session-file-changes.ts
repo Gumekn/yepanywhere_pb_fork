@@ -1,3 +1,4 @@
+import { normalizeToolName } from "@yep-anywhere/shared";
 import { structuredPatch } from "diff";
 import {
   extractRawPatchFromEditInput,
@@ -66,10 +67,6 @@ const WRITE_TOOLS = new Set([
   "notebookedit",
 ]);
 const PATCH_TOOLS = new Set(["applypatch", "patch", "editfile"]);
-
-function normalizeToolName(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
 
 /** Does this tool mutate file contents at all? */
 export function isFileMutatingTool(name: string): boolean {

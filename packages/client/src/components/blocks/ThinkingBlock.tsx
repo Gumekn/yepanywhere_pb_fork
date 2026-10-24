@@ -34,9 +34,19 @@ export const ThinkingBlock = memo(function ThinkingBlock({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const requestedKeyRef = useRef<string | null>(null);
+  const { projectId, sessionId, detailRef, revision, branchId, truncated } =
+    detail ?? {};
 
   useEffect(() => {
-    if (!isExpanded || !detail?.truncated) return;
+    if (
+      !isExpanded ||
+      !truncated ||
+      !projectId ||
+      !sessionId ||
+      !detailRef ||
+      !revision
+    )
+      return;
     if (loaded?.key === detailKey) return;
     if (requestedKeyRef.current === detailKey) return;
     requestedKeyRef.current = detailKey;
@@ -44,21 +54,18 @@ export const ThinkingBlock = memo(function ThinkingBlock({
     setError(null);
     let cancelled = false;
     void api
-      .getSessionThinkingDetail(
-        detail.projectId,
-        detail.sessionId,
-        detail.detailRef,
-        {
-          revision: detail.revision,
-          ...(detail.branchId ? { branchId: detail.branchId } : {}),
-        },
-      )
+      .getSessionThinkingDetail(projectId, sessionId, detailRef, {
+        revision,
+        ...(branchId ? { branchId } : {}),
+      })
       .then((response) => {
-        if (!cancelled)
-          setLoaded({ key: detailKey, content: response.content });
+        if (cancelled) return;
+        setLoading(false);
+        setLoaded({ key: detailKey, content: response.content });
       })
       .catch((loadError: unknown) => {
         if (cancelled) return;
+        setLoading(false);
         const code =
           loadError && typeof loadError === "object"
             ? (loadError as { code?: unknown }).code
@@ -69,14 +76,23 @@ export const ThinkingBlock = memo(function ThinkingBlock({
             ? t("sessionToolGroupStale")
             : t("sessionThinkingLoadFailed"),
         );
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
       });
     return () => {
       cancelled = true;
+      if (requestedKeyRef.current === detailKey) requestedKeyRef.current = null;
     };
-  }, [detail, detailKey, isExpanded, loaded?.key, t]);
+  }, [
+    projectId,
+    sessionId,
+    detailRef,
+    revision,
+    branchId,
+    truncated,
+    detailKey,
+    isExpanded,
+    loaded?.key,
+    t,
+  ]);
 
   const hasFullBody = loaded?.key === detailKey;
   const body = hasFullBody ? loaded.content : thinking;

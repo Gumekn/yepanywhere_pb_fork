@@ -7,9 +7,12 @@ import {
   encodeCodexAppServerCursor,
 } from "../../src/codex-history/CodexAppServerHistoryReader.js";
 import { CodexHistoryClientError } from "../../src/codex-history/types.js";
+import { SessionDisplayReducer } from "../../src/display/SessionDisplayReducer.js";
+import { compactDisplayMessage } from "../../src/display/SessionDisplayService.js";
 import type { Thread } from "../../src/sdk/providers/codex-protocol/generated/v2/Thread.js";
 import type { Turn } from "../../src/sdk/providers/codex-protocol/generated/v2/Turn.js";
 import { publicCodexThreadItem } from "../../src/sdk/providers/codex.js";
+import type { Message } from "../../src/supervisor/types.js";
 
 function thread(historyMode: "legacy" | "paginated" = "paginated"): Thread {
   return {
@@ -119,6 +122,195 @@ function client(overrides: Record<string, unknown> = {}) {
 }
 
 describe("CodexAppServerHistoryReader", () => {
+  it("restarts a cold semantic read when mailbox messages change during hydration", async () => {
+    const fake = client({
+      listItems: vi.fn(async () => ({ data: [], nextCursor: null })),
+    });
+    const reader = new CodexAppServerHistoryReader({
+      client: fake,
+      readInterAgentRevision: vi
+        .fn()
+        .mockResolvedValueOnce("before")
+        .mockResolvedValue("after"),
+    });
+    const result = await reader.getSemanticTurnsPage(
+      thread().id,
+      "project" as UrlProjectId,
+      "/tmp/project",
+      { limit: 20, itemsView: "full" },
+    );
+    expect(result.kind).toBe("loaded");
+    expect(result.kind === "loaded" && result.revision).toContain(
+      Buffer.from("after").toString("base64url"),
+    );
+    expect(fake.readThread).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back after bounded cold retries when the mailbox keeps changing", async () => {
+    const fake = client({
+      listItems: vi.fn(async () => ({ data: [], nextCursor: null })),
+    });
+    let revision = 0;
+    const reader = new CodexAppServerHistoryReader({
+      client: fake,
+      readInterAgentRevision: async () => String(++revision),
+    });
+    await expect(
+      reader.getSemanticTurnsPage(
+        thread().id,
+        "project" as UrlProjectId,
+        "/tmp/project",
+        { limit: 20, itemsView: "full" },
+      ),
+    ).resolves.toEqual({ kind: "fallback", reason: "transcript_parity" });
+    expect(fake.readThread).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { cursor: "older" },
+    {
+      expectedRevision: `cas1.${thread().updatedAt}.${thread().id}.${Buffer.from("before").toString("base64url")}`,
+    },
+  ])("keeps revision-bound semantic reads strict: %j", async (scope) => {
+    const fake = client({
+      listItems: vi.fn(async () => ({ data: [], nextCursor: null })),
+    });
+    const reader = new CodexAppServerHistoryReader({
+      client: fake,
+      readInterAgentRevision: vi
+        .fn()
+        .mockResolvedValueOnce("before")
+        .mockResolvedValue("after"),
+    });
+    await expect(
+      reader.getSemanticTurnsPage(
+        thread().id,
+        "project" as UrlProjectId,
+        "/tmp/project",
+        { limit: 20, itemsView: "full", ...scope },
+      ),
+    ).rejects.toThrow("ROLLOUT_CURSOR_STALE");
+    expect(fake.readThread).toHaveBeenCalledTimes(1);
+  });
+
+  it("supplements mailbox results before the parent's answer across history APIs and revises mailbox-only changes", async () => {
+    const items = [
+      {
+        turnId: "turn-1",
+        item: {
+          type: "userMessage",
+          id: "user-1",
+          clientId: null,
+          content: [{ type: "text", text: "Review", text_elements: [] }],
+        },
+      },
+      {
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          id: "answer-1",
+          text: "Done",
+          phase: "final_answer",
+          memoryCitation: null,
+        },
+      },
+    ];
+    const fake = client({
+      listItems: vi.fn(async (params: { sortDirection: string }) => ({
+        data: params.sortDirection === "desc" ? [...items].reverse() : items,
+        nextCursor: null,
+        backwardsCursor: null,
+      })),
+    });
+    const message: Message = {
+      uuid: "mailbox-1",
+      type: "system",
+      subtype: "codex_native_item",
+      codexThreadId: thread().id,
+      codexTurnId: "turn-1",
+      codexThreadItemId: "amsg-1",
+      codexCorrelationKey: "codex:turn-1:inter-agent-message:amsg-1",
+      codexThreadItem: {
+        type: "interAgentMessage",
+        id: "amsg-1",
+        kind: "result",
+        sender: "/root/review",
+        recipient: "/root",
+        text: "Review passed",
+        encrypted: false,
+      },
+    };
+    const readInterAgentMessages = vi.fn(async () => [
+      { message, beforeItemId: "answer-1", afterItemId: "user-1" },
+    ]);
+    let mailboxRevision = "one";
+    const reader = new CodexAppServerHistoryReader({
+      client: fake,
+      readInterAgentMessages,
+      readInterAgentRevision: async () => mailboxRevision,
+    });
+    const page = await reader.getSemanticTurnsPage(
+      thread().id,
+      "project" as UrlProjectId,
+      "/tmp/project",
+      { limit: 20, itemsView: "full" },
+    );
+    expect(page.kind).toBe("loaded");
+    if (page.kind !== "loaded") throw new Error("Expected loaded");
+    expect(page.messages.map((entry) => entry.codexThreadItemId)).toEqual([
+      "user-1",
+      "amsg-1",
+      "answer-1",
+    ]);
+    expect(readInterAgentMessages).toHaveBeenCalledWith(
+      thread().id,
+      "/tmp/project",
+      ["turn-1"],
+      ["user-1", "answer-1"],
+    );
+    const detail = await reader.getSemanticTurn(
+      thread().id,
+      "/tmp/project",
+      "turn-1",
+      page.revision,
+    );
+    expect(
+      detail.kind === "loaded" &&
+        detail.messages.map((entry) => entry.codexThreadItemId),
+    ).toEqual(["user-1", "amsg-1", "answer-1"]);
+    const ordinary = await reader.getSession(
+      thread().id,
+      "project" as UrlProjectId,
+      "/tmp/project",
+      undefined,
+      {},
+    );
+    expect(
+      ordinary.kind === "loaded" &&
+        ordinary.session.projectedMessages?.map(
+          (entry) => entry.codexThreadItemId,
+        ),
+    ).toEqual(["user-1", "amsg-1", "answer-1"]);
+    mailboxRevision = "two";
+    await expect(
+      reader.getSemanticTurnsPage(
+        thread().id,
+        "project" as UrlProjectId,
+        "/tmp/project",
+        { limit: 20, itemsView: "full", expectedRevision: page.revision },
+      ),
+    ).rejects.toThrow("ROLLOUT_CURSOR_STALE");
+    const refreshed = await reader.getSemanticTurnsPage(
+      thread().id,
+      "project" as UrlProjectId,
+      "/tmp/project",
+      { limit: 20, itemsView: "full" },
+    );
+    expect(refreshed.kind === "loaded" && refreshed.revision).not.toBe(
+      page.revision,
+    );
+  });
+
   it("retains async question metadata in paginated history", async () => {
     const questions = [
       { title: "Which address?", options: ["Production", "Local"] },
@@ -258,6 +450,27 @@ describe("CodexAppServerHistoryReader", () => {
     if (result.kind !== "loaded") return;
     expect(result.nextCursor).toBe("older-turns");
     expect(result.revision).toBe(`cas1.${thread().updatedAt}.${thread().id}`);
+    // Cold history keeps the command's native 10ms, not the enclosing
+    // turn's 10,000ms; compact projection and closed groups retain it too.
+    const model = new SessionDisplayReducer(
+      { sessionId: thread().id, branchScopeId: "active", epoch: "timing" },
+      "codex",
+    );
+    model.restore(
+      result.messages.map((message) =>
+        compactDisplayMessage(message as unknown as Record<string, unknown>),
+      ) as Message[],
+      result.turnStatuses,
+    );
+    const group = model
+      .snapshot()
+      .nodes.find(
+        (node) => node.type === "segment" && node.segment.type === "tool_group",
+      );
+    expect(group).toMatchObject({
+      segment: { durationMs: 10, timedCount: 1, displayMode: "summary" },
+    });
+
     expect(result.turnStatuses).toEqual({
       "turn-semantic": "completed",
     });
@@ -368,13 +581,46 @@ describe("CodexAppServerHistoryReader", () => {
           nextCursor: null,
           backwardsCursor: null,
         })),
-        listItems: vi.fn(async () => ({
-          data: [],
+        listItems: vi.fn(async ({ turnId }: { turnId: string }) => ({
+          data: [
+            {
+              turnId,
+              item: {
+                type: "collabAgentToolCall",
+                id: `wait-${turnId}`,
+                tool: "wait",
+                status: "inProgress",
+                senderThreadId: thread().id,
+                receiverThreadIds: [],
+                receiverAgents: [],
+                agentsStates: {},
+              },
+            },
+          ],
           nextCursor: null,
           backwardsCursor: null,
         })),
       });
-      const reader = new CodexAppServerHistoryReader({ client: fake });
+      const reader = new CodexAppServerHistoryReader({
+        client: fake,
+        readInterAgentMessages: async (_session, _project, turnIds) =>
+          turnIds.map((turnId) => ({
+            updateOnly: true,
+            message: {
+              uuid: `wait-message-${turnId}`,
+              type: "system",
+              subtype: "codex_native_item",
+              codexTurnId: turnId,
+              codexThreadItemId: `wait-${turnId}`,
+              codexThreadItem: {
+                type: "agentWait",
+                id: `wait-${turnId}`,
+                status: "running",
+                startedAt: "2026-10-08T01:00:00.000Z",
+              },
+            },
+          })),
+      });
       const result = await reader.getSemanticTurnsPage(
         thread().id,
         "project" as UrlProjectId,
@@ -391,6 +637,18 @@ describe("CodexAppServerHistoryReader", () => {
       expect(result.summary.lastTurnStatus).toBe(
         expected === "running" ? undefined : expected,
       );
+      const waits = result.messages.filter(
+        (message) => message.codexThreadItem?.type === "agentWait",
+      );
+      expect(waits).toHaveLength(2);
+      for (const wait of waits) {
+        expect(wait.codexThreadItem).toMatchObject({
+          status: wait.codexTurnId === "turn-live" ? expected : "interrupted",
+          startedAt: "2026-10-08T01:00:00.000Z",
+        });
+        expect(wait.codexThreadItem).not.toHaveProperty("durationMs");
+        expect(wait.codexThreadItem).not.toHaveProperty("completedAt");
+      }
     },
   );
 
@@ -845,6 +1103,20 @@ describe("CodexAppServerHistoryReader", () => {
       userEntry("turn-d", "user-d", "d"),
     ];
     const fake = client({
+      listTurns: vi.fn(async ({ threadId }: { threadId: string }) => ({
+        data: (threadId === "child" ? childItems : rootItems).map((entry) => ({
+          id: entry.turnId,
+          items: [entry.item],
+          itemsView: "summary" as const,
+          status: "completed" as const,
+          error: null,
+          startedAt: null,
+          completedAt: null,
+          durationMs: null,
+        })),
+        nextCursor: null,
+        backwardsCursor: null,
+      })),
       listItems: vi.fn(async ({ threadId }: { threadId: string }) => ({
         data: threadId === "child" ? childItems : rootItems,
         nextCursor: null,
@@ -902,6 +1174,97 @@ describe("CodexAppServerHistoryReader", () => {
     const rootState = await reader.getForkBranchState("root", candidates);
     expect(rootState?.activeBranchId).toBe("user-c-turn-c");
     expect(rootState?.branches).toHaveLength(6);
+    // Two threads, shared by metadata and display consumers. Tool history is
+    // independent of the branch graph even when it spans thousands of items.
+    expect(fake.listTurns).toHaveBeenCalledTimes(2);
+    expect(fake.listItems).not.toHaveBeenCalled();
+    await reader.getForkBranchState(
+      "child",
+      candidates.map((candidate) =>
+        candidate.id === "child"
+          ? { ...candidate, updatedAt: "new-revision" }
+          : candidate,
+      ),
+    );
+    expect(fake.listTurns).toHaveBeenCalledTimes(3);
+  });
+
+  it("hydrates only the turn containing a steered edit boundary, including inherited copies", async () => {
+    const user = (id: string) => ({
+      type: "userMessage" as const,
+      id,
+      clientId: null,
+      content: [{ type: "text" as const, text: id, text_elements: [] }],
+    });
+    const turn = (id: string, itemId: string) => ({
+      id,
+      items: [user(itemId)],
+      itemsView: "summary" as const,
+      status: "completed" as const,
+      error: null,
+      startedAt: null,
+      completedAt: null,
+      durationMs: null,
+    });
+    const fake = client({
+      listTurns: vi.fn(async ({ threadId }: { threadId: string }) => ({
+        data:
+          threadId === "child"
+            ? [turn("a", "a"), turn("edited", "replacement")]
+            : threadId === "later"
+              ? [turn("a", "a"), turn("b", "first"), turn("c2", "later")]
+              : [turn("a", "a"), turn("b", "first"), turn("c", "last")],
+        nextCursor: null,
+        backwardsCursor: null,
+      })),
+      listItems: vi.fn(async () => ({
+        data: [user("first"), user("steered")].map((item) => ({
+          turnId: "b",
+          item,
+        })),
+        nextCursor: null,
+        backwardsCursor: null,
+      })),
+    });
+    const reader = new CodexAppServerHistoryReader({ client: fake });
+    const candidates = [
+      { id: "root" },
+      {
+        id: "later",
+        forkParentSessionId: "root",
+        forkTargetMessageId: "last-c",
+      },
+      {
+        id: "child",
+        forkParentSessionId: "root",
+        forkTargetMessageId: "steered-b",
+      },
+    ];
+    const [state, concurrent] = await Promise.all([
+      reader.getForkBranchState("child", candidates),
+      reader.getForkBranchState("root", candidates),
+    ]);
+    expect(
+      state?.branches.find((branch) => branch.id === "replacement-edited"),
+    ).toMatchObject({
+      parentId: "first-b",
+      siblingCount: 2,
+    });
+    expect(
+      concurrent?.branches.find((branch) => branch.id === "steered-b")
+        ?.siblingCount,
+    ).toBe(2);
+    expect(
+      state?.branches.find((branch) => branch.id === "later-c2"),
+    ).toMatchObject({ parentId: "steered-b", siblingCount: 2 });
+    expect(fake.listTurns).toHaveBeenCalledTimes(3);
+    expect(fake.listItems).toHaveBeenCalledTimes(2);
+    expect(fake.listItems).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: "later", turnId: "b" }),
+    );
+    expect(fake.listItems).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: "root", turnId: "b" }),
+    );
   });
 
   it("maps a bounded paginated item page without reading the rollout", async () => {

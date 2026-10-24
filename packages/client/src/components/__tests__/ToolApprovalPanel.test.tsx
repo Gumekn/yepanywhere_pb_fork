@@ -1,5 +1,7 @@
 import {
+  act,
   cleanup,
+  createEvent,
   fireEvent,
   render,
   screen,
@@ -37,8 +39,189 @@ function renderPanel(actionUrl: string) {
   );
 }
 
+async function renderKeyboardPanel(feedback?: string) {
+  localStorage.removeItem(
+    "draft-tool-prompt-session-shortcuts-toolApprovalFeedback",
+  );
+  if (feedback) {
+    localStorage.setItem(
+      "draft-tool-prompt-session-shortcuts-toolApprovalFeedback",
+      feedback,
+    );
+  }
+  const onApprove = vi.fn(async () => undefined);
+  const onDeny = vi.fn(async () => undefined);
+  const onDenyWithFeedback = vi.fn(async (_feedback: string) => undefined);
+  vi.useFakeTimers();
+  try {
+    render(
+      <I18nProvider>
+        <ToolApprovalPanel
+          request={{
+            id: "approval-shortcuts",
+            sessionId: "session-shortcuts",
+            type: "tool-approval",
+            prompt: "Run command?",
+            toolName: "Bash",
+            toolInput: { command: "pwd" },
+            timestamp: "2026-10-08T00:00:00.000Z",
+          }}
+          sessionId="session-shortcuts"
+          onApprove={onApprove}
+          onDeny={onDeny}
+          onDenyWithFeedback={onDenyWithFeedback}
+        />
+        <input aria-label="Other input" />
+        <textarea aria-label="Other draft" />
+        <div contentEditable suppressContentEditableWarning>
+          <span data-testid="historical-editor">
+            Editing a historical prompt
+          </span>
+        </div>
+      </I18nProvider>,
+    );
+    // The enabled DOM can appear before the passive effect replaces the
+    // keyboard listener. Flush the arming timer and React effects together
+    // before dispatching keys, independently of CI scheduling/load.
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync();
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(
+    (screen.getByRole("button", { name: /^1.*Yes/ }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(false);
+  return { onApprove, onDeny, onDenyWithFeedback };
+}
+
 describe("ToolApprovalPanel", () => {
   afterEach(() => cleanup());
+
+  it.each(["Bash", "Edit"])(
+    "routes Cursor %s persistent approval to the native Always handler",
+    async (toolName) => {
+      const always = vi.fn(async () => undefined);
+      const acceptEdits = vi.fn(async () => undefined);
+      render(
+        <I18nProvider>
+          <ToolApprovalPanel
+            request={{
+              id: "cursor-permission",
+              sessionId: "cursor-permission",
+              type: "tool-approval",
+              prompt: "Allow?",
+              toolName,
+              toolInput: {
+                command: "node probe.js",
+                approvalKind: "acp_tool_call",
+                acpPermissionOptions: [
+                  { optionId: "native-always", kind: "allow_always" },
+                ],
+              },
+              timestamp: "2026-10-13T00:00:00Z",
+            }}
+            sessionId="cursor-permission"
+            onApprove={vi.fn()}
+            onDeny={vi.fn()}
+            onApproveAlways={always}
+            onApproveAcceptEdits={acceptEdits}
+          />
+        </I18nProvider>,
+      );
+      const button = screen.getByRole("button", { name: /Always allow/i });
+      await waitFor(() =>
+        expect((button as HTMLButtonElement).disabled).toBe(false),
+      );
+      fireEvent.click(button);
+      await waitFor(() => expect(always).toHaveBeenCalledOnce());
+      expect(acceptEdits).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not invent persistent edit approval when Cursor only offers once", () => {
+    render(
+      <I18nProvider>
+        <ToolApprovalPanel
+          request={{
+            id: "cursor-once",
+            sessionId: "cursor-once",
+            type: "tool-approval",
+            prompt: "Allow?",
+            toolName: "Edit",
+            toolInput: {
+              approvalKind: "acp_tool_call",
+              acpPermissionOptions: [{ optionId: "once", kind: "allow_once" }],
+            },
+            timestamp: "2026-10-13T00:00:00Z",
+          }}
+          sessionId="cursor-once"
+          onApprove={vi.fn()}
+          onDeny={vi.fn()}
+          onApproveAlways={vi.fn()}
+          onApproveAcceptEdits={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+    expect(
+      screen.queryByRole("button", {
+        name: /Always allow|don't ask|for session/i,
+      }),
+    ).toBeNull();
+  });
+
+  it("does not approve or deny while typing in another editor", async () => {
+    const { onApprove, onDeny } = await renderKeyboardPanel();
+    for (const target of [
+      screen.getByRole("textbox", { name: "Other input" }),
+      screen.getByRole("textbox", { name: "Other draft" }),
+      screen.getByTestId("historical-editor"),
+    ]) {
+      for (const key of ["1", "2", "3", "Enter", "Escape"]) {
+        const event = createEvent.keyDown(target, { key });
+        fireEvent(target, event);
+        expect(event.defaultPrevented).toBe(false);
+      }
+    }
+    expect(onApprove).not.toHaveBeenCalled();
+    expect(onDeny).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: "1" });
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
+  });
+
+  it("ignores handled keys and IME confirmation before applying approval shortcuts", async () => {
+    const { onApprove, onDeny } = await renderKeyboardPanel();
+    const handled = createEvent.keyDown(window, { key: "Enter" });
+    handled.preventDefault();
+    fireEvent(window, handled);
+    fireEvent.keyDown(window, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(window, { key: "Enter", keyCode: 229 });
+    fireEvent.keyDown(window, { key: "Escape", isComposing: true });
+    expect(onApprove).not.toHaveBeenCalled();
+    expect(onDeny).not.toHaveBeenCalled();
+  });
+
+  it("keeps feedback Enter local to the panel and waits for IME to finish", async () => {
+    const { onApprove, onDenyWithFeedback } =
+      await renderKeyboardPanel("请调整命令");
+    const feedback = screen.getByDisplayValue("请调整命令");
+    fireEvent.keyDown(screen.getByTestId("historical-editor"), {
+      key: "Enter",
+    });
+    fireEvent.keyDown(feedback, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(feedback, { key: "Enter", keyCode: 229 });
+    expect(onDenyWithFeedback).not.toHaveBeenCalled();
+    expect(onApprove).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(feedback, { key: "Enter" });
+    await waitFor(() =>
+      expect(onDenyWithFeedback).toHaveBeenCalledWith("请调整命令"),
+    );
+    expect(onDenyWithFeedback).toHaveBeenCalledTimes(1);
+    expect(onApprove).not.toHaveBeenCalled();
+  });
 
   it("renders safe MCP URL actions as external links", () => {
     renderPanel("https://example.com/sign-in");
@@ -64,7 +247,11 @@ describe("ToolApprovalPanel", () => {
       type: "tool-approval",
       prompt: "Accept this plan?",
       toolName: "ExitPlanMode",
-      toolInput: { kind: "switch_mode", title: "ExitPlanMode" },
+      toolInput: {
+        kind: "switch_mode",
+        title: "ExitPlanMode",
+        plan: "Read the fixture, then propose the change.",
+      },
       timestamp: "2026-08-14T00:00:00.000Z",
     };
     render(
@@ -79,6 +266,9 @@ describe("ToolApprovalPanel", () => {
         />
       </I18nProvider>,
     );
+    expect(
+      screen.getByText("Read the fixture, then propose the change."),
+    ).toBeTruthy();
 
     const approve = screen.getByRole("button", {
       name: /Approve and keep current permission mode/i,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   type ApkBuildType,
@@ -25,6 +25,7 @@ const LAST_DEPLOY_JOB_KEY = "yepanywhere:lastDeployJobId";
 const DEFAULT_RESTART_TARGETS: Required<DeploymentRestartTargets> = {
   server: true,
   codexBridge: false,
+  runtime: false,
 };
 
 function getErrorMessage(err: unknown): string {
@@ -60,6 +61,7 @@ function saveBlob(blob: Blob, fileName: string): void {
 
 export function DevelopmentSettings() {
   const { t } = useI18n();
+  const runtimeHintId = useId();
   const {
     isManualReloadMode,
     pendingReloads,
@@ -67,6 +69,7 @@ export function DevelopmentSettings() {
     reloadBackend,
     unsafeToRestart,
     workerActivity,
+    runtimeMode,
   } = useReloadNotifications();
   const { settings: validationSettings, setEnabled: setValidationEnabled } =
     useSchemaValidation();
@@ -254,8 +257,10 @@ export function DevelopmentSettings() {
   const runningBuildId = versionInfo?.build?.buildId?.slice(0, 12);
   const stagedBuildId = deployStatus?.stagedBuild?.buildId?.slice(0, 12);
   const latestApk = deployStatus?.apk.latest ?? null;
+  const externalRuntime = runtimeMode === "external";
+  const restartRuntime = externalRuntime && restartTargets.runtime;
   const hasSelectedRestartTarget =
-    restartTargets.server || restartTargets.codexBridge;
+    restartTargets.server || restartTargets.codexBridge || restartRuntime;
 
   const setRestartTarget = (
     target: keyof Required<DeploymentRestartTargets>,
@@ -365,12 +370,10 @@ export function DevelopmentSettings() {
                   className="settings-button"
                   onClick={() =>
                     void handleStartDeployment("server", {
-                      // A server deploy always rebuilds/restarts 8022. Include
-                      // the selected bridge sidecar so it restarts onto the
-                      // same freshly built bundle instead of keeping the old
-                      // JavaScript loaded in memory.
+                      // All selected services load the same newly built bundle.
                       restartTargets: {
                         codexBridge: restartTargets.codexBridge,
+                        runtime: restartRuntime,
                       },
                     })
                   }
@@ -413,12 +416,29 @@ export function DevelopmentSettings() {
                 />
                 <span>{t("deploymentRestartTargetCodexBridge")}</span>
               </label>
+              {externalRuntime && (
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={restartTargets.runtime}
+                    onChange={(e) =>
+                      setRestartTarget("runtime", e.target.checked)
+                    }
+                    disabled={deployRunning}
+                    aria-describedby={runtimeHintId}
+                  />
+                  <span>{t("deploymentRestartTargetRuntime")}</span>
+                </label>
+              )}
               <button
                 type="button"
                 className="settings-button settings-button-secondary"
                 onClick={() =>
                   void handleStartDeployment("services-restart", {
-                    restartTargets,
+                    restartTargets: {
+                      ...restartTargets,
+                      runtime: restartRuntime,
+                    },
                   })
                 }
                 disabled={
@@ -432,6 +452,21 @@ export function DevelopmentSettings() {
                   : t("deploymentRestartSelected")}
               </button>
             </div>
+            {externalRuntime && (
+              <p
+                id={runtimeHintId}
+                className={
+                  restartRuntime ? "settings-warning" : "settings-hint"
+                }
+                role={restartRuntime ? "status" : undefined}
+              >
+                {t(
+                  restartRuntime
+                    ? "deploymentRuntimeRestartWarning"
+                    : "deploymentRuntimeRestartDescription",
+                )}
+              </p>
+            )}
             {!hasSelectedRestartTarget && (
               <p className="settings-warning">
                 {t("deploymentRestartSelectTarget")}

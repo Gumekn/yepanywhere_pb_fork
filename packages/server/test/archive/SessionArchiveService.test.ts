@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UrlProjectId } from "@yep-anywhere/shared";
@@ -8,6 +8,7 @@ import {
   SessionArchiveService,
   getDelayUntilNextBeijingHour,
 } from "../../src/archive/index.js";
+import { readCursorSessionDir } from "../../src/sessions/cursor-store.js";
 import type { Project, SessionSummary } from "../../src/supervisor/types.js";
 
 describe("SessionArchiveService", () => {
@@ -127,6 +128,75 @@ describe("SessionArchiveService", () => {
 
     await service.restoreSession(sessionId);
     expect(await readFile(sessionPath, "utf-8")).toContain("session_meta");
+  });
+
+  it("archives and restores the whole Cursor directory including committed WAL data and nested assets", async () => {
+    const sqlite = process.getBuiltinModule?.("node:sqlite") as
+      | typeof import("node:sqlite")
+      | undefined;
+    if (!sqlite) throw new Error("node:sqlite unavailable");
+    const staging = join(testDir, "staging");
+    const directory = join(testDir, "cursor", "acp-sessions", "cursor-1");
+    await mkdir(staging, { recursive: true });
+    const db = new sqlite.DatabaseSync(join(staging, "store.db"));
+    try {
+      db.exec(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)",
+      );
+      const id = "a".repeat(64);
+      db.prepare("INSERT INTO blobs VALUES (?, ?)").run(
+        id,
+        Buffer.from(
+          JSON.stringify({
+            role: "user",
+            content: "<user_query>Keep my history</user_query>",
+          }),
+        ),
+      );
+      db.prepare("INSERT INTO meta VALUES ('0', ?)").run(
+        Buffer.from(
+          JSON.stringify({ latestRootBlobId: id, createdAt: 1700000000000 }),
+        ).toString("hex"),
+      );
+      await cp(staging, directory, { recursive: true });
+    } finally {
+      db.close();
+    }
+    await writeFile(
+      join(directory, "meta.json"),
+      JSON.stringify({ cwd: "/tmp/project", title: "Cursor archive" }),
+    );
+    await mkdir(join(directory, "assets"));
+    await writeFile(
+      join(directory, "assets", "attachment.txt"),
+      "retain attachment",
+    );
+    expect((await readCursorSessionDir(directory))?.messages[0]?.text).toBe(
+      "Keep my history",
+    );
+    const record = await service.archiveSession({
+      sessionId: "cursor-1",
+      provider: "cursor",
+      project: createProject(),
+      sessionFilePath: join(directory, "store.db"),
+      reason: "manual",
+    });
+    expect(record.files[0]?.directory).toBe(true);
+    await expect(stat(directory)).rejects.toThrow();
+    const archivedDirectory = record.files[0]?.archivePath;
+    if (!archivedDirectory) throw new Error("Missing archive directory");
+    expect(
+      (await readCursorSessionDir(archivedDirectory))?.messages[0]?.text,
+    ).toBe("Keep my history");
+    const reloaded = new SessionArchiveService({ dataDir });
+    await reloaded.initialize();
+    await reloaded.restoreSession("cursor-1");
+    expect((await readCursorSessionDir(directory))?.messages[0]?.text).toBe(
+      "Keep my history",
+    );
+    expect(
+      await readFile(join(directory, "assets", "attachment.txt"), "utf8"),
+    ).toBe("retain attachment");
   });
 
   it("archives one ZCode row without moving its shared SQLite database", async () => {

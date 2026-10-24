@@ -5,19 +5,26 @@ import type {
 } from "@yep-anywhere/shared";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
-import { useElapsedLabel } from "../../hooks/useElapsedLabel";
 import { useI18n } from "../../i18n";
 import { preprocessMessages } from "../../lib/preprocessMessages";
+import { isHiddenCodexMainControlTool } from "../../lib/preprocessMessagesSubagents";
 import type { Message } from "../../types";
-import type { DisplayToolGroupItem } from "../../types/renderItems";
+import type {
+  DisplayToolGroupItem,
+  ToolCallItem,
+} from "../../types/renderItems";
 import { LiveOutputPreview } from "./LiveOutputPreview";
 import { ToolCallRow } from "./ToolCallRow";
+import { ToolDuration } from "./ToolDuration";
+import { ToolGroupDuration } from "./ToolGroupDuration";
 
 interface ToolSelection {
   projectId: string;
   sessionId: string;
   branchId?: string;
   sessionProvider?: string;
+  mainTimeline?: boolean;
+  representedAgentCallIds?: string[];
 }
 
 // Row virtualization must not erase a user's explicit reading choice. Raw
@@ -177,12 +184,19 @@ export function ProjectedToolStepRow({
     () =>
       detail
         ? preprocessMessages(detail.messages).filter(
-            (item) => item.type === "tool_call",
+            (item): item is ToolCallItem =>
+              item.type === "tool_call" &&
+              (!selection.mainTimeline ||
+                !isHiddenCodexMainControlTool(
+                  item.toolName,
+                  item.status,
+                  item.id,
+                  selection.representedAgentCallIds,
+                )),
           )
         : [],
-    [detail],
+    [detail, selection.mainTimeline, selection.representedAgentCallIds],
   );
-  const elapsed = useElapsedLabel(step.timestamp, step.status === "running");
   const showLiveOutput =
     step.status === "running" &&
     (!outputState || outputState.status === "running") &&
@@ -234,18 +248,13 @@ export function ProjectedToolStepRow({
             {step.summary}
           </span>
         )}
-        {elapsed && (
-          <span
-            className="display-step-elapsed"
-            data-testid="display-step-elapsed"
-            title={t("sessionDisplayStepElapsed", {
-              elapsed: elapsed.label,
-              time: new Date(elapsed.startedAt).toLocaleTimeString(),
-            })}
-          >
-            {elapsed.label}
-          </span>
-        )}
+        <ToolDuration
+          timestamp={step.timestamp}
+          completedAt={step.completedAt}
+          durationMs={step.durationMs}
+          running={step.status === "running"}
+          testId="display-step-elapsed"
+        />
         <span className="display-step-chevron" aria-hidden="true">
           {expanded ? "▾" : "▸"}
         </span>
@@ -351,15 +360,31 @@ export function ProjectedToolGroupRow({
       ? lastProjectedSteps.current
       : [];
   const steps = useMemo(
-    () => [
-      ...new Map(
-        [...retainedSteps, ...loadedSteps, ...projectedSteps].map((step) => [
-          step.id,
-          step,
-        ]),
-      ).values(),
+    () =>
+      [
+        ...new Map(
+          [...retainedSteps, ...loadedSteps, ...projectedSteps].map((step) => [
+            step.id,
+            step,
+          ]),
+        ).values(),
+      ].filter(
+        (step) =>
+          !item.mainTimeline ||
+          !isHiddenCodexMainControlTool(
+            step.name,
+            step.status,
+            step.id,
+            item.representedAgentCallIds,
+          ),
+      ),
+    [
+      retainedSteps,
+      loadedSteps,
+      projectedSteps,
+      item.mainTimeline,
+      item.representedAgentCallIds,
     ],
-    [retainedSteps, loadedSteps, projectedSteps],
   );
   const load = useCallback(
     async (before?: string) => {
@@ -497,6 +522,7 @@ export function ProjectedToolGroupRow({
               {t("sessionToolGroupChecks", { count: group.checkCount })}
             </span>
           ) : null}
+          {group.type === "tool_group" && <ToolGroupDuration group={group} />}
         </span>
         <span className="expand-chevron" aria-hidden="true">
           {expanded ? "▾" : "▸"}
@@ -527,6 +553,8 @@ export function ProjectedToolGroupRow({
               sessionId={item.sessionId}
               branchId={item.branchId}
               sessionProvider={sessionProvider}
+              mainTimeline={item.mainTimeline}
+              representedAgentCallIds={item.representedAgentCallIds}
               onRead={pinReading}
             />
           ))}

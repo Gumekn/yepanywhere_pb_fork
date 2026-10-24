@@ -5,12 +5,17 @@ import type {
   UrlProjectId,
   ZCodeStoredMessage,
 } from "@yep-anywhere/shared";
+import { codexAgentWaitMessage } from "../codex/agent-wait.js";
 import {
   buildCodexEditInput,
   publicCodexFileChanges,
   publicCodexFilePath,
 } from "../codex/file-change.js";
 import { codexImagePreviewUrl } from "../codex/image-preview.js";
+import {
+  type CodexInterAgentMessageSupplement,
+  mergeCodexInterAgentMessages,
+} from "../codex/inter-agent-message.js";
 import { codexUserMessageIdentity } from "../codex/user-message-identity.js";
 import { canonicalizeProjectPath } from "../projects/paths.js";
 import type { ThreadItem } from "../sdk/providers/codex-protocol/generated/v2/ThreadItem.js";
@@ -42,8 +47,9 @@ const MAX_TURN_PAGE_LIMIT = 100;
 const SEMANTIC_ITEM_READ_CONCURRENCY = 4;
 const MAX_SEMANTIC_ITEMS_PER_TURN = 10_000;
 const MAX_FORK_BRANCH_FAMILY_SIZE = 64;
-const MAX_FORK_BRANCH_ITEM_PAGES = 100;
-const MAX_FORK_BRANCH_ITEMS = 10_000;
+const MAX_FORK_BRANCH_TURN_PAGES = 100;
+const FORK_BRANCH_CACHE_TTL_MS = 2_000;
+const MAX_FORK_BRANCH_CACHE_ENTRIES = 128;
 const LOCAL_MODEL_PROVIDERS = new Set(["ollama", "lmstudio", "local"]);
 const KNOWN_THREAD_ITEM_TYPES = new Set([
   "userMessage",
@@ -110,6 +116,7 @@ export interface CodexForkBranchCandidate {
   id: string;
   forkParentSessionId?: string;
   forkTargetMessageId?: string;
+  updatedAt?: string;
   createdAt?: string;
   provider?: "codex" | "codex-oss";
 }
@@ -131,6 +138,17 @@ export interface CodexAppServerHistoryReaderOptions {
     "readThread" | "listTurns" | "listItems" | "getCapability"
   >;
   mode?: "auto" | "rollout" | "app-server";
+  /** Cross-agent mailbox inputs are not part of upstream ThreadItem history. */
+  readInterAgentMessages?: (
+    sessionId: string,
+    projectPath: string,
+    turnIds: readonly string[],
+    itemIds: readonly string[],
+  ) => Promise<readonly CodexInterAgentMessageSupplement[]>;
+  readInterAgentRevision?: (
+    sessionId: string,
+    projectPath: string,
+  ) => Promise<string | undefined>;
 }
 
 type AppServerCursorDirection = "older" | "newer";
@@ -188,12 +206,63 @@ export function decodeCodexAppServerCursor(
 }
 
 export class CodexAppServerHistoryReader {
+  // Cache only compact prompt identities. Metadata, display bootstrap and
+  // branch switching share reads; no tool transcripts are retained here.
+  private readonly forkPromptCache = new Map<
+    string,
+    {
+      revision: string;
+      expiresAt: number;
+      messages: Promise<ZCodeStoredMessage[]>;
+    }
+  >();
   private readonly mode: "auto" | "rollout" | "app-server";
 
   constructor(private readonly options: CodexAppServerHistoryReaderOptions) {
     this.mode =
       options.mode ??
       resolveHistoryReadMode(process.env.YEP_CODEX_HISTORY_READ_MODE);
+  }
+
+  private async semanticRevision(
+    sessionId: string,
+    updatedAt: number,
+    projectPath: string,
+  ): Promise<string> {
+    const native = codexAppServerSemanticRevision(sessionId, updatedAt);
+    const mailbox = await this.options.readInterAgentRevision?.(
+      sessionId,
+      projectPath,
+    );
+    return mailbox
+      ? `${native}.${Buffer.from(mailbox).toString("base64url")}`
+      : native;
+  }
+
+  private async supplementInterAgentMessages(
+    messages: Message[],
+    sessionId: string,
+    projectPath: string,
+    turnIds: readonly string[],
+    completeTurns = true,
+  ): Promise<Message[]> {
+    if (!this.options.readInterAgentMessages) return messages;
+    const itemIds = [
+      ...new Set(
+        messages.flatMap((message) =>
+          typeof message.codexThreadItemId === "string"
+            ? [message.codexThreadItemId]
+            : [],
+        ),
+      ),
+    ];
+    const supplements = await this.options.readInterAgentMessages(
+      sessionId,
+      projectPath,
+      turnIds,
+      itemIds,
+    );
+    return mergeCodexInterAgentMessages(messages, supplements, completeTurns);
   }
 
   /**
@@ -204,6 +273,36 @@ export class CodexAppServerHistoryReader {
    * items; full pages retain every item for display projection.
    */
   async getSemanticTurnsPage(
+    sessionId: string,
+    projectId: UrlProjectId,
+    projectPath: string,
+    options: CodexAppServerSemanticPageOptions,
+  ): Promise<CodexAppServerSemanticPageResult> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.readSemanticTurnsPage(
+          sessionId,
+          projectId,
+          projectPath,
+          options,
+        );
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          error.message !== "ROLLOUT_CURSOR_STALE" ||
+          options.cursor ||
+          options.expectedRevision
+        )
+          throw error;
+        // A cold read has no client revision to invalidate. Mailbox updates
+        // during hydration need a fresh read; sustained writes use the rollout
+        // fallback instead of failing both HTTP and WS view initialization.
+        if (attempt >= 1) return semanticFallback("transcript_parity");
+      }
+    }
+  }
+
+  private async readSemanticTurnsPage(
     sessionId: string,
     projectId: UrlProjectId,
     projectPath: string,
@@ -237,9 +336,10 @@ export class CodexAppServerHistoryReader {
         ? Promise.reject(staleCursorError())
         : semanticFallback("legacy_history");
     }
-    const revision = codexAppServerSemanticRevision(
+    const revision = await this.semanticRevision(
       thread.id,
       thread.updatedAt,
+      projectPath,
     );
     if (options.expectedRevision && options.expectedRevision !== revision) {
       throw staleCursorError();
@@ -329,9 +429,26 @@ export class CodexAppServerHistoryReader {
         }
       }
 
+      const supplementedMessages =
+        options.itemsView === "full"
+          ? await this.supplementInterAgentMessages(
+              messages,
+              sessionId,
+              projectPath,
+              pageTurns.map((turn) => turn.id),
+            )
+          : messages;
+      if (
+        revision !==
+        (await this.semanticRevision(thread.id, thread.updatedAt, projectPath))
+      )
+        throw staleCursorError();
       return {
         kind: "loaded",
-        messages,
+        messages: settleTerminalAgentWaits(
+          supplementedMessages,
+          new Map(pageTurns.map((turn) => [turn.id, turn])),
+        ),
         summary: threadSummary(
           thread,
           projectId,
@@ -396,9 +513,10 @@ export class CodexAppServerHistoryReader {
     ) {
       throw staleCursorError();
     }
-    const revision = codexAppServerSemanticRevision(
+    const revision = await this.semanticRevision(
       thread.id,
       thread.updatedAt,
+      projectPath,
     );
     if (expectedRevision && revision !== expectedRevision)
       throw staleCursorError();
@@ -422,7 +540,22 @@ export class CodexAppServerHistoryReader {
         projectPath,
         "semantic-display",
       );
-      return { kind: "loaded", messages, revision };
+      const supplementedMessages = await this.supplementInterAgentMessages(
+        messages,
+        sessionId,
+        projectPath,
+        [turnId],
+      );
+      if (
+        revision !==
+        (await this.semanticRevision(thread.id, thread.updatedAt, projectPath))
+      )
+        throw staleCursorError();
+      return {
+        kind: "loaded",
+        messages: supplementedMessages,
+        revision,
+      };
     } catch (error) {
       if (error instanceof CodexHistoryParityError) {
         return { kind: "fallback", reason: "transcript_parity" };
@@ -435,7 +568,9 @@ export class CodexAppServerHistoryReader {
    * Build the provider-neutral b1/b2 branch graph for a native Codex fork
    * family. Paginated forks retain copied turn/item ids, so native identity —
    * not prompt text — proves the shared prefix even when an edit keeps the
-   * exact same text.
+   * exact same text. This is a sparse navigation graph: one prompt per native
+   * turn plus exact edit boundaries. Full transcripts (including steered
+   * messages) continue to come from the display history reader.
    */
   async getForkBranchState(
     sessionId: string,
@@ -449,6 +584,15 @@ export class CodexAppServerHistoryReader {
     }
 
     try {
+      const targets = [
+        ...new Set(
+          family.flatMap((candidate) =>
+            candidate.forkTargetMessageId
+              ? [candidate.forkTargetMessageId]
+              : [],
+          ),
+        ),
+      ].sort();
       const familySessions = await mapWithConcurrency(
         family,
         SEMANTIC_ITEM_READ_CONCURRENCY,
@@ -457,10 +601,7 @@ export class CodexAppServerHistoryReader {
           parentId: candidate.forkParentSessionId ?? null,
           forkBoundaryMessageId: candidate.forkTargetMessageId,
           createdAt: candidate.createdAt,
-          messages: await readCodexForkBranchMessages(
-            this.options.client,
-            candidate.id,
-          ),
+          messages: await this.getForkPromptMessages(candidate, targets),
         }),
       );
       const provider =
@@ -481,6 +622,44 @@ export class CodexAppServerHistoryReader {
       // unavailable history page must not make the transcript itself fail.
       return undefined;
     }
+  }
+
+  private getForkPromptMessages(
+    candidate: CodexForkBranchCandidate,
+    targets: readonly string[],
+  ): Promise<ZCodeStoredMessage[]> {
+    const revision = JSON.stringify([candidate.updatedAt, targets]);
+    const cached = this.forkPromptCache.get(candidate.id);
+    if (cached?.revision === revision && cached.expiresAt > Date.now()) {
+      return cached.messages;
+    }
+    const entry = {
+      revision,
+      expiresAt: Number.POSITIVE_INFINITY,
+      messages: readCodexForkBranchMessages(
+        this.options.client,
+        candidate.id,
+        targets,
+      ),
+    };
+    this.forkPromptCache.delete(candidate.id);
+    this.forkPromptCache.set(candidate.id, entry);
+    while (this.forkPromptCache.size > MAX_FORK_BRANCH_CACHE_ENTRIES) {
+      const oldest = this.forkPromptCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.forkPromptCache.delete(oldest);
+    }
+    void entry.messages.then(
+      () => {
+        entry.expiresAt = Date.now() + FORK_BRANCH_CACHE_TTL_MS;
+      },
+      () => {
+        if (this.forkPromptCache.get(candidate.id) === entry) {
+          this.forkPromptCache.delete(candidate.id);
+        }
+      },
+    );
+    return entry.messages;
   }
 
   async getSession(
@@ -621,7 +800,7 @@ export class CodexAppServerHistoryReader {
       }
       const chronologicalEntries =
         direction === "older" ? [...entries].reverse() : entries;
-      const messages = projectThreadEntries(
+      const nativeMessages = projectThreadEntries(
         sessionId,
         chronologicalEntries,
         turnsById,
@@ -631,6 +810,16 @@ export class CodexAppServerHistoryReader {
         options.inspectorProjection || options.titleProjection
           ? "semantic-display"
           : "strict",
+      );
+      const messages = settleTerminalAgentWaits(
+        await this.supplementInterAgentMessages(
+          nativeMessages,
+          sessionId,
+          projectPath,
+          [...new Set(chronologicalEntries.map((entry) => entry.turnId))],
+          false,
+        ),
+        turnsById,
       );
       if (messages.length > messageLimit) {
         throw new CodexHistoryParityError();
@@ -790,58 +979,77 @@ function findCodexForkBranchFamily(
 }
 
 async function readCodexForkBranchMessages(
-  client: Pick<CodexHistoryClient, "listItems">,
+  client: Pick<CodexHistoryClient, "listTurns" | "listItems">,
   sessionId: string,
+  targets: readonly string[],
 ): Promise<ZCodeStoredMessage[]> {
-  const entries: ThreadItemEntry[] = [];
+  const turns: Turn[] = [];
   const seenCursors = new Set<string>();
   let cursor: string | null = null;
   for (
     let pageIndex = 0;
-    pageIndex < MAX_FORK_BRANCH_ITEM_PAGES;
+    pageIndex < MAX_FORK_BRANCH_TURN_PAGES;
     pageIndex += 1
   ) {
-    const page = await client.listItems({
+    const page = await client.listTurns({
       threadId: sessionId,
-      turnId: null,
       cursor,
-      limit: MAX_ITEM_PAGE_LIMIT,
+      limit: MAX_TURN_PAGE_LIMIT,
       sortDirection: "asc",
+      itemsView: "summary",
     });
-    entries.push(...page.data);
-    if (entries.length > MAX_FORK_BRANCH_ITEMS) {
-      throw new CodexHistoryParityError();
-    }
-    if (!page.nextCursor) {
-      cursor = null;
-      break;
-    }
-    if (!seenCursors.add(page.nextCursor)) {
-      throw new CodexHistoryParityError();
-    }
+    turns.push(...page.data);
     cursor = page.nextCursor;
+    if (!cursor) break;
+    if (seenCursors.has(cursor)) throw new CodexHistoryParityError();
+    seenCursors.add(cursor);
   }
   if (cursor) throw new CodexHistoryParityError();
 
-  const messages: ZCodeStoredMessage[] = [];
-  for (const entry of entries) {
-    if (entry.item.type !== "userMessage") continue;
-    const id = codexSemanticMessageId(entry.item.id, entry.turnId);
-    messages.push({
-      id,
-      role: "user",
-      parts: [
-        {
-          id: `${id}:text`,
-          messageID: id,
-          sessionID: sessionId,
-          type: "text",
-          text: codexUserPromptText(entry.item),
-        },
-      ],
-    });
-  }
-  return messages;
+  const prompts = await mapWithConcurrency(
+    turns,
+    SEMANTIC_ITEM_READ_CONCURRENCY,
+    async (turn) => {
+      // Summary includes the FIRST user message only. A historical edit may
+      // target a later steered prompt in the same turn. Hydrate that exact turn
+      // in every family member that inherited it, keeping copied prefixes equal.
+      const needsExactBoundary = targets.some(
+        (target) =>
+          target.endsWith(`-${turn.id}`) &&
+          !turn.items.some(
+            (item) =>
+              item.type === "userMessage" &&
+              codexSemanticMessageId(item.id, turn.id) === target,
+          ),
+      );
+      const items = needsExactBoundary
+        ? await readAllTurnItems(client, sessionId, turn.id)
+        : turn.items;
+      return items.flatMap((item): ZCodeStoredMessage[] => {
+        if (item.type !== "userMessage") return [];
+        const id = codexSemanticMessageId(item.id, turn.id);
+        return [
+          {
+            id,
+            role: "user",
+            ...(turn.startedAt != null
+              ? { createdAt: turn.startedAt * 1_000 }
+              : {}),
+            parts: [
+              {
+                id: `${id}:text`,
+                messageID: id,
+                sessionID: sessionId,
+                type: "text",
+                text: codexUserPromptText(item),
+              },
+            ],
+          },
+        ];
+      });
+    },
+  );
+  return prompts.flat();
 }
 
 function codexUserPromptText(
@@ -1124,6 +1332,7 @@ function projectThreadItem(
     }
     case "commandExecution":
       return toolMessages(base, "Bash", { command: item.command }, item.id, {
+        durationMs: item.durationMs,
         content: item.aggregatedOutput ?? "",
         isError:
           item.status === "failed" ||
@@ -1153,6 +1362,7 @@ function projectThreadItem(
         item.arguments,
         item.id,
         {
+          durationMs: item.durationMs,
           content:
             item.status === "completed"
               ? JSON.stringify(item.result)
@@ -1168,6 +1378,7 @@ function projectThreadItem(
         item.arguments,
         item.id,
         {
+          durationMs: item.durationMs,
           content: JSON.stringify(item.contentItems ?? []),
           isError: item.success === false,
           completed: item.status !== "inProgress",
@@ -1325,6 +1536,39 @@ function hasStableThreadItemIdentity(value: unknown): boolean {
   );
 }
 
+/** A terminal turn cannot retain an active wait, even if its return was never saved. */
+function settleTerminalAgentWaits(
+  messages: Message[],
+  turns: ReadonlyMap<string, Turn>,
+): Message[] {
+  return messages.map((message) => {
+    const candidate = message.codexThreadItem;
+    const item =
+      candidate && typeof candidate === "object" && !Array.isArray(candidate)
+        ? (candidate as Record<string, unknown>)
+        : undefined;
+    const status =
+      typeof message.codexTurnId === "string"
+        ? turns.get(message.codexTurnId)?.status
+        : undefined;
+    if (
+      !item ||
+      item.type !== "agentWait" ||
+      item.status !== "running" ||
+      (status !== "completed" &&
+        status !== "interrupted" &&
+        status !== "failed")
+    )
+      return message;
+    // Turn timing is not the wait's duration. Preserve only recorded item timing.
+    return {
+      ...message,
+      codexThreadItemLifecycle: "completed",
+      codexThreadItem: { ...item, status, outcome: item.outcome ?? "unknown" },
+    };
+  });
+}
+
 function nativeSystemMessage(
   base: Record<string, unknown> & { uuid: string },
   item: Extract<
@@ -1332,6 +1576,32 @@ function nativeSystemMessage(
     { type: "plan" | "collabAgentToolCall" | "subAgentActivity" }
   >,
 ): Message {
+  if (item.type === "collabAgentToolCall" && item.tool === "wait") {
+    return {
+      ...base,
+      ...codexAgentWaitMessage(
+        {
+          item: {
+            type: "agentWait",
+            id: item.id,
+            status:
+              item.status === "inProgress"
+                ? "running"
+                : item.status === "failed"
+                  ? "failed"
+                  : "completed",
+            ...(item.status !== "inProgress"
+              ? { outcome: "unknown" as const }
+              : {}),
+          },
+          ...(typeof base.codexTurnId === "string"
+            ? { turnId: base.codexTurnId }
+            : {}),
+        },
+        typeof base.codexThreadId === "string" ? base.codexThreadId : "",
+      ),
+    };
+  }
   return {
     ...base,
     type: "system",
@@ -1349,6 +1619,7 @@ function toolMessages(
     content: string;
     isError: boolean;
     completed: boolean;
+    durationMs?: number | null;
     toolUseResult?: unknown;
   },
 ): Message[] {
@@ -1365,6 +1636,11 @@ function toolMessages(
     type: "tool_result",
     tool_use_id: toolUseId,
     content: result.content,
+    ...(typeof result.durationMs === "number" &&
+    Number.isFinite(result.durationMs) &&
+    result.durationMs >= 0
+      ? { durationMs: result.durationMs }
+      : {}),
     ...(result.isError ? { is_error: true } : {}),
   };
   return [

@@ -10,7 +10,15 @@ import {
   type CodexNativeCapabilities,
   codexControlFailure,
 } from "../sdk/providers/codex-controls.js";
-import { configureClaudeRemoteExecutors } from "../sdk/providers/index.js";
+import {
+  discardCursorPrepare as discardCursorPrepareState,
+  prepareCursorSession as prepareCursorSessionState,
+  warmCursorAuth as warmCursorAuthState,
+} from "../sdk/providers/cursor-prepare.js";
+import {
+  codexProvider,
+  configureClaudeRemoteExecutors,
+} from "../sdk/providers/index.js";
 import type { UserMessage } from "../sdk/types.js";
 import {
   createSessionSubscription,
@@ -21,6 +29,7 @@ import type { Supervisor } from "../supervisor/Supervisor.js";
 import type { ProcessEvent, ProcessInfo } from "../supervisor/types.js";
 import type { EventBus } from "../watcher/index.js";
 import type { RuntimeEventStore } from "./RuntimeEventStore.js";
+import { CURSOR_RUNTIME_VERSION } from "./cursor-availability.js";
 import {
   type CreateRuntimeSessionRequest,
   type QueueRuntimeMessageRequest,
@@ -182,6 +191,7 @@ export class EmbeddedRuntimeController implements RuntimeController {
     }
 
     await this.supervisor.shutdown();
+    await codexProvider.disposeBridgeSideConversations();
     for (const cleanup of this.journalSubscriptions.values()) cleanup();
     this.journalSubscriptions.clear();
     await this.eventStore?.flush();
@@ -194,11 +204,32 @@ export class EmbeddedRuntimeController implements RuntimeController {
       mode: this.mode,
       protocolVersion: RUNTIME_CONTROLLER_PROTOCOL_VERSION,
       processCount: this.supervisor.getProcessInfoList().length,
+      availableProviders: this.supervisor.getAvailableProviderNames(),
+      providerVersions: { cursor: CURSOR_RUNTIME_VERSION },
     };
   }
 
   async getWorkerActivity(): Promise<RuntimeWorkerActivity> {
     return this.supervisor.getWorkerActivity();
+  }
+
+  async prepareCursorSession(input: {
+    cwd: string;
+    model?: string;
+    permissionMode?: PermissionMode;
+  }): Promise<void> {
+    await prepareCursorSessionState(input);
+  }
+
+  async discardCursorPrepare(input: {
+    cwd: string;
+    model?: string;
+  }): Promise<void> {
+    await discardCursorPrepareState(input);
+  }
+
+  async warmCursorAuth(model?: string): Promise<void> {
+    await warmCursorAuthState(model);
   }
 
   async listProcesses(): Promise<ProcessInfo[]> {
@@ -454,6 +485,30 @@ export class EmbeddedRuntimeController implements RuntimeController {
       permissionMode: process.permissionMode,
       modeVersion: process.modeVersion,
     };
+  }
+
+  async sideConversation(
+    sessionId: string,
+    request: import("@yep-anywhere/shared").SideConversationRequest,
+  ): Promise<import("@yep-anywhere/shared").SideConversationResponse> {
+    const process = this.supervisor.getProcessForSession(sessionId);
+    if (
+      !process ||
+      process.isTerminated ||
+      codexProvider.hasBridgeSideConversation(sessionId)
+    ) {
+      try {
+        return await codexProvider.bridgeSideConversation(sessionId, request);
+      } catch {
+        return { supported: false, reason: "not_ready" };
+      }
+    }
+    return (
+      process.sideConversations?.execute(request) ?? {
+        supported: false,
+        reason: "unsupported",
+      }
+    );
   }
 
   async executeCodexControl(input: RuntimeCodexControlRequest) {

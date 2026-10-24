@@ -292,7 +292,7 @@ describe("APK mobile shell recovery", () => {
         .getComputedStyle(dom.window.document.documentElement)
         .getPropertyValue("--shell-page-bg")
         .trim(),
-    ).toBe("#181818");
+    ).toBe("#0f0f10");
     expect(nativeSystemBarThemes.at(-1)).toBe("dark");
 
     postClientMessage(dom, frame, {

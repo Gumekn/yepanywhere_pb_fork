@@ -2,7 +2,12 @@ import { useEffect, useState } from "react";
 import { useNativePushNotifications } from "../hooks/useNativePushNotifications";
 import { useI18n } from "../i18n";
 import { debugNativePush } from "../lib/nativePushBridge";
-import type { TestNotificationUrgency } from "./PushNotificationToggle";
+import {
+  NotificationTestActions,
+  SettingsItem,
+  SettingsToggle,
+  type TestNotificationUrgency,
+} from "./ui/SettingsItem";
 
 export function NativePushNotificationToggle() {
   const { t } = useI18n();
@@ -46,90 +51,62 @@ export function NativePushNotificationToggle() {
 
   if (!isSupported) {
     return (
-      <div className="settings-item">
-        <div className="settings-item-info">
-          <strong>{t("nativePushToggleTitle")}</strong>
-          <p>{error || t("nativePushToggleUnsupported")}</p>
-        </div>
-      </div>
+      <SettingsItem title={t("nativePushToggleTitle")}>
+        <p>{error || t("nativePushToggleUnsupported")}</p>
+      </SettingsItem>
     );
   }
 
   if (!isServerConfigured) {
     return (
-      <div className="settings-item">
-        <div className="settings-item-info">
-          <strong>{t("nativePushToggleTitle")}</strong>
-          <p className="settings-warning">
-            {t("nativePushToggleServerNotConfigured")}
-          </p>
-          {error && <p className="settings-error">{error}</p>}
-        </div>
-      </div>
+      <SettingsItem title={t("nativePushToggleTitle")}>
+        <p className="settings-warning">
+          {t("nativePushToggleServerNotConfigured")}
+        </p>
+        {error && <p className="settings-error">{error}</p>}
+      </SettingsItem>
     );
   }
 
   if (permission === "denied") {
     return (
-      <div className="settings-item">
-        <div className="settings-item-info">
-          <strong>{t("nativePushToggleTitle")}</strong>
-          <p className="settings-warning">{t("nativePushToggleBlocked")}</p>
-        </div>
-      </div>
+      <SettingsItem title={t("nativePushToggleTitle")}>
+        <p className="settings-warning">{t("nativePushToggleBlocked")}</p>
+      </SettingsItem>
     );
   }
 
   return (
     <>
-      <div className="settings-item">
-        <div className="settings-item-info">
-          <strong>{t("nativePushToggleTitle")}</strong>
-          <p>{t("nativePushToggleDescription")}</p>
-          {error && <p className="settings-error">{error}</p>}
-        </div>
-        <label className="toggle-switch">
-          <input
-            type="checkbox"
+      <SettingsItem
+        title={t("nativePushToggleTitle")}
+        action={
+          <SettingsToggle
             checked={isSubscribed}
             onChange={handleToggle}
             disabled={isLoading}
           />
-          <span className="toggle-slider" />
-        </label>
-      </div>
+        }
+      >
+        <p>{t("nativePushToggleDescription")}</p>
+        {error && <p className="settings-error">{error}</p>}
+      </SettingsItem>
 
       {isSubscribed && (
-        <div className="settings-item">
-          <div className="settings-item-info">
-            <strong>{t("pushToggleTestTitle")}</strong>
-            <p>{t("pushToggleTestDescription")}</p>
-          </div>
-          <div className="settings-item-actions">
-            <select
-              className="settings-select"
-              value={testUrgency}
-              onChange={(e) =>
-                setTestUrgency(e.target.value as TestNotificationUrgency)
-              }
+        <SettingsItem
+          title={t("pushToggleTestTitle")}
+          action={
+            <NotificationTestActions
+              urgency={testUrgency}
+              onUrgencyChange={setTestUrgency}
+              onSend={() => sendTest(testUrgency)}
               disabled={isLoading}
-            >
-              <option value="normal">{t("pushToggleUrgencyNormal")}</option>
-              <option value="persistent">
-                {t("pushToggleUrgencyPersistent")}
-              </option>
-              <option value="silent">{t("pushToggleUrgencySilent")}</option>
-            </select>
-            <button
-              type="button"
-              className="settings-button"
-              onClick={() => sendTest(testUrgency)}
-              disabled={isLoading}
-            >
-              {isLoading ? t("pushToggleSending") : t("pushToggleSendTest")}
-            </button>
-          </div>
-        </div>
+              sending={isLoading}
+            />
+          }
+        >
+          <p>{t("pushToggleTestDescription")}</p>
+        </SettingsItem>
       )}
     </>
   );

@@ -132,6 +132,12 @@ export function createStaticRoutes(options: StaticServeOptions): Hono {
       reqPath = reqPath.slice(basePath.length) || "/";
     }
 
+    // Unknown API paths are errors, not SPA navigations. Answering them with
+    // index.html (200, text/html) hides missing endpoints from clients.
+    if (reqPath === "/api" || reqPath.startsWith("/api/")) {
+      return c.json({ error: "Not found", code: "API_NOT_FOUND" }, 404);
+    }
+
     // Try to serve the exact file
     const filePath = path.join(distPath, reqPath);
 

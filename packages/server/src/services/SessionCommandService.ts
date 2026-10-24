@@ -1,3 +1,4 @@
+import { parseSideConversationCommand } from "@yep-anywhere/shared";
 import {
   ALL_CODEX_MCP_MODES,
   ALL_PERMISSION_MODES,
@@ -42,6 +43,7 @@ import {
 } from "../projects/paths.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
+import { getCursorRuntimeAvailability } from "../runtime/cursor-availability.js";
 import type {
   RuntimeController,
   RuntimeProcessSnapshot,
@@ -72,6 +74,7 @@ import { CodexSessionReader } from "../sessions/codex-reader.js";
 import { computeCodexRollbackNumTurns } from "../sessions/codex-rollback.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import type { KimiSessionReader } from "../sessions/kimi-reader.js";
+import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
 import {
   type ProviderResolutionDeps,
@@ -117,6 +120,7 @@ export interface SessionCommandServiceDeps {
   zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
   kimiSessionsDir?: string;
   kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
   enabledProviders?: readonly string[];
 }
 
@@ -804,6 +808,16 @@ export class SessionCommandService {
     input: StartSessionCommandInput,
   ): Promise<SessionCommandResult<Record<string, unknown>>> {
     const { projectId, body } = input;
+    if (
+      typeof body.message === "string" &&
+      (parseSideConversationCommand(body.message) ||
+        /^\/yep:side-v1(?:\s|$)/u.test(body.message.trim()))
+    ) {
+      return commandFailure(
+        "Open Side chat to send this question without changing the main task.",
+        400,
+      );
+    }
     const providerFailure = this.validateRequestedProvider(body.provider);
     if (providerFailure) return providerFailure;
     if (!isUrlProjectId(projectId)) {
@@ -844,6 +858,11 @@ export class SessionCommandService {
 
     const prepared = this.prepareNewSession(project, body);
     if (!prepared.ok) return prepared.result;
+
+    const runtimeFailure = await this.validateCursorRuntime(
+      prepared.modelSettings?.providerName,
+    );
+    if (runtimeFailure) return runtimeFailure;
 
     console.log("[startSession] Request body:", {
       provider: body.provider,
@@ -914,6 +933,11 @@ export class SessionCommandService {
     const prepared = this.prepareNewSession(project, body);
     if (!prepared.ok) return prepared.result;
 
+    const runtimeFailure = await this.validateCursorRuntime(
+      prepared.modelSettings?.providerName,
+    );
+    if (runtimeFailure) return runtimeFailure;
+
     const result = await this.deps.runtimeController.createSession({
       projectPath: project.path,
       permissionMode: body.mode,
@@ -954,6 +978,16 @@ export class SessionCommandService {
     input: ResumeSessionCommandInput,
   ): Promise<SessionCommandResult<Record<string, unknown>>> {
     const { projectId, sessionId, body } = input;
+    if (
+      typeof body.message === "string" &&
+      (parseSideConversationCommand(body.message) ||
+        /^\/yep:side-v1(?:\s|$)/u.test(body.message.trim()))
+    ) {
+      return commandFailure(
+        "Open Side chat to send this question without changing the main task.",
+        400,
+      );
+    }
     const controlAfterResume = input.controlAfterResume;
     const persistedProvider =
       this.deps.sessionMetadataService?.getPersistedProvider?.(sessionId) ??
@@ -1247,6 +1281,8 @@ export class SessionCommandService {
         effectiveCodexForkExcludedTurns !== undefined) ||
       ((providerName === "pi" || providerName === "zcode") &&
         Boolean(body.resumeSessionAt));
+    const runtimeFailure = await this.validateCursorRuntime(providerName);
+    if (runtimeFailure) return runtimeFailure;
     const result = await this.deps.runtimeController.resumeSession({
       sessionId,
       projectPath: project.path,
@@ -1283,9 +1319,6 @@ export class SessionCommandService {
         feishuMcpConfig: input.origin?.feishuMcpConfig,
         llmGatewayConfig,
         executor,
-        globalInstructions:
-          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
-          undefined,
         permissions: body.permissions,
         resumeSessionAt: supportsResumeSessionAt(providerName)
           ? body.resumeSessionAt
@@ -1580,6 +1613,16 @@ export class SessionCommandService {
   ): Promise<SessionCommandResult<Record<string, unknown>>> {
     const { sessionId, body } = input;
     if (
+      typeof body.message === "string" &&
+      (parseSideConversationCommand(body.message) ||
+        /^\/yep:side-v1(?:\s|$)/u.test(body.message.trim()))
+    ) {
+      return commandFailure(
+        "Open Side chat to send this question without changing the main task.",
+        400,
+      );
+    }
+    if (
       body.interruptBeforeSend !== undefined &&
       typeof body.interruptBeforeSend !== "boolean"
     ) {
@@ -1732,9 +1775,6 @@ export class SessionCommandService {
           parsedBodyExecutor.executor ??
           metadataExecutor.executor ??
           process.executor ??
-          undefined,
-        globalInstructions:
-          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
           undefined,
         permissions: body.permissions,
       },
@@ -2105,6 +2145,23 @@ export class SessionCommandService {
     return null;
   }
 
+  private async validateCursorRuntime(
+    provider: unknown,
+  ): Promise<SessionCommandResult<never> | null> {
+    if (provider !== "cursor") return null;
+    const availability = await getCursorRuntimeAvailability(
+      this.deps.runtimeController,
+    );
+    if (availability === "ready") return null;
+    return commandFailure(
+      availability === "runtime-update-required"
+        ? "Cursor requires an updated agent runtime. Update it when active sessions can be interrupted."
+        : "The agent runtime is unavailable. Retry when it reconnects.",
+      503,
+      { code: availability },
+    );
+  }
+
   private prepareNewSession(
     project: Project,
     body: CreateSessionBody | StartSessionBody,
@@ -2238,9 +2295,6 @@ export class SessionCommandService {
         llmGatewayKeyId: parsedLlmGatewayKeyId.llmGatewayKeyId,
         llmGatewayConfig: parsedGatewayConfig.llmGatewayConfig,
         executor: parsedExecutor.executor,
-        globalInstructions:
-          this.deps.serverSettingsService?.getSetting("globalInstructions") ||
-          undefined,
         permissions: body.permissions,
       },
     };
@@ -2285,6 +2339,7 @@ export class SessionCommandService {
       piReaderFactory: this.deps.piReaderFactory,
       kimiSessionsDir: this.deps.kimiSessionsDir,
       kimiReaderFactory: this.deps.kimiReaderFactory,
+      mcodeReaderFactory: this.deps.mcodeReaderFactory,
       zcodeDbPath: this.deps.zcodeDbPath,
       zcodeReaderFactory: this.deps.zcodeReaderFactory,
       sessionMetadataService: this.deps.sessionMetadataService,

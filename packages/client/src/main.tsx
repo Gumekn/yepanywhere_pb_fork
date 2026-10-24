@@ -10,15 +10,16 @@ import {
   Route,
   Routes,
   useLocation,
-  useParams,
 } from "react-router-dom";
 import { App } from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { initializeFontSize } from "./hooks/useFontSize";
+import { installMobileSafeAreaInset } from "./hooks/useMobileViewport";
 import { initializeTabSize } from "./hooks/useTabSize";
 import { initializeTheme } from "./hooks/useTheme";
 import { I18nProvider } from "./i18n";
 import { NavigationLayout } from "./layouts";
+import { startSessionPrefetch } from "./lib/sessionPrefetch";
 import { armSplashSafety } from "./lib/splash";
 import "./styles/index.css";
 
@@ -90,6 +91,12 @@ const TerminalPage = lazy(() =>
     default: module.TerminalPage,
   })),
 );
+const DshPage = lazy(() =>
+  import("./pages/DshPage").then((module) => ({ default: module.DshPage })),
+);
+const CurlPage = lazy(() =>
+  import("./pages/CurlPage").then((module) => ({ default: module.CurlPage })),
+);
 const SettingsLayout = lazy(() =>
   import("./pages/settings").then((module) => ({
     default: module.SettingsLayout,
@@ -102,30 +109,14 @@ function RedirectWithSearch({ to }: { to: string }) {
 }
 
 function LegacyDeviceRedirect() {
-  const location = useLocation();
-  const { deviceId } = useParams<{ deviceId?: string }>();
-  const searchParams = new URLSearchParams(location.search);
-
-  if (deviceId) {
-    searchParams.set("deviceId", deviceId);
-  }
-
-  const search = searchParams.toString();
-  return (
-    <Navigate
-      to={{
-        pathname: "/settings/emulator",
-        search: search ? `?${search}` : "",
-      }}
-      replace
-    />
-  );
+  return <Navigate to="/settings" replace />;
 }
 
 // Apply saved preferences before React renders to avoid flash
 initializeTheme();
 initializeFontSize();
 initializeTabSize();
+installMobileSafeAreaInset();
 
 // SSE activity stream connection is managed by useActivityBusConnection hook
 // in App.tsx, which connects only when authenticated (or auth is disabled)
@@ -133,6 +124,13 @@ initializeTabSize();
 // Get base URL for router (Vite sets this based on --base flag)
 // Remove trailing slash for BrowserRouter basename
 const basename = import.meta.env.BASE_URL.replace(/\/$/, "") || undefined;
+
+// Opened directly on a session (PWA relaunch, notification, reload): start the
+// first-paint reads and the session chunk now instead of after the router and
+// the lazy page have loaded.
+if (startSessionPrefetch(window.location, basename)) {
+  void import("./pages/SessionPage").catch(() => undefined);
+}
 
 const rootElement = document.getElementById("root");
 if (!rootElement) {
@@ -157,6 +155,7 @@ createRoot(rootElement).render(
                   <Route path="/archive" element={<ArchivePage />} />
                   <Route path="/search" element={<SearchPage />} />
                   <Route path="/reports" element={<ReportsPage />} />
+                  <Route path="/curl" element={<CurlPage />} />
                   <Route path="/agents" element={<AgentsPage />} />
                   <Route path="/inbox" element={<InboxPage />} />
                   <Route path="/settings" element={<SettingsLayout />} />
@@ -181,6 +180,7 @@ createRoot(rootElement).render(
                     element={<LegacyDeviceRedirect />}
                   />
                   <Route path="/terminal" element={<TerminalPage />} />
+                  <Route path="/dsh" element={<DshPage />} />
                   <Route
                     path="/terminal/:terminalId"
                     element={<TerminalPage />}
