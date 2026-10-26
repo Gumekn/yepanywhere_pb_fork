@@ -28,6 +28,8 @@ export interface AuthMiddlewareOptions {
   authDisabled?: boolean;
   /** Desktop auth token from Tauri app. Acts as minimum auth floor when no other auth is configured. */
   desktopAuthToken?: string;
+  /** Optional base path prefix (e.g. "/yep") when served behind a reverse proxy. */
+  basePath?: string;
 }
 
 /**
@@ -60,19 +62,41 @@ function hasValidDesktopToken(
   return false;
 }
 
+function normalizePath(rawPath: string, basePath?: string): string {
+  const cleanBase = basePath?.trim().replace(/\/+$/, "");
+  if (
+    cleanBase &&
+    (rawPath === cleanBase || rawPath.startsWith(`${cleanBase}/`))
+  ) {
+    const stripped = rawPath.slice(cleanBase.length);
+    return stripped.startsWith("/") ? stripped : `/${stripped}`;
+  }
+  return rawPath;
+}
+
 /**
  * Create auth middleware that validates session cookies.
  */
 export function createAuthMiddleware(
   options: AuthMiddlewareOptions,
 ): MiddlewareHandler {
-  const { authService, authDisabled = false, desktopAuthToken } = options;
+  const {
+    authService,
+    authDisabled = false,
+    desktopAuthToken,
+    basePath,
+  } = options;
 
   return async (c, next) => {
-    const path = c.req.path;
+    const rawPath = c.req.path;
+    const path = normalizePath(rawPath, basePath);
 
     // Skip auth for health check (always open for readiness probes)
-    if (path === "/health") {
+    if (
+      path === "/health" ||
+      rawPath === "/health" ||
+      rawPath.endsWith("/health")
+    ) {
       await next();
       return;
     }
@@ -94,7 +118,7 @@ export function createAuthMiddleware(
     // Skip local password auth for requests from the trusted local websocket.
     // The websocket handler sets this Symbol when routing requests through app.fetch().
     // Using a Symbol ensures this cannot be forged by external HTTP requests.
-    if (c.env[WS_INTERNAL_AUTHENTICATED]) {
+    if (c.env?.[WS_INTERNAL_AUTHENTICATED]) {
       c.set("authenticated", true);
       await next();
       return;
@@ -106,7 +130,10 @@ export function createAuthMiddleware(
       if (desktopAuthToken && !authService.isLocalhostOpen()) {
         // Desktop token is set but request didn't have it (checked above).
         // Allow auth status so the UI can detect state.
-        if (path === "/api/auth/status") {
+        if (
+          path === "/api/auth/status" ||
+          rawPath.endsWith("/api/auth/status")
+        ) {
           await next();
           return;
         }
@@ -118,7 +145,12 @@ export function createAuthMiddleware(
     }
 
     // Skip auth for /api/auth/* paths
-    if (path.startsWith("/api/auth/") || path === "/api/auth") {
+    if (
+      path.startsWith("/api/auth/") ||
+      path === "/api/auth" ||
+      rawPath.includes("/api/auth/") ||
+      rawPath.endsWith("/api/auth")
+    ) {
       await next();
       return;
     }
@@ -126,7 +158,10 @@ export function createAuthMiddleware(
     // The ZCode bridge plugin authenticates hook posts with its own shared
     // token (validated by the route itself); cookie auth must not block them
     // even when password auth is enabled.
-    if (path === "/api/zcode-bridge/hook") {
+    if (
+      path === "/api/zcode-bridge/hook" ||
+      rawPath.endsWith("/api/zcode-bridge/hook")
+    ) {
       await next();
       return;
     }

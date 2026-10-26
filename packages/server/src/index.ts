@@ -1073,6 +1073,7 @@ async function startServer() {
         authService,
         authDisabled: config.authDisabled,
         desktopAuthToken: config.desktopAuthToken,
+        basePath: config.basePath,
       },
     }),
   );

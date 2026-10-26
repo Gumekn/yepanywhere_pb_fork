@@ -28,6 +28,7 @@ function fileIconKey(entry: ProjectBrowseEntry): string {
   if (["tsconfig.json", "jsconfig.json"].includes(name)) return "tsconfig";
 
   const extension = name.includes(".") ? (name.split(".").pop() ?? "") : "";
+  const FONT_EXT = "font";
   const groups: Record<string, readonly string[]> = {
     javascript: ["js", "mjs", "cjs"],
     typescript: ["ts"],
@@ -92,7 +93,7 @@ function fileIconKey(entry: ProjectBrowseEntry): string {
       "deb",
       "rpm",
     ],
-    font: ["ttf", "otf", "woff", "woff2", "eot"],
+    [FONT_EXT]: ["ttf", "otf", "woff", "woff2", "eot"],
     audio: ["mp3", "wav", "ogg", "flac", "m4a", "aac", "wma"],
     video: ["mp4", "webm", "mkv", "avi", "mov", "wmv", "flv", "m4v"],
     key: ["key", "pem", "crt", "cer", "pub"],

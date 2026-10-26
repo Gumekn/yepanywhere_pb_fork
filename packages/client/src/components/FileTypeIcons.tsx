@@ -3,6 +3,8 @@
 // crisp at any size; markdown uses a filled document with a bold "MD" label so
 // it's instantly recognizable and distinct from the outline FileText icons.
 
+const FONT_CATEGORY = "font";
+
 import {
   AudioLines,
   Binary,
@@ -81,7 +83,7 @@ export const ICON_COLORS = {
   image: "#a074c4",
   archive: "#ac733c",
   binary: "#757575",
-  font: "#1a6b9b",
+  [FONT_CATEGORY]: "#1a6b9b",
   audio: "#0071bc",
   video: "#ff5050",
   map: "#ffc107",
@@ -133,9 +135,9 @@ export function MarkdownIcon(): React.JSX.Element {
         y="15.5"
         textAnchor="middle"
         dominantBaseline="middle"
-        fontSize="9"
+        fontSize="8"
         fontWeight="700"
-        fontFamily="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+        fontFamily="var(--font-sans)"
         fill="#ffffff"
       >
         MD
@@ -197,7 +199,7 @@ export const FILE_ICONS_V2: Record<string, IconFactory> & {
   image: make(ICON_COLORS.image, FileImage),
   archive: make(ICON_COLORS.archive, FileArchive),
   binary: make(ICON_COLORS.binary, Binary),
-  font: make(ICON_COLORS.font, Type),
+  [FONT_CATEGORY]: make(ICON_COLORS[FONT_CATEGORY], Type),
   audio: make(ICON_COLORS.audio, AudioLines),
   video: make(ICON_COLORS.video, Film),
   map: make(ICON_COLORS.map, MapIcon),
