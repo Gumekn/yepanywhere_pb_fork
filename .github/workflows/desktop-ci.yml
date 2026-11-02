@@ -258,6 +258,11 @@ jobs:
           "$APPIMAGE" --appimage-extract
           cp /tmp/bun-real squashfs-root/usr/bin/bun
           chmod +x squashfs-root/usr/bin/bun
+          # --appimage-extract leaves the AppDir (and many subdirectories) at
+          # 0700. AppImages run as other users, and appimagetool now rejects
+          # such an AppDir, so grant read/execute to everyone before repacking.
+          chmod -R a+rX squashfs-root
+          chmod a+rx squashfs-root/AppRun squashfs-root/usr/bin/bun
 
           # Recreate AppImage with appimagetool
           ARCH_NAME=$(uname -m)
