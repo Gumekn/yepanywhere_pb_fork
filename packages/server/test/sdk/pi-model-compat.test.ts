@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { piAnthropicModelTraits } from "../../src/sdk/providers/pi-model-compat.js";
+import {
+  piAnthropicModelTraits,
+  piOpenAiCompatibleThinkingLevelMap,
+  piPickerReasoningEfforts,
+} from "../../src/sdk/providers/pi-model-compat.js";
 
 describe("piAnthropicModelTraits", () => {
   it("forces the adaptive thinking payload for current Claude releases", () => {
@@ -9,6 +13,7 @@ describe("piAnthropicModelTraits", () => {
       "claude-opus-4-8",
       "claude-opus-4-8-fast",
       "claude-opus-5",
+      "claude-opus-5-5",
       "claude-sonnet-4-6",
       "claude-sonnet-5",
       "claude-fable-5",
@@ -49,14 +54,22 @@ describe("piAnthropicModelTraits", () => {
     });
   });
 
-  it("marks Fable 5 as unable to disable thinking", () => {
+  it("marks models that reject an explicit thinking disable", () => {
     // Upstream expresses this as `off: null`; without it Pi would send
     // `thinking: { type: "disabled" }` to a model that rejects it.
-    expect(piAnthropicModelTraits("claude-fable-5").thinkingLevelMap).toEqual({
-      max: "max",
-      xhigh: "xhigh",
-      off: null,
-    });
+    for (const id of ["claude-fable-5", "claude-opus-5-5", "claude-opus-5.5"]) {
+      expect(piAnthropicModelTraits(id).thinkingLevelMap, id).toEqual({
+        max: "max",
+        xhigh: "xhigh",
+        off: null,
+      });
+    }
+    // Opus 5 and Sonnet 5.5 still accept `thinking: disabled`.
+    for (const id of ["claude-opus-5", "claude-sonnet-5-5"]) {
+      expect(piAnthropicModelTraits(id).thinkingLevelMap?.off, id).toBe(
+        undefined,
+      );
+    }
   });
 
   it("drops temperature for the models that reject it", () => {
@@ -75,5 +88,64 @@ describe("piAnthropicModelTraits", () => {
     expect(piAnthropicModelTraits("claude-sonnet-5").compat).toEqual({
       forceAdaptiveThinking: true,
     });
+  });
+});
+
+describe("piOpenAiCompatibleThinkingLevelMap", () => {
+  it("carries the extended efforts without marking off unsupported", () => {
+    // `off` must stay valid: Pi then omits reasoning_effort, while `off: null`
+    // would clamp it to `minimal`, which Claude rejects.
+    expect(piOpenAiCompatibleThinkingLevelMap("claude-opus-5-5")).toEqual({
+      max: "max",
+      xhigh: "xhigh",
+    });
+    expect(piOpenAiCompatibleThinkingLevelMap("claude-fable-5")).toEqual({
+      max: "max",
+      xhigh: "xhigh",
+    });
+    expect(piOpenAiCompatibleThinkingLevelMap("claude-opus-4-6")).toEqual({
+      max: "max",
+    });
+  });
+
+  it("leaves non-adaptive models unmapped", () => {
+    for (const id of ["claude-opus-4-5", "gpt-6-sol", "MiniMax-M3.1-Flash"]) {
+      expect(piOpenAiCompatibleThinkingLevelMap(id), id).toBeUndefined();
+    }
+  });
+});
+
+describe("piPickerReasoningEfforts", () => {
+  it("offers xhigh and max where Pi will send them", () => {
+    for (const id of [
+      "claude-opus-5-5",
+      "claude-opus-5",
+      "claude-sonnet-5-5",
+      "claude-fable-5",
+    ]) {
+      expect(piPickerReasoningEfforts(id), id).toEqual([
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]);
+    }
+    expect(piPickerReasoningEfforts("claude-sonnet-4-6")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "max",
+    ]);
+  });
+
+  it("keeps the three lossless levels for every other model", () => {
+    for (const id of ["claude-haiku-4-5", "gpt-6-sol", "test-model"]) {
+      expect(piPickerReasoningEfforts(id), id).toEqual([
+        "low",
+        "medium",
+        "high",
+      ]);
+    }
   });
 });

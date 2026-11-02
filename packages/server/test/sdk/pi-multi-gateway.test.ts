@@ -123,6 +123,12 @@ describe("PiProvider multi-gateway channels", () => {
     expect(
       models.find((model) => model.id === "aitl/claude-opus-5")?.name,
     ).toBe("Claude Opus 5 (extra.example)");
+    // The picker advertises the efforts Pi registers for the bare model id.
+    expect(
+      models
+        .find((model) => model.id === "aitl/claude-opus-5")
+        ?.supportedReasoningEfforts?.map((effort) => effort.reasoningEffort),
+    ).toEqual(["low", "medium", "high", "xhigh", "max"]);
 
     // The extra channel now fails; its last good catalog must survive so one
     // unreachable gateway cannot empty the picker.
@@ -471,7 +477,9 @@ describe("PiProvider multi-gateway channels", () => {
               supportsStore: false,
               maxTokensField: "max_tokens",
             },
-            thinkingLevelMap: null,
+            // The gateway maps reasoning_effort onto the same Claude effort,
+            // so the OpenAI-compatible route needs the extended levels too.
+            thinkingLevelMap: { max: "max", xhigh: "xhigh" },
           },
         ],
       },

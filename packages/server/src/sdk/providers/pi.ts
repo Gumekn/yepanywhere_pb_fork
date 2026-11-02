@@ -65,6 +65,8 @@ import {
   type PiAnthropicModelTraits,
   type PiThinkingLevelMap,
   piAnthropicModelTraits,
+  piOpenAiCompatibleThinkingLevelMap,
+  piPickerReasoningEfforts,
 } from "./pi-model-compat.js";
 import {
   isPiNativeConfigEnabled,
@@ -96,7 +98,6 @@ const PI_THINKING_LEVELS = new Set([
   "xhigh",
   "max",
 ]);
-const PI_PICKER_REASONING_EFFORTS = ["low", "medium", "high"] as const;
 
 /**
  * Pi's detectCompat targets api.openai.com by default: it promotes the system
@@ -382,16 +383,22 @@ function clonePiModelCatalog(catalog: PiModelCatalog): PiModelCatalog {
 }
 
 /**
- * Dynamically registered Pi models have no thinkingLevelMap, so upstream Pi
- * exposes off/minimal/low/medium/high and clamps xhigh/max. Yep's shared picker
- * has no minimal preset; advertise only the three lossless named levels.
+ * Advertise the named efforts Pi will actually honour for each model.
+ *
+ * A dynamically registered model without a `thinkingLevelMap` exposes
+ * off/minimal/low/medium/high and clamps xhigh/max, so most models get the
+ * three lossless levels; adaptive Claude models also get the `xhigh`/`max`
+ * entries their registered level map carries (see `pi-model-compat.ts`).
  */
-function withPiReasoningCapabilities(models: ModelInfo[]): ModelInfo[] {
+function withPiReasoningCapabilities(
+  models: ModelInfo[],
+  routes: ReadonlyMap<string, PiCatalogRoute>,
+): ModelInfo[] {
   return models.map((model) => ({
     ...model,
-    supportedReasoningEfforts: PI_PICKER_REASONING_EFFORTS.map(
-      (reasoningEffort) => ({ reasoningEffort }),
-    ),
+    supportedReasoningEfforts: piPickerReasoningEfforts(
+      routes.get(model.id)?.bareModelId ?? model.id,
+    ).map((reasoningEffort) => ({ reasoningEffort })),
     defaultReasoningEffort: "medium",
     supportsEffort: true,
   }));
@@ -452,6 +459,10 @@ function buildPiExtensionConfig(
         protocol,
         models: [],
       };
+      const openAiThinkingLevelMap =
+        protocol === "openai-compatible"
+          ? piOpenAiCompatibleThinkingLevelMap(route.bareModelId)
+          : undefined;
       entry.models.push({
         id: route.bareModelId,
         name: model.name || route.bareModelId,
@@ -466,7 +477,13 @@ function buildPiExtensionConfig(
           model.maxOutputTokens ??
           Math.min(32_768, Math.max(4_096, model.contextWindow ?? 32_768)),
         ...(protocol === "openai-compatible"
-          ? { compat: PI_OPENAI_COMPLETIONS_COMPAT }
+          ? {
+              compat: PI_OPENAI_COMPLETIONS_COMPAT,
+              // Without it Pi clamps a requested xhigh/max down to high.
+              ...(openAiThinkingLevelMap
+                ? { thinkingLevelMap: openAiThinkingLevelMap }
+                : {}),
+            }
           : // Current Claude releases reject the legacy budget-based thinking
             // payload, which is all Pi sends for a model registered without
             // these traits.
@@ -1043,7 +1060,7 @@ export class PiProvider implements AgentProvider {
         : { models: [], routes: new Map() };
     }
 
-    const models = withPiReasoningCapabilities(merged);
+    const models = withPiReasoningCapabilities(merged, routes);
     const catalog = { models, routes };
     this.modelCache = { catalog: clonePiModelCatalog(catalog), at: Date.now() };
     return clonePiModelCatalog(catalog);
