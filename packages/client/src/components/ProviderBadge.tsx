@@ -15,6 +15,17 @@ const PROVIDER_COLORS: Record<LiveProviderName, string> = {
   dsh: "var(--provider-dsh)",
 };
 
+/**
+ * Provider 主题色（CSS 变量表达式）。未知或已退役 provider 返回 undefined，
+ * 由调用方回落到默认品牌色。
+ */
+export function getProviderAccentColor(
+  provider: ProviderName | null | undefined,
+): string | undefined {
+  if (!provider) return undefined;
+  return PROVIDER_COLORS[provider as LiveProviderName];
+}
+
 const PROVIDER_LABELS: Record<LiveProviderName, string> = {
   claude: "Claude",
   // Same product brand as `claude` (both use the Claude SDK + Anthropic agent

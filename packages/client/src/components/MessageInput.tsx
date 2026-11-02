@@ -1,5 +1,11 @@
 import type { ProviderName, UploadedFile } from "@yep-anywhere/shared";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useComposer } from "../hooks/useComposer";
 import { useConnection } from "../hooks/useConnection";
 import {
@@ -12,6 +18,7 @@ import type { ContextUsage, PermissionMode } from "../types";
 import type { ComposerAttachment } from "./AttachmentComposer";
 import { ComposerEditor } from "./ComposerEditor";
 import { MessageInputToolbar } from "./MessageInputToolbar";
+import { getProviderAccentColor } from "./ProviderBadge";
 
 /** Progress info for an in-flight upload */
 export interface UploadProgress {
@@ -252,9 +259,18 @@ export function MessageInput({
   const handleSubmit = () => submitMessage(onSend);
   const handleQueue = onQueue ? () => submitMessage(onQueue) : undefined;
   submitRef.current = { submit: handleSubmit, queue: handleQueue };
+  // 输入框焦点边框与发送按钮跟随当前 provider 主题色，避免误认为是别的 agent。
+  const providerAccent = getProviderAccentColor(provider);
+  const composerAccentStyle = providerAccent
+    ? ({ "--composer-accent": providerAccent } as CSSProperties)
+    : undefined;
 
   return (
-    <div className="message-input-wrapper">
+    <div
+      className="message-input-wrapper"
+      data-provider={provider}
+      style={composerAccentStyle}
+    >
       {/* Floating toggle button - only show when user can control collapse (not externally collapsed) */}
       {!externalCollapsed && (
         <button

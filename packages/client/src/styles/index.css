@@ -5160,7 +5160,7 @@ a.sidebar-nav-item {
 }
 
 .send-button {
-  background: var(--app-yep-green);
+  background: var(--composer-accent, var(--app-yep-green));
   color: white;
 }
 
@@ -5231,7 +5231,8 @@ a.sidebar-nav-item {
 }
 
 .message-submit-choice:focus-visible {
-  outline: 2px solid var(--focus-border, var(--app-yep-green));
+  outline: 2px solid
+    var(--composer-accent, var(--focus-border, var(--app-yep-green)));
   outline-offset: 2px;
 }
 
@@ -5945,11 +5946,15 @@ a.sidebar-nav-item {
 
 .attachment-composer:focus {
   outline: none;
-  border-color: var(--new-session-accent, var(--app-yep-green));
+  border-color: var(
+    --composer-accent,
+    var(--new-session-accent, var(--app-yep-green))
+  );
   box-shadow: 0 0 0 2px
     color-mix(
       in srgb,
-      var(--new-session-accent, var(--app-yep-green)) 20%,
+      var(--composer-accent, var(--new-session-accent, var(--app-yep-green)))
+        20%,
       transparent
     );
 }
