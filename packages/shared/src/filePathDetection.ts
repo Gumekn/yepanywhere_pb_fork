@@ -110,8 +110,21 @@ const KNOWN_FILENAMES = new Set([
  * - Email-like patterns (user@domain)
  * - Paths that are clearly prose
  */
-const FILE_PATH_PATTERN =
-  /(?<!\S)(?:\.{0,2}\/)?(?:[a-zA-Z0-9_@-]+\/)*[a-zA-Z0-9_.-]+\.[a-zA-Z0-9]+(?::\d+(?::\d+)?)?(?!\S)|(?<!\S)\/(?:[a-zA-Z0-9_@.-]+\/)+[a-zA-Z0-9_.-]+(?::\d+(?::\d+)?)?(?!\S)/g;
+// Path segments accept any Unicode letter/number so non-ASCII names such as
+// `docs/退款链路串讲.md` are detected; extensions stay ASCII. CJK prose rarely
+// puts spaces around paths, so full-width punctuation also acts as a boundary.
+const BOUNDARY = "[\\s，。：；、！？（）【】「」『』《》“”‘’]";
+const BEFORE = `(?<=^|${BOUNDARY})`;
+const AFTER = `(?=$|${BOUNDARY})`;
+const SEGMENT_CHAR = "\\p{L}\\p{N}\\p{M}_";
+const LINE_COL = "(?::\\d+(?::\\d+)?)?";
+const FILE_PATH_PATTERN = new RegExp(
+  `${BEFORE}(?:\\.{0,2}\\/)?(?:[${SEGMENT_CHAR}@-]+\\/)*[${SEGMENT_CHAR}.-]+\\.[a-zA-Z0-9]+${LINE_COL}${AFTER}` +
+    `|${BEFORE}\\/(?:[${SEGMENT_CHAR}@.-]+\\/)+[${SEGMENT_CHAR}.-]+${LINE_COL}${AFTER}`,
+  "gu",
+);
+const GLUED_PROSE_PREFIX =
+  /^[^/]*?[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}][A-Za-z0-9]/u;
 
 /**
  * Check if a string looks like a URL.
@@ -159,7 +172,11 @@ export function isLikelyFilePath(str: string): boolean {
 
   // If the path has directory components and looks like a reasonable path
   // be more lenient (e.g., packages/client/src/...)
-  if (parts.length >= 2 && filename && /^[a-zA-Z0-9_.-]+$/.test(filename)) {
+  if (
+    parts.length >= 2 &&
+    filename &&
+    /^[\p{L}\p{N}\p{M}_.-]+$/u.test(filename)
+  ) {
     // Check if it has a common directory pattern
     const commonDirs = [
       "src",
@@ -218,7 +235,7 @@ export function parseLineColumn(str: string): {
  */
 export function detectFilePaths(text: string): DetectedFilePath[] {
   const results: DetectedFilePath[] = [];
-  const pattern = new RegExp(FILE_PATH_PATTERN.source, "g");
+  const pattern = new RegExp(FILE_PATH_PATTERN.source, "gu");
 
   for (
     let match = pattern.exec(text);
@@ -229,6 +246,10 @@ export function detectFilePaths(text: string): DetectedFilePath[] {
 
     // Validate that this looks like a real file path
     if (!isLikelyFilePath(matchStr)) continue;
+
+    // CJK prose often glues words onto a relative path (`修改src/a.ts`); the
+    // prefix is not part of the path, so do not link a guessed name.
+    if (!/^[./]/.test(matchStr) && GLUED_PROSE_PREFIX.test(matchStr)) continue;
 
     // Parse line/column
     const { path, line, column } = parseLineColumn(matchStr);

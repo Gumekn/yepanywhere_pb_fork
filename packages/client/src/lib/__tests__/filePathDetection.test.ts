@@ -44,6 +44,29 @@ describe("detectFilePaths", () => {
     });
   });
 
+  describe("non-ASCII paths", () => {
+    it("detects absolute paths with Chinese file names", () => {
+      const path =
+        "/Users/yueyuan/Desktop/work/before_work/data_flow_ui/docs/退款链路串讲.md";
+      expect(detectFilePaths(path)[0]?.filePath).toBe(path);
+    });
+
+    it("treats full-width punctuation as a path boundary", () => {
+      const result = detectFilePaths("文件位置：/tmp/报告/总结.md。");
+      expect(result.map((r) => r.filePath)).toEqual(["/tmp/报告/总结.md"]);
+    });
+
+    it("detects relative paths with Chinese directories", () => {
+      expect(detectFilePaths("见 docs/设计/方案.md")[0]?.filePath).toBe(
+        "docs/设计/方案.md",
+      );
+    });
+
+    it("does not link prose glued onto a relative path", () => {
+      expect(detectFilePaths("修改src/foo.ts 即可")).toHaveLength(0);
+    });
+  });
+
   describe("line numbers", () => {
     it("detects paths with line numbers", () => {
       const result = detectFilePaths("Error at src/app.ts:42");
