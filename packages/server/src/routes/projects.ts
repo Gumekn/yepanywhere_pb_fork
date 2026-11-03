@@ -23,22 +23,24 @@ import type {
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
+import type { DshSessionScanner } from "../projects/dsh-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
-import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import { canonicalizeProjectPath, isAbsolutePath } from "../projects/paths.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RuntimeController } from "../runtime/types.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
+import type { DshSessionReader } from "../sessions/dsh-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
-import type { KimiSessionReader } from "../sessions/kimi-reader.js";
 import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
-import { listSessionsAcrossProviders } from "../sessions/provider-resolution.js";
+import {
+  hydrateCodexSessionUsage,
+  listSessionsAcrossProviders,
+} from "../sessions/provider-resolution.js";
 import { pendingInputTypeFromRequest } from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
-import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
 import type {
@@ -55,6 +57,7 @@ const PROJECT_LIST_TIMING_NAMES = [
   "bridgeView",
   "catalog",
   "sessionScan",
+  "usage",
   "total",
 ] as const;
 
@@ -88,19 +91,13 @@ export interface ProjectsDeps {
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
   /** Pi scanner for checking if a project has Pi sessions */
   piScanner?: PiSessionScanner;
-  zcodeDbPath?: string;
   piSessionsDir?: string;
   piReaderFactory?: (projectPath: string) => PiSessionReader;
-  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
-  /** Kimi scanner for checking if a project has Kimi sessions */
-  kimiScanner?: KimiSessionScanner;
   cursorScanner?: CursorSessionScanner;
   mcodeScanner?: McodeSessionScanner;
+  dshScanner?: DshSessionScanner;
   mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
-  /** Kimi sessions directory */
-  kimiSessionsDir?: string;
-  /** Optional shared Kimi reader factory for cross-provider session lookups */
-  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  dshReaderFactory?: (projectPath: string) => DshSessionReader;
   /** Codex bridge for externally launched `codex --remote` sessions. */
   codexBridgeService?: CodexBridgeController;
 }
@@ -697,9 +694,9 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
         codexScanner: deps.codexScanner,
         geminiScanner: deps.geminiScanner,
         piScanner: deps.piScanner,
-        kimiScanner: deps.kimiScanner,
         cursorScanner: deps.cursorScanner,
         mcodeScanner: deps.mcodeScanner,
+        dshScanner: deps.dshScanner,
         codexSessionCatalog: deps.codexSessionCatalog,
       }),
     );
@@ -717,9 +714,8 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
           geminiHashToCwd: providerCatalog.geminiHashToCwd,
           piSessionsDir: deps.piSessionsDir,
           piReaderFactory: deps.piReaderFactory,
-          kimiSessionsDir: deps.kimiSessionsDir,
-          kimiReaderFactory: deps.kimiReaderFactory,
           mcodeReaderFactory: deps.mcodeReaderFactory,
+          dshReaderFactory: deps.dshReaderFactory,
         },
         providerCatalog,
       ),
@@ -751,6 +747,14 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
       },
     );
 
+    await serverTiming.measure("usage", () =>
+      hydrateCodexSessionUsage(
+        publicSessions,
+        [project],
+        deps,
+        providerCatalog.codexUnknownMessageCountIds,
+      ),
+    );
     serverTiming.set("total", performance.now() - requestStartedAt);
     c.header("Server-Timing", serverTiming.headerValue());
     return c.json({ sessions: publicSessions });

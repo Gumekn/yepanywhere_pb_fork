@@ -16,6 +16,9 @@ import { installPiSideConversations } from "./pi-side-conversation.mjs";
 const APPROVAL_TITLE_PREFIX = "__YEP_PI_TOOL_APPROVAL__:";
 const MAX_APPROVAL_PAYLOAD_CHARS = 200_000;
 const PROVIDER_STATE_KEY = Symbol.for("yep.pi.provider-config.v1");
+const FILE_OPERATION_DIRECTORY_KEY = Symbol.for(
+  "yep.pi.file-operations-directory.v1",
+);
 
 // Relay bounded previews through the extension UI channel. Native RPC progress
 // is also consumed by the provider; file tails are read here on the tool host.
@@ -451,7 +454,14 @@ export default function yepPiExtension(pi) {
   }
 
   registerPartialOutputRelay(pi);
-  const fileOperationDirectory = process.env.YEP_PI_FILE_OPERATIONS_DIRECTORY;
+  // Pi re-runs extension factories when a native fork/new session replaces the
+  // AgentSession. Retain the directory process-locally so capture survives the
+  // reload after the env var has been scrubbed from tool subprocesses.
+  const fileOperationDirectory =
+    process.env.YEP_PI_FILE_OPERATIONS_DIRECTORY ??
+    globalThis[FILE_OPERATION_DIRECTORY_KEY];
+  if (fileOperationDirectory)
+    globalThis[FILE_OPERATION_DIRECTORY_KEY] = fileOperationDirectory;
   Reflect.deleteProperty(process.env, "YEP_PI_FILE_OPERATIONS_DIRECTORY");
 
   pi.on("tool_call", async (event, ctx) => {

@@ -4,12 +4,11 @@ import {
   CodexProvider,
 } from "./implementations/CodexProvider";
 import { CursorProvider } from "./implementations/CursorProvider";
+import { DshProvider } from "./implementations/DshProvider";
 import { GeminiACPProvider } from "./implementations/GeminiACPProvider";
 import { GeminiProvider } from "./implementations/GeminiProvider";
-import { KimiProvider } from "./implementations/KimiProvider";
 import { McodeProvider } from "./implementations/McodeProvider";
 import { PiProvider } from "./implementations/PiProvider";
-import { ZCodeProvider } from "./implementations/ZCodeProvider";
 import type { Provider, ProviderMetadata } from "./types";
 
 const activeProviders: Record<string, Provider> = {
@@ -18,8 +17,6 @@ const activeProviders: Record<string, Provider> = {
   codex: new CodexProvider(),
   "codex-oss": new CodexOssProvider(),
   pi: new PiProvider(),
-  kimi: new KimiProvider(),
-  zcode: new ZCodeProvider(),
   cursor: new CursorProvider(),
   mcode: new McodeProvider(),
 };
@@ -28,6 +25,8 @@ const providers: Record<string, Provider> = {
   // Retain Claude capabilities for rendering historical sessions, but keep the
   // retired SSH channel out of settings and new-session provider discovery.
   claude: new ClaudeProvider(),
+  // Read-only: rendered from ~/.dsh, never offered for new sessions.
+  dsh: new DshProvider(),
   ...activeProviders,
 };
 

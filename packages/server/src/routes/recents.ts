@@ -10,8 +10,8 @@ import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
+import type { DshSessionScanner } from "../projects/dsh-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
-import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import { decodeProjectId, getProjectName } from "../projects/paths.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
@@ -19,13 +19,12 @@ import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { CursorSessionReader } from "../sessions/cursor-reader.js";
+import type { DshSessionReader } from "../sessions/dsh-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
-import type { KimiSessionReader } from "../sessions/kimi-reader.js";
 import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { findSessionSummaryAcrossProviders } from "../sessions/provider-resolution.js";
 import type { ISessionReader } from "../sessions/types.js";
-import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { Project } from "../supervisor/types.js";
 
 export interface RecentsDeps {
@@ -42,16 +41,13 @@ export interface RecentsDeps {
   geminiSessionsDir?: string;
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
   piScanner?: PiSessionScanner;
-  zcodeDbPath?: string;
   piSessionsDir?: string;
   piReaderFactory?: (projectPath: string) => PiSessionReader;
-  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
-  kimiScanner?: KimiSessionScanner;
   cursorScanner?: CursorSessionScanner;
   mcodeScanner?: McodeSessionScanner;
+  dshScanner?: DshSessionScanner;
   mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
-  kimiSessionsDir?: string;
-  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  dshReaderFactory?: (projectPath: string) => DshSessionReader;
   cursorSessionsDir?: string;
   cursorReaderFactory?: (projectPath: string) => CursorSessionReader;
 }
@@ -103,9 +99,8 @@ export function createRecentsRoutes(deps: RecentsDeps): Hono {
           geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
           piSessionsDir: deps.piSessionsDir,
           piReaderFactory: deps.piReaderFactory,
-          kimiSessionsDir: deps.kimiSessionsDir,
-          kimiReaderFactory: deps.kimiReaderFactory,
           mcodeReaderFactory: deps.mcodeReaderFactory,
+          dshReaderFactory: deps.dshReaderFactory,
           cursorSessionsDir: deps.cursorSessionsDir,
           cursorReaderFactory: deps.cursorReaderFactory,
         },

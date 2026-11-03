@@ -38,7 +38,6 @@ BRIDGE_LABEL="${YEP_LAUNCHD_BRIDGE_LABEL:-com.yueyuan.yepanywhere.codex-bridge}"
 RUNTIME_LABEL="${YEP_LAUNCHD_RUNTIME_LABEL:-com.yueyuan.yepanywhere.runtime}"
 SERVER_PORT="${YEP_DEPLOY_PORT:-8022}"
 SERVER_BASE_PATH="${YEP_DEPLOY_BASE_PATH:-/yep}"
-SERVER_ALLOWED_IMAGE_PATHS="${ALLOWED_IMAGE_PATHS:-/tmp,$HOME/Downloads}"
 SERVER_ALLOWED_HOSTS="${ALLOWED_HOSTS:-}"
 BRIDGE_PORT="${YEP_CODEX_BRIDGE_PORT:-${CODEX_BRIDGE_PORT:-4510}}"
 BRIDGE_URL="${YEP_CODEX_BRIDGE_CONTROL_URL:-${CODEX_BRIDGE_CONTROL_URL:-http://127.0.0.1:${BRIDGE_PORT}}}"
@@ -87,6 +86,7 @@ LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 LOG_DIR="${YEP_LAUNCHD_LOG_DIR:-$HOME/.yep-anywhere/logs}"
 USER_DOMAIN="gui/$(id -u)"
 START_NOW=true
+SKIP_SYNC=false
 INSTALL_SERVER=true
 INSTALL_CODEX_BRIDGE=true
 INSTALL_RUNTIME_EXPLICIT=false
@@ -109,6 +109,8 @@ Options:
                                server and point the server at it
   --no-start                   Write plist file(s) without unloading or starting LaunchAgents
   --server-plist PATH          Write the server definition to PATH
+  --skip-sync                  With --no-start, only write definitions; the caller
+                               publishes the bundle during the later cutover
 
 Environment overrides:
   YEP_DEPLOY_PORT              Main server port (default: 8022)
@@ -183,6 +185,10 @@ while [[ $# -gt 0 ]]; do
       SERVER_PLIST_PATH="$2"
       shift 2
       ;;
+    --skip-sync)
+      SKIP_SYNC=true
+      shift
+      ;;
     --server-only)
       INSTALL_SERVER=true
       INSTALL_CODEX_BRIDGE=false
@@ -217,6 +223,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if $SKIP_SYNC && $START_NOW; then
+  err "--skip-sync requires --no-start; publish the bundle before starting LaunchAgents."
+  exit 2
+fi
 
 # --server-only / --bridge-only refresh only the selected service. Preserving
 # external wiring does not authorize installing or starting its worker.
@@ -319,11 +330,13 @@ if $INSTALL_RUNTIME; then
   prepare_private_log "$LOG_DIR/runtime-launchd.err.log"
 fi
 
-log "Syncing LaunchAgent runtime outside the repository ..."
-YEP_LAUNCHD_RUNTIME_DIR="$LAUNCHD_RUNTIME_DIR" "$SCRIPT_DIR/sync-launchd-runtime.sh"
-if [[ ! -x "$CLI_JS" ]]; then
-  err "LaunchAgent runtime sync did not produce an executable CLI at $CLI_JS."
-  exit 1
+if ! $SKIP_SYNC; then
+  log "Syncing LaunchAgent runtime outside the repository ..."
+  YEP_LAUNCHD_RUNTIME_DIR="$LAUNCHD_RUNTIME_DIR" "$SCRIPT_DIR/sync-launchd-runtime.sh"
+  if [[ ! -x "$CLI_JS" ]]; then
+    err "LaunchAgent runtime sync did not produce an executable CLI at $CLI_JS."
+    exit 1
+  fi
 fi
 
 NODE_DIR="$(dirname "$NODE_BIN")"
@@ -577,7 +590,6 @@ write_runtime_plist() {
     "PATH" "$LAUNCHD_PATH"
     "YEP_DEPLOY_REPO_ROOT" "$REPO_ROOT"
     "YEP_REPORTS_DIR" "$SERVER_REPORTS_DIR"
-    "ALLOWED_IMAGE_PATHS" "$SERVER_ALLOWED_IMAGE_PATHS"
     "PORT" "$SERVER_PORT"
     "YEP_RUNTIME_PORT" "$RUNTIME_PORT"
     "YEP_CODEX_BRIDGE_MODE" "external"
@@ -603,7 +615,6 @@ write_server_plist() {
     "PATH" "$LAUNCHD_PATH"
     "YEP_DEPLOY_PORT" "$SERVER_PORT"
     "BASE_PATH" "$SERVER_BASE_PATH"
-    "ALLOWED_IMAGE_PATHS" "$SERVER_ALLOWED_IMAGE_PATHS"
     "YEP_DEPLOY_REPO_ROOT" "$REPO_ROOT"
     "YEP_REPORTS_DIR" "$SERVER_REPORTS_DIR"
     "YEP_CODEX_BRIDGE_MODE" "external"

@@ -10,14 +10,12 @@ import {
   type ModelInfo,
   type NewSessionProviderDefaults,
   type ProviderInfo,
-  type ProviderMcpServerStatus,
   getLlmGatewayModelDefaultLimits,
   getNewSessionProviderDefaults,
   resolveModel,
 } from "@yep-anywhere/shared";
 import {
   type CSSProperties,
-  type KeyboardEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -27,7 +25,9 @@ import {
 import { useNavigate } from "react-router-dom";
 import { type UploadedFile, api } from "../api/client";
 import { useToastContext } from "../contexts/ToastContext";
-import { useComposerDocument } from "../hooks/useComposerDocument";
+import { useAgentCommandCatalog } from "../hooks/useAgentCommandCatalog";
+import { useAgentCommandListing } from "../hooks/useAgentCommandListing";
+import { useComposer } from "../hooks/useComposer";
 import { useConnection } from "../hooks/useConnection";
 import { useDraftPersistence } from "../hooks/useDraftPersistence";
 import { useLlmGatewayKeys } from "../hooks/useLlmGatewayKeys";
@@ -48,13 +48,17 @@ import {
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
 import { useServerSettings } from "../hooks/useServerSettings";
 import { useI18n } from "../i18n";
-import { getAgentCommandConfigs } from "../lib/agentCommands";
+import type { AgentCommandAvailability } from "../lib/agentCommands";
+import {
+  type CodexSkillCommand,
+  resolveCodexSkillInputs,
+} from "../lib/codexInputCommands";
 import {
   getModelReasoningEfforts,
   resolveModelReasoningEffort,
 } from "../lib/codexReasoning";
-import { handleComposerSubmitKey } from "../lib/composerKeyboard";
 import { getPreferredCursorModelId } from "../lib/cursorModels";
+import { draftFileStore } from "../lib/draftFileStore";
 import {
   clearLegacySessionPrefill,
   getLegacySessionPrefill,
@@ -69,22 +73,22 @@ import {
   requireStartedHistoricalEdit,
   shouldRestoreHistoricalEditAfterFailure,
 } from "../lib/sessionBranching";
+import { getCurrentInstallId } from "../lib/storageKeys";
 import type { PermissionMode, SessionNavigationState } from "../types";
-import {
-  AttachmentComposer,
-  type AttachmentComposerHandle,
-} from "./AttachmentComposer";
-import { AttachmentPreviewModal } from "./AttachmentPreviewModal";
 import { CodexAccountSelect } from "./CodexAccountSelect";
 import { CodexUsageCard } from "./CodexUsageCard";
-import { ComposerAttachmentCard } from "./ComposerAttachmentCard";
+import { ComposerEditor } from "./ComposerEditor";
+import {
+  ComposerToolbar,
+  composerToolbarButtonClass,
+  composerToolbarIconSize,
+} from "./ComposerToolbar";
 import { CursorAccountCard } from "./CursorAccountCard";
 import { CursorModelSelect } from "./CursorModelSelect";
 import { FilterDropdown, type FilterOption } from "./FilterDropdown";
 import { NewSessionSetupSkeleton } from "./NewSessionSkeleton";
 import { PiGatewayKeySelect } from "./PiGatewayKeySelect";
-import { SlashCommandButton } from "./SlashCommandButton";
-import { VoiceInputButton, type VoiceInputButtonRef } from "./VoiceInputButton";
+import { ThinkingToggleButton } from "./ThinkingToggleButton";
 
 interface PendingFile {
   id: string;
@@ -93,6 +97,10 @@ interface PendingFile {
 }
 
 const CODEX_MCP_MODE_ORDER: CodexMcpMode[] = ["clear", "standard", "full"];
+const NEW_SESSION_COMMAND_AVAILABILITY: AgentCommandAvailability = {
+  scope: "new-session",
+};
+const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 
 const NEW_SESSION_PROVIDER_ACCENTS = {
   claude: "var(--provider-claude)",
@@ -102,10 +110,9 @@ const NEW_SESSION_PROVIDER_ACCENTS = {
   gemini: "var(--provider-gemini)",
   "gemini-acp": "var(--provider-gemini)",
   pi: "var(--provider-pi)",
-  kimi: "var(--provider-kimi)",
-  zcode: "var(--provider-zcode)",
   cursor: "var(--provider-cursor)",
   mcode: "var(--provider-mcode)",
+  dsh: "var(--provider-dsh)",
 } satisfies Record<LiveProviderName, string>;
 
 export function getNewSessionProviderAccent(
@@ -323,9 +330,9 @@ export function NewSessionForm({
   const [codexReasoningEffort, setCodexReasoningEffort] = useState<
     string | null
   >(null);
-  const [kimiReasoningEffort, setKimiReasoningEffort] = useState<string | null>(
-    null,
-  );
+  const [namedReasoningEffort, setNamedReasoningEffort] = useState<
+    string | null
+  >(null);
   const [selectedGatewayProtocol, setSelectedGatewayProtocol] =
     useState<LlmGatewayRequestProtocol>("openai-compatible");
   const [selectedCodexMcpMode, setSelectedCodexMcpMode] =
@@ -340,7 +347,6 @@ export function NewSessionForm({
   >(null);
   const llmGatewayKeys = useLlmGatewayKeys(selectedProvider === "pi");
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
-  const [previewFileId, setPreviewFileId] = useState<string | null>(null);
   const pendingFilesRef = useRef<PendingFile[]>(pendingFiles);
   const removedPendingFilesRef = useRef(new Map<string, PendingFile>());
   const pendingFileOrderRef = useRef<string[]>([]);
@@ -352,45 +358,12 @@ export function NewSessionForm({
   const [uploadProgress, setUploadProgress] = useState<
     Record<string, { uploaded: number; total: number }>
   >({});
-  const [interimTranscript, setInterimTranscript] = useState("");
   const [isSavingDefaults, setIsSavingDefaults] = useState(false);
 
-  // ZCode MCP server status snapshot. Loaded once per provider selection
-  // (no polling) purely as informational context for new sessions.
-  const [zcodeMcpServers, setZcodeMcpServers] = useState<Record<
-    string,
-    ProviderMcpServerStatus
-  > | null>(null);
-  const [zcodeMcpLoading, setZcodeMcpLoading] = useState(false);
-  const [zcodeMcpError, setZcodeMcpError] = useState<string | null>(null);
   const [cursorCatalog, setCursorCatalog] = useState<ModelInfo[] | null>(null);
   const [cursorCatalogLoading, setCursorCatalogLoading] = useState(false);
+  const [mcodeCatalog, setMcodeCatalog] = useState<ModelInfo[] | null>(null);
   const cursorPrepareKeyRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (selectedProvider !== "zcode") return;
-    let cancelled = false;
-    setZcodeMcpServers(null);
-    setZcodeMcpError(null);
-    setZcodeMcpLoading(true);
-    api
-      .listZCodeMcpServers(projectId)
-      .then((response) => {
-        if (cancelled) return;
-        setZcodeMcpServers(response.servers);
-        setZcodeMcpLoading(false);
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setZcodeMcpError(
-          error instanceof Error ? error.message : String(error),
-        );
-        setZcodeMcpLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedProvider, projectId]);
 
   // Object URLs keep their backing Blob alive for the lifetime of the page.
   // Removal and successful submission revoke them below; this cleanup covers
@@ -412,9 +385,6 @@ export function NewSessionForm({
   // so the selector grid stays tidy instead of showing tall, uneven cards.
   const [showUnavailableProviders, setShowUnavailableProviders] =
     useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const textareaRef = useRef<AttachmentComposerHandle>(null);
-  const voiceButtonRef = useRef<VoiceInputButtonRef>(null);
   const hasInitializedDefaultsRef = useRef(false);
   // Thinking toggle state
   const {
@@ -463,26 +433,19 @@ export function NewSessionForm({
     standard: t("newSessionCodexMcpStandardDescription"),
     full: t("newSessionCodexMcpFullDescription"),
   };
-  // ZCode mcp/list lifecycle statuses (real CLI 0.16.1 enum).
-  const zcodeMcpStatusLabels: Record<string, string> = {
-    connecting: t("newSessionZcodeMcpStatusConnecting"),
-    connected: t("newSessionZcodeMcpStatusConnected"),
-    disabled: t("newSessionZcodeMcpStatusDisabled"),
-    disconnected: t("newSessionZcodeMcpStatusDisconnected"),
-    failed: t("newSessionZcodeMcpStatusFailed"),
-    untrusted: t("newSessionZcodeMcpStatusUntrusted"),
-  };
   // Get models and capabilities for the currently selected provider.
   // A cold Cursor catalog must not block the shared provider list, so the
   // form loads it only after Cursor is selected and the list is still empty.
   const listedModels = selectedProviderInfo?.models ?? [];
   const availableModels: ModelInfo[] =
-    selectedProvider === "cursor" &&
-    listedModels.length === 0 &&
-    cursorCatalog &&
-    cursorCatalog.length > 0
-      ? cursorCatalog
-      : listedModels;
+    selectedProvider === "mcode" && mcodeCatalog
+      ? mcodeCatalog
+      : selectedProvider === "cursor" &&
+          listedModels.length === 0 &&
+          cursorCatalog &&
+          cursorCatalog.length > 0
+        ? cursorCatalog
+        : listedModels;
   const selectedModelInfo = availableModels.find(
     (model) => model.id === selectedModel,
   );
@@ -512,14 +475,15 @@ export function NewSessionForm({
         : [],
     [selectedModelInfo, selectedProvider],
   );
-  // MiniMax Code folds its plain/thinking model variants into the same
-  // off + named-effort picker Kimi uses (see server mcode-models.ts).
-  const usesKimiStyleReasoning =
-    selectedProvider === "kimi" || selectedProvider === "mcode";
-  const kimiReasoningEfforts = useMemo(
+  // MiniMax Code folds its plain/thinking model variants into an
+  // off + named-effort picker (see server mcode-models.ts).
+  const usesNamedEffortReasoning = selectedProvider === "mcode";
+  const namedReasoningEfforts = useMemo(
     () =>
-      usesKimiStyleReasoning ? getModelReasoningEfforts(selectedModelInfo) : [],
-    [selectedModelInfo, usesKimiStyleReasoning],
+      usesNamedEffortReasoning
+        ? getModelReasoningEfforts(selectedModelInfo)
+        : [],
+    [selectedModelInfo, usesNamedEffortReasoning],
   );
   const piReasoningEfforts = useMemo(
     () =>
@@ -536,9 +500,9 @@ export function NewSessionForm({
             (codexReasoningEfforts.length === 0 ? thinkingLevel : undefined),
         )
       : undefined;
-  const effectiveKimiReasoningEffort =
-    usesKimiStyleReasoning && kimiReasoningEfforts.length > 0
-      ? resolveModelReasoningEffort(selectedModelInfo, kimiReasoningEffort)
+  const effectiveNamedReasoningEffort =
+    usesNamedEffortReasoning && namedReasoningEfforts.length > 0
+      ? resolveModelReasoningEffort(selectedModelInfo, namedReasoningEffort)
       : undefined;
   const resolvedPiThinkingEffort =
     selectedProvider === "pi"
@@ -550,8 +514,8 @@ export function NewSessionForm({
   const selectedReasoningEffort =
     selectedProvider === "codex" && thinkingMode === "on"
       ? effectiveCodexReasoningEffort
-      : usesKimiStyleReasoning
-        ? effectiveKimiReasoningEffort
+      : usesNamedEffortReasoning
+        ? effectiveNamedReasoningEffort
         : selectedProvider === "pi" && thinkingMode !== "off"
           ? resolvedPiThinkingEffort
           : undefined;
@@ -658,8 +622,8 @@ export function NewSessionForm({
     },
     [applyThinkingPreset],
   );
-  const kimiReasoningOptions = useMemo((): FilterOption<string>[] => {
-    return kimiReasoningEfforts.map((option) => {
+  const namedReasoningOptions = useMemo((): FilterOption<string>[] => {
+    return namedReasoningEfforts.map((option) => {
       const effort = option.reasoningEffort;
       const label =
         effort === "off"
@@ -676,12 +640,12 @@ export function NewSessionForm({
         description: option.description,
       };
     });
-  }, [getEffortLabel, kimiReasoningEfforts, t]);
-  const handleKimiReasoningSelect = useCallback((selected: string[]) => {
-    setKimiReasoningEffort(selected[0] ?? null);
+  }, [getEffortLabel, namedReasoningEfforts, t]);
+  const handleNamedReasoningSelect = useCallback((selected: string[]) => {
+    setNamedReasoningEffort(selected[0] ?? null);
   }, []);
-  const showKimiReasoningSelector =
-    usesKimiStyleReasoning && kimiReasoningOptions.length > 0;
+  const showNamedReasoningSelector =
+    usesNamedEffortReasoning && namedReasoningOptions.length > 0;
 
   // Default to true for backwards compatibility with providers that don't set these flags
   const permissionModes = getProviderPermissionModes(
@@ -699,21 +663,41 @@ export function NewSessionForm({
       !selectedModelInfo ||
       selectedModelInfo.supportsAdaptiveThinking === true ||
       selectedModelInfo.supportsEffort === true);
-  const commandButtons = useMemo(
+  // Skills and provider commands for this project, without a session: the
+  // provider's last report for the directory, or its skill directories.
+  const { listing: commandListing, refresh: refreshCommandListing } =
+    useAgentCommandListing({ projectId, provider: selectedProvider });
+  const codexSkills = useMemo<CodexSkillCommand[]>(
     () =>
-      getAgentCommandConfigs(
-        selectedProvider,
-        selectedProviderInfo?.supportsSlashCommands,
-        [],
-        [],
-        {
-          codexCommands: t("codexCommandsLabel"),
-          skills: t("codexSkillsLabel"),
-          slashCommands: t("slashCommandsLabel"),
-        },
-      ),
-    [selectedProvider, selectedProviderInfo?.supportsSlashCommands, t],
+      selectedProvider === "codex"
+        ? (commandListing?.skills ?? []).flatMap((skill) =>
+            skill.path
+              ? [
+                  {
+                    name: skill.name,
+                    path: skill.path,
+                    ...(skill.description
+                      ? { description: skill.description }
+                      : {}),
+                  },
+                ]
+              : [],
+          )
+        : [],
+    [commandListing, selectedProvider],
   );
+  const codexInputsForMessage = (text: string) => {
+    if (selectedProvider !== "codex") return undefined;
+    const inputs = resolveCodexSkillInputs(text, codexSkills);
+    return inputs.length > 0 ? inputs : undefined;
+  };
+  const commandButtons = useAgentCommandCatalog({
+    provider: selectedProvider,
+    supportsSlashCommands: selectedProviderInfo?.supportsSlashCommands,
+    providerCommands: commandListing?.commands,
+    codexSkills,
+    availability: NEW_SESSION_COMMAND_AVAILABILITY,
+  });
 
   const applyProviderSelection = useCallback(
     (provider: ProviderInfo, savedDefaults?: NewSessionProviderDefaults) => {
@@ -779,8 +763,8 @@ export function NewSessionForm({
       setSelectedLlmGatewayKeyId(
         providerName === "pi" ? (savedDefaults?.llmGatewayKeyId ?? null) : null,
       );
-      setKimiReasoningEffort(
-        providerName === "kimi" || providerName === "mcode"
+      setNamedReasoningEffort(
+        providerName === "mcode"
           ? (savedDefaults?.reasoningEffort ?? null)
           : null,
       );
@@ -1106,42 +1090,58 @@ export function NewSessionForm({
     [selectedGatewayProtocols],
   );
 
-  // Combined display text: committed text + interim transcript
-  const displayText = interimTranscript
-    ? message + (message.trimEnd() ? " " : "") + interimTranscript
-    : message;
-
-  // Auto-scroll textarea when voice input updates (interim transcript changes)
-  // Browser handles scrolling for normal typing, but programmatic updates need explicit scroll
+  // Local files survive refreshes and navigation in IndexedDB, keyed like the
+  // text draft. Until the restore finishes, starting is blocked so a draft
+  // cannot be sent with `@[name]` tokens whose files are still loading.
+  const draftFilesKey = `${getCurrentInstallId() ?? location.host}:new-session:${projectId}`;
+  const [restoringFiles, setRestoringFiles] = useState(
+    draftFileStore.available,
+  );
+  const reportedUnsavedRef = useRef(new Set<string>());
   useEffect(() => {
-    if (interimTranscript) {
-      const textarea = textareaRef.current;
-      if (textarea) {
-        textarea.scrollTop = textarea.scrollHeight;
+    if (!draftFileStore.available) return;
+    let cancelled = false;
+    void draftFileStore.load(draftFilesKey).then((stored) => {
+      if (cancelled) return;
+      if (stored.length > 0 && pendingFilesRef.current.length === 0) {
+        const restored = stored.map(({ id, file }) => ({
+          id,
+          file,
+          previewUrl: file.type.startsWith("image/")
+            ? URL.createObjectURL(file)
+            : undefined,
+        }));
+        pendingFileOrderRef.current = restored.map((file) => file.id);
+        setPendingFiles(restored);
       }
-    }
-  }, [interimTranscript]);
-
-  // Focus textarea on mount if autoFocus is enabled
+      setRestoringFiles(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [draftFilesKey]);
   useEffect(() => {
-    if (autoFocus) {
-      textareaRef.current?.focus();
-    }
-  }, [autoFocus]);
-
-  // Recover a pending draft handoff from clients with the retired floating composer.
-  useEffect(() => {
-    const prefill = getLegacySessionPrefill();
-    if (prefill) {
-      setMessage(prefill);
-      clearLegacySessionPrefill();
-      // Focus and move cursor to end
-      if (textareaRef.current) {
-        textareaRef.current.focus();
-        textareaRef.current.setSelectionRange(prefill.length, prefill.length);
-      }
-    }
-  }, [setMessage]);
+    if (!draftFileStore.available || restoringFiles || isStarting) return;
+    const timer = setTimeout(() => {
+      void draftFileStore
+        .save(
+          draftFilesKey,
+          pendingFiles.map(({ id, file }) => ({ id, file })),
+        )
+        .then(({ skippedNames }) => {
+          const fresh = skippedNames.filter(
+            (name) => !reportedUnsavedRef.current.has(name),
+          );
+          for (const name of fresh) reportedUnsavedRef.current.add(name);
+          if (fresh.length > 0)
+            showToast(
+              t("newSessionFilesNotSaved", { names: fresh.join(", ") }),
+              "info",
+            );
+        });
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [draftFilesKey, isStarting, pendingFiles, restoringFiles, showToast, t]);
 
   const addPendingFiles = (files: File[], beforeAttachmentId?: string) => {
     const newPendingFiles: PendingFile[] = files.map((file) => ({
@@ -1176,16 +1176,9 @@ export function NewSessionForm({
     setPendingFiles((prev) => prev.filter((file) => !ids.includes(file.id)));
   };
 
-  const {
-    composerAttachments,
-    detachedAttachments: detachedPendingFiles,
-    handleChange,
-    handleFileSelect,
-    handlePaste,
-    removeAttachment: handleRemoveFile,
-  } = useComposerDocument({
-    value: displayText,
-    editorRef: textareaRef,
+  const composer = useComposer({
+    text: message,
+    setText: setMessage,
     attachments: pendingFiles,
     describeAttachment: (pending) => {
       const progress = isStarting ? uploadProgress[pending.id] : undefined;
@@ -1202,6 +1195,12 @@ export function NewSessionForm({
           : undefined,
       };
     },
+    // Pending files are still local, so copies carry their bytes.
+    getClipboardSource: (pending) => ({
+      name: pending.file.name,
+      mimeType: pending.file.type,
+      read: async () => pending.file,
+    }),
     disabled: isStarting,
     onAttach: addPendingFiles,
     onRemove: removePendingFiles,
@@ -1221,11 +1220,34 @@ export function NewSessionForm({
           ),
         );
     },
-    onTextChange: (value) => {
-      setInterimTranscript("");
-      setMessage(value);
+    commandConfigs: commandButtons,
+    onCommandMenuOpen: refreshCommandListing,
+    onSubmit: () => {
+      void handleStartSession();
     },
   });
+  const editorRef = composer.editorRef;
+
+  // Focus the editor on mount if autoFocus is enabled
+  useEffect(() => {
+    if (autoFocus) {
+      editorRef.current?.focus();
+    }
+  }, [autoFocus, editorRef]);
+
+  // Recover a pending draft handoff from clients with the retired floating composer.
+  useEffect(() => {
+    const prefill = getLegacySessionPrefill();
+    if (prefill) {
+      setMessage(prefill);
+      clearLegacySessionPrefill();
+      // Focus and move cursor to end
+      if (editorRef.current) {
+        editorRef.current.focus();
+        editorRef.current.setSelectionRange(prefill.length, prefill.length);
+      }
+    }
+  }, [setMessage, editorRef]);
 
   const handleModeSelect = (selectedMode: PermissionMode) => {
     setMode(selectedMode);
@@ -1296,6 +1318,28 @@ export function NewSessionForm({
   const cursorListedCount =
     providers.find((provider) => provider.name === "cursor")?.models?.length ??
     0;
+  useEffect(() => {
+    if (selectedProvider !== "mcode") {
+      setMcodeCatalog(null);
+      return;
+    }
+    let cancelled = false;
+    // The shared provider list returns immediately while ACP refreshes in the
+    // background. Consume that refresh even when the previous list was nonempty.
+    api
+      .getProvider("mcode", { fresh: true })
+      .then(({ provider }) => {
+        if (cancelled) return;
+        const models = provider.models ?? [];
+        setMcodeCatalog(models);
+        setSelectedModel((current) => getPreferredModelId(models, current));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProvider]);
+
   useEffect(() => {
     if (selectedProvider !== "cursor" || cursorListedCount > 0) return;
     let cancelled = false;
@@ -1441,22 +1485,15 @@ export function NewSessionForm({
   ]);
 
   const handleStartSession = async () => {
-    // Stop voice recording and get any pending interim text
-    const pendingVoice = voiceButtonRef.current?.stopAndFinalize() ?? "";
-
-    // Combine committed text with any pending voice text
-    let finalMessage = message.trimEnd();
-    if (pendingVoice) {
-      finalMessage = finalMessage
-        ? `${finalMessage} ${pendingVoice}`
-        : pendingVoice;
-    }
+    // Stop dictation and include any pending transcript.
+    const finalMessage = composer.takeText();
 
     const hasContent = finalMessage.trim() || pendingFiles.length > 0;
     if (
       !projectId ||
       !hasContent ||
       isStarting ||
+      restoringFiles ||
       startRetryBlockedMessage ||
       selectedProviderInfo?.unavailableReason ||
       hasGatewayConfigError
@@ -1466,7 +1503,6 @@ export function NewSessionForm({
 
     const trimmedMessage = finalMessage.trim();
 
-    setInterimTranscript("");
     setIsStarting(true);
     let sessionStartOutcomePending = false;
 
@@ -1507,6 +1543,7 @@ export function NewSessionForm({
             ? (selectedLlmGatewayKeyId ?? undefined)
             : undefined,
         llmGatewayConfig: llmGatewayConfigForRequest,
+        codexInputs: codexInputsForMessage(trimmedMessage),
       };
 
       if (pendingFiles.length > 0) {
@@ -1565,6 +1602,8 @@ export function NewSessionForm({
           undefined, // tempId
           thinking, // Pass the captured thinking setting to avoid process restart
           sessionOptions.reasoningEffort,
+          undefined, // deferred
+          sessionOptions.codexInputs,
         );
       } else {
         // No files - use single-step flow for efficiency
@@ -1589,6 +1628,7 @@ export function NewSessionForm({
       }
 
       draftControls.clearDraft();
+      void draftFileStore.remove(draftFilesKey);
       // Pass initial status so SessionPage can connect SSE immediately
       // without waiting for getSession to complete
       // Also pass initial message as optimistic title (session name = first message)
@@ -1660,82 +1700,7 @@ export function NewSessionForm({
     }
   };
 
-  const handleKeyDown = (event: KeyboardEvent) => {
-    handleComposerSubmitKey(event, {
-      onSubmit: () => {
-        void handleStartSession();
-      },
-      isListening: voiceButtonRef.current?.isListening,
-    });
-  };
-
-  // Voice input handlers
-  const handleVoiceTranscript = useCallback(
-    (transcript: string) => {
-      const trimmed = message.trimEnd();
-      if (trimmed) {
-        setMessage(`${trimmed} ${transcript}`);
-      } else {
-        setMessage(transcript);
-      }
-      setInterimTranscript("");
-      // Scroll to bottom after committing voice transcript
-      // Use setTimeout to ensure state update has rendered
-      setTimeout(() => {
-        const textarea = textareaRef.current;
-        if (textarea) {
-          textarea.scrollTop = textarea.scrollHeight;
-        }
-      }, 0);
-    },
-    [message, setMessage],
-  );
-
-  const handleInterimTranscript = useCallback((transcript: string) => {
-    setInterimTranscript(transcript);
-  }, []);
-
-  const insertIntoMessage = useCallback(
-    (insertText: string) => {
-      const textarea = textareaRef.current;
-      const start = textarea?.selectionStart ?? message.length;
-      const end = textarea?.selectionEnd ?? message.length;
-      const before = message.slice(0, start);
-      const after = message.slice(end);
-      const leading = before.length > 0 && !/\s$/.test(before) ? " " : "";
-      const trailing = after.length > 0 && !/^\s/.test(after) ? " " : " ";
-      const nextMessage = `${before}${leading}${insertText}${trailing}${after}`;
-      const nextCursor =
-        before.length + leading.length + insertText.length + trailing.length;
-
-      setInterimTranscript("");
-      setMessage(nextMessage);
-
-      const restoreFocus = () => {
-        textareaRef.current?.focus();
-        textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
-      };
-
-      if (typeof requestAnimationFrame === "function") {
-        requestAnimationFrame(restoreFocus);
-      } else {
-        setTimeout(restoreFocus, 0);
-      }
-    },
-    [message, setMessage],
-  );
-
-  const handleSelectCommand = useCallback(
-    (command: string) => {
-      insertIntoMessage(command);
-    },
-    [insertIntoMessage],
-  );
-
   const hasContent = message.trim() || pendingFiles.length > 0;
-  const previewFile = previewFileId
-    ? pendingFiles.find((pf) => pf.id === previewFileId)
-    : undefined;
   const savedDefaults = settings?.newSessionDefaults;
   const savedProviderDefaults = selectedProvider
     ? getNewSessionProviderDefaults(savedDefaults, selectedProvider)
@@ -1753,7 +1718,6 @@ export function NewSessionForm({
   const reasoningEffortDefaultsMatch =
     selectedProvider === "codex" ||
     selectedProvider === "pi" ||
-    selectedProvider === "kimi" ||
     selectedProvider === "mcode"
       ? (savedProviderDefaults?.reasoningEffort ?? undefined) ===
         selectedReasoningEffort
@@ -1841,154 +1805,82 @@ export function NewSessionForm({
     );
   };
 
-  // Shared input area with toolbar (textarea + attach/voice on left, send on right)
+  // Shared composer (editor + toolbar); the send button starts the session.
   const inputArea = (
     <>
-      <div className="new-session-composer">
-        <AttachmentComposer
-          ref={textareaRef}
-          value={displayText}
-          attachments={composerAttachments}
-          onPreview={setPreviewFileId}
-          onRemove={handleRemoveFile}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-          placeholder={resolvedPlaceholder}
-          disabled={isStarting}
-          rows={rows}
-          className="new-session-form-textarea"
-        />
-      </div>
-      <div className="new-session-form-toolbar">
-        <div className="new-session-form-toolbar-left">
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            style={{ display: "none" }}
-            onChange={handleFileSelect}
-          />
+      <ComposerEditor
+        composer={composer}
+        containerClassName="new-session-composer"
+        className="new-session-form-textarea"
+        menuPlacement="below"
+        placeholder={resolvedPlaceholder}
+        disabled={isStarting}
+        rows={rows}
+        attachmentDetail={(pending) => {
+          const progress = isStarting ? uploadProgress[pending.id] : undefined;
+          return progress
+            ? `${Math.round((progress.uploaded / progress.total) * 100)}%`
+            : formatSize(pending.file.size);
+        }}
+      />
+      <ComposerToolbar
+        variant="new-session"
+        attach={{
+          onClick: composer.openFilePicker,
+          disabled: isStarting,
+          title: t("newSessionAttachFiles"),
+        }}
+        copy={{
+          onCopy: composer.document.copyAll,
+          disabled: isStarting || !hasContent,
+        }}
+        thinking={
+          supportsThinkingToggle && compact ? (
+            <ThinkingToggleButton
+              mode={thinkingMode}
+              levelLabel={getEffortLabel(
+                effectiveCodexReasoningEffort ?? thinkingLevel,
+              )}
+              onCycle={cycleThinkingMode}
+              disabled={isStarting}
+              className={composerToolbarButtonClass("new-session")}
+              iconSize={composerToolbarIconSize("new-session")}
+            />
+          ) : undefined
+        }
+        voice={{
+          ...composer.voice,
+          disabled: isStarting,
+        }}
+        commands={{
+          buttons: commandButtons,
+          onSelect: composer.completion.insertCommand,
+          disabled: isStarting,
+        }}
+        actions={
           <button
             type="button"
-            className="toolbar-button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isStarting}
-            aria-label={t("newSessionAttachFiles")}
+            onClick={handleStartSession}
+            disabled={
+              isStarting ||
+              restoringFiles ||
+              Boolean(startRetryBlockedMessage) ||
+              Boolean(selectedProviderInfo?.unavailableReason) ||
+              !hasContent ||
+              hasGatewayConfigError
+            }
+            className="send-button"
+            aria-label={t("newSessionStartAction")}
+            title={startRetryBlockedMessage ?? undefined}
           >
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              aria-hidden="true"
-            >
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-            </svg>
+            {isStarting ? (
+              <span className="send-spinner" />
+            ) : (
+              <span className="send-icon">↑</span>
+            )}
           </button>
-          <VoiceInputButton
-            ref={voiceButtonRef}
-            onTranscript={handleVoiceTranscript}
-            onInterimTranscript={handleInterimTranscript}
-            onListeningStart={() => textareaRef.current?.focus()}
-            disabled={isStarting}
-            className="toolbar-button"
-          />
-          {commandButtons
-            .filter((button) => button.showButton && button.commands.length > 0)
-            .map((button) => (
-              <SlashCommandButton
-                key={button.prefix}
-                commands={button.commands}
-                onSelectCommand={handleSelectCommand}
-                disabled={isStarting}
-                prefix={button.prefix}
-                label={button.label}
-              />
-            ))}
-          {supportsThinkingToggle && compact && (
-            <button
-              type="button"
-              className={`toolbar-button thinking-toggle-button ${thinkingMode !== "off" ? `active ${thinkingMode}` : ""}`}
-              onClick={cycleThinkingMode}
-              disabled={isStarting}
-              title={
-                thinkingMode === "off"
-                  ? t("newSessionThinkingOff")
-                  : thinkingMode === "auto"
-                    ? t("newSessionThinkingAuto")
-                    : t("newSessionThinkingOn", {
-                        level: getEffortLabel(
-                          effectiveCodexReasoningEffort ?? thinkingLevel,
-                        ),
-                      })
-              }
-              aria-label={t("newSessionThinkingMode", { mode: thinkingMode })}
-            >
-              <svg
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="10" />
-                <polyline points="12 6 12 12 16 14" />
-                {thinkingMode === "auto" && (
-                  <g>
-                    <circle
-                      cx="19"
-                      cy="5"
-                      r="5.5"
-                      fill="currentColor"
-                      stroke="none"
-                    />
-                    <text
-                      x="19"
-                      y="5"
-                      textAnchor="middle"
-                      dominantBaseline="central"
-                      fill="var(--bg-primary, #1a1a2e)"
-                      fontSize="8"
-                      fontWeight="700"
-                      fontFamily="var(--font-sans)"
-                      stroke="none"
-                    >
-                      A
-                    </text>
-                  </g>
-                )}
-              </svg>
-            </button>
-          )}
-        </div>
-        <button
-          type="button"
-          onClick={handleStartSession}
-          disabled={
-            isStarting ||
-            Boolean(startRetryBlockedMessage) ||
-            Boolean(selectedProviderInfo?.unavailableReason) ||
-            !hasContent ||
-            hasGatewayConfigError
-          }
-          className="send-button"
-          aria-label={t("newSessionStartAction")}
-          title={startRetryBlockedMessage ?? undefined}
-        >
-          {isStarting ? (
-            <span className="send-spinner" />
-          ) : (
-            <span className="send-icon">↑</span>
-          )}
-        </button>
-      </div>
+        }
+      />
       {startRetryBlockedMessage && (
         <p className="new-session-limit-error" role="alert">
           {startRetryBlockedMessage}
@@ -2022,20 +1914,20 @@ export function NewSessionForm({
           </div>
         </div>
       )}
-      {showKimiReasoningSelector && compact && (
+      {showNamedReasoningSelector && compact && (
         <div className="new-session-effort-control">
           <span className="new-session-effort-label">
             {t("newSessionThinkingControlTitle")}
           </span>
           <div className="new-session-effort-options">
-            {kimiReasoningOptions.map((option) => {
-              const selected = effectiveKimiReasoningEffort === option.value;
+            {namedReasoningOptions.map((option) => {
+              const selected = effectiveNamedReasoningEffort === option.value;
               return (
                 <button
                   key={option.value}
                   type="button"
                   className={`new-session-effort-option ${selected ? "selected" : ""}`}
-                  onClick={() => setKimiReasoningEffort(option.value)}
+                  onClick={() => setNamedReasoningEffort(option.value)}
                   disabled={isStarting}
                   aria-pressed={selected}
                   aria-label={`${t("newSessionThinkingControlTitle")}: ${option.label}`}
@@ -2047,39 +1939,6 @@ export function NewSessionForm({
           </div>
         </div>
       )}
-      {detachedPendingFiles.length > 0 && (
-        <div className="attachment-list">
-          {detachedPendingFiles.map((pf) => {
-            const progress = isStarting ? uploadProgress[pf.id] : undefined;
-            return (
-              <ComposerAttachmentCard
-                key={pf.id}
-                attachment={{
-                  id: pf.id,
-                  name: pf.file.name,
-                  mimeType: pf.file.type,
-                  previewUrl: pf.previewUrl,
-                }}
-                detail={
-                  progress
-                    ? `${Math.round((progress.uploaded / progress.total) * 100)}%`
-                    : formatSize(pf.file.size)
-                }
-                disabled={isStarting}
-                onPreview={setPreviewFileId}
-                onRemove={handleRemoveFile}
-              />
-            );
-          })}
-        </div>
-      )}
-      {previewFile && (
-        <AttachmentPreviewModal
-          name={previewFile.file.name}
-          src={previewFile.previewUrl ?? null}
-          onClose={() => setPreviewFileId(null)}
-        />
-      )}
     </>
   );
 
@@ -2087,7 +1946,7 @@ export function NewSessionForm({
   if (compact) {
     return (
       <div
-        className={`new-session-form new-session-form-compact ${interimTranscript ? "voice-recording" : ""}`}
+        className={`new-session-form new-session-form-compact ${composer.isDictating ? "voice-recording" : ""}`}
         data-provider={selectedProvider ?? undefined}
         style={newSessionThemeStyle}
       >
@@ -2107,7 +1966,7 @@ export function NewSessionForm({
   // Full mode: form with header, input area, and mode selector
   return (
     <div
-      className={`new-session-form new-session-container ${interimTranscript ? "voice-recording" : ""}`}
+      className={`new-session-form new-session-container ${composer.isDictating ? "voice-recording" : ""}`}
       data-provider={selectedProvider ?? undefined}
       style={newSessionThemeStyle}
     >
@@ -2208,7 +2067,7 @@ export function NewSessionForm({
         selectedProvider !== "cursor" &&
         (modelOptions.length > 0 ||
           supportsThinkingToggle ||
-          showKimiReasoningSelector) && (
+          showNamedReasoningSelector) && (
           <div className="new-session-model-section">
             <div className="new-session-model-controls">
               {modelOptions.length > 0 && (
@@ -2294,18 +2153,18 @@ export function NewSessionForm({
                   </div>
                 </div>
               )}
-              {showKimiReasoningSelector && (
+              {showNamedReasoningSelector && (
                 <div className="new-session-config-field">
                   <h3>{t("newSessionThinkingControlTitle")}</h3>
                   <FilterDropdown
                     label={t("newSessionThinkingControlTitle")}
-                    options={kimiReasoningOptions}
+                    options={namedReasoningOptions}
                     selected={
-                      effectiveKimiReasoningEffort
-                        ? [effectiveKimiReasoningEffort]
+                      effectiveNamedReasoningEffort
+                        ? [effectiveNamedReasoningEffort]
                         : []
                     }
-                    onChange={handleKimiReasoningSelect}
+                    onChange={handleNamedReasoningSelect}
                     accentColor={selectedProviderAccent}
                     multiSelect={false}
                     placeholder={t("newSessionThinkingControlTitle")}
@@ -2364,44 +2223,6 @@ export function NewSessionForm({
               </button>
             ))}
           </div>
-        </div>
-      )}
-
-      {/* Read-only ZCode MCP server status snapshot, informational only */}
-      {selectedProvider === "zcode" && (
-        <div className="new-session-mcp-section">
-          <h3>{t("newSessionZcodeMcpTitle")}</h3>
-          {zcodeMcpLoading ? (
-            <p className="settings-hint">{t("newSessionZcodeMcpLoading")}</p>
-          ) : zcodeMcpError ? (
-            <p className="new-session-limit-error" role="alert">
-              {t("newSessionZcodeMcpError", { message: zcodeMcpError })}
-            </p>
-          ) : !zcodeMcpServers || Object.keys(zcodeMcpServers).length === 0 ? (
-            <p className="settings-hint">{t("newSessionZcodeMcpNone")}</p>
-          ) : (
-            <ul className="new-session-mcp-list">
-              {Object.entries(zcodeMcpServers).map(([name, server]) => (
-                <li key={name} className="new-session-mcp-item">
-                  <span className="new-session-mcp-name">{name}</span>
-                  <span className="new-session-mcp-meta">
-                    {zcodeMcpStatusLabels[server.status] ?? server.status}
-                    {server.toolCount !== undefined
-                      ? ` · ${t("newSessionZcodeMcpToolCount", {
-                          count: server.toolCount,
-                        })}`
-                      : ""}
-                    {server.transport ? ` · ${server.transport}` : ""}
-                  </span>
-                  {server.error && (
-                    <span className="new-session-mcp-error">
-                      {server.error}
-                    </span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
         </div>
       )}
 

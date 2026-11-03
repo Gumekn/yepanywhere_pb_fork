@@ -10,11 +10,21 @@ const PROVIDER_COLORS: Record<LiveProviderName, string> = {
   gemini: "var(--provider-gemini)", // Google blue
   "gemini-acp": "var(--provider-gemini)", // Google blue (same as gemini)
   pi: "var(--provider-pi)", // Pi cyan
-  kimi: "var(--provider-kimi, #1783ff)", // Kimi KMBlue
-  zcode: "var(--provider-zcode)", // ZCode
   cursor: "var(--provider-cursor)",
   mcode: "var(--provider-mcode)",
+  dsh: "var(--provider-dsh)",
 };
+
+/**
+ * Provider 主题色（CSS 变量表达式）。未知或已退役 provider 返回 undefined，
+ * 由调用方回落到默认品牌色。
+ */
+export function getProviderAccentColor(
+  provider: ProviderName | null | undefined,
+): string | undefined {
+  if (!provider) return undefined;
+  return PROVIDER_COLORS[provider as LiveProviderName];
+}
 
 const PROVIDER_LABELS: Record<LiveProviderName, string> = {
   claude: "Claude",
@@ -28,10 +38,9 @@ const PROVIDER_LABELS: Record<LiveProviderName, string> = {
   gemini: "Gemini",
   "gemini-acp": "Gemini ACP",
   pi: "Pi",
-  kimi: "Kimi",
-  zcode: "ZCode",
   cursor: "Cursor",
   mcode: "MiniMax",
+  dsh: "dsh",
 };
 
 interface ProviderBadgeProps {

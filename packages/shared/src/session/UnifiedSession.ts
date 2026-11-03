@@ -1,9 +1,7 @@
 import type { ClaudeSessionEntry } from "../claude-sdk-schema/types.js";
 import type { CodexSessionEntry } from "../codex-schema/index.js";
 import type { GeminiSessionFile } from "../gemini-schema/session.js";
-import type { KimiSessionContent } from "../kimi-schema/types.js";
 import type { PiSessionContent } from "../pi-schema/session.js";
-import type { ZCodeSessionContent } from "../zcode-schema/session.js";
 
 /**
  * Claude session file content - array of JSONL entries.
@@ -58,12 +56,15 @@ export type UnifiedSession =
   | { provider: "codex-oss"; session: CodexSessionContent }
   | { provider: "gemini"; session: GeminiSessionFile }
   | { provider: "pi"; session: PiSessionContent }
-  | { provider: "kimi"; session: KimiSessionContent }
-  | { provider: "zcode"; session: ZCodeSessionContent }
   | { provider: "cursor"; session: CursorSessionContent }
   /**
    * MiniMax Code persists Pi-shaped AgentMessages in
    * `~/.minimax/v2/sessions/.../messages.jsonl`; the reader adapts them into
    * a linear Pi session so Pi's transcript projection can be reused.
    */
-  | { provider: "mcode"; session: PiSessionContent };
+  | { provider: "mcode"; session: PiSessionContent }
+  /**
+   * DeepSeek Harness logs (`~/.dsh/sessions/.../session.v*.jsonl.zstd`) are
+   * projected into a linear Pi session by the read-only dsh reader.
+   */
+  | { provider: "dsh"; session: PiSessionContent };

@@ -20,21 +20,20 @@ import type {
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
+import type { DshSessionScanner } from "../projects/dsh-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
-import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { CodexSessionReader } from "../sessions/codex-reader.js";
 import type { CursorSessionReader } from "../sessions/cursor-reader.js";
+import type { DshSessionReader } from "../sessions/dsh-reader.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
-import type { KimiSessionReader } from "../sessions/kimi-reader.js";
 import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import { normalizeSession } from "../sessions/normalization.js";
 import type { PiSessionReader } from "../sessions/pi-reader.js";
 import { resolveSessionSources } from "../sessions/provider-resolution.js";
 import type { ISessionReader } from "../sessions/types.js";
-import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { Project } from "../supervisor/types.js";
 import { buildProviderProjectCatalog } from "./provider-catalog.js";
 
@@ -50,16 +49,13 @@ export interface SearchDeps {
   geminiSessionsDir?: string;
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
   piScanner?: PiSessionScanner;
-  zcodeDbPath?: string;
   piSessionsDir?: string;
   piReaderFactory?: (projectPath: string) => PiSessionReader;
-  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
-  kimiScanner?: KimiSessionScanner;
   cursorScanner?: CursorSessionScanner;
   mcodeScanner?: McodeSessionScanner;
+  dshScanner?: DshSessionScanner;
   mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
-  kimiSessionsDir?: string;
-  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  dshReaderFactory?: (projectPath: string) => DshSessionReader;
   cursorSessionsDir?: string;
   cursorReaderFactory?: (projectPath: string) => CursorSessionReader;
 }
@@ -177,9 +173,9 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       codexScanner: deps.codexScanner,
       geminiScanner: deps.geminiScanner,
       piScanner: deps.piScanner,
-      kimiScanner: deps.kimiScanner,
       cursorScanner: deps.cursorScanner,
       mcodeScanner: deps.mcodeScanner,
+      dshScanner: deps.dshScanner,
     });
 
     const resolutionDeps = {
@@ -191,9 +187,8 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
       geminiHashToCwd: providerCatalog.geminiHashToCwd,
       piSessionsDir: deps.piSessionsDir,
       piReaderFactory: deps.piReaderFactory,
-      kimiSessionsDir: deps.kimiSessionsDir,
-      kimiReaderFactory: deps.kimiReaderFactory,
       mcodeReaderFactory: deps.mcodeReaderFactory,
+      dshReaderFactory: deps.dshReaderFactory,
       cursorSessionsDir: deps.cursorSessionsDir,
       cursorReaderFactory: deps.cursorReaderFactory,
     };

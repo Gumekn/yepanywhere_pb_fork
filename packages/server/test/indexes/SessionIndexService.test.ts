@@ -13,7 +13,6 @@ import { dirname, join } from "node:path";
 import { toUrlProjectId } from "@yep-anywhere/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionIndexService } from "../../src/indexes/SessionIndexService.js";
-import { KimiSessionReader } from "../../src/sessions/kimi-reader.js";
 import { SessionReader } from "../../src/sessions/reader.js";
 import type { ISessionReader } from "../../src/sessions/types.js";
 import type { SessionSummary } from "../../src/supervisor/types.js";
@@ -420,42 +419,6 @@ describe("SessionIndexService", () => {
         expect(sessions[0]?.title).toBe("Real title");
       },
     );
-
-    it("rebuilds a current-version index containing a poisoned Kimi title", async () => {
-      await createSession("session-1", "Recovered title");
-      const fileStats = await stat(join(sessionDir, "session-1.jsonl"));
-      const poisonedTitle =
-        "<system-reminder> [yep-anywhere:kimi-acp-single-question] This ACP host can transport exactly one AskUserQuestion ite...";
-      const indexPath = service.getIndexPath(sessionDir);
-      await writeFile(
-        indexPath,
-        JSON.stringify({
-          version: 14,
-          projectId,
-          sessions: {
-            "session-1": {
-              title: poisonedTitle,
-              fullTitle: poisonedTitle,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-              messageCount: 1,
-              indexedBytes: fileStats.size,
-              fileMtime: fileStats.mtimeMs,
-              provider: "kimi",
-            },
-          },
-        }),
-      );
-
-      const sessions = await service.getSessionsWithCache(
-        sessionDir,
-        projectId,
-        reader,
-      );
-
-      expect(sessions[0]?.title).toBe("Recovered title");
-      expect(sessions[0]?.provider).not.toBe("kimi");
-    });
   });
 
   describe("index file location", () => {
@@ -631,7 +594,7 @@ describe("SessionIndexService", () => {
       expect(sessions).toHaveLength(1);
     });
 
-    it.each(["codex", "kimi"] as const)(
+    it.each(["codex", "mcode"] as const)(
       "invalidates loaded %s scopes on file-change events",
       async (provider) => {
         const eventBus = new EventBus();
@@ -805,7 +768,7 @@ describe("SessionIndexService", () => {
       expect(refreshed[0]?.lastTurnStatus).toBe("completed");
     });
 
-    it.each(["gemini", "kimi"] as const)(
+    it.each(["gemini", "mcode"] as const)(
       "does not leak a modified %s session into another project scope",
       async (provider) => {
         const eventBus = new EventBus();
@@ -882,103 +845,6 @@ describe("SessionIndexService", () => {
         expect(afterB.map((session) => session.id)).toEqual([]);
       },
     );
-
-    it("refreshes Kimi metadata when only state.json changes", async () => {
-      const eventBus = new EventBus();
-      const kimiService = new SessionIndexService({
-        dataDir,
-        projectsDir,
-        eventBus,
-        fullValidationIntervalMs: 60000,
-      });
-      await kimiService.initialize();
-
-      const projectPath = "/test/project";
-      const kimiSessionsDir = join(testDir, "kimi-state-sessions");
-      const kimiSessionDir = join(kimiSessionsDir, "wd_test", "session_state");
-      const statePath = join(kimiSessionDir, "state.json");
-      const wirePath = join(kimiSessionDir, "agents", "main", "wire.jsonl");
-      const timestamp = Date.now();
-      const writeState = (title: string) =>
-        writeFile(
-          statePath,
-          JSON.stringify({
-            version: 2,
-            cwd: projectPath,
-            title,
-            createdAt: timestamp,
-            updatedAt: timestamp,
-          }),
-        );
-
-      await mkdir(join(kimiSessionDir, "agents", "main"), {
-        recursive: true,
-      });
-      await writeState("Old title");
-      await writeFile(
-        wirePath,
-        `${JSON.stringify({
-          type: "turn.prompt",
-          input: [{ type: "text", text: "hello" }],
-          origin: { kind: "user" },
-          time: timestamp,
-        })}\n`,
-      );
-
-      const kimiReader = new KimiSessionReader({
-        sessionsDir: kimiSessionsDir,
-        projectPath,
-      });
-      const first = await kimiService.getSessionsWithCache(
-        kimiSessionsDir,
-        projectId,
-        kimiReader,
-      );
-      expect(first[0]?.title).toBe("Old title");
-
-      await writeState("New title");
-      const future = new Date(Date.now() + 5000);
-      await utimes(statePath, future, future);
-      kimiReader.invalidateCache();
-      eventBus.emit({
-        type: "file-change",
-        provider: "kimi",
-        path: statePath,
-        relativePath: "wd_test/session_state/state.json",
-        changeType: "modify",
-        timestamp: new Date().toISOString(),
-        fileType: "session",
-      });
-
-      const refreshed = await kimiService.getSessionsWithCache(
-        kimiSessionsDir,
-        projectId,
-        kimiReader,
-      );
-      expect(refreshed[0]?.title).toBe("New title");
-
-      const cachedSummary = await kimiService.getSessionSummaryWithCache(
-        kimiSessionsDir,
-        projectId,
-        "session_state",
-        kimiReader,
-      );
-      expect(cachedSummary?.title).toBe("New title");
-
-      await writeState("Hot title");
-      const later = new Date(Date.now() + 10000);
-      await utimes(statePath, later, later);
-      kimiReader.invalidateCache();
-
-      const refreshedSummary = await kimiService.getSessionSummaryWithCache(
-        kimiSessionsDir,
-        projectId,
-        "session_state",
-        kimiReader,
-      );
-      expect(refreshedSummary?.title).toBe("Hot title");
-      kimiService.dispose();
-    });
   });
 
   describe("getSessionSummaryWithCache", () => {
@@ -1418,7 +1284,7 @@ describe("SessionIndexService full-validation throttling", () => {
     testDir = join(tmpdir(), `index-throttle-${randomUUID()}`);
     dataDir = join(testDir, "indexes");
     projectsDir = join(testDir, "projects");
-    sessionDir = join(testDir, "zcode-sessions");
+    sessionDir = join(testDir, "mcode-sessions");
     await mkdir(dataDir, { recursive: true });
     await mkdir(sessionDir, { recursive: true });
     projectId = toUrlProjectId("/test/project");
@@ -1435,7 +1301,7 @@ describe("SessionIndexService full-validation throttling", () => {
   function countingReader(scope: string, onList?: () => Promise<void>) {
     let listCalls = 0;
     const reader: ISessionReader = {
-      getIndexScopeKey: (dir) => `zcode::${dir}::${scope}`,
+      getIndexScopeKey: (dir) => `mcode::${dir}::${scope}`,
       listSessionFiles: async (dir) => {
         listCalls += 1;
         await onList?.();
@@ -1455,7 +1321,7 @@ describe("SessionIndexService full-validation throttling", () => {
         updatedAt: "2026-08-17T00:00:00.000Z",
         messageCount: 1,
         ownership: { owner: "none" },
-        provider: "zcode",
+        provider: "mcode",
       }),
       getAgentMappings: async () => [],
       getAgentSession: async () => null,
@@ -1468,10 +1334,10 @@ describe("SessionIndexService full-validation throttling", () => {
     };
   }
 
-  function emitZCodeChange(bus: EventBus): void {
+  function emitMcodeChange(bus: EventBus): void {
     bus.emit({
       type: "file-change",
-      provider: "zcode",
+      provider: "mcode",
       path: join(sessionDir, "session-1.jsonl"),
       relativePath: "session-1.jsonl",
       changeType: "modify",
@@ -1501,7 +1367,7 @@ describe("SessionIndexService full-validation throttling", () => {
 
     // A watcher storm: every event marks the scope dirty.
     for (let i = 0; i < 20; i++) {
-      emitZCodeChange(eventBus);
+      emitMcodeChange(eventBus);
       await service.getSessionsWithCache(sessionDir, projectId, reader);
     }
 
@@ -1525,7 +1391,7 @@ describe("SessionIndexService full-validation throttling", () => {
     await service.getSessionsWithCache(sessionDir, projectId, reader);
     const primed = probe.listCalls();
 
-    emitZCodeChange(eventBus);
+    emitMcodeChange(eventBus);
     await new Promise((resolve) => setTimeout(resolve, 40));
     await service.getSessionsWithCache(sessionDir, projectId, reader);
 
@@ -1549,7 +1415,7 @@ describe("SessionIndexService full-validation throttling", () => {
     await service.getSessionsWithCache(sessionDir, projectId, reader);
     const primed = probe.listCalls();
 
-    emitZCodeChange(eventBus);
+    emitMcodeChange(eventBus);
     await service.getSessionsWithCache(sessionDir, projectId, reader);
 
     expect(probe.listCalls()).toBeGreaterThan(primed);
@@ -1621,7 +1487,7 @@ describe("SessionIndexService full-validation accounting", () => {
 
   function slowReader(scope: string, workMs: number): ISessionReader {
     return {
-      getIndexScopeKey: (dir) => `zcode::${dir}::${scope}`,
+      getIndexScopeKey: (dir) => `mcode::${dir}::${scope}`,
       listSessionFiles: async (dir) => {
         await new Promise((resolve) => setTimeout(resolve, workMs));
         return [
@@ -1640,7 +1506,7 @@ describe("SessionIndexService full-validation accounting", () => {
         updatedAt: "2026-08-17T00:00:00.000Z",
         messageCount: 1,
         ownership: { owner: "none" },
-        provider: "zcode",
+        provider: "mcode",
       }),
       getAgentMappings: async () => [],
       getAgentSession: async () => null,
@@ -1732,7 +1598,7 @@ describe("SessionIndexService full-validation admission", () => {
 
   function reader(scope: string, workMs: number): ISessionReader {
     return {
-      getIndexScopeKey: (dir) => `zcode::${dir}::${scope}`,
+      getIndexScopeKey: (dir) => `mcode::${dir}::${scope}`,
       listSessionFiles: async (dir) => {
         if (workMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, workMs));
@@ -1753,7 +1619,7 @@ describe("SessionIndexService full-validation admission", () => {
         updatedAt: "2026-08-17T00:00:00.000Z",
         messageCount: 1,
         ownership: { owner: "none" },
-        provider: "zcode",
+        provider: "mcode",
       }),
       getAgentMappings: async () => [],
       getAgentSession: async () => null,

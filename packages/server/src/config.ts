@@ -20,10 +20,7 @@ import {
   DEFAULT_LLM_GATEWAY_API_BASE,
   defaultSubModuleForApiBase,
 } from "./llm-gateways/index.js";
-import {
-  getDefaultCodexHomeDir,
-  getDefaultCodexSessionsDir,
-} from "./projects/codex-scanner.js";
+import { getDefaultCodexSessionsDir } from "./projects/codex-scanner.js";
 
 /**
  * Get the data directory for yep-anywhere state files.
@@ -59,8 +56,6 @@ export interface Config {
   geminiSessionsDir: string;
   /** Codex sessions directory (~/.codex/sessions) */
   codexSessionsDir: string;
-  /** Kimi sessions directory (~/.kimi-code/sessions) */
-  kimiSessionsDir: string;
   /** User-triggered AI session title generation. */
   sessionTitleGeneration: SessionTitleGenerationConfig;
   /** Whether to run the local Codex CLI bridge for `codex --remote ws://...`. */
@@ -161,8 +156,6 @@ export interface Config {
   enabledProviders: string[];
   /** Whether voice input is enabled. Default: true */
   voiceInputEnabled: boolean;
-  /** Allowed directory prefixes for serving local images (e.g., ["/tmp"]). Empty = disabled. */
-  allowedImagePaths: string[];
 
   /** Whether cookie-based auth is disabled by env var (--auth-disable or AUTH_DISABLED=true). Used for recovery. */
   authDisabled: boolean;
@@ -241,16 +234,6 @@ export function loadConfig(): Config {
     path.join(os.homedir(), ".gemini", "tmp");
   const codexSessionsDir =
     process.env.CODEX_SESSIONS_DIR ?? getDefaultCodexSessionsDir();
-  // Empty env values must not become an empty local-image allowlist prefix:
-  // `${prefix}/` would be "/" and match every absolute path.
-  const configuredKimiSessionsDir = process.env.KIMI_SESSIONS_DIR?.trim();
-  const configuredKimiCodeHome = process.env.KIMI_CODE_HOME?.trim();
-  const kimiSessionsDir =
-    configuredKimiSessionsDir ||
-    path.join(
-      configuredKimiCodeHome || path.join(os.homedir(), ".kimi-code"),
-      "sessions",
-    );
   const codexBridgePort = parseIntOrDefault(
     process.env.YEP_CODEX_BRIDGE_PORT ?? process.env.CODEX_BRIDGE_PORT,
     4510,
@@ -308,17 +291,6 @@ export function loadConfig(): Config {
     0,
     parseIntOrDefault(process.env.PROJECT_SCAN_CACHE_TTL_MS, 5000),
   );
-  const managedUploadsDir = path.join(dataDir, "uploads");
-  const extraAllowedImagePaths =
-    process.env.ALLOWED_IMAGE_PATHS !== undefined
-      ? process.env.ALLOWED_IMAGE_PATHS.split(",")
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : ["/tmp"];
-  const codexGeneratedImagesDir = path.join(
-    getDefaultCodexHomeDir(),
-    "generated_images",
-  );
   const sessionTitleApiKey =
     process.env.SESSION_TITLE_LLM_API_KEY ?? process.env.LLM_API_KEY;
   const sessionTitleApiBase =
@@ -362,7 +334,6 @@ export function loadConfig(): Config {
     claudeSessionsDir,
     geminiSessionsDir,
     codexSessionsDir,
-    kimiSessionsDir,
     sessionTitleGeneration,
     codexBridgeEnabled: codexBridgeMode !== "disabled",
     codexBridgeMode,
@@ -471,20 +442,6 @@ export function loadConfig(): Config {
       : [],
     // Voice input (default: true, set VOICE_INPUT=false to disable)
     voiceInputEnabled: process.env.VOICE_INPUT !== "false",
-    // Always allow yep-managed uploads. ALLOWED_IMAGE_PATHS adds external paths
-    // like /tmp; an empty value disables only those extras.
-    // kimiSessionsDir is included so transcripts can render the prompt images
-    // Kimi persists content-addressed under `<session>/agents/*/blobs/`.
-    allowedImagePaths: Array.from(
-      new Set(
-        [
-          managedUploadsDir,
-          codexGeneratedImagesDir,
-          kimiSessionsDir,
-          ...extraAllowedImagePaths,
-        ].filter((allowedPath) => allowedPath.trim().length > 0),
-      ),
-    ),
     // Auth disabled override (for recovery if user forgets password)
     authDisabled: process.env.AUTH_DISABLED === "true",
     authCookieSecret: process.env.AUTH_COOKIE_SECRET,

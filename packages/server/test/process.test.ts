@@ -99,6 +99,68 @@ describe("Process", () => {
     expect(process.resolvedReasoningEffort).toBe("max");
   });
 
+  it("passes trimmed compaction instructions to the provider", async () => {
+    const compact = vi.fn(async () => {});
+    const process = new Process(createMockIterator([]), {
+      projectPath: "/test",
+      projectId: "proj-1",
+      sessionId: "sess-pi-compact",
+      provider: "pi",
+      compactFn: compact,
+    });
+
+    expect(process.supportsCompact).toBe(true);
+    await expect(
+      process.compact({ customInstructions: "  keep API notes " }),
+    ).resolves.toBe(true);
+    expect(compact).toHaveBeenLastCalledWith({
+      customInstructions: "keep API notes",
+    });
+    await process.compact({ customInstructions: "   " });
+    expect(compact).toHaveBeenLastCalledWith({});
+  });
+
+  it("keeps an idle Pi session busy while a between-turn compaction runs", async () => {
+    const pending: Array<(value: IteratorResult<SDKMessage>) => void> = [];
+    const queued: SDKMessage[] = [];
+    const iterator: AsyncIterator<SDKMessage> = {
+      next: () => {
+        const message = queued.shift();
+        if (message) return Promise.resolve({ done: false, value: message });
+        return new Promise((resolve) => pending.push(resolve));
+      },
+    };
+    const emit = (message: SDKMessage) => {
+      const waiter = pending.shift();
+      if (waiter) waiter({ done: false, value: message });
+      else queued.push(message);
+    };
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const process = new Process(iterator, {
+      projectPath: "/test",
+      projectId: "proj-1",
+      sessionId: "sess-pi-compacting",
+      provider: "pi",
+      idleTimeoutMs: 60_000,
+      queue: new MessageQueue(),
+    });
+
+    emit({ type: "system", subtype: "init", session_id: "sess-pi-compacting" });
+    emit({ type: "result", session_id: "sess-pi-compacting" });
+    await settle();
+    expect(process.state.type).toBe("idle");
+
+    emit({ type: "system", subtype: "status", status: "compacting" });
+    await settle();
+    expect(process.state.type).toBe("in-turn");
+
+    emit({ type: "system", subtype: "status", status: null });
+    emit({ type: "result", session_id: "sess-pi-compacting" });
+    await settle();
+    expect(process.state.type).toBe("idle");
+    process.abort();
+  });
+
   it("does not report a model switch when the provider has no native API", async () => {
     const process = new Process(createMockIterator([]), {
       projectPath: "/test",
@@ -217,7 +279,7 @@ describe("Process", () => {
         markSecondTurnStarted = resolve;
       });
 
-      async function* kimiLikeIterator(): AsyncGenerator<SDKMessage> {
+      async function* residentAcpIterator(): AsyncGenerator<SDKMessage> {
         const messages = queue.generator();
         const first = await messages.next();
         if (first.done) return;
@@ -234,11 +296,11 @@ describe("Process", () => {
         yield { type: "result", session_id: "sess-1" };
       }
 
-      const process = new Process(kimiLikeIterator(), {
+      const process = new Process(residentAcpIterator(), {
         projectPath: "/test",
         projectId: "proj-1",
         sessionId: "sess-1",
-        provider: "kimi",
+        provider: "mcode",
         idleTimeoutMs: 60_000,
         queue,
       });

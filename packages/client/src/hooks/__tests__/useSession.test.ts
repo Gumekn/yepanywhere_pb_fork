@@ -6,10 +6,7 @@ import type { Message, Session } from "../../types";
 import {
   type PendingMessage,
   buildAgentMappingLoadPlan,
-  extractKimiAgentIdFromFileEvent,
-  hasUnresolvedKimiAgentMappings,
   isCodexHistoryRewriteSnapshotReady,
-  isKimiAuthoritativeSnapshotReady,
   isToolUseOnlyAssistantMessage,
   mergeSessionMetadataChange,
   processStateFromProcessEvent,
@@ -266,7 +263,7 @@ describe("mergeSessionMetadataChange", () => {
 });
 
 describe("shouldRefreshSettledAuthoritativeSnapshot", () => {
-  it.each(["pi", "kimi"] as const)(
+  it.each(["pi", "mcode"] as const)(
     "refreshes an owned %s session once its turn becomes idle",
     (provider) => {
       expect(
@@ -303,7 +300,7 @@ describe("shouldRefreshSettledAuthoritativeSnapshot", () => {
 });
 
 describe("shouldDeferUncorrelatedPersistedSync", () => {
-  it.each(["pi", "kimi"] as const)(
+  it.each(["pi", "mcode"] as const)(
     "defers an owned %s snapshot until the turn is idle",
     (provider) => {
       for (const state of [
@@ -320,9 +317,9 @@ describe("shouldDeferUncorrelatedPersistedSync", () => {
   );
 
   it.each([
-    ["kimi", "self", "idle"],
+    ["mcode", "self", "idle"],
     ["pi", "self", "idle"],
-    ["kimi", "none", "in-turn"],
+    ["mcode", "none", "in-turn"],
     ["pi", "external", "in-turn"],
     ["claude", "self", "in-turn"],
   ] as const)(
@@ -336,7 +333,7 @@ describe("shouldDeferUncorrelatedPersistedSync", () => {
 });
 
 describe("shouldForceOwnedPersistedDisplayRefresh", () => {
-  it.each(["pi", "kimi"] as const)(
+  it.each(["pi", "mcode"] as const)(
     "forces the display refresh for an owned %s session",
     (provider) => {
       expect(
@@ -369,23 +366,19 @@ describe("shouldForceOwnedPersistedDisplayRefresh", () => {
 });
 
 describe("shouldWatchOwnedSessionFile", () => {
-  it.each(["pi", "kimi"] as const)(
+  it.each(["pi", "mcode"] as const)(
     "keeps the focused watch for owned %s sessions",
     (provider) => {
       expect(shouldWatchOwnedSessionFile(provider)).toBe(true);
     },
   );
 
-  it.each([
-    "claude",
-    "codex",
-    "codex-oss",
-    "gemini",
-    "zcode",
-    undefined,
-  ] as const)("leaves owned %s sessions on their live stream", (provider) => {
-    expect(shouldWatchOwnedSessionFile(provider)).toBe(false);
-  });
+  it.each(["claude", "codex", "codex-oss", "gemini", undefined] as const)(
+    "leaves owned %s sessions on their live stream",
+    (provider) => {
+      expect(shouldWatchOwnedSessionFile(provider)).toBe(false);
+    },
+  );
 });
 
 describe("buildAgentMappingLoadPlan", () => {
@@ -425,58 +418,6 @@ describe("buildAgentMappingLoadPlan", () => {
     },
   };
 
-  it("makes pending Kimi calls eligible (provisional ids) and keeps completed ones", () => {
-    // Pending calls are eligible: the server assigns provisional child ids
-    // from the on-disk agents/ directory so live activity can be shown.
-    const pendingPlan = buildAgentMappingLoadPlan(
-      [swarmToolUse],
-      "kimi",
-      "session-1",
-    );
-    expect(pendingPlan?.tasks).toEqual([
-      expect.objectContaining({
-        toolUseId: "AgentSwarm_0",
-        resultCount: 0,
-        expectedAgentCount: 2,
-      }),
-    ]);
-
-    const completedPlan = buildAgentMappingLoadPlan(
-      [swarmToolUse, swarmResult],
-      "kimi",
-      "session-1",
-    );
-    expect(completedPlan?.tasks).toEqual([
-      expect.objectContaining({
-        toolUseId: "AgentSwarm_0",
-        resultCount: 1,
-      }),
-    ]);
-  });
-
-  it("advances the Kimi load key when another result for the call lands", () => {
-    const firstPlan = buildAgentMappingLoadPlan(
-      [swarmToolUse, swarmResult],
-      "kimi",
-      "session-1",
-    );
-    const secondPlan = buildAgentMappingLoadPlan(
-      [
-        swarmToolUse,
-        swarmResult,
-        {
-          ...swarmResult,
-          id: "user-swarm-result-2",
-        },
-      ],
-      "kimi",
-      "session-1",
-    );
-
-    expect(firstPlan?.loadKey).not.toBe(secondPlan?.loadKey);
-    expect(secondPlan?.tasks[0]?.resultCount).toBe(2);
-  });
-
   it("preserves pending-only mapping restoration for other providers", () => {
     expect(
       buildAgentMappingLoadPlan([swarmToolUse], "claude", "session-1")?.tasks,
@@ -491,92 +432,6 @@ describe("buildAgentMappingLoadPlan", () => {
   });
 });
 
-describe("hasUnresolvedKimiAgentMappings", () => {
-  const swarmTask = {
-    toolUseId: "AgentSwarm_0",
-    description: "inspect",
-    subagentType: "explore",
-    resultCount: 0,
-    expectedAgentCount: 2,
-  };
-
-  it("keeps a pending swarm unresolved until every declared child is mapped", () => {
-    expect(
-      hasUnresolvedKimiAgentMappings(
-        [swarmTask],
-        new Map([["AgentSwarm_0", ["agent-0"]]]),
-      ),
-    ).toBe(true);
-    expect(
-      hasUnresolvedKimiAgentMappings(
-        [swarmTask],
-        new Map([["AgentSwarm_0", ["agent-0", "agent-1"]]]),
-      ),
-    ).toBe(false);
-  });
-
-  it("does not retry completed calls", () => {
-    expect(
-      hasUnresolvedKimiAgentMappings(
-        [{ ...swarmTask, resultCount: 1 }],
-        new Map(),
-      ),
-    ).toBe(false);
-  });
-});
-
-describe("isKimiAuthoritativeSnapshotReady", () => {
-  const assistantMessage = (uuid: string, content: string): Message => ({
-    type: "assistant",
-    uuid,
-    message: { role: "assistant", content },
-  });
-
-  const current = [
-    userMessage({
-      uuid: "persisted-user-0",
-      message: { role: "user", content: "first question" },
-    }),
-    assistantMessage("persisted-assistant-0", "first answer"),
-    userMessage({
-      uuid: "live-user-1",
-      message: { role: "user", content: "second question" },
-    }),
-    assistantMessage("live-assistant-1", "second answer"),
-  ];
-
-  it("rejects a wire snapshot that has not persisted the latest prompt", () => {
-    expect(isKimiAuthoritativeSnapshotReady(current, current.slice(0, 2))).toBe(
-      false,
-    );
-  });
-
-  it("rejects a wire snapshot missing the current turn's final output", () => {
-    expect(
-      isKimiAuthoritativeSnapshotReady(current, [
-        ...current.slice(0, 2),
-        userMessage({
-          uuid: "session-user-1",
-          message: { role: "user", content: "second question" },
-        }),
-      ]),
-    ).toBe(false);
-  });
-
-  it("accepts the complete persisted turn despite different message ids", () => {
-    expect(
-      isKimiAuthoritativeSnapshotReady(current, [
-        ...current.slice(0, 2),
-        userMessage({
-          uuid: "session-user-1",
-          message: { role: "user", content: "second question" },
-        }),
-        assistantMessage("session-assistant-1", "second answer"),
-      ]),
-    ).toBe(true);
-  });
-});
-
 describe("extractSessionIdFromFileEvent", () => {
   it("extracts Pi's native id from its timestamped JSONL filename", () => {
     expect(
@@ -588,16 +443,6 @@ describe("extractSessionIdFromFileEvent", () => {
     ).toBe("186997d7-2289-4e62-993c-c97c703ded86");
   });
 
-  it("extracts Kimi's session directory instead of the wire.jsonl basename", () => {
-    expect(
-      extractSessionIdFromFileEvent({
-        provider: "kimi",
-        relativePath:
-          "wd_example/session_186997d7-2289-4e62-993c-c97c703ded86/agents/main/wire.jsonl",
-      }),
-    ).toBe("session_186997d7-2289-4e62-993c-c97c703ded86");
-  });
-
   it("decodes MiniMax Code's base64url session directory", () => {
     expect(
       extractSessionIdFromFileEvent({
@@ -607,31 +452,15 @@ describe("extractSessionIdFromFileEvent", () => {
       }),
     ).toBe("mvs_08415984c3c94c9f84781cdcf3c4346f");
   });
-});
 
-describe("extractKimiAgentIdFromFileEvent", () => {
-  it("extracts child ids from Kimi agent wire paths", () => {
+  it("uses the session directory for DeepSeek Harness logs", () => {
     expect(
-      extractKimiAgentIdFromFileEvent({
-        provider: "kimi",
-        relativePath: "wd_example/session_123/agents/agent-6/wire.jsonl",
+      extractSessionIdFromFileEvent({
+        provider: "dsh",
+        relativePath:
+          "--Users-me-work--/session-846eb2c2-c340-433c-ab4e-508ba45ba257/session.v4.jsonl.zstd",
       }),
-    ).toBe("agent-6");
-  });
-
-  it("ignores the main Kimi wire and other providers", () => {
-    expect(
-      extractKimiAgentIdFromFileEvent({
-        provider: "kimi",
-        relativePath: "wd_example/session_123/agents/main/wire.jsonl",
-      }),
-    ).toBeNull();
-    expect(
-      extractKimiAgentIdFromFileEvent({
-        provider: "claude",
-        relativePath: "projects/example/agent-6.jsonl",
-      }),
-    ).toBeNull();
+    ).toBe("session-846eb2c2-c340-433c-ab4e-508ba45ba257");
   });
 });
 
@@ -643,7 +472,7 @@ describe("shouldFetchSessionMetadataForUpdate", () => {
 });
 
 describe("shouldRefreshFullPersistedSession", () => {
-  it.each(["codex", "codex-oss", "pi", "kimi"] as const)(
+  it.each(["codex", "codex-oss", "pi", "mcode"] as const)(
     "reloads the authoritative window for %s in-place updates",
     (provider) => {
       expect(shouldRefreshFullPersistedSession(provider)).toBe(true);

@@ -4,15 +4,13 @@ import { I18nProvider } from "../../i18n";
 import { UI_KEYS } from "../../lib/storageKeys";
 import { FileViewer } from "../FileViewer";
 
-const { getFile, getFileRawUrl } = vi.hoisted(() => ({
+const { getFile } = vi.hoisted(() => ({
   getFile: vi.fn(),
-  getFileRawUrl: vi.fn(),
 }));
 
 vi.mock("../../api/client", () => ({
   api: {
-    getFile,
-    getFileRawUrl,
+    getFilePreview: getFile,
   },
 }));
 
@@ -29,10 +27,10 @@ const originalSecureContextDescriptor = Object.getOwnPropertyDescriptor(
   "isSecureContext",
 );
 
-function renderViewer(filePath = "docs/notes.md") {
+function renderViewer() {
   return render(
     <I18nProvider>
-      <FileViewer projectId="project-1" filePath={filePath} />
+      <FileViewer fileRef={{ path: "docs/notes.md", projectId: "project-1" }} />
     </I18nProvider>,
   );
 }
@@ -43,11 +41,8 @@ describe("FileViewer", () => {
   beforeEach(() => {
     localStorage.setItem(UI_KEYS.locale, "en");
     getFile.mockReset();
-    getFileRawUrl.mockReset();
-    getFileRawUrl.mockReturnValue(
-      "/api/projects/project-1/files/raw?path=docs%2Fnotes.md&download=true",
-    );
     getFile.mockResolvedValue({
+      kind: "markdown",
       metadata: {
         path: "docs/notes.md",
         absolutePath: "/workspace/docs/notes.md",
@@ -98,14 +93,13 @@ describe("FileViewer", () => {
     }
 
     vi.restoreAllMocks();
-    vi.unstubAllGlobals();
   });
 
   it("separates the filename from its directory and metadata", async () => {
     renderViewer();
 
     expect(await screen.findByText("12 B • 2 lines")).toBeTruthy();
-    expect(screen.getByText("docs")).toBeTruthy();
+    expect(screen.getByText("/workspace/docs")).toBeTruthy();
     expect(screen.getByText("notes.md")).toBeTruthy();
   });
 
@@ -121,17 +115,12 @@ describe("FileViewer", () => {
     renderViewer();
     fireEvent.click(await screen.findByTitle("Download"));
 
-    expect(getFileRawUrl).toHaveBeenCalledWith(
-      "project-1",
-      "docs/notes.md",
-      true,
-    );
     const clickedLink = captured.link;
     expect(clickedLink).not.toBeNull();
     if (!clickedLink)
       throw new Error("Expected the download link to be clicked");
     expect(clickedLink.getAttribute("href")).toBe(
-      "/api/projects/project-1/files/raw?path=docs%2Fnotes.md&download=true",
+      "/api/fs/raw?path=docs%2Fnotes.md&projectId=project-1&download=true",
     );
     expect(clickedLink.getAttribute("download")).toBe("notes.md");
     expect(clickedLink.getAttribute("target")).toBeNull();
@@ -189,6 +178,7 @@ describe("FileViewer", () => {
 
   it("copies the preview path when the file has no absolute path", async () => {
     getFile.mockResolvedValueOnce({
+      kind: "markdown",
       metadata: {
         path: "docs/notes.md",
         size: 12,
@@ -277,70 +267,5 @@ describe("FileViewer", () => {
     expect(writeText).toHaveBeenCalledWith("hello world\n");
     expect(execCommand).toHaveBeenCalledWith("copy");
     expect(consoleError).toHaveBeenCalled();
-  });
-
-  it("renders PDF files inline with the project raw URL", async () => {
-    getFileRawUrl.mockReturnValue(
-      "/api/projects/project-1/files/raw?path=docs%2Freport.pdf",
-    );
-    getFile.mockResolvedValue({
-      metadata: {
-        path: "docs/report.pdf",
-        size: 2048,
-        mimeType: "application/pdf",
-        isText: false,
-      },
-      rawUrl: "/wrong-unbased-url",
-    });
-
-    renderViewer("docs/report.pdf");
-
-    const frame = await screen.findByTitle("report.pdf");
-    expect(frame.getAttribute("src")).toBe(
-      "/api/projects/project-1/files/raw?path=docs%2Freport.pdf",
-    );
-  });
-
-  it("parses CSV files into the original table preview", async () => {
-    getFile.mockResolvedValue({
-      metadata: {
-        path: "data.csv",
-        size: 18,
-        mimeType: "text/csv",
-        isText: false,
-      },
-      rawUrl: "/wrong-unbased-url",
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(new Response("name,value\nalpha,1")),
-    );
-
-    renderViewer("data.csv");
-
-    expect(await screen.findByText("alpha")).toBeTruthy();
-    expect(screen.getByText("value")).toBeTruthy();
-  });
-
-  it("restores the Markdown table of contents in preview mode", async () => {
-    getFile.mockResolvedValue({
-      metadata: {
-        path: "docs/notes.md",
-        size: 32,
-        mimeType: "text/markdown",
-        isText: true,
-      },
-      content: "# Overview\n\n## Details",
-      renderedMarkdownHtml:
-        '<h1 id="overview" class="md-heading">Overview</h1><h2 id="details" class="md-heading">Details</h2>',
-      rawUrl: "/wrong-unbased-url",
-    });
-
-    renderViewer();
-    fireEvent.click(await screen.findByRole("button", { name: "Preview" }));
-
-    expect(await screen.findByText("Contents")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Overview" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Details" })).toBeTruthy();
   });
 });

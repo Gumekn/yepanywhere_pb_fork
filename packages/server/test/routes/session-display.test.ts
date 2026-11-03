@@ -258,8 +258,6 @@ describe("session display routes", () => {
           codexReaderFactory: () => reader as never,
           geminiReaderFactory: () => reader as never,
           piReaderFactory: () => emptyReader as never,
-          kimiReaderFactory: () => emptyReader as never,
-          zcodeReaderFactory: () => emptyReader as never,
         },
         getRuntimeState: vi.fn(async () => runtime),
       });

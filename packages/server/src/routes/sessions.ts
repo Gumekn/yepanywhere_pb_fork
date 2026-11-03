@@ -11,12 +11,15 @@ import {
   PI_THINKING_PREVIEW_MAX_LENGTH,
   type ProviderName,
   type SessionBranchState,
+  type SlashCommand,
   type UrlProjectId,
   escalateContextWindow,
   getModelContextWindow,
   isUrlProjectId,
 } from "@yep-anywhere/shared";
 import { Hono } from "hono";
+import { readAgentCommandCache } from "../agent-commands/command-cache.js";
+import { AgentCommandService } from "../agent-commands/service.js";
 import {
   ArchiveError,
   type ArchivedSessionRecord,
@@ -62,8 +65,8 @@ import type { SessionMetadataService } from "../metadata/index.js";
 import type { NotificationService } from "../notifications/index.js";
 import type { CodexSessionScanner } from "../projects/codex-scanner.js";
 import type { CursorSessionScanner } from "../projects/cursor-scanner.js";
+import type { DshSessionScanner } from "../projects/dsh-scanner.js";
 import type { GeminiSessionScanner } from "../projects/gemini-scanner.js";
-import type { KimiSessionScanner } from "../projects/kimi-scanner.js";
 import type { McodeSessionScanner } from "../projects/mcode-scanner.js";
 import { canonicalizeProjectPath, encodeProjectId } from "../projects/paths.js";
 import type { PiSessionScanner } from "../projects/pi-scanner.js";
@@ -75,6 +78,7 @@ import {
   type CodexNativeControlRequest,
   isCodexNativeControlMethod,
 } from "../sdk/providers/codex-controls.js";
+import { readPiCommandCache } from "../sdk/providers/pi-command-cache.js";
 import type { PermissionMode, SDKMessage, UserMessage } from "../sdk/types.js";
 import type { ModelInfoService } from "../services/ModelInfoService.js";
 import type { ServerSettingsService } from "../services/ServerSettingsService.js";
@@ -89,10 +93,10 @@ import {
   type SessionTitleService,
 } from "../services/SessionTitleService.js";
 import { CodexSessionReader } from "../sessions/codex-reader.js";
+import type { DshSessionReader } from "../sessions/dsh-reader.js";
 import { cloneClaudeSession, cloneCodexSession } from "../sessions/fork.js";
 import type { GeminiSessionReader } from "../sessions/gemini-reader.js";
 import { projectSessionInspectorMessages } from "../sessions/inspector-projection.js";
-import type { KimiSessionReader } from "../sessions/kimi-reader.js";
 import type { McodeSessionReader } from "../sessions/mcode-reader.js";
 import {
   annotateBranchMessages,
@@ -121,7 +125,6 @@ import {
 } from "../sessions/session-runtime.js";
 import type { ISessionReader } from "../sessions/types.js";
 import { isUserPromptMessage } from "../sessions/user-prompt-message.js";
-import type { ZCodeSessionReader } from "../sessions/zcode-reader.js";
 import type { ExternalSessionTracker } from "../supervisor/ExternalSessionTracker.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
 import type {
@@ -166,6 +169,8 @@ const CODEX_CANONICAL_MAX_ROLLOUT_BYTES = (() => {
 
 export interface SessionsDeps {
   sessionDisplayService?: SessionDisplayService;
+  /** Composer command/skill lists (live process, cache, or skill scan). */
+  agentCommandService?: AgentCommandService;
   runtimeController?: RuntimeController;
   /** Shared pending-input authority used by HTTP and channel adapters. */
   sessionInteractionService?: SessionInteractionService;
@@ -197,17 +202,13 @@ export interface SessionsDeps {
   /** Optional shared Gemini reader factory for cross-provider session lookups */
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
   piScanner?: PiSessionScanner;
-  zcodeDbPath?: string;
   piSessionsDir?: string;
   piReaderFactory?: (projectPath: string) => PiSessionReader;
-  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
-  kimiScanner?: KimiSessionScanner;
   cursorScanner?: CursorSessionScanner;
   mcodeScanner?: McodeSessionScanner;
+  dshScanner?: DshSessionScanner;
   mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
-  kimiSessionsDir?: string;
-  /** Optional shared Kimi reader factory for cross-provider session lookups */
-  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
+  dshReaderFactory?: (projectPath: string) => DshSessionReader;
   /** Server-wide settings service */
   serverSettingsService?: ServerSettingsService;
   /** ModelInfoService for context window lookups */
@@ -626,12 +627,11 @@ interface ArchiveTarget {
  * Resolve the reader that actually owns `sessionId`.
  *
  * A project id is derived purely from the working directory, so a single path
- * can host sessions from several providers (e.g. Claude + Codex + Kimi under
+ * can host sessions from several providers (e.g. Claude + Codex + Pi under
  * the same repo). `readerFactory(project)` only yields the project's primary
  * provider reader, which returns nothing for a session owned by a different
- * provider — this is why the subagent (Agent/AgentSwarm) endpoints returned an
- * empty result for Kimi sessions living under a Claude-primary project. Resolve
- * the owning provider's reader by session instead, falling back to the primary.
+ * provider. Resolve the owning provider's reader by session instead, falling
+ * back to the primary.
  */
 async function resolveReaderForSession(
   deps: SessionsDeps,
@@ -661,11 +661,8 @@ function toProviderResolutionDeps(deps: SessionsDeps): ProviderResolutionDeps {
     geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
     piSessionsDir: deps.piSessionsDir,
     piReaderFactory: deps.piReaderFactory,
-    kimiSessionsDir: deps.kimiSessionsDir,
-    kimiReaderFactory: deps.kimiReaderFactory,
     mcodeReaderFactory: deps.mcodeReaderFactory,
-    zcodeDbPath: deps.zcodeDbPath,
-    zcodeReaderFactory: deps.zcodeReaderFactory,
+    dshReaderFactory: deps.dshReaderFactory,
   };
 }
 
@@ -765,9 +762,7 @@ function emitArchiveFileEvents(
         ? deps.codexSessionsDir
         : record.provider === "pi"
           ? deps.piSessionsDir
-          : record.provider === "kimi"
-            ? deps.kimiSessionsDir
-            : deps.claudeProjectsDir;
+          : deps.claudeProjectsDir;
   if (!providerRoot) return;
 
   for (const file of record.files) {
@@ -843,6 +838,38 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     deps.generatedArtifactUploadManager ?? new UploadManager();
   const runtimeController =
     deps.runtimeController ?? new EmbeddedRuntimeController(deps.supervisor);
+
+  /**
+   * The `/` list for the input. Live from the provider when a process runs;
+   * for Pi, the last list Pi reported for this directory otherwise, so an idle
+   * session still offers its commands (sending one resumes the session).
+   */
+  const loadSlashCommands = async (
+    process:
+      | { id: string; supportsDynamicCommands?: boolean }
+      | null
+      | undefined,
+    provider: string | undefined,
+    projectPath: string,
+  ): Promise<SlashCommand[] | null> => {
+    if (process?.supportsDynamicCommands) {
+      const live = await runtimeController
+        .getSupportedCommands(process.id)
+        // A provider that is still starting (Pi before its RPC is ready)
+        // must not fail the whole session load; init carries the list.
+        .catch(() => null);
+      if (live) return live;
+    }
+    if (provider === "pi") {
+      return readPiCommandCache(projectPath).catch(() => null);
+    }
+    if (provider === "mcode" || provider === "cursor") {
+      return readAgentCommandCache(provider, projectPath).catch(() => null);
+    }
+    return null;
+  };
+  const agentCommandService =
+    deps.agentCommandService ?? new AgentCommandService();
   const sessionInteractionService =
     deps.sessionInteractionService ??
     new SessionInteractionService({
@@ -870,9 +897,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       geminiReaderFactory: deps.geminiReaderFactory,
       piSessionsDir: deps.piSessionsDir,
       piReaderFactory: deps.piReaderFactory,
-      kimiSessionsDir: deps.kimiSessionsDir,
-      kimiReaderFactory: deps.kimiReaderFactory,
       mcodeReaderFactory: deps.mcodeReaderFactory,
+      dshReaderFactory: deps.dshReaderFactory,
     });
   const getCodexReader = (projectPath: string): CodexSessionReader | null =>
     deps.codexReaderFactory?.(projectPath) ??
@@ -1051,6 +1077,52 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     });
   });
 
+  // GET /api/projects/:projectId/agent-commands?provider=&sessionId= -
+  // Commands and skills for the composer. Works without a session (new
+  // session form) and for idle sessions; a running process answers live.
+  routes.get("/projects/:projectId/agent-commands", async (c) => {
+    const projectId = c.req.param("projectId");
+    if (!isUrlProjectId(projectId)) {
+      return c.json({ error: "Invalid project ID format" }, 400);
+    }
+    const provider = c.req.query("provider")?.trim();
+    if (!provider) {
+      return c.json({ error: "provider is required" }, 400);
+    }
+    const project = await deps.scanner.getOrCreateProject(projectId);
+    if (!project) {
+      return c.json({ error: "Project not found" }, 404);
+    }
+    const sessionId = c.req.query("sessionId")?.trim() || undefined;
+    const process = sessionId
+      ? await runtimeController
+          .getProcessSnapshotForSession(sessionId)
+          .catch(() => null)
+      : null;
+    const liveProcess = process?.provider === provider ? process : null;
+    const listing = await agentCommandService.list(provider, project.path, {
+      ...(liveProcess?.supportsDynamicCommands
+        ? {
+            liveCommands: () =>
+              runtimeController.getSupportedCommands(liveProcess.id),
+          }
+        : {}),
+      ...(liveProcess && provider === "codex" && sessionId
+        ? {
+            liveCodexSkills: async () => {
+              const result = await runtimeController.executeCodexControl({
+                sessionId,
+                request: { control: "skills/list" },
+              });
+              if (!result.ok) throw new Error(result.error.message);
+              return result.data;
+            },
+          }
+        : {}),
+    });
+    return c.json(listing);
+  });
+
   // GET /api/projects/:projectId/sessions/:sessionId/agents - Get agent mappings
   // Used to find agent sessions for pending Tasks on page reload
   routes.get("/projects/:projectId/sessions/:sessionId/agents", async (c) => {
@@ -1206,15 +1278,17 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           : "user-question"
         : undefined);
 
-    // Get available slash commands from active process
-    const slashCommands = process?.supportsDynamicCommands
-      ? await runtimeController.getSupportedCommands(process.id)
-      : null;
-
     // Read minimal session info from disk (just for title/timestamps, no messages)
     const metadataProvider = deps.sessionMetadataService?.getProvider(
       sessionId,
     ) as ProviderName | undefined;
+
+    // Available slash commands (live process, or Pi's last known list)
+    const slashCommands = await loadSlashCommands(
+      process,
+      process?.provider ?? metadataProvider,
+      project.path,
+    );
     const catalogSummary = bridgedSession
       ? null
       : await deps.codexSessionCatalog
@@ -2183,9 +2257,13 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     // Get available slash commands from active process (for "/" button in toolbar)
     // The init message that normally carries these gets discarded from the SSE buffer
     // after ~30s, so we attach them to the REST response for reliable delivery.
-    const slashCommands = process?.supportsDynamicCommands
-      ? await runtimeController.getSupportedCommands(process.id)
-      : null;
+    const slashCommands = await loadSlashCommands(
+      process,
+      process?.provider ??
+        session?.provider ??
+        deps.sessionMetadataService?.getProvider(sessionId),
+      project.path,
+    );
 
     if (!session) {
       // Session file doesn't exist yet - only valid if we own the process
@@ -3023,10 +3101,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         } else if (
           error instanceof ArchiveError &&
           error.code === "unsupported_provider" &&
-          target.provider === "mcode"
+          (target.provider === "mcode" || target.provider === "dsh")
         ) {
-          // MiniMax Code shares its store with the desktop App; Yep only
-          // hides the session through metadata and never moves its files.
+          // MiniMax Code and DeepSeek Harness share their stores with their
+          // own apps; Yep only hides the session through metadata and never
+          // moves their files.
         } else if (error instanceof ArchiveError) {
           return c.json(
             { error: error.message, code: error.code },

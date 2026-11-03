@@ -7,6 +7,7 @@ import type { SessionIndexService } from "../indexes/index.js";
 import type { SessionMetadataService } from "../metadata/SessionMetadataService.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import { EmbeddedRuntimeController } from "../runtime/EmbeddedRuntimeController.js";
+import { parseCompactRequestBody } from "../runtime/compact-request.js";
 import type { RuntimeController } from "../runtime/types.js";
 import type { ISessionReader } from "../sessions/types.js";
 import type { Supervisor } from "../supervisor/Supervisor.js";
@@ -253,9 +254,15 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
   });
 
   // POST /api/processes/:processId/compact - Trigger a provider-native
-  // context compaction (Pi compact / ZCode session/compact).
+  // context compaction (Pi compact). Body: { customInstructions?: string }.
+  // Resolves after the compaction finishes.
   routes.post("/:processId/compact", async (c) => {
     const processId = c.req.param("processId");
+
+    const parsed = parseCompactRequestBody(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
 
     const process = await runtimeController.getProcess(processId);
     if (!process) {
@@ -263,7 +270,10 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
     }
 
     try {
-      const { success } = await runtimeController.compact(processId);
+      const { success } = await runtimeController.compact(
+        processId,
+        parsed.options,
+      );
       if (!success) {
         return c.json(
           { error: "Context compaction not supported for this process" },
@@ -281,7 +291,7 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
 
   // POST /api/processes/:processId/reasoning-effort - Change the
   // provider-native reasoning effort mid-session (Pi set_thinking_level /
-  // ZCode session/setThoughtLevel). Body: { effort: string }
+  // MiniMax Code). Body: { effort: string }
   routes.post("/:processId/reasoning-effort", async (c) => {
     const processId = c.req.param("processId");
 
@@ -321,8 +331,8 @@ export function createProcessesRoutes(deps: ProcessesDeps): Hono {
     }
   });
 
-  // POST /api/processes/:processId/goal - Goal lifecycle actions (ZCode
-  // session/goal and Codex thread/goal native controls). Body: { action:
+  // POST /api/processes/:processId/goal - Goal lifecycle actions (Codex
+  // thread/goal native controls). Body: { action:
   // "show"|"set"|"replace"|"pause"|"resume"|"clear", objective?: string }.
   // set/replace require objective.
   routes.post("/:processId/goal", async (c) => {

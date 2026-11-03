@@ -5,9 +5,10 @@
  * - "codex-oss": Codex via CLI with --oss (local models via Ollama)
  * - "gemini": Google Gemini via CLI
  * - "pi": Pi coding agent via its JSONL RPC mode
- * - "kimi": Kimi Code CLI via Agent Client Protocol (`kimi acp`)
  * - "cursor": Cursor CLI via Agent Client Protocol (`agent acp`)
  * - "mcode": MiniMax Code CLI via Agent Client Protocol (`mcode acp`)
+ * - "dsh": DeepSeek Harness. Read-only: Yep lists and displays sessions from
+ *   `~/.dsh`; continuing a conversation happens in the embedded dsh Web UI.
  */
 export type ProviderName =
   | "claude"
@@ -17,16 +18,19 @@ export type ProviderName =
   | "gemini"
   | "gemini-acp"
   | "pi"
-  | "kimi"
-  | "zcode"
   | "cursor"
-  | "mcode";
+  | "mcode"
+  | "dsh";
 
 /** Providers that can be registered or selected by the current product. */
 export type LiveProviderName = ProviderName;
 
 /** Provider identifiers accepted only while reading legacy persisted state. */
-export type PersistedProviderName = ProviderName | "opencode";
+export type PersistedProviderName =
+  | ProviderName
+  | "opencode"
+  | "zcode"
+  | "kimi";
 
 /**
  * All provider names in display order.
@@ -41,11 +45,27 @@ export const ALL_PROVIDERS: readonly LiveProviderName[] = [
   "gemini",
   "gemini-acp",
   "pi",
-  "kimi",
-  "zcode",
   "cursor",
   "mcode",
+  "dsh",
 ] as const;
+
+/**
+ * Providers whose sessions Yep only reads. They cannot start, resume or
+ * receive messages through Yep; the provider's own UI owns every mutation.
+ */
+export const READ_ONLY_PROVIDERS: readonly LiveProviderName[] = [
+  "dsh",
+] as const;
+
+export function isReadOnlyProvider(
+  provider: string | null | undefined,
+): boolean {
+  return (
+    typeof provider === "string" &&
+    (READ_ONLY_PROVIDERS as readonly string[]).includes(provider)
+  );
+}
 
 /**
  * The default provider when none is specified.
@@ -228,6 +248,36 @@ export interface SlashCommand {
   description: string;
   /** Hint for command arguments (e.g., "<file>") */
   argumentHint?: string;
+  /**
+   * Where the command comes from, when the provider reports it (Pi:
+   * extension command, prompt template, or skill).
+   */
+  source?: SlashCommandSource;
+}
+
+export type SlashCommandSource = "extension" | "prompt" | "skill";
+
+/** A skill as the provider resolves it (Codex `$name` mentions need `path`). */
+export interface AgentSkill {
+  name: string;
+  description: string;
+  /** Absolute `SKILL.md` path. */
+  path?: string;
+}
+
+/**
+ * Commands and skills the composer can offer for one provider and project.
+ * `live` comes from a running provider process, `cache` from the last list a
+ * process reported for the directory, `scan` from reading the provider's
+ * skill directories when neither exists yet.
+ */
+export interface AgentCommandListing {
+  provider: string;
+  origin: "live" | "cache" | "scan" | "none";
+  /** `/` commands, including skills for providers that invoke them with `/`. */
+  commands: SlashCommand[];
+  /** Codex `$` skills; empty for providers that list skills as commands. */
+  skills: AgentSkill[];
 }
 
 /**
@@ -640,6 +690,52 @@ export interface FileContentResponse {
   renderedMarkdownHtml?: string;
 }
 
+/**
+ * Response from the unified preview API (`GET /api/fs/preview`).
+ */
+export interface FilePreviewResponse extends FileContentResponse {
+  /** How the client should render the file. */
+  kind: import("./file-types.js").PreviewKind;
+  /** Parsed from a `:line[:column]` suffix on the requested path. */
+  lineNumber?: number;
+  columnNumber?: number;
+  /** Text/table extraction for docx/xlsx/pptx (kind `office`). */
+  office?: OfficeDocumentPreview;
+  /** Why an office document could not be converted. */
+  officeError?: string;
+}
+
+/** A project that contains a given relative path (`GET /api/fs/locate`). */
+export interface FileLocateCandidate {
+  projectId: string;
+  projectName: string;
+  projectPath: string;
+  absolutePath: string;
+}
+
+export interface FileLocateResponse {
+  candidates: FileLocateCandidate[];
+}
+
+export interface OfficeSheetPreview {
+  name: string;
+  /** Rectangular cell text, first rows only. */
+  rows: string[][];
+  totalRows: number;
+  truncatedRows: boolean;
+  truncatedColumns: boolean;
+}
+
+export interface OfficeSlidePreview {
+  /** Text paragraphs in slide order. */
+  paragraphs: string[];
+}
+
+export type OfficeDocumentPreview =
+  | { format: "docx"; html: string; truncated: boolean }
+  | { format: "xlsx"; sheets: OfficeSheetPreview[]; truncatedSheets: boolean }
+  | { format: "pptx"; slides: OfficeSlidePreview[]; truncated: boolean };
+
 export type ReportDocumentKind = "markdown" | "text" | "transcript";
 
 /**
@@ -791,64 +887,8 @@ export interface MarkdownAugment {
 }
 
 /**
- * Provider-neutral MCP server status snapshot (read-only introspection).
- *
- * The wire fields are the safe subset Yep exposes to clients — a provider
- * never echoes raw provider configuration (endpoints, credentials, headers)
- * back through this shape.
- */
-export interface ProviderMcpServerStatus {
-  /** Provider-native lifecycle status (ZCode: connecting|connected|disabled|disconnected|failed|untrusted). */
-  status: string;
-  /** Transport kind when known (e.g. "stdio", "http", "sse"). */
-  transport?: string;
-  /** Number of tools the server currently advertises. */
-  toolCount?: number;
-  /** Provider-native last-update timestamp (ISO string). */
-  updatedAt?: string;
-  /** Human-readable failure summary, when the provider reports one. */
-  error?: string;
-}
-
-// =============================================================================
-// ZCode bridge (external `zcode tui` sessions via the hook plugin)
-// =============================================================================
-
-/** An external `zcode tui` session observed through the bridge hook plugin. */
-export interface ZCodeBridgeExternalSession {
-  sessionId: string;
-  cwd?: string;
-  permissionMode?: string;
-  /** ISO timestamp of the SessionStart hook. */
-  startedAt: string;
-  /** ISO timestamp of the most recent hook event for this session. */
-  lastSeenAt: string;
-}
-
-/** A tool approval an external ZCode session is waiting on. */
-export interface ZCodeBridgePendingInput {
-  id: string;
-  kind: "permission";
-  sessionId: string;
-  cwd?: string;
-  toolName: string;
-  toolInput?: unknown;
-  permissionSuggestions?: unknown[];
-  /** ISO timestamp of the PermissionRequest hook. */
-  createdAt: string;
-}
-
-/**
- * Client decision for a bridge pending input. `allow` may carry an
- * `updatedInput` rewrite; `deny` may carry a reason `message`.
- */
-export type ZCodeBridgeDecision =
-  | { behavior: "allow"; updatedInput?: unknown }
-  | { behavior: "deny"; message?: string };
-
-/**
  * Provider-neutral goal lifecycle shapes. `response` is the provider-rendered
- * status text (e.g. ZCode's CLI-formatted goal summary); `startedTurn` flags
+ * status text (e.g. a CLI-formatted goal summary); `startedTurn` flags
  * that a set/replace immediately began a model turn.
  */
 export type ProviderGoalAction =

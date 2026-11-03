@@ -7,9 +7,10 @@ import {
   CURSOR_ACP_SESSIONS_DIR,
   CursorSessionReader,
 } from "./cursor-reader.js";
+import type { DshSessionReader } from "./dsh-reader.js";
+import { DSH_SESSIONS_DIR } from "./dsh-store.js";
 import { collapseEditForkFamilies } from "./edit-fork-families.js";
 import { GeminiSessionReader } from "./gemini-reader.js";
-import { KimiSessionReader } from "./kimi-reader.js";
 import { McodeSessionReader } from "./mcode-reader.js";
 import { MCODE_SESSIONS_DIR } from "./mcode-store.js";
 import { PI_SESSIONS_DIR } from "./pi-files.js";
@@ -20,18 +21,16 @@ import {
 } from "./provider-groups.js";
 import { ClaudeSessionReader } from "./reader.js";
 import type { ISessionReader } from "./types.js";
-import { ZCODE_DB_PATH } from "./zcode-db.js";
-import { ZCodeSessionReader } from "./zcode-reader.js";
 
 export interface ProviderProjectCatalog {
   codexPaths: Set<string>;
   geminiPaths: Set<string>;
   piPaths: Set<string>;
-  kimiPaths: Set<string>;
-  zcodePaths: Set<string>;
   cursorPaths: Set<string>;
   /** Optional so older catalog builders/tests remain valid. */
   mcodePaths?: Set<string>;
+  /** Projects with read-only DeepSeek Harness sessions. */
+  dshPaths?: Set<string>;
   geminiHashToCwd?: Promise<Map<string, string>>;
   codexSessionsByPath?: Map<string, SessionSummary[]>;
 }
@@ -46,14 +45,15 @@ export interface ProviderResolutionDeps {
   geminiHashToCwd?: Promise<Map<string, string>>;
   piSessionsDir?: string;
   piReaderFactory?: (projectPath: string) => PiSessionReader;
-  kimiSessionsDir?: string;
-  kimiReaderFactory?: (projectPath: string) => KimiSessionReader;
   cursorSessionsDir?: string;
   cursorReaderFactory?: (projectPath: string) => CursorSessionReader;
   mcodeSessionsDir?: string;
   mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
-  zcodeDbPath?: string;
-  zcodeReaderFactory?: (projectPath: string) => ZCodeSessionReader;
+  /**
+   * Read-only DeepSeek Harness reader. Absent when the provider is disabled;
+   * unlike other providers there is no fallback reader.
+   */
+  dshReaderFactory?: (projectPath: string) => DshSessionReader;
   allowStaleSessionCache?: boolean;
   /** Yep sidecar lineage used when a stable provider API cannot persist it. */
   sessionMetadataService?: {
@@ -68,15 +68,7 @@ export interface SessionSource {
   provider: ProviderName;
   reader: ISessionReader;
   sessionDir: string;
-  kind:
-    | "primary"
-    | "codex"
-    | "gemini"
-    | "pi"
-    | "kimi"
-    | "zcode"
-    | "cursor"
-    | "mcode";
+  kind: "primary" | "codex" | "gemini" | "pi" | "cursor" | "mcode" | "dsh";
 }
 
 export interface ResolvedSessionSummary {
@@ -105,22 +97,6 @@ function mayHaveGeminiSessions(
   return provider === "claude" || provider === "codex";
 }
 
-function mayHaveKimiSessions(
-  project: Project,
-  catalog?: ProviderProjectCatalog,
-): boolean {
-  if (catalog) {
-    return catalog.kimiPaths.has(canonicalizeProjectPath(project.path));
-  }
-  const provider = normalizeProviderGroup(project.provider);
-  return (
-    provider === "claude" ||
-    provider === "codex" ||
-    provider === "gemini" ||
-    provider === "pi"
-  );
-}
-
 function mayHavePiSessions(
   project: Project,
   catalog?: ProviderProjectCatalog,
@@ -144,9 +120,7 @@ function mayHaveCursorSessions(
     provider === "claude" ||
     provider === "codex" ||
     provider === "gemini" ||
-    provider === "pi" ||
-    provider === "kimi" ||
-    provider === "zcode"
+    provider === "pi"
   );
 }
 
@@ -164,21 +138,15 @@ function mayHaveMcodeSessions(
   return normalizeProviderGroup(project.provider) !== null;
 }
 
-function mayHaveZCodeSessions(
+function mayHaveDshSessions(
   project: Project,
   catalog?: ProviderProjectCatalog,
 ): boolean {
-  if (catalog) {
-    return catalog.zcodePaths.has(canonicalizeProjectPath(project.path));
+  if (catalog?.dshPaths) {
+    return catalog.dshPaths.has(canonicalizeProjectPath(project.path));
   }
-  const provider = normalizeProviderGroup(project.provider);
-  return (
-    provider === "claude" ||
-    provider === "codex" ||
-    provider === "gemini" ||
-    provider === "pi" ||
-    provider === "kimi"
-  );
+  // The reader filters by cwd, so a miss only costs one cached directory scan.
+  return normalizeProviderGroup(project.provider) !== null;
 }
 
 function createClaudeSource(
@@ -237,27 +205,6 @@ function createGeminiSource(
   };
 }
 
-function createKimiSource(
-  project: Project,
-  deps: ProviderResolutionDeps,
-): SessionSource | null {
-  const reader =
-    deps.kimiReaderFactory?.(project.path) ??
-    (deps.kimiSessionsDir
-      ? new KimiSessionReader({
-          sessionsDir: deps.kimiSessionsDir,
-          projectPath: project.path,
-        })
-      : null);
-  if (!reader) return null;
-  return {
-    provider: "kimi",
-    reader,
-    sessionDir: deps.kimiSessionsDir ?? project.sessionDir,
-    kind: "kimi",
-  };
-}
-
 function createPiSource(
   project: Project,
   deps: ProviderResolutionDeps,
@@ -271,22 +218,6 @@ function createPiSource(
     reader,
     sessionDir: sessionsDir,
     kind: "pi",
-  };
-}
-
-function createZCodeSource(
-  project: Project,
-  deps: ProviderResolutionDeps,
-): SessionSource | null {
-  const dbPath = deps.zcodeDbPath ?? ZCODE_DB_PATH;
-  const reader =
-    deps.zcodeReaderFactory?.(project.path) ??
-    new ZCodeSessionReader({ dbPath, projectPath: project.path });
-  return {
-    provider: "zcode",
-    reader,
-    sessionDir: dbPath,
-    kind: "zcode",
   };
 }
 
@@ -316,17 +247,14 @@ function buildCandidateGroups(
   if (mayHavePiSessions(project, catalog)) {
     pushGroup("pi");
   }
-  if (mayHaveKimiSessions(project, catalog)) {
-    pushGroup("kimi");
-  }
-  if (mayHaveZCodeSessions(project, catalog)) {
-    pushGroup("zcode");
-  }
   if (mayHaveCursorSessions(project, catalog)) {
     pushGroup("cursor");
   }
   if (mayHaveMcodeSessions(project, catalog)) {
     pushGroup("mcode");
+  }
+  if (mayHaveDshSessions(project, catalog)) {
+    pushGroup("dsh");
   }
 
   return groups;
@@ -347,15 +275,27 @@ function getSourceForGroup(
       return createCodexSource(project, deps);
     case "gemini":
       return createGeminiSource(project, deps, catalog);
-    case "kimi":
-      return createKimiSource(project, deps);
-    case "zcode":
-      return createZCodeSource(project, deps);
     case "cursor":
       return createCursorSource(project, deps);
     case "mcode":
       return createMcodeSource(project, deps);
+    case "dsh":
+      return createDshSource(project, deps);
   }
+}
+
+function createDshSource(
+  project: Project,
+  deps: ProviderResolutionDeps,
+): SessionSource | null {
+  const reader = deps.dshReaderFactory?.(project.path);
+  if (!reader) return null;
+  return {
+    provider: "dsh",
+    reader,
+    sessionDir: DSH_SESSIONS_DIR,
+    kind: "dsh",
+  };
 }
 
 function createMcodeSource(
@@ -534,6 +474,67 @@ export async function listSessionsAcrossProviders(
     (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
   );
   return collapseEditForkFamilies(applyForkLineageMetadata(sessions, deps));
+}
+
+/**
+ * The Codex thread/list catalog omits usage. Enrich only rows selected for the
+ * response, after pagination/pins/project coverage, rather than scanning every
+ * rollout during project discovery. The shared index validates each file's
+ * revision and persists the result; the existing reader retains compaction and
+ * rollback accounting instead of treating a tail window as the whole session.
+ */
+export async function hydrateCodexSessionUsage(
+  sessions: (Pick<
+    SessionSummary,
+    "id" | "provider" | "contextUsage" | "cumulativeUsage"
+  > & { projectId: string })[],
+  projects: readonly Project[],
+  deps: ProviderResolutionDeps,
+  catalogSessionIds: ReadonlySet<string> | undefined,
+): Promise<void> {
+  if (!catalogSessionIds?.size) return;
+  const pending = sessions.filter(
+    (session) =>
+      catalogSessionIds.has(session.id) &&
+      (session.provider === "codex" || session.provider === "codex-oss") &&
+      (!session.cumulativeUsage || !session.contextUsage),
+  );
+  const projectsById = new Map<string, Project>(
+    projects.map((project) => [project.id, project]),
+  );
+  const sources = new Map<string, SessionSource | null>();
+  let index = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(4, pending.length) }, async () => {
+      while (index < pending.length) {
+        const session = pending[index++];
+        if (!session) continue;
+        const project = projectsById.get(session.projectId);
+        if (!project) continue;
+        try {
+          if (!sources.has(project.id)) {
+            sources.set(project.id, createCodexSource(project, deps));
+          }
+          const source = sources.get(project.id);
+          if (!source) continue;
+          const summary = deps.sessionIndexService
+            ? await deps.sessionIndexService.getSessionSummaryWithCache(
+                source.sessionDir,
+                project.id,
+                session.id,
+                source.reader,
+              )
+            : await source.reader.getSessionSummary(session.id, project.id);
+          if (!summary) continue;
+          // Keep any live bridge values, titles, timestamps and ownership.
+          session.contextUsage ??= summary.contextUsage;
+          session.cumulativeUsage ??= summary.cumulativeUsage;
+        } catch {
+          // An unavailable rollout must not hide the catalog row or fail a page.
+        }
+      }
+    }),
+  );
 }
 
 export async function findSessionSummaryAcrossProviders(

@@ -60,7 +60,6 @@ import { CodexSessionScanner } from "./projects/codex-scanner.js";
 import { GeminiSessionScanner } from "./projects/gemini-scanner.js";
 import { PiSessionScanner } from "./projects/pi-scanner.js";
 import { ProjectScanner } from "./projects/scanner.js";
-import { ZCodeSessionScanner } from "./projects/zcode-scanner.js";
 import {
   NativePushService,
   PushService,
@@ -85,14 +84,13 @@ import {
   OhMyRouterBenchmarkService,
   ServerSettingsService,
   SharingService,
-  ZCodeSessionChangeMonitor,
 } from "./services/index.js";
 import { CURSOR_ACP_SESSIONS_DIR } from "./sessions/cursor-reader.js";
+import { DSH_SESSIONS_DIR } from "./sessions/dsh-store.js";
 import { MCODE_SESSIONS_DIR } from "./sessions/mcode-store.js";
 import { PI_SESSIONS_DIR } from "./sessions/pi-files.js";
 import { ClaudeSessionReader } from "./sessions/reader.js";
 import { pendingInputTypeFromRequest } from "./sessions/session-runtime.js";
-import { ZCODE_DB_PATH } from "./sessions/zcode-db.js";
 import { TerminalService } from "./terminal/TerminalService.js";
 import { UploadManager } from "./uploads/manager.js";
 import {
@@ -182,8 +180,6 @@ codexProvider.configureBridgeExecution({
 let runtimeControllerForShutdown: RuntimeController | null = null;
 let codexBridgeForShutdown: CodexBridgeController | null = null;
 let feishuChannelRuntimeForShutdown: FeishuChannelRuntime | null = null;
-let zcodeSessionChangeMonitorForShutdown: ZCodeSessionChangeMonitor | null =
-  null;
 let terminalServiceForShutdown: TerminalService | null = null;
 let sessionArchiveServiceForShutdown: SessionArchiveService | null = null;
 let sessionInteractionServiceForShutdown: SessionInteractionService | null =
@@ -245,18 +241,6 @@ async function gracefulShutdown(signal: string, exitCode = 0): Promise<void> {
   sessionInteractionServiceForShutdown = null;
   interactionBrokerForShutdown?.shutdown();
   interactionBrokerForShutdown = null;
-
-  if (zcodeSessionChangeMonitorForShutdown) {
-    try {
-      await zcodeSessionChangeMonitorForShutdown.stop();
-      console.log("[Shutdown] ZCode session change monitor stopped");
-    } catch (error) {
-      console.error(
-        "[Shutdown] Error stopping ZCode session change monitor:",
-        error,
-      );
-    }
-  }
 
   if (terminalServiceForShutdown) {
     try {
@@ -472,7 +456,7 @@ console.log(
 // Helper to create watcher if directory exists
 function createWatcherIfExists(
   watchDir: string,
-  provider: "claude" | "gemini" | "codex" | "pi" | "kimi" | "cursor" | "mcode",
+  provider: "claude" | "gemini" | "codex" | "pi" | "cursor" | "mcode" | "dsh",
   ensureDirectory = false,
   persistent = false,
   periodicRescanOverrideMs?: number,
@@ -552,7 +536,6 @@ function syncClaudeSharedSessionWatchers(
 createWatcherIfExists(config.claudeSessionsDir, "claude", true, true);
 createWatcherIfExists(config.geminiSessionsDir, "gemini", false, true);
 createWatcherIfExists(config.codexSessionsDir, "codex", false, true);
-createWatcherIfExists(config.kimiSessionsDir, "kimi", false, true);
 createWatcherIfExists(PI_SESSIONS_DIR, "pi", true, true);
 createWatcherIfExists(
   CURSOR_ACP_SESSIONS_DIR,
@@ -563,6 +546,10 @@ createWatcherIfExists(
 );
 if (isProviderEnabled("mcode", config.enabledProviders)) {
   createWatcherIfExists(MCODE_SESSIONS_DIR, "mcode", false, true);
+}
+if (isProviderEnabled("dsh", config.enabledProviders)) {
+  // Read-only DeepSeek Harness logs; dsh Web and the dsh CLI append here.
+  createWatcherIfExists(DSH_SESSIONS_DIR, "dsh", false, true);
 }
 
 // When running without tsx watch (NO_BACKEND_RELOAD=true), start source watcher
@@ -926,7 +913,6 @@ async function startServer() {
     enabledProviders: config.enabledProviders,
     voiceInputEnabled: config.voiceInputEnabled,
     maxUploadSizeBytes: config.maxUploadSizeBytes,
-    allowedImagePaths: config.allowedImagePaths,
     basePath: config.basePath,
     runtimeController: configuredRuntimeController,
     interactionBroker,
@@ -934,29 +920,6 @@ async function startServer() {
 
   await feishuChannelRuntime.start({ eventBus, sessionCommandService });
 
-  const zcodeProviderEnabled = isProviderEnabled(
-    "zcode",
-    config.enabledProviders,
-  );
-  const zcodeMonitorDisabled = ["false", "0", "off", "disabled"].includes(
-    (process.env.ZCODE_SESSION_CHANGE_MONITOR ?? "").trim().toLowerCase(),
-  );
-  if (
-    config.sessionTitleGeneration.enabled &&
-    zcodeProviderEnabled &&
-    !zcodeMonitorDisabled
-  ) {
-    const zcodeChangeScanner = new ZCodeSessionScanner();
-    const zcodeSessionChangeMonitor = new ZCodeSessionChangeMonitor({
-      dbPath: zcodeChangeScanner.databasePath,
-      scanner: zcodeChangeScanner,
-      eventBus,
-    });
-    // createApp starts SessionTitleService before returning, so no database
-    // reconciliation event can race ahead of its EventBus subscription.
-    zcodeSessionChangeMonitor.start();
-    zcodeSessionChangeMonitorForShutdown = zcodeSessionChangeMonitor;
-  }
   if (configuredRuntimeController) {
     const [activity, processes] = await Promise.all([
       runtimeController.getWorkerActivity(),
@@ -1020,7 +983,6 @@ async function startServer() {
         ? new GeminiSessionScanner({ sessionsDir: config.geminiSessionsDir })
         : emptyFocusedScanner,
     piScanner: focusedPiScanner,
-    zcodeScanner: zcodeProviderEnabled ? new ZCodeSessionScanner() : undefined,
   });
 
   // Set service references for graceful shutdown
@@ -1084,9 +1046,7 @@ async function startServer() {
     projectsDir: config.claudeProjectsDir,
     enableCodex: false,
     enableGemini: false,
-    enableKimi: false,
     enablePi: false,
-    enableZCode: false,
     enableCursor: false,
   });
   const uploadRoutes = createUploadRoutes({

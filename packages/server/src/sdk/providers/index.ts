@@ -62,22 +62,6 @@ export {
 import { piProvider } from "./pi.js";
 export { PiProvider, piProvider, type PiProviderConfig } from "./pi.js";
 
-// Kimi provider (uses `kimi acp` for ACP-based agent execution)
-import { kimiProvider } from "./kimi.js";
-export {
-  KimiProvider,
-  kimiProvider,
-  type KimiProviderConfig,
-} from "./kimi.js";
-
-// ZCode provider (uses `zcode app-server` for JSON-RPC over stdio)
-import { zcodeProvider } from "./zcode.js";
-export {
-  ZCodeProvider,
-  zcodeProvider,
-  type ZCodeProviderConfig,
-} from "./zcode.js";
-
 import { cursorProvider } from "./cursor.js";
 export { CursorProvider, cursorProvider } from "./cursor.js";
 
@@ -103,8 +87,6 @@ export function getAllProviders(): AgentProvider[] {
     geminiProvider,
     geminiACPProvider,
     piProvider,
-    kimiProvider,
-    zcodeProvider,
     cursorProvider,
     mcodeProvider,
   ];
@@ -131,10 +113,6 @@ export function getProvider(name: ProviderName | string): AgentProvider | null {
       return geminiACPProvider;
     case "pi":
       return piProvider;
-    case "kimi":
-      return kimiProvider;
-    case "zcode":
-      return zcodeProvider;
     case "cursor":
       return cursorProvider;
     case "mcode":

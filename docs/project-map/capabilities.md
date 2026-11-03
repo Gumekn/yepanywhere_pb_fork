@@ -10,7 +10,7 @@
 | 创建或继续工作 | prompt、provider、model、权限、附件 → session/process ID 或排队结果 | `NewSessionForm` → `SessionCommandService` → `RuntimeController` → `Supervisor` → provider。`start` 与无消息的 `create` 分开；附件可先建 session，再上传、发送。F1 |
 | 阅读历史并监督实时进度 | project/session/branch、游标 → 问题目录、工具组、文本、状态、按需详情 | `useSession` + `SessionDisplayService` 合并历史与运行事件；新显示投影与 legacy 路径并存。折叠工具合集可带 `durationMs`/`timedCount`，没有可靠起止时不推算。依赖 provider store、runtime journal、内存缓存。F2 |
 | 批准工具或回答 agent | request ID、批准/拒绝/答案 → 继续执行或明确失败 | `SessionInteractionService` 在 runtime / Codex bridge 中选请求持有者；`InteractionBroker` 协调并发回答；通知只是提醒入口。F3 |
-| 编辑历史探索另一条路线 | 原 prompt 身份、修改文本 → 新会话或 provider 特定恢复结果 | `resolveSessionEditSubmission` 区分 Codex/Pi/ZCode fork 与 Claude resume；不是统一“截断文件”。Codex 使用原生 fork，另记 family 元数据。F4 |
+| 编辑历史探索另一条路线 | 原 prompt 身份、修改文本 → 新会话或 provider 特定恢复结果 | `resolveSessionEditSubmission` 区分 Codex/Pi fork 与 Claude resume；不是统一“截断文件”。Codex 使用原生 fork，另记 family 元数据。F4 |
 | 及时发现要处理的会话 | 聚合状态、访问记录 → needsAttention / active / recent / unread | `createInboxRoutes` 结合 catalog、runtime、bridge、metadata、`NotificationService`；可见会话页面标记已读，activity 事件刷新其他客户端。F5 |
 
 以上对应的源码入口：
@@ -30,7 +30,7 @@
 | 改标题、置顶、归档 | [routes/sessions.ts](../../packages/server/src/routes/sessions.ts) `createSessionsRoutes` 的 `PUT /sessions/:sessionId/metadata` → [archive/SessionArchiveService.ts](../../packages/server/src/archive/SessionArchiveService.ts) `archiveSession/restoreSession` | metadata 与 archive manifest 分开；归档可能移动会话文件，忙碌/外部活跃会话返回 409；不能把 archived 理解成只改 UI 字段 |
 | 克隆整个会话 | [routes/sessions.ts](../../packages/server/src/routes/sessions.ts) `POST /projects/:projectId/sessions/:sessionId/clone` | 调用 `cloneCodexSession` / `cloneClaudeSession`，写新会话文件及标题；与“编辑某条历史 prompt”的原生 fork 是两套入口 |
 | 看工具造成的文件变化 | [routes/session-display.ts](../../packages/server/src/routes/session-display.ts) `registerSessionDisplayRoutes` → [session-files/lifecycle.ts](../../packages/server/src/session-files/lifecycle.ts) `SessionFileLifecycle`、[operation-store.ts](../../packages/server/src/session-files/operation-store.ts) `SessionFileOperationStore` | 工具操作记录与执行边界快照共同提供证据；快照不证明每次变化由某个进程独占造成 |
-| 发送文件、预览文件 | [uploads/manager.ts](../../packages/server/src/uploads/manager.ts) `UploadManager`；[routes/files.ts](../../packages/server/src/routes/files.ts) `createFilesRoutes`；[routes/local-file.ts](../../packages/server/src/routes/local-file.ts) `createLocalFileRoutes`；[routes/local-image.ts](../../packages/server/src/routes/local-image.ts) `createLocalImageRoutes` | 上传归 Yep uploads；项目文件预览读取工作区。local-file 接受绝对文本路径。local-image 在 allowlist 或已发现的本地项目路径下提供图片和视频，扩展名见 `MEDIA_EXTENSIONS`。这些路径边界彼此不同 |
+| 发送文件、预览文件 | [uploads/manager.ts](../../packages/server/src/uploads/manager.ts) `UploadManager`；[routes/files.ts](../../packages/server/src/routes/files.ts) `createFilesRoutes`；[routes/local-file.ts](../../packages/server/src/routes/local-file.ts) `createLocalFileRoutes`；[routes/local-image.ts](../../packages/server/src/routes/local-image.ts) `createLocalImageRoutes` | 上传归 Yep uploads；项目文件预览读取工作区。local-file 接受绝对文本路径，local-image 接受绝对路径的图片和视频（扩展名见 `MEDIA_EXTENSIONS`），二者都不限制目录，只依赖 API 认证 |
 | 浏览报告并评论、上传 | [routes/reports.ts](../../packages/server/src/routes/reports.ts) `createReportsRoutes`；[client ReportsPage](../../packages/client/src/pages/ReportsPage.tsx) `ReportsPage` | 报告目录、图片及评论由该路由管理；不是 agent 原生会话存储 |
 | 不打断主任务地侧聊 | [routes/sessions.ts](../../packages/server/src/routes/sessions.ts) `POST /sessions/:sessionId/side-conversation`；[side-conversations/session.ts](../../packages/server/src/side-conversations/session.ts) `SideConversationSession` | provider 特定 side channel，Codex/Pi 有适配；主 command 入口拒绝保留 side 指令。未推定所有 provider 支持 |
 | 管理模型、账号和上下文 | [routes/providers.ts](../../packages/server/src/routes/providers.ts) `createProvidersRoutes`；[codex-accounts.ts](../../packages/server/src/routes/codex-accounts.ts) `createCodexAccountsRoutes`；[llm-gateway-keys.ts](../../packages/server/src/routes/llm-gateway-keys.ts) `createLlmGatewayKeysRoutes` | 发现能力/模型与账号配置；session metadata 固定 Codex account 或 Pi gateway key，resume 继承，不等于全局当前选择 |
@@ -50,8 +50,8 @@
 | Codex OSS | 独立 active provider，不能自动套用 Codex app-server 的编辑与审批契约 | `sdk/providers/codex-oss.ts`；客户端 `CodexOssProvider` |
 | Gemini | registry 同时包含 legacy Gemini 与 ACP；`getProvider("gemini")` 和 `getProvider("gemini-acp")` 都返回 ACP 实例 | `sdk/providers/index.ts` `getProvider`；`gemini-acp.ts`、`sessions/gemini-reader.ts` |
 | Pi | active；RPC 执行路径和原生 session tree；网关配置可按 session 保存 | `sdk/providers/pi.ts`、`sessions/pi-reader.ts`；参考 `references/pi/.../rpc-types.ts`，本轮只抽查命令定义 |
-| Kimi | active；ACP 适配，独立 scanner/reader | `sdk/providers/kimi.ts`、`projects/kimi-scanner.ts`、`sessions/kimi-reader.ts` |
-| ZCode | active；app-server adapter、SQLite reader、独立 hook bridge | `sdk/providers/zcode.ts`、`sessions/zcode-db.ts`、`zcode-bridge/ZCodeBridgeService.ts`；未探测本机 CLI，协议兼容性待确认 |
+| Kimi | retired（2026-10 移除）；旧数据中的 `kimi` 按 retired provider 处理，接口返回 410 | `sdk/providers/policy.ts` `RETIRED_PROVIDER_NAMES` |
+| ZCode | retired（2026-10 移除）；旧数据中的 `zcode` 按 retired provider 处理，接口返回 410 | `sdk/providers/policy.ts` `RETIRED_PROVIDER_NAMES` |
 | Cursor | **实际 active registry 成员**，有 ACP adapter 与 SQLite/blob 历史读取；旧总览未列全 | `sdk/providers/cursor.ts`、`sessions/cursor-store.ts`、`sessions/cursor-reader.ts` |
 | Claude | 不在 active discovery；`getProvider("claude")` 仍能解析，供既有会话兼容 | `sdk/providers/index.ts` `getAllProviders/getProvider`；`claude.ts`、`sessions/reader.ts` |
 | Claude Ollama / OpenCode | policy 仍把 `claude-ollama` 算 live，但 server `getProvider` 无对应分支；OpenCode 被明确列为 retired | 差异是现状，不代表可新建或可安全删除；见 findings |

@@ -31,27 +31,6 @@ export function useProviderPermissionModeConfig(
     bypassPermissions: t("modeBypassPermissionsDescription"),
   };
 
-  if (provider === "kimi") {
-    return {
-      labels: {
-        ...genericLabels,
-        default: t("modeKimiDefaultLabel"),
-        plan: t("modeKimiPlanLabel"),
-        auto: t("modeKimiAutoLabel"),
-        bypassPermissions: t("modeKimiYoloLabel"),
-      },
-      descriptions: {
-        ...genericDescriptions,
-        default: t("modeKimiDefaultDescription"),
-        plan: t("modeKimiPlanDescription"),
-        auto: t("modeKimiAutoDescription"),
-        bypassPermissions: t("modeKimiYoloDescription"),
-      },
-      title: t("newSessionKimiPermissionTitle"),
-      description: t("newSessionKimiPermissionDescription"),
-    };
-  }
-
   if (provider === "mcode") {
     return {
       labels: {
@@ -129,27 +108,6 @@ export function useProviderPermissionModeConfig(
       },
       title: t("newSessionPiPermissionTitle"),
       description: t("newSessionPiPermissionDescription"),
-    };
-  }
-
-  if (provider === "zcode") {
-    return {
-      labels: {
-        ...genericLabels,
-        default: t("modeZcodeDefaultLabel"),
-        acceptEdits: t("modeZcodeAcceptEditsLabel"),
-        plan: t("modeZcodePlanLabel"),
-        bypassPermissions: t("modeZcodeBypassPermissionsLabel"),
-      },
-      descriptions: {
-        ...genericDescriptions,
-        default: t("modeZcodeDefaultDescription"),
-        acceptEdits: t("modeZcodeAcceptEditsDescription"),
-        plan: t("modeZcodePlanDescription"),
-        bypassPermissions: t("modeZcodeBypassPermissionsDescription"),
-      },
-      title: t("newSessionZcodePermissionTitle"),
-      description: t("newSessionZcodePermissionDescription"),
     };
   }
 

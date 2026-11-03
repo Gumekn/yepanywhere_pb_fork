@@ -1491,6 +1491,7 @@ export class CodexProvider implements AgentProvider {
       const control = new SideConversationSession({
         ready: () => true,
         parentId: () => sessionId,
+        supportsImages: true,
         create: async (context, emit) => {
           const currentTarget = await this.resolveBridgeExecutionTarget({
             resumeSessionId: sessionId,
@@ -2180,6 +2181,7 @@ export class CodexProvider implements AgentProvider {
     const sideConversations = new SideConversationSession({
       ready: () => runtimeState.ready && (activeClient?.isAlive() ?? false),
       parentId: () => runtimeState.threadId,
+      supportsImages: true,
       create: (context, emit) => {
         if (!activeClient) throw new Error("Codex is not ready");
         return createCodexSideConversation({

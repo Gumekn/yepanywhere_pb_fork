@@ -60,9 +60,7 @@ describe("ProjectScanner missing projectsDir", () => {
       codexSessionsDir: codexDir,
       enableCodex: true,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
     });
 
@@ -99,9 +97,7 @@ describe("ProjectScanner cache", () => {
       projectsDir,
       enableCodex: false,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
       cacheTtlMs: 60000,
     });
@@ -139,9 +135,7 @@ describe("ProjectScanner cache", () => {
       projectsDir,
       enableCodex: false,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
       cacheTtlMs: 0,
     });
@@ -178,9 +172,7 @@ describe("ProjectScanner cache", () => {
       projectsDir,
       enableCodex: false,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
       cacheTtlMs: 60000,
       eventBus,
@@ -242,9 +234,7 @@ describe("ProjectScanner cache", () => {
       projectsDir,
       enableCodex: true,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
       cacheTtlMs: 60000,
     });
@@ -299,9 +289,7 @@ describe("ProjectScanner cache", () => {
       codexScanner,
       enableCodex: true,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
       cacheTtlMs: 60000,
       eventBus,
@@ -382,9 +370,7 @@ describe("ProjectScanner stale-cwd recovery", () => {
       projectsDir,
       enableCodex: false,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
     });
     const projects = await scanner.listProjects();
@@ -442,9 +428,7 @@ describe("ProjectScanner shared Claude storage", () => {
       ],
       enableCodex: false,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
     });
 
@@ -488,9 +472,7 @@ describe("ProjectScanner shared Claude storage", () => {
       ],
       enableCodex: false,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
     });
 
@@ -524,9 +506,7 @@ describe("ProjectScanner shared Claude storage", () => {
       ],
       enableCodex: false,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
     });
 
@@ -575,9 +555,7 @@ describe("ProjectScanner stale-tolerant lookup", () => {
       codexScanner,
       enableCodex: true,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
       cacheTtlMs: 60_000,
     });
@@ -696,9 +674,7 @@ describe("ProjectScanner persisted snapshot seed", () => {
       codexScanner,
       enableCodex: true,
       enableGemini: false,
-      enableKimi: false,
       enablePi: false,
-      enableZCode: false,
       enableCursor: false,
       cacheTtlMs: 60_000,
       snapshotCachePath: cachePath,

@@ -1,3 +1,7 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 /**
  * Test environment hygiene.
  *
@@ -21,8 +25,6 @@ const SCRUB_PREFIXES = [
   // Gateway/AI-title credentials.
   "LLM_",
   "SESSION_TITLE_",
-  // ZCode config/CLI path env vars (YEP_ZCODE_CLI_PATH, ZCODE_*).
-  "ZCODE",
 ];
 
 const SCRUB_EXACT = new Set([
@@ -46,3 +48,15 @@ for (const key of Object.keys(process.env)) {
 // YEP_LLM_GATEWAYS_FILE to their own temp file.
 process.env.YEP_LLM_GATEWAYS_FILE =
   "/nonexistent/yep-anywhere-test/llm-gateways.json";
+
+// Pi providers otherwise overlay the developer's real ~/.pi/agent (packages,
+// MCP servers) into test agent dirs. Tests of the native overlay opt back in
+// with an explicit userAgentDir.
+process.env.YEP_PI_NATIVE_CONFIG = "false";
+
+// Code that falls back to the default data dir (caches, file-operation
+// imports) must never write into the developer's real ~/.yep-anywhere. Tests
+// that care about the location still stub YEP_ANYWHERE_DATA_DIR themselves.
+process.env.YEP_ANYWHERE_DATA_DIR = mkdtempSync(
+  join(tmpdir(), "yep-test-data-"),
+);
