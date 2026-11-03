@@ -284,6 +284,7 @@ describe("Codex streaming reader windows", () => {
     expect(
       loaded ? normalizeSession(loaded).messages[0]?.message?.content : null,
     ).toEqual([{ type: "text", text: "image inspected" }]);
+  });
 
   it("reuses a summary scan while the rollout revision is unchanged", async () => {
     resetCodexSummaryScanCache();

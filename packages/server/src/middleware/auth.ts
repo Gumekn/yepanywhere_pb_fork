@@ -155,7 +155,6 @@ export function createAuthMiddleware(
       return;
     }
 
-
     // Check if account exists (shouldn't happen if enabled via enableAuth)
     if (!authService.hasAccount()) {
       c.header("X-Setup-Required", "true");

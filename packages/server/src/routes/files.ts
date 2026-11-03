@@ -1,13 +1,16 @@
 import { readdir, stat } from "node:fs/promises";
 import { normalize, resolve, sep } from "node:path";
-import { type PatchHunk, isUrlProjectId } from "@yep-anywhere/shared";
+import {
+  type PatchHunk,
+  isTextFilePath,
+  isUrlProjectId,
+} from "@yep-anywhere/shared";
 import { type Context, Hono } from "hono";
 import { computeEditAugment } from "../augments/edit-augments.js";
 import {
   FilePreviewError,
   type PreviewFile,
   buildFilePreview,
-  isTextFilePath,
   openPreviewFile,
   rawFileResponse,
 } from "../file-preview/index.js";
