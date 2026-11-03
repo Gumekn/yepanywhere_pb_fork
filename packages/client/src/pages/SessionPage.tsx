@@ -5,7 +5,6 @@ import {
 import type {
   ProviderName,
   SessionDisplayPage,
-  SessionDisplaySegment,
   SlashCommand,
   UserQuestionAnswers,
 } from "@yep-anywhere/shared";
@@ -97,6 +96,7 @@ import {
 } from "../lib/sessionBranching";
 import {
   buildSessionDisplayRenderItems,
+  formatSessionDisplayNotice,
   mergeSessionInspectorMessages,
 } from "../lib/sessionDisplay";
 import {
@@ -143,37 +143,6 @@ function isCodexAppServerProvider(
   provider: ProviderName | string | undefined | null,
 ): provider is "codex" {
   return provider === "codex";
-}
-
-type DisplayNotice = Extract<SessionDisplaySegment, { type: "notice" }>;
-type Translate = ReturnType<typeof useI18n>["t"];
-
-function formatDisplayNotice(notice: DisplayNotice, t: Translate): string {
-  const detail = notice.message ?? notice.title;
-  const withDetail = (label: string) =>
-    detail && detail !== label ? `${label}: ${detail}` : label;
-  switch (notice.kind) {
-    case "session_setup":
-      return t("sessionDisplaySetup", { count: notice.count ?? 1 });
-    case "compaction":
-      return t("sessionDisplayCompaction");
-    case "warning":
-      return withDetail(t("sessionDisplayWarning"));
-    case "turn_aborted":
-      return t("sessionDisplayTurnAborted");
-    case "goal":
-      return withDetail(t("sessionDisplayGoal"));
-    case "plan":
-      return withDetail(t("sessionDisplayPlan"));
-    case "subagent":
-      return withDetail(t("sessionDisplaySubagent"));
-    case "inter_agent_message":
-      return withDetail(t("codexAgentCommunication"));
-    case "agent_wait":
-      return t("codexAgentWaiting");
-    case "provider_event":
-      return withDetail(t("sessionDisplayProviderEvent"));
-  }
 }
 
 function calculateDisplayForkExcludedTurns(
@@ -1966,7 +1935,7 @@ function SessionPageContent({
           branchId: selectedBranchId,
           branchState: session?.branchState ?? session?.codexBranchState,
           omitToolGroupDetailRef: hydratedLiveTailDetailRef,
-          formatNotice: (notice) => formatDisplayNotice(notice, t),
+          formatNotice: (notice) => formatSessionDisplayNotice(notice, t),
         })
       : [];
     const timelineMessages = displayPage

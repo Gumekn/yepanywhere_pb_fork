@@ -444,6 +444,106 @@
   padding: 0;
 }
 
+/* A settled answer's working steps (reasoning, progress, tool groups) folded
+   behind one quiet summary row. Opening it renders the members in the same
+   timeline lane, so the expanded view reads like the live transcript. */
+.display-process {
+  min-width: 0;
+}
+
+.display-process.timeline-item::before {
+  top: 9px;
+  box-sizing: border-box;
+  background: transparent;
+  border: 1px solid var(--timeline-dot-default);
+}
+
+.display-process.timeline-item::after {
+  top: 15px;
+}
+
+.display-process--failed.timeline-item::before {
+  border-color: var(--timeline-dot-error);
+}
+
+.display-process-header {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.display-process-header:hover,
+.display-process-header:focus-visible {
+  color: var(--text-primary);
+}
+
+.display-process-title {
+  flex-shrink: 0;
+  font-size: var(--font-size-sm);
+}
+
+.display-process--failed .display-process-title {
+  color: var(--error-color);
+}
+
+.display-process--interrupted .display-process-title {
+  color: var(--warning-color, var(--text-secondary));
+}
+
+.display-process-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.display-process-meta > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.display-process-meta > span + span::before {
+  content: "·";
+  padding-right: 5px;
+  color: var(--text-dimmed);
+}
+
+.display-process-meta .is-error {
+  color: var(--error-color);
+}
+
+.display-process-chevron {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.display-process-content {
+  margin-top: 4px;
+}
+
+/* A fold that ends its turn (no reply) still connects its own members. */
+.assistant-turn
+  > :last-child
+  .display-process-content
+  > :not(:last-child)
+  .timeline-item::after {
+  display: block;
+}
+
 .display-step {
   min-width: 0;
   color: var(--text-primary);

@@ -267,6 +267,37 @@ export const SessionDisplayNoticeSegmentSchema = z
   })
   .strict();
 
+/**
+ * The working steps of a settled answer (reasoning, progress updates, tool
+ * groups and process notices) folded behind one summary row.
+ *
+ * Only the summary crosses the wire by default; `/display/process/:id` returns
+ * the folded members when a reader expands the row. Running turns, final
+ * answers, async questions, errors and visible system markers are never
+ * folded.
+ */
+export const SessionDisplayProcessSegmentSchema = z
+  .object({
+    type: z.literal("process"),
+    id: NonEmptyIdSchema,
+    /** Outcome of the work this fold ends; `unknown` renders a neutral label. */
+    status: z.enum(["completed", "interrupted", "failed", "unknown"]),
+    stepCount: z.number().int().positive(),
+    toolCount: z.number().int().nonnegative(),
+    failedToolCount: z.number().int().nonnegative(),
+    thinkingCount: z.number().int().nonnegative(),
+    updateCount: z.number().int().nonnegative(),
+    changedFileCount: z.number().int().nonnegative().optional(),
+    startedAt: TimestampSchema.optional(),
+    endedAt: TimestampSchema.optional(),
+    /** Changes whenever a folded member changes, e.g. a late tool result. */
+    version: z.number().int().nonnegative(),
+    /** Older-history cursor that reproduces this fold outside the live view. */
+    pageCursor: z.string().min(1).max(8_192).optional(),
+    timestamp: TimestampSchema.optional(),
+  })
+  .strict();
+
 export const SessionDisplaySegmentSchema = z.discriminatedUnion("type", [
   SessionDisplayAssistantTextSegmentSchema,
   SessionDisplayThinkingSegmentSchema,
@@ -274,6 +305,7 @@ export const SessionDisplaySegmentSchema = z.discriminatedUnion("type", [
   SessionDisplayActionRequiredSegmentSchema,
   SessionDisplayErrorSegmentSchema,
   SessionDisplayNoticeSegmentSchema,
+  SessionDisplayProcessSegmentSchema,
 ]);
 
 /** Provider-native lifecycle projected onto one semantic turn. */
@@ -451,6 +483,12 @@ export interface SessionDisplaySubscriptionOptions {
 export interface SessionDisplayCurrent {
   view: SessionDisplayView;
   seq: number;
+}
+
+/** Folded members of one `process` segment, in their original order. */
+export interface SessionDisplayProcessPage {
+  processId: string;
+  nodes: SessionDisplayNode[];
 }
 
 export interface SessionDisplayGroupPage {

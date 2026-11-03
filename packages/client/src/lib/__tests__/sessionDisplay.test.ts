@@ -1,6 +1,7 @@
 import type { SessionDisplayPage } from "@yep-anywhere/shared";
 import { describe, expect, it } from "vitest";
 import {
+  buildSessionDisplayProcessItems,
   buildSessionDisplayRenderItems,
   mergeSessionInspectorMessages,
   resolveSessionInspectorNavigation,
@@ -379,6 +380,98 @@ describe("buildSessionDisplayRenderItems", () => {
       type: "thinking",
       detail: { detailRef: "thinking-ref-2", truncated: true },
     });
+  });
+
+  it("maps a folded process to one row whose times span the folded work", () => {
+    const items = buildSessionDisplayRenderItems(
+      {
+        sessionId: "session-3",
+        revision: "display-v2:epoch",
+        turns: [
+          {
+            id: "turn:t",
+            question: { messageId: "user-1", content: "Fix it" },
+            segments: [
+              {
+                type: "process",
+                id: "process:question:user-1:0",
+                status: "completed",
+                stepCount: 4,
+                toolCount: 6,
+                failedToolCount: 0,
+                thinkingCount: 2,
+                updateCount: 2,
+                startedAt: "2026-01-02T10:00:00Z",
+                endedAt: "2026-01-02T10:01:08Z",
+                timestamp: "2026-01-02T10:00:00Z",
+                version: 1,
+              },
+              {
+                type: "assistant_text",
+                id: "text:final",
+                phase: "final",
+                content: "Done",
+              },
+            ],
+          },
+        ],
+      },
+      { projectId: "project-1", branchId: "branch-1", formatNotice: () => "" },
+    );
+    expect(items.map((item) => item.type)).toEqual([
+      "user_prompt",
+      "display_process",
+      "text",
+    ]);
+    expect(items[1]).toMatchObject({
+      type: "display_process",
+      projectId: "project-1",
+      sessionId: "session-3",
+      branchId: "branch-1",
+      revision: "display-v2:epoch",
+    });
+    expect(items[1]?.sourceMessages.map((m) => m.timestamp)).toEqual([
+      "2026-01-02T10:00:00Z",
+      "2026-01-02T10:01:08Z",
+    ]);
+  });
+
+  it("builds expanded process members with the Codex timeline projection", () => {
+    const items = buildSessionDisplayProcessItems(
+      [
+        {
+          type: "segment",
+          id: "thinking:1",
+          turnId: "turn:t",
+          segment: {
+            type: "thinking",
+            id: "thinking:1",
+            content: "Plan the change",
+            detailRef: "thinking:1",
+          },
+        },
+        {
+          type: "segment",
+          id: "text:progress",
+          turnId: "turn:t",
+          segment: {
+            type: "assistant_text",
+            id: "text:progress",
+            phase: "progress",
+            content: "Checking",
+          },
+        },
+      ],
+      {
+        projectId: "project-1",
+        sessionId: "session-3",
+        revision: "display-v2:epoch",
+        provider: "codex",
+        formatNotice: () => "",
+      },
+    );
+    expect(items.map((item) => item.type)).toEqual(["thinking", "text"]);
+    expect(items[1]).toMatchObject({ phase: "commentary", text: "Checking" });
   });
 });
 

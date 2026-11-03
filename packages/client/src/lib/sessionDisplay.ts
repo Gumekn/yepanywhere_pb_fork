@@ -1,14 +1,53 @@
 import type {
   SessionBranchState,
+  SessionDisplayNode,
   SessionDisplayPage,
   SessionDisplaySegment,
+  SessionDisplayTurn,
   SessionDisplayUserContent,
 } from "@yep-anywhere/shared";
+import type { useI18n } from "../i18n";
 import type { ContentBlock, Message } from "../types";
 import type { RenderItem } from "../types/renderItems";
-import { collapseCodexSubagentActivities } from "./preprocessMessagesSubagents";
+import {
+  collapseCodexSubagentActivities,
+  projectCodexMainTimeline,
+} from "./preprocessMessagesSubagents";
 
 type DisplayNotice = Extract<SessionDisplaySegment, { type: "notice" }>;
+type Translate = ReturnType<typeof useI18n>["t"];
+
+/** Localized one-line label for lightweight display notices. */
+export function formatSessionDisplayNotice(
+  notice: DisplayNotice,
+  t: Translate,
+): string {
+  const detail = notice.message ?? notice.title;
+  const withDetail = (label: string) =>
+    detail && detail !== label ? `${label}: ${detail}` : label;
+  switch (notice.kind) {
+    case "session_setup":
+      return t("sessionDisplaySetup", { count: notice.count ?? 1 });
+    case "compaction":
+      return t("sessionDisplayCompaction");
+    case "warning":
+      return withDetail(t("sessionDisplayWarning"));
+    case "turn_aborted":
+      return t("sessionDisplayTurnAborted");
+    case "goal":
+      return withDetail(t("sessionDisplayGoal"));
+    case "plan":
+      return withDetail(t("sessionDisplayPlan"));
+    case "subagent":
+      return withDetail(t("sessionDisplaySubagent"));
+    case "inter_agent_message":
+      return withDetail(t("codexAgentCommunication"));
+    case "agent_wait":
+      return t("codexAgentWaiting");
+    case "provider_event":
+      return withDetail(t("sessionDisplayProviderEvent"));
+  }
+}
 
 export interface BuildSessionDisplayRenderItemsOptions {
   projectId: string;
@@ -177,6 +216,29 @@ export function buildSessionDisplayRenderItems(
             sourceMessages: [source],
           });
           break;
+        case "process":
+          items.push({
+            type: "display_process",
+            id: segment.id,
+            process: segment,
+            projectId: options.projectId,
+            sessionId: page.sessionId,
+            revision: page.revision,
+            ...(options.branchId ? { branchId: options.branchId } : {}),
+            // The end time keeps the turn's "last updated" and duration
+            // covering the folded work, not just the visible answer.
+            sourceMessages: segment.endedAt
+              ? [
+                  source,
+                  segmentSourceMessage(
+                    turn.id,
+                    `${segment.id}:end`,
+                    segment.endedAt,
+                  ),
+                ]
+              : [source],
+          });
+          break;
         case "notice":
           if (segment.kind === "agent_wait" && segment.agentWait) {
             items.push({
@@ -256,6 +318,37 @@ export function buildSessionDisplayRenderItems(
   }
 
   return collapseCodexSubagentActivities(items);
+}
+
+/**
+ * Render items for the members of one expanded `process` fold, using the same
+ * segment mapping and Codex timeline projection as the main transcript.
+ */
+export function buildSessionDisplayProcessItems(
+  nodes: readonly SessionDisplayNode[],
+  options: Omit<BuildSessionDisplayRenderItemsOptions, "branchState"> & {
+    sessionId: string;
+    revision: string;
+    provider?: string;
+  },
+): RenderItem[] {
+  const turns: SessionDisplayTurn[] = [];
+  for (const node of nodes) {
+    if (node.type !== "segment") continue;
+    let turn = turns.at(-1);
+    if (!turn || turn.id !== node.turnId) {
+      turn = { id: node.turnId, question: null, segments: [] };
+      turns.push(turn);
+    }
+    turn.segments.push(node.segment);
+  }
+  const items = buildSessionDisplayRenderItems(
+    { sessionId: options.sessionId, revision: options.revision, turns },
+    options,
+  );
+  return options.provider === "codex" || options.provider === "codex-oss"
+    ? projectCodexMainTimeline(items)
+    : items;
 }
 
 function questionSourceMessage(

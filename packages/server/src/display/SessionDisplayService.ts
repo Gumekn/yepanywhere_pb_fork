@@ -5,6 +5,7 @@ import type {
   SessionDisplayCurrent,
   SessionDisplayGroupPage,
   SessionDisplayKnownView,
+  SessionDisplayProcessPage,
   SessionDisplaySnapshot,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
@@ -29,6 +30,7 @@ import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.
 import type { Message } from "../supervisor/types.js";
 import {
   SessionDisplayReducer,
+  type SessionDisplayReducerOptions,
   decodeDisplayToolId,
 } from "./SessionDisplayReducer.js";
 import {
@@ -56,6 +58,8 @@ export interface DisplaySourcePage {
   messages: Message[];
   contextUsage?: ContextUsage;
   turnStatuses?: Readonly<Record<string, SessionDisplayTurnStatus>>;
+  /** Native turn completion times, for providers whose items lack them. */
+  turnCompletedAt?: Readonly<Record<string, string>>;
   /** Native Codex turns covering [from, before); newer live turns may lag history. */
   codexTurnWindow?: { turnIds: string[]; from: number; before: number };
   activity: SessionDisplayActivity["state"];
@@ -530,8 +534,17 @@ export class SessionDisplayService {
       /** Settled views kept after expiry; 0 disables dormancy. */
       maxDormantEntries?: number;
       maxDormantBytes?: number;
+      /**
+       * Fold the working steps of settled answers behind one `process`
+       * segment (default true). Members load through `process()`.
+       */
+      foldSettledTurns?: boolean;
     },
   ) {}
+
+  private get reducerOptions(): SessionDisplayReducerOptions {
+    return { foldSettled: this.options.foldSettledTurns ?? true };
+  }
 
   configureSource(source: SessionDisplaySource): void {
     this.source = source;
@@ -1579,7 +1592,11 @@ export class SessionDisplayService {
       }
     }
     this.acknowledgePersisted(entry, page);
-    const model = new SessionDisplayReducer(entry.view, page.provider);
+    const model = new SessionDisplayReducer(
+      entry.view,
+      page.provider,
+      this.reducerOptions,
+    );
     let restored = page.messages;
     if (page.provider === "cursor") {
       for (const message of entry.overlay.values()) {
@@ -1587,7 +1604,7 @@ export class SessionDisplayService {
           restored = insertCursorPrompt(restored, message);
       }
     }
-    model.restore(restored, page.turnStatuses);
+    model.restore(restored, page.turnStatuses, page.turnCompletedAt);
     if (!page.messages.length)
       for (const message of entry.bootstrapReplay.values())
         model.message(message, true);
@@ -1636,10 +1653,7 @@ export class SessionDisplayService {
     entry.stamp = page.stamp;
     const previous = entry.snapshot;
     const previousTail = previous?.nodes.at(-1);
-    if (
-      previousTail &&
-      !model.snapshot().nodes.some((node) => node.id === previousTail.id)
-    ) {
+    if (previousTail && !model.hasNode(previousTail.id)) {
       // A rewrite (or a source window too far ahead to prove continuity)
       // invalidates the view. Do not replay acknowledged, removed history.
       entry.view = { ...entry.view, epoch: randomUUID() };
@@ -2097,15 +2111,47 @@ export class SessionDisplayService {
     if (entry.view.epoch !== view.epoch)
       throw new Error("Display view changed while loading history");
     const reduceStartedAt = performance.now();
-    const model = new SessionDisplayReducer(view, page.provider);
-    model.restore(page.messages, page.turnStatuses);
+    const model = new SessionDisplayReducer(
+      view,
+      page.provider,
+      this.reducerOptions,
+    );
+    model.restore(page.messages, page.turnStatuses, page.turnCompletedAt);
     if (!entry.snapshot) throw new Error("Display snapshot is not ready");
     const snapshot = {
-      ...model.snapshot(page.cursor),
+      ...model.snapshot(page.cursor, cursor),
       seq: entry.snapshot.seq,
     };
     observer?.timing?.add("reduce", performance.now() - reduceStartedAt);
     return snapshot;
+  }
+  /**
+   * Folded working steps of one settled answer. Live folds come from the
+   * current projection; folds from older history pages are rebuilt from the
+   * page cursor recorded on the segment.
+   */
+  async process(
+    selection: DisplaySelection,
+    processId: string,
+    pageCursor?: string,
+  ): Promise<SessionDisplayProcessPage> {
+    if (!processId.startsWith("process:"))
+      throw new Error("Invalid display process id");
+    const entry = await this.get(selection);
+    this.flush(entry);
+    let nodes = entry.model?.processNodes(processId) ?? null;
+    if (!nodes && pageCursor) {
+      const page = await this.requireSource().read(selection, pageCursor);
+      const model = new SessionDisplayReducer(
+        entry.view,
+        page.provider,
+        this.reducerOptions,
+      );
+      model.restore(page.messages, page.turnStatuses, page.turnCompletedAt);
+      nodes = model.processNodes(processId);
+    }
+    if (!nodes) throw new Error("Display process not found");
+    return { processId, nodes };
   }
   async group(
     selection: DisplaySelection,

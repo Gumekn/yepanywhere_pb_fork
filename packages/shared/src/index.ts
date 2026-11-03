@@ -440,6 +440,7 @@ export {
   SessionDisplayErrorSegmentSchema,
   SessionDisplayNoticeSegmentSchema,
   SessionDisplayPageSchema,
+  SessionDisplayProcessSegmentSchema,
   SessionDisplayQuestionSchema,
   SessionDisplaySegmentSchema,
   SessionDisplayThinkingSegmentSchema,
@@ -699,6 +700,7 @@ export type {
   SessionDisplayKnownView,
   SessionDisplayCurrent,
   SessionDisplayGroupPage,
+  SessionDisplayProcessPage,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
 } from "./session-display.js";

@@ -220,6 +220,22 @@ export function registerSessionDisplayRoutes(
       },
     );
     routes.get(
+      "/projects/:projectId/sessions/:sessionId/display/process/:processId",
+      async (c) => {
+        try {
+          return c.json(
+            await service.process(
+              selection(c),
+              c.req.param("processId"),
+              c.req.query("cursor") || undefined,
+            ),
+          );
+        } catch (error) {
+          return displayErrorResponse(c, error);
+        }
+      },
+    );
+    routes.get(
       "/projects/:projectId/sessions/:sessionId/display/groups/:groupId",
       async (c) => {
         try {
@@ -905,6 +921,9 @@ export function createSessionDisplaySource(
                   })
                 : native.messages,
               turnStatuses,
+              ...(native.turnCompletedAt
+                ? { turnCompletedAt: native.turnCompletedAt }
+                : {}),
               ...(!cursor && native.turnStatuses && turnStarts.length > 0
                 ? {
                     codexTurnWindow: {

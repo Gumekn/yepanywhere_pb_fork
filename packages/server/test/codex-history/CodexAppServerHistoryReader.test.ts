@@ -474,6 +474,10 @@ describe("CodexAppServerHistoryReader", () => {
     expect(result.turnStatuses).toEqual({
       "turn-semantic": "completed",
     });
+    // Items carry the turn start; the native completion bounds its duration.
+    expect(result.turnCompletedAt).toEqual({
+      "turn-semantic": new Date(1_777_000_020_000).toISOString(),
+    });
     expect(result.messages.map((message) => message.uuid)).toEqual([
       "summary-user-turn-semantic",
       "semantic-command-turn-semantic",

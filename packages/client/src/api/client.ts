@@ -1,6 +1,7 @@
 import type {
   AgentCommandListing,
   SessionDisplayGroupPage,
+  SessionDisplayProcessPage,
   SessionDisplaySnapshot,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
@@ -1276,6 +1277,20 @@ export const api = {
       serverTiming: response.headers.get("server-timing"),
     });
     return response.json() as Promise<SessionDisplaySnapshot>;
+  },
+  getSessionDisplayProcess: (
+    projectId: string,
+    sessionId: string,
+    processId: string,
+    options?: { branchId?: string; cursor?: string; signal?: AbortSignal },
+  ) => {
+    const params = new URLSearchParams();
+    if (options?.branchId) params.set("branchId", options.branchId);
+    if (options?.cursor) params.set("cursor", options.cursor);
+    return fetchJSON<SessionDisplayProcessPage>(
+      `/projects/${projectId}/sessions/${sessionId}/display/process/${encodeURIComponent(processId)}?${params}`,
+      { signal: options?.signal },
+    );
   },
   getSessionDisplayGroup: (
     projectId: string,

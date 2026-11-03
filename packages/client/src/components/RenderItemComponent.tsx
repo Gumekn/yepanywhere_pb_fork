@@ -5,6 +5,7 @@ import { getMessageId } from "../lib/mergeMessages";
 import { canEditPersistedUserPrompt } from "../lib/sessionBranching";
 import type { EditUserPromptRequest } from "../lib/userPromptContent";
 import type { RenderItem } from "../types/renderItems";
+import { DisplayProcessRow } from "./blocks/DisplayProcessRow";
 import { DisplayToolGroupRow } from "./blocks/DisplayToolGroupRow";
 import { SessionSetupBlock } from "./blocks/SessionSetupBlock";
 import { TextBlock } from "./blocks/TextBlock";
@@ -209,6 +210,24 @@ export const RenderItemComponent = memo(function RenderItemComponent({
       case "display_tool_group":
         return (
           <DisplayToolGroupRow item={item} sessionProvider={sessionProvider} />
+        );
+
+      case "display_process":
+        return (
+          <DisplayProcessRow
+            item={item}
+            sessionProvider={sessionProvider}
+            renderItem={(child, childThinkingExpanded, toggleChildThinking) => (
+              <RenderItemComponent
+                item={child}
+                isStreaming={false}
+                thinkingExpanded={childThinkingExpanded}
+                toggleThinkingExpanded={toggleChildThinking}
+                sessionProvider={sessionProvider}
+                onSelectBranch={onSelectBranch}
+              />
+            )}
+          />
         );
 
       case "user_prompt": {

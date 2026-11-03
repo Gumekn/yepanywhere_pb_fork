@@ -22,10 +22,85 @@ import {
 import type { Message } from "../supervisor/types.js";
 
 type RecordValue = Record<string, unknown>;
-type GroupSegment = Extract<
-  Extract<SessionDisplayNode, { type: "segment" }>["segment"],
-  { type: "tool_group" }
->;
+type SegmentNode = Extract<SessionDisplayNode, { type: "segment" }>;
+type QuestionNode = Extract<SessionDisplayNode, { type: "question" }>;
+type DisplaySegment = SegmentNode["segment"];
+type GroupSegment = Extract<DisplaySegment, { type: "tool_group" }>;
+type ProcessSegment = Extract<DisplaySegment, { type: "process" }>;
+interface SourceTime {
+  time: number;
+  value: string;
+}
+
+/** Runtime states in which the latest block cannot receive more work. */
+const SETTLED_RUNTIME_STATES = new Set<SessionDisplayActivity["state"]>([
+  "completed",
+  "interrupted",
+  "failed",
+  "unknown",
+]);
+/** Visible markers that stay in the timeline when a settled answer folds. */
+const PINNED_NOTICE_KINDS = new Set<string>([
+  "session_setup",
+  "compaction",
+  "warning",
+  "turn_aborted",
+  "goal",
+]);
+
+export interface SessionDisplayReducerOptions {
+  /**
+   * Fold the working steps of settled answers behind one `process` segment.
+   * Members stay retrievable through `processNodes`.
+   */
+  foldSettled?: boolean;
+}
+
+function isAsyncText(segment: DisplaySegment): boolean {
+  return (
+    segment.type === "assistant_text" && segment.asyncMessage !== undefined
+  );
+}
+
+/** Errors, async questions and visible markers are never folded away. */
+function isPinnedSegment(segment: DisplaySegment): boolean {
+  if (segment.type === "error") return true;
+  if (segment.type === "notice") return PINNED_NOTICE_KINDS.has(segment.kind);
+  return isAsyncText(segment);
+}
+
+/**
+ * Live work that keeps a block expanded. Only tools and streaming text count:
+ * closing a run settles both, whereas notice states (agent waits, subagents)
+ * may legitimately stay stale and must not pin a finished answer open.
+ */
+function isActiveSegment(segment: DisplaySegment): boolean {
+  if (segment.type === "tool_group")
+    return segment.status === "running" || (segment.runningCount ?? 0) > 0;
+  return segment.type === "assistant_text" && segment.streaming === true;
+}
+
+function foldVersion(members: readonly SegmentNode[]): number {
+  let hash = 2166136261;
+  const mix = (value: string) => {
+    for (let index = 0; index < value.length; index++) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+  };
+  for (const node of members) {
+    const segment = node.segment;
+    mix(node.id);
+    mix(
+      segment.type === "tool_group"
+        ? `${segment.version ?? 0}:${segment.status}`
+        : segment.type === "assistant_text" || segment.type === "thinking"
+          ? String(segment.content.length)
+          : String(JSON.stringify(segment).length),
+    );
+  }
+  return hash >>> 0;
+}
 
 export interface DisplayToolRecord {
   rawId: string;
@@ -167,6 +242,10 @@ export class SessionDisplayReducer {
   private streamingId: string | undefined;
   private streamingTexts = new Map<string, string>();
   private endedRuns = new Set<string>();
+  /** Terminal outcome per provider run, used to label folded work. */
+  private runStatuses = new Map<string, SessionDisplayTurnStatus>();
+  /** Known completion time per provider run, bounding a fold's duration. */
+  private runEndedAt = new Map<string, string>();
   private runtime: SessionDisplayActivity["state"] = "unknown";
   private compactionRun: string | undefined;
   private seq = 0;
@@ -174,6 +253,7 @@ export class SessionDisplayReducer {
   constructor(
     public view: SessionDisplayView,
     private readonly provider?: string,
+    private readonly options: SessionDisplayReducerOptions = {},
   ) {}
 
   get currentRunId(): string {
@@ -197,11 +277,15 @@ export class SessionDisplayReducer {
   restore(
     messages: readonly Message[],
     statuses?: Readonly<Record<string, SessionDisplayTurnStatus>>,
+    completedAt?: Readonly<Record<string, string>>,
   ): void {
     for (const message of messages) this.message(message as RecordValue, true);
     for (const [runId, status] of Object.entries(statuses ?? {})) {
       if (status !== "running") this.closeRun(runId, status);
     }
+    for (const [runId, timestamp] of Object.entries(completedAt ?? {}))
+      if (Number.isFinite(Date.parse(timestamp)))
+        this.runEndedAt.set(runId, timestamp);
   }
 
   private put(node: SessionDisplayNode): void {
@@ -352,6 +436,7 @@ export class SessionDisplayReducer {
   private closeRun(runId: string, status: SessionDisplayTurnStatus): void {
     if (status !== "running") {
       this.endedRuns.add(runId);
+      this.runStatuses.set(runId, status);
       this.stopStreaming(runId);
     }
     if (this.compactionRun === runId && status !== "running")
@@ -722,19 +807,23 @@ export class SessionDisplayReducer {
         (status === "completed" ||
           status === "interrupted" ||
           status === "failed")
-      )
+      ) {
         this.closeRun(runId, status);
+        if (timestamp) this.runEndedAt.set(runId, timestamp);
+      }
       return;
     }
     if (message.type === "result") {
+      const resultRun = runId ?? this.currentRun;
       this.closeRun(
-        runId ?? this.currentRun,
+        resultRun,
         message.turnStatus === "interrupted"
           ? "interrupted"
           : message.is_error === true
             ? "failed"
             : "completed",
       );
+      if (timestamp) this.runEndedAt.set(resultRun, timestamp);
       return;
     }
     if (message.type === "stream_event") {
@@ -1115,9 +1204,9 @@ export class SessionDisplayReducer {
     }
   }
 
-  snapshot(olderCursor?: string): SessionDisplaySnapshot {
-    this.reapStrandedTools();
-    const nodes = this.nodes.map((node) => {
+  /** Nodes with Markdown and current tool-group summaries, before folding. */
+  private renderNodes(): SessionDisplayNode[] {
+    return this.nodes.map((node) => {
       if (node.type === "segment" && node.segment.type === "assistant_text") {
         const cached = this.renderedNodes.get(node);
         if (cached) return cached;
@@ -1148,6 +1237,324 @@ export class SessionDisplayReducer {
           }
         : node;
     });
+  }
+
+  /**
+   * Replace the working steps of every settled answer with one `process`
+   * segment. Blocks are delimited by user prompts; only the latest block can
+   * still be running, and a block with live work is never folded.
+   */
+  private foldProcesses(
+    nodes: readonly SessionDisplayNode[],
+    pageCursor?: string,
+  ): {
+    nodes: SessionDisplayNode[];
+    folds: Map<string, SegmentNode[]>;
+  } {
+    const output: SessionDisplayNode[] = [];
+    const folds = new Map<string, SegmentNode[]>();
+    let anchor: QuestionNode | undefined;
+    let block: SegmentNode[] = [];
+    const flush = (isLast: boolean) => {
+      if (block.length)
+        output.push(
+          ...this.foldBlock(block, anchor, isLast, folds, pageCursor),
+        );
+      block = [];
+    };
+    for (const node of nodes) {
+      if (node.type === "question") {
+        flush(false);
+        output.push(node);
+        anchor = node;
+      } else block.push(node);
+    }
+    flush(true);
+    return { nodes: output, folds };
+  }
+
+  private foldBlock(
+    block: SegmentNode[],
+    anchor: QuestionNode | undefined,
+    isLast: boolean,
+    folds: Map<string, SegmentNode[]>,
+    pageCursor?: string,
+  ): SegmentNode[] {
+    if (
+      isLast &&
+      (!SETTLED_RUNTIME_STATES.has(this.runtime) || this.compactionRun)
+    )
+      return block;
+    if (block.some((node) => isActiveSegment(node.segment))) return block;
+
+    // The answer is the trailing text after the last working step. Trailing
+    // notices (late subagent/wait updates) fold into the work before it.
+    const tail = new Set<string>();
+    let tailStart = block.length;
+    for (let index = block.length - 1; index >= 0; index--) {
+      const node = block[index];
+      if (!node) continue;
+      const segment = node.segment;
+      if (isPinnedSegment(segment) || segment.type === "notice") continue;
+      if (segment.type !== "assistant_text" || segment.phase === "progress")
+        break;
+      tail.add(node.id);
+      tailStart = index;
+    }
+    // Visible markers recorded once the answer had begun (a manual compaction
+    // between turns, a late warning) keep their source position after it
+    // instead of being hoisted above the answer together with the work.
+    const afterAnswer = new Set<string>();
+    for (let index = tailStart + 1; index < block.length; index++) {
+      const node = block[index];
+      if (node && !tail.has(node.id) && isPinnedSegment(node.segment))
+        afterAnswer.add(node.id);
+    }
+    const trailing = (node: SegmentNode) =>
+      tail.has(node.id) || afterAnswer.has(node.id);
+    let answered = tail.size > 0;
+
+    type Part =
+      | { node: SegmentNode }
+      | { members: SegmentNode[]; startedAt?: string };
+    const parts: Part[] = [];
+    let members: SegmentNode[] = [];
+    let held: SegmentNode[] = [];
+    let boundary = anchor?.question.timestamp;
+    const close = () => {
+      if (members.length) parts.push({ members, startedAt: boundary });
+      for (const node of held) parts.push({ node });
+      members = [];
+      held = [];
+    };
+    for (const node of block) {
+      if (trailing(node)) continue;
+      const segment = node.segment;
+      const explicitAnswer =
+        segment.type === "assistant_text" &&
+        !segment.asyncMessage &&
+        segment.phase === "final";
+      if (explicitAnswer || isAsyncText(segment)) {
+        // A mid-turn final answer or async question splits the work into
+        // ordered folds and stays visible between them.
+        if (explicitAnswer) answered = true;
+        close();
+        parts.push({ node });
+        boundary = segment.timestamp ?? boundary;
+      } else if (isPinnedSegment(segment)) {
+        if (members.length) held.push(node);
+        else parts.push({ node });
+      } else members.push(node);
+    }
+    close();
+    const foldCount = parts.filter((part) => "members" in part).length;
+    if (!foldCount) return block;
+    for (const node of block) if (trailing(node)) parts.push({ node });
+
+    // Session-wide run facts (generic run, runtime state) may describe the
+    // activity behind those later markers, e.g. a compaction's own result.
+    // Only the block's own run then speaks for the answer.
+    const sessionFacts = isLast && afterAnswer.size === 0;
+    const status = this.blockStatus(block, anchor, sessionFacts, answered);
+    const runId = this.blockRunId(block, anchor, sessionFacts);
+    const runEnd = runId ? this.runEndedAt.get(runId) : undefined;
+    const runEndTime = Date.parse(runEnd ?? "");
+    const latest = this.latestTime(
+      block.filter((node) => !afterAnswer.has(node.id)),
+    );
+    // Codex history stamps every item with the turn start; its native turn
+    // completion is then the only evidence of how long the work took.
+    const blockEnd =
+      runEnd &&
+      Number.isFinite(runEndTime) &&
+      (!latest || runEndTime > latest.time)
+        ? { time: runEndTime, value: runEnd }
+        : latest;
+    const anchorId =
+      anchor?.id ?? `start:${block[0]?.id ?? this.view.sessionId}`;
+    const output: SegmentNode[] = [];
+    let foldIndex = 0;
+    for (const part of parts) {
+      if ("node" in part) {
+        output.push(part.node);
+        continue;
+      }
+      const isFinalFold = foldIndex === foldCount - 1;
+      const id = `process:${anchorId}:${foldIndex}`;
+      foldIndex++;
+      folds.set(id, part.members);
+      output.push({
+        type: "segment",
+        id,
+        turnId: part.members[0]?.turnId ?? anchor?.turnId ?? "preamble",
+        segment: this.processSegment(id, part.members, {
+          // Only the last fold ends this answer; earlier folds lead into an
+          // async question or a mid-turn reply.
+          status: isFinalFold ? status : "unknown",
+          startedAt: part.startedAt,
+          endedAt: isFinalFold ? blockEnd : undefined,
+          pageCursor,
+        }),
+      });
+    }
+    return output;
+  }
+
+  /**
+   * Provider run that a block belongs to. Providers without native run ids
+   * share the generic `session` run, whose facts only describe the latest
+   * block.
+   */
+  private blockRunId(
+    block: readonly SegmentNode[],
+    anchor: QuestionNode | undefined,
+    isLast: boolean,
+  ): string | undefined {
+    const turnId = anchor?.turnId ?? block[0]?.turnId;
+    const runId = turnId?.startsWith("turn:")
+      ? turnId.slice("turn:".length)
+      : undefined;
+    if (runId && runId !== "session" && this.endedRuns.has(runId)) return runId;
+    if (runId && runId !== "session" && this.runEndedAt.has(runId))
+      return runId;
+    return isLast ? this.currentRun : undefined;
+  }
+
+  private blockStatus(
+    block: readonly SegmentNode[],
+    anchor: QuestionNode | undefined,
+    isLast: boolean,
+    answered: boolean,
+  ): ProcessSegment["status"] {
+    if (block.some((node) => node.segment.type === "error")) return "failed";
+    if (
+      block.some(
+        (node) =>
+          node.segment.type === "notice" &&
+          node.segment.kind === "turn_aborted",
+      )
+    )
+      return "interrupted";
+    const runId = this.blockRunId(block, anchor, isLast);
+    const runStatus = runId ? this.runStatuses.get(runId) : undefined;
+    if (runStatus && runStatus !== "running") return runStatus;
+    if (
+      isLast &&
+      (this.runtime === "completed" ||
+        this.runtime === "interrupted" ||
+        this.runtime === "failed")
+    )
+      return this.runtime;
+    return answered ? "completed" : "unknown";
+  }
+
+  /** Known source times of a segment, including its tools' lifecycles. */
+  private segmentTimes(node: SegmentNode): SourceTime[] {
+    const values: Array<string | undefined> = [node.segment.timestamp];
+    if (node.segment.type === "tool_group") {
+      for (const id of this.groups.get(node.segment.id)?.tools ?? []) {
+        const step = this.tools.get(id)?.step;
+        values.push(step?.timestamp, step?.completedAt);
+      }
+    }
+    return values.flatMap((value) => {
+      const time = Date.parse(value ?? "");
+      return value && Number.isFinite(time) ? [{ time, value }] : [];
+    });
+  }
+
+  private latestTime(nodes: readonly SegmentNode[]): SourceTime | undefined {
+    let latest: SourceTime | undefined;
+    for (const node of nodes)
+      for (const time of this.segmentTimes(node))
+        if (!latest || time.time > latest.time) latest = time;
+    return latest;
+  }
+
+  private processSegment(
+    id: string,
+    members: readonly SegmentNode[],
+    options: {
+      status: ProcessSegment["status"];
+      startedAt?: string;
+      endedAt?: SourceTime;
+      pageCursor?: string;
+    },
+  ): ProcessSegment {
+    let toolCount = 0;
+    let failedToolCount = 0;
+    let thinkingCount = 0;
+    let updateCount = 0;
+    const paths = new Set<string>();
+    let earliest: SourceTime | undefined;
+    for (const node of members) {
+      const segment = node.segment;
+      if (segment.type === "tool_group") {
+        toolCount += segment.count;
+        failedToolCount += segment.failedCount;
+        for (const toolId of this.groups.get(segment.id)?.tools ?? [])
+          for (const path of this.tools.get(toolId)?.paths ?? [])
+            paths.add(path);
+      } else if (segment.type === "thinking") thinkingCount++;
+      else if (segment.type === "assistant_text") updateCount++;
+      for (const time of this.segmentTimes(node))
+        if (!earliest || time.time < earliest.time) earliest = time;
+    }
+    const startedAt = Number.isFinite(Date.parse(options.startedAt ?? ""))
+      ? options.startedAt
+      : earliest?.value;
+    const startMs = Date.parse(startedAt ?? "");
+    const end = options.endedAt ?? this.latestTime(members);
+    const endedAt =
+      end && Number.isFinite(startMs) && end.time > startMs
+        ? end.value
+        : undefined;
+    return {
+      type: "process",
+      id,
+      status: options.status,
+      stepCount: members.length,
+      toolCount,
+      failedToolCount,
+      thinkingCount,
+      updateCount,
+      ...(paths.size ? { changedFileCount: paths.size } : {}),
+      ...(startedAt ? { startedAt } : {}),
+      ...(endedAt ? { endedAt } : {}),
+      version: foldVersion(members),
+      ...(options.pageCursor ? { pageCursor: options.pageCursor } : {}),
+      ...(startedAt ? { timestamp: startedAt } : {}),
+    };
+  }
+
+  /** True when the id is a raw node or a fold of the current projection. */
+  hasNode(id: string): boolean {
+    if (this.nodeIndices.has(id)) return true;
+    return (
+      this.options.foldSettled === true &&
+      id.startsWith("process:") &&
+      this.foldProcesses(this.renderNodes()).folds.has(id)
+    );
+  }
+
+  /** Folded members of one `process` segment, or null when it is not folded. */
+  processNodes(id: string): SessionDisplayNode[] | null {
+    if (!id.startsWith("process:")) return null;
+    this.reapStrandedTools();
+    return this.foldProcesses(this.renderNodes()).folds.get(id) ?? null;
+  }
+
+  /**
+   * @param olderCursor cursor of the next older history page
+   * @param pageCursor cursor that produced this (older) page, recorded on
+   *   folds so their members can be read back outside the live projection
+   */
+  snapshot(olderCursor?: string, pageCursor?: string): SessionDisplaySnapshot {
+    this.reapStrandedTools();
+    const rendered = this.renderNodes();
+    const nodes = this.options.foldSettled
+      ? this.foldProcesses(rendered, pageCursor).nodes
+      : rendered;
     const running = [...this.tools.values()].filter(
       (t) => t.step.status === "running",
     );
