@@ -18,6 +18,7 @@ const FAKE_PI_RPC = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
 const output = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 const log = (value) => fs.appendFileSync("commands.log", JSON.stringify(value) + "\n");
+log({ type: "startup", args: process.argv.slice(2) });
 let buffer = "";
 const entries = [
   { type: "message", id: "old-user", parentId: null, timestamp: "2026-09-02T07:58:51.565Z", message: { role: "user", content: [{ type: "text", text: "earlier" }], timestamp: 1 } },
@@ -142,7 +143,7 @@ describe("PiProvider compaction and / commands", () => {
     );
   });
 
-  async function startSession() {
+  async function startSession(resume = false) {
     const root = join(tmpdir(), `pi-compact-${randomUUID()}`);
     const sessionsDir = join(root, "sessions");
     const projectPath = join(root, "project");
@@ -152,6 +153,16 @@ describe("PiProvider compaction and / commands", () => {
     await mkdir(projectPath, { recursive: true });
     await writeFile(fakePiPath, FAKE_PI_RPC);
     await chmod(fakePiPath, 0o755);
+    if (resume) {
+      await writeFile(
+        join(
+          sessionsDir,
+          "--project--",
+          "2026-09-02T07-58-51.565Z_pi-compact-session.jsonl",
+        ),
+        `${JSON.stringify({ type: "session", version: 3, id: "pi-compact-session", timestamp: "2026-09-02T07:58:51.565Z", cwd: projectPath })}\n`,
+      );
+    }
 
     vi.stubEnv("YEP_ANYWHERE_DATA_DIR", join(root, "data"));
     vi.stubEnv("YEP_LLM_GATEWAY_API_KEY", "test-only-secret");
@@ -190,6 +201,7 @@ describe("PiProvider compaction and / commands", () => {
     const session = await provider.startSession({
       cwd: projectPath,
       model: "test-model",
+      ...(resume ? { resumeSessionId: "pi-compact-session" } : {}),
     });
     const iterator = session.iterator as AsyncIterableIterator<SdkRecord>;
     const commands = async () =>
@@ -234,6 +246,36 @@ describe("PiProvider compaction and / commands", () => {
       );
       await iterator.next();
       await expect(session.supportedCommands?.()).resolves.toHaveLength(3);
+    } finally {
+      session.abort();
+    }
+  });
+
+  it("compacts restored history immediately after init without a prompt turn", async () => {
+    const { session, iterator, commands } = await startSession(true);
+    try {
+      expect((await iterator.next()).value).toMatchObject({
+        subtype: "init",
+        session_id: "pi-compact-session",
+      });
+      const compacted = session.compact?.({
+        customInstructions: "keep earlier decisions",
+      });
+      const messages = await drainUntilResult(iterator);
+      await compacted;
+      const sent = await commands();
+      expect(sent.find((c) => c.type === "startup")?.args).toContain(
+        "--session",
+      );
+      expect(sent.some((c) => c.type === "prompt")).toBe(false);
+      expect(sent.find((c) => c.type === "compact")).toMatchObject({
+        customInstructions: "keep earlier decisions",
+      });
+      expect(messages.some((m) => m.type === "user")).toBe(false);
+      expect(
+        messages.find((m) => m.subtype === "compact_boundary"),
+      ).toMatchObject({ uuid: "compaction-1", content: "manual summary" });
+      expect(statuses(messages)).toEqual(["compacting", null]);
     } finally {
       session.abort();
     }

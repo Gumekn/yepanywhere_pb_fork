@@ -148,10 +148,9 @@ export interface ResumeSessionCommandInput {
   /** Reject atomically when resuming would enter the worker queue. */
   requireImmediate?: boolean;
   /** Internal provider-native action to run after a message-free resume. */
-  controlAfterResume?: Extract<
-    CodexNativeControlRequest,
-    { control: "thread/compact/start" }
-  >;
+  controlAfterResume?:
+    | Extract<CodexNativeControlRequest, { control: "thread/compact/start" }>
+    | { control: "pi/compact"; customInstructions?: string };
   /** Internal-only source override used by the Feishu usage-limit router. */
   codexModelProviderOverride?: {
     sourceId: string;
@@ -1001,6 +1000,7 @@ export class SessionCommandService {
       );
     }
     const controlAfterResume = input.controlAfterResume;
+    const piCompaction = controlAfterResume?.control === "pi/compact";
     const persistedProvider =
       this.deps.sessionMetadataService?.getPersistedProvider?.(sessionId) ??
       this.deps.sessionMetadataService?.getProvider(sessionId);
@@ -1109,6 +1109,7 @@ export class SessionCommandService {
     if (
       !providerName ||
       providerName === "codex" ||
+      piCompaction ||
       !parsedReasoningEffort.reasoningEffort
     ) {
       const sessionSummaryResult = await findSessionSummaryAcrossProviders(
@@ -1129,9 +1130,14 @@ export class SessionCommandService {
     if (isReadOnlyProvider(providerName)) {
       return readOnlyProviderFailure();
     }
-    if (controlAfterResume && providerName !== "codex") {
+    if (
+      controlAfterResume &&
+      providerName !== (piCompaction ? "pi" : "codex")
+    ) {
       return commandFailure(
-        "Only Codex sessions can resume for native compaction",
+        piCompaction
+          ? "Only Pi sessions can use Pi compaction"
+          : "Only Codex sessions can resume for native compaction",
         400,
         { code: "unsupported_provider" },
       );
@@ -1143,7 +1149,9 @@ export class SessionCommandService {
     // token means no named model was selected, not a switch to global defaults.
     const model =
       resolveSessionModel(body.model, providerName) ??
-      (providerName === "codex" ? sessionSummary?.model : undefined);
+      (providerName === "codex" || piCompaction
+        ? sessionSummary?.model
+        : undefined);
     let effectiveCodexForkExcludedTurns = parsedRollbackNumTurns.value;
     if (
       providerName === "codex" &&
@@ -1528,6 +1536,14 @@ export class SessionCommandService {
       reasoningEffort: resumeReasoningEffort,
     };
 
+    if (controlAfterResume?.control === "pi/compact") {
+      return this.compactPiProcess(
+        actualSessionId,
+        result.id,
+        controlAfterResume.customInstructions,
+      );
+    }
+
     if (controlAfterResume) {
       const controlResult =
         await this.deps.runtimeController.executeCodexControl({
@@ -1615,6 +1631,68 @@ export class SessionCommandService {
       requireImmediate: true,
       controlAfterResume: input.request,
     });
+  }
+
+  /** Compact an existing Pi session, restoring its resident process if needed. */
+  async compactPiSession(input: {
+    projectId: string;
+    sessionId: string;
+    customInstructions?: string;
+  }): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const providerFailure = this.validateRequestedProvider("pi");
+    if (providerFailure) return providerFailure;
+    const existing =
+      await this.deps.runtimeController.getProcessSnapshotForSession(
+        input.sessionId,
+      );
+    if (existing) {
+      if (existing.provider !== "pi") {
+        return commandFailure("Only Pi sessions can use Pi compaction", 400);
+      }
+      // Pi queues this control between turns, including when a different
+      // client resumed the session while this request was in flight.
+      return this.compactPiProcess(
+        input.sessionId,
+        existing.id,
+        input.customInstructions,
+      );
+    }
+    return this.resume({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      body: { message: "", provider: "pi" },
+      requireImmediate: true,
+      controlAfterResume: {
+        control: "pi/compact",
+        customInstructions: input.customInstructions,
+      },
+    });
+  }
+
+  private async compactPiProcess(
+    sessionId: string,
+    processId: string,
+    customInstructions?: string,
+  ): Promise<SessionCommandResult<Record<string, unknown>>> {
+    const identity = { sessionId, processId };
+    try {
+      const result = await this.deps.runtimeController.compact(processId, {
+        ...(customInstructions ? { customInstructions } : {}),
+      });
+      return result.success
+        ? commandSuccess({ ...identity, success: true })
+        : commandFailure(
+            "Pi session is no longer available for compaction",
+            410,
+            identity,
+          );
+    } catch (error) {
+      return commandFailure(
+        error instanceof Error ? error.message : "Pi compaction failed",
+        502,
+        identity,
+      );
+    }
   }
 
   async queue(

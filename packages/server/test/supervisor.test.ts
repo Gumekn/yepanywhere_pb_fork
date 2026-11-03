@@ -300,60 +300,95 @@ describe("Supervisor", () => {
       expect(process.sessionId).toBe("sess-123");
     });
 
-    it("resumes a resident provider without injecting an initial message", async () => {
-      let aborted = false;
-      const startSession = vi.fn(async (options: StartSessionOptions) => {
-        async function* iterator() {
-          yield {
-            type: "system",
-            subtype: "init",
-            session_id: options.resumeSessionId ?? "unexpected-session",
-          };
-          while (!aborted) {
-            await new Promise((resolve) => setTimeout(resolve, 5));
+    it.each(["codex", "pi"])(
+      "resumes resident %s without injecting an initial message",
+      async (provider) => {
+        let aborted = false;
+        const startSession = vi.fn(async (options: StartSessionOptions) => {
+          async function* iterator() {
+            yield {
+              type: "system",
+              subtype: "init",
+              session_id: options.resumeSessionId ?? "unexpected-session",
+            };
+            while (!aborted) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
           }
+
+          return {
+            iterator: iterator(),
+            queue: new MessageQueue(),
+            abort: () => {
+              aborted = true;
+            },
+          };
+        });
+        const providerSupervisor = new Supervisor({
+          provider:
+            provider === "pi"
+              ? createPiTestProvider(startSession)
+              : createCodexTestProvider(startSession),
+          idleTimeoutMs: 100,
+        });
+
+        try {
+          const process = await providerSupervisor.resumeSession(
+            "sess-compact",
+            "/tmp/test",
+            undefined,
+            undefined,
+            undefined,
+            { requireImmediate: true },
+          );
+
+          expect(startSession).toHaveBeenCalledWith(
+            expect.objectContaining({
+              resumeSessionId: "sess-compact",
+            }),
+          );
+          expect(startSession.mock.calls[0]?.[0]).not.toHaveProperty(
+            "initialMessage",
+          );
+          expect((process as { sessionId: string }).sessionId).toBe(
+            "sess-compact",
+          );
+          expect((process as { state: { type: string } }).state.type).toBe(
+            "idle",
+          );
+          expect(
+            providerSupervisor.getProcessForSession("sess-compact")?.id,
+          ).toBe((process as { id: string }).id);
+        } finally {
+          await providerSupervisor.shutdown();
         }
+      },
+    );
 
-        return {
-          iterator: iterator(),
-          queue: new MessageQueue(),
-          abort: () => {
-            aborted = true;
-          },
-        };
-      });
+    it("rejects failed Pi restoration before accepting a native control", async () => {
+      const abort = vi.fn();
       const providerSupervisor = new Supervisor({
-        provider: createCodexTestProvider(startSession),
-        idleTimeoutMs: 100,
+        provider: createPiTestProvider(async () => ({
+          iterator: (async function* () {
+            yield { type: "error", error: "Pi session file is missing" };
+          })(),
+          queue: new MessageQueue(),
+          abort,
+        })),
       });
-
       try {
-        const process = await providerSupervisor.resumeSession(
-          "sess-compact",
-          "/tmp/test",
-          undefined,
-          undefined,
-          undefined,
-          { requireImmediate: true },
-        );
-
-        expect(startSession).toHaveBeenCalledWith(
-          expect.objectContaining({
-            resumeSessionId: "sess-compact",
-          }),
-        );
-        expect(startSession.mock.calls[0]?.[0]).not.toHaveProperty(
-          "initialMessage",
-        );
-        expect((process as { sessionId: string }).sessionId).toBe(
-          "sess-compact",
-        );
-        expect((process as { state: { type: string } }).state.type).toBe(
-          "idle",
-        );
-        expect(
-          providerSupervisor.getProcessForSession("sess-compact")?.id,
-        ).toBe((process as { id: string }).id);
+        await expect(
+          providerSupervisor.resumeSession(
+            "pi-missing",
+            "/tmp/test",
+            undefined,
+            undefined,
+            undefined,
+            { requireImmediate: true },
+          ),
+        ).rejects.toThrow("Pi session file is missing");
+        expect(abort).toHaveBeenCalled();
+        expect(providerSupervisor.getAllProcesses()).toHaveLength(0);
       } finally {
         await providerSupervisor.shutdown();
       }

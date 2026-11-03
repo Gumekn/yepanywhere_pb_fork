@@ -298,7 +298,7 @@ export function buildAgentCommandCatalog({
   const live = canSend ? providerCommands.map((command) => command.name) : [];
 
   if (provider === "pi") {
-    addYep("compact", ownsProcess);
+    addYep("compact", inSession && canSend);
     addYep("model", ownsProcess);
     sideCommands(hasSide);
     // Yep always intercepts these names for Pi, so a provider entry with the

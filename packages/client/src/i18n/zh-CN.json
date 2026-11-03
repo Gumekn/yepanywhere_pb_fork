@@ -457,7 +457,7 @@
   "codexCompactActiveSessionRequired": "请等待当前 Codex 任务结束后再压缩上下文。",
   "codexCompactExternalSessionRequired": "该 Codex 会话正由其他进程控制，无法在这里压缩上下文。",
   "codexCompactAlreadyRunning": "正在压缩上下文",
-  "piCompactSessionNotRunning": "该 Pi 会话当前未运行，请先发送一条消息再压缩上下文。",
+  "piCompactExternalSessionRequired": "该 Pi 会话正由其他进程控制，无法在这里压缩上下文。",
   "piCompactQueuedAfterTurn": "将在当前回合结束后压缩上下文。",
   "piCompactInstructionsTooLong": "压缩说明过长（最多 {max} 个字符）。",
   "codexCommandsLabel": "Codex 命令",

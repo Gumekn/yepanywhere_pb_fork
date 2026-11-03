@@ -480,6 +480,27 @@ describe("Codex native controls", () => {
     );
   });
 
+  it("compacts Pi by session identity without submitting a user prompt", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        success: true,
+        sessionId: "session-1",
+        processId: "process-1",
+      }),
+    } as Response);
+    await api.compactPiSession("project-1", "session-1", {
+      customInstructions: "keep decisions",
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/projects/project-1/sessions/session-1/compact",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ customInstructions: "keep decisions" }),
+      }),
+    );
+  });
+
   it("uses the project-scoped endpoint to resume before compaction", async () => {
     fetchMock.mockResolvedValue({
       ok: true,

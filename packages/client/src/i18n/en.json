@@ -457,7 +457,7 @@
   "codexCompactActiveSessionRequired": "Wait for the active Codex turn to finish before compacting.",
   "codexCompactExternalSessionRequired": "This Codex session is controlled by another process and cannot be compacted here.",
   "codexCompactAlreadyRunning": "Context compaction is already running",
-  "piCompactSessionNotRunning": "This Pi session is not running. Send a message first, then compact.",
+  "piCompactExternalSessionRequired": "This Pi session is controlled by another process and cannot be compacted here.",
   "piCompactQueuedAfterTurn": "Context will be compacted after the current turn finishes.",
   "piCompactInstructionsTooLong": "Compaction instructions are too long (max {max} characters).",
   "codexCommandsLabel": "Codex commands",

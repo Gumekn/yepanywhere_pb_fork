@@ -73,6 +73,7 @@ import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
 import { EmbeddedRuntimeController } from "../runtime/EmbeddedRuntimeController.js";
+import { parseCompactRequestBody } from "../runtime/compact-request.js";
 import type { RuntimeController } from "../runtime/types.js";
 import {
   type CodexNativeControlRequest,
@@ -2660,6 +2661,48 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       body,
     });
     return c.json(result.body, result.status);
+  });
+
+  // Session-scoped Pi compaction also works after the resident process exits.
+  routes.post("/projects/:projectId/sessions/:sessionId/compact", async (c) => {
+    const projectId = c.req.param("projectId");
+    if (!isUrlProjectId(projectId)) {
+      return c.json({ error: "Invalid project ID format" }, 400);
+    }
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "Invalid JSON body" }, 400);
+    }
+    const parsed = parseCompactRequestBody(body);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    const sessionId = c.req.param("sessionId");
+    if (deps.externalTracker?.isExternal(sessionId)) {
+      return c.json(
+        {
+          error: "Pi session is controlled by an external process",
+          code: "session_external",
+        },
+        409,
+      );
+    }
+    try {
+      const result = await sessionCommandService.compactPiSession({
+        projectId,
+        sessionId,
+        ...parsed.options,
+      });
+      return c.json(result.body, result.status);
+    } catch (error) {
+      return c.json(
+        {
+          error:
+            error instanceof Error ? error.message : "Pi compaction failed",
+        },
+        502,
+      );
+    }
   });
 
   // POST /api/projects/:projectId/sessions/:sessionId/codex-control - Resume

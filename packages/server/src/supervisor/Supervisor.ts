@@ -661,7 +661,8 @@ export class Supervisor {
           strict:
             activeProvider.name === "codex" ||
             activeProvider.name === "cursor" ||
-            activeProvider.name === "mcode",
+            activeProvider.name === "mcode" ||
+            (activeProvider.name === "pi" && Boolean(resumeSessionId)),
         },
       );
     } catch (error) {

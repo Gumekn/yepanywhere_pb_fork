@@ -1794,6 +1794,17 @@ export const api = {
       ),
     }),
 
+  /** Restore the original Pi session if needed, then compact without a user turn. */
+  compactPiSession: (
+    projectId: string,
+    sessionId: string,
+    options?: { customInstructions?: string },
+  ) =>
+    fetchJSON<{ success: true; sessionId: string; processId: string }>(
+      `/projects/${projectId}/sessions/${sessionId}/compact`,
+      { method: "POST", body: JSON.stringify(options ?? {}) },
+    ),
+
   /** Change the provider-native reasoning effort mid-session. */
   setProcessReasoningEffort: (processId: string, effort: string) =>
     fetchJSON<{ success: boolean; effort: string }>(

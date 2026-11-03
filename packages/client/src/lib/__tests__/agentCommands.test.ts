@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { filterCommands } from "../../hooks/useCommandCompletion";
 import {
   type AgentCommandAvailability,
   CODEX_SLASH_COMMANDS,
@@ -106,7 +107,7 @@ describe("agent command catalog", () => {
     expect(config?.commands).toEqual([]);
   });
 
-  it("offers Pi's handled built-ins only with a live process", () => {
+  it("keeps Pi compaction available after its process exits", () => {
     const providerCommands = [
       { name: "skill:review", description: "", source: "skill" as const },
       { name: "compact", description: "" },
@@ -125,7 +126,18 @@ describe("agent command catalog", () => {
       providerCommands,
       availability: { scope: "session", canResume: true },
     });
-    expect(idle?.commands).toEqual(["skill:review"]);
+    expect(idle?.commands).toEqual(["compact", "skill:review"]);
+    for (const query of ["co", "com", "compact"]) {
+      expect(filterCommands(idle?.commands ?? [], query)).toContain("compact");
+    }
+    for (const availability of [NEW_SESSION, { scope: "session" as const }]) {
+      const [unavailable] = buildAgentCommandCatalog({
+        provider: "pi",
+        providerCommands,
+        availability,
+      });
+      expect(unavailable?.commands).not.toContain("compact");
+    }
   });
 
   it("offers ACP-reported commands and skills for MiniMax Code and Cursor", () => {

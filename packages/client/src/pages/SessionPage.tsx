@@ -1031,19 +1031,23 @@ function SessionPageContent({
       showToast(t("codexCompactAlreadyRunning"), "info");
       return false;
     }
-    if (status.owner !== "self" || !status.processId) {
-      showToast(t("piCompactSessionNotRunning"), "error");
+    if (status.owner === "external") {
+      showToast(t("piCompactExternalSessionRequired"), "error");
       return false;
     }
-    const processId = status.processId;
-    if (processState !== "idle") {
+    if (status.owner === "self" && processState !== "idle") {
       showToast(t("piCompactQueuedAfterTurn"), "info");
     }
     setIsRequestingPiCompaction(true);
     setScrollTrigger((prev) => prev + 1);
     void api
-      .compactProcess(processId, { customInstructions })
-      .then(() => showToast(t("sessionCompacted"), "success"))
+      .compactPiSession(projectId, actualSessionId ?? sessionId, {
+        customInstructions,
+      })
+      .then((result) => {
+        setStatus({ owner: "self", processId: result.processId });
+        showToast(t("sessionCompacted"), "success");
+      })
       .catch((err: unknown) => {
         console.error("Failed to compact Pi session:", err);
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -2409,10 +2413,11 @@ function SessionPageContent({
                     }}
                     onTerminate={handleTerminate}
                     onCompact={
-                      (session?.provider === "codex" ||
-                        session?.provider === "pi") &&
-                      status.owner === "self" &&
-                      status.processId
+                      (session?.provider === "pi" &&
+                        status.owner !== "external") ||
+                      (session?.provider === "codex" &&
+                        status.owner === "self" &&
+                        status.processId)
                         ? handleCompact
                         : undefined
                     }
