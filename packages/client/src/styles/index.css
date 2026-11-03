@@ -2631,6 +2631,35 @@ a.sidebar-nav-item {
   min-width: 16px;
 }
 
+.sidebar-nav-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Page links fold behind one heading; unfolded they pack into columns so the
+   recent sessions below stay within the first screen. */
+.sidebar-nav-group {
+  margin-bottom: 0.75rem;
+}
+
+.sidebar-nav-group .sidebar-collapsible-title {
+  margin-bottom: 0.25rem;
+}
+
+.sidebar-nav-section--grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr));
+  gap: 0.125rem;
+  padding: 0 0.25rem;
+}
+
+.sidebar-nav-section--grid .sidebar-nav-item {
+  min-width: 0;
+  padding-inline: 0.625rem;
+}
+
 .sidebar-section {
   margin-bottom: 1rem;
 }
@@ -11554,6 +11583,7 @@ button.context-usage-indicator--button:focus-visible {
 
   .sidebar-collapsed .sidebar-nav-section {
     padding: 0.25rem;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .sidebar-collapsed .sidebar-nav-item {

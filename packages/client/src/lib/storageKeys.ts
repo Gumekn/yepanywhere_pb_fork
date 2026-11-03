@@ -49,6 +49,8 @@ export const UI_KEYS = {
   sidebarWidth: "yep-anywhere-sidebar-width",
   detailPanelWidthRatio: "yep-anywhere-detail-panel-width-ratio",
   sidebarExpanded: "yep-anywhere-sidebar-expanded",
+  sidebarNavExpandedDesktop: "yep-anywhere-sidebar-nav-expanded-desktop",
+  sidebarNavExpandedMobile: "yep-anywhere-sidebar-nav-expanded-mobile",
   sessionInspectorExpanded: "yep-anywhere-session-inspector-expanded",
   reportsDocumentPanelExpanded: "yep-anywhere-reports-document-panel-expanded",
   funPhrases: "yep-anywhere-fun-phrases-enabled",

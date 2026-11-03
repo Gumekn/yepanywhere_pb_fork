@@ -91,6 +91,7 @@
   "sidebarServerNotificationHint": "最近 24 小时已结束且未读的会话，打开对应会话后清除；侧边栏打开时每 15 秒刷新。",
   "sidebarSectionLast24Hours": "最近会话",
   "sidebarSectionOlder": "更早",
+  "sidebarSectionNavigation": "导航",
   "sidebarLoadingSessions": "正在加载会话...",
   "sidebarNoSessions": "还没有会话",
   "settingsAppearanceTitle": "外观",

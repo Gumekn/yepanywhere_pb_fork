@@ -13,6 +13,7 @@ import type { GlobalSessionItem } from "../../api/client";
 import { ToastProvider } from "../../contexts/ToastContext";
 import { I18nProvider } from "../../i18n";
 import type { SessionMetadataChangedEvent } from "../../lib/activityBus";
+import { UI_KEYS } from "../../lib/storageKeys";
 import type { Project } from "../../types";
 import { Sidebar } from "../Sidebar";
 
@@ -265,6 +266,44 @@ describe("Sidebar recent session browsing", () => {
     fireEvent.click(expandButton);
 
     expect(onToggleExpanded).toHaveBeenCalledTimes(1);
+  });
+
+  it("unfolds page links on desktop and remembers folding them", () => {
+    renderSidebar([]);
+    const toggle = screen.getByRole("button", { name: "Navigation" });
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
+
+    fireEvent.click(toggle);
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
+    expect(localStorage.getItem(UI_KEYS.sidebarNavExpandedDesktop)).toBe(
+      "false",
+    );
+  });
+
+  it("opens the mobile drawer with page links folded", () => {
+    renderSidebar([], { isDesktop: false });
+    const toggle = screen.getByRole("button", { name: "Navigation" });
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
+    expect(screen.getByRole("link", { name: "New Session" })).toBeTruthy();
+
+    fireEvent.click(toggle);
+
+    expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
+    expect(localStorage.getItem(UI_KEYS.sidebarNavExpandedMobile)).toBe("true");
+  });
+
+  it("keeps every page icon in the collapsed desktop rail", () => {
+    localStorage.setItem(UI_KEYS.sidebarNavExpandedDesktop, "false");
+    renderSidebar([], { isCollapsed: true });
+
+    expect(screen.queryByRole("button", { name: "Navigation" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
   });
 
   it("collapses pinned sessions with their project and keeps pins first when expanded", () => {

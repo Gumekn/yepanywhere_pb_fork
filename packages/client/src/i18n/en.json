@@ -91,6 +91,7 @@
   "sidebarServerNotificationHint": "Unread sessions that have stopped running in the last 24 hours. Open their sessions to clear; refreshes every 15 seconds while the sidebar is open.",
   "sidebarSectionLast24Hours": "Recent Sessions",
   "sidebarSectionOlder": "Older",
+  "sidebarSectionNavigation": "Navigation",
   "sidebarLoadingSessions": "Loading sessions...",
   "sidebarNoSessions": "No sessions yet",
   "settingsAppearanceTitle": "Appearance",

@@ -9,6 +9,7 @@ import { useGlobalSessions } from "../hooks/useGlobalSessions";
 import { resolvePreferredProjectId } from "../hooks/useRecentProject";
 import { useRecentProjects } from "../hooks/useRecentProjects";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
+import { useSidebarNavPreference } from "../hooks/useSidebarPreference";
 import { useI18n } from "../i18n";
 import { activityBus } from "../lib/activityBus";
 import { formatSmartTime } from "../lib/datetime";
@@ -246,6 +247,12 @@ export function Sidebar({
   // Base path for navigation links (empty — app is served at its own root).
   const basePath = useRemoteBasePath();
   const shouldLoadSessionLists = isDesktop ? !isCollapsed : isOpen;
+  // The icon rail is the only navigation left when the desktop sidebar is
+  // collapsed, so it ignores the fold preference and always shows the icons.
+  const isIconRail = isDesktop && isCollapsed;
+  const { isExpanded: isNavExpanded, toggleExpanded: toggleNavExpanded } =
+    useSidebarNavPreference(isDesktop);
+  const showNavLinks = isIconRail || isNavExpanded;
 
   // One combined list powers the project groups. `includePinned` asks the
   // server to append old pins that fall outside the ordinary top-N window.
@@ -930,66 +937,94 @@ export function Sidebar({
         </div>
 
         <div className="sidebar-sessions">
-          {/* Navigation items that scroll with content */}
-          <SidebarNavSection>
-            <SidebarNavItem
-              to="/sessions"
-              icon={SidebarIcons.allSessions}
-              label={t("sidebarAllSessions")}
-              onClick={onNavigate}
-              basePath={basePath}
-              inactiveWhenSearchParams={["kind"]}
-            />
-            <SidebarNavItem
-              to="/search"
-              icon={SidebarIcons.search}
-              label={t("sidebarSearch")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/reports"
-              icon={SidebarIcons.reports}
-              label={t("sidebarReports")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/projects"
-              icon={SidebarIcons.projects}
-              label={t("sidebarProjects")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/terminal"
-              icon={SidebarIcons.terminal}
-              label={t("sidebarTerminal")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/dsh"
-              icon={SidebarIcons.dsh}
-              label={t("sidebarDsh")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/curl"
-              icon={SidebarIcons.curl}
-              label={t("curlTitle")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/settings"
-              icon={SidebarIcons.settings}
-              label={t("sidebarSettings")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-          </SidebarNavSection>
+          {/* Page links scroll with the session list. They fold behind one
+              heading so the mobile drawer opens straight onto sessions. */}
+          <div className="sidebar-nav-group">
+            {!isIconRail && (
+              <h3 className="sidebar-section-title sidebar-collapsible-title">
+                <button
+                  type="button"
+                  className="sidebar-section-toggle"
+                  onClick={toggleNavExpanded}
+                  aria-expanded={isNavExpanded}
+                >
+                  <span
+                    className={`sidebar-section-chevron${
+                      isNavExpanded ? " expanded" : ""
+                    }`}
+                    aria-hidden="true"
+                  >
+                    ›
+                  </span>
+                  <span>{t("sidebarSectionNavigation")}</span>
+                </button>
+              </h3>
+            )}
+            {showNavLinks && (
+              <SidebarNavSection
+                label={t("sidebarSectionNavigation")}
+                layout="grid"
+              >
+                <SidebarNavItem
+                  to="/sessions"
+                  icon={SidebarIcons.allSessions}
+                  label={t("sidebarAllSessions")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                  inactiveWhenSearchParams={["kind"]}
+                />
+                <SidebarNavItem
+                  to="/search"
+                  icon={SidebarIcons.search}
+                  label={t("sidebarSearch")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/reports"
+                  icon={SidebarIcons.reports}
+                  label={t("sidebarReports")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/projects"
+                  icon={SidebarIcons.projects}
+                  label={t("sidebarProjects")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/terminal"
+                  icon={SidebarIcons.terminal}
+                  label={t("sidebarTerminal")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/dsh"
+                  icon={SidebarIcons.dsh}
+                  label={t("sidebarDsh")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/curl"
+                  icon={SidebarIcons.curl}
+                  label={t("curlTitle")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/settings"
+                  icon={SidebarIcons.settings}
+                  label={t("sidebarSettings")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+              </SidebarNavSection>
+            )}
+          </div>
 
           {isSelectionMode && (
             <div className="sidebar-bulk-toolbar is-active">
