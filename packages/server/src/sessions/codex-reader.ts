@@ -77,6 +77,7 @@ import {
 import {
   type CodexSessionManifest,
   type CodexSessionManifestEntry,
+  codexManifestEntryMatchesProjectPath,
   getCodexSessionManifest,
   invalidateCodexSessionManifest,
 } from "./codex-session-manifest.js";
@@ -2777,7 +2778,7 @@ export class CodexSessionReader implements ISessionReader {
   private isManifestEntryInScope(entry: CodexSessionManifestEntry): boolean {
     return (
       this.projectPath === undefined ||
-      canonicalizeProjectPath(entry.cwd) === this.projectPath
+      codexManifestEntryMatchesProjectPath(entry, this.projectPath)
     );
   }
 
@@ -2842,7 +2843,7 @@ export class CodexSessionReader implements ISessionReader {
 
     if (
       this.projectPath &&
-      canonicalizeProjectPath(session.cwd) !== this.projectPath
+      !codexManifestEntryMatchesProjectPath(session, this.projectPath)
     ) {
       return null;
     }

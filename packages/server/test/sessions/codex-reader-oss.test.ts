@@ -3,7 +3,9 @@ import {
   appendFile,
   mkdir,
   readFile,
+  realpath,
   rm,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
@@ -1055,6 +1057,59 @@ describe("CodexSessionReader - OSS Support", () => {
     expect(summaries).toHaveLength(1);
     expect(summaries[0].id).toBe(sessionId);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "finds a session recorded under a symlinked cwd from its resolved project path",
+    async () => {
+      // Codex records the raw cwd (`/tmp/x`) in the rollout but the resolved
+      // one (`/private/tmp/x`) in its state DB, which drives project grouping.
+      const workspaceRoot = await realpath(tmpdir());
+      const realProject = join(workspaceRoot, `codex-real-${randomUUID()}`);
+      const linkedProject = join(workspaceRoot, `codex-link-${randomUUID()}`);
+      await mkdir(realProject, { recursive: true });
+      await symlink(realProject, linkedProject);
+      try {
+        const sessionId = "symlinked-cwd";
+        await writeFile(
+          join(testDir, `${sessionId}.jsonl`),
+          `${[
+            JSON.stringify({
+              type: "session_meta",
+              timestamp: new Date().toISOString(),
+              payload: {
+                id: sessionId,
+                cwd: linkedProject,
+                timestamp: new Date().toISOString(),
+                model_provider: "openai",
+              },
+            }),
+            JSON.stringify({
+              type: "event_msg",
+              timestamp: new Date().toISOString(),
+              payload: { type: "user_message", message: "Hello world" },
+            }),
+          ].join("\n")}\n`,
+        );
+
+        for (const projectPath of [realProject, linkedProject]) {
+          const scopedReader = new CodexSessionReader({
+            sessionsDir: testDir,
+            projectPath,
+          });
+          const projectId = encodeProjectId(projectPath);
+          await expect(
+            scopedReader.getSessionSummary(sessionId, projectId),
+          ).resolves.toMatchObject({ id: sessionId });
+          await expect(
+            scopedReader.getSessionFilePath(sessionId),
+          ).resolves.toBe(join(testDir, `${sessionId}.jsonl`));
+        }
+      } finally {
+        await rm(linkedProject, { force: true });
+        await rm(realProject, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("identifies codex based on model name (gpt-4)", async () => {
     const sessionId = "heuristic-openai";

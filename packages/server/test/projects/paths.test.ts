@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -13,6 +13,7 @@ import {
   getSessionIdFromPath,
   normalizeProjectPathForDedup,
   readCwdFromSessionFile,
+  resolveProjectPathAliases,
   resolveResumeCwd,
 } from "../../src/projects/paths.js";
 
@@ -416,4 +417,50 @@ describe("Project Path Utilities", () => {
       expect(recovered).toBeNull();
     });
   });
+
+  describe.skipIf(process.platform === "win32")(
+    "resolveProjectPathAliases",
+    () => {
+      let testDir: string;
+      let realDir: string;
+      let linkDir: string;
+
+      beforeEach(async () => {
+        // tmpdir() is itself a symlink on macOS; anchor fixtures at its real path.
+        testDir = join(
+          await realpath(tmpdir()),
+          `paths-aliases-${randomUUID()}`,
+        );
+        realDir = join(testDir, "real");
+        linkDir = join(testDir, "link");
+        await mkdir(join(realDir, "project"), { recursive: true });
+        await symlink(realDir, linkDir);
+      });
+
+      afterEach(async () => {
+        await rm(testDir, { recursive: true, force: true });
+      });
+
+      it("adds the resolved path that Codex's state DB records", async () => {
+        await expect(
+          resolveProjectPathAliases(join(linkDir, "project")),
+        ).resolves.toEqual([join(realDir, "project")]);
+      });
+
+      it("resolves a removed directory through its deepest existing ancestor", async () => {
+        await expect(
+          resolveProjectPathAliases(join(linkDir, "removed", "project")),
+        ).resolves.toEqual([join(realDir, "removed", "project")]);
+      });
+
+      it("returns no aliases for an already-resolved path", async () => {
+        await expect(
+          resolveProjectPathAliases(join(realDir, "project")),
+        ).resolves.toEqual([]);
+        await expect(
+          resolveProjectPathAliases(join(realDir, "missing")),
+        ).resolves.toEqual([]);
+      });
+    },
+  );
 });

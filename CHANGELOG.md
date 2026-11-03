@@ -35,6 +35,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - 移除 ZCode provider 及其全部逻辑：app-server 接入、`~/.zcode` SQLite 会话读取与变更监视（每 15 秒轮询）、会话归档写回、ZCode TUI hook bridge（`/api/zcode-bridge` 与「全部会话」页的审批卡片）、新建会话页的 MCP 状态面板，以及 `test:zcode-app-server-smoke` 脚本。旧数据中的 `zcode` 会话不再出现在列表中，按已退役 provider 处理（相关接口返回 410）；Yep 从未修改的 ZCode 原始数据仍保留在 `~/.zcode`。曾安装 hook 插件的用户可删除 `~/.zcode/plugins/yep-bridge` 与 `~/.zcode/yep-bridge.json`。仅被 ZCode 使用的 SQLite 查询 worker 一并删除；Pi 与 Codex 共用的编辑分支推导迁至 `sessions/copied-prefix-branch.ts`，行为不变。
 
 ### Fixed
+- 修复 macOS 上工作目录位于符号链接路径（如 `/tmp/...`）的 Codex 会话无法打开、无法归档：Codex 在 rollout 中记录原始 cwd（`/tmp/x`），在 state DB 中记录解析后的路径（`/private/tmp/x`），侧栏按后者分组列出，但打开和归档时按项目查找 rollout 只比对原始 cwd，于是返回“会话不存在”，归档报“Session file not found”。Codex 会话清单现在为每个 rollout 额外记录同一目录的解析路径（目录已被清理时按最近的现存上级目录解析），按项目查找时两种写法都能命中；项目分组与项目 ID 不变。
 - Pi 会话中 Claude 模型的思考档位改为按模型提供，并与网关实际行为一致：Opus 5／5.5、Opus 4.7／4.8、Sonnet 5／5.5、Fable 5 在新建会话和会话中切换模型时提供 `low`／`medium`／`high`／`xhigh`／`max` 五档，Opus 4.6、Sonnet 4.6 提供到 `max`；此前所有 Pi 模型一律只有前三档。走 OpenAI 兼容端点的 Claude 模型此前会把 `xhigh`／`max` 静默降为 `high`，现在原样发送。Opus 5.5 与 Fable 5 一样不接受关闭思考：此前在 Anthropic 端点上选择「关闭」会被网关以 400 拒绝，现在改为低强度自适应思考；在 OpenAI 兼容端点上选择「关闭」时仍然不发送思考参数。
 - 修复 Pi 会话在编辑历史消息（原生 fork）后「文件」面板一直为空的问题：Pi fork 时会重新加载 Yep 扩展，而文件操作记录目录的环境变量在首次加载时已被清除，导致 fork 后的 `write`／`edit` 不再被记录；目录现与 provider 配置一样在进程内保留。fork 前已发生、未被记录的改动无法补回。
 - 消息中的文件路径识别支持中文等非 ASCII 文件名和目录名（如 `docs/退款链路串讲.md`），全角标点（`：`、`，`、`。`、括号、引号等）也视为路径边界；中文直接粘连在相对路径前（如 `修改src/a.ts`）时不生成链接，避免指向错误文件。
