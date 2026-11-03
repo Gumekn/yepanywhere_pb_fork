@@ -703,6 +703,7 @@
   "toolbarSend": "Send",
   "contextTooltipWithWindow": "Context: {percentage}% ({used} / {total} tokens)",
   "contextTooltipNoWindow": "Context: {percentage}% ({used} tokens)",
+  "contextTooltipUnknown": "Context was compacted. Usage updates after the next response.",
   "contextBreakdownTitle": "Context breakdown",
   "contextBreakdownSourceSDK": "Live (SDK)",
   "contextBreakdownSourceEstimate": "Estimate (JSONL)",

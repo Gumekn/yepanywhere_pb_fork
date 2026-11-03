@@ -340,8 +340,9 @@ export function ProcessInfoModal({
           )}
         </Section>
 
-        {/* Context Usage - if available */}
-        {contextUsage && (
+        {/* Context Usage - if available (an unknown post-compaction fill
+            has no token counts to list) */}
+        {contextUsage && !contextUsage.unknown && (
           <Section title={t("processInfoSectionTokenUsage")}>
             <InfoRow
               label={t("processInfoLabelInputTokens")}

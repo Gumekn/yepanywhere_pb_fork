@@ -37,6 +37,9 @@ export function ContextUsageIndicator({
   const { t } = useI18n();
   if (!usage) return null;
 
+  // An unknown fill (right after compaction) keeps the window size visible
+  // but never shows the placeholder 0 as a measured value.
+  const unknown = usage.unknown === true;
   const { percentage } = usage;
   const displayPercentage = Math.max(0, percentage);
   // Clamp only the visual fill to 0-100.
@@ -55,25 +58,30 @@ export function ContextUsageIndicator({
     return "var(--text-muted, #9d9d9d)";
   };
 
-  const tooltip = usage.contextWindow
-    ? t("contextTooltipWithWindow", {
-        percentage: displayPercentage,
-        used: formatTokens(usage.inputTokens),
-        total: formatTokens(usage.contextWindow),
-      })
-    : t("contextTooltipNoWindow", {
-        percentage: displayPercentage,
-        used: formatTokens(usage.inputTokens),
-      });
+  const tooltip = unknown
+    ? t("contextTooltipUnknown")
+    : usage.contextWindow
+      ? t("contextTooltipWithWindow", {
+          percentage: displayPercentage,
+          used: formatTokens(usage.inputTokens),
+          total: formatTokens(usage.contextWindow),
+        })
+      : t("contextTooltipNoWindow", {
+          percentage: displayPercentage,
+          used: formatTokens(usage.inputTokens),
+        });
+  const used = unknown ? "?" : formatTokens(usage.inputTokens);
   const label =
     labelMode === "tokens"
       ? usage.contextWindow
-        ? `${formatTokens(usage.inputTokens)}/${formatTokens(usage.contextWindow)}`
-        : formatTokens(usage.inputTokens)
-      : // Round the visible label even though the tooltip keeps full precision:
-        // producers disagree (Pi forwards a raw ratio), and "19.38%" does not
-        // fit the compact list/toolbar surfaces.
-        `${Math.round(displayPercentage)}%`;
+        ? `${used}/${formatTokens(usage.contextWindow)}`
+        : used
+      : unknown
+        ? "?"
+        : // Round the visible label even though the tooltip keeps full precision:
+          // producers disagree (Pi forwards a raw ratio), and "19.38%" does not
+          // fit the compact list/toolbar surfaces.
+          `${Math.round(displayPercentage)}%`;
 
   return (
     <ContextUsageWrapper

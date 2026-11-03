@@ -1020,7 +1020,7 @@ describe("SessionIndexService", () => {
       await writeFile(
         indexPath,
         JSON.stringify({
-          version: 14,
+          version: 15,
           projectId,
           sessions: {
             legacy: {
