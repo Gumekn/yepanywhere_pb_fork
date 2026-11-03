@@ -17,12 +17,12 @@ import { useGitStatus } from "../hooks/useGitStatus";
 import { useModelSettings } from "../hooks/useModelSettings";
 import { useSessionFileIndex } from "../hooks/useSessionFileIndex";
 import { useI18n } from "../i18n";
-import { getModelReasoningEfforts } from "../lib/codexReasoning";
 import {
   type CodexAgentStatus,
   codexAgentStatusLabel,
   normalizeCodexAgentStatus,
 } from "../lib/codexAgentStatus";
+import { getModelReasoningEfforts } from "../lib/codexReasoning";
 import { formatSmartTime } from "../lib/datetime";
 import {
   type ActiveToolApproval,

@@ -2616,53 +2616,53 @@ function SessionPageContent({
         <FileTabOpenerContext.Provider
           value={{ openFileTab: openOrFocusFileTab }}
         >
-        <div
-          className="editor-tabbar"
-          role="tablist"
-          aria-label={t("editorTabs" as never)}
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeWorkbenchTab === "chat"}
-            className={`editor-tab${activeWorkbenchTab === "chat" ? " is-active" : ""}`}
-            onClick={() => setActiveWorkbenchTab("chat")}
+          <div
+            className="editor-tabbar"
+            role="tablist"
+            aria-label={t("editorTabs" as never)}
           >
-            <span className="editor-tab-label">
-              {t("editorTabChat" as never)}
-            </span>
-          </button>
-          {openFileTabs.map((path) => (
-            <div
-              key={path}
-              role="presentation"
-              className={`editor-tab editor-tab--file${activeWorkbenchTab === path ? " is-active" : ""}`}
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeWorkbenchTab === "chat"}
+              className={`editor-tab${activeWorkbenchTab === "chat" ? " is-active" : ""}`}
+              onClick={() => setActiveWorkbenchTab("chat")}
             >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeWorkbenchTab === path}
-                className="editor-tab-main"
-                onClick={() => setActiveWorkbenchTab(path)}
-                title={path}
+              <span className="editor-tab-label">
+                {t("editorTabChat" as never)}
+              </span>
+            </button>
+            {openFileTabs.map((path) => (
+              <div
+                key={path}
+                role="presentation"
+                className={`editor-tab editor-tab--file${activeWorkbenchTab === path ? " is-active" : ""}`}
               >
-                <TabFileIcon />
-                <span className="editor-tab-label">
-                  {path.split("/").pop() ?? path}
-                </span>
-              </button>
-              <button
-                type="button"
-                className="editor-tab-close"
-                onClick={() => closeFileTab(path)}
-                aria-label={t("editorClose" as never)}
-                title={t("editorClose" as never)}
-              >
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeWorkbenchTab === path}
+                  className="editor-tab-main"
+                  onClick={() => setActiveWorkbenchTab(path)}
+                  title={path}
+                >
+                  <TabFileIcon />
+                  <span className="editor-tab-label">
+                    {path.split("/").pop() ?? path}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="editor-tab-close"
+                  onClick={() => closeFileTab(path)}
+                  aria-label={t("editorClose" as never)}
+                  title={t("editorClose" as never)}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
 
           <div
             className={`session-workbench-chat${activeWorkbenchTab === "chat" ? "" : " workbench-hidden"}`}
@@ -2672,132 +2672,134 @@ function SessionPageContent({
                 : { display: "none" }
             }
           >
-        <SessionTranscript
-          loading={loading}
-          projectId={projectId}
-          projectPath={project?.path ?? null}
-          sessionId={sessionId}
-          actualSessionId={actualSessionId}
-          provider={session?.provider}
-          messages={messages}
-          renderItems={renderItems}
-          isProcessing={status.owner === "self" && processState === "in-turn"}
-          lastActivityAt={lastStreamActivityAt}
-          isCompacting={isCompacting || isStartingCodexCompaction}
-          scrollTrigger={scrollTrigger + activeWindowTrimRevision}
-          pendingMessages={pendingMessages}
-          deferredMessages={deferredMessages}
-          markdownAugments={markdownAugments}
-          activeToolApproval={activeToolApproval}
-          hasOlderMessages={
-            displayPage
-              ? Boolean(displayPage.nextCursor)
-              : pagination?.hasOlderMessages
-          }
-          hasNewerMessages={pagination?.hasNewerMessages}
-          loadingOlder={loadingOlder}
-          loadingNewer={loadingNewer}
-          loadingTargetMessage={loadingTargetMessage}
-          onLoadOlderMessages={loadOlderMessages}
-          onLoadNewerMessages={loadNewerMessages}
-          onLoadTargetMessage={loadTargetMessageWindow}
-          onFollowingBottomChange={updateActiveWindowFollowingBottom}
-          onEditUserPrompt={
-            !isViewingHistoricalBranch &&
-            supportsHistoricalMessageEditing(session?.provider)
-              ? handleEditUserPrompt
-              : undefined
-          }
-          onSelectBranch={handleSelectBranch}
-          focusBranchId={pendingBranchFocusId}
-          onBranchFocused={handleBranchFocused}
-          targetMessageId={targetMessageId}
-          onTargetFocused={handleTargetFocused}
-          transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
-          agentContent={agentContent}
-          setAgentContent={setAgentContent}
-          toolUseToAgent={toolUseToAgent}
-          toolUseToAgentIds={toolUseToAgentIds}
-          displayActivity={displayActivity}
-          displayRevision={displayPage?.revision}
-          sessionUpdatesConnected={sessionUpdatesConnected}
-          selectedBranchId={selectedBranchId}
-        />
-        {isReadOnlySession ? (
-          <ReadOnlySessionBar
-            sessionId={actualSessionId ?? sessionId}
-            basePath={basePath}
-            status={status}
-            processState={processState}
-          />
-        ) : (
-          <SessionComposer
-            sessionConnectionStatus={sessionConnectionStatus}
-            pendingInputRequest={pendingInputRequest}
-            actualSessionId={actualSessionId}
-            sessionId={sessionId}
-            projectId={projectId}
-            isAskUserQuestion={isAskUserQuestion}
-            isPersistedInputRequest={isPersistedInputRequest}
-            hasSideConversation={hasSideConversation}
-            sideVisible={sideVisible}
-            openSideConversation={openSideConversation}
-            approvalAgentName={approvalAgentName}
-            provider={effectiveProvider}
-            approvalCollapsed={approvalCollapsed}
-            setApprovalCollapsed={setApprovalCollapsed}
-            permissionMode={permissionMode}
-            setPermissionMode={setPermissionMode}
-            holdModeEnabled={holdModeEnabled}
-            isHeld={isHeld}
-            setHold={setHold}
-            supportsPermissionMode={supportsPermissionMode}
-            permissionModes={permissionModes}
-            supportsThinkingToggle={supportsThinkingToggle}
-            contextUsage={session?.contextUsage}
-            status={status}
-            processState={processState}
-            onAbort={abortTurn}
-            turnHealth={turnHealth}
-            retryActionLink={retryActionLink}
-            isRestoringEdit={isRestoringEdit}
-            onCancelEdit={handleCancelEdit}
-            historyRewritePending={historyRewritePending}
-            onSend={sendMessage}
-            onQueue={queueMessage}
-            editRewindActive={Boolean(editRewind)}
-            attachments={attachments}
-            onAttach={uploads.attach}
-            onRemoveAttachment={(id) => uploads.remove([id])}
-            onRestoreAttachment={uploads.restoreFile}
-            attachmentOrder={uploads.orderRef.current}
-            uploadProgress={uploads.uploadProgress}
-            commandButtons={commandButtons}
-            onCommandMenuOpen={refreshCommandListing}
-            onCustomCommand={handleCustomCommand}
-            onDraftControlsReady={handleDraftControlsReady}
-            onQuestionSubmit={handleQuestionSubmit}
-            onDeny={handleDeny}
-            onApprove={handleApprove}
-            onApproveAcceptEdits={handleApproveAcceptEdits}
-            onApproveForSession={handleApproveForSession}
-            onApproveStrictAutoReview={handleApproveStrictAutoReview}
-            onApproveAlways={handleApproveAlways}
-            onDenyWithFeedback={handleDenyWithFeedback}
-          />
-        )}
-          </div>
-        {openFileTabs.map((path) => (
-          <div
-            key={path}
-            className={`file-panel${activeWorkbenchTab === path ? " is-active" : ""}`}
-          >
-            <FileViewer
-              fileRef={{ path, projectId }}
-              onClose={() => closeFileTab(path)}
+            <SessionTranscript
+              loading={loading}
+              projectId={projectId}
+              projectPath={project?.path ?? null}
+              sessionId={sessionId}
+              actualSessionId={actualSessionId}
+              provider={session?.provider}
+              messages={messages}
+              renderItems={renderItems}
+              isProcessing={
+                status.owner === "self" && processState === "in-turn"
+              }
+              lastActivityAt={lastStreamActivityAt}
+              isCompacting={isCompacting || isStartingCodexCompaction}
+              scrollTrigger={scrollTrigger + activeWindowTrimRevision}
+              pendingMessages={pendingMessages}
+              deferredMessages={deferredMessages}
+              markdownAugments={markdownAugments}
+              activeToolApproval={activeToolApproval}
+              hasOlderMessages={
+                displayPage
+                  ? Boolean(displayPage.nextCursor)
+                  : pagination?.hasOlderMessages
+              }
+              hasNewerMessages={pagination?.hasNewerMessages}
+              loadingOlder={loadingOlder}
+              loadingNewer={loadingNewer}
+              loadingTargetMessage={loadingTargetMessage}
+              onLoadOlderMessages={loadOlderMessages}
+              onLoadNewerMessages={loadNewerMessages}
+              onLoadTargetMessage={loadTargetMessageWindow}
+              onFollowingBottomChange={updateActiveWindowFollowingBottom}
+              onEditUserPrompt={
+                !isViewingHistoricalBranch &&
+                supportsHistoricalMessageEditing(session?.provider)
+                  ? handleEditUserPrompt
+                  : undefined
+              }
+              onSelectBranch={handleSelectBranch}
+              focusBranchId={pendingBranchFocusId}
+              onBranchFocused={handleBranchFocused}
+              targetMessageId={targetMessageId}
+              onTargetFocused={handleTargetFocused}
+              transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
+              agentContent={agentContent}
+              setAgentContent={setAgentContent}
+              toolUseToAgent={toolUseToAgent}
+              toolUseToAgentIds={toolUseToAgentIds}
+              displayActivity={displayActivity}
+              displayRevision={displayPage?.revision}
+              sessionUpdatesConnected={sessionUpdatesConnected}
+              selectedBranchId={selectedBranchId}
             />
+            {isReadOnlySession ? (
+              <ReadOnlySessionBar
+                sessionId={actualSessionId ?? sessionId}
+                basePath={basePath}
+                status={status}
+                processState={processState}
+              />
+            ) : (
+              <SessionComposer
+                sessionConnectionStatus={sessionConnectionStatus}
+                pendingInputRequest={pendingInputRequest}
+                actualSessionId={actualSessionId}
+                sessionId={sessionId}
+                projectId={projectId}
+                isAskUserQuestion={isAskUserQuestion}
+                isPersistedInputRequest={isPersistedInputRequest}
+                hasSideConversation={hasSideConversation}
+                sideVisible={sideVisible}
+                openSideConversation={openSideConversation}
+                approvalAgentName={approvalAgentName}
+                provider={effectiveProvider}
+                approvalCollapsed={approvalCollapsed}
+                setApprovalCollapsed={setApprovalCollapsed}
+                permissionMode={permissionMode}
+                setPermissionMode={setPermissionMode}
+                holdModeEnabled={holdModeEnabled}
+                isHeld={isHeld}
+                setHold={setHold}
+                supportsPermissionMode={supportsPermissionMode}
+                permissionModes={permissionModes}
+                supportsThinkingToggle={supportsThinkingToggle}
+                contextUsage={session?.contextUsage}
+                status={status}
+                processState={processState}
+                onAbort={abortTurn}
+                turnHealth={turnHealth}
+                retryActionLink={retryActionLink}
+                isRestoringEdit={isRestoringEdit}
+                onCancelEdit={handleCancelEdit}
+                historyRewritePending={historyRewritePending}
+                onSend={sendMessage}
+                onQueue={queueMessage}
+                editRewindActive={Boolean(editRewind)}
+                attachments={attachments}
+                onAttach={uploads.attach}
+                onRemoveAttachment={(id) => uploads.remove([id])}
+                onRestoreAttachment={uploads.restoreFile}
+                attachmentOrder={uploads.orderRef.current}
+                uploadProgress={uploads.uploadProgress}
+                commandButtons={commandButtons}
+                onCommandMenuOpen={refreshCommandListing}
+                onCustomCommand={handleCustomCommand}
+                onDraftControlsReady={handleDraftControlsReady}
+                onQuestionSubmit={handleQuestionSubmit}
+                onDeny={handleDeny}
+                onApprove={handleApprove}
+                onApproveAcceptEdits={handleApproveAcceptEdits}
+                onApproveForSession={handleApproveForSession}
+                onApproveStrictAutoReview={handleApproveStrictAutoReview}
+                onApproveAlways={handleApproveAlways}
+                onDenyWithFeedback={handleDenyWithFeedback}
+              />
+            )}
           </div>
-        ))}
+          {openFileTabs.map((path) => (
+            <div
+              key={path}
+              className={`file-panel${activeWorkbenchTab === path ? " is-active" : ""}`}
+            >
+              <FileViewer
+                fileRef={{ path, projectId }}
+                onClose={() => closeFileTab(path)}
+              />
+            </div>
+          ))}
         </FileTabOpenerContext.Provider>
       </div>
       <SideConversationPanel
