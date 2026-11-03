@@ -2673,7 +2673,9 @@ function SessionPageContent({
       <SideConversationPanel
         side={side}
         projectId={projectId}
+        projectPath={project?.path ?? null}
         sessionId={actualSessionId}
+        provider={effectiveProvider}
         visible={sideVisible}
         mobile={!isWideScreen}
         parentStatus={t(

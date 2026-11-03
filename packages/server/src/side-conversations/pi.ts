@@ -1,8 +1,44 @@
 import { randomUUID } from "node:crypto";
+import type { SideConversationBlock } from "@yep-anywhere/shared";
+import {
+  canonicalizePiToolName,
+  normalizePiToolInput,
+} from "../sessions/pi-tools.js";
 import type { SideEvent, SideTransport } from "./session.js";
 
 export const PI_SIDE_COMMAND = "yep:side-v1";
 export const PI_SIDE_PREFIX = "__YEP_PI_SIDE_V1__:";
+
+const record = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+/** Pi assistant content in the shape the main Pi transcript renders. */
+export function piSideBlocks(content: unknown): SideConversationBlock[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((value): SideConversationBlock[] => {
+    const part = record(value);
+    if (part?.type === "text" && typeof part.text === "string")
+      return [{ type: "text", text: part.text }];
+    if (part?.type === "thinking" && typeof part.thinking === "string")
+      return [{ type: "thinking", thinking: part.thinking }];
+    if (
+      part?.type === "toolCall" &&
+      typeof part.id === "string" &&
+      typeof part.name === "string"
+    )
+      return [
+        {
+          type: "tool_use",
+          id: part.id,
+          name: canonicalizePiToolName(part.name),
+          input: normalizePiToolInput(part.name, part.arguments),
+        },
+      ];
+    return [];
+  });
+}
 
 /** Dedicated RPC event dispatcher, independent of the parent's turn-consumption loop. */
 export class PiSideChannel {
@@ -53,6 +89,34 @@ export class PiSideChannel {
             id: event.messageId,
             text: event.text,
             append: event.append === true,
+          });
+        else if (
+          event.type === "thinking" &&
+          typeof event.messageId === "string" &&
+          typeof event.text === "string"
+        )
+          sink?.({
+            type: "thinking",
+            id: event.messageId,
+            text: event.text,
+            append: event.append === true,
+          });
+        else if (event.type === "blocks" && typeof event.messageId === "string")
+          sink?.({
+            type: "blocks",
+            id: event.messageId,
+            blocks: piSideBlocks(event.content),
+          });
+        else if (
+          event.type === "tool_result" &&
+          typeof event.toolCallId === "string" &&
+          typeof event.text === "string"
+        )
+          sink?.({
+            type: "tool_result",
+            toolUseId: event.toolCallId,
+            content: event.text,
+            isError: event.isError === true,
           });
         else if (event.type === "activity")
           sink?.({

@@ -33,6 +33,47 @@ async function loadInstalledSdk() {
 
 const MAX_SIDE_IMAGES = 8;
 const MAX_SIDE_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_SIDE_TOOL_RESULT = 8_000;
+
+/** Bounded display text of a tool result; the server re-checks the bound. */
+export function sideToolResultText(result) {
+  const content = Array.isArray(result?.content) ? result.content : [];
+  const text = content
+    .flatMap((part) =>
+      part?.type === "text" && typeof part.text === "string"
+        ? [part.text]
+        : part?.type === "image"
+          ? ["[Image]"]
+          : [],
+    )
+    .join("\n");
+  return text.length > MAX_SIDE_TOOL_RESULT
+    ? text.slice(0, MAX_SIDE_TOOL_RESULT)
+    : text;
+}
+
+/** Assistant content the main transcript can render; drops opaque parts. */
+export function sideContent(message) {
+  return (Array.isArray(message?.content) ? message.content : []).flatMap(
+    (part) =>
+      part?.type === "text" && typeof part.text === "string"
+        ? [{ type: "text", text: part.text }]
+        : part?.type === "thinking" && typeof part.thinking === "string"
+          ? [{ type: "thinking", thinking: part.thinking }]
+          : part?.type === "toolCall" &&
+              typeof part.id === "string" &&
+              typeof part.name === "string"
+            ? [
+                {
+                  type: "toolCall",
+                  id: part.id,
+                  name: part.name,
+                  arguments: part.arguments,
+                },
+              ]
+            : [],
+  );
+}
 
 /**
  * Pi `ImageContent` for side question images. Yep validated the paths as its
@@ -265,38 +306,49 @@ export function installPiSideConversations(pi, loadSdk = loadInstalledSdk) {
                 event.message?.role === "assistant"
               )
                 current.replyId = `side-${command.id}-${++current.index}`;
-              if (
-                event.type === "message_update" &&
-                event.assistantMessageEvent?.type === "text_delta"
-              )
-                emit(ctx, current.id, {
-                  type: "text",
-                  id: current.id,
-                  messageId: current.replyId,
-                  text: event.assistantMessageEvent.delta,
-                  append: true,
-                });
+              if (event.type === "message_update") {
+                const update = event.assistantMessageEvent;
+                if (
+                  update?.type === "text_delta" ||
+                  update?.type === "thinking_delta"
+                )
+                  emit(ctx, current.id, {
+                    type: update.type === "text_delta" ? "text" : "thinking",
+                    messageId: current.replyId,
+                    text: update.delta,
+                    append: true,
+                  });
+                // Show the call while it runs, before the message completes.
+                if (update?.type === "toolcall_end")
+                  emit(ctx, current.id, {
+                    type: "blocks",
+                    messageId: current.replyId,
+                    content: sideContent(event.message),
+                  });
+              }
               if (
                 event.type === "message_end" &&
                 event.message?.role === "assistant"
-              ) {
-                const text = event.message.content
-                  .filter((p) => p.type === "text")
-                  .map((p) => p.text)
-                  .join("\n");
+              )
                 emit(ctx, current.id, {
-                  type: "text",
+                  type: "blocks",
                   messageId: current.replyId,
-                  text,
+                  content: sideContent(event.message),
                 });
-              }
               if (event.type === "tool_execution_start")
                 emit(ctx, current.id, {
                   type: "activity",
                   text: event.toolName,
                 });
-              if (event.type === "tool_execution_end")
+              if (event.type === "tool_execution_end") {
+                emit(ctx, current.id, {
+                  type: "tool_result",
+                  toolCallId: event.toolCallId,
+                  text: sideToolResultText(event.result),
+                  isError: event.isError === true,
+                });
                 emit(ctx, current.id, { type: "activity" });
+              }
             });
             return { model: model.id, reasoningEffort: thinkingLevel };
           })();

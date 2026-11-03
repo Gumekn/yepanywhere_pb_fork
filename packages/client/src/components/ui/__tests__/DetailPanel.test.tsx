@@ -134,7 +134,8 @@ describe("DetailPanel", () => {
 
     fireEvent.doubleClick(resizeHandle);
     expect(host?.style.getPropertyValue("--detail-panel-width")).toBe("640px");
-    expect(localStorage.getItem(UI_KEYS.detailPanelWidthRatio)).toBe("0.4000");
+    // Reset returns to the default split instead of pinning a ratio.
+    expect(localStorage.getItem(UI_KEYS.detailPanelWidthRatio)).toBeNull();
   });
 
   it("docks beside the session on a desktop viewport", () => {

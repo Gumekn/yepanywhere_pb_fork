@@ -143,6 +143,17 @@ export async function createCodexSideConversation(options: {
           text: params.delta,
           append: true,
         });
+      } else if (
+        method === "item/reasoning/summaryTextDelta" &&
+        typeof params.delta === "string" &&
+        typeof params.itemId === "string"
+      ) {
+        emit({
+          type: "thinking",
+          id: params.itemId,
+          text: params.delta,
+          append: true,
+        });
       } else if (method === "item/completed") {
         const item = record(params.item);
         if (
@@ -150,7 +161,25 @@ export async function createCodexSideConversation(options: {
           typeof item.id === "string" &&
           typeof item.text === "string"
         )
-          emit({ type: "text", id: item.id, text: item.text });
+          emit({
+            type: "text",
+            id: item.id,
+            text: item.text,
+            ...(item.phase === "commentary" || item.phase === "final_answer"
+              ? { phase: item.phase }
+              : {}),
+          });
+        else if (item.type === "reasoning" && typeof item.id === "string") {
+          const parts = (value: unknown) =>
+            Array.isArray(value)
+              ? value.filter((part): part is string => typeof part === "string")
+              : [];
+          const summary = parts(item.summary);
+          const thinking = (summary.length ? summary : parts(item.content))
+            .join("\n\n")
+            .trim();
+          emit({ type: "thinking", id: item.id, text: thinking });
+        }
       } else if (method === "turn/completed") {
         if (typeof turn.id === "string") completed.add(turn.id);
         turnId = undefined;

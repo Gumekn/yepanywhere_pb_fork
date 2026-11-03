@@ -10,10 +10,14 @@
   line-height: 1.6;
 }
 .side-conversation {
+  position: relative;
   display: flex;
   flex-direction: column;
-  flex: 0 0 clamp(360px, 34vw, 480px);
-  width: clamp(360px, 34vw, 480px);
+  /* Set from the resize handle; the fallback is the default split. */
+  flex: 0 0 var(--side-conversation-width, clamp(360px, 34vw, 480px));
+  width: var(--side-conversation-width, clamp(360px, 34vw, 480px));
+  /* The conversation keeps its minimum width even before JS measures. */
+  max-width: max(240px, calc(100% - 360px));
   height: 100dvh;
   min-width: 0;
   font-size: var(--font-size-base);
@@ -29,6 +33,7 @@
   position: fixed;
   inset: 0;
   width: 100%;
+  max-width: none;
   z-index: 100;
   padding-top: env(safe-area-inset-top);
   padding-bottom: 0;
@@ -48,10 +53,14 @@
   font-size: var(--font-size-lg);
   margin: 0;
 }
-/* Panel controls only: attachment cards keep their own compact buttons. */
-.side-conversation
+/* Panel controls only: the transcript keeps the main session's own controls,
+   and attachment cards keep their own compact buttons. */
+.side-conversation-header button,
+.side-conversation-parent,
+.side-conversation-handoff,
+.side-conversation-composer
   button:not(.attachment-composer button):not(.attachment-list button),
-.side-conversation select {
+.side-conversation-composer select {
   color: var(--text-primary);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -61,13 +70,17 @@
   cursor: pointer;
   min-height: 40px;
 }
-.side-conversation
+.side-conversation-header button:hover:not(:disabled),
+.side-conversation .side-conversation-parent:hover,
+.side-conversation .side-conversation-handoff:hover,
+.side-conversation-composer
   button:not(.attachment-composer button):not(
     .attachment-list button
   ):hover:not(:disabled) {
   background: var(--bg-hover);
 }
-.side-conversation button:disabled {
+.side-conversation-header button:disabled,
+.side-conversation-composer button:disabled {
   opacity: 0.5;
   cursor: default;
 }
@@ -97,31 +110,13 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* Same as the main transcript: wide code/diffs scroll inside their block. */
+  overflow-x: hidden;
   padding: var(--space-3);
   overscroll-behavior: contain;
 }
-.side-conversation-message {
-  margin-bottom: var(--space-4);
-  overflow-wrap: anywhere;
-}
-.side-conversation-role {
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-.side-conversation-message--user {
-  padding: var(--space-3);
-  background: var(--bg-secondary);
-  border-radius: var(--radius-sm);
-}
-.side-conversation-message .text-block {
-  padding: var(--space-2) 0;
-}
-.side-conversation-message pre {
-  max-width: 100%;
-  overflow-x: auto;
-}
 .side-conversation .side-conversation-handoff {
+  margin-top: var(--space-1);
   font-size: var(--font-size-sm);
   background: transparent;
 }
@@ -174,19 +169,6 @@
 }
 .side-conversation-toolbar .side-conversation-actions {
   flex: 1;
-}
-.side-conversation-attachments {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1);
-  margin: var(--space-1) 0 0;
-  padding: 0;
-  list-style: none;
-  font-size: var(--font-size-sm);
-  color: var(--text-secondary);
-}
-.side-conversation-attachments li::before {
-  content: "🖼 ";
 }
 .side-conversation-setting {
   display: flex;

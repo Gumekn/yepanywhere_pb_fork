@@ -48,6 +48,7 @@ export const UI_KEYS = {
   tabSize: "yep-anywhere-tab-size",
   sidebarWidth: "yep-anywhere-sidebar-width",
   detailPanelWidthRatio: "yep-anywhere-detail-panel-width-ratio",
+  sideConversationWidthRatio: "yep-anywhere-side-conversation-width-ratio",
   sidebarExpanded: "yep-anywhere-sidebar-expanded",
   sidebarNavExpandedDesktop: "yep-anywhere-sidebar-nav-expanded-desktop",
   sidebarNavExpandedMobile: "yep-anywhere-sidebar-nav-expanded-mobile",

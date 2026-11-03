@@ -2,6 +2,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import type { MarkdownAugment } from "@yep-anywhere/shared";
 import {
   Fragment,
+  type ReactNode,
   memo,
   useCallback,
   useEffect,
@@ -208,6 +209,14 @@ interface Props {
    * without remounting the component.
    */
   transcriptKey?: string;
+  /**
+   * Extra controls rendered at the end of each assistant turn, e.g. the side
+   * conversation's handoff action. `progressTextItemIds` marks interim prose.
+   */
+  renderTurnFooter?: (turn: {
+    items: RenderItem[];
+    progressTextItemIds: string[];
+  }) => ReactNode;
 }
 
 export const MessageList = memo(function MessageList({
@@ -241,6 +250,7 @@ export const MessageList = memo(function MessageList({
   targetMessageId,
   onTargetFocused,
   transcriptKey,
+  renderTurnFooter,
 }: Props) {
   const i18n = useOptionalI18n();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -979,6 +989,10 @@ export const MessageList = memo(function MessageList({
               }
               copyText={row.turnCopyText}
             />
+            {renderTurnFooter?.({
+              items: row.items,
+              progressTextItemIds: row.progressTextItemIds,
+            })}
           </div>
         );
       }

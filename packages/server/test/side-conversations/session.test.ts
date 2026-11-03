@@ -267,3 +267,99 @@ describe("side conversation lifecycle isolation", () => {
     expect(f.transport.close).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("side conversation transcript content", () => {
+  async function running() {
+    const f = fixture();
+    const id =
+      (
+        await f.session.execute({
+          action: "create",
+          requestId: "c",
+          context: "snapshot",
+        })
+      ).conversation?.id ?? "missing";
+    await f.session.execute({
+      action: "send",
+      id,
+      requestId: "q",
+      text: "question",
+    });
+    return f;
+  }
+
+  it("keeps reasoning and tool steps structured instead of one empty entry per step", async () => {
+    const f = await running();
+    f.emit({ type: "thinking", id: "step-1", text: "Need ", append: true });
+    f.emit({ type: "thinking", id: "step-1", text: "files", append: true });
+    const step = {
+      type: "blocks" as const,
+      id: "step-1",
+      blocks: [
+        { type: "thinking" as const, thinking: "Need files" },
+        {
+          type: "tool_use" as const,
+          id: "call",
+          name: "Grep",
+          input: { pattern: "x" },
+        },
+      ],
+    };
+    f.emit(step);
+    f.emit({
+      type: "tool_result",
+      toolUseId: "call",
+      content: "y".repeat(20_000),
+    });
+    // A repeated snapshot of the step must not drop the known result.
+    f.emit(step);
+    // Older Pi extensions end tool-only steps with empty prose.
+    f.emit({ type: "text", id: "step-0", text: "" });
+    f.emit({ type: "text", id: "step-2", text: "**Done**", append: true });
+    f.emit({ type: "done" });
+    const conversation = (await f.session.execute({ action: "get" }))
+      .conversation;
+    expect(conversation?.messages.map((m) => m.id)).toEqual([
+      "q",
+      "step-1",
+      "step-2",
+    ]);
+    const [thinking, tool] = conversation?.messages[1]?.blocks ?? [];
+    expect(thinking).toEqual({ type: "thinking", thinking: "Need files" });
+    expect(tool).toMatchObject({ type: "tool_use", id: "call" });
+    const result = tool?.type === "tool_use" ? tool.result?.content : "";
+    expect(result?.length).toBeGreaterThan(7_000);
+    expect(result?.length).toBeLessThan(8_100);
+    expect(conversation?.messages[1]?.text).toBe("");
+    expect(conversation?.messages[2]?.blocks?.[0]).toMatchObject({
+      type: "text",
+      text: "**Done**",
+      html: expect.stringContaining("<strong>Done</strong>"),
+    });
+    expect(conversation?.messages[2]?.html).toContain("<strong>Done</strong>");
+  });
+
+  it("replaces streamed prose with the completed item text", async () => {
+    const f = await running();
+    f.emit({ type: "text", id: "item", text: "Hel", append: true });
+    f.emit({ type: "text", id: "item", text: "Hello" });
+    const message = (await f.session.execute({ action: "get" })).conversation
+      ?.messages[1];
+    expect(message?.text).toBe("Hello");
+    expect(message?.blocks).toEqual([{ type: "text", text: "Hello" }]);
+  });
+
+  it("ends the conversation once content exhausts the transcript budget", async () => {
+    const f = await running();
+    for (let index = 0; index < 70; index++)
+      f.emit({
+        type: "blocks",
+        id: `step-${index}`,
+        blocks: [{ type: "thinking", thinking: "t".repeat(8_000) }],
+      });
+    const conversation = (await f.session.execute({ action: "get" }))
+      .conversation;
+    expect(conversation?.status).toBe("closed");
+    expect(conversation?.error).toMatch(/history limit/);
+  });
+});
