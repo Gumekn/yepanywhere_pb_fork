@@ -1158,13 +1158,21 @@ export class SessionDisplayService {
         entry.model?.isMessageCommitted(message.messageId)
       )
         return;
+      const snapshot = asRecord(message.message);
+      // Claude deltas rely on message_start rather than carrying their own
+      // message ID. It may already have aged out of the replay buffer.
+      if (!snapshot?.codexTurnId) entry.streamId = message.messageId;
       this.event(entry, "message", {
         ...previous,
+        ...(snapshot?.uuid === message.messageId ? snapshot : {}),
         type: "assistant",
         uuid: message.messageId,
-        _isStreaming: true,
+        _isStreaming: snapshot?._isStreaming !== false,
         _isStreamingPlaceholder: true,
-        message: { role: "assistant", content: message.text },
+        message:
+          snapshot?.uuid === message.messageId
+            ? snapshot.message
+            : { role: "assistant", content: message.text },
       });
       return;
     }
@@ -1277,6 +1285,7 @@ export class SessionDisplayService {
         if (
           previous &&
           previous._isStreaming !== true &&
+          !(message.codexTurnId && messageContent(previous) === "") &&
           (!start || previous._isStreamingPlaceholder !== true)
         )
           return;
