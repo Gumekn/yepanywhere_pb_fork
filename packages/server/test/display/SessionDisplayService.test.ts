@@ -1525,6 +1525,60 @@ describe("SessionDisplayService", () => {
     },
   );
 
+  it("keeps a Pi compaction spinner across source refreshes until it closes", async () => {
+    const { service, source, push } = fixture();
+    const page: DisplaySourcePage = {
+      provider: "pi",
+      messages: [
+        {
+          uuid: "u",
+          type: "user",
+          message: { role: "user", content: "Run" },
+        },
+      ] as Message[],
+      activity: "completed",
+      stamp: "1",
+    };
+    source.read.mockResolvedValue(page);
+    await service.subscribe(selection, vi.fn());
+    push("message", {
+      type: "system",
+      subtype: "status",
+      status: "compacting",
+      uuid: "pi-compaction-status-1",
+    });
+    expect((await service.snapshot(selection)).activity.isCompacting).toBe(
+      true,
+    );
+    // The resumed process reports idle before the compaction job starts its
+    // busy period; the resulting history refresh must not drop the spinner.
+    source.read.mockResolvedValue({ ...page, stamp: "2" });
+    source.stamp.mockResolvedValue("2");
+    push("status", { state: "idle" });
+    await vi.waitFor(() => expect(source.read).toHaveBeenCalledTimes(2));
+    await vi.waitFor(async () => {
+      expect((await service.snapshot(selection)).activity).toMatchObject({
+        state: "running",
+        isCompacting: true,
+      });
+    });
+    push("message", {
+      type: "system",
+      subtype: "status",
+      status: null,
+      uuid: "pi-compaction-status-1",
+    });
+    source.read.mockResolvedValue({ ...page, stamp: "3" });
+    source.stamp.mockResolvedValue("3");
+    push("status", { state: "idle" });
+    await vi.waitFor(() => expect(source.read).toHaveBeenCalledTimes(3));
+    await vi.waitFor(async () => {
+      expect(
+        (await service.snapshot(selection)).activity.isCompacting,
+      ).not.toBe(true);
+    });
+  });
+
   it.each(["completed", "failed", "interrupted"])(
     "does not replay compaction progress after a %s turn",
     async (outcome) => {

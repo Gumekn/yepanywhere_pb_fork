@@ -953,8 +953,14 @@ function SessionPageContent({
   const [showModelSwitchModal, setShowModelSwitchModal] = useState(false);
   const [showGoalModal, setShowGoalModal] = useState(false);
   const [goalInitialObjective, setGoalInitialObjective] = useState("");
-  const [isRequestingPiCompaction, setIsRequestingPiCompaction] =
-    useState(false);
+  /**
+   * Pi compaction request in flight. `starting` runs right away (idle or
+   * resumed session) and shows the compacting row optimistically, like Codex;
+   * `queued` waits for the active turn, whose spinner must stay accurate.
+   */
+  const [piCompactionRequest, setPiCompactionRequest] = useState<
+    "starting" | "queued" | null
+  >(null);
   const [isStartingCodexCompaction, setIsStartingCodexCompaction] =
     useState(false);
 
@@ -996,7 +1002,7 @@ function SessionPageContent({
    * HTTP call resolves when the compaction finishes or fails.
    */
   const requestPiCompaction = (customInstructions?: string): boolean => {
-    if (isCompacting || isRequestingPiCompaction) {
+    if (isCompacting || piCompactionRequest) {
       showToast(t("codexCompactAlreadyRunning"), "info");
       return false;
     }
@@ -1004,10 +1010,11 @@ function SessionPageContent({
       showToast(t("piCompactExternalSessionRequired"), "error");
       return false;
     }
-    if (status.owner === "self" && processState !== "idle") {
+    const queuedBehindTurn = status.owner === "self" && processState !== "idle";
+    if (queuedBehindTurn) {
       showToast(t("piCompactQueuedAfterTurn"), "info");
     }
-    setIsRequestingPiCompaction(true);
+    setPiCompactionRequest(queuedBehindTurn ? "queued" : "starting");
     setScrollTrigger((prev) => prev + 1);
     void api
       .compactPiSession(projectId, actualSessionId ?? sessionId, {
@@ -1022,7 +1029,7 @@ function SessionPageContent({
         const errorMsg = err instanceof Error ? err.message : String(err);
         showToast(t("sessionCompactFailed", { message: errorMsg }), "error");
       })
-      .finally(() => setIsRequestingPiCompaction(false));
+      .finally(() => setPiCompactionRequest(null));
     return true;
   };
 
@@ -2566,7 +2573,11 @@ function SessionPageContent({
           renderItems={renderItems}
           isProcessing={status.owner === "self" && processState === "in-turn"}
           lastActivityAt={lastStreamActivityAt}
-          isCompacting={isCompacting || isStartingCodexCompaction}
+          isCompacting={
+            isCompacting ||
+            isStartingCodexCompaction ||
+            piCompactionRequest === "starting"
+          }
           scrollTrigger={scrollTrigger + activeWindowTrimRevision}
           pendingMessages={pendingMessages}
           deferredMessages={deferredMessages}

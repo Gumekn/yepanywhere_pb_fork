@@ -125,6 +125,16 @@ const statuses = (messages: SdkRecord[]) =>
     .filter((m) => m.type === "system" && m.subtype === "status")
     .map((m) => m.status);
 
+/** Each compaction opens and closes its status row under one stable id. */
+const expectPairedStatusIds = (messages: SdkRecord[]) => {
+  const ids = messages
+    .filter((m) => m.type === "system" && m.subtype === "status")
+    .map((m) => m.uuid);
+  expect(ids).toHaveLength(2);
+  expect(ids[0]).toEqual(expect.stringMatching(/^pi-compaction-status-/));
+  expect(ids[1]).toBe(ids[0]);
+};
+
 describe("PiProvider compaction and / commands", () => {
   const tempDirs: string[] = [];
 
@@ -276,6 +286,7 @@ describe("PiProvider compaction and / commands", () => {
         messages.find((m) => m.subtype === "compact_boundary"),
       ).toMatchObject({ uuid: "compaction-1", content: "manual summary" });
       expect(statuses(messages)).toEqual(["compacting", null]);
+      expectPairedStatusIds(messages);
     } finally {
       session.abort();
     }
@@ -386,6 +397,7 @@ describe("PiProvider compaction and / commands", () => {
       session.queue.push({ text: "auto", uuid: "client-1" });
       const messages = await drainUntilResult(iterator);
       expect(statuses(messages)).toEqual(["compacting", null]);
+      expectPairedStatusIds(messages);
       expect(
         messages.find((m) => m.subtype === "compact_boundary"),
       ).toMatchObject({ uuid: "compaction-1", content: "auto summary" });

@@ -38,6 +38,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - 移除 ZCode provider 及其全部逻辑：app-server 接入、`~/.zcode` SQLite 会话读取与变更监视（每 15 秒轮询）、会话归档写回、ZCode TUI hook bridge（`/api/zcode-bridge` 与「全部会话」页的审批卡片）、新建会话页的 MCP 状态面板，以及 `test:zcode-app-server-smoke` 脚本。旧数据中的 `zcode` 会话不再出现在列表中，按已退役 provider 处理（相关接口返回 410）；Yep 从未修改的 ZCode 原始数据仍保留在 `~/.zcode`。曾安装 hook 插件的用户可删除 `~/.zcode/plugins/yep-bridge` 与 `~/.zcode/yep-bridge.json`。仅被 ZCode 使用的 SQLite 查询 worker 一并删除；Pi 与 Codex 共用的编辑分支推导迁至 `sessions/copied-prefix-branch.ts`，行为不变。
 
 ### Fixed
+- 修复 Pi 会话 `/compact` 期间不显示「正在压缩上下文…」，只显示普通的「Cooking…」与「LLM 思考中」：Pi 的压缩状态行没有 id，展示层在恢复进程等触发的历史刷新后会丢掉它；现在每次压缩（手动与自动）的开始／结束状态共用一个稳定 id，刷新后仍保留，结束时原位撤销。输入框发起压缩时也像 Codex 一样立即显示压缩提示（等待当前回合结束的排队压缩仍在真正开始后才显示）。
 - 修复 macOS 上工作目录位于符号链接路径（如 `/tmp/...`）的 Codex 会话无法打开、无法归档：Codex 在 rollout 中记录原始 cwd（`/tmp/x`），在 state DB 中记录解析后的路径（`/private/tmp/x`），侧栏按后者分组列出，但打开和归档时按项目查找 rollout 只比对原始 cwd，于是返回“会话不存在”，归档报“Session file not found”。Codex 会话清单现在为每个 rollout 额外记录同一目录的解析路径（目录已被清理时按最近的现存上级目录解析），按项目查找时两种写法都能命中；项目分组与项目 ID 不变。
 - 修复 Pi 历史会话的进程退出后 `/compact` 从补全与会话菜单消失：压缩现在按会话 ID 执行，必要时恢复原会话，保留原模型、权限、推理设置与附加摘要指引，不注入额外用户消息；已有任务仍等回合结束再压缩，恢复失败或运行槽位不足时返回明确错误。
 - Pi 会话中 Claude 模型的思考档位改为按模型提供，并与网关实际行为一致：Opus 5／5.5、Opus 4.7／4.8、Sonnet 5／5.5、Fable 5 在新建会话和会话中切换模型时提供 `low`／`medium`／`high`／`xhigh`／`max` 五档，Opus 4.6、Sonnet 4.6 提供到 `max`；此前所有 Pi 模型一律只有前三档。走 OpenAI 兼容端点的 Claude 模型此前会把 `xhigh`／`max` 静默降为 `high`，现在原样发送。Opus 5.5 与 Fable 5 一样不接受关闭思考：此前在 Anthropic 端点上选择「关闭」会被网关以 400 拒绝，现在改为低强度自适应思考；在 OpenAI 兼容端点上选择「关闭」时仍然不发送思考参数。

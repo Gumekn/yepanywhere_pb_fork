@@ -1,4 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -207,6 +208,16 @@ interface PiCompactJob {
  */
 const PI_COMPACT_TIMEOUT_MS = 30 * 60_000;
 
+/**
+ * One id per compaction for its live status rows. The display overlay only
+ * retains rows with an id, so an anonymous "compacting" status was lost on the
+ * next source refresh and the transcript fell back to a plain busy spinner.
+ * The closing `status: null` reuses the id and retires the row in place.
+ */
+function piCompactionStatusId(): string {
+  return `pi-compaction-status-${randomUUID()}`;
+}
+
 /** `get_commands` is answered from memory; startup never waits long on it. */
 const PI_STARTUP_COMMANDS_TIMEOUT_MS = 3_000;
 
@@ -234,6 +245,8 @@ interface PiStreamState {
     string,
     { terminal: string; log: string; combined: string }
   >;
+  /** Status row id of the automatic compaction running inside this turn. */
+  compactionStatusId?: string;
 }
 
 interface PiExtensionProviderConfig {
@@ -1672,12 +1685,14 @@ export class PiProvider implements AgentProvider {
       else job.resolve();
     };
     runtime.compacting = true;
+    const statusId = piCompactionStatusId();
     try {
       try {
         yield {
           type: "system",
           subtype: "status",
           status: "compacting",
+          uuid: statusId,
           session_id: sessionId(),
         };
         const response = client
@@ -1765,6 +1780,7 @@ export class PiProvider implements AgentProvider {
         type: "system",
         subtype: "status",
         status: null,
+        uuid: statusId,
         session_id: sessionId(),
       };
       yield { type: "result", session_id: sessionId() };
@@ -1935,11 +1951,13 @@ export class PiProvider implements AgentProvider {
     // Automatic (threshold/overflow) compaction runs inside a turn; manual
     // compaction events are consumed by runCompactJob.
     if (event.type === "compaction_start") {
+      stream.compactionStatusId = piCompactionStatusId();
       return [
         {
           type: "system",
           subtype: "status",
           status: "compacting",
+          uuid: stream.compactionStatusId,
           session_id: sessionId,
         },
       ];
@@ -1960,8 +1978,10 @@ export class PiProvider implements AgentProvider {
         type: "system",
         subtype: "status",
         status: null,
+        uuid: stream.compactionStatusId ?? piCompactionStatusId(),
         session_id: sessionId,
       });
+      stream.compactionStatusId = undefined;
       const errorMessage = stringValue(event.errorMessage);
       if (errorMessage) {
         messages.push({
