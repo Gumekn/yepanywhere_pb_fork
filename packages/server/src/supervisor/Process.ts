@@ -1542,7 +1542,7 @@ export class Process {
 
   /**
    * Add a message to the deferred queue.
-   * Deferred messages are held server-side and auto-sent when the agent's current turn ends.
+   * Start the next queued message immediately if idle; otherwise wait for the current turn.
    */
   deferMessage(message: UserMessage): { success: true } {
     this.deferredQueue.push({
@@ -1550,6 +1550,10 @@ export class Process {
       timestamp: new Date().toISOString(),
     });
     this.emitDeferredQueueChange();
+    // The turn may have ended before a client's deferred request arrives.
+    // Use the same drain path to preserve FIFO order, interrupt reservations,
+    // and blocked inputs when the resident provider can no longer accept them.
+    if (this._state.type === "idle") this.transitionToIdle();
     return { success: true };
   }
 

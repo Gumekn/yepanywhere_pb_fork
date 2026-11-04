@@ -69,6 +69,87 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("deferred messages", () => {
+  it.each(["before", "after"])(
+    "starts the next turn when a deferred request arrives %s completion",
+    async (arrival) => {
+      const { process, queue, users, steerFn, endTurn } = setup();
+      const queues: unknown[] = [];
+      process.subscribe((event) => {
+        if (event.type === "deferred-queue") queues.push(event.messages);
+      });
+      if (arrival === "after") {
+        endTurn();
+        await vi.waitFor(() => expect(process.state.type).toBe("idle"));
+      }
+
+      process.deferMessage({ text: "Follow up", tempId: "follow-up" });
+      if (arrival === "before") {
+        expect(queue.depth).toBe(0);
+        expect(users).toHaveLength(0);
+        endTurn();
+      }
+
+      await vi.waitFor(() => expect(queue.depth).toBe(1));
+      expect(process.state.type).toBe("in-turn");
+      expect(process.getDeferredQueueSummary()).toEqual([]);
+      expect(queues.at(-1)).toEqual([]);
+      expect(users).toMatchObject([{ tempId: "follow-up" }]);
+      expect(steerFn).not.toHaveBeenCalled();
+      const input = (await queue.generator().next()).value;
+      expect(getUserPromptProjection(input).internalPrompt).toBe("Follow up");
+      expect(input?.uuid).toBe(users[0]?.uuid);
+    },
+  );
+
+  it("starts only one of several idle submissions and drains the rest in order", async () => {
+    const { process, queue, users, endTurn } = setup();
+    endTurn();
+    await vi.waitFor(() => expect(process.state.type).toBe("idle"));
+
+    for (const text of ["First", "Second", "Third"]) {
+      process.deferMessage({ text, tempId: text });
+    }
+    expect(queue.depth).toBe(1);
+    expect(process.getDeferredQueueSummary()).toMatchObject([
+      { content: "Second" },
+      { content: "Third" },
+    ]);
+
+    const inputs = queue.generator();
+    for (const text of ["First", "Second", "Third"]) {
+      await vi.waitFor(() => expect(queue.depth).toBe(1));
+      expect(process.state.type).toBe("in-turn");
+      expect(
+        getUserPromptProjection((await inputs.next()).value).internalPrompt,
+      ).toBe(text);
+      endTurn();
+    }
+    await vi.waitFor(() => expect(process.state.type).toBe("idle"));
+    expect(process.getDeferredQueueSummary()).toEqual([]);
+    expect(users.map((message) => message.tempId)).toEqual([
+      "First",
+      "Second",
+      "Third",
+    ]);
+  });
+
+  it("keeps messages visible as blocked when the idle provider can no longer accept input", async () => {
+    const { process, queue, users, endTurn } = setup();
+    queue.close();
+    endTurn();
+    await vi.waitFor(() => expect(process.state.type).toBe("idle"));
+
+    process.deferMessage({ text: "Keep this message", tempId: "blocked" });
+    expect(process.getDeferredQueueSummary()).toMatchObject([
+      { tempId: "blocked", blocked: true },
+    ]);
+    expect(users).toHaveLength(0);
+    expect(queue.depth).toBe(0);
+    expect(process.state.type).toBe("idle");
+  });
+});
+
 describe("interrupt and send", () => {
   it("retains deferred inputs when a closing provider emits its final result", async () => {
     const { process, queue, users, endTurn } = setup();
@@ -146,9 +227,11 @@ describe("interrupt and send", () => {
     );
     endTurn();
     await vi.waitFor(() => expect(process.state.type).toBe("idle"));
+    process.deferMessage({ text: "Arrived after completion", tempId: "late" });
     expect(queue.depth).toBe(0);
     expect(process.getDeferredQueueSummary()).toMatchObject([
       { tempId: "deferred" },
+      { tempId: "late" },
     ]);
     acknowledge();
     await expect(sent).resolves.toMatchObject({ success: true });
@@ -156,12 +239,18 @@ describe("interrupt and send", () => {
     expect(
       getUserPromptProjection((await inputs.next()).value).internalPrompt,
     ).toBe("Urgent correction");
-    expect(process.getDeferredQueueSummary()).toHaveLength(1);
+    expect(process.getDeferredQueueSummary()).toHaveLength(2);
     endTurn();
     await vi.waitFor(() => expect(queue.depth).toBe(1));
     expect(
       getUserPromptProjection((await inputs.next()).value).internalPrompt,
     ).toBe("Queued task");
+    endTurn();
+    await vi.waitFor(() => expect(queue.depth).toBe(1));
+    expect(
+      getUserPromptProjection((await inputs.next()).value).internalPrompt,
+    ).toBe("Arrived after completion");
+    expect(process.getDeferredQueueSummary()).toEqual([]);
     expect(steerFn).not.toHaveBeenCalled();
   });
 
