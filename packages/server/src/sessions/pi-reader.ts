@@ -274,6 +274,23 @@ export class PiSessionReader implements ISessionReader {
     };
   }
 
+  async getBranchState(
+    sessionId: string,
+    branchId?: string,
+  ): Promise<SessionBranchState | undefined> {
+    const record = await this.findRecord(sessionId);
+    if (!record || (this.projectPath && record.cwd !== this.projectPath)) {
+      return undefined;
+    }
+    const records = await this.scan();
+    if (!this.hasBranchRelation(record, records)) return undefined;
+    // Same projection as getSessionSummary, so metadata reads reuse its
+    // parsed snapshot instead of parsing the current file a second time.
+    const session = await this.getParsedSession(record, { deferMedia: true });
+    if (!session) return undefined;
+    return this.loadBranchState(sessionId, branchId, records, session);
+  }
+
   async getSessionSummaryIfChanged(
     sessionId: string,
     projectId: UrlProjectId,
@@ -424,7 +441,15 @@ export class PiSessionReader implements ISessionReader {
       familySessions,
       currentSessionId,
       selectedBranchId,
-      { provider: "pi", sessionRootPrefix: "pi-session-root" },
+      {
+        provider: "pi",
+        sessionRootPrefix: "pi-session-root",
+        // Pi's fork copies the retained path with its original entry ids, so
+        // identity marks the copied prefix exactly. Matching by text instead
+        // swallowed a resubmitted prompt whose text equals the original,
+        // which hid or misplaced the edit's branch switcher.
+        isCopiedMessage: (child, parent) => child.id === parent.id,
+      },
     );
     for (const diagnostic of view.diagnostics) {
       getLogger().debug(

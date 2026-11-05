@@ -1382,6 +1382,9 @@ function SessionPageContent({
                   processId: result.processId,
                 },
                 initialProvider: effectiveProvider,
+                // Metadata can load before the edited prompt reaches the
+                // fork's file; poll until its branch switcher is derivable.
+                refreshBranchAfterNavigation: true,
               },
             },
           );

@@ -14,6 +14,7 @@ import {
 import type { RuntimeProcessSnapshot } from "../../src/runtime/types.js";
 import { ManualSessionTitleError } from "../../src/services/SessionTitleService.js";
 import type { CodexSessionReader } from "../../src/sessions/codex-reader.js";
+import { PiSessionReader } from "../../src/sessions/pi-reader.js";
 import type { ISessionReader } from "../../src/sessions/types.js";
 import type { Project, SessionSummary } from "../../src/supervisor/types.js";
 import { EventBus } from "../../src/watcher/EventBus.js";
@@ -820,6 +821,125 @@ describe("Sessions metadata route", () => {
       }
     },
   );
+
+  it("returns the Pi edit-fork branch family in metadata", async () => {
+    const sessionsDir = join(tmpdir(), `pi-meta-sessions-${randomUUID()}`);
+    const projectPath = join(tmpdir(), `pi-meta-project-${randomUUID()}`);
+    const projectDir = join(sessionsDir, "--pi-meta-project--");
+    await mkdir(projectDir, { recursive: true });
+    try {
+      const message = (
+        id: string,
+        parentId: string | null,
+        role: "user" | "assistant",
+        text: string,
+      ) => ({
+        type: "message",
+        id,
+        parentId,
+        timestamp: "2026-11-04T06:30:00.000Z",
+        message:
+          role === "user"
+            ? { role, content: text, timestamp: 1 }
+            : {
+                role,
+                content: [{ type: "text", text }],
+                stopReason: "stop",
+                timestamp: 2,
+              },
+      });
+      const lines = (records: unknown[]) =>
+        `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+      const parentId = randomUUID();
+      const parentPath = join(projectDir, `parent_${parentId}.jsonl`);
+      await writeFile(
+        parentPath,
+        lines([
+          {
+            type: "session",
+            version: 3,
+            id: parentId,
+            timestamp: "2026-11-04T06:30:00.000Z",
+            cwd: projectPath,
+          },
+          message("user-beijing", null, "user", "Beijing weather?"),
+          message("answer-beijing", "user-beijing", "assistant", "Sunny"),
+        ]),
+      );
+      const childId = randomUUID();
+      await writeFile(
+        join(projectDir, `child_${childId}.jsonl`),
+        lines([
+          {
+            type: "session",
+            version: 3,
+            id: childId,
+            timestamp: "2026-11-04T06:36:00.000Z",
+            cwd: projectPath,
+            parentSession: parentPath,
+          },
+          message("user-shanghai", null, "user", "Shanghai weather?"),
+          message("answer-shanghai", "user-shanghai", "assistant", "Rain"),
+        ]),
+      );
+
+      const project: Project = {
+        ...createProject(),
+        id: encodeProjectId(projectPath),
+        path: projectPath,
+        provider: "pi",
+      };
+      const piReader = new PiSessionReader({ sessionsDir, projectPath });
+      const routes = createSessionsRoutes({
+        supervisor: {
+          getProcessForSession: vi.fn(() => null),
+        } as unknown as SessionsDeps["supervisor"],
+        scanner: {
+          getProject: vi.fn(async () => project),
+          getOrCreateProject: vi.fn(async () => project),
+        } as unknown as SessionsDeps["scanner"],
+        readerFactory: vi.fn(
+          () =>
+            ({
+              getSessionSummary: vi.fn(async () => null),
+            }) as unknown as ISessionReader,
+        ),
+        piSessionsDir: sessionsDir,
+        piReaderFactory: vi.fn(() => piReader),
+      });
+
+      // The display transport only reads /metadata, so the switcher's branch
+      // options must arrive there, not only on the full session detail route.
+      const response = await routes.request(
+        `/projects/${project.id}/sessions/${childId}/metadata`,
+      );
+      expect(response.status).toBe(200);
+      const json = await response.json();
+      expect(json.session.provider).toBe("pi");
+      expect(json.session.branchState).toMatchObject({
+        provider: "pi",
+        sessionId: childId,
+        activeBranchId: "user-shanghai",
+        branches: [
+          expect.objectContaining({
+            id: "user-beijing",
+            sessionId: parentId,
+            siblingIndex: 1,
+            siblingCount: 2,
+          }),
+          expect.objectContaining({
+            id: "user-shanghai",
+            sessionId: childId,
+            siblingIndex: 2,
+            siblingCount: 2,
+          }),
+        ],
+      });
+      expect(json.session.codexBranchState).toBeUndefined();
+    } finally {
+      await rm(sessionsDir, { recursive: true, force: true });
+    }
+  });
 
   it("returns the native Codex edit-fork branch family in metadata", async () => {
     const project = createProject();

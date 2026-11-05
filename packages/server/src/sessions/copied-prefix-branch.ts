@@ -80,8 +80,9 @@ export interface CopiedPrefixBranchViewOptions {
   sessionRootPrefix?: string;
   /**
    * Provider-specific proof that one leading child row is copied history.
-   * Pi uses same-position text (the default); Codex can use its retained native ids so
-   * an edit that keeps the same prompt text is not mistaken for copied input.
+   * The default is same-position role and text. Pi and Codex prefer retained
+   * native ids, so an edit that keeps the same prompt text is not mistaken
+   * for copied input.
    */
   isCopiedMessage?: (
     child: CopiedPrefixMessage,

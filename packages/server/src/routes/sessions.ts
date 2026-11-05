@@ -1347,6 +1347,26 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           })
         : undefined;
     const forkFamilyRootId = forkBranchState?.branches[0]?.sessionId;
+    // Pi edit forks are separate native session files, and the summary index
+    // never carries their family. Without it the display transport has no
+    // branch options, so an edited prompt rendered without its switcher.
+    const readerBranchState =
+      !forkBranchState && sessionSummaryResult?.source.reader.getBranchState
+        ? await sessionSummaryResult.source.reader
+            .getBranchState(sessionId)
+            .catch((error: unknown) => {
+              getLogger().warn(
+                {
+                  event: "session_metadata_branch_state_failed",
+                  sessionId,
+                  provider: sessionSummaryResult.source.provider,
+                  error: error instanceof Error ? error.message : String(error),
+                },
+                "Session metadata omitted its edit-fork branch state",
+              );
+              return undefined;
+            })
+        : undefined;
     const forkFamilyRootSummary = forkFamilyRootId
       ? await deps.codexSessionCatalog
           ?.getSessionSummary(forkFamilyRootId, project.path)
@@ -1404,7 +1424,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         source: sessionSummary?.source,
         approvalPolicy: sessionSummary?.approvalPolicy,
         sandboxPolicy: sessionSummary?.sandboxPolicy,
-        branchState: forkBranchState ?? sessionSummary?.branchState,
+        branchState:
+          forkBranchState ?? readerBranchState ?? sessionSummary?.branchState,
         codexBranchState: forkBranchState ?? sessionSummary?.codexBranchState,
         contextUsage: sessionSummary?.contextUsage,
         cumulativeUsage: sessionSummary?.cumulativeUsage,

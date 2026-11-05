@@ -7,6 +7,9 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ## [Unreleased]
 
+### Fixed
+- 修复 Pi 会话编辑历史消息后看不到分支切换器、无法切回原分支的问题：会话页默认的展示链路只从 `/metadata` 读取分支信息，而该接口只为 Codex 生成编辑分支，Pi 的 fork 家族只出现在完整的会话详情接口中，切换器因此缺少候选分支而不显示。现在 `/metadata` 同样返回 Pi 的分支状态（只在存在 fork 关系的会话上计算，复用已解析的会话快照）；编辑后跳转到新会话时也会像 Codex 一样短暂轮询，直到分支信息就绪。同时修复编辑后的文本与原文完全相同（例如重新提交「继续」）时切换器消失或挂到错误消息上的问题：Pi 的 fork 会保留复制部分的原 entry id，分支边界改为按 id 判定，不再按文本比对。
+
 ## [2026.11.0] - 2026-11-04
 
 ### Added
