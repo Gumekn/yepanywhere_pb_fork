@@ -12,10 +12,14 @@ import {
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { writeClipboardText } from "../lib/clipboard";
+import { formatSmartTime } from "../lib/datetime";
+import { formatGitCount, getGitSyncIndicator } from "../lib/gitSync";
 
 interface ProjectGitStatusButtonProps {
   status?: ProjectGitStatusSummary | null;
   projectName: string;
+  /** A user-triggered `git fetch` for this project is in flight. */
+  isSyncing?: boolean;
 }
 
 const LONG_PRESS_MS = 500;
@@ -154,8 +158,9 @@ function CopyableGitRef({
 export function ProjectGitStatusButton({
   status,
   projectName,
+  isSyncing = false,
 }: ProjectGitStatusButtonProps) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [isOpen, setIsOpen] = useState(false);
   const [isPinned, setIsPinned] = useState(false);
   const [placement, setPlacement] = useState<CSSProperties | null>(null);
@@ -166,6 +171,7 @@ export function ProjectGitStatusButton({
   const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const suppressNextClickRef = useRef(false);
   const popoverId = useId();
+  const syncDescriptionId = useId();
 
   const clearLongPress = useCallback(() => {
     if (longPressTimerRef.current !== null) {
@@ -259,7 +265,42 @@ export function ProjectGitStatusButton({
 
   const branchLabel =
     status.branch ?? (status.head ? `:${status.head}` : "HEAD");
+  const sync = getGitSyncIndicator(status);
+  const showUpstreamRow = status.upstream !== null;
+  const base = status.base ?? null;
+  const showBaseRow = base !== null && base.ref !== status.upstream;
+  const syncSummary = [
+    sync.unpushed > 0 ? `↑${sync.unpushed}` : "",
+    sync.incoming > 0 ? `↓${sync.incoming}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   const buttonLabel = t("projectGitDetails", { project: projectName });
+  const syncDescription = [
+    sync.unpushed > 0 ? t("projectGitUnpushed", { count: sync.unpushed }) : "",
+    sync.incoming > 0
+      ? t("projectGitBaseIncoming", { count: sync.incoming })
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const legendParts = [
+    sync.unpushedRef
+      ? t("projectGitLegendUnpushed", { ref: sync.unpushedRef })
+      : "",
+    sync.incomingRef
+      ? t("projectGitLegendIncoming", { ref: sync.incomingRef })
+      : "",
+  ].filter(Boolean);
+  const fetchError = status.fetchError ?? null;
+  const lastFetchedAt = status.lastFetchedAt ?? null;
+  // Repos without any remote-tracking refs have nothing to fetch or compare.
+  const hasRemoteInfo =
+    status.upstream !== null ||
+    base !== null ||
+    lastFetchedAt !== null ||
+    fetchError !== null ||
+    isSyncing;
   const changeRows = [
     {
       label: t("gitStatusStaged"),
@@ -398,21 +439,96 @@ export function ProjectGitStatusButton({
                   />
                 </div>
               )}
-              {(status.ahead > 0 || status.behind > 0) && (
+              {showUpstreamRow ? (
                 <div>
-                  <dt>{t("gitStatusSync")}</dt>
-                  <dd>
-                    {status.ahead > 0
-                      ? `${t("gitStatusAhead")} ${status.ahead}`
-                      : ""}
-                    {status.ahead > 0 && status.behind > 0 ? " · " : ""}
-                    {status.behind > 0
-                      ? `${t("gitStatusBehind")} ${status.behind}`
-                      : ""}
+                  <dt>{t("projectGitUpstreamSync")}</dt>
+                  <dd className="project-git-popover__sync">
+                    {status.ahead === 0 && status.behind === 0
+                      ? t("projectGitInSync")
+                      : [
+                          status.ahead > 0
+                            ? t("projectGitUnpushed", { count: status.ahead })
+                            : "",
+                          status.behind > 0
+                            ? t("projectGitToPull", { count: status.behind })
+                            : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                  </dd>
+                </div>
+              ) : (
+                <div>
+                  <dt>{t("gitStatusUpstream")}</dt>
+                  <dd>{t("gitStatusNoUpstream")}</dd>
+                </div>
+              )}
+              {showBaseRow && base && (
+                <>
+                  <div>
+                    <dt>{t("projectGitBase")}</dt>
+                    <CopyableGitRef
+                      key={base.ref}
+                      value={base.ref}
+                      copyLabel={t("projectGitCopyBase")}
+                    />
+                  </div>
+                  <div>
+                    <dt>{t("projectGitBaseSync")}</dt>
+                    <dd className="project-git-popover__sync">
+                      {[
+                        base.behind > 0
+                          ? t("projectGitBaseIncoming", { count: base.behind })
+                          : t("projectGitBaseUpToDate"),
+                        base.ahead > 0
+                          ? t("projectGitBaseOwn", { count: base.ahead })
+                          : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </dd>
+                  </div>
+                </>
+              )}
+              {!base && status.unrelatedBaseRef && (
+                <div>
+                  <dt>{t("projectGitBase")}</dt>
+                  <dd className="project-git-popover__sync">
+                    {t("projectGitBaseUnrelated", {
+                      ref: status.unrelatedBaseRef,
+                    })}
+                  </dd>
+                </div>
+              )}
+              {hasRemoteInfo && (
+                <div>
+                  <dt>{t("projectGitLastFetched")}</dt>
+                  <dd
+                    className={
+                      fetchError && !isSyncing ? "is-error" : undefined
+                    }
+                    title={
+                      lastFetchedAt
+                        ? new Date(lastFetchedAt).toLocaleString(locale)
+                        : undefined
+                    }
+                  >
+                    {isSyncing
+                      ? t("projectGitFetching")
+                      : fetchError
+                        ? t("projectGitFetchFailed")
+                        : lastFetchedAt
+                          ? formatSmartTime(lastFetchedAt, locale)
+                          : t("projectGitNeverFetched")}
                   </dd>
                 </div>
               )}
             </dl>
+            {fetchError && !isSyncing && (
+              <p className="project-git-popover__error" title={fetchError}>
+                {fetchError}
+              </p>
+            )}
             {changeRows.length > 0 && (
               <div className="project-git-popover__changes">
                 {changeRows.map((row) => (
@@ -424,6 +540,17 @@ export function ProjectGitStatusButton({
                     <strong>{row.value}</strong>
                   </span>
                 ))}
+              </div>
+            )}
+            {hasRemoteInfo && (
+              <div className="project-git-popover__legend">
+                {legendParts.length > 0 && (
+                  <p>
+                    {t("projectGitLegendTitle")}
+                    {legendParts.join(t("projectGitLegendSeparator"))}
+                  </p>
+                )}
+                <p>{t("projectGitRefreshHint")}</p>
               </div>
             )}
           </div>,
@@ -438,7 +565,11 @@ export function ProjectGitStatusButton({
         type="button"
         className={`sidebar-project-git-button${
           status.isClean ? " is-clean" : " is-dirty"
-        }${isOpen ? " is-open" : ""}`}
+        }${isOpen ? " is-open" : ""}${isSyncing ? " is-syncing" : ""}${
+          syncSummary ? " has-sync" : ""
+        }`}
+        aria-busy={isSyncing || undefined}
+        aria-describedby={syncDescription ? syncDescriptionId : undefined}
         aria-label={buttonLabel}
         aria-haspopup="dialog"
         aria-expanded={isOpen}
@@ -487,12 +618,37 @@ export function ProjectGitStatusButton({
         onPointerCancel={handlePointerEnd}
         onContextMenu={(event) => event.preventDefault()}
       >
-        <GitBranchIcon />
-        {!status.isClean && (
-          <span
-            className="sidebar-project-git-button__dot"
-            aria-hidden="true"
-          />
+        <span className="sidebar-project-git-button__icon">
+          <GitBranchIcon />
+          {!status.isClean && (
+            <span
+              className="sidebar-project-git-button__dot"
+              aria-hidden="true"
+            />
+          )}
+        </span>
+        {syncDescription && (
+          <span id={syncDescriptionId} hidden>
+            {syncDescription}
+          </span>
+        )}
+        {syncSummary && (
+          <span className="sidebar-project-git-button__sync" aria-hidden="true">
+            {sync.unpushed > 0 && (
+              <span className="sidebar-project-git-button__count is-unpushed">
+                ↑{formatGitCount(sync.unpushed)}
+              </span>
+            )}
+            {sync.incoming > 0 && (
+              <span
+                className={`sidebar-project-git-button__count is-incoming${
+                  sync.diverged ? " is-diverged" : ""
+                }`}
+              >
+                ↓{formatGitCount(sync.incoming)}
+              </span>
+            )}
+          </span>
         )}
       </button>
       {popover}

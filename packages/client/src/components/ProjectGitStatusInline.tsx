@@ -1,5 +1,6 @@
 import type { ProjectGitStatusSummary } from "@yep-anywhere/shared";
 import { useI18n } from "../i18n";
+import { getGitSyncIndicator } from "../lib/gitSync";
 
 type TFunction = ReturnType<typeof useI18n>["t"];
 
@@ -18,9 +19,11 @@ function formatGitSummaryTitle(
     status.isClean ? t("gitStatusClean") : t("gitStatusDirty"),
   ];
 
-  if (status.ahead > 0) parts.push(`${t("gitStatusAhead")}: ${status.ahead}`);
-  if (status.behind > 0)
-    parts.push(`${t("gitStatusBehind")}: ${status.behind}`);
+  const sync = getGitSyncIndicator(status);
+  if (sync.unpushed > 0 && sync.unpushedRef)
+    parts.push(`↑${sync.unpushed} ${sync.unpushedRef}`);
+  if (sync.incoming > 0 && sync.incomingRef)
+    parts.push(`↓${sync.incoming} ${sync.incomingRef}`);
   if (status.stagedCount > 0)
     parts.push(`${t("gitStatusStaged")}: ${status.stagedCount}`);
   if (status.unstagedCount > 0)
@@ -48,6 +51,7 @@ export function ProjectGitStatusInline({
 
   const branchLabel =
     status.branch ?? (status.head ? `:${status.head}` : "HEAD");
+  const sync = getGitSyncIndicator(status);
 
   return (
     <span
@@ -75,11 +79,11 @@ export function ProjectGitStatusInline({
         </svg>
       )}
       <span className="project-git-status__branch">{branchLabel}</span>
-      {status.ahead > 0 && (
-        <span className="project-git-status__count">↑{status.ahead}</span>
+      {sync.unpushed > 0 && (
+        <span className="project-git-status__count">↑{sync.unpushed}</span>
       )}
-      {status.behind > 0 && (
-        <span className="project-git-status__count">↓{status.behind}</span>
+      {sync.incoming > 0 && (
+        <span className="project-git-status__count">↓{sync.incoming}</span>
       )}
       {status.isClean ? (
         <span className="project-git-status__clean">✓</span>
@@ -110,12 +114,12 @@ export function ProjectGitStatusInline({
               ?{status.untrackedCount}
             </span>
           )}
-          {status.stashCount > 0 && (
-            <span className="project-git-status__count is-stashed">
-              *{status.stashCount}
-            </span>
-          )}
         </>
+      )}
+      {status.stashCount > 0 && (
+        <span className="project-git-status__count is-stashed">
+          *{status.stashCount}
+        </span>
       )}
     </span>
   );

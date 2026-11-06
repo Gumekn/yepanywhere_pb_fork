@@ -1,5 +1,6 @@
 import type {
   AgentCommandListing,
+  ProjectGitFetchResponse,
   SessionDisplayGroupPage,
   SessionDisplayProcessPage,
   SessionDisplaySnapshot,
@@ -1199,6 +1200,16 @@ export const api = {
     }),
 
   getProjects: () => fetchJSON<{ projects: Project[] }>("/projects"),
+
+  /**
+   * Run `git fetch` for the given projects so remote ahead/behind counts are
+   * current. Only call on explicit user refresh; it touches the network.
+   */
+  fetchProjectGitRemotes: (projectIds: string[]) =>
+    fetchJSON<ProjectGitFetchResponse>("/projects/git/fetch", {
+      method: "POST",
+      body: JSON.stringify({ projectIds }),
+    }),
 
   /**
    * Add a project by file path.

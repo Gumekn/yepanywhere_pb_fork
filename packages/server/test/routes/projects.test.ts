@@ -3,6 +3,7 @@ import type {
   UrlProjectId,
 } from "@yep-anywhere/shared";
 import { describe, expect, it, vi } from "vitest";
+import { GitRemoteFetcher } from "../../src/git-remote-fetch.js";
 import type { ProjectScanner } from "../../src/projects/scanner.js";
 import { createProjectsRoutes } from "../../src/routes/projects.js";
 import type { CodexSessionReader } from "../../src/sessions/codex-reader.js";
@@ -80,6 +81,93 @@ describe("Projects Routes", () => {
       activeExternalCount: 0,
       gitStatus,
     });
+  });
+
+  it("fetches git remotes on request and surfaces fetch errors in the list", async () => {
+    const project = createProject();
+    const runFetch = vi.fn(async () => {
+      throw Object.assign(new Error("exit 128"), {
+        stderr: "fatal: could not read Username for 'https://example.com'\n",
+      });
+    });
+    const gitRemoteFetcher = new GitRemoteFetcher({
+      resolveRepo: async () => ({
+        commonDir: "/tmp/project/.git",
+        remotes: ["origin"],
+      }),
+      runFetch,
+    });
+    const gitStatusProvider = vi.fn(
+      async (): Promise<ProjectGitStatusSummary> => ({
+        isGitRepo: true,
+        branch: "main",
+        head: "abc1234",
+        upstream: "origin/main",
+        ahead: 0,
+        behind: 2,
+        isClean: true,
+        stagedCount: 0,
+        unstagedCount: 0,
+        deletedCount: 0,
+        untrackedCount: 0,
+        conflictedCount: 0,
+        stashCount: 0,
+      }),
+    );
+    const routes = createProjectsRoutes({
+      scanner: {
+        listProjects: vi.fn(async () => [project]),
+        getProject: vi.fn(async (id: string) =>
+          id === project.id ? project : null,
+        ),
+      } as unknown as ProjectScanner,
+      readerFactory: vi.fn(() => ({}) as ISessionReader),
+      gitStatusProvider,
+      gitRemoteFetcher,
+    });
+
+    const response = await routes.request("/git/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectIds: [project.id, "missing"] }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      results: [
+        {
+          projectId: project.id,
+          status: "failed",
+          error: "fatal: could not read Username for 'https://example.com'",
+        },
+        { projectId: "missing", status: "not-git" },
+      ],
+    });
+    expect(runFetch).toHaveBeenCalledWith("/tmp/project", null);
+
+    const list = await (await routes.request("/")).json();
+    expect(list.projects[0].gitStatus).toMatchObject({
+      behind: 2,
+      fetchError: "fatal: could not read Username for 'https://example.com'",
+    });
+  });
+
+  it("rejects malformed git fetch requests", async () => {
+    const routes = createProjectsRoutes({
+      scanner: {} as unknown as ProjectScanner,
+      readerFactory: vi.fn(() => ({}) as ISessionReader),
+    });
+    const bad = await routes.request("/git/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectIds: "nope" }),
+    });
+    expect(bad.status).toBe(400);
+    const invalidId = await routes.request("/git/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectIds: ["../etc"] }),
+    });
+    expect(invalidId.status).toBe(400);
   });
 
   it("lists mixed-provider sessions through the shared provider resolver", async () => {

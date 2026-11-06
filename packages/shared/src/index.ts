@@ -242,6 +242,10 @@ export {
 export type {
   GitStatusInfo,
   GitFileChange,
+  ProjectGitBaseComparison,
+  ProjectGitFetchResponse,
+  ProjectGitFetchResult,
+  ProjectGitFetchStatus,
   ProjectGitStatusSummary,
 } from "./git-status.js";
 

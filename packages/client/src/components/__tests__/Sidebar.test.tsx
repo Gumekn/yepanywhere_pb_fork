@@ -21,9 +21,11 @@ const {
   mockUseGlobalSessions,
   mockUseRecentProjects,
   mockUpdateSessionMetadata,
+  mockFetchProjectGitRemotes,
   mockRenderSessionItem,
   mockActivityOn,
 } = vi.hoisted(() => ({
+  mockFetchProjectGitRemotes: vi.fn(),
   mockUseGlobalSessions: vi.fn(),
   mockUseRecentProjects: vi.fn(),
   mockUpdateSessionMetadata: vi.fn(),
@@ -52,6 +54,7 @@ vi.mock("../../hooks/useGlobalSessions", () => ({
 vi.mock("../../api/client", () => ({
   api: {
     updateSessionMetadata: mockUpdateSessionMetadata,
+    fetchProjectGitRemotes: mockFetchProjectGitRemotes,
   },
 }));
 
@@ -403,6 +406,83 @@ describe("Sidebar recent session browsing", () => {
     expect(screen.getByRole("dialog").textContent).toContain(
       "feature/sidebar-details",
     );
+  });
+
+  it("fetches remotes for visible git projects when refreshing recent sessions", async () => {
+    const gitStatus = {
+      isGitRepo: true,
+      branch: "main",
+      head: "abc1234",
+      upstream: "origin/main",
+      ahead: 0,
+      behind: 0,
+      isClean: true,
+      stagedCount: 0,
+      unstagedCount: 0,
+      deletedCount: 0,
+      untrackedCount: 0,
+      conflictedCount: 0,
+      stashCount: 0,
+    };
+    const projects: Project[] = [
+      {
+        id: "project-1",
+        path: "/workspace/project-1",
+        name: "Project 1",
+        sessionCount: 1,
+        activeOwnedCount: 0,
+        activeExternalCount: 0,
+        lastActivity: null,
+        gitStatus,
+      },
+      {
+        id: "project-2",
+        path: "/workspace/project-2",
+        name: "Project 2",
+        sessionCount: 1,
+        activeOwnedCount: 0,
+        activeExternalCount: 0,
+        lastActivity: null,
+        gitStatus: { ...gitStatus, isGitRepo: false },
+      },
+    ];
+    let finishFetch: (() => void) | undefined;
+    mockFetchProjectGitRemotes.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishFetch = () => resolve({ results: [] });
+        }),
+    );
+    const now = new Date().toISOString();
+    renderSidebar(
+      [
+        createSession({ updatedAt: now }),
+        createSession({
+          id: "session-2",
+          projectId: "project-2",
+          projectName: "Project 2",
+          updatedAt: now,
+        }),
+      ],
+      {},
+      projects,
+    );
+    const refetchProjects = mockUseRecentProjects.mock.results[0]?.value
+      .refetch as ReturnType<typeof vi.fn>;
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(mockFetchProjectGitRemotes).toHaveBeenCalledWith(["project-1"]);
+    const gitButton = screen.getByRole("button", {
+      name: "Show Git details for Project 1",
+    });
+    expect(gitButton.classList.contains("is-syncing")).toBe(true);
+
+    await act(async () => finishFetch?.());
+    await waitFor(() =>
+      expect(refetchProjects).toHaveBeenCalledWith({ fresh: true }),
+    );
+    expect(gitButton.classList.contains("is-syncing")).toBe(false);
   });
 
   it.each(["recent", "older"])(
