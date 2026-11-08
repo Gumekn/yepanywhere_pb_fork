@@ -14,6 +14,10 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - 只有 stash、没有工作区改动的项目不再显示为「有改动」，stash 数量仍在 Git 弹层和项目卡片中显示。
 
 ### Fixed
+- 修复外置 agent runtime（`YEP_RUNTIME_EXTERNAL`）下 Codex 目标全部不可用的问题：runtime 控制服务缺少 `/processes/:id/goal` 路由，目标对话框的读取、设定、暂停、清除都返回 `Runtime request failed (404)`。
+- 修复经 Yep 设定的 Codex 目标不被视为用户指令的问题：`thread/goal/set`、`thread/goal/clear` 现在带上 `origin: "user"`（Codex 0.16x 起的字段，旧版本会忽略）。缺少该字段时 Codex 不会把「用户设定了目标」写入模型历史，自动审批（Guardian）也不把目标当作用户授权。
+- 修复 Codex 自行发起的回合（目标续跑、`/review`、空闲时的 `/compact`）期间会话仍显示空闲的问题：此前进程状态停在空闲，界面没有运行指示和停止按钮，空闲超过驻留时长（默认 60 分钟）时还可能在目标执行中途被回收。现在 Codex 开始这类回合时进程转为运行中，回合结束后回到空闲。
+- Codex 记录为用户角色的内部上下文（目标续跑提示 `<codex_internal_context source="goal">`、用户目标变更 `source="user_goal"`、旧版 `<goal_context>`）不再被当作用户消息显示，也不再作为会话标题或提问列表项。
 - 修复 Pi 会话编辑历史消息后看不到分支切换器、无法切回原分支的问题：会话页默认的展示链路只从 `/metadata` 读取分支信息，而该接口只为 Codex 生成编辑分支，Pi 的 fork 家族只出现在完整的会话详情接口中，切换器因此缺少候选分支而不显示。现在 `/metadata` 同样返回 Pi 的分支状态（只在存在 fork 关系的会话上计算，复用已解析的会话快照）；编辑后跳转到新会话时也会像 Codex 一样短暂轮询，直到分支信息就绪。同时修复编辑后的文本与原文完全相同（例如重新提交「继续」）时切换器消失或挂到错误消息上的问题：Pi 的 fork 会保留复制部分的原 entry id，分支边界改为按 id 判定，不再按文本比对。
 
 ## [2026.11.0] - 2026-11-04

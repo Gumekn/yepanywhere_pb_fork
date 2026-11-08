@@ -2638,7 +2638,15 @@ process.stdin.on("data", (chunk) => {
           await expect(
             session.codexControls?.invoke({ control: "thread/compact/start" }),
           ).resolves.toMatchObject({ ok: true });
+          // A Codex-initiated turn is announced so the process leaves idle.
           await expect(progress).resolves.toMatchObject({
+            value: {
+              type: "system",
+              subtype: "turn_started",
+              codexTurnId: "compact-turn",
+            },
+          });
+          await expect(session.iterator.next()).resolves.toMatchObject({
             value: {
               type: "system",
               subtype: "status",
@@ -2793,6 +2801,7 @@ process.stdin.on("data", (chunk) => {
               method: "thread/goal/set",
               params: {
                 threadId: "thread-new",
+                origin: "user",
                 objective: "Ship the control boundary",
                 status: "active",
                 tokenBudget: 40_000,
@@ -2878,19 +2887,24 @@ process.stdin.on("data", (chunk) => {
           },
           {
             method: "thread/goal/clear",
-            params: { threadId: "thread-new" },
+            params: { threadId: "thread-new", origin: "user" },
           },
           {
             method: "thread/goal/set",
             params: {
               threadId: "thread-new",
+              origin: "user",
               objective: "Replacement goal",
               status: "active",
             },
           },
           {
             method: "thread/goal/set",
-            params: { threadId: "thread-new", status: "paused" },
+            params: {
+              threadId: "thread-new",
+              origin: "user",
+              status: "paused",
+            },
           },
         ]);
       } finally {

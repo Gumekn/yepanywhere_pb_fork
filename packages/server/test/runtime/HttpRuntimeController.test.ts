@@ -302,6 +302,44 @@ describe("HttpRuntimeController", () => {
     );
   });
 
+  it("forwards provider goal actions to an external runtime", async () => {
+    const getGoal = vi.fn(async () => ({
+      response: "No goal set.",
+      startedTurn: false,
+    }));
+    const goalAction = vi.fn(async () => ({
+      response: "Goal: ship",
+      startedTurn: false,
+    }));
+    const app = createRuntimeControlApp({
+      controller: { getGoal, goalAction } as unknown as RuntimeController,
+      token: "runtime-test-token",
+    });
+    const controller = new HttpRuntimeController({
+      baseUrl: "http://runtime.test",
+      token: "runtime-test-token",
+      fetch: (input, init) =>
+        app.fetch(input instanceof Request ? input : new Request(input, init)),
+    });
+
+    await expect(controller.getGoal("proc-1")).resolves.toEqual({
+      response: "No goal set.",
+      startedTurn: false,
+    });
+    expect(getGoal).toHaveBeenCalledWith("proc-1");
+    await expect(
+      controller.goalAction("proc-1", "set", "ship"),
+    ).resolves.toMatchObject({ response: "Goal: ship" });
+    expect(goalAction).toHaveBeenCalledWith("proc-1", "set", "ship");
+
+    goalAction.mockResolvedValueOnce(null as never);
+    await expect(controller.goalAction("proc-1", "pause")).resolves.toBe(null);
+    goalAction.mockRejectedValueOnce(new Error("goals feature is disabled"));
+    await expect(controller.goalAction("proc-1", "clear")).rejects.toThrow(
+      "goals feature is disabled",
+    );
+  });
+
   it("runs Cursor prepare inside the resident runtime", async () => {
     const prepareCursorSession = vi.fn(async () => undefined);
     const discardCursorPrepare = vi.fn(async () => undefined);

@@ -42,6 +42,14 @@ export const CODEX_NATIVE_CAPABILITIES = Object.freeze({
   }),
 }) satisfies CodexNativeCapabilities;
 
+/**
+ * `ThreadGoalMutationOrigin.user` (Codex 0.16x+). Newer app-servers record
+ * user-origin goal edits into model history and Guardian authorization;
+ * older ones ignore the unknown field. The checked-in protocol baseline
+ * predates the field, so it is declared here.
+ */
+export const CODEX_USER_GOAL_ORIGIN = "user" as const;
+
 export interface CodexNativeCapabilities {
   readonly codexVersion: string;
   readonly experimentalApi: boolean;

@@ -2373,6 +2373,20 @@ export class Process {
           this.setState({ type: "in-turn" });
         }
 
+        // Codex can start a turn on its own (goal continuation, review,
+        // compaction). Without this the session would look idle while the
+        // agent works, and idle reclamation could stop it mid-goal.
+        if (
+          this.provider === "codex" &&
+          message.type === "system" &&
+          message.subtype === "turn_started" &&
+          this._state.type === "idle"
+        ) {
+          this.clearIdleTimer();
+          this._unmaterializedSession = false;
+          this.setState({ type: "in-turn" });
+        }
+
         // Handle special message types
         if (message.type === "system" && message.subtype === "input_request") {
           // Legacy mock SDK behavior - handle input_request message

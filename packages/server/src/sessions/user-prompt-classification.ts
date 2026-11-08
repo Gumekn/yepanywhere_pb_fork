@@ -9,6 +9,11 @@ const SYNTHETIC_USER_PROMPT_PREFIXES = [
   "<permissions instructions>",
   "<skill>",
   "<skills_instructions>",
+  // Codex host context recorded with the user role: goal continuation and
+  // budget steering (`source="goal"`), user goal edits (`source="user_goal"`)
+  // and the pre-0.16x goal wrapper. None of it is typed by the user.
+  "<codex_internal_context",
+  "<goal_context>",
 ];
 
 export function isSessionSetupText(text: string): boolean {
