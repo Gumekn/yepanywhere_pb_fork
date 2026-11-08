@@ -64,6 +64,10 @@ import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
 import { stripAttachmentTokensForTitle } from "../lib/attachmentTokens";
 import {
+  leadingSlashCommandName,
+  terminalOnlyCommand,
+} from "../lib/cliSlashCommands";
+import {
   type CodexGoalShortcut,
   type CodexSkillCommand,
   parseCodexSlashCommand,
@@ -729,11 +733,21 @@ function SessionPageContent({
   const supportsThinkingToggle =
     currentProviderInfo?.supportsThinkingToggle ?? true;
   const supportsSlashCommands = currentProviderInfo?.supportsSlashCommands;
+  // The Codex CLI lists `/fast` when the session's model offers the tier.
+  const codexFastMode =
+    effectiveProvider === "codex" &&
+    (session?.codexModelProvider ?? "openai") === "openai" &&
+    (currentProviderInfo?.models ?? []).some(
+      (model) =>
+        (model.providerModelId ?? model.id) === session?.model &&
+        model.supportsFastMode === true,
+    );
   const commandButtons = useAgentCommandCatalog({
     provider: effectiveProvider,
     supportsSlashCommands,
     providerCommands,
     codexSkills,
+    codexFastMode,
     availability: {
       scope: "session",
       ownsProcess: status.owner === "self",
@@ -1176,6 +1190,18 @@ function SessionPageContent({
   const openCodexGoalRef = useRef(openCodexGoal);
   openCodexGoalRef.current = openCodexGoal;
 
+  /** `/model` switches through the live provider process. */
+  const openModelSwitch = (): boolean => {
+    if (status.owner !== "self" || !status.processId) {
+      showToast(t("slashCommandNeedsSession", { command: "model" }), "error");
+      return false;
+    }
+    setShowModelSwitchModal(true);
+    return true;
+  };
+  const openModelSwitchRef = useRef(openModelSwitch);
+  openModelSwitchRef.current = openModelSwitch;
+
   const handleSend = async (text: string, interruptBeforeSend = false) => {
     if (isRestoringEdit) return;
     const sideCommand = parseSideConversationCommand(text);
@@ -1202,6 +1228,31 @@ function SessionPageContent({
         draftControlsRef.current?.clearDraft();
       else draftControlsRef.current?.restoreFromStorage();
       return;
+    }
+    if (effectiveProvider === "codex" || effectiveProvider === "pi") {
+      // The menu mirrors the CLI's `/` list; its terminal-only entries would
+      // reach the model as plain text, so they are refused here.
+      const terminalOnly = terminalOnlyCommand(
+        effectiveProvider,
+        text,
+        providerCommands.map((command) => command.name),
+      );
+      if (terminalOnly) {
+        draftControlsRef.current?.restoreFromStorage();
+        showToast(
+          t("slashCommandTerminalOnly", {
+            command: terminalOnly,
+            provider: effectiveProvider === "codex" ? "Codex" : "Pi",
+          }),
+          "error",
+        );
+        return;
+      }
+      if (!editRewind && leadingSlashCommandName(text) === "model") {
+        if (openModelSwitch()) draftControlsRef.current?.clearDraft();
+        else draftControlsRef.current?.restoreFromStorage();
+        return;
+      }
     }
     if (effectiveProvider === "codex") {
       const command = parseCodexSlashCommand(text);
@@ -1708,8 +1759,21 @@ function SessionPageContent({
 
   const handleCustomCommand = useCallback(
     (command: string) => {
+      if (
+        (effectiveProvider === "codex" || effectiveProvider === "pi") &&
+        terminalOnlyCommand(effectiveProvider, `/${command}`, [])
+      ) {
+        showToast(
+          t("slashCommandTerminalOnly", {
+            command,
+            provider: effectiveProvider === "codex" ? "Codex" : "Pi",
+          }),
+          "error",
+        );
+        return true;
+      }
       if (command === "model") {
-        setShowModelSwitchModal(true);
+        openModelSwitchRef.current();
         return true;
       }
       // Picking `/goal` from the menu opens the dialog directly (restoring
@@ -1725,7 +1789,7 @@ function SessionPageContent({
       }
       return false;
     },
-    [effectiveProvider, status.owner],
+    [effectiveProvider, status.owner, showToast, t],
   );
 
   const handleAbort = async () => {

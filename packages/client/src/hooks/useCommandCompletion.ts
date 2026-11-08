@@ -45,11 +45,16 @@ export function findActiveCommandToken(
   };
 }
 
-export function filterCommands(commands: string[], query: string): string[] {
+export function filterCommands(
+  commands: string[],
+  query: string,
+  typedOnly: readonly string[] = [],
+): string[] {
   const normalizedQuery = query.toLowerCase();
   const deduped = Array.from(new Set(commands)).filter(Boolean);
 
-  if (!normalizedQuery) return deduped;
+  if (!normalizedQuery)
+    return deduped.filter((command) => !typedOnly.includes(command));
 
   return deduped
     .filter((command) => command.toLowerCase().includes(normalizedQuery))
@@ -124,7 +129,11 @@ export function useCommandCompletion({
   const items = useMemo(
     () =>
       activeToken && activeConfig
-        ? filterCommands(activeConfig.commands, activeToken.query)
+        ? filterCommands(
+            activeConfig.commands,
+            activeToken.query,
+            activeConfig.typedOnly,
+          )
         : [],
     [activeConfig, activeToken],
   );

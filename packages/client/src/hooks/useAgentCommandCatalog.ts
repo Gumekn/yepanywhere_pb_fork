@@ -14,6 +14,7 @@ export function useAgentCommandCatalog({
   supportsSlashCommands,
   providerCommands,
   codexSkills,
+  codexFastMode,
   availability,
 }: CatalogOptions): AgentCommandConfig[] {
   const { t } = useI18n();
@@ -25,6 +26,7 @@ export function useAgentCommandCatalog({
         supportsSlashCommands,
         providerCommands,
         codexSkills,
+        codexFastMode,
         availability: { scope, ownsProcess, canResume, hasSideConversation },
         labels: {
           codexCommands: t("codexCommandsLabel"),
@@ -36,6 +38,7 @@ export function useAgentCommandCatalog({
           compact: t("slashCommandCompactDescription"),
           codexCompact: t("slashCommandCodexCompactDescription"),
           review: t("slashCommandReviewDescription"),
+          fast: t("slashCommandFastDescription"),
           goal: t("slashCommandGoalDescription"),
           goalNewSession: t("slashCommandGoalNewSessionDescription"),
           side: t("slashCommandSideDescription"),
@@ -46,6 +49,7 @@ export function useAgentCommandCatalog({
       supportsSlashCommands,
       providerCommands,
       codexSkills,
+      codexFastMode,
       scope,
       ownsProcess,
       canResume,

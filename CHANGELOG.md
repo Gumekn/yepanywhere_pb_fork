@@ -12,6 +12,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ### Changed
 - 只有 stash、没有工作区改动的项目不再显示为「有改动」，stash 数量仍在 Git 弹层和项目卡片中显示。
+- Codex 和 Pi 的 `/` 菜单改为与各自 CLI 的 `/` 列表一致（Codex 按 `codex-cli` 0.167 终端界面的顺序和说明列出内置命令，当前模型支持 Fast 服务档时在 `/model` 后列出 `/fast`，`/quit`、`/btw` 与终端一样只在输入前缀后出现，`/apps` 不在列表中；Pi 先列 Pi 1.5.0 的内置命令，再按提示模板、扩展命令、技能的顺序列出 Pi 报告的命令；两者都已与本机真实终端的 `/` 列表逐项核对一致），新建会话、运行中和空闲会话都显示同一份列表，最后附上 Yep 的 `/side`、`/btw`（Pi）。Yep 能执行的命令标为「Yep」，照常由 Yep 处理（Codex：`/compact`、`/model`、`/review`、`/goal`、`/side`、`/btw`；Pi：`/compact`、`/model`）；只在终端界面里有效的命令（如 `/vim`、`/theme`、Pi 的 `/tree`、`/settings`）标为「仅终端」，选中或发送时提示无法在 Yep 中执行，不再作为普通文字发给模型（Codex 的命令别名如 `/cwd`、`/clean` 同样识别；Pi 扩展命令与内置命令同名时仍交给 Pi 执行）。新建 Codex 会话时 `/fast` 切换 Fast（优先）开关（会话中途仍为仅终端）。手动输入 `/model` 现在也会打开模型切换，会话未运行时给出提示，不再静默无反应；新建会话中发送需要会话才能执行的命令（如 `/compact`）时提示先开始会话。
 - Codex 的 `/goal` 与 Codex 终端行为对齐：新建会话输入 `/` 会列出 `/goal`（此前 Codex 新建会话的 `/` 菜单为空、工具栏也没有 `/` 按钮）。在新建会话中发送 `/goal <目标>` 会先创建会话（不发起普通回合），再设定 Codex 原生目标，由 Codex 自动开始第一轮目标回合；此前这段文字会作为普通提示发给模型，目标并没有设定。新建会话的 `/goal` 不接受附件，也必须带目标文字。会话进程未运行时（空闲、服务重启后）`/goal` 仍可用：会先在不发起回合的前提下恢复进程（只读 `thread/goal/get`），再打开目标对话框；此前会提示「请先发送一条消息」。新增 `/goal pause`、`/goal resume`、`/goal clear` 直接执行对应操作，`/goal edit` 打开对话框，与 Codex 终端一致；其他文字仍预填为目标描述。
 
 ### Fixed

@@ -156,7 +156,13 @@ export function ComposerToolbar({
           .map((button) => (
             <SlashCommandButton
               key={button.prefix}
-              commands={button.commands}
+              commands={
+                button.typedOnly
+                  ? button.commands.filter(
+                      (command) => !button.typedOnly?.includes(command),
+                    )
+                  : button.commands
+              }
               details={button.details}
               onSelectCommand={commands.onSelect}
               disabled={commands.disabled}

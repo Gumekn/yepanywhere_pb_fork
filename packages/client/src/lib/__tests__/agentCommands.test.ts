@@ -2,12 +2,16 @@ import { describe, expect, it } from "vitest";
 import { filterCommands } from "../../hooks/useCommandCompletion";
 import {
   type AgentCommandAvailability,
-  CODEX_SLASH_COMMANDS,
   STATIC_SLASH_COMMANDS,
   buildAgentCommandCatalog,
   buildSlashCommandDetails,
   normalizeSlashCommands,
 } from "../agentCommands";
+import {
+  CODEX_CLI_SLASH_COMMANDS,
+  PI_CLI_SLASH_COMMANDS,
+  terminalOnlyCommand,
+} from "../cliSlashCommands";
 
 const OWNED: AgentCommandAvailability = {
   scope: "session",
@@ -22,23 +26,66 @@ const IDLE: AgentCommandAvailability = {
 const NEW_SESSION: AgentCommandAvailability = { scope: "new-session" };
 
 describe("agent command catalog", () => {
-  it("offers only the Codex commands Yep actually handles", () => {
-    const [slash, skills] = buildAgentCommandCatalog({
+  it("offers exactly the Codex CLI picker in every composer state", () => {
+    // `/apps` runs when typed but never appears in the Codex picker.
+    const cliNames = CODEX_CLI_SLASH_COMMANDS.filter(
+      (command) => command.picker !== "hidden",
+    ).map((command) => command.name);
+    for (const availability of [
+      OWNED,
+      IDLE,
+      NEW_SESSION,
+      { scope: "session" as const },
+    ]) {
+      const [slash, skills] = buildAgentCommandCatalog({
+        provider: "codex",
+        supportsSlashCommands: false,
+        providerCommands: [{ name: "ignored", description: "" }],
+        codexSkills: [
+          { name: "imagegen", description: "Make images" },
+          { name: "openai-docs" },
+        ],
+        availability,
+        descriptions: { codexCompact: "Compact now", side: "Side chat" },
+      });
+      expect(slash?.prefix).toBe("/");
+      expect(slash?.label).toBe("Codex commands");
+      expect(slash?.showButton).toBe(true);
+      expect(slash?.commands).toEqual(cliNames);
+      expect(skills).toEqual({
+        prefix: "$",
+        label: "Skills",
+        showButton: true,
+        commands: ["imagegen", "openai-docs"],
+        details: { imagegen: { description: "Make images" } },
+      });
+    }
+  });
+
+  it("marks what Yep runs versus terminal-only Codex commands", () => {
+    const [slash] = buildAgentCommandCatalog({
       provider: "codex",
-      supportsSlashCommands: false,
-      providerCommands: [{ name: "ignored", description: "" }],
-      codexSkills: [
-        { name: "imagegen", description: "Make images" },
-        { name: "openai-docs" },
-      ],
       availability: OWNED,
       descriptions: { codexCompact: "Compact now", side: "Side chat" },
     });
-
-    expect(slash?.prefix).toBe("/");
-    expect(slash?.label).toBe("Codex commands");
-    expect(slash?.commands).toEqual(CODEX_SLASH_COMMANDS);
-    expect(slash?.commands).not.toContain("vim");
+    expect(slash?.commands.slice(0, 3)).toEqual([
+      "model",
+      "presets",
+      "daybreak",
+    ]);
+    // Like the TUI, aliases appear only once a prefix is typed.
+    expect(slash?.typedOnly).toEqual(["btw", "quit"]);
+    const unfiltered = filterCommands(
+      slash?.commands ?? [],
+      "",
+      slash?.typedOnly,
+    );
+    expect(unfiltered).not.toContain("btw");
+    expect(unfiltered).not.toContain("quit");
+    expect(
+      filterCommands(slash?.commands ?? [], "bt", slash?.typedOnly),
+    ).toEqual(["btw"]);
+    expect(terminalOnlyCommand("codex", "/apps")).toBe("apps");
     expect(slash?.details?.compact).toEqual({
       description: "Compact now",
       source: "yep",
@@ -47,45 +94,71 @@ describe("agent command catalog", () => {
       description: "Side chat",
       source: "yep",
     });
-    expect(skills).toEqual({
-      prefix: "$",
-      label: "Skills",
-      showButton: true,
-      commands: ["imagegen", "openai-docs"],
-      details: { imagegen: { description: "Make images" } },
+    expect(slash?.details?.vim).toEqual({
+      description: "toggle Vim mode for the composer",
+      source: "terminal",
     });
+    expect(slash?.commands).not.toContain("debug-m-drop");
+    expect(slash?.commands).not.toContain("setup-default-sandbox");
   });
 
-  it("keeps only resumable Codex commands for an idle session", () => {
-    const [slash, skills] = buildAgentCommandCatalog({
+  it("lists /fast after /model when the Codex model offers the Fast tier", () => {
+    const [newSession] = buildAgentCommandCatalog({
       provider: "codex",
-      availability: { ...IDLE, hasSideConversation: false },
+      codexFastMode: true,
+      availability: NEW_SESSION,
+      descriptions: { fast: "Toggle Fast" },
     });
-    expect(slash?.commands).toEqual(["compact", "goal"]);
-    expect(skills?.showButton).toBe(false);
+    expect(newSession?.commands.slice(0, 3)).toEqual([
+      "model",
+      "fast",
+      "presets",
+    ]);
+    expect(newSession?.details?.fast).toEqual({
+      description: "Toggle Fast",
+      source: "yep",
+    });
+
+    const [inSession] = buildAgentCommandCatalog({
+      provider: "codex",
+      codexFastMode: true,
+      availability: OWNED,
+    });
+    expect(inSession?.details?.fast?.source).toBe("terminal");
+
+    const [noFast] = buildAgentCommandCatalog({
+      provider: "codex",
+      availability: OWNED,
+    });
+    expect(noFast?.commands).not.toContain("fast");
+    expect(terminalOnlyCommand("codex", "/fast")).toBe("fast");
   });
 
-  it("offers Codex /goal before a session exists, like the Codex TUI", () => {
+  it("uses the session-start /goal description before a Codex session exists", () => {
     const [slash] = buildAgentCommandCatalog({
       provider: "codex",
       availability: NEW_SESSION,
       descriptions: { goal: "In session", goalNewSession: "Start on a goal" },
     });
-    expect(slash?.commands).toEqual(["goal"]);
-    expect(slash?.showButton).toBe(true);
     expect(slash?.details?.goal).toEqual({
       description: "Start on a goal",
       source: "yep",
     });
   });
 
-  it("offers no Codex commands for an externally owned session", () => {
-    const [slash] = buildAgentCommandCatalog({
-      provider: "codex",
-      availability: { scope: "session" },
-    });
-    expect(slash?.commands).toEqual([]);
-    expect(slash?.showButton).toBe(false);
+  it("refuses terminal-only CLI commands, resolving aliases", () => {
+    expect(terminalOnlyCommand("codex", "/vim")).toBe("vim");
+    expect(terminalOnlyCommand("codex", "  /cwd now")).toBe("pwd");
+    expect(terminalOnlyCommand("codex", "/clean")).toBe("stop");
+    expect(terminalOnlyCommand("codex", "/goal ship")).toBeNull();
+    expect(terminalOnlyCommand("codex", "/compact")).toBeNull();
+    expect(terminalOnlyCommand("codex", "/unknown")).toBeNull();
+    expect(terminalOnlyCommand("codex", "see /vim")).toBeNull();
+    expect(terminalOnlyCommand("codex", "/usr/bin/env")).toBeNull();
+    expect(terminalOnlyCommand("pi", "/tree")).toBe("tree");
+    expect(terminalOnlyCommand("pi", "/compact keep notes")).toBeNull();
+    // A Pi extension of the same name runs over RPC.
+    expect(terminalOnlyCommand("pi", "/export", ["export"])).toBeNull();
   });
 
   it("keeps Claude provider commands usable while idle", () => {
@@ -121,37 +194,59 @@ describe("agent command catalog", () => {
     expect(config?.commands).toEqual([]);
   });
 
-  it("keeps Pi compaction available after its process exits", () => {
+  it("lists Pi's CLI built-ins, then its reported commands, then Yep side chat", () => {
     const providerCommands = [
       { name: "skill:review", description: "", source: "skill" as const },
-      { name: "compact", description: "" },
+      { name: "goal", description: "Goals", source: "extension" as const },
+      { name: "gcp", description: "Commit", source: "prompt" as const },
+      { name: "compact", description: "extension shadowing a built-in" },
     ];
+    const builtins = PI_CLI_SLASH_COMMANDS.map((command) => command.name);
     const [owned] = buildAgentCommandCatalog({
       provider: "pi",
       providerCommands,
       availability: { scope: "session", ownsProcess: true },
+      descriptions: { compact: "Yep compact", side: "Side chat" },
     });
-    expect(owned?.commands).toEqual(["compact", "model", "skill:review"]);
+    // Pi's picker order: prompt templates, extensions, then skills.
+    expect(owned?.commands).toEqual([
+      ...builtins,
+      "gcp",
+      "goal",
+      "skill:review",
+      "side",
+      "btw",
+    ]);
     expect(owned?.commands).not.toContain("help");
     expect(owned?.details?.["skill:review"]).toEqual({ source: "skill" });
+    expect(owned?.details?.goal).toEqual({
+      description: "Goals",
+      source: "extension",
+    });
+    expect(owned?.details?.compact).toEqual({
+      description: "Yep compact",
+      source: "yep",
+    });
+    expect(owned?.details?.tree).toEqual({
+      description: "Navigate session tree (switch branches)",
+      source: "terminal",
+    });
+    expect(owned?.details?.side).toEqual({
+      description: "Side chat",
+      source: "yep",
+    });
+    for (const query of ["co", "com", "compact"]) {
+      expect(filterCommands(owned?.commands ?? [], query)).toContain("compact");
+    }
 
-    const [idle] = buildAgentCommandCatalog({
+    // Reported commands need a process or a resumable session; the CLI
+    // list itself is always shown.
+    const [external] = buildAgentCommandCatalog({
       provider: "pi",
       providerCommands,
-      availability: { scope: "session", canResume: true },
+      availability: { scope: "session" },
     });
-    expect(idle?.commands).toEqual(["compact", "skill:review"]);
-    for (const query of ["co", "com", "compact"]) {
-      expect(filterCommands(idle?.commands ?? [], query)).toContain("compact");
-    }
-    for (const availability of [NEW_SESSION, { scope: "session" as const }]) {
-      const [unavailable] = buildAgentCommandCatalog({
-        provider: "pi",
-        providerCommands,
-        availability,
-      });
-      expect(unavailable?.commands).not.toContain("compact");
-    }
+    expect(external?.commands).toEqual([...builtins, "side", "btw"]);
   });
 
   it("offers ACP-reported commands and skills for MiniMax Code and Cursor", () => {

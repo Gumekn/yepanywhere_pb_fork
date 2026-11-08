@@ -50,6 +50,13 @@ import { useServerSettings } from "../hooks/useServerSettings";
 import { useI18n } from "../i18n";
 import type { AgentCommandAvailability } from "../lib/agentCommands";
 import {
+  YEP_EXTRA_PI_COMMANDS,
+  YEP_HANDLED_CODEX_COMMANDS,
+  YEP_HANDLED_PI_COMMANDS,
+  leadingSlashCommandName,
+  terminalOnlyCommand,
+} from "../lib/cliSlashCommands";
+import {
   type CodexSkillCommand,
   parseCodexSlashCommand,
   resolveCodexSkillInputs,
@@ -700,13 +707,58 @@ export function NewSessionForm({
     const inputs = resolveCodexSkillInputs(text, codexSkills);
     return inputs.length > 0 ? inputs : undefined;
   };
+  /**
+   * Why a `/` command cannot start a session, if it cannot: CLI built-ins
+   * that only work in the terminal, and Yep-run commands that need a session
+   * (only Codex `/goal` can start one). Pi's own reported commands run.
+   */
+  const newSessionCommandError = (
+    text: string,
+    reportedNames: readonly string[],
+  ): string | null => {
+    if (selectedProvider !== "codex" && selectedProvider !== "pi") return null;
+    const name = leadingSlashCommandName(text);
+    if (!name) return null;
+    const terminalOnly = terminalOnlyCommand(
+      selectedProvider,
+      text,
+      reportedNames,
+    );
+    if (terminalOnly) {
+      return t("slashCommandTerminalOnly", {
+        command: terminalOnly,
+        provider: selectedProvider === "codex" ? "Codex" : "Pi",
+      });
+    }
+    if (reportedNames.includes(name)) return null;
+    const needsSession =
+      selectedProvider === "codex"
+        ? YEP_HANDLED_CODEX_COMMANDS.has(name) && name !== "goal"
+        : YEP_HANDLED_PI_COMMANDS.has(name) ||
+          (YEP_EXTRA_PI_COMMANDS as readonly string[]).includes(name);
+    return needsSession
+      ? t("slashCommandNeedsSession", { command: name })
+      : null;
+  };
+
   const commandButtons = useAgentCommandCatalog({
     provider: selectedProvider,
     supportsSlashCommands: selectedProviderInfo?.supportsSlashCommands,
     providerCommands: commandListing?.commands,
     codexSkills,
+    codexFastMode: showCodexFastMode && supportsCodexFastMode,
     availability: NEW_SESSION_COMMAND_AVAILABILITY,
   });
+
+  /** `/fast` flips the Fast toggle, like the Codex TUI's service-tier command. */
+  const toggleCodexFastFromCommand = () => {
+    const next = !codexFastMode;
+    setCodexFastMode(next);
+    showToast(
+      t(next ? "codexFastModeEnabled" : "codexFastModeDisabled"),
+      "success",
+    );
+  };
 
   const applyProviderSelection = useCallback(
     (provider: ProviderInfo, savedDefaults?: NewSessionProviderDefaults) => {
@@ -1232,6 +1284,20 @@ export function NewSessionForm({
     },
     commandConfigs: commandButtons,
     onCommandMenuOpen: refreshCommandListing,
+    onCustomCommand: (command) => {
+      if (
+        command === "fast" &&
+        selectedProvider === "codex" &&
+        showCodexFastMode &&
+        supportsCodexFastMode
+      ) {
+        toggleCodexFastFromCommand();
+        return true;
+      }
+      const error = newSessionCommandError(`/${command}`, []);
+      if (error) showToast(error, "error");
+      return error !== null;
+    },
     onSubmit: () => {
       void handleStartSession();
     },
@@ -1512,6 +1578,26 @@ export function NewSessionForm({
     }
 
     const trimmedMessage = finalMessage.trim();
+
+    if (
+      selectedProvider === "codex" &&
+      showCodexFastMode &&
+      supportsCodexFastMode &&
+      leadingSlashCommandName(trimmedMessage) === "fast" &&
+      pendingFiles.length === 0
+    ) {
+      toggleCodexFastFromCommand();
+      draftControls.clearDraft();
+      return;
+    }
+    const commandError = newSessionCommandError(
+      trimmedMessage,
+      (commandListing?.commands ?? []).map((command) => command.name),
+    );
+    if (commandError) {
+      showToast(commandError, "error");
+      return;
+    }
 
     // `/goal <objective>` starts the session on a Codex goal instead of a
     // prompt, like the Codex TUI before its first turn. Codex app-server does

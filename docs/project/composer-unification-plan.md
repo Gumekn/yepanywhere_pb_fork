@@ -60,6 +60,8 @@ Codex 的 `/` 命令全部由 TUI 在本地解析（`references/codex/codex-rs/t
 
 命令目录要为每条命令标注处理方式：`yep`（Yep 自己处理）、`native-rpc`（映射到 provider RPC）或 `provider-text`（原文交给 provider 解析，例如 Claude、Pi 的扩展命令）。菜单只显示其中可执行的命令。
 
+> **后续调整（2026-11）**：菜单不再只显示可执行的命令，改为与 CLI 的 `/` 列表完全一致（`packages/client/src/lib/cliSlashCommands.ts`：Codex 按 `codex-cli` 0.167 TUI 的顺序和说明，Pi 按 1.5.0 的 `BUILTIN_SLASH_COMMANDS`，Pi 之后接 `get_commands` 报告的提示模板、扩展和技能）。Yep 能执行的标为 `yep`；其余标为 `terminal`（仅终端），选中或发送时提示无法在 Yep 中执行，不会作为普通文字发给模型。升级 Codex 或 Pi 后需要对照上游源码同步这两份列表。
+
 ### 2.5 复制
 
 | 位置 | 现状 |
