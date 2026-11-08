@@ -12,8 +12,17 @@ export type CodexSlashCommandResult =
   | { kind: "invalid-compact-args" }
   /** `review/start`: bare → uncommitted changes, text → custom instructions. */
   | { kind: "review"; instructions?: string }
-  /** Opens the goal dialog; trailing text prefills the objective. */
-  | { kind: "goal"; objective?: string };
+  /**
+   * Goal lifecycle, matching the Codex TUI: bare `/goal` (or `/goal edit`)
+   * opens the goal dialog, `/goal pause|resume|clear` runs that action
+   * directly, and any other text is the objective to set.
+   */
+  | { kind: "goal"; objective?: string; action?: CodexGoalShortcut };
+
+/** `/goal` arguments the Codex TUI treats as controls, not objectives. */
+export type CodexGoalShortcut = "pause" | "resume" | "clear";
+
+const CODEX_GOAL_SHORTCUTS = new Set<string>(["pause", "resume", "clear"]);
 
 /**
  * Codex slash commands Yep intercepts. Codex itself parses slash commands
@@ -33,7 +42,13 @@ export function parseCodexSlashCommand(text: string): CodexSlashCommandResult {
   const goal = /^\/goal(?:\s+([\s\S]*))?$/u.exec(trimmed);
   if (goal) {
     const objective = goal[1]?.trim();
-    return objective ? { kind: "goal", objective } : { kind: "goal" };
+    if (!objective) return { kind: "goal" };
+    const keyword = objective.toLowerCase();
+    if (keyword === "edit") return { kind: "goal" };
+    if (CODEX_GOAL_SHORTCUTS.has(keyword)) {
+      return { kind: "goal", action: keyword as CodexGoalShortcut };
+    }
+    return { kind: "goal", objective };
   }
   return { kind: "none" };
 }

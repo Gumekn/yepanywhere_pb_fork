@@ -12,6 +12,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ### Changed
 - 只有 stash、没有工作区改动的项目不再显示为「有改动」，stash 数量仍在 Git 弹层和项目卡片中显示。
+- Codex 的 `/goal` 与 Codex 终端行为对齐：新建会话输入 `/` 会列出 `/goal`（此前 Codex 新建会话的 `/` 菜单为空、工具栏也没有 `/` 按钮）。在新建会话中发送 `/goal <目标>` 会先创建会话（不发起普通回合），再设定 Codex 原生目标，由 Codex 自动开始第一轮目标回合；此前这段文字会作为普通提示发给模型，目标并没有设定。新建会话的 `/goal` 不接受附件，也必须带目标文字。会话进程未运行时（空闲、服务重启后）`/goal` 仍可用：会先在不发起回合的前提下恢复进程（只读 `thread/goal/get`），再打开目标对话框；此前会提示「请先发送一条消息」。新增 `/goal pause`、`/goal resume`、`/goal clear` 直接执行对应操作，`/goal edit` 打开对话框，与 Codex 终端一致；其他文字仍预填为目标描述。
 
 ### Fixed
 - 修复外置 agent runtime（`YEP_RUNTIME_EXTERNAL`）下 Codex 目标全部不可用的问题：runtime 控制服务缺少 `/processes/:id/goal` 路由，目标对话框的读取、设定、暂停、清除都返回 `Runtime request failed (404)`。

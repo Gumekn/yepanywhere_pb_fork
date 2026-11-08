@@ -64,6 +64,7 @@ import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
 import { stripAttachmentTokensForTitle } from "../lib/attachmentTokens";
 import {
+  type CodexGoalShortcut,
   type CodexSkillCommand,
   parseCodexSlashCommand,
   resolveCodexSkillInputs,
@@ -1113,15 +1114,67 @@ function SessionPageContent({
     }
   };
 
-  const openCodexGoal = (objective?: string): boolean => {
-    if (status.owner !== "self" || !status.processId) {
-      showToast(t("codexGoalSessionNotRunning"), "error");
-      return false;
+  /**
+   * The Codex process that owns this session's goal. Like the Codex TUI, a
+   * goal can be changed on an inactive thread: restore the process without a
+   * model turn (read-only `thread/goal/get`) and attach to it.
+   */
+  const ensureCodexGoalProcess = async (): Promise<string | null> => {
+    if (status.owner === "self" && status.processId) return status.processId;
+    if (status.owner === "external") {
+      showToast(t("codexGoalExternalSession"), "error");
+      return null;
     }
+    try {
+      const result = await api.resumeAndExecuteCodexControl(
+        projectId,
+        actualSessionId ?? sessionId,
+        { control: "thread/goal/get" },
+        {
+          mode: permissionMode,
+          model: session?.model ?? getModelSetting(),
+          thinking: getThinkingSetting(),
+          reasoningEffort: session?.reasoningEffort,
+          provider: "codex",
+          codexModelProvider: session?.codexModelProvider,
+          executor: session?.executor,
+        },
+      );
+      setStatus({ owner: "self", processId: result.processId });
+      return result.processId;
+    } catch (err) {
+      console.error("Failed to restore Codex session for goal:", err);
+      const message = err instanceof Error ? err.message : String(err);
+      showToast(t("codexGoalResumeFailed", { message }), "error");
+      return null;
+    }
+  };
+
+  const openCodexGoal = async (objective?: string): Promise<boolean> => {
+    if (!(await ensureCodexGoalProcess())) return false;
     setGoalInitialObjective(objective ?? "");
     setShowGoalModal(true);
     return true;
   };
+
+  /** `/goal pause|resume|clear` act directly, as in the Codex TUI. */
+  const runCodexGoalShortcut = async (
+    action: CodexGoalShortcut,
+  ): Promise<boolean> => {
+    const processId = await ensureCodexGoalProcess();
+    if (!processId) return false;
+    try {
+      const result = await api.processGoal(processId, { action });
+      showToast(result.response, "success");
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      showToast(t("sessionGoalActionFailed", { message }), "error");
+      return false;
+    }
+  };
+  const openCodexGoalRef = useRef(openCodexGoal);
+  openCodexGoalRef.current = openCodexGoal;
 
   const handleSend = async (text: string, interruptBeforeSend = false) => {
     if (isRestoringEdit) return;
@@ -1174,7 +1227,11 @@ function SessionPageContent({
         return;
       }
       if (command.kind === "goal" && !editRewind) {
-        if (openCodexGoal(command.objective)) {
+        if (
+          await (command.action
+            ? runCodexGoalShortcut(command.action)
+            : openCodexGoal(command.objective))
+        ) {
           draftControlsRef.current?.clearDraft();
         } else {
           draftControlsRef.current?.restoreFromStorage();
@@ -1655,21 +1712,20 @@ function SessionPageContent({
         setShowModelSwitchModal(true);
         return true;
       }
-      // Picking `/goal` from the menu opens the dialog directly; typing
-      // `/goal <objective>` and sending prefills it instead.
+      // Picking `/goal` from the menu opens the dialog directly (restoring
+      // an inactive session first); typing `/goal <objective>` and sending
+      // prefills it instead.
       if (
         command === "goal" &&
         effectiveProvider === "codex" &&
-        status.owner === "self" &&
-        status.processId
+        status.owner !== "external"
       ) {
-        setGoalInitialObjective("");
-        setShowGoalModal(true);
+        void openCodexGoalRef.current();
         return true;
       }
       return false;
     },
-    [effectiveProvider, status],
+    [effectiveProvider, status.owner],
   );
 
   const handleAbort = async () => {
@@ -2402,12 +2458,9 @@ function SessionPageContent({
                     }
                     onGoal={
                       session?.provider === "codex" &&
-                      status.owner === "self" &&
-                      status.processId
-                        ? () => {
-                            setGoalInitialObjective("");
-                            setShowGoalModal(true);
-                          }
+                      status.owner !== "external" &&
+                      !isReadOnlySession
+                        ? () => void openCodexGoal()
                         : undefined
                     }
                     sharingConfigured={sharingConfigured}

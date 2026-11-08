@@ -61,14 +61,28 @@ describe("agent command catalog", () => {
       provider: "codex",
       availability: { ...IDLE, hasSideConversation: false },
     });
-    expect(slash?.commands).toEqual(["compact"]);
+    expect(slash?.commands).toEqual(["compact", "goal"]);
     expect(skills?.showButton).toBe(false);
   });
 
-  it("offers no session-bound Codex commands in a new session", () => {
+  it("offers Codex /goal before a session exists, like the Codex TUI", () => {
     const [slash] = buildAgentCommandCatalog({
       provider: "codex",
       availability: NEW_SESSION,
+      descriptions: { goal: "In session", goalNewSession: "Start on a goal" },
+    });
+    expect(slash?.commands).toEqual(["goal"]);
+    expect(slash?.showButton).toBe(true);
+    expect(slash?.details?.goal).toEqual({
+      description: "Start on a goal",
+      source: "yep",
+    });
+  });
+
+  it("offers no Codex commands for an externally owned session", () => {
+    const [slash] = buildAgentCommandCatalog({
+      provider: "codex",
+      availability: { scope: "session" },
     });
     expect(slash?.commands).toEqual([]);
     expect(slash?.showButton).toBe(false);

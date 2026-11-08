@@ -149,7 +149,7 @@ export interface ResumeSessionCommandInput {
   requireImmediate?: boolean;
   /** Internal provider-native action to run after a message-free resume. */
   controlAfterResume?:
-    | Extract<CodexNativeControlRequest, { control: "thread/compact/start" }>
+    | ResumableCodexControlRequest
     | { control: "pi/compact"; customInstructions?: string };
   /** Internal-only source override used by the Feishu usage-limit router. */
   codexModelProviderOverride?: {
@@ -160,13 +160,19 @@ export interface ResumeSessionCommandInput {
   allowMissingRolloutReplacement?: boolean;
 }
 
+/**
+ * Codex controls that may restore an inactive session first: compaction, and
+ * the read-only goal lookup that lets the goal dialog attach to the process.
+ */
+export type ResumableCodexControlRequest = Extract<
+  CodexNativeControlRequest,
+  { control: "thread/compact/start" | "thread/goal/get" }
+>;
+
 export interface ResumeCodexControlCommandInput {
   projectId: string;
   sessionId: string;
-  request: Extract<
-    CodexNativeControlRequest,
-    { control: "thread/compact/start" }
-  >;
+  request: ResumableCodexControlRequest;
   body?: CreateSessionBody;
   origin?: SessionCommandOrigin;
 }
@@ -1137,7 +1143,7 @@ export class SessionCommandService {
       return commandFailure(
         piCompaction
           ? "Only Pi sessions can use Pi compaction"
-          : "Only Codex sessions can resume for native compaction",
+          : "Only Codex sessions can resume for native controls",
         400,
         { code: "unsupported_provider" },
       );
@@ -1566,12 +1572,16 @@ export class SessionCommandService {
       }
       getLogger().info(
         {
-          event: "codex_compact_after_resume_started",
+          event:
+            controlAfterResume.control === "thread/compact/start"
+              ? "codex_compact_after_resume_started"
+              : "codex_control_after_resume_completed",
+          control: controlAfterResume.control,
           sessionId: actualSessionId,
           processId: result.id,
           projectId: resolvedProjectId,
         },
-        "Resumed inactive Codex session and started native compaction",
+        "Resumed inactive Codex session for a native control",
       );
       return commandSuccess({
         ...resumeBody,
@@ -1598,7 +1608,11 @@ export class SessionCommandService {
           { code: "unsupported_provider" },
         );
       }
-      if (existing.state !== "idle") {
+      // Only compaction starts a turn; a goal lookup is safe at any time.
+      if (
+        input.request.control === "thread/compact/start" &&
+        existing.state !== "idle"
+      ) {
         return commandFailure(
           "Wait for the active Codex turn to finish before compacting",
           409,

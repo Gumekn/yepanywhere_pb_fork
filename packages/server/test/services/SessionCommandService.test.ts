@@ -1693,6 +1693,42 @@ describe("SessionCommandService runtime boundary", () => {
     expect(executeCodexControl).toHaveBeenCalledTimes(1);
   });
 
+  it("looks up a goal on a busy Codex process but refuses to compact it", async () => {
+    const resumeSession = vi.fn();
+    const executeCodexControl = vi.fn(async () => ({
+      ok: true as const,
+      control: "thread/goal/get" as const,
+      data: { goal: null },
+    }));
+    const service = createService({
+      getProcessSnapshotForSession: vi.fn(async () =>
+        processSnapshot({ state: "in-turn" }),
+      ),
+      resumeSession,
+      executeCodexControl,
+    });
+
+    await expect(
+      service.resumeCodexControl({
+        projectId: "project-1",
+        sessionId: "session-1",
+        request: { control: "thread/goal/get" },
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      body: { processId: "process-1", control: "thread/goal/get" },
+    });
+    await expect(
+      service.resumeCodexControl({
+        projectId: "project-1",
+        sessionId: "session-1",
+        request: { control: "thread/compact/start" },
+      }),
+    ).resolves.toMatchObject({ ok: false, status: 409 });
+    expect(resumeSession).not.toHaveBeenCalled();
+    expect(executeCodexControl).toHaveBeenCalledTimes(1);
+  });
+
   it("delegates interactions and runtime subscriptions", async () => {
     const getPendingInput = vi.fn(async () => null);
     const respondToInput = vi.fn(async () => ({

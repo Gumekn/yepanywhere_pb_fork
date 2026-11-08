@@ -37,6 +37,7 @@ export function useAgentCommandCatalog({
           codexCompact: t("slashCommandCodexCompactDescription"),
           review: t("slashCommandReviewDescription"),
           goal: t("slashCommandGoalDescription"),
+          goalNewSession: t("slashCommandGoalNewSessionDescription"),
           side: t("slashCommandSideDescription"),
         },
       }),

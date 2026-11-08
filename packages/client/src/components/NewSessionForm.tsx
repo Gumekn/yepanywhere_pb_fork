@@ -51,6 +51,7 @@ import { useI18n } from "../i18n";
 import type { AgentCommandAvailability } from "../lib/agentCommands";
 import {
   type CodexSkillCommand,
+  parseCodexSlashCommand,
   resolveCodexSkillInputs,
 } from "../lib/codexInputCommands";
 import {
@@ -1512,6 +1513,26 @@ export function NewSessionForm({
 
     const trimmedMessage = finalMessage.trim();
 
+    // `/goal <objective>` starts the session on a Codex goal instead of a
+    // prompt, like the Codex TUI before its first turn. Codex app-server does
+    // not parse slash commands, so sending the text would only reach the model.
+    const goalCommand =
+      selectedProvider === "codex"
+        ? parseCodexSlashCommand(trimmedMessage)
+        : null;
+    const goalObjective =
+      goalCommand?.kind === "goal" ? goalCommand.objective : undefined;
+    if (goalCommand?.kind === "goal") {
+      if (!goalObjective) {
+        showToast(t("codexGoalObjectiveRequired"), "error");
+        return;
+      }
+      if (pendingFiles.length > 0) {
+        showToast(t("codexGoalAttachmentsUnsupported"), "error");
+        return;
+      }
+    }
+
     setIsStarting(true);
     let sessionStartOutcomePending = false;
 
@@ -1552,10 +1573,38 @@ export function NewSessionForm({
             ? (selectedLlmGatewayKeyId ?? undefined)
             : undefined,
         llmGatewayConfig: llmGatewayConfigForRequest,
-        codexInputs: codexInputsForMessage(trimmedMessage),
+        codexInputs: goalObjective
+          ? undefined
+          : codexInputsForMessage(trimmedMessage),
       };
 
-      if (pendingFiles.length > 0) {
+      if (goalObjective) {
+        // Create the thread without a turn, then set an active goal; Codex
+        // starts the first goal turn itself.
+        sessionStartOutcomePending = true;
+        const createResult = await requireStartedHistoricalEdit(
+          await api.createSession(projectId, sessionOptions),
+          api.cancelQueuedRequest,
+          "session start",
+        );
+        sessionStartOutcomePending = false;
+        sessionId = createResult.sessionId;
+        processId = createResult.processId;
+        initialPermissionMode = createResult.permissionMode;
+        initialModeVersion = createResult.modeVersion;
+        try {
+          await api.processGoal(processId, {
+            action: "set",
+            objective: goalObjective,
+          });
+        } catch (goalErr) {
+          // The session exists; open it so the goal can be retried there.
+          console.error("Failed to set Codex goal:", goalErr);
+          const message =
+            goalErr instanceof Error ? goalErr.message : String(goalErr);
+          showToast(t("codexGoalStartFailed", { message }), "error");
+        }
+      } else if (pendingFiles.length > 0) {
         // Two-phase flow: create session first, then upload to real session folder
         // Step 1: Create the session without sending a message
         sessionStartOutcomePending = true;
@@ -1649,7 +1698,7 @@ export function NewSessionForm({
           permissionMode: initialPermissionMode,
           modeVersion: initialModeVersion,
         },
-        initialTitle: trimmedMessage,
+        initialTitle: goalObjective ?? trimmedMessage,
         initialProvider: selectedProvider ?? undefined,
         initialModel: sessionOptions.model,
         initialReasoningEffort: sessionOptions.reasoningEffort,

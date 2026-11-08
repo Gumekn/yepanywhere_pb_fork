@@ -1706,7 +1706,7 @@ export const api = {
   resumeAndExecuteCodexControl: (
     projectId: string,
     sessionId: string,
-    request: { control: "thread/compact/start" },
+    request: { control: "thread/compact/start" | "thread/goal/get" },
     options?: SessionOptions,
   ) =>
     fetchJSON<ResumedCodexControlResponse>(

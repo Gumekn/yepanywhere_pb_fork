@@ -2727,7 +2727,9 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   });
 
   // POST /api/projects/:projectId/sessions/:sessionId/codex-control - Resume
-  // an inactive Codex session without a model turn, then start compaction.
+  // an inactive Codex session without a model turn, then run a control that
+  // is safe to start from idle: compaction, or a read-only goal fetch so the
+  // goal dialog can attach to the restored process.
   routes.post(
     "/projects/:projectId/sessions/:sessionId/codex-control",
     async (c) => {
@@ -2751,9 +2753,15 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       ) {
         return c.json({ error: "Supported Codex control is required" }, 400);
       }
-      if (request.control !== "thread/compact/start") {
+      if (
+        request.control !== "thread/compact/start" &&
+        request.control !== "thread/goal/get"
+      ) {
         return c.json(
-          { error: "Only Codex compaction can auto-resume a session" },
+          {
+            error:
+              "Only Codex compaction or goal lookup can auto-resume a session",
+          },
           400,
         );
       }

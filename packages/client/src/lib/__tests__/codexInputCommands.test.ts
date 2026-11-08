@@ -30,6 +30,23 @@ describe("Codex input commands", () => {
       objective: "ship v2",
     });
     expect(parseCodexSlashCommand("please /goal x")).toEqual({ kind: "none" });
+    expect(parseCodexSlashCommand("/goal edit")).toEqual({ kind: "goal" });
+    expect(parseCodexSlashCommand("/goal Pause")).toEqual({
+      kind: "goal",
+      action: "pause",
+    });
+    expect(parseCodexSlashCommand("/goal resume")).toEqual({
+      kind: "goal",
+      action: "resume",
+    });
+    expect(parseCodexSlashCommand("/goal clear")).toEqual({
+      kind: "goal",
+      action: "clear",
+    });
+    expect(parseCodexSlashCommand("/goal clear the backlog")).toEqual({
+      kind: "goal",
+      objective: "clear the backlog",
+    });
   });
 
   it("normalizes enabled skills from app-server skills/list", () => {

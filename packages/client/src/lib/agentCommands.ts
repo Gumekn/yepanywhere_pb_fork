@@ -143,6 +143,8 @@ export interface AgentCommandDescriptions {
   codexCompact: string;
   review: string;
   goal: string;
+  /** `/goal` before a session exists: starts the session on the goal. */
+  goalNewSession: string;
   side: string;
 }
 
@@ -194,9 +196,11 @@ function yepCommandDescription(
   name: YepCommandName,
   descriptions: Partial<AgentCommandDescriptions> | undefined,
   codex: boolean,
+  inSession: boolean,
 ): string | undefined {
   if (name === "btw") return descriptions?.side;
   if (name === "compact" && codex) return descriptions?.codexCompact;
+  if (name === "goal" && !inSession) return descriptions?.goalNewSession;
   return descriptions?.[name];
 }
 
@@ -235,6 +239,7 @@ export function buildAgentCommandCatalog({
           name,
           descriptions,
           isCodexCommandProvider(provider),
+          inSession,
         );
         return [
           name,
@@ -268,12 +273,13 @@ export function buildAgentCommandCatalog({
   };
 
   if (isCodexCommandProvider(provider)) {
-    // Codex compaction can resume an idle session; the other controls need
-    // the live app-server thread.
+    // Codex compaction and goals can resume an idle session (goals can even
+    // start a new one, like `/goal` before the Codex TUI's first turn); the
+    // other controls need the live app-server thread.
     addYep("compact", inSession && canSend);
     addYep("model", ownsProcess);
     addYep("review", ownsProcess);
-    addYep("goal", ownsProcess);
+    addYep("goal", canSend);
     sideCommands(hasSide);
     const skillDetails = Object.fromEntries(
       codexSkills.flatMap((skill) =>
