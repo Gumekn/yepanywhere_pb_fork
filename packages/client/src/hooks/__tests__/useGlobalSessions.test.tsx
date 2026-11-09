@@ -12,6 +12,7 @@ import type {
 import type {
   ProcessStateEvent,
   SessionCreatedEvent,
+  SessionIdChangedEvent,
   SessionMetadataChangedEvent,
   SessionSeenEvent,
   SessionStatusEvent,
@@ -99,6 +100,7 @@ describe("useGlobalSessions", () => {
     onProcessStateChange?: (event: ProcessStateEvent) => void;
     onSessionSeen?: (event: SessionSeenEvent) => void;
     onSessionCreated?: (event: SessionCreatedEvent) => void;
+    onSessionIdChanged?: (event: SessionIdChangedEvent) => void;
     onSessionMetadataChange?: (event: SessionMetadataChangedEvent) => void;
     onSessionUpdated?: (event: SessionUpdatedEvent) => void;
     onReconnect?: () => void;
@@ -630,6 +632,145 @@ describe("useGlobalSessions", () => {
       title: "Resumed old session",
       projectName: "Project 1",
       lastTurnStatus: "completed",
+    });
+  });
+
+  describe("temporary session IDs", () => {
+    const temporaryCard = {
+      ...baseSessionSummary,
+      id: "temporary-id",
+      provider: "pi" as const,
+      title: "First prompt",
+      fullTitle: "First prompt",
+      messageCount: 1,
+      ownership: { owner: "self" as const, processId: "process-1" },
+      activity: "in-turn" as const,
+    };
+    const durableSession = {
+      ...baseSession,
+      id: "durable-id",
+      provider: "pi" as const,
+      title: "First prompt",
+      messageCount: 2,
+      ownership: { owner: "self" as const, processId: "process-1" },
+      activity: "idle" as const,
+    };
+
+    async function renderWithTemporaryCard() {
+      const rendered = renderHook(() => useGlobalSessions());
+      await flushPromises();
+      act(() => {
+        activityHandlers.onSessionCreated?.({
+          type: "session-created",
+          session: temporaryCard,
+          timestamp: "now",
+        });
+      });
+      return rendered;
+    }
+
+    it("merges the temporary card into a durable card that arrived first", async () => {
+      mockGetSessionMetadata.mockResolvedValue({
+        session: durableSession,
+        ownership: durableSession.ownership,
+      });
+      const { result } = await renderWithTemporaryCard();
+      act(() => {
+        activityHandlers.onSessionStatusChange?.({
+          type: "session-status-changed",
+          sessionId: "durable-id",
+          projectId,
+          ownership: durableSession.ownership,
+          timestamp: "now",
+        });
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      expect(result.current.sessions.map((session) => session.id)).toEqual([
+        "durable-id",
+        "temporary-id",
+      ]);
+
+      act(() => {
+        activityHandlers.onSessionIdChanged?.({
+          type: "session-id-changed",
+          oldSessionId: "temporary-id",
+          newSessionId: "durable-id",
+          projectId,
+          timestamp: "now",
+        });
+      });
+      expect(result.current.sessions.map((session) => session.id)).toEqual([
+        "durable-id",
+      ]);
+      expect(result.current.sessions[0]?.activity).toBe("idle");
+    });
+
+    it("renames the temporary card and reconciles it under the durable ID", async () => {
+      mockGetSessionMetadata.mockResolvedValue({
+        session: durableSession,
+        ownership: durableSession.ownership,
+      });
+      const { result } = await renderWithTemporaryCard();
+      act(() => {
+        activityHandlers.onSessionIdChanged?.({
+          type: "session-id-changed",
+          oldSessionId: "temporary-id",
+          newSessionId: "durable-id",
+          projectId,
+          timestamp: "now",
+        });
+      });
+      expect(result.current.sessions.map((session) => session.id)).toEqual([
+        "durable-id",
+      ]);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      expect(mockGetSessionMetadata).toHaveBeenCalledWith(
+        projectId,
+        "durable-id",
+      );
+      expect(result.current.sessions).toHaveLength(1);
+      expect(result.current.sessions[0]).toMatchObject({
+        id: "durable-id",
+        activity: "idle",
+        messageCount: 2,
+      });
+    });
+
+    it("replaces a temporary card when its own refresh resolves to the durable ID", async () => {
+      mockGetGlobalSessions.mockResolvedValue(
+        response([
+          { ...durableSession },
+          { ...temporaryCard, projectName: "Project 1" },
+        ]),
+      );
+      mockGetSessionMetadata.mockResolvedValue({
+        session: durableSession,
+        ownership: durableSession.ownership,
+      });
+      const { result } = renderHook(() => useGlobalSessions());
+      await flushPromises();
+      act(() => {
+        activityHandlers.onSessionUpdated?.({
+          type: "session-updated",
+          sessionId: "temporary-id",
+          projectId,
+          timestamp: "now",
+        });
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+      expect(mockGetSessionMetadata).toHaveBeenCalledWith(
+        projectId,
+        "temporary-id",
+      );
+      expect(result.current.sessions.map((session) => session.id)).toEqual([
+        "durable-id",
+      ]);
     });
   });
 

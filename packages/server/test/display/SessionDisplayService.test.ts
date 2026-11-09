@@ -2057,6 +2057,45 @@ describe("SessionDisplayService", () => {
     expect(connected?.[1].deferredMessages ?? []).toEqual([]);
   });
 
+  it("moves a late subscriber off a temporary ID the runtime already replaced", async () => {
+    const { service, push } = fixture();
+    await service.subscribe(selection, vi.fn());
+    push("session-id-changed", {
+      oldSessionId: selection.sessionId,
+      newSessionId: "durable",
+    });
+    const emit = vi.fn();
+    await service.subscribe(selection, emit);
+    expect(emit).toHaveBeenCalledWith(
+      "connected",
+      expect.objectContaining({ sessionId: selection.sessionId }),
+    );
+    expect(emit).toHaveBeenCalledWith("session-id-changed", {
+      oldSessionId: selection.sessionId,
+      newSessionId: "durable",
+    });
+  });
+
+  it("reports the attached process ID when the rename predates the view", async () => {
+    const { service, push } = fixture();
+    await service.subscribe(selection, vi.fn());
+    // A view created after the rename only sees the runtime's connected ID.
+    push("connected", { sessionId: "durable", state: "idle" });
+    const emit = vi.fn();
+    await service.subscribe(selection, emit);
+    expect(emit).toHaveBeenCalledWith("session-id-changed", {
+      oldSessionId: selection.sessionId,
+      newSessionId: "durable",
+    });
+
+    const unchanged = vi.fn();
+    push("connected", { sessionId: selection.sessionId, state: "idle" });
+    await service.subscribe(selection, unchanged);
+    expect(
+      unchanged.mock.calls.some(([type]) => type === "session-id-changed"),
+    ).toBe(false);
+  });
+
   it("renders safe Markdown and file links in cold, older and live projections", async () => {
     const { service, source, push } = fixture();
     const initial = await source.read();

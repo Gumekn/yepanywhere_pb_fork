@@ -174,6 +174,35 @@ describe("Recents Routes", () => {
     expect(markSeen).toHaveBeenCalledWith("sess-1");
   });
 
+  it("records a visit to a temporary session ID under its durable ID", async () => {
+    const markSeen = vi.fn(async () => undefined);
+    const recordVisit = vi.fn(async () => undefined);
+
+    const routes = createRecentsRoutes({
+      recentsService: { recordVisit } as unknown as RecentsService,
+      notificationService: { markSeen } as unknown as NotificationService,
+      sessionMetadataService: {
+        getCanonicalSessionId: vi.fn((id: string) =>
+          id === "temporary-id" ? "durable-id" : id,
+        ),
+      } as unknown as SessionMetadataService,
+      scanner: {
+        listProjects: vi.fn(async () => []),
+      } as unknown as ProjectScanner,
+      readerFactory: vi.fn(),
+    });
+
+    const response = await routes.request("/visit", {
+      method: "POST",
+      body: JSON.stringify({ sessionId: "temporary-id", projectId: "proj-1" }),
+      headers: { "Content-Type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(recordVisit).toHaveBeenCalledWith("durable-id", "proj-1");
+    expect(markSeen).toHaveBeenCalledWith("durable-id");
+  });
+
   it("uses custom and AI titles ahead of the provider title", async () => {
     const project = createProject();
     const summary = createSummary();

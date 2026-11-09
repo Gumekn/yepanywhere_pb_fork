@@ -255,6 +255,43 @@ export class NotificationService {
     }
   }
 
+  /**
+   * Move read and review state from a provider's temporary session ID to its
+   * durable ID. A page opened under the temporary ID marks that ID as seen; the
+   * durable session must inherit it or it stays unread after being viewed.
+   */
+  async remapSessionId(
+    oldSessionId: string,
+    newSessionId: string,
+  ): Promise<void> {
+    if (!oldSessionId || !newSessionId || oldSessionId === newSessionId) {
+      return;
+    }
+    const oldSeen = this.state.lastSeen[oldSessionId];
+    const oldReview = this.state.needsReview[oldSessionId];
+    if (!oldSeen && !oldReview) return;
+
+    delete this.state.lastSeen[oldSessionId];
+    delete this.state.needsReview[oldSessionId];
+    if (oldSeen) {
+      const current = this.state.lastSeen[newSessionId];
+      if (!current || current.timestamp < oldSeen.timestamp) {
+        this.state.lastSeen[newSessionId] = oldSeen;
+      }
+    }
+    if (oldReview) {
+      const current = this.state.needsReview[newSessionId];
+      const seen = this.state.lastSeen[newSessionId];
+      if (
+        (!current || current.timestamp < oldReview.timestamp) &&
+        !(seen && seen.timestamp >= oldReview.timestamp)
+      ) {
+        this.state.needsReview[newSessionId] = oldReview;
+      }
+    }
+    await this.save();
+  }
+
   private async recordSeen(
     sessionId: string,
     timestamp: string,

@@ -4,6 +4,7 @@ import {
   type FileType,
   type ProcessStateEvent,
   type SessionCreatedEvent,
+  type SessionIdChangedEvent,
   type SessionMetadataChangedEvent,
   type SessionSeenEvent,
   type SessionStatusEvent,
@@ -19,6 +20,7 @@ export type {
   FileType,
   ProcessStateEvent,
   SessionCreatedEvent,
+  SessionIdChangedEvent,
   SessionMetadataChangedEvent,
   SessionSeenEvent,
   SessionStatusEvent,
@@ -44,6 +46,8 @@ interface UseFileActivityOptions {
   onSessionStatusChange?: (event: SessionStatusEvent) => void;
   /** Callback when a new session is created */
   onSessionCreated?: (event: SessionCreatedEvent) => void;
+  /** Callback when a temporary session ID is replaced by its durable ID */
+  onSessionIdChanged?: (event: SessionIdChangedEvent) => void;
   /** Callback when a session is marked as seen (from another tab/device) */
   onSessionSeen?: (event: SessionSeenEvent) => void;
   /** Callback when a process state changes (running/waiting-input) */
@@ -70,6 +74,7 @@ export function useFileActivity(options: UseFileActivityOptions = {}) {
     onFileChange,
     onSessionStatusChange,
     onSessionCreated,
+    onSessionIdChanged,
     onSessionSeen,
     onProcessStateChange,
     onSessionMetadataChange,
@@ -89,6 +94,8 @@ export function useFileActivity(options: UseFileActivityOptions = {}) {
   onSessionStatusChangeRef.current = onSessionStatusChange;
   const onSessionCreatedRef = useRef(onSessionCreated);
   onSessionCreatedRef.current = onSessionCreated;
+  const onSessionIdChangedRef = useRef(onSessionIdChanged);
+  onSessionIdChangedRef.current = onSessionIdChanged;
   const onSessionSeenRef = useRef(onSessionSeen);
   onSessionSeenRef.current = onSessionSeen;
   const onProcessStateChangeRef = useRef(onProcessStateChange);
@@ -137,6 +144,12 @@ export function useFileActivity(options: UseFileActivityOptions = {}) {
     unsubscribers.push(
       activityBus.on("session-created", (data) => {
         onSessionCreatedRef.current?.(data);
+      }),
+    );
+
+    unsubscribers.push(
+      activityBus.on("session-id-changed", (data) => {
+        onSessionIdChangedRef.current?.(data);
       }),
     );
 

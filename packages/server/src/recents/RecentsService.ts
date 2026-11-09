@@ -116,6 +116,36 @@ export class RecentsService {
   }
 
   /**
+   * Move visits recorded under a provider's temporary session ID onto its
+   * durable ID, keeping only the most recent visit of that session.
+   */
+  async remapSessionId(
+    oldSessionId: string,
+    newSessionId: string,
+  ): Promise<void> {
+    if (!oldSessionId || !newSessionId || oldSessionId === newSessionId) {
+      return;
+    }
+    if (!this.state.visits.some((entry) => entry.sessionId === oldSessionId)) {
+      return;
+    }
+    const seen = new Set<string>();
+    const visits: RecentEntry[] = [];
+    // Visits are ordered most recent first, so the first one wins.
+    for (const entry of this.state.visits) {
+      const sessionId =
+        entry.sessionId === oldSessionId ? newSessionId : entry.sessionId;
+      if (seen.has(sessionId)) continue;
+      seen.add(sessionId);
+      visits.push(
+        sessionId === entry.sessionId ? entry : { ...entry, sessionId },
+      );
+    }
+    this.state.visits = visits;
+    await this.save();
+  }
+
+  /**
    * Get all recent entries, most recent first.
    */
   getRecents(): RecentEntry[] {

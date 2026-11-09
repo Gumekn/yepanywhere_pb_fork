@@ -696,6 +696,24 @@ async function startServer() {
       `[NotificationService] Imported ${importedRecentReadMarkers} read marker(s) from recents`,
     );
   }
+  // A page opened under a provider's temporary session ID records its visit and
+  // read marker under that ID. Both runtime modes publish the durable ID on the
+  // bus (external mode replays it at startup), so move that state over here.
+  eventBus.subscribe((event) => {
+    if (event.type !== "session-id-changed") return;
+    void Promise.all([
+      recentsService.remapSessionId(event.oldSessionId, event.newSessionId),
+      notificationService.remapSessionId(
+        event.oldSessionId,
+        event.newSessionId,
+      ),
+    ]).catch((error) => {
+      console.error(
+        "[SessionIdChange] Failed to move recents/read state to the durable ID:",
+        error,
+      );
+    });
+  });
   await authService.initialize();
   await serverSettingsService.initialize();
   syncClaudeSharedSessionWatchers(

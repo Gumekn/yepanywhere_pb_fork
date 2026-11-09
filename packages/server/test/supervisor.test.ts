@@ -208,6 +208,103 @@ describe("Supervisor", () => {
         await providerSupervisor.shutdown();
       }
     });
+
+    it.each(["start", "create"] as const)(
+      "announces a slow new Pi session only under its durable ID (%s)",
+      async (mode) => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        let releaseInit!: () => void;
+        let stop!: () => void;
+        const initGate = new Promise<void>((resolve) => {
+          releaseInit = resolve;
+        });
+        const stopGate = new Promise<void>((resolve) => {
+          stop = resolve;
+        });
+        const eventBus = new EventBus();
+        const events: BusEvent[] = [];
+        eventBus.subscribe((event) => events.push(event));
+        const local = new Supervisor({
+          eventBus,
+          idleTimeoutMs: 60_000,
+          provider: createPiTestProvider(async () => ({
+            iterator: (async function* () {
+              await initGate;
+              yield {
+                type: "system",
+                subtype: "init",
+                session_id: "pi-durable",
+              };
+              await stopGate;
+            })(),
+            queue: new MessageQueue(),
+            abort: () => stop(),
+          })),
+        });
+        try {
+          const started =
+            mode === "start"
+              ? local.startSession("/tmp/pi-slow", { text: "hi" })
+              : local.createSession("/tmp/pi-slow");
+          // Pi loads its native extensions before answering get_state.
+          await vi.advanceTimersByTimeAsync(8_000);
+          expect(events.some((event) => event.type === "session-created")).toBe(
+            false,
+          );
+          releaseInit();
+          const process = await started;
+          if (!("id" in process)) throw new Error("Expected process");
+          expect(process.sessionId).toBe("pi-durable");
+          const created = events.filter(
+            (event) => event.type === "session-created",
+          );
+          expect(created).toHaveLength(1);
+          expect(created[0]).toMatchObject({
+            session: { id: "pi-durable" },
+          });
+          expect(
+            events.some((event) => event.type === "session-id-changed"),
+          ).toBe(false);
+        } finally {
+          vi.useRealTimers();
+          stop();
+          await local.shutdown();
+        }
+      },
+    );
+
+    it("fails a new Pi session that never reports its durable ID", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      let stop!: () => void;
+      const stopGate = new Promise<void>((resolve) => {
+        stop = resolve;
+      });
+      const abort = vi.fn(() => stop());
+      const local = new Supervisor({
+        provider: createPiTestProvider(async () => ({
+          iterator: (async function* () {
+            await stopGate;
+            // Only reached after the start already failed and aborted.
+            yield { type: "result", session_id: "pi-stuck" };
+          })(),
+          queue: new MessageQueue(),
+          abort,
+        })),
+      });
+      try {
+        const started = local.startSession("/tmp/pi-stuck", { text: "hi" });
+        const outcome = expect(started).rejects.toThrow(
+          "Provider initialization timed out after 30000ms",
+        );
+        await vi.advanceTimersByTimeAsync(30_000);
+        await outcome;
+        expect(abort).toHaveBeenCalled();
+        expect(local.getAllProcesses()).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+        await local.shutdown();
+      }
+    });
   });
 
   describe("resumeSession", () => {

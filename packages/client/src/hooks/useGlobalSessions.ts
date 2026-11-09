@@ -14,6 +14,7 @@ import {
 import {
   type ProcessStateEvent,
   type SessionCreatedEvent,
+  type SessionIdChangedEvent,
   type SessionMetadataChangedEvent,
   type SessionSeenEvent,
   type SessionStatusEvent,
@@ -81,6 +82,33 @@ function mergeFetchedSession(
   }
 
   return incoming;
+}
+
+/**
+ * Move a card announced under a provider's temporary ID onto its durable ID.
+ * When the durable card already arrived on its own, the temporary card is a
+ * duplicate of the same session and only lends it a title it may still lack.
+ */
+export function renameSessionEntry(
+  sessions: GlobalSessionItem[],
+  oldSessionId: string,
+  newSessionId: string,
+): GlobalSessionItem[] {
+  if (oldSessionId === newSessionId) return sessions;
+  const old = sessions.find((session) => session.id === oldSessionId);
+  if (!old) return sessions;
+  if (sessions.some((session) => session.id === newSessionId)) {
+    return sessions
+      .filter((session) => session.id !== oldSessionId)
+      .map((session) =>
+        session.id === newSessionId
+          ? mergeFetchedSession(old, session)
+          : session,
+      );
+  }
+  return sessions.map((session) =>
+    session.id === oldSessionId ? { ...session, id: newSessionId } : session,
+  );
 }
 
 function isBusyActivity(activity: GlobalSessionItem["activity"]): boolean {
@@ -410,12 +438,18 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
         )
           return;
 
-        if (hasResolvedTitle(data.session)) {
+        // A temporary ID resolves to its durable session on the server.
+        const canonicalId = data.session.id || sessionId;
+        const aliased = canonicalId !== sessionId;
+        if (aliased || hasResolvedTitle(data.session)) {
           clearPendingTitleRefetch(sessionId);
         }
 
-        setSessions((prev) => {
-          const existing = prev.find((session) => session.id === sessionId);
+        setSessions((current) => {
+          const prev = aliased
+            ? renameSessionEntry(current, sessionId, canonicalId)
+            : current;
+          const existing = prev.find((session) => session.id === canonicalId);
           const project = projectsRef.current.find(
             (p) => p.id === data.session.projectId,
           );
@@ -451,11 +485,13 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
             });
           if (!matches)
             return existing
-              ? prev.filter((session) => session.id !== sessionId)
+              ? prev.filter((session) => session.id !== canonicalId)
               : prev;
           if (!existing) return collapseEditForkFamilies([next, ...prev]);
           return collapseEditForkFamilies(
-            prev.map((session) => (session.id === sessionId ? next : session)),
+            prev.map((session) =>
+              session.id === canonicalId ? next : session,
+            ),
           );
         });
       } catch {
@@ -729,6 +765,36 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     ],
   );
 
+  // A provider replaced the temporary ID this session was announced under.
+  // Without this the temporary card stays next to the durable one, frozen in
+  // the activity it had when the ID changed, until a full reload.
+  const handleSessionIdChanged = useCallback(
+    (event: SessionIdChangedEvent) => {
+      const { oldSessionId, newSessionId } = event;
+      if (!enabled || !oldSessionId || !newSessionId) return;
+      if (oldSessionId === newSessionId) return;
+      if (projectId && event.projectId !== projectId) return;
+      clearPendingTitleRefetch(oldSessionId);
+      invalidateSessionRefresh(oldSessionId);
+      if (!sessionsRef.current.some((session) => session.id === oldSessionId))
+        return;
+      setSessions((prev) =>
+        renameSessionEntry(prev, oldSessionId, newSessionId),
+      );
+      if (searchQuery) debouncedRefetch();
+      else queueSessionRefresh(newSessionId, event.projectId);
+    },
+    [
+      enabled,
+      projectId,
+      searchQuery,
+      clearPendingTitleRefetch,
+      invalidateSessionRefresh,
+      debouncedRefetch,
+      queueSessionRefresh,
+    ],
+  );
+
   // Handle session metadata changes
   const handleSessionMetadataChange = useCallback(
     (event: SessionMetadataChangedEvent) => {
@@ -920,6 +986,7 @@ export function useGlobalSessions(options: UseGlobalSessionsOptions = {}) {
     enabled: enabled && (liveUpdates || metadataLiveUpdates),
     onSessionStatusChange: liveUpdates ? handleSessionStatusChange : undefined,
     onSessionCreated: liveUpdates ? handleSessionCreated : undefined,
+    onSessionIdChanged: liveUpdates ? handleSessionIdChanged : undefined,
     onProcessStateChange: liveUpdates ? handleProcessStateChange : undefined,
     onSessionMetadataChange: metadataLiveUpdates
       ? handleSessionMetadataChange

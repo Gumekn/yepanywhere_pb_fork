@@ -623,6 +623,81 @@ describe("Sessions metadata route", () => {
     }
   });
 
+  it("returns the durable ID from metadata opened under a temporary ID", async () => {
+    const testDir = join(tmpdir(), `session-alias-metadata-${randomUUID()}`);
+    const project = createProject();
+    const metadata = new SessionMetadataService({ dataDir: testDir });
+    const durableSummary = {
+      ...createSummary(),
+      id: "durable-id",
+      title: "Durable title",
+      provider: "claude" as const,
+    };
+    const getSessionSummary = vi.fn(async (sessionId: string) =>
+      sessionId === "durable-id" ? durableSummary : null,
+    );
+    const createRoutes = (
+      getProcessSnapshotForSession: (
+        sessionId: string,
+      ) => Promise<RuntimeProcessSnapshot | null>,
+    ) =>
+      createSessionsRoutes({
+        supervisor: {} as SessionsDeps["supervisor"],
+        runtimeController: {
+          getProcessSnapshotForSession: vi.fn(getProcessSnapshotForSession),
+          wasEverOwned: vi.fn(async () => true),
+        } as unknown as NonNullable<SessionsDeps["runtimeController"]>,
+        scanner: {
+          getOrCreateProject: vi.fn(async () => project),
+        } as unknown as SessionsDeps["scanner"],
+        readerFactory: vi.fn(
+          () => ({ getSessionSummary }) as unknown as ISessionReader,
+        ),
+        sessionMetadataService: metadata,
+      });
+
+    try {
+      await metadata.initialize();
+      await metadata.remapSessionId("temporary-id", "durable-id");
+
+      // Process gone: the persisted alias is the only link.
+      const persisted = await createRoutes(async () => null).request(
+        `/projects/${project.id}/sessions/temporary-id/metadata`,
+      );
+      expect(persisted.status).toBe(200);
+      await expect(persisted.json()).resolves.toMatchObject({
+        session: { id: "durable-id", title: "Durable title" },
+      });
+
+      // Live process still indexed under both IDs reports its current one.
+      const live = await createRoutes(async (sessionId) =>
+        sessionId === "live-temporary-id"
+          ? ({
+              id: "proc-live",
+              sessionId: "durable-id",
+              projectId: project.id,
+              provider: "pi",
+              state: "idle",
+              permissionMode: "default",
+              modeVersion: 0,
+              messageHistory: [],
+            } as unknown as RuntimeProcessSnapshot)
+          : null,
+      ).request(`/projects/${project.id}/sessions/live-temporary-id/metadata`);
+      expect(live.status).toBe(200);
+      await expect(live.json()).resolves.toMatchObject({
+        session: { id: "durable-id", title: "Durable title" },
+        ownership: { owner: "self", processId: "proc-live" },
+      });
+      expect(getSessionSummary).not.toHaveBeenCalledWith(
+        "live-temporary-id",
+        expect.anything(),
+      );
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
   it("resolves metadata across providers for mixed-provider projects", async () => {
     const project = createProject();
     const summary = createSummary();

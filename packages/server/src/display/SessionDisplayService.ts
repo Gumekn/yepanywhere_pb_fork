@@ -2077,6 +2077,12 @@ export class SessionDisplayService {
     if (contextUsage) emit("display-context-usage", contextUsage);
     for (const [key, value] of entry.controls)
       if (key.startsWith("message:init")) emit("message", value);
+    const durableSessionId = this.durableSessionId(entry);
+    if (durableSessionId)
+      emit("session-id-changed", {
+        oldSessionId: selection.sessionId,
+        newSessionId: durableSessionId,
+      });
     entry.listeners.add(emit);
     const cleanup = () => {
       entry.listeners.delete(emit);
@@ -2085,6 +2091,30 @@ export class SessionDisplayService {
     };
     signal?.addEventListener("abort", cleanup, { once: true });
     return { cleanup };
+  }
+  /**
+   * The durable ID of a view opened under a provider's temporary bootstrap ID.
+   * The rename usually happened before this listener (often before this view)
+   * existed, so its live `session-id-changed` was never delivered, and the
+   * `connected` above deliberately keeps the requested ID for the snapshot
+   * view. Without this the client stays on the alias as a second session.
+   */
+  private durableSessionId(entry: Entry): string | undefined {
+    if (entry.selection.branchId) return undefined;
+    const requested = entry.selection.sessionId;
+    const changed = asRecord(entry.controls.get("session-id-changed"));
+    if (
+      changed?.oldSessionId === requested &&
+      typeof changed.newSessionId === "string" &&
+      changed.newSessionId &&
+      changed.newSessionId !== requested
+    )
+      return changed.newSessionId;
+    // A runtime subscription reports the attached process's current ID.
+    const reported = asRecord(entry.controls.get("connected"))?.sessionId;
+    return typeof reported === "string" && reported && reported !== requested
+      ? reported
+      : undefined;
   }
   async snapshot(
     selection: DisplaySelection,

@@ -1221,7 +1221,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   // Lightweight endpoint for refreshing title, status, etc. without re-fetching all messages
   routes.get("/projects/:projectId/sessions/:sessionId/metadata", async (c) => {
     const projectId = c.req.param("projectId");
-    const sessionId = c.req.param("sessionId");
+    const requestedSessionId = c.req.param("sessionId");
 
     // Validate projectId format at API boundary
     if (!isUrlProjectId(projectId)) {
@@ -1233,9 +1233,20 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       return c.json({ error: "Project not found" }, 404);
     }
 
-    // Check if session is actively owned by a process
-    const process =
-      await runtimeController.getProcessSnapshotForSession(sessionId);
+    // Check if session is actively owned by a process. A temporary bootstrap
+    // ID resolves to its durable ID, exactly like the full session read, so a
+    // page opened before the provider reported its ID can move onto it.
+    let process =
+      await runtimeController.getProcessSnapshotForSession(requestedSessionId);
+    const sessionId =
+      process?.sessionId ??
+      deps.sessionMetadataService?.getCanonicalSessionId?.(
+        requestedSessionId,
+      ) ??
+      requestedSessionId;
+    if (!process && sessionId !== requestedSessionId) {
+      process = await runtimeController.getProcessSnapshotForSession(sessionId);
+    }
     const bridgeView = await getBridgeSessionView(deps, sessionId);
     const bridgedSession =
       bridgeView?.session.projectId === projectId ? bridgeView : null;
@@ -2930,7 +2941,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
   // POST /api/sessions/:sessionId/mark-seen - Mark session as seen (read)
   routes.post("/sessions/:sessionId/mark-seen", async (c) => {
-    const sessionId = c.req.param("sessionId");
+    // A page may still be open under a provider's temporary ID.
+    const sessionId =
+      deps.sessionMetadataService?.getCanonicalSessionId?.(
+        c.req.param("sessionId"),
+      ) ?? c.req.param("sessionId");
 
     if (!deps.notificationService) {
       return c.json({ error: "Notification service not available" }, 503);
@@ -2954,7 +2969,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
   // DELETE /api/sessions/:sessionId/mark-seen - Mark session as unread
   routes.delete("/sessions/:sessionId/mark-seen", async (c) => {
-    const sessionId = c.req.param("sessionId");
+    const sessionId =
+      deps.sessionMetadataService?.getCanonicalSessionId?.(
+        c.req.param("sessionId"),
+      ) ?? c.req.param("sessionId");
 
     if (!deps.notificationService) {
       return c.json({ error: "Notification service not available" }, 503);
