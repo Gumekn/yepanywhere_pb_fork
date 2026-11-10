@@ -29,7 +29,9 @@ import { isRetiredProviderName } from "../sdk/providers/policy.js";
 import type { Project } from "../supervisor/types.js";
 import type { CodexSessionReader } from "./codex-reader.js";
 import { getCodexSessionManifest } from "./codex-session-manifest.js";
+import type { DshSessionReader } from "./dsh-reader.js";
 import type { GeminiSessionReader } from "./gemini-reader.js";
+import type { McodeSessionReader } from "./mcode-reader.js";
 import type { PiSessionReader } from "./pi-reader.js";
 import { findSessionSummaryAcrossProviders } from "./provider-resolution.js";
 import type { ISessionReader } from "./types.js";
@@ -50,6 +52,12 @@ export interface SessionLocatorDeps {
   geminiReaderFactory?: (projectPath: string) => GeminiSessionReader;
   piSessionsDir?: string;
   piReaderFactory?: (projectPath: string) => PiSessionReader;
+  mcodeReaderFactory?: (projectPath: string) => McodeSessionReader;
+  /**
+   * Read-only DeepSeek Harness reader. Without it the fallback scan cannot see
+   * dsh sessions at all, since no other source indexes them.
+   */
+  dshReaderFactory?: (projectPath: string) => DshSessionReader;
   codexBridgeService?: BridgeController;
 }
 
@@ -231,7 +239,8 @@ async function locateViaMetadata(
 
 /**
  * Last resort: ask every provider reader about every project. This is what
- * covers Gemini, whose on-disk layout has no id-keyed index.
+ * covers Gemini, MiniMax Code and DeepSeek Harness, whose on-disk layouts
+ * have no id-keyed index Yep can consult.
  */
 async function locateViaProviderScan(
   deps: SessionLocatorDeps,
@@ -250,6 +259,8 @@ async function locateViaProviderScan(
     geminiHashToCwd: deps.geminiScanner?.getHashToCwd(),
     piSessionsDir: deps.piSessionsDir,
     piReaderFactory: deps.piReaderFactory,
+    mcodeReaderFactory: deps.mcodeReaderFactory,
+    dshReaderFactory: deps.dshReaderFactory,
   };
 
   for (const project of projects) {

@@ -16,6 +16,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 - Codex 的 `/goal` 与 Codex 终端行为对齐：新建会话输入 `/` 会列出 `/goal`（此前 Codex 新建会话的 `/` 菜单为空、工具栏也没有 `/` 按钮）。在新建会话中发送 `/goal <目标>` 会先创建会话（不发起普通回合），再设定 Codex 原生目标，由 Codex 自动开始第一轮目标回合；此前这段文字会作为普通提示发给模型，目标并没有设定。新建会话的 `/goal` 不接受附件，也必须带目标文字。会话进程未运行时（空闲、服务重启后）`/goal` 仍可用：会先在不发起回合的前提下恢复进程（只读 `thread/goal/get`），再打开目标对话框；此前会提示「请先发送一条消息」。新增 `/goal pause`、`/goal resume`、`/goal clear` 直接执行对应操作，`/goal edit` 打开对话框，与 Codex 终端一致；其他文字仍预填为目标描述。
 
 ### Fixed
+- 修复 `GET /api/sessions/:sessionId/locate` 无法定位 DeepSeek Harness（dsh）和 MiniMax Code（mcode）会话的问题：最后一步「逐个 provider 扫描」没有传入这两个 provider 的 reader，因此只拿会话 ID 的跳转和 agent 永远返回「Session not found」。
 - 修复会话内搜索（`Cmd/Ctrl+F`）搜得到却不跳转、长消息后半段搜不到的问题，同时把定位精确到命中的文字。
   - **跳转失效**：搜索索引返回原始消息 id，而默认展示链路中 assistant 正文的行 id 是派生的（如 `text:<id>:<块序号>`），两边对不上，命中 assistant 回复时既不滚动也没有标识。现在展示段落带上来源消息 id，折叠进「过程」的中间文字也会记录在过程段上；全局搜索结果跳进会话也因此生效。
   - **长消息搜不到**：每条消息原来只索引前 2000 个字符，现在放宽到 64000 个字符。旧索引在首次搜索时自动重建。
