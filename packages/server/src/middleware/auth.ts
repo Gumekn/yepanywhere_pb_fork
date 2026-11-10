@@ -28,6 +28,26 @@ export interface AuthMiddlewareOptions {
   authDisabled?: boolean;
   /** Desktop auth token from Tauri app. Acts as minimum auth floor when no other auth is configured. */
   desktopAuthToken?: string;
+  /**
+   * Reverse-proxy prefix the app is mounted under (e.g. `/yep`). `c.req.path`
+   * keeps the prefix, so path exemptions are matched after stripping it.
+   */
+  basePath?: string;
+}
+
+/**
+ * Routes that are reachable without logging in. Each one must authorize the
+ * request itself — the share-link routes treat their unguessable token as the
+ * credential and expose only the frozen snapshot behind it.
+ */
+export const PUBLIC_API_PREFIX = "/api/public/";
+
+function stripBasePath(path: string, basePath: string | undefined): string {
+  const prefix = (basePath ?? "").replace(/\/$/, "");
+  if (!prefix || !path.startsWith(prefix)) return path;
+  const rest = path.slice(prefix.length);
+  if (rest === "") return "/";
+  return rest.startsWith("/") ? rest : path;
 }
 
 /**
@@ -66,13 +86,25 @@ function hasValidDesktopToken(
 export function createAuthMiddleware(
   options: AuthMiddlewareOptions,
 ): MiddlewareHandler {
-  const { authService, authDisabled = false, desktopAuthToken } = options;
+  const {
+    authService,
+    authDisabled = false,
+    desktopAuthToken,
+    basePath,
+  } = options;
 
   return async (c, next) => {
-    const path = c.req.path;
+    const path = stripBasePath(c.req.path, basePath);
 
     // Skip auth for health check (always open for readiness probes)
     if (path === "/health") {
+      await next();
+      return;
+    }
+
+    // Token-addressed public routes authorize themselves; never ask them for
+    // a session cookie or the desktop token.
+    if (path.startsWith(PUBLIC_API_PREFIX)) {
       await next();
       return;
     }

@@ -747,3 +747,17 @@ export type {
   CursorUsage,
 } from "./cursor.js";
 export * from "./curl.js";
+export type {
+  PublicSessionShareResponse,
+  SessionShareExpiry,
+  SessionShareRecord,
+  SessionShareSnapshot,
+  SessionShareSnapshotSession,
+} from "./session-share.js";
+export {
+  DEFAULT_SESSION_SHARE_EXPIRY,
+  SESSION_SHARE_EXPIRY_OPTIONS,
+  isSessionShareExpiry,
+  isSessionShareToken,
+  resolveSessionShareExpiresAt,
+} from "./session-share.js";

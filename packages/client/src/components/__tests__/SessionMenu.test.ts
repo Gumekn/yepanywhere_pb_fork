@@ -32,6 +32,7 @@ describe("buildSessionInfoText", () => {
       Provider: "pi",
       Project: PROJECT_PATH,
       Link: `${window.location.origin}/projects/${PROJECT_ID}/sessions/${SESSION_ID}`,
+      Transcript: `${window.location.origin}/api/projects/${PROJECT_ID}/sessions/${SESSION_ID}/transcript`,
     });
   });
 
@@ -49,6 +50,7 @@ describe("buildSessionInfoText", () => {
       "Provider",
       "Project",
       "Link",
+      "Transcript",
     ]);
   });
 
@@ -88,7 +90,7 @@ describe("buildSessionInfoText", () => {
 
     expect(text).not.toContain("User uploaded files:");
     expect(parse(text).Title).toBe("看看这个 pi session");
-    expect(text.split("\n")).toHaveLength(5);
+    expect(text.split("\n")).toHaveLength(6);
   });
 
   it("handles non-ascii project paths", () => {

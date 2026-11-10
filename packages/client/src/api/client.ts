@@ -6,6 +6,8 @@ import type {
   SessionDisplaySnapshot,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
+  SessionShareExpiry,
+  SessionShareRecord,
 } from "@yep-anywhere/shared";
 import type {
   AgentActivity,
@@ -2464,6 +2466,27 @@ export const api = {
       body: JSON.stringify({ html, title }),
     }),
 
+  // Read-only share links (frozen snapshot served at /share/:token)
+  createSessionShareLink: (input: {
+    projectId: string;
+    sessionId: string;
+    expiresIn: SessionShareExpiry;
+    title?: string | null;
+  }) =>
+    fetchJSON<{ share: SessionShareRecord }>("/session-shares", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  listSessionShareLinks: (projectId: string, sessionId: string) =>
+    fetchJSON<{ shares: SessionShareRecord[] }>(
+      `/session-shares?${new URLSearchParams({ projectId, sessionId })}`,
+    ),
+
+  revokeSessionShareLink: (token: string) =>
+    fetchJSON<{ ok: true }>(`/session-shares/${encodeURIComponent(token)}`, {
+      method: "DELETE",
+    }),
 };
 
 export interface RemoteExecutorTestResult {

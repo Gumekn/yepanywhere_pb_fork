@@ -111,6 +111,11 @@ import { createReportsRoutes } from "./routes/reports.js";
 import { createSearchRoutes } from "./routes/search.js";
 import { createServerAdminRoutes } from "./routes/server-admin.js";
 import { createServerInfoRoutes } from "./routes/server-info.js";
+import {
+  createPublicSessionShareRoutes,
+  createSessionShareRoutes,
+  createSessionTranscriptRoutes,
+} from "./routes/session-shares.js";
 import { createSessionsRoutes } from "./routes/sessions.js";
 import { createSettingsRoutes } from "./routes/settings.js";
 import { createSharingRoutes } from "./routes/sharing.js";
@@ -136,6 +141,8 @@ import type { ServerSettingsService } from "./services/ServerSettingsService.js"
 import { SessionCommandService } from "./services/SessionCommandService.js";
 import { SessionTitleService } from "./services/SessionTitleService.js";
 import type { SharingService } from "./services/SharingService.js";
+import { SessionShareService } from "./session-shares/SessionShareService.js";
+import { createInProcessSessionPayloadLoader } from "./session-shares/session-payload-loader.js";
 import { CodexSessionReader } from "./sessions/codex-reader.js";
 import { resolveExistingCodexRolloutPath } from "./sessions/codex-rollout-file.js";
 import {
@@ -255,6 +262,8 @@ export interface AppOptions {
   modelInfoService?: ModelInfoService;
   /** SharingService for session sharing */
   sharingService?: SharingService;
+  /** Read-only share-link store; defaults to one under `dataDir`. */
+  sessionShareService?: SessionShareService;
   /** Codex bridge for externally launched `codex --remote` TUI sessions. */
   codexBridgeService?: CodexBridgeController;
   /** Canonical Codex transcript sources. Primarily injectable for tests/embedders. */
@@ -465,6 +474,7 @@ export function createApp(options: AppOptions): AppResult {
         authService: options.authService,
         authDisabled: options.authDisabled,
         desktopAuthToken: options.desktopAuthToken,
+        basePath,
       }),
     );
   }
@@ -1681,6 +1691,36 @@ export function createApp(options: AppOptions): AppResult {
         operationStore: options.feishuOperationStore,
         isChannelReady: options.feishuChannelReady,
       }),
+    );
+  }
+
+  // Transcript export and read-only share links. Captures replay the session
+  // detail route in-process, so a share shows exactly what the owner sees.
+  const loadSessionPayload = createInProcessSessionPayloadLoader({
+    fetch: (request, env) => app.fetch(request, env as HttpBindings),
+    basePath,
+  });
+  const sessionShareService =
+    options.sessionShareService ??
+    (options.dataDir
+      ? new SessionShareService({
+          dataDir: options.dataDir,
+          loadSession: loadSessionPayload,
+        })
+      : undefined);
+  app.route(
+    "/api",
+    createSessionTranscriptRoutes({ loadSession: loadSessionPayload }),
+  );
+  if (sessionShareService) {
+    app.route(
+      "/api",
+      createSessionShareRoutes({ shareService: sessionShareService }),
+    );
+    // Exempted from login by the auth middleware (see PUBLIC_API_PREFIX).
+    app.route(
+      "/api/public",
+      createPublicSessionShareRoutes({ shareService: sessionShareService }),
     );
   }
 

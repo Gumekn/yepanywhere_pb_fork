@@ -8,6 +8,8 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 ## [Unreleased]
 
 ### Added
+- 新增会话只读分享链接：会话右侧「⋯」菜单新增「分享链接…」，选择有效期（1 天／7 天／30 天／永久）后生成带 token 的链接并自动复制，打开者无需登录即可查看。链接内容是生成时冻结的快照（与 ChatGPT 网页端分享一致），之后的新消息不会出现；想分享新内容就再生成一个。对话框同时列出该会话已有的有效链接，可复制或撤销，撤销与过期立即生效。分享页（`/share/<token>`）独立于主界面渲染，不触发登录跳转，只展示标题、provider、模型和项目目录名，不包含项目完整路径和会话 ID；页面提供「查看 Markdown」，即同一快照的纯文本版本（`/api/public/session-shares/<token>/transcript.md`），可以直接交给其他机器上的 agent 阅读。快照存放在数据目录的 `session-shares/` 下（仅所有者可读写），抓取方式是在服务端进程内重放会话详情接口，所以内容与所有者看到的一致，适用于所有 provider（包括只读的 dsh）；Codex 等分页加载的历史会一并取全，单个快照超过 40 MB 时会去掉内嵌图片后重试，页面会提示历史不完整或图片已省略。原有 Cloudflare R2 HTML 快照分享（需手动配置 `sharing.json`）保留，菜单文案改为「分享 HTML 快照」以便区分。
+- 新增会话纯文本导出接口 `GET /api/projects/:projectId/sessions/:sessionId/transcript`（需登录）：默认输出 Markdown，工具调用及其结果放在对应的助手回合下，工具输出默认截断为 4000 字符；`?thinking=1` 包含思考内容，`?toolOutputLimit=0` 不截断，`?format=json` 返回规范化消息。「复制会话信息」新增 `Transcript:` 一行，粘贴给其他机器上的 agent 时，它可以通过 HTTP 读取会话，不再因为本机没有该 provider 的会话文件而读取失败。
 - 侧栏项目的分支图标同时显示本地和远端的提交差异：图标颜色和圆点仍表示工作区是否有未提交改动；图标右侧的 `↑N` 是还没推送到上游的本地提交，`↓N` 是远端默认分支（如 `origin/main`）上还没合入当前分支的提交（在 `main` 上时即待拉取的提交；本地和远端都有新提交时 `↓` 显示为警告色）。点击「最近会话」旁的刷新按钮会对侧栏中可见的 Git 项目执行一次 `git fetch`（新接口 `POST /api/projects/git/fetch`），获取期间分支图标轻微闪动，完成后自动刷新，有人合入 `main` 后即可看到。fetch 只在手动刷新时执行，不会在轮询中联网；同一仓库（含多个 worktree）只 fetch 一次、15 秒内成功过的跳过，禁止交互式认证且 20 秒超时，不触发 gc/maintenance。悬停弹层分别列出与上游、与主干的差异、上次获取时间和获取失败原因，并说明侧栏箭头的含义。远端默认分支与当前分支没有共同历史时（例如托管平台建仓时在 `main` 上生成的占位「Initial commit」，实际开发在其他分支），不再拿它比较，`↓` 改按上游计算，弹层注明「与当前分支没有共同历史，不作比较」。
 
 ### Changed
@@ -17,6 +19,7 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ### Fixed
 - 修复 `GET /api/sessions/:sessionId/locate` 无法定位 DeepSeek Harness（dsh）和 MiniMax Code（mcode）会话的问题：最后一步「逐个 provider 扫描」没有传入这两个 provider 的 reader，因此只拿会话 ID 的跳转和 agent 永远返回「Session not found」。
+- 修复设置了反向代理前缀（如 `/yep`）时登录鉴权的路径豁免失效的问题：鉴权中间件拿带前缀的完整路径去匹配 `/api/auth/*`、`/health`，导致开启密码登录后登录接口本身也要求已登录。现在会先去掉前缀再匹配。
 - 修复会话内搜索（`Cmd/Ctrl+F`）搜得到却不跳转、长消息后半段搜不到的问题，同时把定位精确到命中的文字。
   - **跳转失效**：搜索索引返回原始消息 id，而默认展示链路中 assistant 正文的行 id 是派生的（如 `text:<id>:<块序号>`），两边对不上，命中 assistant 回复时既不滚动也没有标识。现在展示段落带上来源消息 id，折叠进「过程」的中间文字也会记录在过程段上；全局搜索结果跳进会话也因此生效。
   - **长消息搜不到**：每条消息原来只索引前 2000 个字符，现在放宽到 64000 个字符。旧索引在首次搜索时自动重建。

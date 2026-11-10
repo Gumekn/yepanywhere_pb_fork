@@ -7,8 +7,10 @@ import { useI18n } from "../i18n";
 import { appPath } from "../lib/apiPath";
 import { writeClipboardText } from "../lib/clipboard";
 import { parseUserPrompt } from "../lib/parseUserPrompt";
+import { buildSessionTranscriptUrl } from "../lib/sessionShareLinks";
 import { getProvider } from "../providers/registry";
 import { PinIcon } from "./PinIcon";
+import { ShareSessionDialog } from "./ShareSessionDialog";
 
 /**
  * Decode a base64url project id back into its absolute path.
@@ -71,6 +73,9 @@ export function buildSessionInfoText(input: {
         `/projects/${projectId}/sessions/${sessionId}`,
       )}`,
     ],
+    // The link above is a UI page. An agent on another machine cannot read the
+    // provider's files there, but it can fetch this plain-text export.
+    ["Transcript", buildSessionTranscriptUrl(projectId, sessionId)],
   ];
 
   return rows
@@ -159,6 +164,7 @@ export function SessionMenu({
   const [isCompacting, setIsCompacting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
   const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
+  const [isShareDialogOpen, setIsShareDialogOpen] = useState(false);
   const [dropdownPosition, setDropdownPosition] = useState<{
     top: number;
     left?: number;
@@ -515,6 +521,24 @@ export function SessionMenu({
           {isCloning ? t("sessionMenuCloning") : t("sessionMenuClone")}
         </button>
       )}
+      <button
+        type="button"
+        onClick={() => handleAction(() => setIsShareDialogOpen(true))}
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          aria-hidden="true"
+        >
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </svg>
+        {t("sessionMenuShareLink")}
+      </button>
       {sharingConfigured && onShare && (
         <button type="button" onClick={handleShare} disabled={isSharing}>
           <svg
@@ -705,6 +729,14 @@ export function SessionMenu({
         )}
       </button>
       {isOpen && renderDropdown()}
+      {isShareDialogOpen && (
+        <ShareSessionDialog
+          projectId={projectId}
+          sessionId={sessionId}
+          title={title}
+          onClose={() => setIsShareDialogOpen(false)}
+        />
+      )}
     </div>
   );
 }
