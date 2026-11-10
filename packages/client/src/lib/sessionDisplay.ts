@@ -149,6 +149,7 @@ export function buildSessionDisplayRenderItems(
         segment.type === "assistant_text"
           ? segment.codexCorrelationKey
           : undefined,
+        contentSearchIds(segment),
       );
       switch (segment.type) {
         case "assistant_text":
@@ -405,11 +406,23 @@ function questionSourceMessage(
   };
 }
 
+/** Source message ids that content search may report for this segment. */
+function contentSearchIds(
+  segment: SessionDisplaySegment,
+): string[] | undefined {
+  if (segment.type === "assistant_text" && segment.messageId)
+    return [segment.messageId];
+  if (segment.type === "process" && segment.messageIds?.length)
+    return segment.messageIds;
+  return undefined;
+}
+
 function segmentSourceMessage(
   turnId: string,
   id: string,
   timestamp: string | undefined,
   codexCorrelationKey?: string,
+  searchIds?: string[],
 ): Message {
   return {
     uuid: id,
@@ -418,6 +431,7 @@ function segmentSourceMessage(
     role: "assistant",
     timestamp,
     ...(codexCorrelationKey ? { codexCorrelationKey } : {}),
+    ...(searchIds?.length ? { _contentSearchIds: searchIds } : {}),
     codexTurnId: turnId.startsWith("turn:")
       ? turnId.slice("turn:".length)
       : turnId,

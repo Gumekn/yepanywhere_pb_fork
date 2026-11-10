@@ -147,6 +147,26 @@ describe("SessionDisplayReducer process folding", () => {
     expect(model.hasNode(fold?.id ?? "")).toBe(true);
   });
 
+  it("records source message ids so content search can find text segments", () => {
+    const model = new SessionDisplayReducer(view, "codex", {
+      foldSettled: true,
+    });
+    model.restore(completedTurn("turn-1", 0), { "turn-1": "completed" });
+    model.setRuntime("completed");
+    const snapshot = model.snapshot();
+    expect(SessionDisplaySnapshotSchema.safeParse(snapshot).success).toBe(true);
+    const answer = snapshot.nodes.find(
+      (node) =>
+        node.type === "segment" && node.segment.type === "assistant_text",
+    );
+    expect(answer?.type === "segment" && answer.segment).toMatchObject({
+      type: "assistant_text",
+      messageId: "final-turn-1",
+    });
+    // Hidden progress text stays reachable through its fold.
+    expect(processes(snapshot)[0]?.messageIds).toEqual(["progress-turn-1"]);
+  });
+
   it("keeps the running answer expanded while folding earlier answers", () => {
     const model = new SessionDisplayReducer(view, "codex", {
       foldSettled: true,

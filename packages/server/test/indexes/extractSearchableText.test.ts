@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_CHARS_PER_MESSAGE,
   buildSnippet,
+  countOccurrences,
   extractSearchableMessages,
 } from "../../src/indexes/extractSearchableText.js";
 import type { Message } from "../../src/supervisor/types.js";
@@ -114,5 +115,50 @@ describe("buildSnippet", () => {
         snippet.matchStart + snippet.matchLength,
       ),
     ).toBe("WORLD");
+  });
+});
+
+describe("countOccurrences", () => {
+  it("counts non-overlapping hits", () => {
+    expect(countOccurrences("允许不同，允许不同", "允许不同")).toBe(2);
+    expect(countOccurrences("aaaa", "aa")).toBe(2);
+    expect(countOccurrences("abc", "x")).toBe(0);
+    expect(countOccurrences("abc", "")).toBe(0);
+  });
+});
+
+describe("long messages", () => {
+  it("keeps text far past the old 2K cap searchable", () => {
+    const text = `${"前文".repeat(1_600)}允许不同`;
+    const [message] = extractSearchableMessages([userMessage("u1", text)]);
+    expect(message?.text.includes("允许不同")).toBe(true);
+  });
+});
+
+describe("folded assistant text", () => {
+  it("marks assistant messages outside the visible set as folded", () => {
+    const messages: Message[] = [
+      userMessage("u1", "question"),
+      {
+        type: "assistant",
+        uuid: "a1",
+        message: { role: "assistant", content: "progress" as never },
+      } as Message,
+      {
+        type: "assistant",
+        uuid: "a2",
+        message: { role: "assistant", content: "answer" as never },
+      } as Message,
+    ];
+    const result = extractSearchableMessages(messages, new Set(["a2"]));
+    expect(result.map((message) => [message.id, message.folded])).toEqual([
+      ["u1", undefined],
+      ["a1", true],
+      ["a2", undefined],
+    ]);
+    // Without a projection every message stays searchable by default.
+    expect(
+      extractSearchableMessages(messages, null).some((m) => m.folded),
+    ).toBe(false);
   });
 });

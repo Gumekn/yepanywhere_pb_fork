@@ -15,6 +15,7 @@ import { api } from "../api/client";
 import { extractCodexTurnContextUsage } from "../lib/codexMessageContext";
 import { connectionManager } from "../lib/connection";
 import { DisplaySnapshotCache } from "../lib/displaySnapshotCache";
+import { displayNodeContainsMessage } from "../lib/messageSearchTarget";
 import { sessionLoadTracer } from "../lib/sessionLoadTiming";
 import {
   takePrefetchedMetadata,
@@ -639,13 +640,7 @@ export function useProjectedSessionMessages(
     UseSessionMessagesResult["loadTargetMessageWindow"]
   >(
     async (target) => {
-      if (
-        combined?.nodes.some(
-          (n) =>
-            n.id === target ||
-            (n.type === "question" && n.question.messageId === target),
-        )
-      )
+      if (combined?.nodes.some((n) => displayNodeContainsMessage(n, target)))
         return true;
       setLoadingTargetMessage(true);
       const expected = keyRef.current;
@@ -670,13 +665,7 @@ export function useProjectedSessionMessages(
           ]);
           cursor = page.olderCursor;
           setOlderCursor(cursor ?? "");
-          if (
-            page.nodes.some(
-              (n) =>
-                n.id === target ||
-                (n.type === "question" && n.question.messageId === target),
-            )
-          )
+          if (page.nodes.some((n) => displayNodeContainsMessage(n, target)))
             return true;
         }
         return false;

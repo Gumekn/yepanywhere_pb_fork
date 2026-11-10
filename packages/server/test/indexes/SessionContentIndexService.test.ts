@@ -126,6 +126,92 @@ describe("SessionContentIndexService", () => {
     expect(results[0]?.matches[0]?.role).toBe("assistant");
   });
 
+  it("reports how often the query occurs inside each message", async () => {
+    await createSession(
+      "s1",
+      "hello",
+      `unicorn first. ${"filler ".repeat(600)}unicorn again, Unicorn third`,
+    );
+
+    const index = await service.ensureIndexed(
+      sessionDir,
+      projectId,
+      reader,
+      loadMessages,
+    );
+    const [result] = service.searchScope(index, "unicorn", 3);
+    expect(result?.matchCount).toBe(1);
+    expect(result?.matches[0]?.occurrenceCount).toBe(3);
+  });
+
+  it("skips progress text folded behind a process unless asked", async () => {
+    const at = (second: number) =>
+      `2026-01-02T10:00:${String(second).padStart(2, "0")}Z`;
+    const entries = [
+      {
+        type: "user",
+        uuid: "s1-u",
+        parentUuid: null,
+        timestamp: at(0),
+        message: { role: "user", content: "Fix the unicorn" },
+      },
+      {
+        type: "assistant",
+        uuid: "s1-progress",
+        parentUuid: "s1-u",
+        timestamp: at(1),
+        message: {
+          id: "msg-progress",
+          role: "assistant",
+          content: [
+            { type: "text", text: "Checking the unicorn first" },
+            { type: "tool_use", id: "tool-1", name: "Bash", input: {} },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "s1-result",
+        parentUuid: "s1-progress",
+        timestamp: at(2),
+        message: {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "tool-1", content: "ok" },
+          ],
+        },
+      },
+      {
+        type: "assistant",
+        uuid: "s1-final",
+        parentUuid: "s1-result",
+        timestamp: at(3),
+        message: {
+          id: "msg-final",
+          role: "assistant",
+          content: [{ type: "text", text: "The unicorn is fixed" }],
+        },
+      },
+    ];
+    await writeFile(
+      join(sessionDir, "s1.jsonl"),
+      `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    );
+
+    const index = await service.ensureIndexed(
+      sessionDir,
+      projectId,
+      reader,
+      loadMessages,
+    );
+    const ids = (includeFolded: boolean) =>
+      service
+        .searchScope(index, "unicorn", 10, "s1", { includeFolded })[0]
+        ?.matches.map((match) => match.messageId);
+    expect(ids(false)).toEqual(["s1-u", "s1-final"]);
+    expect(ids(true)).toEqual(["s1-u", "s1-progress", "s1-final"]);
+  });
+
   it("returns no results when nothing matches", async () => {
     await createSession("s1", "hello", "world");
     const index = await service.ensureIndexed(

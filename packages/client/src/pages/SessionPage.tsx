@@ -26,7 +26,10 @@ import { ReadOnlySessionBar } from "../components/ReadOnlySessionBar";
 import { RemoteProjectIcon } from "../components/RemoteProjectIcon";
 import { SessionInspector } from "../components/SessionInspector";
 import { SessionMenu } from "../components/SessionMenu";
-import { SessionSearchBar } from "../components/SessionSearchBar";
+import {
+  SessionSearchBar,
+  type SessionSearchOccurrence,
+} from "../components/SessionSearchBar";
 import { SessionTitleGenerationStatus } from "../components/SessionTitleGenerationStatus";
 import { SideConversationPanel } from "../components/SideConversationPanel";
 import { SubagentDetailProvider } from "../components/SubagentDetailProvider";
@@ -452,6 +455,11 @@ function SessionPageContent({
     setIsExpanded: setInspectorExpanded,
   } = useSessionInspectorPreference();
   const [isSessionSearchOpen, setSessionSearchOpen] = useState(false);
+  const [sessionSearchQuery, setSessionSearchQuery] = useState<string | null>(
+    null,
+  );
+  // Set only when the current target came from the in-session find.
+  const [targetOccurrence, setTargetOccurrence] = useState<number | null>(null);
   const pageVisible = useDocumentVisibility();
   const isInspectorVisible =
     pageVisible &&
@@ -476,13 +484,23 @@ function SessionPageContent({
   }, []);
   const handleSelectMessage = useCallback((messageId: string) => {
     if (!messageId) return;
+    setTargetOccurrence(null);
     setTargetMessageId(messageId);
   }, []);
+  const handleSelectSearchMatch = useCallback(
+    (match: SessionSearchOccurrence) => {
+      if (!match.messageId) return;
+      setTargetOccurrence(match.occurrence);
+      setTargetMessageId(match.messageId);
+    },
+    [],
+  );
   const handleOpenSessionSearch = useCallback(() => {
     setSessionSearchOpen(true);
   }, []);
   const handleCloseSessionSearch = useCallback(() => {
     setSessionSearchOpen(false);
+    setSessionSearchQuery(null);
   }, []);
 
   const inspectorMessages = useMemo(
@@ -500,6 +518,7 @@ function SessionPageContent({
   useEffect(() => {
     const focus = resolveBranchNavigationFocus(navState, selectedBranchId);
     setPendingBranchFocusId(focus.branchId);
+    setTargetOccurrence(null);
     setTargetMessageId(focus.messageId);
   }, [sessionId]);
 
@@ -2607,7 +2626,8 @@ function SessionPageContent({
           sessionId={sessionId}
           onOpen={handleOpenSessionSearch}
           onClose={handleCloseSessionSearch}
-          onSelectMessage={handleSelectMessage}
+          onSelectMatch={handleSelectSearchMatch}
+          onQueryChange={setSessionSearchQuery}
         />
 
         {session?.parentSessionId && (
@@ -2726,6 +2746,8 @@ function SessionPageContent({
           focusBranchId={pendingBranchFocusId}
           onBranchFocused={handleBranchFocused}
           targetMessageId={targetMessageId}
+          targetOccurrence={targetOccurrence}
+          searchQuery={isSessionSearchOpen ? sessionSearchQuery : null}
           onTargetFocused={handleTargetFocused}
           transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
           agentContent={agentContent}

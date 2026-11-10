@@ -12,6 +12,8 @@ export const SESSION_DISPLAY_QUESTION_PREVIEW_MAX_LENGTH = 140;
 export const SESSION_DISPLAY_THINKING_PREVIEW_MAX_LENGTH = 240;
 export const SESSION_DISPLAY_LIVE_STEP_LIMIT = 50;
 export const SESSION_DISPLAY_STEP_PREVIEW_LIMIT = 2_048;
+/** Folded assistant-text source ids listed on one process segment. */
+export const SESSION_DISPLAY_PROCESS_MAX_MESSAGE_IDS = 256;
 
 export const SessionDisplayToolStepSchema = z
   .object({
@@ -106,6 +108,12 @@ export const SessionDisplayAssistantTextSegmentSchema = z
   .object({
     type: z.literal("assistant_text"),
     id: NonEmptyIdSchema,
+    /**
+     * Source message identity (`uuid ?? id`) of the row that produced this
+     * text. Content search reports this id, so deep links can find the
+     * segment even though the display id is derived from it.
+     */
+    messageId: NonEmptyIdSchema.optional(),
     /** Stable native identity shared by live and persisted assistant rows. */
     codexCorrelationKey: NonEmptyIdSchema.optional(),
     phase: z.enum(["progress", "final", "text"]),
@@ -294,6 +302,14 @@ export const SessionDisplayProcessSegmentSchema = z
     version: z.number().int().nonnegative(),
     /** Older-history cursor that reproduces this fold outside the live view. */
     pageCursor: z.string().min(1).max(8_192).optional(),
+    /**
+     * Source message ids of the assistant text folded inside, so a content
+     * search hit on hidden progress text can still land on its fold.
+     */
+    messageIds: z
+      .array(NonEmptyIdSchema)
+      .max(SESSION_DISPLAY_PROCESS_MAX_MESSAGE_IDS)
+      .optional(),
     timestamp: TimestampSchema.optional(),
   })
   .strict();

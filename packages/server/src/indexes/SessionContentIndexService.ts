@@ -30,8 +30,10 @@ import type { EventBus, FileChangeEvent } from "../watcher/index.js";
 import {
   type IndexedMessage,
   buildSnippet,
+  countOccurrences,
   extractSearchableMessages,
 } from "./extractSearchableText.js";
+import { findVisibleAssistantMessageIds } from "./foldedMessages.js";
 
 const logger = getLogger();
 
@@ -59,12 +61,17 @@ export interface CachedSessionContent {
 }
 
 export interface SessionContentIndexState {
-  version: 1;
+  version: number;
   projectId: string;
   sessions: Record<string, CachedSessionContent>;
 }
 
-const CURRENT_VERSION = 1;
+/**
+ * v2: per-message text cap raised from 2K chars.
+ * v3: assistant text hidden in folded processes is marked `folded`.
+ * Older indexes are rebuilt.
+ */
+const CURRENT_VERSION = 3;
 
 /**
  * Loads a session's normalized messages on cache miss. Provided by the caller
@@ -88,6 +95,7 @@ export interface ScopeSearchResult {
   title: string | null;
   updatedAt: string;
   provider: ProviderName;
+  /** Number of messages that contain the query. */
   matchCount: number;
   /** Whether the query matched the session title (used for ranking). */
   titleMatch: boolean;
@@ -97,6 +105,8 @@ export interface ScopeSearchResult {
     snippet: string;
     matchStart: number;
     matchLength: number;
+    /** Occurrences of the query within this message's indexed text. */
+    occurrenceCount: number;
   }>;
 }
 
@@ -440,7 +450,14 @@ export class SessionContentIndexService {
       };
     }
 
-    const messages = extractSearchableMessages(loaded.messages);
+    const messages = extractSearchableMessages(
+      loaded.messages,
+      findVisibleAssistantMessageIds(
+        sessionId,
+        loaded.provider,
+        loaded.messages,
+      ),
+    );
     return {
       fileMtime: mtime,
       indexedBytes: size,
@@ -596,6 +613,7 @@ export class SessionContentIndexService {
     queryLower: string,
     perSessionMatchLimit: number,
     filterSessionId?: string,
+    options: { includeFolded?: boolean } = {},
   ): ScopeSearchResult[] {
     const results: ScopeSearchResult[] = [];
     if (!queryLower) return results;
@@ -626,6 +644,7 @@ export class SessionContentIndexService {
       let matchCount = 0;
 
       for (const message of session.messages) {
+        if (message.folded && !options.includeFolded) continue;
         if (!message.text.includes(queryLower)) continue;
         matchCount++;
         if (matches.length < perSessionMatchLimit) {
@@ -637,6 +656,10 @@ export class SessionContentIndexService {
               snippet: snippet.snippet,
               matchStart: snippet.matchStart,
               matchLength: snippet.matchLength,
+              occurrenceCount: Math.max(
+                1,
+                countOccurrences(message.text, queryLower),
+              ),
             });
           }
         }

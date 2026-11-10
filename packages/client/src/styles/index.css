@@ -1556,6 +1556,11 @@ h2 {
   cursor: default;
 }
 
+.session-search-control.is-active {
+  color: var(--primary-color);
+  background: color-mix(in srgb, var(--primary-color) 14%, transparent);
+}
+
 .session-search-close {
   margin-left: var(--space-1);
 }
@@ -15117,4 +15122,14 @@ button.context-usage-indicator--button:focus-visible {
 .message-target-highlight {
   animation: message-target-flash 2.4s ease-out;
   border-radius: var(--radius-md);
+}
+
+/* In-session find: every rendered hit, and the one currently selected. */
+::highlight(yep-search-match) {
+  background-color: color-mix(in srgb, #f5c542 38%, transparent);
+}
+
+::highlight(yep-search-current) {
+  background-color: #f59e0b;
+  color: #111;
 }

@@ -689,6 +689,7 @@ export {
   SessionDisplayActivitySchema,
   SESSION_DISPLAY_LIVE_STEP_LIMIT,
   SESSION_DISPLAY_STEP_PREVIEW_LIMIT,
+  SESSION_DISPLAY_PROCESS_MAX_MESSAGE_IDS,
   applySessionDisplayPatch,
   sameSessionDisplayView,
   sessionDisplaySnapshotPage,

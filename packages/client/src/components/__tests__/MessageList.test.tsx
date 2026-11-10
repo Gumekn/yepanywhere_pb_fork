@@ -299,6 +299,33 @@ describe("MessageList target loading", () => {
     expect(loadOlderMessages).not.toHaveBeenCalled();
   });
 
+  it("focuses a display row through the source id content search reports", async () => {
+    const onTargetFocused = vi.fn();
+    const loadTargetMessage = vi.fn(async () => false);
+    const item = assistantTextItem("text:raw-1:0", "2026-01-01T00:00:00Z");
+    const source = item.sourceMessages[0];
+    if (!source) throw new Error("expected source message");
+    source._contentSearchIds = ["raw-1"];
+
+    render(
+      <MessageList
+        messages={[]}
+        preprocessedItems={[userPromptItem("question"), item]}
+        targetMessageId="raw-1"
+        targetOccurrence={0}
+        searchQuery="raw"
+        onLoadTargetMessage={loadTargetMessage}
+        onTargetFocused={onTargetFocused}
+      />,
+    );
+
+    // No layout in jsdom: the hit cannot be measured, so the row is the
+    // fallback — but it is found locally without asking the server.
+    await waitFor(() => expect(onTargetFocused).toHaveBeenCalledTimes(1));
+    expect(loadTargetMessage).not.toHaveBeenCalled();
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+  });
+
   it("focuses a branch prompt restored from cross-session navigation state", async () => {
     const onBranchFocused = vi.fn();
     const item = userPromptItem("edited prompt", "msg_edited");

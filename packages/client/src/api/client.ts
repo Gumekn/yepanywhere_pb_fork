@@ -280,6 +280,8 @@ export interface SearchMatch {
   matchStart: number;
   /** Char length of the matched substring. */
   matchLength: number;
+  /** Occurrences of the query within this message (older servers omit it). */
+  occurrenceCount?: number;
 }
 
 /** One session's grouped search results. */
@@ -2307,6 +2309,8 @@ export const api = {
     session?: string;
     limit?: number;
     sort?: SearchSort;
+    /** Also match progress text folded behind a process summary. */
+    includeFolded?: boolean;
   }) => {
     const searchParams = new URLSearchParams();
     searchParams.set("q", params.q);
@@ -2314,6 +2318,7 @@ export const api = {
     if (params.session) searchParams.set("session", params.session);
     if (params.limit) searchParams.set("limit", String(params.limit));
     if (params.sort) searchParams.set("sort", params.sort);
+    if (params.includeFolded) searchParams.set("includeFolded", "true");
     return fetchJSON<SearchResponse>(`/search?${searchParams.toString()}`);
   },
 
@@ -2458,6 +2463,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ html, title }),
     }),
+
 };
 
 export interface RemoteExecutorTestResult {

@@ -1,6 +1,7 @@
 import type { CodexAsyncMessage } from "@yep-anywhere/shared";
 import {
   SESSION_DISPLAY_LIVE_STEP_LIMIT,
+  SESSION_DISPLAY_PROCESS_MAX_MESSAGE_IDS,
   SESSION_DISPLAY_STEP_PREVIEW_LIMIT,
   type SessionDisplayActivity,
   type SessionDisplayNode,
@@ -469,10 +470,19 @@ export class SessionDisplayReducer {
     asyncMessage?: CodexAsyncMessage,
     provisional = false,
     placement?: CursorThinkingPlacement,
+    messageId?: string,
   ): void {
     if (!text.trim()) return;
     if (streaming && this.committed.has(id)) return;
     const old = this.nodeIndices.get(id);
+    const previous = old === undefined ? undefined : this.nodes[old];
+    // Deltas carry no persisted identity; keep the one already recorded.
+    const sourceMessageId =
+      messageId ??
+      (previous?.type === "segment" &&
+      previous.segment.type === "assistant_text"
+        ? previous.segment.messageId
+        : undefined);
     if (old === undefined) this.stopStreaming(this.currentRun, id);
     const active = streaming && !this.endedRuns.has(this.currentRun);
     if (active && !thinking) this.streamingTexts.set(id, this.currentRun);
@@ -498,6 +508,7 @@ export class SessionDisplayReducer {
         : {
             type: "assistant_text",
             id,
+            ...(sourceMessageId ? { messageId: sourceMessageId } : {}),
             content: text,
             streaming: active,
             ...(asyncMessage ? { asyncMessage } : {}),
@@ -999,6 +1010,8 @@ export class SessionDisplayReducer {
               message.codexAsyncMessage as CodexAsyncMessage | undefined,
               message._isStreaming === true ||
                 message._isStreamingPlaceholder === true,
+              undefined,
+              rawId ?? undefined,
             );
           } else if (
             block.type === "thinking" &&
@@ -1486,6 +1499,7 @@ export class SessionDisplayReducer {
     let thinkingCount = 0;
     let updateCount = 0;
     const paths = new Set<string>();
+    const messageIds = new Set<string>();
     let earliest: SourceTime | undefined;
     for (const node of members) {
       const segment = node.segment;
@@ -1496,7 +1510,14 @@ export class SessionDisplayReducer {
           for (const path of this.tools.get(toolId)?.paths ?? [])
             paths.add(path);
       } else if (segment.type === "thinking") thinkingCount++;
-      else if (segment.type === "assistant_text") updateCount++;
+      else if (segment.type === "assistant_text") {
+        updateCount++;
+        if (
+          segment.messageId &&
+          messageIds.size < SESSION_DISPLAY_PROCESS_MAX_MESSAGE_IDS
+        )
+          messageIds.add(segment.messageId);
+      }
       for (const time of this.segmentTimes(node))
         if (!earliest || time.time < earliest.time) earliest = time;
     }
@@ -1523,6 +1544,7 @@ export class SessionDisplayReducer {
       ...(endedAt ? { endedAt } : {}),
       version: foldVersion(members),
       ...(options.pageCursor ? { pageCursor: options.pageCursor } : {}),
+      ...(messageIds.size ? { messageIds: [...messageIds] } : {}),
       ...(startedAt ? { timestamp: startedAt } : {}),
     };
   }

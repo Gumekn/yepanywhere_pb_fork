@@ -67,6 +67,8 @@ export const SessionTranscript = memo(function SessionTranscript({
   focusBranchId,
   onBranchFocused,
   targetMessageId,
+  targetOccurrence,
+  searchQuery,
   onTargetFocused,
   transcriptKey,
   agentContent,
@@ -108,6 +110,8 @@ export const SessionTranscript = memo(function SessionTranscript({
   focusBranchId: TranscriptListProps["focusBranchId"];
   onBranchFocused: TranscriptListProps["onBranchFocused"];
   targetMessageId: TranscriptListProps["targetMessageId"];
+  targetOccurrence?: TranscriptListProps["targetOccurrence"];
+  searchQuery?: TranscriptListProps["searchQuery"];
   onTargetFocused: TranscriptListProps["onTargetFocused"];
   transcriptKey: string;
   agentContent: AgentContentMap;
@@ -168,6 +172,8 @@ export const SessionTranscript = memo(function SessionTranscript({
                 focusBranchId={focusBranchId}
                 onBranchFocused={onBranchFocused}
                 targetMessageId={targetMessageId}
+                targetOccurrence={targetOccurrence}
+                searchQuery={searchQuery}
                 onTargetFocused={onTargetFocused}
                 transcriptKey={transcriptKey}
               />

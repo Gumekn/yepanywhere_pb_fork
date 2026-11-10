@@ -17,8 +17,11 @@
 import { stringMessageId } from "@yep-anywhere/shared";
 import type { ContentBlock, Message } from "../supervisor/types.js";
 
-/** Hard cap on indexed text per message to bound index size. */
-export const MAX_CHARS_PER_MESSAGE = 2000;
+/**
+ * Hard cap on indexed text per message to bound index size. Large enough that
+ * long assistant reports stay fully searchable; only pasted blobs are cut.
+ */
+export const MAX_CHARS_PER_MESSAGE = 64_000;
 
 /** Default snippet window (chars of context around a match). */
 export const DEFAULT_SNIPPET_WINDOW = 150;
@@ -36,6 +39,11 @@ export interface IndexedMessage {
   text: string;
   /** Original-case text, used for snippet display. Same length as `text`. */
   originalText: string;
+  /**
+   * Assistant text shown only inside a folded process (progress between tool
+   * calls). Content search skips it unless folded text is requested.
+   */
+  folded?: true;
 }
 
 /** A single match within a message, with offsets for client highlighting. */
@@ -93,10 +101,13 @@ function extractMessageText(message: Message): string {
 
 /**
  * Extract indexed messages from a normalized session's `Message[]`.
- * Only user/assistant messages with non-empty text are kept.
+ * Only user/assistant messages with non-empty text are kept. When
+ * `visibleAssistantIds` is given, assistant messages outside it are marked
+ * `folded`.
  */
 export function extractSearchableMessages(
   messages: Message[],
+  visibleAssistantIds?: ReadonlySet<string> | null,
 ): IndexedMessage[] {
   const result: IndexedMessage[] = [];
 
@@ -116,15 +127,36 @@ export function extractSearchableMessages(
         ? raw.slice(0, MAX_CHARS_PER_MESSAGE)
         : raw;
 
+    const folded =
+      message.type === "assistant" &&
+      visibleAssistantIds != null &&
+      !visibleAssistantIds.has(id);
     result.push({
       id,
       role: messageRole(message),
       text: originalText.toLowerCase(),
       originalText,
+      ...(folded ? { folded: true as const } : {}),
     });
   }
 
   return result;
+}
+
+/** Count non-overlapping occurrences of `queryLower` in lowercased `textLower`. */
+export function countOccurrences(
+  textLower: string,
+  queryLower: string,
+): number {
+  if (!queryLower) return 0;
+  let count = 0;
+  let from = 0;
+  while (true) {
+    const index = textLower.indexOf(queryLower, from);
+    if (index === -1) return count;
+    count++;
+    from = index + queryLower.length;
+  }
 }
 
 /**
