@@ -5,7 +5,9 @@
  * session via `?project=&session=`.
  * Results are grouped per session, each with snippet matches that the client
  * can deep-link + highlight. Ordering is controlled by `?sort=` (`recent`,
- * default, or `relevance`). Backed by SessionContentIndexService, which caches
+ * default, or `relevance`). Assistant progress text that the session view
+ * folds behind a process summary is skipped unless `?includeFolded=true`.
+ * Backed by SessionContentIndexService, which caches
  * per-message text and only re-parses files that changed (mtime/size + watcher
  * dirty-tracking), so repeat searches are served from memory.
  */
@@ -66,6 +68,8 @@ export interface SearchMatch {
   snippet: string;
   matchStart: number;
   matchLength: number;
+  /** Occurrences of the query within this message. */
+  occurrenceCount: number;
 }
 
 export interface SearchResultSession {
@@ -134,13 +138,16 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
   const routes = new Hono();
   const loadMessages = createLoadMessages();
 
-  // GET /api/search?q=&project=&session=&limit=&sort=
+  // GET /api/search?q=&project=&session=&limit=&sort=&includeFolded=
   routes.get("/", async (c) => {
     const start = Date.now();
     const rawQuery = c.req.query("q")?.trim() ?? "";
     const sort = parseSort(c.req.query("sort"));
     const filterProjectId = c.req.query("project");
     const filterSessionId = c.req.query("session")?.trim() || undefined;
+    // Progress text folded behind a settled answer's process summary is
+    // skipped unless explicitly requested.
+    const includeFolded = c.req.query("includeFolded") === "true";
     const limitParam = c.req.query("limit");
     const limit = Math.min(
       Math.max(1, Number.parseInt(limitParam || "", 10) || DEFAULT_LIMIT),
@@ -219,6 +226,7 @@ export function createSearchRoutes(deps: SearchDeps): Hono {
             queryLower,
             filterSessionId ? MATCHES_FOR_SINGLE_SESSION : MATCHES_PER_SESSION,
             filterSessionId,
+            { includeFolded },
           );
           for (const result of scopeResults) {
             if (bySession.has(result.sessionId)) continue;

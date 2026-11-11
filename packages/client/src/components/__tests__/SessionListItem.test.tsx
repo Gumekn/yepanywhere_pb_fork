@@ -169,6 +169,7 @@ describe("SessionListItem actions", () => {
         "Provider: codex",
         "Project: /Users/someone/work/alpha",
         `Link: ${window.location.origin}/projects/${projectId}/sessions/session-1`,
+        `Transcript: ${window.location.origin}/api/projects/${projectId}/sessions/session-1/transcript`,
       ].join("\n"),
     );
   });

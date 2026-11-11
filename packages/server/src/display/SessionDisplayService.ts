@@ -5,6 +5,7 @@ import type {
   SessionDisplayCurrent,
   SessionDisplayGroupPage,
   SessionDisplayKnownView,
+  SessionDisplayProcessPage,
   SessionDisplaySnapshot,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
@@ -29,6 +30,7 @@ import { augmentPersistedSessionMessages } from "../sessions/persisted-augments.
 import type { Message } from "../supervisor/types.js";
 import {
   SessionDisplayReducer,
+  type SessionDisplayReducerOptions,
   decodeDisplayToolId,
 } from "./SessionDisplayReducer.js";
 import {
@@ -56,6 +58,8 @@ export interface DisplaySourcePage {
   messages: Message[];
   contextUsage?: ContextUsage;
   turnStatuses?: Readonly<Record<string, SessionDisplayTurnStatus>>;
+  /** Native turn completion times, for providers whose items lack them. */
+  turnCompletedAt?: Readonly<Record<string, string>>;
   /** Native Codex turns covering [from, before); newer live turns may lag history. */
   codexTurnWindow?: { turnIds: string[]; from: number; before: number };
   activity: SessionDisplayActivity["state"];
@@ -530,8 +534,17 @@ export class SessionDisplayService {
       /** Settled views kept after expiry; 0 disables dormancy. */
       maxDormantEntries?: number;
       maxDormantBytes?: number;
+      /**
+       * Fold the working steps of settled answers behind one `process`
+       * segment (default true). Members load through `process()`.
+       */
+      foldSettledTurns?: boolean;
     },
   ) {}
+
+  private get reducerOptions(): SessionDisplayReducerOptions {
+    return { foldSettled: this.options.foldSettledTurns ?? true };
+  }
 
   configureSource(source: SessionDisplaySource): void {
     this.source = source;
@@ -1145,13 +1158,21 @@ export class SessionDisplayService {
         entry.model?.isMessageCommitted(message.messageId)
       )
         return;
+      const snapshot = asRecord(message.message);
+      // Claude deltas rely on message_start rather than carrying their own
+      // message ID. It may already have aged out of the replay buffer.
+      if (!snapshot?.codexTurnId) entry.streamId = message.messageId;
       this.event(entry, "message", {
         ...previous,
+        ...(snapshot?.uuid === message.messageId ? snapshot : {}),
         type: "assistant",
         uuid: message.messageId,
-        _isStreaming: true,
+        _isStreaming: snapshot?._isStreaming !== false,
         _isStreamingPlaceholder: true,
-        message: { role: "assistant", content: message.text },
+        message:
+          snapshot?.uuid === message.messageId
+            ? snapshot.message
+            : { role: "assistant", content: message.text },
       });
       return;
     }
@@ -1264,6 +1285,7 @@ export class SessionDisplayService {
         if (
           previous &&
           previous._isStreaming !== true &&
+          !(message.codexTurnId && messageContent(previous) === "") &&
           (!start || previous._isStreamingPlaceholder !== true)
         )
           return;
@@ -1579,7 +1601,11 @@ export class SessionDisplayService {
       }
     }
     this.acknowledgePersisted(entry, page);
-    const model = new SessionDisplayReducer(entry.view, page.provider);
+    const model = new SessionDisplayReducer(
+      entry.view,
+      page.provider,
+      this.reducerOptions,
+    );
     let restored = page.messages;
     if (page.provider === "cursor") {
       for (const message of entry.overlay.values()) {
@@ -1587,7 +1613,7 @@ export class SessionDisplayService {
           restored = insertCursorPrompt(restored, message);
       }
     }
-    model.restore(restored, page.turnStatuses);
+    model.restore(restored, page.turnStatuses, page.turnCompletedAt);
     if (!page.messages.length)
       for (const message of entry.bootstrapReplay.values())
         model.message(message, true);
@@ -1636,10 +1662,7 @@ export class SessionDisplayService {
     entry.stamp = page.stamp;
     const previous = entry.snapshot;
     const previousTail = previous?.nodes.at(-1);
-    if (
-      previousTail &&
-      !model.snapshot().nodes.some((node) => node.id === previousTail.id)
-    ) {
+    if (previousTail && !model.hasNode(previousTail.id)) {
       // A rewrite (or a source window too far ahead to prove continuity)
       // invalidates the view. Do not replay acknowledged, removed history.
       entry.view = { ...entry.view, epoch: randomUUID() };
@@ -2054,6 +2077,12 @@ export class SessionDisplayService {
     if (contextUsage) emit("display-context-usage", contextUsage);
     for (const [key, value] of entry.controls)
       if (key.startsWith("message:init")) emit("message", value);
+    const durableSessionId = this.durableSessionId(entry);
+    if (durableSessionId)
+      emit("session-id-changed", {
+        oldSessionId: selection.sessionId,
+        newSessionId: durableSessionId,
+      });
     entry.listeners.add(emit);
     const cleanup = () => {
       entry.listeners.delete(emit);
@@ -2062,6 +2091,30 @@ export class SessionDisplayService {
     };
     signal?.addEventListener("abort", cleanup, { once: true });
     return { cleanup };
+  }
+  /**
+   * The durable ID of a view opened under a provider's temporary bootstrap ID.
+   * The rename usually happened before this listener (often before this view)
+   * existed, so its live `session-id-changed` was never delivered, and the
+   * `connected` above deliberately keeps the requested ID for the snapshot
+   * view. Without this the client stays on the alias as a second session.
+   */
+  private durableSessionId(entry: Entry): string | undefined {
+    if (entry.selection.branchId) return undefined;
+    const requested = entry.selection.sessionId;
+    const changed = asRecord(entry.controls.get("session-id-changed"));
+    if (
+      changed?.oldSessionId === requested &&
+      typeof changed.newSessionId === "string" &&
+      changed.newSessionId &&
+      changed.newSessionId !== requested
+    )
+      return changed.newSessionId;
+    // A runtime subscription reports the attached process's current ID.
+    const reported = asRecord(entry.controls.get("connected"))?.sessionId;
+    return typeof reported === "string" && reported && reported !== requested
+      ? reported
+      : undefined;
   }
   async snapshot(
     selection: DisplaySelection,
@@ -2097,15 +2150,47 @@ export class SessionDisplayService {
     if (entry.view.epoch !== view.epoch)
       throw new Error("Display view changed while loading history");
     const reduceStartedAt = performance.now();
-    const model = new SessionDisplayReducer(view, page.provider);
-    model.restore(page.messages, page.turnStatuses);
+    const model = new SessionDisplayReducer(
+      view,
+      page.provider,
+      this.reducerOptions,
+    );
+    model.restore(page.messages, page.turnStatuses, page.turnCompletedAt);
     if (!entry.snapshot) throw new Error("Display snapshot is not ready");
     const snapshot = {
-      ...model.snapshot(page.cursor),
+      ...model.snapshot(page.cursor, cursor),
       seq: entry.snapshot.seq,
     };
     observer?.timing?.add("reduce", performance.now() - reduceStartedAt);
     return snapshot;
+  }
+  /**
+   * Folded working steps of one settled answer. Live folds come from the
+   * current projection; folds from older history pages are rebuilt from the
+   * page cursor recorded on the segment.
+   */
+  async process(
+    selection: DisplaySelection,
+    processId: string,
+    pageCursor?: string,
+  ): Promise<SessionDisplayProcessPage> {
+    if (!processId.startsWith("process:"))
+      throw new Error("Invalid display process id");
+    const entry = await this.get(selection);
+    this.flush(entry);
+    let nodes = entry.model?.processNodes(processId) ?? null;
+    if (!nodes && pageCursor) {
+      const page = await this.requireSource().read(selection, pageCursor);
+      const model = new SessionDisplayReducer(
+        entry.view,
+        page.provider,
+        this.reducerOptions,
+      );
+      model.restore(page.messages, page.turnStatuses, page.turnCompletedAt);
+      nodes = model.processNodes(processId);
+    }
+    if (!nodes) throw new Error("Display process not found");
+    return { processId, nodes };
   }
   async group(
     selection: DisplaySelection,

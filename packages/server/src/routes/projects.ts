@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
   type PermissionMode,
+  type ProjectGitFetchResponse,
+  type ProjectGitFetchResult,
   type ProjectGitStatusSummary,
   type UrlProjectId,
   isUrlProjectId,
@@ -14,6 +16,7 @@ import { listActiveBridgeSessionViews } from "../bridge-common/multi.js";
 import type { BridgeSessionView as CommonBridgeSessionView } from "../bridge-common/types.js";
 import type { CodexBridgeController } from "../codex-bridge/types.js";
 import type { CodexSessionCatalog } from "../codex-history/CodexSessionCatalog.js";
+import { GitRemoteFetcher } from "../git-remote-fetch.js";
 import { GitStatusSummaryCache } from "../git-status-summary.js";
 import type { SessionIndexService } from "../indexes/index.js";
 import type {
@@ -76,6 +79,8 @@ export interface ProjectsDeps {
   gitStatusProvider?: (
     project: Project,
   ) => Promise<ProjectGitStatusSummary | null>;
+  /** Optional override for user-triggered `git fetch` (primarily for tests). */
+  gitRemoteFetcher?: GitRemoteFetcher;
   /** Codex scanner for checking if a project has Codex sessions */
   codexScanner?: CodexSessionScanner;
   /** Codex sessions directory (defaults to ~/.codex/sessions) */
@@ -187,6 +192,7 @@ async function loadOwnedProcessViews(
 }
 
 const PROJECT_GIT_STATUS_CONCURRENCY = 6;
+const MAX_GIT_FETCH_PROJECTS = 30;
 
 type BridgeSessionView = CommonBridgeSessionView;
 
@@ -295,6 +301,14 @@ async function getProjectActivityCounts(
   return counts;
 }
 
+function withFetchError(
+  summary: ProjectGitStatusSummary | null,
+  fetchError: string | null,
+): ProjectGitStatusSummary | null {
+  if (!summary?.isGitRepo) return summary;
+  return { ...summary, fetchError };
+}
+
 async function getProjectGitStatusSummaries(
   projects: Project[],
   provider: (project: Project) => Promise<ProjectGitStatusSummary | null>,
@@ -331,6 +345,7 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
   // into one git invocation per project. Tests can bypass it via
   // `deps.gitStatusProvider`.
   const gitStatusCache = new GitStatusSummaryCache();
+  const gitRemoteFetcher = deps.gitRemoteFetcher ?? new GitRemoteFetcher();
 
   /**
    * Get owned sessions for a project that might not be in the file list yet.
@@ -502,7 +517,10 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
         ...project,
         activeOwnedCount: counts?.activeOwnedCount ?? 0,
         activeExternalCount: counts?.activeExternalCount ?? 0,
-        gitStatus: gitStatusSummaries.get(project.id) ?? null,
+        gitStatus: withFetchError(
+          gitStatusSummaries.get(project.id) ?? null,
+          gitRemoteFetcher.getError(project.path),
+        ),
       };
     });
 
@@ -599,6 +617,62 @@ export function createProjectsRoutes(deps: ProjectsDeps): Hono {
       exact: requestedIsDirectory,
       truncated: directoryEntries.length > directories.length,
     });
+  });
+
+  // POST /api/projects/git/fetch - Fetch remotes for the given projects so
+  // ahead/behind counts reflect commits pushed by others. Only runs on an
+  // explicit user refresh; project list polls never touch the network.
+  routes.post("/git/fetch", async (c) => {
+    let body: { projectIds?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "Invalid JSON body" }, 400);
+    }
+    const rawIds = body.projectIds;
+    if (
+      !Array.isArray(rawIds) ||
+      !rawIds.every((id): id is string => typeof id === "string")
+    ) {
+      return c.json({ error: "projectIds must be an array of strings" }, 400);
+    }
+    const projectIds = [...new Set(rawIds)];
+    if (projectIds.length > MAX_GIT_FETCH_PROJECTS) {
+      return c.json(
+        { error: `At most ${MAX_GIT_FETCH_PROJECTS} projects per request` },
+        400,
+      );
+    }
+    if (!projectIds.every((id) => isUrlProjectId(id))) {
+      return c.json({ error: "Invalid project ID format" }, 400);
+    }
+
+    const projects = await Promise.all(
+      projectIds.map(async (projectId) => ({
+        projectId,
+        project: await deps.scanner.getProject(projectId),
+      })),
+    );
+    const paths = projects.flatMap(({ project }) =>
+      project ? [project.path] : [],
+    );
+    const outcomes = await gitRemoteFetcher.fetchPaths(paths);
+    for (const path of paths) {
+      gitStatusCache.invalidate(path);
+    }
+
+    const results: ProjectGitFetchResult[] = projects.map(
+      ({ projectId, project }) => {
+        const outcome = project ? outcomes.get(project.path) : undefined;
+        if (!outcome) return { projectId, status: "not-git" };
+        return {
+          projectId,
+          status: outcome.status,
+          ...(outcome.error ? { error: outcome.error } : {}),
+        };
+      },
+    );
+    return c.json({ results } satisfies ProjectGitFetchResponse);
   });
 
   // GET /api/projects/:projectId - Get project info

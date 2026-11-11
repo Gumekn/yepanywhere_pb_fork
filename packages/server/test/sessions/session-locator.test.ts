@@ -10,6 +10,7 @@ import type { SessionMetadataService } from "../../src/metadata/SessionMetadataS
 import { encodeProjectId } from "../../src/projects/paths.js";
 import type { ProjectScanner } from "../../src/projects/scanner.js";
 import { invalidateCodexSessionManifest } from "../../src/sessions/codex-session-manifest.js";
+import type { DshSessionReader } from "../../src/sessions/dsh-reader.js";
 import type { GeminiSessionReader } from "../../src/sessions/gemini-reader.js";
 import {
   type SessionLocatorDeps,
@@ -259,6 +260,34 @@ describe("locateSession", () => {
     expect(geminiReaderFactory).toHaveBeenCalledWith(
       "/Users/someone/work/gemini-proj",
     );
+  });
+
+  it("finds read-only dsh sessions through the provider scan", async () => {
+    const project = createProject({
+      path: "/Users/someone/work/amap",
+      provider: "dsh",
+    });
+    const dshReaderFactory = vi.fn(
+      () =>
+        ({
+          getSessionSummary: vi.fn(async (id: string) =>
+            id === "session-dsh" ? { id, provider: "dsh" } : null,
+          ),
+        }) as unknown as DshSessionReader,
+    );
+    const deps = baseDeps({
+      scanner: {
+        listProjects: vi.fn(async () => [project]),
+      } as unknown as ProjectScanner,
+      dshReaderFactory,
+    });
+
+    await expect(locateSession(deps, "session-dsh")).resolves.toMatchObject({
+      provider: "dsh",
+      projectPath: "/Users/someone/work/amap",
+      source: "provider-scan",
+    });
+    expect(dshReaderFactory).toHaveBeenCalledWith("/Users/someone/work/amap");
   });
 
   it("follows a bootstrap id alias and echoes the requested id", async () => {

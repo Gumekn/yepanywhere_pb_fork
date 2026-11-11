@@ -62,7 +62,27 @@ describe("Search Routes", () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(searchScope).toHaveBeenCalledWith(index, "needle", 200, "session-2");
+    // Folded progress text is excluded unless explicitly requested.
+    expect(searchScope).toHaveBeenCalledWith(
+      index,
+      "needle",
+      200,
+      "session-2",
+      {
+        includeFolded: false,
+      },
+    );
+
+    await routes.request(
+      "/?q=needle&project=project-1&session=session-2&includeFolded=true",
+    );
+    expect(searchScope).toHaveBeenLastCalledWith(
+      index,
+      "needle",
+      200,
+      "session-2",
+      { includeFolded: true },
+    );
     expect(body).toMatchObject({
       query: "needle",
       sort: "recent",

@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   GitStatusSummaryCache,
   parseGitStatusSummary,
+  parseHeadOid,
+  parseRemoteDefaultRefs,
+  selectBaseRef,
 } from "../src/git-status-summary.js";
 
 describe("parseGitStatusSummary", () => {
@@ -56,6 +59,71 @@ u UU N... 100644 100644 100644 100644 aaaaaa bbbbbb cccccc src/conflict.ts
       conflictedCount: 0,
       stashCount: 0,
     });
+  });
+});
+
+describe("parseGitStatusSummary stash handling", () => {
+  it("does not treat stash-only repos as dirty", () => {
+    const summary = parseGitStatusSummary(
+      "# branch.oid abc1234\n# branch.head main\n",
+      3,
+    );
+    expect(summary.isClean).toBe(true);
+    expect(summary.stashCount).toBe(3);
+  });
+});
+
+describe("parseHeadOid", () => {
+  it("returns the full HEAD oid and null for unborn branches", () => {
+    expect(parseHeadOid("# branch.oid 0123456789abcdef\n")).toBe(
+      "0123456789abcdef",
+    );
+    expect(parseHeadOid("# branch.oid (initial)\n")).toBeNull();
+  });
+});
+
+describe("selectBaseRef", () => {
+  const refs = parseRemoteDefaultRefs(
+    [
+      "refs/remotes/origin/HEAD\trefs/remotes/origin/main\taaa",
+      "refs/remotes/origin/main\t\taaa",
+      "refs/remotes/upstream/HEAD\trefs/remotes/upstream/trunk\tbbb",
+      "refs/remotes/fork/master\t\tccc",
+    ].join("\n"),
+  );
+
+  it("follows <remote>/HEAD of the upstream's remote", () => {
+    expect(selectBaseRef(refs, "upstream/feature")).toEqual({
+      ref: "upstream/trunk",
+      oid: "bbb",
+    });
+    expect(selectBaseRef(refs, "origin/feat/x")).toEqual({
+      ref: "origin/main",
+      oid: "aaa",
+    });
+  });
+
+  it("falls back to origin without an upstream, then main/master", () => {
+    expect(selectBaseRef(refs, null)).toEqual({
+      ref: "origin/main",
+      oid: "aaa",
+    });
+    expect(selectBaseRef(refs, "fork/topic")).toEqual({
+      ref: "fork/master",
+      oid: "ccc",
+    });
+  });
+
+  it("returns null when nothing matches", () => {
+    expect(selectBaseRef([], "origin/main")).toBeNull();
+    expect(
+      selectBaseRef(
+        parseRemoteDefaultRefs(
+          "refs/remotes/a/main\t\t111\nrefs/remotes/b/main\t\t222",
+        ),
+        null,
+      ),
+    ).toBeNull();
   });
 });
 
@@ -145,6 +213,31 @@ describe("GitStatusSummaryCache", () => {
 
     await expect(cache.get("/repo")).rejects.toThrow("git blew up");
     await expect(cache.get("/repo")).resolves.toBeNull();
+    expect(compute).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache in-flight results that predate invalidate()", async () => {
+    let resolveFirst: ((value: null) => void) | undefined;
+    const fresh = summaryFor("bbbbbbb");
+    const compute = vi
+      .fn<(path: string) => Promise<typeof fresh | null>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<null>((r) => {
+            resolveFirst = r;
+          }),
+      )
+      .mockResolvedValue(fresh);
+    const cache = new GitStatusSummaryCache({ ttlMs: 60_000, compute });
+
+    const stale = cache.get("/repo");
+    cache.invalidate("/repo");
+    const next = cache.get("/repo");
+    resolveFirst?.(null);
+
+    expect(await stale).toBeNull();
+    expect(await next).toBe(fresh);
+    expect(await cache.get("/repo")).toBe(fresh);
     expect(compute).toHaveBeenCalledTimes(2);
   });
 });

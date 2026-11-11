@@ -5,7 +5,6 @@ import {
 import type {
   ProviderName,
   SessionDisplayPage,
-  SessionDisplaySegment,
   SlashCommand,
   UserQuestionAnswers,
 } from "@yep-anywhere/shared";
@@ -28,7 +27,10 @@ import { ReadOnlySessionBar } from "../components/ReadOnlySessionBar";
 import { RemoteProjectIcon } from "../components/RemoteProjectIcon";
 import { SessionInspector } from "../components/SessionInspector";
 import { SessionMenu } from "../components/SessionMenu";
-import { SessionSearchBar } from "../components/SessionSearchBar";
+import {
+  SessionSearchBar,
+  type SessionSearchOccurrence,
+} from "../components/SessionSearchBar";
 import { SessionTitleGenerationStatus } from "../components/SessionTitleGenerationStatus";
 import { SideConversationPanel } from "../components/SideConversationPanel";
 import { SubagentDetailProvider } from "../components/SubagentDetailProvider";
@@ -67,6 +69,11 @@ import { useI18n } from "../i18n";
 import { useNavigationLayout } from "../layouts";
 import { stripAttachmentTokensForTitle } from "../lib/attachmentTokens";
 import {
+  leadingSlashCommandName,
+  terminalOnlyCommand,
+} from "../lib/cliSlashCommands";
+import {
+  type CodexGoalShortcut,
   type CodexSkillCommand,
   parseCodexSlashCommand,
   resolveCodexSkillInputs,
@@ -99,6 +106,7 @@ import {
 } from "../lib/sessionBranching";
 import {
   buildSessionDisplayRenderItems,
+  formatSessionDisplayNotice,
   mergeSessionInspectorMessages,
 } from "../lib/sessionDisplay";
 import {
@@ -145,37 +153,6 @@ function isCodexAppServerProvider(
   provider: ProviderName | string | undefined | null,
 ): provider is "codex" {
   return provider === "codex";
-}
-
-type DisplayNotice = Extract<SessionDisplaySegment, { type: "notice" }>;
-type Translate = ReturnType<typeof useI18n>["t"];
-
-function formatDisplayNotice(notice: DisplayNotice, t: Translate): string {
-  const detail = notice.message ?? notice.title;
-  const withDetail = (label: string) =>
-    detail && detail !== label ? `${label}: ${detail}` : label;
-  switch (notice.kind) {
-    case "session_setup":
-      return t("sessionDisplaySetup", { count: notice.count ?? 1 });
-    case "compaction":
-      return t("sessionDisplayCompaction");
-    case "warning":
-      return withDetail(t("sessionDisplayWarning"));
-    case "turn_aborted":
-      return t("sessionDisplayTurnAborted");
-    case "goal":
-      return withDetail(t("sessionDisplayGoal"));
-    case "plan":
-      return withDetail(t("sessionDisplayPlan"));
-    case "subagent":
-      return withDetail(t("sessionDisplaySubagent"));
-    case "inter_agent_message":
-      return withDetail(t("codexAgentCommunication"));
-    case "agent_wait":
-      return t("codexAgentWaiting");
-    case "provider_event":
-      return withDetail(t("sessionDisplayProviderEvent"));
-  }
 }
 
 function calculateDisplayForkExcludedTurns(
@@ -480,6 +457,11 @@ function SessionPageContent({
     setIsExpanded: setInspectorExpanded,
   } = useSessionInspectorPreference();
   const [isSessionSearchOpen, setSessionSearchOpen] = useState(false);
+  const [sessionSearchQuery, setSessionSearchQuery] = useState<string | null>(
+    null,
+  );
+  // Set only when the current target came from the in-session find.
+  const [targetOccurrence, setTargetOccurrence] = useState<number | null>(null);
   const pageVisible = useDocumentVisibility();
   const isInspectorVisible =
     pageVisible &&
@@ -522,13 +504,23 @@ function SessionPageContent({
   }, []);
   const handleSelectMessage = useCallback((messageId: string) => {
     if (!messageId) return;
+    setTargetOccurrence(null);
     setTargetMessageId(messageId);
   }, []);
+  const handleSelectSearchMatch = useCallback(
+    (match: SessionSearchOccurrence) => {
+      if (!match.messageId) return;
+      setTargetOccurrence(match.occurrence);
+      setTargetMessageId(match.messageId);
+    },
+    [],
+  );
   const handleOpenSessionSearch = useCallback(() => {
     setSessionSearchOpen(true);
   }, []);
   const handleCloseSessionSearch = useCallback(() => {
     setSessionSearchOpen(false);
+    setSessionSearchQuery(null);
   }, []);
 
   const inspectorMessages = useMemo(
@@ -546,6 +538,7 @@ function SessionPageContent({
   useEffect(() => {
     const focus = resolveBranchNavigationFocus(navState, selectedBranchId);
     setPendingBranchFocusId(focus.branchId);
+    setTargetOccurrence(null);
     setTargetMessageId(focus.messageId);
   }, [sessionId]);
 
@@ -779,11 +772,21 @@ function SessionPageContent({
   const supportsThinkingToggle =
     currentProviderInfo?.supportsThinkingToggle ?? true;
   const supportsSlashCommands = currentProviderInfo?.supportsSlashCommands;
+  // The Codex CLI lists `/fast` when the session's model offers the tier.
+  const codexFastMode =
+    effectiveProvider === "codex" &&
+    (session?.codexModelProvider ?? "openai") === "openai" &&
+    (currentProviderInfo?.models ?? []).some(
+      (model) =>
+        (model.providerModelId ?? model.id) === session?.model &&
+        model.supportsFastMode === true,
+    );
   const commandButtons = useAgentCommandCatalog({
     provider: effectiveProvider,
     supportsSlashCommands,
     providerCommands,
     codexSkills,
+    codexFastMode,
     availability: {
       scope: "session",
       ownsProcess: status.owner === "self",
@@ -1004,8 +1007,14 @@ function SessionPageContent({
   const [showModelSwitchModal, setShowModelSwitchModal] = useState(false);
   const [showGoalModal, setShowGoalModal] = useState(false);
   const [goalInitialObjective, setGoalInitialObjective] = useState("");
-  const [isRequestingPiCompaction, setIsRequestingPiCompaction] =
-    useState(false);
+  /**
+   * Pi compaction request in flight. `starting` runs right away (idle or
+   * resumed session) and shows the compacting row optimistically, like Codex;
+   * `queued` waits for the active turn, whose spinner must stay accurate.
+   */
+  const [piCompactionRequest, setPiCompactionRequest] = useState<
+    "starting" | "queued" | null
+  >(null);
   const [isStartingCodexCompaction, setIsStartingCodexCompaction] =
     useState(false);
 
@@ -1047,29 +1056,34 @@ function SessionPageContent({
    * HTTP call resolves when the compaction finishes or fails.
    */
   const requestPiCompaction = (customInstructions?: string): boolean => {
-    if (isCompacting || isRequestingPiCompaction) {
+    if (isCompacting || piCompactionRequest) {
       showToast(t("codexCompactAlreadyRunning"), "info");
       return false;
     }
-    if (status.owner !== "self" || !status.processId) {
-      showToast(t("piCompactSessionNotRunning"), "error");
+    if (status.owner === "external") {
+      showToast(t("piCompactExternalSessionRequired"), "error");
       return false;
     }
-    const processId = status.processId;
-    if (processState !== "idle") {
+    const queuedBehindTurn = status.owner === "self" && processState !== "idle";
+    if (queuedBehindTurn) {
       showToast(t("piCompactQueuedAfterTurn"), "info");
     }
-    setIsRequestingPiCompaction(true);
+    setPiCompactionRequest(queuedBehindTurn ? "queued" : "starting");
     setScrollTrigger((prev) => prev + 1);
     void api
-      .compactProcess(processId, { customInstructions })
-      .then(() => showToast(t("sessionCompacted"), "success"))
+      .compactPiSession(projectId, actualSessionId ?? sessionId, {
+        customInstructions,
+      })
+      .then((result) => {
+        setStatus({ owner: "self", processId: result.processId });
+        showToast(t("sessionCompacted"), "success");
+      })
       .catch((err: unknown) => {
         console.error("Failed to compact Pi session:", err);
         const errorMsg = err instanceof Error ? err.message : String(err);
         showToast(t("sessionCompactFailed", { message: errorMsg }), "error");
       })
-      .finally(() => setIsRequestingPiCompaction(false));
+      .finally(() => setPiCompactionRequest(null));
     return true;
   };
 
@@ -1153,15 +1167,79 @@ function SessionPageContent({
     }
   };
 
-  const openCodexGoal = (objective?: string): boolean => {
-    if (status.owner !== "self" || !status.processId) {
-      showToast(t("codexGoalSessionNotRunning"), "error");
-      return false;
+  /**
+   * The Codex process that owns this session's goal. Like the Codex TUI, a
+   * goal can be changed on an inactive thread: restore the process without a
+   * model turn (read-only `thread/goal/get`) and attach to it.
+   */
+  const ensureCodexGoalProcess = async (): Promise<string | null> => {
+    if (status.owner === "self" && status.processId) return status.processId;
+    if (status.owner === "external") {
+      showToast(t("codexGoalExternalSession"), "error");
+      return null;
     }
+    try {
+      const result = await api.resumeAndExecuteCodexControl(
+        projectId,
+        actualSessionId ?? sessionId,
+        { control: "thread/goal/get" },
+        {
+          mode: permissionMode,
+          model: session?.model ?? getModelSetting(),
+          thinking: getThinkingSetting(),
+          reasoningEffort: session?.reasoningEffort,
+          provider: "codex",
+          codexModelProvider: session?.codexModelProvider,
+          executor: session?.executor,
+        },
+      );
+      setStatus({ owner: "self", processId: result.processId });
+      return result.processId;
+    } catch (err) {
+      console.error("Failed to restore Codex session for goal:", err);
+      const message = err instanceof Error ? err.message : String(err);
+      showToast(t("codexGoalResumeFailed", { message }), "error");
+      return null;
+    }
+  };
+
+  const openCodexGoal = async (objective?: string): Promise<boolean> => {
+    if (!(await ensureCodexGoalProcess())) return false;
     setGoalInitialObjective(objective ?? "");
     setShowGoalModal(true);
     return true;
   };
+
+  /** `/goal pause|resume|clear` act directly, as in the Codex TUI. */
+  const runCodexGoalShortcut = async (
+    action: CodexGoalShortcut,
+  ): Promise<boolean> => {
+    const processId = await ensureCodexGoalProcess();
+    if (!processId) return false;
+    try {
+      const result = await api.processGoal(processId, { action });
+      showToast(result.response, "success");
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      showToast(t("sessionGoalActionFailed", { message }), "error");
+      return false;
+    }
+  };
+  const openCodexGoalRef = useRef(openCodexGoal);
+  openCodexGoalRef.current = openCodexGoal;
+
+  /** `/model` switches through the live provider process. */
+  const openModelSwitch = (): boolean => {
+    if (status.owner !== "self" || !status.processId) {
+      showToast(t("slashCommandNeedsSession", { command: "model" }), "error");
+      return false;
+    }
+    setShowModelSwitchModal(true);
+    return true;
+  };
+  const openModelSwitchRef = useRef(openModelSwitch);
+  openModelSwitchRef.current = openModelSwitch;
 
   const handleSend = async (text: string, interruptBeforeSend = false) => {
     if (isRestoringEdit) return;
@@ -1190,6 +1268,31 @@ function SessionPageContent({
       else draftControlsRef.current?.restoreFromStorage();
       return;
     }
+    if (effectiveProvider === "codex" || effectiveProvider === "pi") {
+      // The menu mirrors the CLI's `/` list; its terminal-only entries would
+      // reach the model as plain text, so they are refused here.
+      const terminalOnly = terminalOnlyCommand(
+        effectiveProvider,
+        text,
+        providerCommands.map((command) => command.name),
+      );
+      if (terminalOnly) {
+        draftControlsRef.current?.restoreFromStorage();
+        showToast(
+          t("slashCommandTerminalOnly", {
+            command: terminalOnly,
+            provider: effectiveProvider === "codex" ? "Codex" : "Pi",
+          }),
+          "error",
+        );
+        return;
+      }
+      if (!editRewind && leadingSlashCommandName(text) === "model") {
+        if (openModelSwitch()) draftControlsRef.current?.clearDraft();
+        else draftControlsRef.current?.restoreFromStorage();
+        return;
+      }
+    }
     if (effectiveProvider === "codex") {
       const command = parseCodexSlashCommand(text);
       if (command.kind === "invalid-compact-args") {
@@ -1214,7 +1317,11 @@ function SessionPageContent({
         return;
       }
       if (command.kind === "goal" && !editRewind) {
-        if (openCodexGoal(command.objective)) {
+        if (
+          await (command.action
+            ? runCodexGoalShortcut(command.action)
+            : openCodexGoal(command.objective))
+        ) {
           draftControlsRef.current?.clearDraft();
         } else {
           draftControlsRef.current?.restoreFromStorage();
@@ -1422,6 +1529,9 @@ function SessionPageContent({
                   processId: result.processId,
                 },
                 initialProvider: effectiveProvider,
+                // Metadata can load before the edited prompt reaches the
+                // fork's file; poll until its branch switcher is derivable.
+                refreshBranchAfterNavigation: true,
               },
             },
           );
@@ -1700,25 +1810,37 @@ function SessionPageContent({
 
   const handleCustomCommand = useCallback(
     (command: string) => {
-      if (command === "model") {
-        setShowModelSwitchModal(true);
+      if (
+        (effectiveProvider === "codex" || effectiveProvider === "pi") &&
+        terminalOnlyCommand(effectiveProvider, `/${command}`, [])
+      ) {
+        showToast(
+          t("slashCommandTerminalOnly", {
+            command,
+            provider: effectiveProvider === "codex" ? "Codex" : "Pi",
+          }),
+          "error",
+        );
         return true;
       }
-      // Picking `/goal` from the menu opens the dialog directly; typing
-      // `/goal <objective>` and sending prefills it instead.
+      if (command === "model") {
+        openModelSwitchRef.current();
+        return true;
+      }
+      // Picking `/goal` from the menu opens the dialog directly (restoring
+      // an inactive session first); typing `/goal <objective>` and sending
+      // prefills it instead.
       if (
         command === "goal" &&
         effectiveProvider === "codex" &&
-        status.owner === "self" &&
-        status.processId
+        status.owner !== "external"
       ) {
-        setGoalInitialObjective("");
-        setShowGoalModal(true);
+        void openCodexGoalRef.current();
         return true;
       }
       return false;
     },
-    [effectiveProvider, status],
+    [effectiveProvider, status.owner, showToast, t],
   );
 
   const handleAbort = async () => {
@@ -1994,7 +2116,7 @@ function SessionPageContent({
           branchId: selectedBranchId,
           branchState: session?.branchState ?? session?.codexBranchState,
           omitToolGroupDetailRef: hydratedLiveTailDetailRef,
-          formatNotice: (notice) => formatDisplayNotice(notice, t),
+          formatNotice: (notice) => formatSessionDisplayNotice(notice, t),
         })
       : [];
     const timelineMessages = displayPage
@@ -2441,21 +2563,19 @@ function SessionPageContent({
                     }}
                     onTerminate={handleTerminate}
                     onCompact={
-                      (session?.provider === "codex" ||
-                        session?.provider === "pi") &&
-                      status.owner === "self" &&
-                      status.processId
+                      (session?.provider === "pi" &&
+                        status.owner !== "external") ||
+                      (session?.provider === "codex" &&
+                        status.owner === "self" &&
+                        status.processId)
                         ? handleCompact
                         : undefined
                     }
                     onGoal={
                       session?.provider === "codex" &&
-                      status.owner === "self" &&
-                      status.processId
-                        ? () => {
-                            setGoalInitialObjective("");
-                            setShowGoalModal(true);
-                          }
+                      status.owner !== "external" &&
+                      !isReadOnlySession
+                        ? () => void openCodexGoal()
                         : undefined
                     }
                     sharingConfigured={sharingConfigured}
@@ -2538,7 +2658,8 @@ function SessionPageContent({
           sessionId={sessionId}
           onOpen={handleOpenSessionSearch}
           onClose={handleCloseSessionSearch}
-          onSelectMessage={handleSelectMessage}
+          onSelectMatch={handleSelectSearchMatch}
+          onQueryChange={setSessionSearchQuery}
         />
 
         {session?.parentSessionId && (
@@ -2685,7 +2806,11 @@ function SessionPageContent({
                 status.owner === "self" && processState === "in-turn"
               }
               lastActivityAt={lastStreamActivityAt}
-              isCompacting={isCompacting || isStartingCodexCompaction}
+              isCompacting={
+                isCompacting ||
+                isStartingCodexCompaction ||
+                piCompactionRequest === "starting"
+              }
               scrollTrigger={scrollTrigger + activeWindowTrimRevision}
               pendingMessages={pendingMessages}
               deferredMessages={deferredMessages}
@@ -2714,6 +2839,8 @@ function SessionPageContent({
               focusBranchId={pendingBranchFocusId}
               onBranchFocused={handleBranchFocused}
               targetMessageId={targetMessageId}
+              targetOccurrence={targetOccurrence}
+              searchQuery={isSessionSearchOpen ? sessionSearchQuery : null}
               onTargetFocused={handleTargetFocused}
               transcriptKey={`${sessionId}:${selectedBranchId ?? ""}`}
               agentContent={agentContent}
@@ -2805,7 +2932,9 @@ function SessionPageContent({
       <SideConversationPanel
         side={side}
         projectId={projectId}
+        projectPath={project?.path ?? null}
         sessionId={actualSessionId}
+        provider={effectiveProvider}
         visible={sideVisible}
         mobile={!isWideScreen}
         parentStatus={t(

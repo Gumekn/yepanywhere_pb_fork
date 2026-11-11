@@ -12,6 +12,7 @@ import {
   Renderer,
   type RendererObject,
   type RendererThis,
+  Tokenizer,
   type Tokens,
 } from "marked";
 import sanitizeHtml from "sanitize-html";
@@ -448,7 +449,41 @@ function createMarkdownRenderer(options: SafeMarkdownOptions = {}): Marked {
     async: false,
     gfm: true,
   });
-  instance.use({ renderer: createRenderer(options) });
+  instance.use({
+    renderer: createRenderer(options),
+    tokenizer: {
+      emStrong(src, maskedSrc, prevChar) {
+        // CommonMark treats the 。 in **结论。**后文 as punctuation, so
+        // the closing delimiter is rejected without a following space. Let
+        // marked match CJK punctuation at ** boundaries as word characters,
+        // using its existing code/link/escape masks and delimiter balancing.
+        // Only the matching view changes; tokens retain the exact source.
+        if (!src.startsWith("**") || src.startsWith("***")) return false;
+        const relax = (value: string) =>
+          value.replace(
+            /(?<=\*\*)[，。！？；：“”‘’、（）【】《》〈〉「」『』〔〕]|[，。！？；：“”‘’、（）【】《》〈〉「」『』〔〕](?=\*\*)/g,
+            "中",
+          );
+        const matchingSource = relax(src);
+        if (matchingSource === src) return false;
+        const token = Tokenizer.prototype.emStrong.call(
+          this,
+          matchingSource,
+          relax(maskedSrc),
+          prevChar,
+        );
+        if (token?.type !== "strong") return false;
+        const raw = src.slice(0, token.raw.length);
+        const text = raw.slice(2, -2);
+        return {
+          type: "strong",
+          raw,
+          text,
+          tokens: this.lexer.inlineTokens(text),
+        };
+      },
+    },
+  });
   return instance;
 }
 

@@ -100,8 +100,7 @@ describe("ProjectGitStatusButton", () => {
 
     const popover = screen.getByRole("dialog");
     expect(popover.textContent).toContain("feature/sidebar-git-details");
-    expect(popover.textContent).toContain("Ahead 2");
-    expect(popover.textContent).toContain("Behind 1");
+    expect(popover.textContent).toContain("↑2 unpushed · ↓1 to pull");
     expect(popover.textContent).toContain("Changes14");
     expect(popover.textContent).toContain("Untracked3");
 
@@ -288,5 +287,112 @@ describe("ProjectGitStatusButton", () => {
     expect(
       screen.queryByRole("button", { name: "Copy full upstream branch name" }),
     ).toBeNull();
+  });
+
+  it("shows unpushed and origin/main incoming counts for a feature branch", () => {
+    renderButton({
+      ...STATUS,
+      ahead: 1,
+      behind: 0,
+      base: { ref: "origin/main", ahead: 5, behind: 3 },
+      lastFetchedAt: new Date().toISOString(),
+    });
+    const button = screen.getByRole("button", {
+      name: "Show Git details for Yep Anywhere",
+    });
+    expect(button.textContent).toContain("↑1");
+    expect(button.textContent).toContain("↓3");
+    expect(button.querySelector(".is-diverged")).toBeNull();
+    expect(button.getAttribute("aria-describedby")).toBeTruthy();
+
+    fireEvent.click(button);
+    const text = screen.getByRole("dialog").textContent ?? "";
+    expect(text).toContain("vs upstream↑1 unpushed");
+    expect(text).toContain("Mainorigin/main");
+    expect(text).toContain(
+      "vs main↓3 new on main, not merged · ↑5 only on this branch",
+    );
+    expect(text).toContain(
+      "↑ local commits not yet pushed to origin/feature/sidebar-git-details; ↓ commits on origin/main not yet in this branch",
+    );
+    expect(text).not.toContain("Never fetched");
+  });
+
+  it("marks the incoming count as diverged when tracking the default branch", () => {
+    renderButton({
+      ...STATUS,
+      branch: "main",
+      upstream: "origin/main",
+      ahead: 2,
+      behind: 4,
+      base: { ref: "origin/main", ahead: 2, behind: 4 },
+    });
+    const button = screen.getByRole("button");
+    expect(button.querySelector(".is-incoming.is-diverged")?.textContent).toBe(
+      "↓4",
+    );
+
+    fireEvent.click(button);
+    const text = screen.getByRole("dialog").textContent ?? "";
+    // The default branch is the upstream, so no separate main rows.
+    expect(text).not.toContain("vs main");
+    expect(text).toContain("↑2 unpushed · ↓4 to pull");
+  });
+
+  it("hides arrows when in sync and reports fetch progress and failures", async () => {
+    const synced: ProjectGitStatusSummary = {
+      ...STATUS,
+      ahead: 0,
+      behind: 0,
+      base: { ref: "origin/main", ahead: 0, behind: 0 },
+      fetchError: "fatal: could not read Username",
+    };
+    const { rerender } = renderButton(synced, "zh-CN");
+    const button = screen.getByRole("button");
+    expect(
+      button.querySelector(".sidebar-project-git-button__sync"),
+    ).toBeNull();
+
+    fireEvent.click(button);
+    // The zh-CN dictionary loads asynchronously.
+    await screen.findByText("与上游");
+    let text = screen.getByRole("dialog").textContent ?? "";
+    expect(text).toContain("与上游已同步");
+    expect(text).toContain("与主干已含主干最新提交");
+    expect(text).toContain("上次获取获取失败");
+    expect(text).toContain("fatal: could not read Username");
+
+    rerender(
+      <I18nProvider>
+        <ProjectGitStatusButton
+          status={synced}
+          projectName="Yep Anywhere"
+          isSyncing
+        />
+      </I18nProvider>,
+    );
+    expect(button.classList.contains("is-syncing")).toBe(true);
+    text = screen.getByRole("dialog").textContent ?? "";
+    expect(text).toContain("正在获取远端…");
+    expect(text).not.toContain("fatal: could not read Username");
+  });
+
+  it("explains when the default branch shares no history with the branch", () => {
+    renderButton({
+      ...STATUS,
+      ahead: 0,
+      behind: 0,
+      base: null,
+      unrelatedBaseRef: "origin/main",
+    });
+    const button = screen.getByRole("button");
+    expect(
+      button.querySelector(".sidebar-project-git-button__sync"),
+    ).toBeNull();
+
+    fireEvent.click(button);
+    expect(screen.getByRole("dialog").textContent).toContain(
+      "Mainorigin/main shares no history with this branch; not compared",
+    );
   });
 });

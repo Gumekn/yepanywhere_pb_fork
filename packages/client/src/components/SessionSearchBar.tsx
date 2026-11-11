@@ -13,13 +13,33 @@ import { useI18n } from "../i18n";
 const SEARCH_DEBOUNCE_MS = 250;
 const MIN_QUERY_LENGTH = 2;
 
+/** One hit: the Nth occurrence of the query inside one message. */
+export interface SessionSearchOccurrence {
+  messageId: string;
+  occurrence: number;
+}
+
+/** Flatten per-message matches (in transcript order) into single hits. */
+export function flattenSearchOccurrences(
+  matches: readonly SearchMatch[],
+): SessionSearchOccurrence[] {
+  return matches.flatMap((match) =>
+    Array.from(
+      { length: Math.max(1, match.occurrenceCount ?? 1) },
+      (_, occurrence) => ({ messageId: match.messageId, occurrence }),
+    ),
+  );
+}
+
 interface SessionSearchBarProps {
   isOpen: boolean;
   projectId: string;
   sessionId: string;
   onOpen: () => void;
   onClose: () => void;
-  onSelectMessage: (messageId: string) => void;
+  onSelectMatch: (match: SessionSearchOccurrence) => void;
+  /** The query whose hits are listed, or null when nothing is searched. */
+  onQueryChange?: (query: string | null) => void;
 }
 
 export function SessionSearchBar({
@@ -28,17 +48,21 @@ export function SessionSearchBar({
   sessionId,
   onOpen,
   onClose,
-  onSelectMessage,
+  onSelectMatch,
+  onQueryChange,
 }: SessionSearchBarProps) {
   const { t } = useI18n();
   const inputRef = useRef<HTMLInputElement>(null);
   const statusId = useId();
   const [inputValue, setInputValue] = useState("");
-  const [matches, setMatches] = useState<SearchMatch[]>([]);
-  const [totalMatches, setTotalMatches] = useState(0);
+  const [matches, setMatches] = useState<SessionSearchOccurrence[]>([]);
+  const [limited, setLimited] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
+  // Off by default and reset on close: only the final answers are searched
+  // unless the user opts into the progress text folded behind "process" rows.
+  const [includeFolded, setIncludeFolded] = useState(false);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -74,17 +98,19 @@ export function SessionSearchBar({
   useEffect(() => {
     if (!isOpen) {
       setLoading(false);
+      setIncludeFolded(false);
       return;
     }
 
     const query = inputValue.trim();
     setMatches([]);
-    setTotalMatches(0);
+    setLimited(false);
     setCurrentIndex(-1);
     setFailed(false);
 
     if (query.length < MIN_QUERY_LENGTH) {
       setLoading(false);
+      onQueryChange?.(null);
       return;
     }
 
@@ -97,19 +123,24 @@ export function SessionSearchBar({
           project: projectId,
           session: sessionId,
           limit: 1,
+          ...(includeFolded ? { includeFolded: true } : {}),
         })
         .then((response) => {
           if (cancelled) return;
           const result = response.results.find(
             (candidate) => candidate.sessionId === sessionId,
           );
-          const nextMatches = result?.matches ?? [];
+          const nextMatches = flattenSearchOccurrences(result?.matches ?? []);
           setMatches(nextMatches);
-          setTotalMatches(result?.matchCount ?? 0);
-          if (nextMatches.length > 0) {
-            setCurrentIndex(0);
-            const firstMatch = nextMatches[0];
-            if (firstMatch) onSelectMessage(firstMatch.messageId);
+          setLimited((result?.matchCount ?? 0) > (result?.matches.length ?? 0));
+          onQueryChange?.(query);
+          // Start at the latest hit: the transcript opens at its newest turn,
+          // so this is the nearest one and needs no history paging.
+          const lastIndex = nextMatches.length - 1;
+          const latest = nextMatches[lastIndex];
+          if (latest) {
+            setCurrentIndex(lastIndex);
+            onSelectMatch(latest);
           }
         })
         .catch(() => {
@@ -125,16 +156,24 @@ export function SessionSearchBar({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [inputValue, isOpen, onSelectMessage, projectId, sessionId]);
+  }, [
+    includeFolded,
+    inputValue,
+    isOpen,
+    onQueryChange,
+    onSelectMatch,
+    projectId,
+    sessionId,
+  ]);
 
   const selectMatch = useCallback(
     (index: number) => {
       const match = matches[index];
       if (!match) return;
       setCurrentIndex(index);
-      onSelectMessage(match.messageId);
+      onSelectMatch(match);
     },
-    [matches, onSelectMessage],
+    [matches, onSelectMatch],
   );
 
   const moveSelection = useCallback(
@@ -165,26 +204,17 @@ export function SessionSearchBar({
     if (matches.length === 0) return t("sessionSearchNoResults");
 
     const current = Math.max(1, currentIndex + 1);
-    if (totalMatches > matches.length) {
+    if (limited) {
       return t("sessionSearchPositionLimited", {
         current,
         shown: matches.length,
-        total: totalMatches,
       });
     }
     return t("sessionSearchPosition", {
       current,
       total: matches.length,
     });
-  }, [
-    currentIndex,
-    failed,
-    inputValue,
-    loading,
-    matches.length,
-    t,
-    totalMatches,
-  ]);
+  }, [currentIndex, failed, inputValue, limited, loading, matches.length, t]);
 
   if (!isOpen) return null;
 
@@ -233,6 +263,32 @@ export function SessionSearchBar({
           {statusText}
         </span>
         <div className="session-search-controls">
+          <button
+            type="button"
+            className={`session-search-control session-search-folded-toggle${
+              includeFolded ? " is-active" : ""
+            }`}
+            onClick={() => setIncludeFolded((value) => !value)}
+            aria-pressed={includeFolded}
+            title={t("sessionSearchIncludeFolded")}
+            aria-label={t("sessionSearchIncludeFolded")}
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <polygon points="12 2 2 7 12 12 22 7 12 2" />
+              <polyline points="2 17 12 22 22 17" />
+              <polyline points="2 12 12 17 22 12" />
+            </svg>
+          </button>
           <button
             type="button"
             className="session-search-control"

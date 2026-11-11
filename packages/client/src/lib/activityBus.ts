@@ -55,6 +55,18 @@ export interface SessionCreatedEvent {
   timestamp: string;
 }
 
+/**
+ * A provider replaced the temporary ID a session was announced under with its
+ * durable ID. Every client-side copy keyed by the old ID must move over.
+ */
+export interface SessionIdChangedEvent {
+  type: "session-id-changed";
+  oldSessionId: string;
+  newSessionId: string;
+  projectId: UrlProjectId;
+  timestamp: string;
+}
+
 export interface SessionSeenEvent {
   type: "session-seen";
   sessionId: string;
@@ -180,6 +192,7 @@ interface ActivityEventMap {
   "file-change": FileChangeEvent;
   "session-status-changed": SessionStatusEvent;
   "session-created": SessionCreatedEvent;
+  "session-id-changed": SessionIdChangedEvent;
   "session-updated": SessionUpdatedEvent;
   "session-seen": SessionSeenEvent;
   "process-state-changed": ProcessStateEvent;
@@ -400,6 +413,7 @@ class ActivityBus {
       "file-change",
       "session-status-changed",
       "session-created",
+      "session-id-changed",
       "session-updated",
       "session-seen",
       "process-state-changed",

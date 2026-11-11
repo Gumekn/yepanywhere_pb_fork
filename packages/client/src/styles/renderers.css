@@ -2621,7 +2621,8 @@ details[open] .collapsible__icon {
   background: transparent;
 }
 
-.detail-panel-resize-handle {
+/* Shared left-edge handle of right-docked panels (details, side chat). */
+.panel-resize-handle {
   position: absolute;
   top: 0;
   bottom: 0;
@@ -2632,7 +2633,7 @@ details[open] .collapsible__icon {
   touch-action: none;
 }
 
-.detail-panel-resize-handle::after {
+.panel-resize-handle::after {
   position: absolute;
   top: 0;
   bottom: 0;
@@ -2643,18 +2644,18 @@ details[open] .collapsible__icon {
   transition: background 0.15s ease;
 }
 
-.detail-panel-resize-handle:hover::after,
-.detail-panel-resize-handle:focus-visible::after,
-.detail-panel-resize-handle.active::after {
+.panel-resize-handle:hover::after,
+.panel-resize-handle:focus-visible::after,
+.panel-resize-handle.active::after {
   background: color-mix(in srgb, var(--app-yep-green) 70%, transparent);
 }
 
-.detail-panel-resize-handle:focus-visible {
+.panel-resize-handle:focus-visible {
   outline: 2px solid var(--focus-border);
   outline-offset: -2px;
 }
 
-body.detail-panel-resizing {
+body.panel-resizing {
   cursor: col-resize;
   user-select: none;
 }

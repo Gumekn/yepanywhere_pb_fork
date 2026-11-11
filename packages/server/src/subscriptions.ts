@@ -8,11 +8,6 @@
 import {
   type StreamAugmenter,
   createStreamAugmenter,
-  extractIdFromAssistant,
-  extractMessageIdFromStart,
-  extractTextDelta,
-  extractTextFromAssistant,
-  isStreamingComplete,
   markSubagent,
 } from "./augments/index.js";
 import { getLogger } from "./logging/logger.js";
@@ -114,7 +109,6 @@ export function createSessionSubscription(
   options?: SubscriptionOptions,
 ): SessionSubscription {
   let completed = false;
-  let currentStreamingMessageId: string | null = null;
 
   // Lazy augmenter
   let augmenter: StreamAugmenter | null = null;
@@ -150,10 +144,6 @@ export function createSessionSubscription(
       clearInterval(heartbeatInterval);
     }
   }, 30_000);
-
-  // Message ids the provider has streamed token-by-token. Their final message
-  // must not be replayed into the markdown coordinator or the catch-up buffer.
-  const streamedMessageIds = new Set<string>();
 
   // Augmentation is async, so handling events concurrently would let cheap
   // events overtake expensive ones and reorder the outbound stream. Provider
@@ -193,32 +183,6 @@ export function createSessionSubscription(
     await aug.processMessage(routedMessage, { mode });
     if (completed) return;
     emit("message", routedMessage);
-
-    if (mode === "replay" || routedMessage.isSubagent) return;
-
-    const streamStartMessageId = extractMessageIdFromStart(message);
-    if (streamStartMessageId) {
-      streamedMessageIds.add(streamStartMessageId);
-    }
-    const startMessageId =
-      streamStartMessageId ?? extractIdFromAssistant(message);
-    if (startMessageId) {
-      currentStreamingMessageId = startMessageId;
-    }
-
-    const finalId = extractIdFromAssistant(message);
-    const alreadyStreamed = finalId !== null && streamedMessageIds.has(finalId);
-    const textDelta =
-      extractTextDelta(message) ??
-      (alreadyStreamed ? null : extractTextFromAssistant(message));
-    if (textDelta && currentStreamingMessageId) {
-      process.accumulateStreamingText(currentStreamingMessageId, textDelta);
-    }
-
-    if (isStreamingComplete(message)) {
-      currentStreamingMessageId = null;
-      process.clearStreamingText();
-    }
   };
 
   // IMPORTANT: Subscribe BEFORE capturing state to prevent race condition.
@@ -357,10 +321,6 @@ export function createSessionSubscription(
       completed = true;
       clearInterval(heartbeatInterval);
       unsubscribe();
-      if (currentStreamingMessageId) {
-        process.clearStreamingText();
-        currentStreamingMessageId = null;
-      }
     },
   };
 }

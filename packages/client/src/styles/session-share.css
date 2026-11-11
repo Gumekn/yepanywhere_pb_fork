@@ -1,0 +1,265 @@
+/* Read-only share links: the owner-side dialog and the public share page. */
+
+/* ---- Owner dialog ------------------------------------------------------ */
+
+.share-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  max-width: 34rem;
+}
+
+.share-dialog__description,
+.share-dialog__hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+
+.share-dialog__label {
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.share-dialog__expiry {
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.share-dialog__expiry-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.share-dialog__expiry-option {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.share-dialog__expiry-option input {
+  /* The whole pill is the control; keep the radio for keyboard/a11y. */
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.share-dialog__expiry-option.is-selected {
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+  background: var(--bg-hover);
+}
+
+.share-dialog__expiry-option:focus-within {
+  outline: 2px solid var(--focus-border, var(--primary-color));
+  outline-offset: 1px;
+}
+
+.share-dialog__actions,
+.share-dialog__item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.share-dialog__button {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.share-dialog__button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.share-dialog__button.primary {
+  background: var(--primary-color);
+  border-color: transparent;
+  color: #fff;
+}
+
+.share-dialog__button.primary:hover:not(:disabled) {
+  background: var(--primary-color);
+  filter: brightness(1.08);
+}
+
+.share-dialog__button.danger {
+  color: var(--error-color);
+}
+
+.share-dialog__button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.share-dialog__result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle, var(--border-color));
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+}
+
+.share-dialog__url {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-2);
+  border: 1px solid var(--border-input, var(--border-color));
+  border-radius: var(--radius-sm);
+  background: var(--bg-input, transparent);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-input);
+}
+
+.share-dialog__existing {
+  display: flex;
+  flex-direction: column;
+}
+
+.share-dialog__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.share-dialog__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border-subtle, var(--border-color));
+}
+
+.share-dialog__item-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+
+.share-dialog__item-expiry {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+/* ---- Public share page ------------------------------------------------- */
+
+.share-page__header {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-subtle, var(--border-color));
+  background: var(--bg-surface);
+}
+
+.share-page__header-inner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+}
+
+.share-page__heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.share-page__title {
+  margin: 0;
+  font-size: var(--font-size-xl);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.share-page__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.share-page__badge {
+  padding: 1px var(--space-2);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+}
+
+.share-page__markdown-link {
+  flex-shrink: 0;
+  color: var(--link-color, var(--primary-color));
+  font-size: var(--font-size-sm);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.share-page__markdown-link:hover {
+  text-decoration: underline;
+}
+
+.share-page__notices {
+  padding: 0 var(--space-4) var(--space-3);
+  color: var(--warning-color);
+  font-size: var(--font-size-sm);
+}
+
+.share-page__notices p {
+  margin: 0;
+}
+
+.share-page--status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: var(--space-4);
+  text-align: center;
+  background: var(--bg-surface);
+}
+
+.share-page__status-title {
+  margin: 0;
+  font-size: var(--font-size-2xl);
+  color: var(--text-primary);
+}
+
+.share-page__status {
+  margin: 0;
+  color: var(--text-muted);
+}

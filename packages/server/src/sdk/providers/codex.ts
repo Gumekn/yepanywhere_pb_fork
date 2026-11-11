@@ -118,6 +118,7 @@ import type {
 } from "../types.js";
 import {
   CODEX_NATIVE_CAPABILITIES,
+  CODEX_USER_GOAL_ORIGIN,
   type CodexNativeControlDataMap,
   type CodexNativeControlRequest,
   type CodexNativeControlResult,
@@ -2506,6 +2507,10 @@ export class CodexProvider implements AgentProvider {
             CodexNativeControlDataMap["thread/goal/set"]
           >("thread/goal/set", {
             threadId: runtimeState.threadId,
+            // Every Yep goal control is a direct user action. Codex 0.16x
+            // records user-origin edits into model history and Guardian
+            // authorization; a missing origin is treated as non-user.
+            origin: CODEX_USER_GOAL_ORIGIN,
             ...(request.objective === undefined
               ? {}
               : { objective: request.objective }),
@@ -2520,7 +2525,10 @@ export class CodexProvider implements AgentProvider {
         case "thread/goal/clear": {
           const data = await client.request<
             CodexNativeControlDataMap["thread/goal/clear"]
-          >("thread/goal/clear", { threadId: runtimeState.threadId });
+          >("thread/goal/clear", {
+            threadId: runtimeState.threadId,
+            origin: CODEX_USER_GOAL_ORIGIN,
+          });
           return { ok: true, control: request.control, data };
         }
 
@@ -3735,8 +3743,22 @@ export class CodexProvider implements AgentProvider {
           const params = asRecord(notification.params);
           if (notification.method === "turn/started") {
             const turn = asRecord(params?.turn);
-            if (typeof turn?.id === "string")
+            if (typeof turn?.id === "string") {
+              const providerInitiated = !runtimeState.activeTurnId;
               runtimeState.activeTurnId = turn.id;
+              // Codex starts turns on its own: goal continuations, review and
+              // compaction. Tell the process so it shows (and keeps) the
+              // session busy until the closing result, like a Yep turn.
+              if (providerInitiated) {
+                yield logMessage({
+                  type: "system",
+                  subtype: "turn_started",
+                  session_id: sessionId,
+                  turnId: turn.id,
+                  codexTurnId: turn.id,
+                } as SDKMessage);
+              }
+            }
           }
           if (notification.method === "thread/tokenUsage/updated") {
             const usage = this.extractTurnUsage(notification.params);

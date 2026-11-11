@@ -495,6 +495,41 @@ describe("session display routes", () => {
     }
   });
 
+  it("serves folded process members for the requested branch and page", async () => {
+    const service = new SessionDisplayService({
+      runtime: {
+        getProcessForSession: vi.fn(),
+        subscribeSession: vi.fn(),
+      },
+    });
+    const process = vi
+      .spyOn(service, "process")
+      .mockResolvedValue({ processId: "process:q:0", nodes: [] });
+    const app = new Hono();
+    registerSessionDisplayRoutes(app, {
+      displayService: service,
+      scanner: { getOrCreateProject: vi.fn(async () => project()) },
+      providerResolution: { readerFactory: vi.fn() },
+    });
+    try {
+      const response = await app.request(
+        `/projects/${PROJECT_ID}/sessions/${SESSION_ID}/display/process/${encodeURIComponent("process:q:0")}?branchId=branch-1&cursor=older`,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        processId: "process:q:0",
+        nodes: [],
+      });
+      expect(process).toHaveBeenCalledWith(
+        { projectId: PROJECT_ID, sessionId: SESSION_ID, branchId: "branch-1" },
+        "process:q:0",
+        "older",
+      );
+    } finally {
+      service.dispose();
+    }
+  });
+
   it("reports display view phases and cache state in Server-Timing", async () => {
     const service = new SessionDisplayService({
       runtime: {

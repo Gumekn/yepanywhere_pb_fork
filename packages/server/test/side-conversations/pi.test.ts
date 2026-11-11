@@ -118,6 +118,7 @@ it("creates an isolated SDK session with inherited credentials, read-only tools 
     setModel: parentWrite,
   };
   let finish!: () => void;
+  let listen!: (event: Record<string, unknown>) => void;
   const prompt = vi.fn(
     () =>
       new Promise<void>((resolve) => {
@@ -126,7 +127,10 @@ it("creates an isolated SDK session with inherited credentials, read-only tools 
   );
   const session = {
     prompt,
-    subscribe: vi.fn(() => vi.fn()),
+    subscribe: vi.fn((listener: typeof listen) => {
+      listen = listener;
+      return vi.fn();
+    }),
     abort: vi.fn(async () => {}),
     dispose: vi.fn(),
     messages: [
@@ -205,6 +209,61 @@ it("creates an isolated SDK session with inherited credentials, read-only tools 
     "side question",
     expect.objectContaining({ expandPromptTemplates: false }),
   );
+  // Each step reports its reasoning, structured content and tool results,
+  // never an empty prose-only entry.
+  const toolStep = {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "look" },
+      { type: "toolCall", id: "call", name: "read", arguments: { path: "a" } },
+      { type: "opaque" },
+    ],
+  };
+  notify.mockClear();
+  listen({ type: "message_start", message: { role: "assistant" } });
+  listen({
+    type: "message_update",
+    message: toolStep,
+    assistantMessageEvent: { type: "thinking_delta", delta: "look" },
+  });
+  listen({
+    type: "message_update",
+    message: toolStep,
+    assistantMessageEvent: { type: "toolcall_end" },
+  });
+  listen({ type: "message_end", message: toolStep });
+  listen({
+    type: "tool_execution_end",
+    toolCallId: "call",
+    result: {
+      content: [
+        { type: "text", text: "x".repeat(9_000) },
+        { type: "image", data: "bytes" },
+      ],
+    },
+    isError: false,
+  });
+  const packets = notify.mock.calls.map(([value]) =>
+    JSON.parse(String(value).slice("__YEP_PI_SIDE_V1__:".length)),
+  );
+  expect(packets.map((packet) => packet.type)).toEqual([
+    "thinking",
+    "blocks",
+    "blocks",
+    "tool_result",
+    "activity",
+  ]);
+  expect(packets[2]).toMatchObject({
+    id: "side",
+    messageId: "side-side-1",
+    content: [
+      { type: "thinking", thinking: "look" },
+      { type: "toolCall", id: "call", name: "read", arguments: { path: "a" } },
+    ],
+  });
+  expect(packets[2].content).toHaveLength(2);
+  expect(packets[3]).toMatchObject({ toolCallId: "call", isError: false });
+  expect(packets[3].text).toHaveLength(8_000);
   await command("interrupt");
   expect(session.abort).toHaveBeenCalledTimes(1);
   finish();
@@ -218,4 +277,70 @@ it("creates an isolated SDK session with inherited credentials, read-only tools 
   await command("close");
   expect(session.dispose).toHaveBeenCalledTimes(1);
   expect(parentWrite).not.toHaveBeenCalled();
+});
+
+it("normalizes structured side packets with the main Pi tool mapping", async () => {
+  const sink = vi.fn();
+  let sideId = "";
+  const send = vi.fn(async (command: Record<string, unknown>) => {
+    if (command.type === "get_commands")
+      return {
+        data: {
+          commands: [
+            {
+              name: PI_SIDE_COMMAND,
+              description: "Yep private side conversation protocol v1",
+            },
+          ],
+        },
+      };
+    const payload = JSON.parse(
+      String(command.message).slice(PI_SIDE_COMMAND.length + 2),
+    );
+    sideId = payload.id;
+    channel.accept({
+      type: "extension_ui_request",
+      method: "notify",
+      message: `${PI_SIDE_PREFIX}${JSON.stringify({ type: "control", id: payload.id, requestId: payload.requestId, data: {} })}`,
+    });
+    return {};
+  });
+  const channel = new PiSideChannel(send);
+  await channel.create("snapshot", sink);
+  const packet = (event: Record<string, unknown>) =>
+    channel.accept({
+      type: "extension_ui_request",
+      method: "notify",
+      message: `${PI_SIDE_PREFIX}${JSON.stringify({ id: sideId, ...event })}`,
+    });
+  packet({
+    type: "blocks",
+    messageId: "m",
+    content: [
+      { type: "thinking", thinking: "t" },
+      { type: "toolCall", id: "c", name: "ls", arguments: { path: "src" } },
+      { type: "toolCall", name: "missing-id" },
+    ],
+  });
+  packet({ type: "thinking", messageId: "m", text: "more", append: true });
+  packet({ type: "tool_result", toolCallId: "c", text: "a.ts", isError: true });
+  packet({ type: "tool_result", toolCallId: "c" });
+  expect(sink.mock.calls.map(([event]) => event)).toEqual([
+    {
+      type: "blocks",
+      id: "m",
+      blocks: [
+        { type: "thinking", thinking: "t" },
+        {
+          type: "tool_use",
+          id: "c",
+          name: "Glob",
+          input: { path: "src", pattern: "*" },
+        },
+      ],
+    },
+    { type: "thinking", id: "m", text: "more", append: true },
+    { type: "tool_result", toolUseId: "c", content: "a.ts", isError: true },
+  ]);
+  channel.close();
 });

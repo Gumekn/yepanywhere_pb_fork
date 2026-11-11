@@ -20,6 +20,7 @@ import { initializeTheme } from "./hooks/useTheme";
 import { I18nProvider } from "./i18n";
 import { NavigationLayout } from "./layouts";
 import { startSessionPrefetch } from "./lib/sessionPrefetch";
+import { matchShareRoute } from "./lib/sessionShareLinks";
 import { armSplashSafety } from "./lib/splash";
 import "./styles/index.css";
 
@@ -97,6 +98,11 @@ const DshPage = lazy(() =>
 const CurlPage = lazy(() =>
   import("./pages/CurlPage").then((module) => ({ default: module.CurlPage })),
 );
+const SharePage = lazy(() =>
+  import("./pages/SharePage").then((module) => ({
+    default: module.SharePage,
+  })),
+);
 const SettingsLayout = lazy(() =>
   import("./pages/settings").then((module) => ({
     default: module.SettingsLayout,
@@ -137,7 +143,26 @@ if (!rootElement) {
   throw new Error("Root element not found");
 }
 
-createRoot(rootElement).render(
+// Share links are opened by people with no account on this server. Render them
+// outside <App>, whose auth gate, activity stream and onboarding all assume an
+// owner session.
+const shareToken = matchShareRoute(window.location.pathname, basename);
+
+const shareRoot = shareToken ? (
+  <Wrapper>
+    <I18nProvider>
+      <ErrorBoundary>
+        <BrowserRouter basename={basename}>
+          <Suspense fallback={null}>
+            <SharePage token={shareToken} />
+          </Suspense>
+        </BrowserRouter>
+      </ErrorBoundary>
+    </I18nProvider>
+  </Wrapper>
+) : null;
+
+const appRoot = (
   <Wrapper>
     <I18nProvider>
       <ErrorBoundary>
@@ -210,8 +235,10 @@ createRoot(rootElement).render(
         </BrowserRouter>
       </ErrorBoundary>
     </I18nProvider>
-  </Wrapper>,
+  </Wrapper>
 );
+
+createRoot(rootElement).render(shareRoot ?? appRoot);
 
 // Arm the splash safety timeout (max 6s). The splash is dismissed by
 // whichever first-paint screen calls useHideSplashOnReady(); this is just

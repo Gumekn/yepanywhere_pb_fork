@@ -29,7 +29,8 @@ function renderSearchBar(
     sessionId: "session-1",
     onOpen: vi.fn(),
     onClose: vi.fn(),
-    onSelectMessage: vi.fn(),
+    onSelectMatch: vi.fn(),
+    onQueryChange: vi.fn(),
     ...overrides,
   };
 
@@ -55,7 +56,7 @@ describe("SessionSearchBar", () => {
     vi.clearAllMocks();
   });
 
-  it("searches only the current session and navigates between matches", async () => {
+  it("searches only the current session and steps through every occurrence", async () => {
     mocks.search.mockResolvedValue({
       query: "needle",
       totalSessions: 1,
@@ -84,6 +85,7 @@ describe("SessionSearchBar", () => {
               snippet: "second needle",
               matchStart: 7,
               matchLength: 6,
+              occurrenceCount: 2,
             },
           ],
         },
@@ -104,17 +106,81 @@ describe("SessionSearchBar", () => {
       session: "session-1",
       limit: 1,
     });
-    expect(props.onSelectMessage).toHaveBeenCalledWith("message-1");
-    expect(screen.getByRole("status").textContent).toBe("1 / 2");
+    // Starts at the latest hit, nearest to where the transcript opens.
+    expect(props.onQueryChange).toHaveBeenLastCalledWith("needle");
+    expect(props.onSelectMatch).toHaveBeenCalledWith({
+      messageId: "message-2",
+      occurrence: 1,
+    });
+    expect(screen.getByRole("status").textContent).toBe("3 / 3");
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Previous match",
+      }),
+    );
+    expect(props.onSelectMatch).toHaveBeenLastCalledWith({
+      messageId: "message-2",
+      occurrence: 0,
+    });
+    expect(screen.getByRole("status").textContent).toBe("2 / 3");
 
     fireEvent.click(
       screen.getByRole("button", {
         name: "Next match",
       }),
     );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Next match",
+      }),
+    );
+    expect(props.onSelectMatch).toHaveBeenLastCalledWith({
+      messageId: "message-1",
+      occurrence: 0,
+    });
+    expect(screen.getByRole("status").textContent).toBe("1 / 3");
+  });
 
-    expect(props.onSelectMessage).toHaveBeenLastCalledWith("message-2");
-    expect(screen.getByRole("status").textContent).toBe("2 / 2");
+  it("searches folded process text only when opted in", async () => {
+    mocks.search.mockResolvedValue({
+      query: "needle",
+      totalSessions: 0,
+      totalMatches: 0,
+      searchDurationMs: 1,
+      results: [],
+    });
+    renderSearchBar();
+
+    fireEvent.change(screen.getByRole("searchbox"), {
+      target: { value: "needle" },
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(mocks.search).toHaveBeenLastCalledWith({
+      q: "needle",
+      project: "project-1",
+      session: "session-1",
+      limit: 1,
+    });
+
+    const toggle = screen.getByRole("button", {
+      name: "Include folded steps",
+    });
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(mocks.search).toHaveBeenLastCalledWith({
+      q: "needle",
+      project: "project-1",
+      session: "session-1",
+      limit: 1,
+      includeFolded: true,
+    });
   });
 
   it("opens with the standard find shortcut while collapsed", () => {

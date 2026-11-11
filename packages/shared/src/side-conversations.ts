@@ -59,12 +59,38 @@ export type SideConversationStatus =
   | "stopping"
   | "failed"
   | "closed";
+/**
+ * Ordered assistant content, in the same shape the main transcript renders:
+ * prose, reasoning and read-only tool calls with their (bounded) results.
+ */
+export type SideConversationBlock =
+  | {
+      type: "text";
+      text: string;
+      /** Sanitized server-rendered Markdown, present after completion. */
+      html?: string;
+    }
+  | { type: "thinking"; thinking: string }
+  | {
+      type: "tool_use";
+      id: string;
+      name: string;
+      input: unknown;
+      result?: { content: string; isError?: boolean };
+    };
 export interface SideConversationMessage {
   id: string;
   role: "user" | "assistant";
+  /** Plain prose of the message (assistant: text blocks only). */
   text: string;
-  /** Sanitized server-rendered Markdown, present after completion. */
+  /** Provider-declared prose phase; absent on older servers and Pi messages. */
+  phase?: "commentary" | "final_answer";
+  /** Sanitized server-rendered Markdown of `text`, present after completion. */
   html?: string;
+  /** ISO time the message was last updated. */
+  timestamp?: string;
+  /** Assistant content blocks; older servers send `text` only. */
+  blocks?: SideConversationBlock[];
   /** Images attached to a user question (names only; bytes stay on disk). */
   attachments?: Array<{ name: string; mimeType: string }>;
 }

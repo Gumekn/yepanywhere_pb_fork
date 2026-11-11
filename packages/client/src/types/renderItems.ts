@@ -17,6 +17,7 @@ export type RenderItem =
   | SessionSetupItem
   | SystemItem
   | DisplayToolGroupItem
+  | DisplayProcessItem
   | CodexNativeItem;
 
 /** Base fields shared by all render items */
@@ -123,6 +124,20 @@ export interface DisplayToolGroupItem extends RenderItemBase {
   mainTimeline?: boolean;
   /** Native task/wait rows that already represent these call ids. */
   representedAgentCallIds?: string[];
+}
+
+/**
+ * Collapsed working steps of a settled answer. The folded members (reasoning,
+ * progress updates, tool groups) load only when the reader expands the row.
+ */
+export interface DisplayProcessItem extends RenderItemBase {
+  type: "display_process";
+  id: string;
+  process: Extract<SessionDisplaySegment, { type: "process" }>;
+  projectId: string;
+  sessionId: string;
+  revision: string;
+  branchId?: string;
 }
 
 /**

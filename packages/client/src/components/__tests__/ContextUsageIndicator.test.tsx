@@ -58,4 +58,27 @@ describe("ContextUsageIndicator", () => {
 
     expect(screen.getByText("281.2K/1.0M")).toBeTruthy();
   });
+
+  it("shows an unknown post-compaction fill as ? instead of 0", () => {
+    const usage = {
+      inputTokens: 0,
+      percentage: 0,
+      contextWindow: 1_000_000,
+      unknown: true,
+    };
+    const { container } = render(
+      <I18nProvider>
+        <ContextUsageIndicator usage={usage} labelMode="tokens" />
+        <ContextUsageIndicator usage={usage} />
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText("?/1.0M")).toBeTruthy();
+    expect(screen.getByText("?")).toBeTruthy();
+    expect(
+      container
+        .querySelector(".context-usage-indicator")
+        ?.getAttribute("title"),
+    ).toBe("Context was compacted. Usage updates after the next response.");
+  });
 });

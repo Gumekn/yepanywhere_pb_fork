@@ -204,6 +204,35 @@ const INITIAL_RECONCILE_DELAYS_MS = [1000, 3000] as const;
 const DEFAULT_NATIVE_FORK_SESSION_ID_TIMEOUT_MS = 60_000;
 /** Includes MCP discovery and app-server thread initialization. */
 const CODEX_SESSION_ID_TIMEOUT_MS = 30_000;
+/**
+ * Pi reports its durable ID from `get_state` only after it has loaded the
+ * native extensions, which regularly takes more than five seconds. A new Pi
+ * session must not fall back to the temporary ID: that ID would reach the
+ * session list and the opened page as a second session.
+ */
+const PI_SESSION_ID_TIMEOUT_MS = 30_000;
+const DEFAULT_SESSION_ID_TIMEOUT_MS = 5000;
+
+/**
+ * How long a new provider process may take to report its durable session ID,
+ * and whether a missing ID fails the start instead of keeping the temporary ID.
+ */
+function newSessionIdWait(providerName: string): {
+  timeoutMs: number;
+  strict: boolean;
+} {
+  switch (providerName) {
+    case "codex":
+      return { timeoutMs: CODEX_SESSION_ID_TIMEOUT_MS, strict: true };
+    case "cursor":
+    case "mcode":
+      return { timeoutMs: CURSOR_SESSION_ID_TIMEOUT_MS, strict: true };
+    case "pi":
+      return { timeoutMs: PI_SESSION_ID_TIMEOUT_MS, strict: true };
+    default:
+      return { timeoutMs: DEFAULT_SESSION_ID_TIMEOUT_MS, strict: false };
+  }
+}
 
 export interface SupervisorOptions {
   /** Agent provider interface (preferred for new code) */
@@ -651,19 +680,8 @@ export class Supervisor {
 
     // Wait for the real session ID from the provider
     try {
-      await process.waitForSessionId(
-        activeProvider.name === "codex"
-          ? CODEX_SESSION_ID_TIMEOUT_MS
-          : activeProvider.name === "cursor" || activeProvider.name === "mcode"
-            ? CURSOR_SESSION_ID_TIMEOUT_MS
-            : 5000,
-        {
-          strict:
-            activeProvider.name === "codex" ||
-            activeProvider.name === "cursor" ||
-            activeProvider.name === "mcode",
-        },
-      );
+      const wait = newSessionIdWait(activeProvider.name);
+      await process.waitForSessionId(wait.timeoutMs, { strict: wait.strict });
     } catch (error) {
       await process.abort();
       throw error;
@@ -872,17 +890,11 @@ export class Supervisor {
     if (!resumeSessionId || requiresStrictSessionId) {
       let resolvedSessionId: string;
       try {
-        const sessionIdTimeoutMs = isForkedResume
-          ? this.nativeForkSessionIdTimeoutMs
-          : activeProvider.name === "codex"
-            ? CODEX_SESSION_ID_TIMEOUT_MS
-            : activeProvider.name === "cursor" ||
-                activeProvider.name === "mcode"
-              ? CURSOR_SESSION_ID_TIMEOUT_MS
-              : 5000;
-        resolvedSessionId = await process.waitForSessionId(sessionIdTimeoutMs, {
-          strict: requiresStrictSessionId,
-        });
+        const wait = newSessionIdWait(activeProvider.name);
+        resolvedSessionId = await process.waitForSessionId(
+          isForkedResume ? this.nativeForkSessionIdTimeoutMs : wait.timeoutMs,
+          { strict: requiresStrictSessionId || wait.strict },
+        );
       } catch (error) {
         await process.abort();
         throw error;

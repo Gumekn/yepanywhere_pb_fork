@@ -12,6 +12,8 @@ export const SESSION_DISPLAY_QUESTION_PREVIEW_MAX_LENGTH = 140;
 export const SESSION_DISPLAY_THINKING_PREVIEW_MAX_LENGTH = 240;
 export const SESSION_DISPLAY_LIVE_STEP_LIMIT = 50;
 export const SESSION_DISPLAY_STEP_PREVIEW_LIMIT = 2_048;
+/** Folded assistant-text source ids listed on one process segment. */
+export const SESSION_DISPLAY_PROCESS_MAX_MESSAGE_IDS = 256;
 
 export const SessionDisplayToolStepSchema = z
   .object({
@@ -106,6 +108,12 @@ export const SessionDisplayAssistantTextSegmentSchema = z
   .object({
     type: z.literal("assistant_text"),
     id: NonEmptyIdSchema,
+    /**
+     * Source message identity (`uuid ?? id`) of the row that produced this
+     * text. Content search reports this id, so deep links can find the
+     * segment even though the display id is derived from it.
+     */
+    messageId: NonEmptyIdSchema.optional(),
     /** Stable native identity shared by live and persisted assistant rows. */
     codexCorrelationKey: NonEmptyIdSchema.optional(),
     phase: z.enum(["progress", "final", "text"]),
@@ -267,6 +275,45 @@ export const SessionDisplayNoticeSegmentSchema = z
   })
   .strict();
 
+/**
+ * The working steps of a settled answer (reasoning, progress updates, tool
+ * groups and process notices) folded behind one summary row.
+ *
+ * Only the summary crosses the wire by default; `/display/process/:id` returns
+ * the folded members when a reader expands the row. Running turns, final
+ * answers, async questions, errors and visible system markers are never
+ * folded.
+ */
+export const SessionDisplayProcessSegmentSchema = z
+  .object({
+    type: z.literal("process"),
+    id: NonEmptyIdSchema,
+    /** Outcome of the work this fold ends; `unknown` renders a neutral label. */
+    status: z.enum(["completed", "interrupted", "failed", "unknown"]),
+    stepCount: z.number().int().positive(),
+    toolCount: z.number().int().nonnegative(),
+    failedToolCount: z.number().int().nonnegative(),
+    thinkingCount: z.number().int().nonnegative(),
+    updateCount: z.number().int().nonnegative(),
+    changedFileCount: z.number().int().nonnegative().optional(),
+    startedAt: TimestampSchema.optional(),
+    endedAt: TimestampSchema.optional(),
+    /** Changes whenever a folded member changes, e.g. a late tool result. */
+    version: z.number().int().nonnegative(),
+    /** Older-history cursor that reproduces this fold outside the live view. */
+    pageCursor: z.string().min(1).max(8_192).optional(),
+    /**
+     * Source message ids of the assistant text folded inside, so a content
+     * search hit on hidden progress text can still land on its fold.
+     */
+    messageIds: z
+      .array(NonEmptyIdSchema)
+      .max(SESSION_DISPLAY_PROCESS_MAX_MESSAGE_IDS)
+      .optional(),
+    timestamp: TimestampSchema.optional(),
+  })
+  .strict();
+
 export const SessionDisplaySegmentSchema = z.discriminatedUnion("type", [
   SessionDisplayAssistantTextSegmentSchema,
   SessionDisplayThinkingSegmentSchema,
@@ -274,6 +321,7 @@ export const SessionDisplaySegmentSchema = z.discriminatedUnion("type", [
   SessionDisplayActionRequiredSegmentSchema,
   SessionDisplayErrorSegmentSchema,
   SessionDisplayNoticeSegmentSchema,
+  SessionDisplayProcessSegmentSchema,
 ]);
 
 /** Provider-native lifecycle projected onto one semantic turn. */
@@ -451,6 +499,12 @@ export interface SessionDisplaySubscriptionOptions {
 export interface SessionDisplayCurrent {
   view: SessionDisplayView;
   seq: number;
+}
+
+/** Folded members of one `process` segment, in their original order. */
+export interface SessionDisplayProcessPage {
+  processId: string;
+  nodes: SessionDisplayNode[];
 }
 
 export interface SessionDisplayGroupPage {

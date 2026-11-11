@@ -242,6 +242,10 @@ export {
 export type {
   GitStatusInfo,
   GitFileChange,
+  ProjectGitBaseComparison,
+  ProjectGitFetchResponse,
+  ProjectGitFetchResult,
+  ProjectGitFetchStatus,
   ProjectGitStatusSummary,
 } from "./git-status.js";
 
@@ -440,6 +444,7 @@ export {
   SessionDisplayErrorSegmentSchema,
   SessionDisplayNoticeSegmentSchema,
   SessionDisplayPageSchema,
+  SessionDisplayProcessSegmentSchema,
   SessionDisplayQuestionSchema,
   SessionDisplaySegmentSchema,
   SessionDisplayThinkingSegmentSchema,
@@ -684,6 +689,7 @@ export {
   SessionDisplayActivitySchema,
   SESSION_DISPLAY_LIVE_STEP_LIMIT,
   SESSION_DISPLAY_STEP_PREVIEW_LIMIT,
+  SESSION_DISPLAY_PROCESS_MAX_MESSAGE_IDS,
   applySessionDisplayPatch,
   sameSessionDisplayView,
   sessionDisplaySnapshotPage,
@@ -699,6 +705,7 @@ export type {
   SessionDisplayKnownView,
   SessionDisplayCurrent,
   SessionDisplayGroupPage,
+  SessionDisplayProcessPage,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
 } from "./session-display.js";
@@ -740,3 +747,17 @@ export type {
   CursorUsage,
 } from "./cursor.js";
 export * from "./curl.js";
+export type {
+  PublicSessionShareResponse,
+  SessionShareExpiry,
+  SessionShareRecord,
+  SessionShareSnapshot,
+  SessionShareSnapshotSession,
+} from "./session-share.js";
+export {
+  DEFAULT_SESSION_SHARE_EXPIRY,
+  SESSION_SHARE_EXPIRY_OPTIONS,
+  isSessionShareExpiry,
+  isSessionShareToken,
+  resolveSessionShareExpiresAt,
+} from "./session-share.js";

@@ -153,8 +153,12 @@ export function createRecentsRoutes(deps: RecentsDeps): Hono {
       return c.json({ error: "sessionId and projectId are required" }, 400);
     }
 
-    await deps.recentsService.recordVisit(body.sessionId, body.projectId);
-    await deps.notificationService?.markSeen(body.sessionId);
+    // A page may still be open under a provider's temporary ID.
+    const sessionId =
+      deps.sessionMetadataService?.getCanonicalSessionId(body.sessionId) ??
+      body.sessionId;
+    await deps.recentsService.recordVisit(sessionId, body.projectId);
+    await deps.notificationService?.markSeen(sessionId);
     return c.json({ recorded: true });
   });
 

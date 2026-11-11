@@ -344,12 +344,27 @@ export function SidebarNavItem({
 
 export interface SidebarNavSectionProps {
   children: ReactNode;
+  /** Accessible name for the navigation landmark. */
+  label?: string;
+  /** `grid` packs links into as many columns as the sidebar width allows. */
+  layout?: "list" | "grid";
 }
 
 /**
  * Container for sidebar navigation items.
  * Provides consistent spacing between items.
  */
-export function SidebarNavSection({ children }: SidebarNavSectionProps) {
-  return <nav className="sidebar-nav-section">{children}</nav>;
+export function SidebarNavSection({
+  children,
+  label,
+  layout = "list",
+}: SidebarNavSectionProps) {
+  return (
+    <nav
+      className={`sidebar-nav-section${layout === "grid" ? " sidebar-nav-section--grid" : ""}`}
+      aria-label={label}
+    >
+      {children}
+    </nav>
+  );
 }

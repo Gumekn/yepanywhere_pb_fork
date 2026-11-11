@@ -28,8 +28,26 @@ export interface AuthMiddlewareOptions {
   authDisabled?: boolean;
   /** Desktop auth token from Tauri app. Acts as minimum auth floor when no other auth is configured. */
   desktopAuthToken?: string;
-  /** Optional base path prefix (e.g. "/yep") when served behind a reverse proxy. */
+  /**
+   * Reverse-proxy prefix the app is mounted under (e.g. `/yep`). `c.req.path`
+   * keeps the prefix, so path exemptions are matched after stripping it.
+   */
   basePath?: string;
+}
+
+/**
+ * Routes that are reachable without logging in. Each one must authorize the
+ * request itself — the share-link routes treat their unguessable token as the
+ * credential and expose only the frozen snapshot behind it.
+ */
+export const PUBLIC_API_PREFIX = "/api/public/";
+
+function stripBasePath(path: string, basePath: string | undefined): string {
+  const prefix = (basePath ?? "").replace(/\/$/, "");
+  if (!prefix || !path.startsWith(prefix)) return path;
+  const rest = path.slice(prefix.length);
+  if (rest === "") return "/";
+  return rest.startsWith("/") ? rest : path;
 }
 
 /**
@@ -62,18 +80,6 @@ function hasValidDesktopToken(
   return false;
 }
 
-function normalizePath(rawPath: string, basePath?: string): string {
-  const cleanBase = basePath?.trim().replace(/\/+$/, "");
-  if (
-    cleanBase &&
-    (rawPath === cleanBase || rawPath.startsWith(`${cleanBase}/`))
-  ) {
-    const stripped = rawPath.slice(cleanBase.length);
-    return stripped.startsWith("/") ? stripped : `/${stripped}`;
-  }
-  return rawPath;
-}
-
 /**
  * Create auth middleware that validates session cookies.
  */
@@ -88,15 +94,17 @@ export function createAuthMiddleware(
   } = options;
 
   return async (c, next) => {
-    const rawPath = c.req.path;
-    const path = normalizePath(rawPath, basePath);
+    const path = stripBasePath(c.req.path, basePath);
 
     // Skip auth for health check (always open for readiness probes)
-    if (
-      path === "/health" ||
-      rawPath === "/health" ||
-      rawPath.endsWith("/health")
-    ) {
+    if (path === "/health") {
+      await next();
+      return;
+    }
+
+    // Token-addressed public routes authorize themselves; never ask them for
+    // a session cookie or the desktop token.
+    if (path.startsWith(PUBLIC_API_PREFIX)) {
       await next();
       return;
     }
@@ -118,7 +126,7 @@ export function createAuthMiddleware(
     // Skip local password auth for requests from the trusted local websocket.
     // The websocket handler sets this Symbol when routing requests through app.fetch().
     // Using a Symbol ensures this cannot be forged by external HTTP requests.
-    if (c.env?.[WS_INTERNAL_AUTHENTICATED]) {
+    if (c.env[WS_INTERNAL_AUTHENTICATED]) {
       c.set("authenticated", true);
       await next();
       return;
@@ -130,10 +138,7 @@ export function createAuthMiddleware(
       if (desktopAuthToken && !authService.isLocalhostOpen()) {
         // Desktop token is set but request didn't have it (checked above).
         // Allow auth status so the UI can detect state.
-        if (
-          path === "/api/auth/status" ||
-          rawPath.endsWith("/api/auth/status")
-        ) {
+        if (path === "/api/auth/status") {
           await next();
           return;
         }
@@ -145,12 +150,7 @@ export function createAuthMiddleware(
     }
 
     // Skip auth for /api/auth/* paths
-    if (
-      path.startsWith("/api/auth/") ||
-      path === "/api/auth" ||
-      rawPath.includes("/api/auth/") ||
-      rawPath.endsWith("/api/auth")
-    ) {
+    if (path.startsWith("/api/auth/") || path === "/api/auth") {
       await next();
       return;
     }

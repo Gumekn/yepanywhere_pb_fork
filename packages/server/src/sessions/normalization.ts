@@ -701,6 +701,12 @@ interface PiDerivationAccumulator {
    * reporting the interrupt.
    */
   lastUsageAssistant?: PiAssistantMessage;
+  /**
+   * A compaction happened after the last usage-bearing assistant. Pi treats
+   * the fill level as unknown until the next response reports usage, because
+   * the older usage describes the pre-compaction context.
+   */
+  compactedSinceUsage: boolean;
   userQuestions: NonNullable<SessionSummary["userQuestions"]>;
   compactEvents: ContextCompactEvent[];
   cumulative: ContextCumulativeUsage;
@@ -710,6 +716,7 @@ function createPiDerivationAccumulator(): PiDerivationAccumulator {
   return {
     firstUserText: "",
     messageCount: 0,
+    compactedSinceUsage: false,
     userQuestions: [],
     compactEvents: [],
     cumulative: {
@@ -757,6 +764,8 @@ function consumePiDerivation(
       beforeTokens,
       trigger: "pi",
     });
+    accumulator.lastUsageAssistant = undefined;
+    accumulator.compactedSinceUsage = true;
   }
 
   if (!isPiSessionMessageEntry(entry)) return;
@@ -779,6 +788,7 @@ function consumePiDerivation(
     accumulator.lastAssistant = message;
     if (isPiUsageBearingAssistant(message)) {
       accumulator.lastUsageAssistant = message;
+      accumulator.compactedSinceUsage = false;
     }
     accumulator.model = message.model
       ? qualifyPiSessionModel(message.model, message.provider)
@@ -819,7 +829,7 @@ function finishPiDerivation(
   // load-bearing: the client only falls back to the live `context-status`
   // endpoint when the field is absent, and `mergeSameSessionMetadata()` only
   // preserves the previous good value for an undefined incoming one.
-  const contextUsage =
+  const contextUsage: ContextUsage | undefined =
     usage && contextWindow && inputTokens > 0
       ? {
           inputTokens,
@@ -834,7 +844,17 @@ function finishPiDerivation(
             Math.round((inputTokens / contextWindow) * 100),
           ),
         }
-      : undefined;
+      : accumulator.compactedSinceUsage
+        ? // Explicit, unlike the undefined above: clients keep the previous
+          // reading for an absent value, which here is the stale
+          // pre-compaction fill (Pi's own footer shows `?` in this state).
+          {
+            inputTokens: 0,
+            percentage: 0,
+            ...(contextWindow ? { contextWindow } : {}),
+            unknown: true,
+          }
+        : undefined;
   const stopReason = accumulator.lastAssistant?.stopReason;
   // Only these stop reasons hand control back to the user. `toolUse` (and the
   // non-final `pending`/`deferred`) mean the agent was still mid-turn, so a

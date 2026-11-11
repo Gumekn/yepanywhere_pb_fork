@@ -364,4 +364,118 @@ describe("Pi native session reader", () => {
       expect(secondLoad.data.session).toBe(firstLoad.data.session);
     }
   });
+
+  it("exposes a resubmitted prompt with unchanged text as an edit branch", async () => {
+    const sessionsDir = join(tmpdir(), `pi-sessions-${randomUUID()}`);
+    const projectPath = join(tmpdir(), `pi-project-${randomUUID()}`);
+    const projectDir = join(sessionsDir, "--pi-same-text-project--");
+    tempDirs.push(sessionsDir);
+    await mkdir(projectDir, { recursive: true });
+
+    const user = (id: string, parentId: string | null, text: string) => ({
+      type: "message",
+      id,
+      parentId,
+      timestamp: "2026-11-04T01:00:00.000Z",
+      message: { role: "user", content: text, timestamp: 1 },
+    });
+    const assistant = (id: string, parentId: string, text: string) => ({
+      type: "message",
+      id,
+      parentId,
+      timestamp: "2026-11-04T01:00:01.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text }],
+        stopReason: "stop",
+        timestamp: 2,
+      },
+    });
+
+    const parentId = randomUUID();
+    const parentPath = join(projectDir, `parent_${parentId}.jsonl`);
+    await writeFile(
+      parentPath,
+      jsonl([
+        {
+          type: "session",
+          version: 3,
+          id: parentId,
+          timestamp: "2026-11-04T01:00:00.000Z",
+          cwd: projectPath,
+        },
+        user("u1", null, "first prompt"),
+        assistant("a1", "u1", "first answer"),
+        user("u2", "a1", "continue"),
+        assistant("a2", "u2", "original answer"),
+      ]),
+    );
+
+    // Pi's fork copies the retained path under the same entry ids, then the
+    // edited prompt follows under a new id. Here it repeats the original text.
+    const childId = randomUUID();
+    await writeFile(
+      join(projectDir, `child_${childId}.jsonl`),
+      jsonl([
+        {
+          type: "session",
+          version: 3,
+          id: childId,
+          timestamp: "2026-11-04T02:00:00.000Z",
+          cwd: projectPath,
+          parentSession: parentPath,
+        },
+        user("u1", null, "first prompt"),
+        assistant("a1", "u1", "first answer"),
+        {
+          type: "model_change",
+          id: "model",
+          parentId: "a1",
+          timestamp: "2026-11-04T02:00:01.000Z",
+          provider: "yep-openai-compatible",
+          modelId: "gpt-5",
+        },
+        user("u2-retry", "model", "continue"),
+        assistant("a2-retry", "u2-retry", "another answer"),
+      ]),
+    );
+
+    const reader = new PiSessionReader({ sessionsDir, projectPath });
+    const projectId = encodeProjectId(projectPath);
+    const loaded = await reader.getSession(childId, projectId);
+    const forks = loaded?.branchState?.branches
+      .filter((branch) => branch.siblingCount > 1)
+      .map((branch) => ({
+        id: branch.id,
+        sessionId: branch.sessionId,
+        position: `${branch.siblingIndex}/${branch.siblingCount}`,
+      }));
+    expect(forks).toEqual([
+      { id: "u2", sessionId: parentId, position: "1/2" },
+      { id: "u2-retry", sessionId: childId, position: "2/2" },
+    ]);
+
+    // Metadata-only reads return the same family without a transcript load.
+    expect(await reader.getBranchState(childId)).toEqual(loaded?.branchState);
+    expect(await reader.getBranchState(parentId)).toMatchObject({
+      sessionId: parentId,
+      activeBranchId: "u2",
+    });
+
+    const loneId = randomUUID();
+    await writeFile(
+      join(projectDir, `lone_${loneId}.jsonl`),
+      jsonl([
+        {
+          type: "session",
+          version: 3,
+          id: loneId,
+          timestamp: "2026-11-04T03:00:00.000Z",
+          cwd: projectPath,
+        },
+        user("lone-user", null, "unrelated"),
+      ]),
+    );
+    expect(await reader.getBranchState(loneId)).toBeUndefined();
+  });
 });

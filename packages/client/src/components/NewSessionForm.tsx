@@ -50,7 +50,15 @@ import { useServerSettings } from "../hooks/useServerSettings";
 import { useI18n } from "../i18n";
 import type { AgentCommandAvailability } from "../lib/agentCommands";
 import {
+  YEP_EXTRA_PI_COMMANDS,
+  YEP_HANDLED_CODEX_COMMANDS,
+  YEP_HANDLED_PI_COMMANDS,
+  leadingSlashCommandName,
+  terminalOnlyCommand,
+} from "../lib/cliSlashCommands";
+import {
   type CodexSkillCommand,
+  parseCodexSlashCommand,
   resolveCodexSkillInputs,
 } from "../lib/codexInputCommands";
 import {
@@ -691,13 +699,58 @@ export function NewSessionForm({
     const inputs = resolveCodexSkillInputs(text, codexSkills);
     return inputs.length > 0 ? inputs : undefined;
   };
+  /**
+   * Why a `/` command cannot start a session, if it cannot: CLI built-ins
+   * that only work in the terminal, and Yep-run commands that need a session
+   * (only Codex `/goal` can start one). Pi's own reported commands run.
+   */
+  const newSessionCommandError = (
+    text: string,
+    reportedNames: readonly string[],
+  ): string | null => {
+    if (selectedProvider !== "codex" && selectedProvider !== "pi") return null;
+    const name = leadingSlashCommandName(text);
+    if (!name) return null;
+    const terminalOnly = terminalOnlyCommand(
+      selectedProvider,
+      text,
+      reportedNames,
+    );
+    if (terminalOnly) {
+      return t("slashCommandTerminalOnly", {
+        command: terminalOnly,
+        provider: selectedProvider === "codex" ? "Codex" : "Pi",
+      });
+    }
+    if (reportedNames.includes(name)) return null;
+    const needsSession =
+      selectedProvider === "codex"
+        ? YEP_HANDLED_CODEX_COMMANDS.has(name) && name !== "goal"
+        : YEP_HANDLED_PI_COMMANDS.has(name) ||
+          (YEP_EXTRA_PI_COMMANDS as readonly string[]).includes(name);
+    return needsSession
+      ? t("slashCommandNeedsSession", { command: name })
+      : null;
+  };
+
   const commandButtons = useAgentCommandCatalog({
     provider: selectedProvider,
     supportsSlashCommands: selectedProviderInfo?.supportsSlashCommands,
     providerCommands: commandListing?.commands,
     codexSkills,
+    codexFastMode: showCodexFastMode && supportsCodexFastMode,
     availability: NEW_SESSION_COMMAND_AVAILABILITY,
   });
+
+  /** `/fast` flips the Fast toggle, like the Codex TUI's service-tier command. */
+  const toggleCodexFastFromCommand = () => {
+    const next = !codexFastMode;
+    setCodexFastMode(next);
+    showToast(
+      t(next ? "codexFastModeEnabled" : "codexFastModeDisabled"),
+      "success",
+    );
+  };
 
   const applyProviderSelection = useCallback(
     (provider: ProviderInfo, savedDefaults?: NewSessionProviderDefaults) => {
@@ -1222,6 +1275,20 @@ export function NewSessionForm({
     },
     commandConfigs: commandButtons,
     onCommandMenuOpen: refreshCommandListing,
+    onCustomCommand: (command) => {
+      if (
+        command === "fast" &&
+        selectedProvider === "codex" &&
+        showCodexFastMode &&
+        supportsCodexFastMode
+      ) {
+        toggleCodexFastFromCommand();
+        return true;
+      }
+      const error = newSessionCommandError(`/${command}`, []);
+      if (error) showToast(error, "error");
+      return error !== null;
+    },
     onSubmit: () => {
       void handleStartSession();
     },
@@ -1503,6 +1570,46 @@ export function NewSessionForm({
 
     const trimmedMessage = finalMessage.trim();
 
+    if (
+      selectedProvider === "codex" &&
+      showCodexFastMode &&
+      supportsCodexFastMode &&
+      leadingSlashCommandName(trimmedMessage) === "fast" &&
+      pendingFiles.length === 0
+    ) {
+      toggleCodexFastFromCommand();
+      draftControls.clearDraft();
+      return;
+    }
+    const commandError = newSessionCommandError(
+      trimmedMessage,
+      (commandListing?.commands ?? []).map((command) => command.name),
+    );
+    if (commandError) {
+      showToast(commandError, "error");
+      return;
+    }
+
+    // `/goal <objective>` starts the session on a Codex goal instead of a
+    // prompt, like the Codex TUI before its first turn. Codex app-server does
+    // not parse slash commands, so sending the text would only reach the model.
+    const goalCommand =
+      selectedProvider === "codex"
+        ? parseCodexSlashCommand(trimmedMessage)
+        : null;
+    const goalObjective =
+      goalCommand?.kind === "goal" ? goalCommand.objective : undefined;
+    if (goalCommand?.kind === "goal") {
+      if (!goalObjective) {
+        showToast(t("codexGoalObjectiveRequired"), "error");
+        return;
+      }
+      if (pendingFiles.length > 0) {
+        showToast(t("codexGoalAttachmentsUnsupported"), "error");
+        return;
+      }
+    }
+
     setIsStarting(true);
     let sessionStartOutcomePending = false;
 
@@ -1543,10 +1650,38 @@ export function NewSessionForm({
             ? (selectedLlmGatewayKeyId ?? undefined)
             : undefined,
         llmGatewayConfig: llmGatewayConfigForRequest,
-        codexInputs: codexInputsForMessage(trimmedMessage),
+        codexInputs: goalObjective
+          ? undefined
+          : codexInputsForMessage(trimmedMessage),
       };
 
-      if (pendingFiles.length > 0) {
+      if (goalObjective) {
+        // Create the thread without a turn, then set an active goal; Codex
+        // starts the first goal turn itself.
+        sessionStartOutcomePending = true;
+        const createResult = await requireStartedHistoricalEdit(
+          await api.createSession(projectId, sessionOptions),
+          api.cancelQueuedRequest,
+          "session start",
+        );
+        sessionStartOutcomePending = false;
+        sessionId = createResult.sessionId;
+        processId = createResult.processId;
+        initialPermissionMode = createResult.permissionMode;
+        initialModeVersion = createResult.modeVersion;
+        try {
+          await api.processGoal(processId, {
+            action: "set",
+            objective: goalObjective,
+          });
+        } catch (goalErr) {
+          // The session exists; open it so the goal can be retried there.
+          console.error("Failed to set Codex goal:", goalErr);
+          const message =
+            goalErr instanceof Error ? goalErr.message : String(goalErr);
+          showToast(t("codexGoalStartFailed", { message }), "error");
+        }
+      } else if (pendingFiles.length > 0) {
         // Two-phase flow: create session first, then upload to real session folder
         // Step 1: Create the session without sending a message
         sessionStartOutcomePending = true;
@@ -1640,7 +1775,7 @@ export function NewSessionForm({
           permissionMode: initialPermissionMode,
           modeVersion: initialModeVersion,
         },
-        initialTitle: trimmedMessage,
+        initialTitle: goalObjective ?? trimmedMessage,
         initialProvider: selectedProvider ?? undefined,
         initialModel: sessionOptions.model,
         initialReasoningEffort: sessionOptions.reasoningEffort,

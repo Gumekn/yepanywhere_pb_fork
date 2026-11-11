@@ -30,6 +30,20 @@ export interface GitStatusInfo {
   files: GitFileChange[];
 }
 
+/**
+ * Commit relationship between HEAD and the remote default branch
+ * (e.g. `origin/main`). Based on the local remote-tracking ref, so it only
+ * reflects remote changes after a `git fetch`.
+ */
+export interface ProjectGitBaseComparison {
+  /** Remote default branch ref, e.g. "origin/main" */
+  ref: string;
+  /** Commits in HEAD that are not in the base ref */
+  ahead: number;
+  /** Commits in the base ref that are not in HEAD */
+  behind: number;
+}
+
 export interface ProjectGitStatusSummary {
   /** Whether the project path is a git repository */
   isGitRepo: boolean;
@@ -55,6 +69,37 @@ export interface ProjectGitStatusSummary {
   untrackedCount: number;
   /** Number of files with merge conflicts */
   conflictedCount: number;
-  /** Number of stashed changes */
+  /** Number of stashed changes (does not affect `isClean`) */
   stashCount: number;
+  /**
+   * Comparison against the remote default branch. Null when it cannot be
+   * resolved (no remote, no `origin/HEAD`/`main`/`master`, or no commits).
+   */
+  base?: ProjectGitBaseComparison | null;
+  /**
+   * Remote default branch that was skipped because it shares no history with
+   * HEAD (e.g. a placeholder "Initial commit" on main). `base` is null then.
+   */
+  unrelatedBaseRef?: string | null;
+  /** ISO timestamp of the last fetch (FETCH_HEAD mtime), null if never fetched */
+  lastFetchedAt?: string | null;
+  /** Error from the most recent Yep-initiated fetch, null when it succeeded */
+  fetchError?: string | null;
+}
+
+export type ProjectGitFetchStatus =
+  | "fetched"
+  | "skipped"
+  | "failed"
+  | "no-remote"
+  | "not-git";
+
+export interface ProjectGitFetchResult {
+  projectId: string;
+  status: ProjectGitFetchStatus;
+  error?: string;
+}
+
+export interface ProjectGitFetchResponse {
+  results: ProjectGitFetchResult[];
 }

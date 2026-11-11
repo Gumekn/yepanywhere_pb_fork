@@ -73,13 +73,23 @@ const REFETCH_DEBOUNCE_MS = 500;
  */
 let projectsRequest: Promise<{ projects: Project[] }> | null = null;
 
-function fetchProjectsShared(): Promise<{ projects: Project[] }> {
-  if (!projectsRequest) {
-    projectsRequest = api.getProjects().finally(() => {
-      projectsRequest = null;
+/**
+ * @param fresh Start a new request instead of joining one already in flight,
+ *   e.g. after a server-side change the in-flight response may predate.
+ */
+function fetchProjectsShared(fresh = false): Promise<{ projects: Project[] }> {
+  if (!projectsRequest || fresh) {
+    const request = api.getProjects().finally(() => {
+      if (projectsRequest === request) projectsRequest = null;
     });
+    projectsRequest = request;
   }
   return projectsRequest;
+}
+
+export interface ProjectsRefetchOptions {
+  /** Do not join a projects request that is already in flight. */
+  fresh?: boolean;
 }
 
 export interface UseProjectsOptions {
@@ -98,27 +108,30 @@ export function useProjects(options: UseProjectsOptions = {}) {
   const hasFetchedRef = useRef(false);
   const hasResolvedInitialFetchRef = useRef(false);
 
-  const fetch = useCallback(async () => {
-    if (!enabled) {
-      setLoading(false);
-      setError(null);
-      return;
-    }
+  const fetch = useCallback(
+    async (options?: ProjectsRefetchOptions) => {
+      if (!enabled) {
+        setLoading(false);
+        setError(null);
+        return;
+      }
 
-    // Preserve existing UI during background refetches triggered by activity
-    // events so pages don't bounce back to their initial loading state.
-    setLoading(!hasResolvedInitialFetchRef.current);
-    setError(null);
-    try {
-      const data = await fetchProjectsShared();
-      setProjects(data.projects);
-    } catch (err) {
-      setError(err instanceof Error ? err : new Error(String(err)));
-    } finally {
-      hasResolvedInitialFetchRef.current = true;
-      setLoading(false);
-    }
-  }, [enabled]);
+      // Preserve existing UI during background refetches triggered by activity
+      // events so pages don't bounce back to their initial loading state.
+      setLoading(!hasResolvedInitialFetchRef.current);
+      setError(null);
+      try {
+        const data = await fetchProjectsShared(options?.fresh === true);
+        setProjects(data.projects);
+      } catch (err) {
+        setError(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        hasResolvedInitialFetchRef.current = true;
+        setLoading(false);
+      }
+    },
+    [enabled],
+  );
 
   // Initial fetch - only once (avoid StrictMode double-fetch)
   useEffect(() => {

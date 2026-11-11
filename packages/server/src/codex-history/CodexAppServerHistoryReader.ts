@@ -96,6 +96,11 @@ export type CodexAppServerSemanticPageResult =
       revision: string;
       /** Native lifecycle keyed by Codex turn id for display reconciliation. */
       turnStatuses?: Readonly<Record<string, SessionDisplayTurnStatus>>;
+      /**
+       * Native completion time keyed by Codex turn id. Projected items carry
+       * only the turn start, so this is the sole source of a turn's duration.
+       */
+      turnCompletedAt?: Readonly<Record<string, string>>;
       /** Detached history has no terminal timing for this newest turn. */
       inferredLatestTurnId?: string;
       nextCursor?: string;
@@ -465,6 +470,12 @@ export class CodexAppServerHistoryReader {
             turn.id,
             projectCodexTurnStatus(turn.status),
           ]),
+        ),
+        turnCompletedAt: Object.fromEntries(
+          pageTurns.flatMap((turn) => {
+            const completedAt = codexTurnCompletedAt(turn);
+            return completedAt ? [[turn.id, completedAt]] : [];
+          }),
         ),
         ...(!options.cursor &&
         newestTurn?.status === "interrupted" &&
@@ -1182,6 +1193,19 @@ function projectCodexTurnStatus(
   status: Turn["status"],
 ): SessionDisplayTurnStatus {
   return status === "inProgress" ? "running" : status;
+}
+
+/** ISO completion time from native turn timing, when Codex recorded one. */
+function codexTurnCompletedAt(turn: Turn): string | undefined {
+  const completedMs =
+    turn.completedAt != null
+      ? turn.completedAt * 1_000
+      : turn.startedAt != null && turn.durationMs != null
+        ? turn.startedAt * 1_000 + turn.durationMs
+        : undefined;
+  return completedMs !== undefined && Number.isFinite(completedMs)
+    ? new Date(completedMs).toISOString()
+    : undefined;
 }
 
 function threadSummary(

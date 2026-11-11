@@ -121,6 +121,7 @@ function ContextStatusContent({ data }: { data: ContextStatusResponse }) {
 
   if (data.source === "jsonl") {
     const used = data.contextUsage?.inputTokens ?? 0;
+    const unknown = data.contextUsage?.unknown === true;
     const cw = data.contextWindow;
     const pct = cw > 0 ? Math.round((used / cw) * 100) : 0;
     return (
@@ -132,7 +133,11 @@ function ContextStatusContent({ data }: { data: ContextStatusResponse }) {
           total={cw}
           model={data.model}
           modelLabel={t("processInfoLabelModel")}
+          unknown={unknown}
         />
+        {unknown && (
+          <p className="context-status-hint">{t("contextTooltipUnknown")}</p>
+        )}
         <CumulativeUsageSection usage={data.cumulativeUsage} />
         {!data.contextWindowFromCache && (
           <p className="context-status-hint">
@@ -270,6 +275,8 @@ interface HeroMeterProps {
   modelLabel: string;
   rawMax?: number;
   rawMaxLabel?: string;
+  /** Fill level not known yet (after compaction); show `?` instead of 0. */
+  unknown?: boolean;
 }
 
 /**
@@ -291,17 +298,18 @@ function HeroMeter({
   modelLabel,
   rawMax,
   rawMaxLabel,
+  unknown = false,
 }: HeroMeterProps) {
-  const clamped = Math.max(0, Math.min(100, percentage));
+  const clamped = unknown ? 0 : Math.max(0, Math.min(100, percentage));
   const severity = clamped >= 90 ? "danger" : clamped >= 75 ? "warn" : "normal";
   return (
     <div className="context-status-hero">
       <div className="context-status-hero-numbers">
         <span className={`context-status-percent-big severity-${severity}`}>
-          {formatPercent(Math.max(0, percentage))}%
+          {unknown ? "?" : `${formatPercent(Math.max(0, percentage))}%`}
         </span>
         <span className="context-status-fraction">
-          {formatTokens(used)} / {formatTokens(total)}
+          {unknown ? "?" : formatTokens(used)} / {formatTokens(total)}
         </span>
       </div>
       <div className="context-status-hero-bar" aria-hidden="true">

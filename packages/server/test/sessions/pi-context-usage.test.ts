@@ -148,4 +148,43 @@ describe("derivePiSession contextUsage", () => {
     );
     expect(withInterrupt.cumulativeUsage?.turnCount).toBe(1);
   });
+
+  /**
+   * The usage before a compaction describes the pre-compaction context. Pi's
+   * own `getContextUsage()` reports the fill as unknown until a response after
+   * the compaction; repeating the old reading kept the composer at 810.6K/1.0M
+   * after a manual `/compact`.
+   */
+  it("reports an unknown fill after a compaction until the next usable turn", () => {
+    const compaction = {
+      type: "compaction",
+      id: "c",
+      parentId: goodTurn.id,
+      timestamp: "2026-09-03T00:01:00.000Z",
+      summary: "Summary",
+      firstKeptEntryId: "u",
+      tokensBefore: 502_143,
+    };
+    expect(derive([user, goodTurn, compaction]).contextUsage).toEqual({
+      inputTokens: 0,
+      percentage: 0,
+      contextWindow: CONTEXT_WINDOW,
+      unknown: true,
+    });
+    // An interrupted request reports no usage, so the fill stays unknown.
+    expect(
+      derive([user, goodTurn, compaction, abortedTurn]).contextUsage?.unknown,
+    ).toBe(true);
+
+    const afterCompaction = assistant({
+      stopReason: "stop",
+      usage: usage({ input: 2, output: 500, cacheRead: 30_000 }),
+    });
+    expect(
+      derive([user, goodTurn, compaction, afterCompaction]).contextUsage,
+    ).toMatchObject({ inputTokens: 30_502, percentage: 3 });
+    expect(
+      derive([user, goodTurn, compaction, afterCompaction]).contextUsage,
+    ).not.toHaveProperty("unknown");
+  });
 });

@@ -3,31 +3,17 @@ import type {
   SlashCommand,
   SlashCommandSource,
 } from "@yep-anywhere/shared";
+import {
+  CODEX_CLI_SLASH_COMMANDS,
+  CODEX_FAST_SLASH_COMMAND,
+  type CliSlashCommand,
+  PI_CLI_SLASH_COMMANDS,
+  YEP_EXTRA_PI_COMMANDS,
+  YEP_HANDLED_CODEX_COMMANDS,
+  YEP_HANDLED_PI_COMMANDS,
+} from "./cliSlashCommands";
 
 export type AgentCommandPrefix = "/" | "$";
-
-/**
- * Codex `/` commands that actually do something in Yep. Codex parses every
- * other slash command inside its terminal UI; sent through app-server
- * `turn/start` the text would only reach the model as an ordinary prompt
- * (see `references/codex/codex-rs/tui/src/slash_command.rs`). Each entry here
- * is intercepted by Yep and mapped to an app-server control or a Yep feature.
- */
-export const CODEX_SLASH_COMMANDS = [
-  "compact",
-  "model",
-  "review",
-  "goal",
-  "side",
-  "btw",
-];
-
-/**
- * Pi built-ins Yep handles itself. Pi's other TUI commands do nothing over
- * RPC, so they are not offered; extension commands, prompt templates and
- * skills come from the live `get_commands` list.
- */
-export const PI_SLASH_COMMANDS = ["compact"];
 
 export const STATIC_SLASH_COMMANDS = [
   "help",
@@ -55,8 +41,11 @@ export const STATIC_SLASH_COMMANDS = [
 /** Extra text a command menu shows next to a command name. */
 export interface AgentCommandDetail {
   description?: string;
-  /** Provider-reported origin, or "yep" for commands Yep handles itself. */
-  source?: SlashCommandSource | "yep";
+  /**
+   * Provider-reported origin, "yep" for commands Yep runs itself, or
+   * "terminal" for CLI built-ins that only work in the provider's terminal.
+   */
+  source?: SlashCommandSource | "yep" | "terminal";
 }
 
 export interface AgentCommandConfig {
@@ -66,6 +55,11 @@ export interface AgentCommandConfig {
   commands: string[];
   /** Optional per-command description/source, keyed by command name. */
   details?: Record<string, AgentCommandDetail>;
+  /**
+   * Commands left out of the unfiltered list but matched once a prefix is
+   * typed, like the Codex TUI's `/quit` and `/btw` aliases.
+   */
+  typedOnly?: readonly string[];
 }
 
 /**
@@ -142,7 +136,11 @@ export interface AgentCommandDescriptions {
   /** Codex compaction, which takes no arguments. */
   codexCompact: string;
   review: string;
+  /** `/fast` before a session starts toggles the Fast service tier. */
+  fast: string;
   goal: string;
+  /** `/goal` before a session exists: starts the session on the goal. */
+  goalNewSession: string;
   side: string;
 }
 
@@ -183,6 +181,12 @@ export interface AgentCommandCatalogInput {
   providerCommands?: readonly SlashCommand[];
   /** Codex `$` skills. */
   codexSkills?: readonly { name: string; description?: string }[];
+  /**
+   * The Codex model offers the Fast service tier, so the CLI lists `/fast`
+   * after `/model`. Yep toggles it before a session starts; mid-session the
+   * tier only changes in the terminal.
+   */
+  codexFastMode?: boolean;
   availability: AgentCommandAvailability;
   labels?: AgentCommandLabels;
   descriptions?: Partial<AgentCommandDescriptions>;
@@ -194,9 +198,11 @@ function yepCommandDescription(
   name: YepCommandName,
   descriptions: Partial<AgentCommandDescriptions> | undefined,
   codex: boolean,
+  inSession: boolean,
 ): string | undefined {
   if (name === "btw") return descriptions?.side;
   if (name === "compact" && codex) return descriptions?.codexCompact;
+  if (name === "goal" && !inSession) return descriptions?.goalNewSession;
   return descriptions?.[name];
 }
 
@@ -210,6 +216,7 @@ export function buildAgentCommandCatalog({
   supportsSlashCommands,
   providerCommands = [],
   codexSkills = [],
+  codexFastMode = false,
   availability,
   labels = DEFAULT_AGENT_COMMAND_LABELS,
   descriptions,
@@ -235,6 +242,7 @@ export function buildAgentCommandCatalog({
           name,
           descriptions,
           isCodexCommandProvider(provider),
+          inSession,
         );
         return [
           name,
@@ -267,14 +275,58 @@ export function buildAgentCommandCatalog({
     };
   };
 
+  // Codex and Pi show exactly their CLI's `/` picker. Yep runs the commands
+  // it can (`yep`); the rest are terminal UI features (`terminal`) that Yep
+  // lists for parity and refuses to send as prompt text.
+  const cliDetails = (
+    commands: readonly CliSlashCommand[],
+    handled: ReadonlySet<string>,
+  ): Record<string, AgentCommandDetail> =>
+    Object.fromEntries(
+      commands.map((command) => {
+        if (!handled.has(command.name)) {
+          return [
+            command.name,
+            { description: command.description, source: "terminal" as const },
+          ];
+        }
+        const description = yepCommandDescription(
+          command.name as YepCommandName,
+          descriptions,
+          isCodexCommandProvider(provider),
+          inSession,
+        );
+        return [
+          command.name,
+          { description: description ?? command.description, source: "yep" },
+        ];
+      }),
+    );
+
   if (isCodexCommandProvider(provider)) {
-    // Codex compaction can resume an idle session; the other controls need
-    // the live app-server thread.
-    addYep("compact", inSession && canSend);
-    addYep("model", ownsProcess);
-    addYep("review", ownsProcess);
-    addYep("goal", ownsProcess);
-    sideCommands(hasSide);
+    const cli = codexFastMode
+      ? CODEX_CLI_SLASH_COMMANDS.flatMap((command) =>
+          command.name === "model"
+            ? [command, CODEX_FAST_SLASH_COMMAND]
+            : [command],
+        )
+      : CODEX_CLI_SLASH_COMMANDS;
+    const commands = cli
+      .filter((command) => command.picker !== "hidden")
+      .map((command) => command.name);
+    const typedOnly = cli
+      .filter((command) => command.picker === "typed")
+      .map((command) => command.name);
+    const fastDetail: Record<string, AgentCommandDetail> =
+      codexFastMode && !inSession
+        ? {
+            fast: {
+              description:
+                descriptions?.fast ?? CODEX_FAST_SLASH_COMMAND.description,
+              source: "yep",
+            },
+          }
+        : {};
     const skillDetails = Object.fromEntries(
       codexSkills.flatMap((skill) =>
         skill.description
@@ -284,7 +336,17 @@ export function buildAgentCommandCatalog({
     );
     const skills = mergeCommands(codexSkills.map((skill) => skill.name));
     return [
-      slashGroup(labels.codexCommands, [...yepCommands]),
+      {
+        prefix: "/",
+        label: labels.codexCommands,
+        showButton: commands.length > 0,
+        commands,
+        typedOnly,
+        details: {
+          ...cliDetails(cli, YEP_HANDLED_CODEX_COMMANDS),
+          ...fastDetail,
+        },
+      },
       {
         prefix: "$",
         label: labels.skills,
@@ -298,20 +360,56 @@ export function buildAgentCommandCatalog({
   const live = canSend ? providerCommands.map((command) => command.name) : [];
 
   if (provider === "pi") {
-    addYep("compact", ownsProcess);
-    addYep("model", ownsProcess);
-    sideCommands(hasSide);
-    // Yep always intercepts these names for Pi, so a provider entry with the
-    // same name must not reappear when the Yep version is unavailable.
-    const intercepted = new Set(["compact", "model", "side", "btw"]);
+    // Pi's order: built-ins, then prompt templates, extension commands and
+    // skills (Pi skips extension names that collide with a built-in), then
+    // Yep's side conversation.
+    const builtins = PI_CLI_SLASH_COMMANDS.map((command) => command.name);
+    const builtinNames = new Set<string>(builtins);
+    const sourceRank = new Map(
+      providerCommands.map((command) => [
+        command.name,
+        command.source === "prompt" ? 0 : command.source === "skill" ? 2 : 1,
+      ]),
+    );
+    const reported = live
+      .filter((name) => !builtinNames.has(name))
+      .map((name, index) => ({ name, index }))
+      .sort(
+        (a, b) =>
+          (sourceRank.get(a.name) ?? 1) - (sourceRank.get(b.name) ?? 1) ||
+          a.index - b.index,
+      )
+      .map(({ name }) => name);
+    const extras = YEP_EXTRA_PI_COMMANDS.filter(
+      (name) => !reported.includes(name),
+    );
+    const commands = mergeCommands(builtins, reported, [...extras]);
     return [
-      slashGroup(
-        labels.slashCommands,
-        mergeCommands(
-          yepCommands,
-          live.filter((name) => !intercepted.has(name)),
-        ),
-      ),
+      {
+        prefix: "/",
+        label: labels.slashCommands,
+        showButton: commands.length > 0,
+        commands,
+        details: {
+          ...buildSlashCommandDetails(
+            providerCommands.filter(
+              (command) => !builtinNames.has(command.name),
+            ),
+          ),
+          ...cliDetails(PI_CLI_SLASH_COMMANDS, YEP_HANDLED_PI_COMMANDS),
+          ...Object.fromEntries(
+            extras.map((name) => [
+              name,
+              {
+                ...(descriptions?.side
+                  ? { description: descriptions.side }
+                  : {}),
+                source: "yep" as const,
+              },
+            ]),
+          ),
+        },
+      },
     ];
   }
 

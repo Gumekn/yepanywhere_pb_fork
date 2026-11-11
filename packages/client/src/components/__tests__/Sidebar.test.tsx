@@ -13,6 +13,7 @@ import type { GlobalSessionItem } from "../../api/client";
 import { ToastProvider } from "../../contexts/ToastContext";
 import { I18nProvider } from "../../i18n";
 import type { SessionMetadataChangedEvent } from "../../lib/activityBus";
+import { UI_KEYS } from "../../lib/storageKeys";
 import type { Project } from "../../types";
 import { Sidebar } from "../Sidebar";
 
@@ -20,9 +21,11 @@ const {
   mockUseGlobalSessions,
   mockUseRecentProjects,
   mockUpdateSessionMetadata,
+  mockFetchProjectGitRemotes,
   mockRenderSessionItem,
   mockActivityOn,
 } = vi.hoisted(() => ({
+  mockFetchProjectGitRemotes: vi.fn(),
   mockUseGlobalSessions: vi.fn(),
   mockUseRecentProjects: vi.fn(),
   mockUpdateSessionMetadata: vi.fn(),
@@ -51,6 +54,7 @@ vi.mock("../../hooks/useGlobalSessions", () => ({
 vi.mock("../../api/client", () => ({
   api: {
     updateSessionMetadata: mockUpdateSessionMetadata,
+    fetchProjectGitRemotes: mockFetchProjectGitRemotes,
   },
 }));
 
@@ -267,6 +271,44 @@ describe("Sidebar recent session browsing", () => {
     expect(onToggleExpanded).toHaveBeenCalledTimes(1);
   });
 
+  it("unfolds page links on desktop and remembers folding them", () => {
+    renderSidebar([]);
+    const toggle = screen.getByRole("button", { name: "Navigation" });
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
+
+    fireEvent.click(toggle);
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
+    expect(localStorage.getItem(UI_KEYS.sidebarNavExpandedDesktop)).toBe(
+      "false",
+    );
+  });
+
+  it("opens the mobile drawer with page links folded", () => {
+    renderSidebar([], { isDesktop: false });
+    const toggle = screen.getByRole("button", { name: "Navigation" });
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
+    expect(screen.getByRole("link", { name: "New Session" })).toBeTruthy();
+
+    fireEvent.click(toggle);
+
+    expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
+    expect(localStorage.getItem(UI_KEYS.sidebarNavExpandedMobile)).toBe("true");
+  });
+
+  it("keeps every page icon in the collapsed desktop rail", () => {
+    localStorage.setItem(UI_KEYS.sidebarNavExpandedDesktop, "false");
+    renderSidebar([], { isCollapsed: true });
+
+    expect(screen.queryByRole("button", { name: "Navigation" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
+  });
+
   it("collapses pinned sessions with their project and keeps pins first when expanded", () => {
     const pinnedSession = createSession({
       id: "pinned-session",
@@ -364,6 +406,83 @@ describe("Sidebar recent session browsing", () => {
     expect(screen.getByRole("dialog").textContent).toContain(
       "feature/sidebar-details",
     );
+  });
+
+  it("fetches remotes for visible git projects when refreshing recent sessions", async () => {
+    const gitStatus = {
+      isGitRepo: true,
+      branch: "main",
+      head: "abc1234",
+      upstream: "origin/main",
+      ahead: 0,
+      behind: 0,
+      isClean: true,
+      stagedCount: 0,
+      unstagedCount: 0,
+      deletedCount: 0,
+      untrackedCount: 0,
+      conflictedCount: 0,
+      stashCount: 0,
+    };
+    const projects: Project[] = [
+      {
+        id: "project-1",
+        path: "/workspace/project-1",
+        name: "Project 1",
+        sessionCount: 1,
+        activeOwnedCount: 0,
+        activeExternalCount: 0,
+        lastActivity: null,
+        gitStatus,
+      },
+      {
+        id: "project-2",
+        path: "/workspace/project-2",
+        name: "Project 2",
+        sessionCount: 1,
+        activeOwnedCount: 0,
+        activeExternalCount: 0,
+        lastActivity: null,
+        gitStatus: { ...gitStatus, isGitRepo: false },
+      },
+    ];
+    let finishFetch: (() => void) | undefined;
+    mockFetchProjectGitRemotes.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishFetch = () => resolve({ results: [] });
+        }),
+    );
+    const now = new Date().toISOString();
+    renderSidebar(
+      [
+        createSession({ updatedAt: now }),
+        createSession({
+          id: "session-2",
+          projectId: "project-2",
+          projectName: "Project 2",
+          updatedAt: now,
+        }),
+      ],
+      {},
+      projects,
+    );
+    const refetchProjects = mockUseRecentProjects.mock.results[0]?.value
+      .refetch as ReturnType<typeof vi.fn>;
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(mockFetchProjectGitRemotes).toHaveBeenCalledWith(["project-1"]);
+    const gitButton = screen.getByRole("button", {
+      name: "Show Git details for Project 1",
+    });
+    expect(gitButton.classList.contains("is-syncing")).toBe(true);
+
+    await act(async () => finishFetch?.());
+    await waitFor(() =>
+      expect(refetchProjects).toHaveBeenCalledWith({ fresh: true }),
+    );
+    expect(gitButton.classList.contains("is-syncing")).toBe(false);
   });
 
   it.each(["recent", "older"])(

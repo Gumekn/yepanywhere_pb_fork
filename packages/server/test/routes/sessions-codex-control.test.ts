@@ -105,6 +105,32 @@ describe("sessions Codex control route", () => {
     );
     expect(unsupported.status).toBe(400);
     expect(resumeCodexControl).toHaveBeenCalledTimes(1);
+
+    const goal = await routes.request(
+      "/projects/project-1/sessions/session-1/codex-control",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request: { control: "thread/goal/get" } }),
+      },
+    );
+    expect(goal.status).toBe(200);
+    expect(resumeCodexControl).toHaveBeenLastCalledWith(
+      expect.objectContaining({ request: { control: "thread/goal/get" } }),
+    );
+
+    const goalSet = await routes.request(
+      "/projects/project-1/sessions/session-1/codex-control",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          request: { control: "thread/goal/set", objective: "x" },
+        }),
+      },
+    );
+    expect(goalSet.status).toBe(400);
+    expect(resumeCodexControl).toHaveBeenCalledTimes(2);
   });
 });
 

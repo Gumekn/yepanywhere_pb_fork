@@ -516,4 +516,42 @@ describe("NotificationService", () => {
       });
     });
   });
+  describe("remapSessionId", () => {
+    it("moves read and review state from a temporary ID to the durable ID", async () => {
+      await service.initialize();
+      await service.markSessionNeedsReview(
+        "temporary-id",
+        "2024-06-15T11:00:00Z",
+      );
+      await service.markSeen("temporary-id", "2024-06-15T12:00:00Z");
+      await service.markSessionNeedsReview(
+        "temporary-id",
+        "2024-06-15T13:00:00Z",
+      );
+
+      await service.remapSessionId("temporary-id", "durable-id");
+
+      expect(service.getLastSeen("temporary-id")).toBeUndefined();
+      expect(service.getLastSeen("durable-id")).toEqual({
+        timestamp: "2024-06-15T12:00:00Z",
+      });
+      expect(service.getSessionsNeedingReview()).toEqual(["durable-id"]);
+      expect(service.hasUnread("durable-id", "2024-06-15T11:30:00Z")).toBe(
+        false,
+      );
+    });
+
+    it("keeps a newer read marker already stored under the durable ID", async () => {
+      await service.initialize();
+      await service.markSeen("temporary-id", "2024-06-15T12:00:00Z");
+      await service.markSeen("durable-id", "2024-06-15T14:00:00Z");
+
+      await service.remapSessionId("temporary-id", "durable-id");
+
+      expect(service.getLastSeen("durable-id")?.timestamp).toBe(
+        "2024-06-15T14:00:00Z",
+      );
+      expect(service.getAllLastSeen()).not.toHaveProperty("temporary-id");
+    });
+  });
 });

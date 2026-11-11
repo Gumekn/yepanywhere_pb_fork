@@ -409,6 +409,7 @@ export function buildSessionDisplayProjection(
         appendSegment({
           type: "assistant_text",
           id: messageId,
+          messageId,
           ...projectAssistantMessageIdentity(message),
           phase: projectAssistantPhase(message),
           ...(message.codexAsyncMessage
@@ -431,6 +432,7 @@ export function buildSessionDisplayProjection(
         appendSegment({
           type: "assistant_text",
           id: `${messageId}:${blockIndex}`,
+          messageId,
           ...projectAssistantMessageIdentity(message),
           phase: projectAssistantPhase(message),
           ...(message.codexAsyncMessage

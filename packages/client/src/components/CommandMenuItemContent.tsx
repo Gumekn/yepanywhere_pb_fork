@@ -26,7 +26,9 @@ export function CommandMenuItemContent({
           ? t("slashCommandSourceSkill")
           : detail?.source === "yep"
             ? t("slashCommandSourceYep")
-            : null;
+            : detail?.source === "terminal"
+              ? t("slashCommandSourceTerminal")
+              : null;
   return (
     <>
       <span className="command-menu-item-header">

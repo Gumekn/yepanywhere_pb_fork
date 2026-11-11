@@ -161,6 +161,54 @@ describe("Process", () => {
     process.abort();
   });
 
+  it("keeps an idle Codex session busy through a Codex-initiated goal turn", async () => {
+    const pending: Array<(value: IteratorResult<SDKMessage>) => void> = [];
+    const queued: SDKMessage[] = [];
+    const iterator: AsyncIterator<SDKMessage> = {
+      next: () => {
+        const message = queued.shift();
+        if (message) return Promise.resolve({ done: false, value: message });
+        return new Promise((resolve) => pending.push(resolve));
+      },
+    };
+    const emit = (message: SDKMessage) => {
+      const waiter = pending.shift();
+      if (waiter) waiter({ done: false, value: message });
+      else queued.push(message);
+    };
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const sessionId = "sess-codex-goal";
+    const process = new Process(iterator, {
+      projectPath: "/test",
+      projectId: "proj-1",
+      sessionId,
+      provider: "codex",
+      idleTimeoutMs: 60_000,
+      queue: new MessageQueue(),
+      unmaterializedSession: true,
+    });
+
+    emit({ type: "system", subtype: "init", session_id: sessionId });
+    emit({ type: "result", session_id: sessionId });
+    await settle();
+    expect(process.state.type).toBe("idle");
+
+    emit({
+      type: "system",
+      subtype: "turn_started",
+      session_id: sessionId,
+      codexTurnId: "goal-turn",
+    });
+    await settle();
+    expect(process.state.type).toBe("in-turn");
+    expect(process.isUnmaterializedSession).toBe(false);
+
+    emit({ type: "result", session_id: sessionId, codexTurnId: "goal-turn" });
+    await settle();
+    expect(process.state.type).toBe("idle");
+    process.abort();
+  });
+
   it("does not report a model switch when the provider has no native API", async () => {
     const process = new Process(createMockIterator([]), {
       projectPath: "/test",

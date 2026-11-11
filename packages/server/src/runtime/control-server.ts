@@ -159,6 +159,42 @@ export function createRuntimeControlApp(
     }
   });
 
+  app.post("/processes/:processId/goal", async (c) => {
+    const body = await c.req
+      .json<{ action?: unknown; objective?: unknown }>()
+      .catch(() => ({}) as { action?: unknown; objective?: unknown });
+    const action = body.action;
+    if (
+      action !== "show" &&
+      action !== "set" &&
+      action !== "replace" &&
+      action !== "pause" &&
+      action !== "resume" &&
+      action !== "clear"
+    ) {
+      return c.json({ error: "Invalid action" }, 400);
+    }
+    const objective =
+      typeof body.objective === "string" ? body.objective : undefined;
+    const processId = c.req.param("processId");
+    try {
+      // null means the process is gone or has no native goals; the shell
+      // turns that into its own "not supported" response.
+      return c.json(
+        action === "show"
+          ? await controller.getGoal(processId)
+          : await controller.goalAction(processId, action, objective),
+      );
+    } catch (error) {
+      return c.json(
+        {
+          error: error instanceof Error ? error.message : "Goal action failed",
+        },
+        502,
+      );
+    }
+  });
+
   app.post("/sessions", async (c) => {
     const body = await c.req.json<
       StartRuntimeSessionRequest | CreateRuntimeSessionRequest

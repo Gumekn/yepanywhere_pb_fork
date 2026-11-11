@@ -319,6 +319,7 @@ export function InboxProvider({
   // - process-state-changed: processState, pendingInputType (for needsAttention/active tiers)
   // - session-status-changed: when session becomes owned/external/idle
   // - session-created: new session
+  // - session-id-changed: a temporary ID became the durable one
   // - session-seen: hasUnread status changes (less critical for inbox tiers)
   //
   // File changes mostly affect hasUnread, which is secondary to inbox tier categorization.
@@ -327,6 +328,7 @@ export function InboxProvider({
     onSessionStatusChange: debouncedRefetch,
     onSessionSeen: debouncedRefetch,
     onSessionCreated: debouncedRefetch,
+    onSessionIdChanged: debouncedRefetch,
   });
 
   // Initial fetch when enabled (and not on login page or requiring login)

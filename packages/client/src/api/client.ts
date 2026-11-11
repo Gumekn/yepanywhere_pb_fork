@@ -1,9 +1,13 @@
 import type {
   AgentCommandListing,
+  ProjectGitFetchResponse,
   SessionDisplayGroupPage,
+  SessionDisplayProcessPage,
   SessionDisplaySnapshot,
   SessionDisplayToolDetail,
   SessionDisplayToolOutput,
+  SessionShareExpiry,
+  SessionShareRecord,
 } from "@yep-anywhere/shared";
 import type {
   AgentActivity,
@@ -292,6 +296,8 @@ export interface SearchMatch {
   matchStart: number;
   /** Char length of the matched substring. */
   matchLength: number;
+  /** Occurrences of the query within this message (older servers omit it). */
+  occurrenceCount?: number;
 }
 
 /** One session's grouped search results. */
@@ -1214,6 +1220,16 @@ export const api = {
   getProjects: () => fetchJSON<{ projects: Project[] }>("/projects"),
 
   /**
+   * Run `git fetch` for the given projects so remote ahead/behind counts are
+   * current. Only call on explicit user refresh; it touches the network.
+   */
+  fetchProjectGitRemotes: (projectIds: string[]) =>
+    fetchJSON<ProjectGitFetchResponse>("/projects/git/fetch", {
+      method: "POST",
+      body: JSON.stringify({ projectIds }),
+    }),
+
+  /**
    * Add a project by file path.
    * Validates the path exists on disk and returns project info.
    * Supports ~ for home directory and normalizes trailing slashes.
@@ -1290,6 +1306,20 @@ export const api = {
       serverTiming: response.headers.get("server-timing"),
     });
     return response.json() as Promise<SessionDisplaySnapshot>;
+  },
+  getSessionDisplayProcess: (
+    projectId: string,
+    sessionId: string,
+    processId: string,
+    options?: { branchId?: string; cursor?: string; signal?: AbortSignal },
+  ) => {
+    const params = new URLSearchParams();
+    if (options?.branchId) params.set("branchId", options.branchId);
+    if (options?.cursor) params.set("cursor", options.cursor);
+    return fetchJSON<SessionDisplayProcessPage>(
+      `/projects/${projectId}/sessions/${sessionId}/display/process/${encodeURIComponent(processId)}?${params}`,
+      { signal: options?.signal },
+    );
   },
   getSessionDisplayGroup: (
     projectId: string,
@@ -1694,7 +1724,7 @@ export const api = {
   resumeAndExecuteCodexControl: (
     projectId: string,
     sessionId: string,
-    request: { control: "thread/compact/start" },
+    request: { control: "thread/compact/start" | "thread/goal/get" },
     options?: SessionOptions,
   ) =>
     fetchJSON<ResumedCodexControlResponse>(
@@ -1807,6 +1837,17 @@ export const api = {
           : {},
       ),
     }),
+
+  /** Restore the original Pi session if needed, then compact without a user turn. */
+  compactPiSession: (
+    projectId: string,
+    sessionId: string,
+    options?: { customInstructions?: string },
+  ) =>
+    fetchJSON<{ success: true; sessionId: string; processId: string }>(
+      `/projects/${projectId}/sessions/${sessionId}/compact`,
+      { method: "POST", body: JSON.stringify(options ?? {}) },
+    ),
 
   /** Change the provider-native reasoning effort mid-session. */
   setProcessReasoningEffort: (processId: string, effort: string) =>
@@ -2295,6 +2336,8 @@ export const api = {
     session?: string;
     limit?: number;
     sort?: SearchSort;
+    /** Also match progress text folded behind a process summary. */
+    includeFolded?: boolean;
   }) => {
     const searchParams = new URLSearchParams();
     searchParams.set("q", params.q);
@@ -2302,6 +2345,7 @@ export const api = {
     if (params.session) searchParams.set("session", params.session);
     if (params.limit) searchParams.set("limit", String(params.limit));
     if (params.sort) searchParams.set("sort", params.sort);
+    if (params.includeFolded) searchParams.set("includeFolded", "true");
     return fetchJSON<SearchResponse>(`/search?${searchParams.toString()}`);
   },
 
@@ -2445,6 +2489,28 @@ export const api = {
     fetchJSON<{ url: string }>("/sharing/upload", {
       method: "POST",
       body: JSON.stringify({ html, title }),
+    }),
+
+  // Read-only share links (frozen snapshot served at /share/:token)
+  createSessionShareLink: (input: {
+    projectId: string;
+    sessionId: string;
+    expiresIn: SessionShareExpiry;
+    title?: string | null;
+  }) =>
+    fetchJSON<{ share: SessionShareRecord }>("/session-shares", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  listSessionShareLinks: (projectId: string, sessionId: string) =>
+    fetchJSON<{ shares: SessionShareRecord[] }>(
+      `/session-shares?${new URLSearchParams({ projectId, sessionId })}`,
+    ),
+
+  revokeSessionShareLink: (token: string) =>
+    fetchJSON<{ ok: true }>(`/session-shares/${encodeURIComponent(token)}`, {
+      method: "DELETE",
     }),
 };
 

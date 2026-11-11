@@ -9,6 +9,7 @@ import { useGlobalSessions } from "../hooks/useGlobalSessions";
 import { resolvePreferredProjectId } from "../hooks/useRecentProject";
 import { useRecentProjects } from "../hooks/useRecentProjects";
 import { useRemoteBasePath } from "../hooks/useRemoteBasePath";
+import { useSidebarNavPreference } from "../hooks/useSidebarPreference";
 import { useI18n } from "../i18n";
 import { activityBus } from "../lib/activityBus";
 import { formatSmartTime } from "../lib/datetime";
@@ -246,6 +247,12 @@ export function Sidebar({
   // Base path for navigation links (empty — app is served at its own root).
   const basePath = useRemoteBasePath();
   const shouldLoadSessionLists = isDesktop ? !isCollapsed : isOpen;
+  // The icon rail is the only navigation left when the desktop sidebar is
+  // collapsed, so it ignores the fold preference and always shows the icons.
+  const isIconRail = isDesktop && isCollapsed;
+  const { isExpanded: isNavExpanded, toggleExpanded: toggleNavExpanded } =
+    useSidebarNavPreference(isDesktop);
+  const showNavLinks = isIconRail || isNavExpanded;
 
   // One combined list powers the project groups. `includePinned` asks the
   // server to append old pins that fall outside the ordinary top-N window.
@@ -299,6 +306,10 @@ export function Sidebar({
     RECENT_SESSIONS_INITIAL,
   );
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false);
+  const [gitSyncingProjectIds, setGitSyncingProjectIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
+  const isGitSyncingRef = useRef(false);
   const [expandedProjectGroups, setExpandedProjectGroups] = useState<
     Set<string>
   >(() => new Set());
@@ -645,6 +656,45 @@ export function Sidebar({
     });
   }, [currentSessionId, allRecentProjectGroups, allOlderProjectGroups]);
 
+  // Git repos rendered in the sidebar; the refresh button fetches their
+  // remotes so ↓ counts can show commits others pushed (e.g. merged to main).
+  const visibleGitProjectIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const group of [...recentProjectGroups, ...olderProjectGroups]) {
+      if (projectsById.get(group.projectId)?.gitStatus?.isGitRepo) {
+        ids.add(group.projectId);
+      }
+    }
+    return [...ids];
+  }, [olderProjectGroups, projectsById, recentProjectGroups]);
+
+  const syncProjectGitRemotes = useCallback(
+    async (projectIds: string[]) => {
+      if (isGitSyncingRef.current || projectIds.length === 0) return;
+      isGitSyncingRef.current = true;
+      setGitSyncingProjectIds(new Set(projectIds));
+      try {
+        await api.fetchProjectGitRemotes(projectIds);
+        await refetchProjects({ fresh: true });
+      } catch (err) {
+        console.error("Failed to fetch project git remotes:", err);
+      } finally {
+        isGitSyncingRef.current = false;
+        setGitSyncingProjectIds(new Set());
+      }
+    },
+    [refetchProjects],
+  );
+
+  const handleRefreshSidebar = useCallback(() => {
+    void syncProjectGitRemotes(visibleGitProjectIds);
+    void handleRefreshRecentSessions();
+  }, [
+    handleRefreshRecentSessions,
+    syncProjectGitRemotes,
+    visibleGitProjectIds,
+  ]);
+
   const toggleProjectGroup = (groupKey: string) => {
     setExpandedProjectGroups((current) => {
       const next = new Set(current);
@@ -773,6 +823,7 @@ export function Sidebar({
               <ProjectGitStatusButton
                 status={gitStatus}
                 projectName={group.projectName}
+                isSyncing={gitSyncingProjectIds.has(group.projectId)}
               />
               <Link
                 to={`${basePath}/new-session?projectId=${encodeURIComponent(group.projectId)}`}
@@ -930,66 +981,94 @@ export function Sidebar({
         </div>
 
         <div className="sidebar-sessions">
-          {/* Navigation items that scroll with content */}
-          <SidebarNavSection>
-            <SidebarNavItem
-              to="/sessions"
-              icon={SidebarIcons.allSessions}
-              label={t("sidebarAllSessions")}
-              onClick={onNavigate}
-              basePath={basePath}
-              inactiveWhenSearchParams={["kind"]}
-            />
-            <SidebarNavItem
-              to="/search"
-              icon={SidebarIcons.search}
-              label={t("sidebarSearch")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/reports"
-              icon={SidebarIcons.reports}
-              label={t("sidebarReports")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/projects"
-              icon={SidebarIcons.projects}
-              label={t("sidebarProjects")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/terminal"
-              icon={SidebarIcons.terminal}
-              label={t("sidebarTerminal")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/dsh"
-              icon={SidebarIcons.dsh}
-              label={t("sidebarDsh")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/curl"
-              icon={SidebarIcons.curl}
-              label={t("curlTitle")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-            <SidebarNavItem
-              to="/settings"
-              icon={SidebarIcons.settings}
-              label={t("sidebarSettings")}
-              onClick={onNavigate}
-              basePath={basePath}
-            />
-          </SidebarNavSection>
+          {/* Page links scroll with the session list. They fold behind one
+              heading so the mobile drawer opens straight onto sessions. */}
+          <div className="sidebar-nav-group">
+            {!isIconRail && (
+              <h3 className="sidebar-section-title sidebar-collapsible-title">
+                <button
+                  type="button"
+                  className="sidebar-section-toggle"
+                  onClick={toggleNavExpanded}
+                  aria-expanded={isNavExpanded}
+                >
+                  <span
+                    className={`sidebar-section-chevron${
+                      isNavExpanded ? " expanded" : ""
+                    }`}
+                    aria-hidden="true"
+                  >
+                    ›
+                  </span>
+                  <span>{t("sidebarSectionNavigation")}</span>
+                </button>
+              </h3>
+            )}
+            {showNavLinks && (
+              <SidebarNavSection
+                label={t("sidebarSectionNavigation")}
+                layout="grid"
+              >
+                <SidebarNavItem
+                  to="/sessions"
+                  icon={SidebarIcons.allSessions}
+                  label={t("sidebarAllSessions")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                  inactiveWhenSearchParams={["kind"]}
+                />
+                <SidebarNavItem
+                  to="/search"
+                  icon={SidebarIcons.search}
+                  label={t("sidebarSearch")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/reports"
+                  icon={SidebarIcons.reports}
+                  label={t("sidebarReports")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/projects"
+                  icon={SidebarIcons.projects}
+                  label={t("sidebarProjects")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/terminal"
+                  icon={SidebarIcons.terminal}
+                  label={t("sidebarTerminal")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/dsh"
+                  icon={SidebarIcons.dsh}
+                  label={t("sidebarDsh")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/curl"
+                  icon={SidebarIcons.curl}
+                  label={t("curlTitle")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+                <SidebarNavItem
+                  to="/settings"
+                  icon={SidebarIcons.settings}
+                  label={t("sidebarSettings")}
+                  onClick={onNavigate}
+                  basePath={basePath}
+                />
+              </SidebarNavSection>
+            )}
+          </div>
 
           {isSelectionMode && (
             <div className="sidebar-bulk-toolbar is-active">
@@ -1065,7 +1144,7 @@ export function Sidebar({
                 <button
                   type="button"
                   className="sidebar-section-refresh"
-                  onClick={() => void handleRefreshRecentSessions()}
+                  onClick={handleRefreshSidebar}
                   disabled={isRefreshingSessions || sessionsLoading}
                   title={t("contextRefreshTooltip")}
                   aria-label={t("contextRefreshTooltip")}

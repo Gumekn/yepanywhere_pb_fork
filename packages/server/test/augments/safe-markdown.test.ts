@@ -4,6 +4,39 @@ import {
   renderSafeMarkdown,
 } from "../../src/augments/safe-markdown.js";
 
+describe("Chinese emphasis boundaries", () => {
+  it.each([renderSafeMarkdown, renderSafeInlineMarkdown])(
+    "renders bold ending in Chinese punctuation without changing the text",
+    (render) => {
+      const source = "资料。**我的判断：还不能说已经验收通过。**目前需要补充。";
+      expect(render(source)).toContain(
+        "资料。<strong>我的判断：还不能说已经验收通过。</strong>目前需要补充。",
+      );
+      expect(render("**“格式化测试”**覆盖了接口规则")).toContain(
+        "<strong>“格式化测试”</strong>覆盖了接口规则",
+      );
+      expect(render("**结论。**目前 **还有补充**")).toContain(
+        "<strong>结论。</strong>目前 <strong>还有补充</strong>",
+      );
+      expect(render("**结论：`a < b`。**目前")).toContain(
+        "<strong>结论：<code>a &lt; b</code>。</strong>目前",
+      );
+    },
+  );
+
+  it("preserves literal markers in code, escaped text and link destinations", () => {
+    for (const source of [
+      "`**判断。**目前`",
+      "```text\n**判断。**目前\n```",
+      "\\*\\*判断。\\*\\*目前",
+      "[报告](https://example.com/**判断。**目前)",
+      "**未完成。",
+      "**English.**next",
+    ])
+      expect(renderSafeMarkdown(source)).not.toContain("<strong>");
+  });
+});
+
 describe("copyable code block content", () => {
   it.each(["", "text"])(
     "renders callback URLs without adding a trailing newline (language: %s)",

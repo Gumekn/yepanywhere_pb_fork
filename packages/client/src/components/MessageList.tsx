@@ -2,6 +2,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import type { MarkdownAugment } from "@yep-anywhere/shared";
 import {
   Fragment,
+  type ReactNode,
   memo,
   useCallback,
   useEffect,
@@ -13,16 +14,22 @@ import {
 import { useOptionalI18n } from "../i18n";
 import { hasAttachmentToken } from "../lib/attachmentTokens";
 import { hasActiveTextSelectionWithin } from "../lib/clipboard";
+import { renderItemContainsMessage } from "../lib/messageSearchTarget";
 import {
   type ActiveToolApproval,
   isSessionInspectorOnlyItem,
   preprocessMessages,
 } from "../lib/preprocessMessages";
+import {
+  clearSearchHighlights,
+  paintSearchHighlights,
+  scrollRangeIntoView,
+  supportsSearchHighlights,
+} from "../lib/transcriptSearchHighlight";
 import { getTurnPhase } from "../lib/turnPhase";
 import type { EditUserPromptRequest } from "../lib/userPromptContent";
 import type { Message } from "../types";
 import type { RenderItem } from "../types/renderItems";
-import { getMessageId } from "../utils";
 import { MessageActions } from "./MessageActions";
 import { ProcessingIndicator } from "./ProcessingIndicator";
 import { RenderItemComponent } from "./RenderItemComponent";
@@ -200,6 +207,14 @@ interface Props {
   onBranchFocused?: () => void;
   /** Message id to scroll to and highlight (e.g. from a search deep-link). */
   targetMessageId?: string | null;
+  /**
+   * Zero-based occurrence of `searchQuery` inside the target message, set when
+   * the target is a find hit: the hit itself is scrolled to and marked instead
+   * of the whole row.
+   */
+  targetOccurrence?: number | null;
+  /** Active in-session find query; every rendered hit is marked while set. */
+  searchQuery?: string | null;
   /** Called after the target message has been focused. */
   onTargetFocused?: () => void;
   /**
@@ -208,6 +223,14 @@ interface Props {
    * without remounting the component.
    */
   transcriptKey?: string;
+  /**
+   * Extra controls rendered at the end of each assistant turn, e.g. the side
+   * conversation's handoff action. `progressTextItemIds` marks interim prose.
+   */
+  renderTurnFooter?: (turn: {
+    items: RenderItem[];
+    progressTextItemIds: string[];
+  }) => ReactNode;
 }
 
 export const MessageList = memo(function MessageList({
@@ -239,8 +262,11 @@ export const MessageList = memo(function MessageList({
   focusBranchId,
   onBranchFocused,
   targetMessageId,
+  targetOccurrence = null,
+  searchQuery = null,
   onTargetFocused,
   transcriptKey,
+  renderTurnFooter,
 }: Props) {
   const i18n = useOptionalI18n();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -261,6 +287,14 @@ export const MessageList = memo(function MessageList({
   > | null>(null);
   const virtualizeEnabledRef = useRef(false);
   const rowCountRef = useRef(0);
+  const rowsRef = useRef<MessageRow[]>([]);
+  // In-session find: the hit currently selected (repainted after DOM churn) and
+  // the row to restore once closing the search re-enables virtualization.
+  const searchCurrentRef = useRef<{
+    itemId: string;
+    occurrence: number;
+  } | null>(null);
+  const searchAnchorRowKeyRef = useRef<string | null>(null);
   // Sticky turn identity. A turn must keep its React key when older messages are
   // prepended, otherwise React unmounts the whole turn subtree and the browser
   // re-homes any in-progress text selection on the list container.
@@ -365,7 +399,7 @@ export const MessageList = memo(function MessageList({
     if (!targetMessageId) return null;
     return (
       visibleRenderItems.find((item) =>
-        item.sourceMessages.some((m) => getMessageId(m) === targetMessageId),
+        renderItemContainsMessage(item, targetMessageId),
       )?.id ?? null
     );
   }, [targetMessageId, visibleRenderItems]);
@@ -438,11 +472,13 @@ export const MessageList = memo(function MessageList({
   // Only window long lists, and never while a branch/target focus is pending —
   // those flows scroll to and highlight a specific DOM node, which must be
   // mounted. Both flags are transient (cleared by onBranchFocused /
-  // onTargetFocused), so virtualization re-engages right after.
+  // onTargetFocused), so virtualization re-engages right after. An open find
+  // keeps every row mounted so hits stay marked and stable to step through.
   const wantsVirtualization =
     rows.length > VIRTUALIZE_ROW_THRESHOLD &&
     !focusBranchId &&
-    !targetMessageId;
+    !targetMessageId &&
+    !searchQuery;
 
   // Never flip virtualization on or off while the user holds a selection: either
   // direction remounts every row and destroys the range they are dragging, and
@@ -464,6 +500,28 @@ export const MessageList = memo(function MessageList({
   virtualizerRef.current = virtualizer;
   virtualizeEnabledRef.current = shouldVirtualize;
   rowCountRef.current = rows.length;
+  rowsRef.current = rows;
+
+  // Closing a find re-enables windowing, whose estimated row heights would
+  // otherwise move the user away from the hit they navigated to.
+  const wasVirtualizedRef = useRef(shouldVirtualize);
+  useLayoutEffect(() => {
+    const wasVirtualized = wasVirtualizedRef.current;
+    wasVirtualizedRef.current = shouldVirtualize;
+    if (wasVirtualized || !shouldVirtualize) return;
+    const anchorKey = searchAnchorRowKeyRef.current;
+    searchAnchorRowKeyRef.current = null;
+    if (!anchorKey) return;
+    const index = rowsRef.current.findIndex(
+      (row) => getRowKey(row) === anchorKey,
+    );
+    if (index < 0) return;
+    isProgrammaticScrollRef.current = true;
+    virtualizerRef.current?.scrollToIndex(index, { align: "center" });
+    requestAnimationFrame(() => {
+      isProgrammaticScrollRef.current = false;
+    });
+  }, [shouldVirtualize]);
 
   const toggleThinkingExpanded = useCallback((itemId: string) => {
     setExpandedThinkingItemIds((previousIds) => {
@@ -800,39 +858,91 @@ export const MessageList = memo(function MessageList({
       return;
     }
 
-    // Found in the current window — scroll and highlight it.
+    // Found in the current window — scroll to it and mark it. With an active
+    // find query the hit itself is targeted; the row is only a fallback.
     if (targetItemId) {
       requestedTargetMessageRef.current = null;
-      const target = targetMessageRef.current;
+      const turn = targetMessageRef.current;
       const container = containerRef.current?.parentElement;
-      if (!target || !container) return;
+      if (!turn || !container) return;
+      const itemElement = findRenderItemElement(turn, targetItemId) ?? turn;
 
       let cancelled = false;
-      const raf = requestAnimationFrame(() => {
-        if (cancelled) return;
+      let frame = 0;
+      let retry: ReturnType<typeof setTimeout> | null = null;
+      const scrollProgrammatically = (scroll: () => void) => {
         isProgrammaticScrollRef.current = true;
-        target.scrollIntoView({ block: "center", behavior: "smooth" });
+        scroll();
         lastHeightRef.current = container.scrollHeight;
+        // Leaving the bottom must stop auto-follow, or the next streamed row
+        // would yank the view away from the hit.
+        const distanceFromBottom =
+          container.scrollHeight - container.scrollTop - container.clientHeight;
+        setFollowingBottom(distanceFromBottom < 100);
         requestAnimationFrame(() => {
           isProgrammaticScrollRef.current = false;
         });
-        // Self-clearing highlight: the CSS animation removes itself on end, so
-        // it survives the re-render triggered by onTargetFocused() below.
-        target.classList.remove("message-target-highlight");
-        target.addEventListener(
-          "animationend",
-          () => target.classList.remove("message-target-highlight"),
-          { once: true },
+      };
+      const focus = (attempt: number) => {
+        if (cancelled) return;
+        const root = containerRef.current;
+        if (searchQuery && targetOccurrence !== null && root) {
+          searchCurrentRef.current = {
+            itemId: targetItemId,
+            occurrence: targetOccurrence,
+          };
+          searchAnchorRowKeyRef.current = findTargetRowKey(rowsRef.current);
+          const range = paintSearchHighlights(root, searchQuery, {
+            element: itemElement,
+            occurrence: targetOccurrence,
+          });
+          let scrolled = false;
+          if (range) {
+            scrollProgrammatically(() => {
+              scrolled = scrollRangeIntoView(container, range);
+            });
+          }
+          if (scrolled) {
+            if (!supportsSearchHighlights()) flashElement(itemElement);
+            onTargetFocused?.();
+            return;
+          }
+          // Rich text can land a frame late; retry once before falling back.
+          if (attempt === 0) {
+            retry = setTimeout(() => {
+              frame = requestAnimationFrame(() => focus(1));
+            }, 120);
+            return;
+          }
+        }
+        // A hit inside a folded process: open the fold so its text (and the
+        // find marks) become visible. The exact hit cannot be singled out
+        // among the fold's steps, so no current mark is kept.
+        if (
+          itemElement.getAttribute("data-render-type") === "display_process"
+        ) {
+          searchCurrentRef.current = null;
+          itemElement
+            .querySelector<HTMLButtonElement>(
+              'button.display-process-header[aria-expanded="false"]',
+            )
+            ?.click();
+        }
+        const tall = itemElement.getBoundingClientRect().height;
+        scrollProgrammatically(() =>
+          itemElement.scrollIntoView({
+            block: tall > container.clientHeight * 0.8 ? "start" : "center",
+          }),
         );
-        // Force reflow so re-adding the class restarts the animation.
-        void target.offsetWidth;
-        target.classList.add("message-target-highlight");
+        flashElement(itemElement);
         onTargetFocused?.();
-      });
+      };
+      frame = requestAnimationFrame(() => focus(0));
 
       return () => {
         cancelled = true;
-        cancelAnimationFrame(raf);
+        cancelAnimationFrame(frame);
+        if (retry) clearTimeout(retry);
       };
     }
 
@@ -861,10 +971,53 @@ export const MessageList = memo(function MessageList({
   }, [
     targetMessageId,
     targetItemId,
+    targetOccurrence,
+    searchQuery,
     loadingTargetMessage,
     onLoadTargetMessage,
     onTargetFocused,
+    setFollowingBottom,
   ]);
+
+  // Mark every rendered hit while a find is open. Highlights paint ranges
+  // without touching React's DOM, so they are recomputed after DOM churn
+  // (streaming, expanded blocks, loaded history) on a short debounce.
+  useEffect(() => {
+    searchCurrentRef.current = null;
+    searchAnchorRowKeyRef.current = null;
+    const root = containerRef.current;
+    if (!searchQuery || !root || !supportsSearchHighlights()) {
+      clearSearchHighlights();
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const repaint = () => {
+      timer = null;
+      const current = searchCurrentRef.current;
+      const element = current
+        ? findRenderItemElement(root, current.itemId)
+        : null;
+      paintSearchHighlights(
+        root,
+        searchQuery,
+        current && element ? { element, occurrence: current.occurrence } : null,
+      );
+    };
+    repaint();
+    const observer = new MutationObserver(() => {
+      if (timer === null) timer = setTimeout(repaint, 150);
+    });
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return () => {
+      observer.disconnect();
+      if (timer !== null) clearTimeout(timer);
+      clearSearchHighlights();
+    };
+  }, [searchQuery]);
 
   const renderRow = (row: MessageRow) => {
     switch (row.kind) {
@@ -979,6 +1132,10 @@ export const MessageList = memo(function MessageList({
               }
               copyText={row.turnCopyText}
             />
+            {renderTurnFooter?.({
+              items: row.items,
+              progressTextItemIds: row.progressTextItemIds,
+            })}
           </div>
         );
       }
@@ -1165,4 +1322,42 @@ function getDurationMs(
   if (Number.isNaN(startMs) || Number.isNaN(endMs)) return undefined;
   if (endMs < startMs) return undefined;
   return endMs - startMs;
+}
+
+/** The rendered element of one render item inside `scope` (inclusive). */
+function findRenderItemElement(
+  scope: Element,
+  itemId: string,
+): HTMLElement | null {
+  if (scope.getAttribute("data-render-id") === itemId)
+    return scope as HTMLElement;
+  for (const element of scope.querySelectorAll<HTMLElement>(
+    "[data-render-id]",
+  )) {
+    if (element.getAttribute("data-render-id") === itemId) return element;
+  }
+  return null;
+}
+
+/** Key of the row holding the current deep-link target, if any. */
+function findTargetRowKey(rows: readonly MessageRow[]): string | null {
+  const row = rows.find(
+    (candidate) =>
+      (candidate.kind === "user-prompt" && candidate.isTarget) ||
+      (candidate.kind === "assistant-turn" && candidate.turnHasTarget),
+  );
+  return row ? getRowKey(row) : null;
+}
+
+/** Self-clearing flash that survives the re-render after focusing. */
+function flashElement(element: HTMLElement): void {
+  element.classList.remove("message-target-highlight");
+  element.addEventListener(
+    "animationend",
+    () => element.classList.remove("message-target-highlight"),
+    { once: true },
+  );
+  // Force reflow so re-adding the class restarts the animation.
+  void element.offsetWidth;
+  element.classList.add("message-target-highlight");
 }

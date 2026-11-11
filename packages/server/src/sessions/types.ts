@@ -204,6 +204,16 @@ export interface ISessionReader {
   getSessionFilePath?(sessionId: string): Promise<string | null>;
 
   /**
+   * Branch state of a cross-session edit-fork family, without converting the
+   * transcript. Metadata-only views (the display transport) need the same
+   * branch options `getSession` returns to render the prompt switcher.
+   */
+  getBranchState?(
+    sessionId: string,
+    branchId?: string,
+  ): Promise<SessionBranchState | undefined>;
+
+  /**
    * Return provider-aware change stats for index caching.
    * Readers whose session metadata spans multiple files can aggregate those
    * files into one mtime/size pair. The index falls back to getSessionFilePath

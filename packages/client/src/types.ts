@@ -134,6 +134,11 @@ export interface Message {
   orphanedToolUseIds?: string[];
   /** Source tracking: "sdk" for streaming, "jsonl" for persisted */
   _source?: "sdk" | "jsonl";
+  /**
+   * Source message ids a projected display row stands in for. Content search
+   * reports source ids, so deep links match a display row through these.
+   */
+  _contentSearchIds?: string[];
   /** Raw detail restored only for the active display live tail. */
   _displayLiveTail?: boolean;
   /** User prompt that owns a body-free Session Inspector index row. */

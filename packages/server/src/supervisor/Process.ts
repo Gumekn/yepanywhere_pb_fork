@@ -40,6 +40,7 @@ import type {
 } from "../sdk/types.js";
 import { validateQuestionAnswers } from "../sessions/question-answers.js";
 import type { SideConversationControl } from "../side-conversations/session.js";
+import { StreamingTextAccumulator } from "./StreamingTextAccumulator.js";
 import type {
   AgentActivity,
   InputRequest,
@@ -239,9 +240,7 @@ export class Process {
   private static readonly BUCKET_SWAP_INTERVAL_MS = 15_000;
 
   /** Accumulated streaming text for catch-up when clients connect mid-stream */
-  private _streamingText = "";
-  /** Message ID for current streaming response */
-  private _streamingMessageId: string | null = null;
+  private streamingText = new StreamingTextAccumulator();
 
   /** Pending tool approval requests (from canUseTool callback) - supports concurrent approvals */
   private pendingToolApprovals: Map<string, PendingToolApproval> = new Map();
@@ -1169,36 +1168,8 @@ export class Process {
    * Get accumulated streaming text for catch-up when clients connect mid-stream.
    * Returns the message ID and accumulated text, or null if not streaming.
    */
-  getStreamingContent(): { messageId: string; text: string } | null {
-    if (!this._streamingMessageId || !this._streamingText) {
-      return null;
-    }
-    return {
-      messageId: this._streamingMessageId,
-      text: this._streamingText,
-    };
-  }
-
-  /**
-   * Accumulate streaming text from a delta.
-   * Called by stream routes when processing stream_event messages.
-   */
-  accumulateStreamingText(messageId: string, text: string): void {
-    if (this._streamingMessageId !== messageId) {
-      // New streaming message, reset accumulator
-      this._streamingMessageId = messageId;
-      this._streamingText = text;
-    } else {
-      this._streamingText += text;
-    }
-  }
-
-  /**
-   * Clear streaming text accumulator (called when stream ends).
-   */
-  clearStreamingText(): void {
-    this._streamingText = "";
-    this._streamingMessageId = null;
+  getStreamingContent() {
+    return this.streamingText.snapshot();
   }
 
   /**
@@ -1542,7 +1513,7 @@ export class Process {
 
   /**
    * Add a message to the deferred queue.
-   * Deferred messages are held server-side and auto-sent when the agent's current turn ends.
+   * Start the next queued message immediately if idle; otherwise wait for the current turn.
    */
   deferMessage(message: UserMessage): { success: true } {
     this.deferredQueue.push({
@@ -1550,6 +1521,10 @@ export class Process {
       timestamp: new Date().toISOString(),
     });
     this.emitDeferredQueueChange();
+    // The turn may have ended before a client's deferred request arrives.
+    // Use the same drain path to preserve FIFO order, interrupt reservations,
+    // and blocked inputs when the resident provider can no longer accept them.
+    if (this._state.type === "idle") this.transitionToIdle();
     return { success: true };
   }
 
@@ -2398,6 +2373,20 @@ export class Process {
           this.setState({ type: "in-turn" });
         }
 
+        // Codex can start a turn on its own (goal continuation, review,
+        // compaction). Without this the session would look idle while the
+        // agent works, and idle reclamation could stop it mid-goal.
+        if (
+          this.provider === "codex" &&
+          message.type === "system" &&
+          message.subtype === "turn_started" &&
+          this._state.type === "idle"
+        ) {
+          this.clearIdleTimer();
+          this._unmaterializedSession = false;
+          this.setState({ type: "in-turn" });
+        }
+
         // Handle special message types
         if (message.type === "system" && message.subtype === "input_request") {
           // Legacy mock SDK behavior - handle input_request message
@@ -2681,6 +2670,16 @@ export class Process {
   }
 
   private emit(event: ProcessEvent): void {
+    // Accumulate once, even with zero subscribers. Subscription cleanup must
+    // never discard another client's catch-up state.
+    if (event.type === "message") {
+      this.streamingText.track(
+        event.message as unknown as Record<string, unknown>,
+        this._sessionId,
+      );
+    } else if (event.type === "complete") {
+      this.streamingText.clear();
+    }
     if (event.type === "state-change") {
       getLogger().debug(
         {

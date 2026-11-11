@@ -9,8 +9,81 @@ import {
   type SideCodexClient,
   createCodexSideConversation,
 } from "../../src/side-conversations/codex.js";
+import { SideConversationSession } from "../../src/side-conversations/session.js";
 
 describe("Codex side thread", () => {
+  it("preserves commentary and final-answer phases from completed items in the side snapshot", async () => {
+    let notify!: (method: string, params: unknown) => void;
+    const client = {
+      requestIsolated: vi.fn(async (method: string) => {
+        if (method === "thread/start")
+          return {
+            thread: { id: "side", ephemeral: true },
+            sandbox: { type: "readOnly" },
+          };
+        if (method === "turn/start")
+          return { turn: { id: "turn", status: "inProgress" } };
+        return {};
+      }),
+      isolateThread: vi.fn((_id, handler) => {
+        notify = handler;
+        return vi.fn();
+      }),
+    } as unknown as SideCodexClient;
+    const session = new SideConversationSession({
+      ready: () => true,
+      parentId: () => "main",
+      create: (context, emit) =>
+        createCodexSideConversation({
+          client,
+          parentId: "main",
+          cwd: "/tmp",
+          context,
+          emit,
+        }),
+    });
+    try {
+      const created = await session.execute({
+        action: "create",
+        requestId: "create",
+        context: "empty",
+      });
+      await session.execute({
+        action: "send",
+        id: created.conversation?.id ?? "missing",
+        requestId: "question",
+        text: "Explain this",
+      });
+      notify("item/agentMessage/delta", { itemId: "progress", delta: "Check" });
+      notify("item/completed", {
+        item: {
+          type: "agentMessage",
+          id: "progress",
+          text: "Checking the context.",
+          phase: "commentary",
+        },
+      });
+      notify("item/agentMessage/delta", { itemId: "answer", delta: "The" });
+      notify("item/completed", {
+        item: {
+          type: "agentMessage",
+          id: "answer",
+          text: "The answer.",
+          phase: "final_answer",
+        },
+      });
+      notify("turn/completed", { turn: { id: "turn", status: "completed" } });
+      const { conversation } = await session.execute({ action: "get" });
+      expect(conversation?.status).toBe("idle");
+      expect(conversation?.messages.slice(1)).toMatchObject([
+        { text: "Checking the context.", phase: "commentary" },
+        { text: "The answer.", phase: "final_answer" },
+      ]);
+    } finally {
+      await session.dispose();
+    }
+  });
+
   it("forks an externally owned bridge session without taking over its parent and inherits current model settings", async () => {
     let port = 0;
     const http = createServer((request, response) => {
@@ -169,6 +242,24 @@ describe("Codex side thread", () => {
       id: "answer",
       text: "hello",
       append: true,
+    });
+    notify("item/reasoning/summaryTextDelta", {
+      itemId: "why",
+      delta: "Check",
+    });
+    notify("item/completed", {
+      item: { type: "reasoning", id: "why", summary: ["Check", "docs"] },
+    });
+    expect(emit).toHaveBeenCalledWith({
+      type: "thinking",
+      id: "why",
+      text: "Check",
+      append: true,
+    });
+    expect(emit).toHaveBeenCalledWith({
+      type: "thinking",
+      id: "why",
+      text: "Check\n\ndocs",
     });
     await side.interrupt();
     expect(request).toHaveBeenCalledWith("turn/interrupt", {

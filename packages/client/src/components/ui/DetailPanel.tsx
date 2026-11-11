@@ -8,23 +8,23 @@ import {
   useId,
   useLayoutEffect,
   useRef,
-  useState,
 } from "react";
 import { createPortal } from "react-dom";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
+import {
+  MIN_SESSION_WIDTH,
+  useResizablePanel,
+} from "../../hooks/useResizablePanel";
 import { DESKTOP_BREAKPOINT } from "../../hooks/useSidebarWidth";
-import { useViewportWidth } from "../../hooks/useViewportWidth";
 import { useI18n } from "../../i18n";
 import { UI_KEYS } from "../../lib/storageKeys";
+import { PanelResizeHandle } from "./PanelResizeHandle";
 
 const DESKTOP_DETAIL_PANEL_QUERY = `(min-width: ${DESKTOP_BREAKPOINT}px)`;
 const DETAIL_PANEL_OPEN_EVENT = "yep:detail-panel-open";
 const DEFAULT_DETAIL_PANEL_RATIO = 0.4;
 const MIN_DETAIL_PANEL_WIDTH = 320;
-const ABSOLUTE_MIN_DETAIL_PANEL_WIDTH = 240;
-const MIN_SESSION_WIDTH = 360;
 const MAX_DETAIL_PANEL_RATIO = 0.72;
-const RESIZE_KEYBOARD_STEP = 24;
 
 // A file opened from a detail transcript belongs above that panel. React
 // context follows portals, so its parent stays known even when both use body.
@@ -49,52 +49,8 @@ interface DetailPanelOpenEventDetail {
   panelId: string;
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(Math.max(value, min), max);
-}
-
-function loadDetailPanelRatio(): number {
-  if (typeof window === "undefined") return DEFAULT_DETAIL_PANEL_RATIO;
-  const stored = localStorage.getItem(UI_KEYS.detailPanelWidthRatio);
-  if (stored === null) return DEFAULT_DETAIL_PANEL_RATIO;
-  const parsed = Number.parseFloat(stored);
-  return Number.isFinite(parsed)
-    ? clamp(parsed, 0.1, MAX_DETAIL_PANEL_RATIO)
-    : DEFAULT_DETAIL_PANEL_RATIO;
-}
-
-function saveDetailPanelRatio(ratio: number): void {
-  localStorage.setItem(UI_KEYS.detailPanelWidthRatio, ratio.toFixed(4));
-}
-
-function getDetailPanelWidthBounds(
-  layoutRoot: HTMLElement | null,
-  viewportWidth: number,
-): { min: number; max: number } {
-  const sidebarWidth =
-    layoutRoot
-      ?.querySelector<HTMLElement>(".sidebar-desktop")
-      ?.getBoundingClientRect().width ?? 0;
-  const availableWidth = Math.max(
-    ABSOLUTE_MIN_DETAIL_PANEL_WIDTH,
-    viewportWidth - sidebarWidth - MIN_SESSION_WIDTH,
-  );
-  const min = Math.min(MIN_DETAIL_PANEL_WIDTH, availableWidth);
-  const max = Math.max(
-    min,
-    Math.min(viewportWidth * MAX_DETAIL_PANEL_RATIO, availableWidth),
-  );
-  return { min, max };
-}
-
-function getDetailPanelWidth(
-  ratio: number,
-  layoutRoot: HTMLElement | null,
-  viewportWidth: number,
-): number {
-  const { min, max } = getDetailPanelWidthBounds(layoutRoot, viewportWidth);
-  return Math.round(clamp(viewportWidth * ratio, min, max));
-}
+const defaultDetailPanelWidth = (viewportWidth: number) =>
+  viewportWidth * DEFAULT_DETAIL_PANEL_RATIO;
 
 /**
  * File/report detail surface.
@@ -127,11 +83,6 @@ export function DetailPanel({
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
-  const viewportWidth = useViewportWidth();
-  const [widthRatio, setWidthRatio] = useState(loadDetailPanelRatio);
-  const widthRatioRef = useRef(widthRatio);
-  const [isResizing, setIsResizing] = useState(false);
-  const resizePointerIdRef = useRef<number | null>(null);
 
   const desktopViewport = useMediaQuery(DESKTOP_DETAIL_PANEL_QUERY);
   const layoutRoot =
@@ -140,76 +91,24 @@ export function DetailPanel({
       : null;
   const isDocked = layoutRoot !== null;
   const portalTarget = layoutRoot ?? document.body;
-  const panelWidth = getDetailPanelWidth(widthRatio, layoutRoot, viewportWidth);
-
-  const updatePanelWidth = useCallback(
-    (requestedWidth: number, persist: boolean) => {
-      const { min, max } = getDetailPanelWidthBounds(layoutRoot, viewportWidth);
-      const nextWidth = clamp(requestedWidth, min, max);
-      const nextRatio = nextWidth / Math.max(viewportWidth, 1);
-      widthRatioRef.current = nextRatio;
-      setWidthRatio(nextRatio);
-      if (persist) saveDetailPanelRatio(nextRatio);
+  const resize = useResizablePanel({
+    storageKey: UI_KEYS.detailPanelWidthRatio,
+    defaultWidth: defaultDetailPanelWidth,
+    minWidth: MIN_DETAIL_PANEL_WIDTH,
+    maxRatio: MAX_DETAIL_PANEL_RATIO,
+    enabled: isDocked,
+    getLayout: () => {
+      if (!layoutRoot) return null;
+      const sidebarWidth =
+        layoutRoot
+          .querySelector<HTMLElement>(".sidebar-desktop")
+          ?.getBoundingClientRect().width ?? 0;
+      return {
+        availableWidth: window.innerWidth - sidebarWidth - MIN_SESSION_WIDTH,
+        right: layoutRoot.getBoundingClientRect().right,
+      };
     },
-    [layoutRoot, viewportWidth],
-  );
-
-  const handleResizePointerDown = (
-    event: React.PointerEvent<HTMLDivElement>,
-  ) => {
-    if (!isDocked || (event.pointerType === "mouse" && event.button !== 0)) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    resizePointerIdRef.current = event.pointerId;
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    setIsResizing(true);
-  };
-
-  const handleResizePointerMove = (
-    event: React.PointerEvent<HTMLDivElement>,
-  ) => {
-    if (resizePointerIdRef.current !== event.pointerId) return;
-    if (!Number.isFinite(event.clientX)) return;
-    event.preventDefault();
-    const measuredRight = layoutRoot?.getBoundingClientRect().right ?? 0;
-    const layoutRight = measuredRight > 0 ? measuredRight : viewportWidth;
-    updatePanelWidth(layoutRight - event.clientX, false);
-  };
-
-  const finishResize = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (resizePointerIdRef.current !== event.pointerId) return;
-    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    resizePointerIdRef.current = null;
-    setIsResizing(false);
-    saveDetailPanelRatio(widthRatioRef.current);
-  };
-
-  const resetPanelWidth = () => {
-    widthRatioRef.current = DEFAULT_DETAIL_PANEL_RATIO;
-    setWidthRatio(DEFAULT_DETAIL_PANEL_RATIO);
-    saveDetailPanelRatio(DEFAULT_DETAIL_PANEL_RATIO);
-  };
-
-  const handleResizeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Home") {
-      event.preventDefault();
-      resetPanelWidth();
-      return;
-    }
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    event.preventDefault();
-    const step = event.shiftKey
-      ? RESIZE_KEYBOARD_STEP * 3
-      : RESIZE_KEYBOARD_STEP;
-    updatePanelWidth(
-      panelWidth + (event.key === "ArrowLeft" ? step : -step),
-      true,
-    );
-  };
+  });
 
   // Escape closes the detail surface. A fullscreen FileViewer consumes the
   // first Escape itself so users return to the side panel before closing it.
@@ -300,14 +199,6 @@ export function DetailPanel({
     }
   }, [hideHeader]);
 
-  useEffect(() => {
-    if (!isResizing) return;
-    document.body.classList.add("detail-panel-resizing");
-    return () => {
-      document.body.classList.remove("detail-panel-resizing");
-    };
-  }, [isResizing]);
-
   const handleBackdropClick = (event: React.MouseEvent<HTMLDivElement>) => {
     if (!isDocked && event.target === event.currentTarget) {
       event.preventDefault();
@@ -321,11 +212,11 @@ export function DetailPanel({
     <div
       className={`modal-overlay detail-panel-host${
         isDocked ? " detail-panel-host--docked" : " detail-panel-host--overlay"
-      }${isResizing ? " detail-panel-host--resizing" : ""}`}
+      }${resize.isResizing ? " detail-panel-host--resizing" : ""}`}
       style={
         isDocked
           ? ({
-              "--detail-panel-width": `${panelWidth}px`,
+              "--detail-panel-width": `${resize.width}px`,
             } as CSSProperties)
           : undefined
       }
@@ -333,26 +224,10 @@ export function DetailPanel({
       onMouseDown={(event) => event.stopPropagation()}
     >
       {isDocked && (
-        <div
-          className={`detail-panel-resize-handle${isResizing ? " active" : ""}`}
-          role="separator"
-          aria-orientation="vertical"
-          aria-label={t("actionResizeDetailPanel")}
-          aria-valuemin={
-            getDetailPanelWidthBounds(layoutRoot, viewportWidth).min
-          }
-          aria-valuemax={
-            getDetailPanelWidthBounds(layoutRoot, viewportWidth).max
-          }
-          aria-valuenow={panelWidth}
-          tabIndex={0}
-          title={t("actionResizeDetailPanelHint")}
-          onPointerDown={handleResizePointerDown}
-          onPointerMove={handleResizePointerMove}
-          onPointerUp={finishResize}
-          onPointerCancel={finishResize}
-          onDoubleClick={resetPanelWidth}
-          onKeyDown={handleResizeKeyDown}
+        <PanelResizeHandle
+          panel={resize}
+          label={t("actionResizeDetailPanel")}
+          hint={t("actionResizeDetailPanelHint")}
         />
       )}
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: click only isolates the panel from its backdrop */}

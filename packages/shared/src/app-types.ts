@@ -289,6 +289,13 @@ export interface ContextUsage {
   cacheReadTokens?: number;
   /** Cache creation tokens (new tokens added to cache) */
   cacheCreationTokens?: number;
+  /**
+   * The fill level is not known yet, e.g. right after a context compaction
+   * and before the next model response reports usage. `inputTokens` and
+   * `percentage` are then 0 placeholders; only `contextWindow` is meaningful.
+   * Sent explicitly so clients replace the stale pre-compaction reading.
+   */
+  unknown?: boolean;
 }
 
 /**

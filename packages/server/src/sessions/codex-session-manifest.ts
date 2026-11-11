@@ -10,7 +10,11 @@ import {
 } from "../codex-history/CodexManifestScanWorker.js";
 import { getCodexSubagentMetadata } from "../codex/subagent.js";
 import { getLogger } from "../logging/logger.js";
-import { canonicalizeProjectPath } from "../projects/paths.js";
+import {
+  type ProjectPathRealpathCache,
+  canonicalizeProjectPath,
+  resolveProjectPathAliases,
+} from "../projects/paths.js";
 import {
   CODEX_ROLLOUT_COMPRESSED_SUFFIX,
   isCodexRolloutDecompressionSupported,
@@ -21,7 +25,14 @@ import {
 
 export interface CodexSessionManifestEntry {
   id: string;
+  /** Raw cwd recorded in rollout `session_meta`; the project identity. */
   cwd: string;
+  /**
+   * Other spellings of `cwd` that name the same directory, such as the
+   * resolved `/private/tmp/x` Codex's state DB uses for `/tmp/x` (see
+   * `resolveProjectPathAliases`). Accepted for lookups, never for grouping.
+   */
+  projectPathAliases: string[];
   /**
    * Path to the rollout on disk.
    *
@@ -51,9 +62,20 @@ export interface CodexSessionManifestEntry {
   depth?: number;
 }
 
+type CodexSessionManifestEntryDraft = Omit<
+  CodexSessionManifestEntry,
+  "projectPathAliases"
+>;
+
 export interface CodexSessionManifest {
   sessions: CodexSessionManifestEntry[];
   byId: Map<string, CodexSessionManifestEntry>;
+  /**
+   * Lookup index by project path. A session is indexed under its canonical
+   * `cwd` and every `projectPathAliases` entry, so a project known by another
+   * spelling of the same directory still finds it. Do not iterate this map to
+   * enumerate projects; group `sessions` by canonical `cwd` instead.
+   */
   byProjectPath: Map<string, CodexSessionManifestEntry[]>;
   /** Sub-agent sessions keyed by parent thread id. */
   byParentThread: Map<string, CodexSessionManifestEntry[]>;
@@ -124,6 +146,17 @@ export function invalidateCodexSessionManifest(sessionsDir: string): void {
   manifestCache.delete(sessionsDir);
 }
 
+/** True when a manifest entry belongs to the given canonical project path. */
+export function codexManifestEntryMatchesProjectPath(
+  entry: Pick<CodexSessionManifestEntry, "cwd" | "projectPathAliases">,
+  projectPath: string,
+): boolean {
+  return (
+    canonicalizeProjectPath(entry.cwd) === projectPath ||
+    entry.projectPathAliases.includes(projectPath)
+  );
+}
+
 async function buildCodexSessionManifest(
   sessionsDir: string,
 ): Promise<CodexSessionManifest> {
@@ -144,7 +177,7 @@ async function buildCodexSessionManifest(
     `[CodexManifest] Found ${files.length} rollout files in ${sessionsDir}`,
   );
 
-  const sessions: CodexSessionManifestEntry[] = [];
+  const drafts: CodexSessionManifestEntryDraft[] = [];
   let failCount = 0;
 
   for (let i = 0; i < files.length; i += MANIFEST_SCAN_BATCH_SIZE) {
@@ -160,12 +193,25 @@ async function buildCodexSessionManifest(
     );
     for (const result of results) {
       if (result) {
-        sessions.push(result);
+        drafts.push(result);
       } else {
         failCount++;
       }
     }
   }
+
+  const realpathCache: ProjectPathRealpathCache = new Map();
+  const sessions = await Promise.all(
+    drafts.map(
+      async (draft): Promise<CodexSessionManifestEntry> => ({
+        ...draft,
+        projectPathAliases: await resolveProjectPathAliases(
+          draft.cwd,
+          realpathCache,
+        ),
+      }),
+    ),
+  );
 
   if (files.length > 0 && sessions.length === 0) {
     const firstFile = files[0];
@@ -198,7 +244,7 @@ function dedupeWorkerRows(
 
 function manifestEntryFromHeader(
   header: CodexManifestFileHeader,
-): CodexSessionManifestEntry | null {
+): CodexSessionManifestEntryDraft | null {
   const entry = parseCodexSessionEntry(header.firstLine ?? "");
   if (!entry || entry.type !== "session_meta") return null;
   const meta = entry.payload;
@@ -243,12 +289,16 @@ function createManifest(
       byId.set(session.id, session);
     }
 
-    const projectPath = canonicalizeProjectPath(session.cwd);
-    const projectSessions = byProjectPath.get(projectPath);
-    if (projectSessions) {
-      projectSessions.push(session);
-    } else {
-      byProjectPath.set(projectPath, [session]);
+    for (const projectPath of [
+      canonicalizeProjectPath(session.cwd),
+      ...session.projectPathAliases,
+    ]) {
+      const projectSessions = byProjectPath.get(projectPath);
+      if (projectSessions) {
+        projectSessions.push(session);
+      } else {
+        byProjectPath.set(projectPath, [session]);
+      }
     }
 
     if (isNewestForId && session.parentThreadId) {
@@ -323,7 +373,7 @@ async function findRolloutFiles(dir: string): Promise<string[]> {
 
 async function readSessionManifestEntry(
   filePath: string,
-): Promise<CodexSessionManifestEntry | null> {
+): Promise<CodexSessionManifestEntryDraft | null> {
   try {
     const [stats, firstLine] = await Promise.all([
       stat(filePath),

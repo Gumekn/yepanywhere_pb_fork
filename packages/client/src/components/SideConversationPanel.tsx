@@ -1,25 +1,64 @@
 import { SIDE_CONVERSATION_MAX_PROMPT } from "@yep-anywhere/shared";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { SessionMetadataProvider } from "../contexts/SessionMetadataContext";
+import { StreamingMarkdownProvider } from "../contexts/StreamingMarkdownContext";
 import { useOptionalToastContext } from "../contexts/ToastContext";
 import { useComposer } from "../hooks/useComposer";
 import { useComposerUploads } from "../hooks/useComposerUploads";
 import { useConnection } from "../hooks/useConnection";
 import { useDraftPersistence } from "../hooks/useDraftPersistence";
+import {
+  MIN_SESSION_WIDTH,
+  useResizablePanel,
+} from "../hooks/useResizablePanel";
 import type { useSideConversation } from "../hooks/useSideConversation";
 import { useI18n } from "../i18n";
-import { getCurrentInstallId } from "../lib/storageKeys";
+import { sideConversationToMessages } from "../lib/sideConversationMessages";
+import { UI_KEYS, getCurrentInstallId } from "../lib/storageKeys";
+import type { RenderItem } from "../types/renderItems";
 import { ComposerEditor } from "./ComposerEditor";
 import { ComposerToolbar } from "./ComposerToolbar";
-import { TextBlock } from "./blocks/TextBlock";
+import { MessageList } from "./MessageList";
+import { PanelResizeHandle } from "./ui/PanelResizeHandle";
 import "../styles/side-conversation.css";
 
 /** Side questions have no `/` commands: Yep owns the side control plane. */
 const NO_COMMANDS: never[] = [];
+const MIN_SIDE_WIDTH = 320;
+const MAX_SIDE_RATIO = 0.7;
+
+/** Width until the user resizes the split (the former fixed CSS width). */
+const defaultSideWidth = (viewportWidth: number) =>
+  Math.min(Math.max(viewportWidth * 0.34, 360), 480);
+
+/** The turn's answer: its prose, without interim progress narration. */
+function turnAnswer(items: RenderItem[], progressTextItemIds: string[]) {
+  return items
+    .flatMap((item) =>
+      item.type === "text" &&
+      item.phase !== "commentary" &&
+      !progressTextItemIds.includes(item.id)
+        ? [item.text]
+        : [],
+    )
+    .join("\n\n")
+    .trim();
+}
 
 export function SideConversationPanel({
   side,
   projectId,
+  projectPath = null,
   sessionId,
+  provider,
   parentStatus,
   visible,
   mobile,
@@ -29,7 +68,11 @@ export function SideConversationPanel({
   side: ReturnType<typeof useSideConversation>;
   /** Project of the parent session; side images upload into its session. */
   projectId?: string;
+  /** Resolves relative file links in side answers, as in the main transcript. */
+  projectPath?: string | null;
   sessionId: string;
+  /** Parent provider; selects the same transcript conventions as the main view. */
+  provider?: string;
   parentStatus: string;
   visible: boolean;
   mobile: boolean;
@@ -42,8 +85,23 @@ export function SideConversationPanel({
   const draftKey = `side-draft-${getCurrentInstallId() ?? location.host}-${sessionId}-${conversation?.id ?? "new"}`;
   const [draft, setDraft, controls] = useDraftPersistence(draftKey);
   const panelRef = useRef<HTMLElement>(null);
-  const logRef = useRef<HTMLDivElement>(null);
-  const follow = useRef(true);
+  const resize = useResizablePanel({
+    storageKey: UI_KEYS.sideConversationWidthRatio,
+    defaultWidth: defaultSideWidth,
+    minWidth: MIN_SIDE_WIDTH,
+    maxRatio: MAX_SIDE_RATIO,
+    enabled: !mobile,
+    // The panel shares its row with the conversation (and any docked file).
+    getLayout: () => {
+      const row = panelRef.current?.parentElement?.getBoundingClientRect();
+      return row && row.width > 0
+        ? { availableWidth: row.width - MIN_SESSION_WIDTH, right: row.right }
+        : null;
+    },
+  });
+  const [scrollTrigger, setScrollTrigger] = useState(0);
+  const bringBack = useRef(onBringBack);
+  bringBack.current = onBringBack;
   const running =
     conversation?.status === "running" || conversation?.status === "stopping";
   const ended = conversation?.status === "closed";
@@ -122,11 +180,48 @@ export function SideConversationPanel({
         previous.focus();
     };
   }, [visible]);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Scroll when a new side snapshot changes the transcript height.
+  // A hidden panel has no layout; follow the tail again once it is shown.
   useEffect(() => {
-    if (visible && follow.current && logRef.current)
-      logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [visible, conversation?.version]);
+    if (visible) setScrollTrigger((value) => value + 1);
+  }, [visible]);
+  const transcript = useMemo(
+    () => sideConversationToMessages(conversation),
+    [conversation],
+  );
+  const renderTurnFooter = useCallback(
+    ({
+      items,
+      progressTextItemIds,
+    }: {
+      items: RenderItem[];
+      progressTextItemIds: string[];
+    }): ReactNode => {
+      const answer = running ? "" : turnAnswer(items, progressTextItemIds);
+      if (!answer) return null;
+      return (
+        <button
+          className="side-conversation-handoff"
+          type="button"
+          onClick={() => bringBack.current(answer)}
+        >
+          {t("sideChatBringBack")}
+        </button>
+      );
+    },
+    [running, t],
+  );
+  const transcriptList = (
+    <StreamingMarkdownProvider>
+      <MessageList
+        messages={transcript}
+        provider={provider}
+        isProcessing={running}
+        scrollTrigger={scrollTrigger}
+        transcriptKey={conversation?.id}
+        renderTurnFooter={renderTurnFooter}
+      />
+    </StreamingMarkdownProvider>
+  );
   const submit = async () => {
     if (busy || running || ended || !canSend || tooLong) return;
     if (uploads.hasPendingUploads) {
@@ -143,6 +238,7 @@ export function SideConversationPanel({
     // Flush/record the submitted draft before creation changes the side ID.
     controls.clearInput();
     if (await side.send(text, context, images)) {
+      setScrollTrigger((value) => value + 1);
       uploads.clear();
       try {
         localStorage.removeItem(draftKey);
@@ -160,6 +256,13 @@ export function SideConversationPanel({
       id="side-conversation-panel"
       ref={panelRef}
       className={`side-conversation ${mobile ? "side-conversation--mobile" : ""}`}
+      style={
+        mobile
+          ? undefined
+          : ({
+              "--side-conversation-width": `${resize.width}px`,
+            } as CSSProperties)
+      }
       hidden={!visible}
       role={mobile ? "dialog" : "complementary"}
       aria-modal={mobile ? true : undefined}
@@ -185,6 +288,13 @@ export function SideConversationPanel({
         }
       }}
     >
+      {!mobile && (
+        <PanelResizeHandle
+          panel={resize}
+          label={t("sideChatResize")}
+          hint={t("actionResizeDetailPanelHint")}
+        />
+      )}
       <header className="side-conversation-header">
         <h2 id="side-conversation-title">{t("sideChatTitle")}</h2>
         <button type="button" onClick={onClose}>
@@ -220,52 +330,21 @@ export function SideConversationPanel({
           <p>{t("sideChatIntro")}</p>
         )}
       </div>
-      <div
-        ref={logRef}
-        className="side-conversation-messages"
-        onScroll={() => {
-          const el = logRef.current;
-          if (el)
-            follow.current =
-              el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-        }}
-      >
-        {conversation?.messages.map((message) => (
-          <article
-            key={message.id}
-            className={`side-conversation-message side-conversation-message--${message.role}`}
+      <div className="side-conversation-messages">
+        {projectId && sessionId ? (
+          <SessionMetadataProvider
+            projectId={projectId}
+            projectPath={projectPath}
+            sessionId={sessionId}
           >
-            <span className="side-conversation-role">
-              {t(message.role === "user" ? "sideChatYou" : "sideChatAssistant")}
-            </span>
-            <TextBlock text={message.text} augmentHtml={message.html} />
-            {message.attachments && message.attachments.length > 0 && (
-              <ul className="side-conversation-attachments">
-                {message.attachments.map((attachment, index) => (
-                  <li key={`${attachment.name}-${index}`}>{attachment.name}</li>
-                ))}
-              </ul>
-            )}
-            {message.role === "assistant" && message.text && !running && (
-              <button
-                className="side-conversation-handoff"
-                type="button"
-                onClick={() => onBringBack(message.text)}
-              >
-                {t("sideChatBringBack")}
-              </button>
-            )}
-          </article>
-        ))}
-        {running && (
+            {transcriptList}
+          </SessionMetadataProvider>
+        ) : (
+          transcriptList
+        )}
+        {conversation?.status === "stopping" && (
           <p className="side-conversation-status" role="status">
-            {conversation.activity
-              ? t("sideChatReading", { tool: conversation.activity })
-              : t(
-                  conversation.status === "stopping"
-                    ? "sideChatStopping"
-                    : "sideChatThinking",
-                )}
+            {t("sideChatStopping")}
           </p>
         )}
         {(error || conversation?.error) && (
@@ -273,7 +352,9 @@ export function SideConversationPanel({
             {error || conversation?.error}
           </p>
         )}
-        {ended && <p>{t("sideChatEnded")}</p>}
+        {ended && (
+          <p className="side-conversation-status">{t("sideChatEnded")}</p>
+        )}
       </div>
       <form
         className="side-conversation-composer"

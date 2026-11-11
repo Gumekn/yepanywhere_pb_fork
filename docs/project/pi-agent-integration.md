@@ -131,6 +131,26 @@ Yep 计算 `--session-dir` 时复用 Pi 源码的 cwd 编码算法；恢复或�
 则使用源 JSONL 所在目录，确保 fork 仍落在同一个原生项目目录。仅当用户设置
 Pi 原生 `PI_CODING_AGENT_SESSION_DIR` 时，才按上游语义使用一个扁平目录。
 
+### 新建会话与会话 ID
+
+Supervisor 先用随机临时 ID 创建 `Process`，Pi 的真实 ID 要等 provider 完成
+启动才会在 `system/init` 中给出：spawn `pi --mode rpc`（会加载原生扩展，
+常见 3–5 秒、偶尔 10 秒以上）→ `set_model` → `set_thinking_level` →
+`get_state`（拿到 `sessionId`）→ `get_commands` → `init`。
+
+新建 Pi 会话的启动与 create-only 路径都严格等待这个 ID（最长 30 秒），
+拿到后才 `registerProcess`，所以 `session-created`、状态事件和 HTTP 响应里
+只会出现真实 ID；超时或 init 前报错会让请求失败。带消息恢复既有会话时 ID
+已知，不等待；不带消息恢复（如压缩、切换配置）同样严格等待 init；编辑 fork
+按 native fork 的超时等待新 ID。
+
+不要再依赖“先用临时 ID 注册、之后发 `session-id-changed` 修正”：这会把同一
+会话拆成两个客户端视图。对仍可能走非严格等待的 provider，客户端修正链路是：
+侧栏处理 activity 通道的 `session-id-changed`（临时卡片改名或并入真实卡片）；
+会话页的 display 订阅在请求 ID 已被替换时补发 `session-id-changed`；
+`/metadata` 按 `sessionIdAliases` / 进程当前 ID 返回真实 `session.id`；
+访问记录与已读标记在写入时解析别名，并在 ID 变更时迁移。
+
 ## 当前边界
 
 - Yep 创建的 Pi 会话具备 RPC 控制和远程审批；外部终端 Pi 会话可被发现并

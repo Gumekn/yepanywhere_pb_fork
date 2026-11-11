@@ -50,8 +50,6 @@ function createMockProcess(overrides?: Partial<Record<string, unknown>>): {
     }),
     getMessageHistory: vi.fn(() => []),
     getStreamingContent: vi.fn(() => null),
-    accumulateStreamingText: vi.fn(),
-    clearStreamingText: vi.fn(),
     getDeferredQueueSummary: vi.fn(() => []),
     ...overrides,
   } as unknown as Process;
@@ -599,12 +597,9 @@ describe("createSessionSubscription", () => {
     ]);
   });
 
-  it("does not re-accumulate streamed text from its final assistant message", async () => {
-    const accumulateStreamingText = vi.fn();
-    const { process, fireEvent } = createMockProcess({
-      accumulateStreamingText,
-    });
-    const { emit } = collectEmit();
+  it("does not emit duplicate pending text from the final assistant message", async () => {
+    const { process, fireEvent } = createMockProcess();
+    const { emit, events } = collectEmit();
 
     createSessionSubscription(process, emit);
 
@@ -638,8 +633,8 @@ describe("createSessionSubscription", () => {
       },
     } as unknown as ProcessEvent);
 
-    expect(accumulateStreamingText.mock.calls).toEqual([
-      ["msg_step_1", "Reading the file."],
+    expect(events.filter(([type]) => type === "pending")).toEqual([
+      ["pending", { messageId: "msg_step_1", html: "Reading the file." }],
     ]);
   });
 
@@ -695,20 +690,6 @@ describe("createSessionSubscription", () => {
     vi.advanceTimersByTime(60_000);
     // No heartbeats emitted after cleanup
     expect(events.length).toBe(countAfterCleanup);
-  });
-
-  it("cleanup clears streaming text if active", () => {
-    const { process } = createMockProcess();
-    const { emit } = collectEmit();
-
-    // We need to trigger a message with a streaming ID to set currentStreamingMessageId
-    // But since we can't easily do that without async augmenter, test that clearStreamingText
-    // is called on cleanup after a message event triggers accumulation
-    const { cleanup } = createSessionSubscription(process, emit);
-    cleanup();
-
-    // clearStreamingText is not called if no streaming was active (currentStreamingMessageId is null)
-    // This is correct behavior - it only clears if there was active streaming
   });
 
   it("calls onError when emit throws in event handler", async () => {

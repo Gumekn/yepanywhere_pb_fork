@@ -57,9 +57,9 @@
  * 4. Use `getSessionFilePath()` to construct paths to specific session files.
  */
 
-import { open, readdir, stat } from "node:fs/promises";
+import { open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, sep } from "node:path";
+import { basename, isAbsolute, join, posix, sep } from "node:path";
 import type { UrlProjectId } from "@yep-anywhere/shared";
 import { stripBom } from "../utils/jsonl.js";
 
@@ -126,6 +126,62 @@ export function canonicalizeProjectPath(path: string): string {
   return normalized.replace(/^([a-z]):/, (_match, drive: string) => {
     return `${drive.toUpperCase()}:`;
   });
+}
+
+/** Shared realpath lookups for one batch of {@link resolveProjectPathAliases} calls. */
+export type ProjectPathRealpathCache = Map<string, Promise<string | null>>;
+
+function cachedRealpath(
+  path: string,
+  cache: ProjectPathRealpathCache,
+): Promise<string | null> {
+  let pending = cache.get(path);
+  if (!pending) {
+    pending = realpath(path).catch(() => null);
+    cache.set(path, pending);
+  }
+  return pending;
+}
+
+/**
+ * Other canonical spellings of a recorded project path, for lookups only.
+ *
+ * Codex writes the raw cwd to rollout `session_meta` but `realpath(cwd)` to its
+ * state DB, which drives project grouping. On macOS `/tmp/x` is therefore
+ * listed under `/private/tmp/x`, and a lookup by that project path must still
+ * find the rollout. For a directory that has since been removed (temp dirs are
+ * routinely cleaned) the deepest existing ancestor is resolved instead, which
+ * reproduces the path Codex stored while it existed.
+ *
+ * Returns an empty list when the path has no other spelling. Windows paths are
+ * not resolved.
+ */
+export async function resolveProjectPathAliases(
+  path: string,
+  cache: ProjectPathRealpathCache = new Map(),
+): Promise<string[]> {
+  const canonical = canonicalizeProjectPath(path);
+  if (process.platform === "win32" || !posix.isAbsolute(canonical)) {
+    return [];
+  }
+
+  const missingSegments: string[] = [];
+  let current = canonical;
+  while (true) {
+    const resolved = await cachedRealpath(current, cache);
+    if (resolved !== null) {
+      const alias = canonicalizeProjectPath(
+        missingSegments.length > 0
+          ? posix.join(resolved, ...missingSegments)
+          : resolved,
+      );
+      return alias === canonical ? [] : [alias];
+    }
+    const parent = posix.dirname(current);
+    if (parent === current) return [];
+    missingSegments.unshift(posix.basename(current));
+    current = parent;
+  }
 }
 
 /**

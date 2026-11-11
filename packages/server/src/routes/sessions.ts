@@ -73,6 +73,7 @@ import type { PiSessionScanner } from "../projects/pi-scanner.js";
 import type { ProjectScanner } from "../projects/scanner.js";
 import type { RecentsService } from "../recents/index.js";
 import { EmbeddedRuntimeController } from "../runtime/EmbeddedRuntimeController.js";
+import { parseCompactRequestBody } from "../runtime/compact-request.js";
 import type { RuntimeController } from "../runtime/types.js";
 import {
   type CodexNativeControlRequest,
@@ -1220,7 +1221,7 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
   // Lightweight endpoint for refreshing title, status, etc. without re-fetching all messages
   routes.get("/projects/:projectId/sessions/:sessionId/metadata", async (c) => {
     const projectId = c.req.param("projectId");
-    const sessionId = c.req.param("sessionId");
+    const requestedSessionId = c.req.param("sessionId");
 
     // Validate projectId format at API boundary
     if (!isUrlProjectId(projectId)) {
@@ -1232,9 +1233,20 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       return c.json({ error: "Project not found" }, 404);
     }
 
-    // Check if session is actively owned by a process
-    const process =
-      await runtimeController.getProcessSnapshotForSession(sessionId);
+    // Check if session is actively owned by a process. A temporary bootstrap
+    // ID resolves to its durable ID, exactly like the full session read, so a
+    // page opened before the provider reported its ID can move onto it.
+    let process =
+      await runtimeController.getProcessSnapshotForSession(requestedSessionId);
+    const sessionId =
+      process?.sessionId ??
+      deps.sessionMetadataService?.getCanonicalSessionId?.(
+        requestedSessionId,
+      ) ??
+      requestedSessionId;
+    if (!process && sessionId !== requestedSessionId) {
+      process = await runtimeController.getProcessSnapshotForSession(sessionId);
+    }
     const bridgeView = await getBridgeSessionView(deps, sessionId);
     const bridgedSession =
       bridgeView?.session.projectId === projectId ? bridgeView : null;
@@ -1346,6 +1358,26 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
           })
         : undefined;
     const forkFamilyRootId = forkBranchState?.branches[0]?.sessionId;
+    // Pi edit forks are separate native session files, and the summary index
+    // never carries their family. Without it the display transport has no
+    // branch options, so an edited prompt rendered without its switcher.
+    const readerBranchState =
+      !forkBranchState && sessionSummaryResult?.source.reader.getBranchState
+        ? await sessionSummaryResult.source.reader
+            .getBranchState(sessionId)
+            .catch((error: unknown) => {
+              getLogger().warn(
+                {
+                  event: "session_metadata_branch_state_failed",
+                  sessionId,
+                  provider: sessionSummaryResult.source.provider,
+                  error: error instanceof Error ? error.message : String(error),
+                },
+                "Session metadata omitted its edit-fork branch state",
+              );
+              return undefined;
+            })
+        : undefined;
     const forkFamilyRootSummary = forkFamilyRootId
       ? await deps.codexSessionCatalog
           ?.getSessionSummary(forkFamilyRootId, project.path)
@@ -1403,7 +1435,8 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         source: sessionSummary?.source,
         approvalPolicy: sessionSummary?.approvalPolicy,
         sandboxPolicy: sessionSummary?.sandboxPolicy,
-        branchState: forkBranchState ?? sessionSummary?.branchState,
+        branchState:
+          forkBranchState ?? readerBranchState ?? sessionSummary?.branchState,
         codexBranchState: forkBranchState ?? sessionSummary?.codexBranchState,
         contextUsage: sessionSummary?.contextUsage,
         cumulativeUsage: sessionSummary?.cumulativeUsage,
@@ -2662,8 +2695,52 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
     return c.json(result.body, result.status);
   });
 
+  // Session-scoped Pi compaction also works after the resident process exits.
+  routes.post("/projects/:projectId/sessions/:sessionId/compact", async (c) => {
+    const projectId = c.req.param("projectId");
+    if (!isUrlProjectId(projectId)) {
+      return c.json({ error: "Invalid project ID format" }, 400);
+    }
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "Invalid JSON body" }, 400);
+    }
+    const parsed = parseCompactRequestBody(body);
+    if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+    const sessionId = c.req.param("sessionId");
+    if (deps.externalTracker?.isExternal(sessionId)) {
+      return c.json(
+        {
+          error: "Pi session is controlled by an external process",
+          code: "session_external",
+        },
+        409,
+      );
+    }
+    try {
+      const result = await sessionCommandService.compactPiSession({
+        projectId,
+        sessionId,
+        ...parsed.options,
+      });
+      return c.json(result.body, result.status);
+    } catch (error) {
+      return c.json(
+        {
+          error:
+            error instanceof Error ? error.message : "Pi compaction failed",
+        },
+        502,
+      );
+    }
+  });
+
   // POST /api/projects/:projectId/sessions/:sessionId/codex-control - Resume
-  // an inactive Codex session without a model turn, then start compaction.
+  // an inactive Codex session without a model turn, then run a control that
+  // is safe to start from idle: compaction, or a read-only goal fetch so the
+  // goal dialog can attach to the restored process.
   routes.post(
     "/projects/:projectId/sessions/:sessionId/codex-control",
     async (c) => {
@@ -2687,9 +2764,15 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       ) {
         return c.json({ error: "Supported Codex control is required" }, 400);
       }
-      if (request.control !== "thread/compact/start") {
+      if (
+        request.control !== "thread/compact/start" &&
+        request.control !== "thread/goal/get"
+      ) {
         return c.json(
-          { error: "Only Codex compaction can auto-resume a session" },
+          {
+            error:
+              "Only Codex compaction or goal lookup can auto-resume a session",
+          },
           400,
         );
       }
@@ -2858,7 +2941,11 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
   // POST /api/sessions/:sessionId/mark-seen - Mark session as seen (read)
   routes.post("/sessions/:sessionId/mark-seen", async (c) => {
-    const sessionId = c.req.param("sessionId");
+    // A page may still be open under a provider's temporary ID.
+    const sessionId =
+      deps.sessionMetadataService?.getCanonicalSessionId?.(
+        c.req.param("sessionId"),
+      ) ?? c.req.param("sessionId");
 
     if (!deps.notificationService) {
       return c.json({ error: "Notification service not available" }, 503);
@@ -2882,7 +2969,10 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
 
   // DELETE /api/sessions/:sessionId/mark-seen - Mark session as unread
   routes.delete("/sessions/:sessionId/mark-seen", async (c) => {
-    const sessionId = c.req.param("sessionId");
+    const sessionId =
+      deps.sessionMetadataService?.getCanonicalSessionId?.(
+        c.req.param("sessionId"),
+      ) ?? c.req.param("sessionId");
 
     if (!deps.notificationService) {
       return c.json({ error: "Notification service not available" }, 503);

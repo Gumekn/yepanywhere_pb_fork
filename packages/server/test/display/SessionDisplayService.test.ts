@@ -29,7 +29,14 @@ afterEach(() => {
   for (const service of services.splice(0)) service.dispose();
   vi.useRealTimers();
 });
-function fixture(pollMs = 60_000) {
+/**
+ * Most cases assert the raw projection order. Folding of settled answers is
+ * covered by its own cases, which opt in through `foldSettledTurns`.
+ */
+function fixture(
+  pollMs = 60_000,
+  options: { foldSettledTurns?: boolean } = { foldSettledTurns: false },
+) {
   let push: (type: string, data: unknown) => void = () => {};
   const source = {
     stamp: vi.fn(async () => "1"),
@@ -57,7 +64,7 @@ function fixture(pollMs = 60_000) {
       return { cleanup: vi.fn() };
     }),
   };
-  const service = new SessionDisplayService({ runtime, pollMs });
+  const service = new SessionDisplayService({ runtime, pollMs, ...options });
   service.configureSource(source);
   services.push(service);
   return {
@@ -1518,6 +1525,60 @@ describe("SessionDisplayService", () => {
     },
   );
 
+  it("keeps a Pi compaction spinner across source refreshes until it closes", async () => {
+    const { service, source, push } = fixture();
+    const page: DisplaySourcePage = {
+      provider: "pi",
+      messages: [
+        {
+          uuid: "u",
+          type: "user",
+          message: { role: "user", content: "Run" },
+        },
+      ] as Message[],
+      activity: "completed",
+      stamp: "1",
+    };
+    source.read.mockResolvedValue(page);
+    await service.subscribe(selection, vi.fn());
+    push("message", {
+      type: "system",
+      subtype: "status",
+      status: "compacting",
+      uuid: "pi-compaction-status-1",
+    });
+    expect((await service.snapshot(selection)).activity.isCompacting).toBe(
+      true,
+    );
+    // The resumed process reports idle before the compaction job starts its
+    // busy period; the resulting history refresh must not drop the spinner.
+    source.read.mockResolvedValue({ ...page, stamp: "2" });
+    source.stamp.mockResolvedValue("2");
+    push("status", { state: "idle" });
+    await vi.waitFor(() => expect(source.read).toHaveBeenCalledTimes(2));
+    await vi.waitFor(async () => {
+      expect((await service.snapshot(selection)).activity).toMatchObject({
+        state: "running",
+        isCompacting: true,
+      });
+    });
+    push("message", {
+      type: "system",
+      subtype: "status",
+      status: null,
+      uuid: "pi-compaction-status-1",
+    });
+    source.read.mockResolvedValue({ ...page, stamp: "3" });
+    source.stamp.mockResolvedValue("3");
+    push("status", { state: "idle" });
+    await vi.waitFor(() => expect(source.read).toHaveBeenCalledTimes(3));
+    await vi.waitFor(async () => {
+      expect(
+        (await service.snapshot(selection)).activity.isCompacting,
+      ).not.toBe(true);
+    });
+  });
+
   it.each(["completed", "failed", "interrupted"])(
     "does not replay compaction progress after a %s turn",
     async (outcome) => {
@@ -1996,6 +2057,45 @@ describe("SessionDisplayService", () => {
     expect(connected?.[1].deferredMessages ?? []).toEqual([]);
   });
 
+  it("moves a late subscriber off a temporary ID the runtime already replaced", async () => {
+    const { service, push } = fixture();
+    await service.subscribe(selection, vi.fn());
+    push("session-id-changed", {
+      oldSessionId: selection.sessionId,
+      newSessionId: "durable",
+    });
+    const emit = vi.fn();
+    await service.subscribe(selection, emit);
+    expect(emit).toHaveBeenCalledWith(
+      "connected",
+      expect.objectContaining({ sessionId: selection.sessionId }),
+    );
+    expect(emit).toHaveBeenCalledWith("session-id-changed", {
+      oldSessionId: selection.sessionId,
+      newSessionId: "durable",
+    });
+  });
+
+  it("reports the attached process ID when the rename predates the view", async () => {
+    const { service, push } = fixture();
+    await service.subscribe(selection, vi.fn());
+    // A view created after the rename only sees the runtime's connected ID.
+    push("connected", { sessionId: "durable", state: "idle" });
+    const emit = vi.fn();
+    await service.subscribe(selection, emit);
+    expect(emit).toHaveBeenCalledWith("session-id-changed", {
+      oldSessionId: selection.sessionId,
+      newSessionId: "durable",
+    });
+
+    const unchanged = vi.fn();
+    push("connected", { sessionId: selection.sessionId, state: "idle" });
+    await service.subscribe(selection, unchanged);
+    expect(
+      unchanged.mock.calls.some(([type]) => type === "session-id-changed"),
+    ).toBe(false);
+  });
+
   it("renders safe Markdown and file links in cold, older and live projections", async () => {
     const { service, source, push } = fixture();
     const initial = await source.read();
@@ -2453,6 +2553,160 @@ describe("SessionDisplayService", () => {
     expect(runtime.subscribeSession).toHaveBeenCalledTimes(2);
     const snapshot = await service.snapshot(selection);
     expect(JSON.stringify(snapshot)).not.toContain("Already seen");
+  });
+
+  it("folds a settled answer in place and serves its members on demand", async () => {
+    const { service, source, push } = fixture(60_000, {
+      foldSettledTurns: true,
+    });
+    const turn = (id: string, text: string): Message[] => [
+      {
+        uuid: `${id}-user`,
+        type: "user",
+        codexTurnId: id,
+        message: { role: "user", content: text },
+      },
+      {
+        uuid: `${id}-progress`,
+        type: "assistant",
+        codexTurnId: id,
+        codexMessagePhase: "commentary",
+        codexCorrelationKey: `codex:${id}:agent-message:progress`,
+        message: { role: "assistant", content: `Checking ${id}` },
+      },
+      {
+        uuid: `${id}-tool`,
+        type: "assistant",
+        codexTurnId: id,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: `${id}-call`,
+              name: "Bash",
+              input: { command: "pnpm test" },
+            },
+          ],
+        },
+      },
+      {
+        uuid: `${id}-result`,
+        type: "user",
+        codexTurnId: id,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: `${id}-call`,
+              content: "passed",
+            },
+          ],
+        },
+      },
+    ];
+    const final = (id: string): Message => ({
+      uuid: `${id}-final`,
+      type: "assistant",
+      codexTurnId: id,
+      codexMessagePhase: "final_answer",
+      codexCorrelationKey: `codex:${id}:agent-message:final`,
+      message: { role: "assistant", content: `Answer ${id}` },
+    });
+    source.read.mockResolvedValue({
+      provider: "codex",
+      messages: turn("turn-1", "Fix"),
+      activity: "running",
+      stamp: "1",
+    });
+    let live: SessionDisplaySnapshot | undefined;
+    await service.subscribe(selection, (type, data) => {
+      if (type === "display-snapshot") live = data as SessionDisplaySnapshot;
+      if (type === "display-patch") {
+        const next = live
+          ? applySessionDisplayPatch(
+              live,
+              SessionDisplayPatchSchema.parse(data),
+            )
+          : null;
+        if (!next) throw new Error("Expected applicable patch");
+        live = next;
+      }
+    });
+    const running = await service.snapshot(selection);
+    expect(
+      running.nodes.some(
+        (node) => node.type === "segment" && node.segment.type === "process",
+      ),
+    ).toBe(false);
+
+    source.read.mockResolvedValue({
+      provider: "codex",
+      messages: [...turn("turn-1", "Fix"), final("turn-1")],
+      turnStatuses: { "turn-1": "completed" },
+      activity: "completed",
+      stamp: "2",
+    });
+    push("complete", {});
+    await vi.waitFor(async () => {
+      const snapshot = await service.snapshot(selection);
+      expect(
+        snapshot.nodes.map((node) =>
+          node.type === "segment" ? node.segment.type : node.type,
+        ),
+      ).toEqual(["question", "process", "assistant_text"]);
+    });
+    const settled = await service.snapshot(selection);
+    // Completing the turn is an ordinary patch, not a new view epoch.
+    expect(settled.view.epoch).toBe(running.view.epoch);
+    expect(live?.nodes).toEqual(settled.nodes);
+    expect(JSON.stringify(settled)).not.toContain("Checking turn-1");
+    const fold = settled.nodes.find(
+      (node) => node.type === "segment" && node.segment.type === "process",
+    );
+    const page = await service.process(selection, required(fold).id);
+    expect(
+      page.nodes.map((node) =>
+        node.type === "segment" ? node.segment.type : node.type,
+      ),
+    ).toEqual(["assistant_text", "tool_group"]);
+    expect(JSON.stringify(page)).toContain("Checking turn-1");
+
+    // Older history pages record their cursor so folds can be rebuilt later.
+    source.read.mockImplementation(async (_selection, cursor?: string) =>
+      cursor === "older"
+        ? {
+            provider: "codex",
+            messages: [...turn("turn-0", "Earlier"), final("turn-0")],
+            turnStatuses: { "turn-0": "completed" },
+            activity: "unknown",
+            stamp: "2",
+          }
+        : {
+            provider: "codex",
+            messages: [...turn("turn-1", "Fix"), final("turn-1")],
+            turnStatuses: { "turn-1": "completed" },
+            activity: "completed",
+            stamp: "2",
+          },
+    );
+    const older = await service.older(selection, "older");
+    const olderFold = older.nodes.find(
+      (node) => node.type === "segment" && node.segment.type === "process",
+    );
+    if (olderFold?.type !== "segment" || olderFold.segment.type !== "process")
+      throw new Error("Expected an older fold");
+    expect(olderFold.segment.pageCursor).toBe("older");
+    const olderPage = await service.process(
+      selection,
+      olderFold.id,
+      olderFold.segment.pageCursor,
+    );
+    expect(JSON.stringify(olderPage)).toContain("Checking turn-0");
+    await expect(
+      service.process(selection, "process:missing:0"),
+    ).rejects.toThrow("Display process not found");
   });
 });
 
