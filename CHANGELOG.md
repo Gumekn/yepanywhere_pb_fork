@@ -7,6 +7,8 @@ and this independent release line uses calendar versions in `YYYY.M.N` format.
 
 ## [Unreleased]
 
+## [2026.11.1] - 2026-11-12
+
 ### Added
 - 新增会话只读分享链接：会话右侧「⋯」菜单新增「分享链接…」，选择有效期（1 天／7 天／30 天／永久）后生成带 token 的链接并自动复制，打开者无需登录即可查看。链接内容是生成时冻结的快照（与 ChatGPT 网页端分享一致），之后的新消息不会出现；想分享新内容就再生成一个。对话框同时列出该会话已有的有效链接，可复制或撤销，撤销与过期立即生效。分享页（`/share/<token>`）独立于主界面渲染，不触发登录跳转，只展示标题、provider、模型和项目目录名，不包含项目完整路径和会话 ID；页面提供「查看 Markdown」，即同一快照的纯文本版本（`/api/public/session-shares/<token>/transcript.md`），可以直接交给其他机器上的 agent 阅读。快照存放在数据目录的 `session-shares/` 下（仅所有者可读写），抓取方式是在服务端进程内重放会话详情接口，所以内容与所有者看到的一致，适用于所有 provider（包括只读的 dsh）；Codex 等分页加载的历史会一并取全，单个快照超过 40 MB 时会去掉内嵌图片后重试，页面会提示历史不完整或图片已省略。原有 Cloudflare R2 HTML 快照分享（需手动配置 `sharing.json`）保留，菜单文案改为「分享 HTML 快照」以便区分。
 - 新增会话纯文本导出接口 `GET /api/projects/:projectId/sessions/:sessionId/transcript`（需登录）：默认输出 Markdown，工具调用及其结果放在对应的助手回合下，工具输出默认截断为 4000 字符；`?thinking=1` 包含思考内容，`?toolOutputLimit=0` 不截断，`?format=json` 返回规范化消息。「复制会话信息」新增 `Transcript:` 一行，粘贴给其他机器上的 agent 时，它可以通过 HTTP 读取会话，不再因为本机没有该 provider 的会话文件而读取失败。
