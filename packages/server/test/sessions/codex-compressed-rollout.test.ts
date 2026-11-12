@@ -223,11 +223,7 @@ describe("compressed rollout consumers", () => {
     expect(await readdir(sessionsDir)).toEqual(["rollout-undecodable.jsonl"]);
   });
 
-  it("archives and restores a compressed session byte-for-byte", async () => {
-    // Auto-archive fires at 7 days and Codex compresses after 7 days cold, so the
-    // two features meet on the same files. Archiving is a byte-level move, which
-    // is safe for either form; this pins that it stays a move and that the
-    // restored session is readable again.
+  it("rejects physical archival without changing a compressed Codex session", async () => {
     const sessionId = "00000000-0000-0000-0000-0000000000a1";
     const sourcePath = await writeCompressedRollout(sessionId, "archive me");
     const originalBytes = await readFile(sourcePath);
@@ -238,31 +234,25 @@ describe("compressed rollout consumers", () => {
     const projectId = encodeProjectId(CWD) as UrlProjectId;
 
     try {
-      await service.archiveSession({
-        sessionId,
-        provider: "codex",
-        project: {
-          id: projectId,
-          path: CWD,
-          name: "compressed-project",
-          sessionCount: 1,
-          sessionDir: sessionsDir,
-          activeOwnedCount: 0,
-          activeExternalCount: 0,
-          lastActivity: null,
+      await expect(
+        service.archiveSession({
+          sessionId,
           provider: "codex",
-        },
-        sessionFilePath: sourcePath,
-        reason: "manual",
-      });
-
-      // Moved out of the session tree, so discovery no longer sees it.
-      invalidateCodexSessionManifest(sessionsDir);
-      expect(
-        (await getCodexSessionManifest(sessionsDir)).byId.get(sessionId),
-      ).toBeUndefined();
-
-      await service.restoreSession(sessionId);
+          project: {
+            id: projectId,
+            path: CWD,
+            name: "compressed-project",
+            sessionCount: 1,
+            sessionDir: sessionsDir,
+            activeOwnedCount: 0,
+            activeExternalCount: 0,
+            lastActivity: null,
+            provider: "codex",
+          },
+          sessionFilePath: sourcePath,
+          reason: "manual",
+        }),
+      ).rejects.toMatchObject({ code: "unsupported_provider" });
 
       expect(await readFile(sourcePath)).toEqual(originalBytes);
       invalidateCodexSessionManifest(sessionsDir);

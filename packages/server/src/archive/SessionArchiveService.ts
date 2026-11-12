@@ -19,6 +19,7 @@ import {
 } from "../sdk/providers/policy.js";
 import { normalizeProviderGroup } from "../sessions/provider-groups.js";
 import type { Project, SessionSummary } from "../supervisor/types.js";
+import { verifyRestoredCodexArchive } from "./codex-archive-migration.js";
 
 export type ArchiveProvider = "claude" | "codex" | "pi" | "cursor";
 type PersistedArchiveProvider = ArchiveProvider | RetiredProviderName;
@@ -236,6 +237,30 @@ export class SessionArchiveService {
       );
     }
 
+    if (record.provider === "codex") {
+      // Legacy archives are backup copies once independently restored. Never
+      // overwrite a live rollout, delete the backup, or move either file.
+      try {
+        await verifyRestoredCodexArchive(record, true);
+      } catch {
+        throw new ArchiveError(
+          "restore_conflict",
+          "Restore the legacy Codex source file from backup before clearing its archive state; existing files must match the archived history",
+        );
+      }
+      const backupsDir = join(this.archiveDir, "backups");
+      await mkdir(backupsDir, { recursive: true });
+      const backupDir = await mkdtemp(join(backupsDir, "codex-unarchive-"));
+      await writeFile(
+        join(backupDir, "manifest.json"),
+        JSON.stringify(this.manifest, null, 2),
+        { flag: "wx", mode: 0o600 },
+      );
+      delete this.manifest.sessions[sessionId];
+      await this.save();
+      return { record };
+    }
+
     for (const file of record.files) {
       if (await fileExists(file.originalPath)) {
         throw new ArchiveError(
@@ -430,11 +455,10 @@ function normalizeArchiveProvider(
   provider: ProviderName | string | undefined,
 ): ArchiveProvider | null {
   const group = normalizeProviderGroup(provider);
-  // Gemini, MiniMax Code and DeepSeek Harness own their stores (shared with
-  // their own apps); Yep never moves those files.
-  return group === "gemini" || group === "mcode" || group === "dsh"
-    ? null
-    : group;
+  // Codex remains in ArchiveProvider only to read legacy physical archives.
+  return group === "claude" || group === "pi" || group === "cursor"
+    ? group
+    : null;
 }
 
 async function createArchivedFileRecord(

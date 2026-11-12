@@ -100,34 +100,74 @@ describe("SessionArchiveService", () => {
     expect(service.getArchivedSession(sessionId)).toBeUndefined();
   });
 
-  it("archives and restores a Codex rollout file", async () => {
-    const sessionId = "codex-1";
-    const codexDir = join(testDir, "codex", "sessions", "2026", "06", "01");
-    const sessionPath = join(codexDir, "rollout-test.jsonl");
-    await mkdir(codexDir, { recursive: true });
-    await writeFile(sessionPath, '{"type":"session_meta","payload":{}}\n');
+  it.each(["codex", "codex-oss"])(
+    "refuses physical archive for %s",
+    async (provider) => {
+      const sessionPath = join(sessionDir, "rollout.jsonl");
+      const content = '{"type":"session_meta","payload":{}}\n';
+      await writeFile(sessionPath, content);
+      for (const reason of ["manual", "auto"] as const) {
+        await expect(
+          service.archiveSession({
+            sessionId: "codex-1",
+            provider,
+            project: createProject(),
+            sessionFilePath: sessionPath,
+            reason,
+          }),
+        ).rejects.toMatchObject({ code: "unsupported_provider" });
+        expect(await readFile(sessionPath, "utf8")).toBe(content);
+        expect(service.listArchivedSessions()).toEqual([]);
+      }
+    },
+  );
 
-    const project: Project = {
-      ...createProject(),
-      provider: "codex",
-      sessionDir: join(testDir, "codex", "sessions"),
-    };
-    const summary = { ...createSummary(sessionId), provider: "codex" as const };
-
-    const record = await service.archiveSession({
-      sessionId,
-      provider: "codex",
-      project,
-      summary,
-      sessionFilePath: sessionPath,
-      reason: "auto",
+  it("clears a restored legacy Codex archive without touching either copy", async () => {
+    const source = join(sessionDir, "rollout.jsonl");
+    const archived = join(dataDir, "archive", "legacy.jsonl");
+    const content = '{"type":"session_meta","payload":{}}\n';
+    await writeFile(source, content);
+    await writeFile(archived, content);
+    await writeFile(
+      join(dataDir, "archive", "manifest.json"),
+      JSON.stringify({
+        version: 1,
+        sessions: {
+          "codex-1": {
+            sessionId: "codex-1",
+            provider: "codex",
+            projectId: "proj-1",
+            projectPath: "/tmp/project",
+            archivedAt: "2026-11-01",
+            reason: "auto",
+            files: [
+              {
+                kind: "session",
+                originalPath: source,
+                archivePath: archived,
+                size: content.length,
+                mtimeMs: 0,
+              },
+            ],
+          },
+        },
+      }),
+    );
+    await service.initialize();
+    await writeFile(source, "conflicting contents");
+    await expect(service.restoreSession("codex-1")).rejects.toMatchObject({
+      code: "restore_conflict",
     });
-
-    await expect(stat(sessionPath)).rejects.toThrow();
-    expect(record.files).toHaveLength(1);
-
-    await service.restoreSession(sessionId);
-    expect(await readFile(sessionPath, "utf-8")).toContain("session_meta");
+    expect(service.isArchived("codex-1")).toBe(true);
+    await rm(source);
+    await expect(service.restoreSession("codex-1")).rejects.toMatchObject({
+      code: "restore_conflict",
+    });
+    await writeFile(source, `${content}new message\n`);
+    await service.restoreSession("codex-1");
+    expect(await readFile(source, "utf8")).toBe(`${content}new message\n`);
+    expect(await readFile(archived, "utf8")).toBe(content);
+    expect(service.isArchived("codex-1")).toBe(false);
   });
 
   it("archives and restores the whole Cursor directory including committed WAL data and nested assets", async () => {

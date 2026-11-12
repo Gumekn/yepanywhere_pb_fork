@@ -9,6 +9,7 @@ import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { createNodeWebSocket } from "@hono/node-ws";
 import type { RemoteExecutorConfig } from "@yep-anywhere/shared";
 import { createApp } from "./app.js";
+import { reconcileRestoredCodexArchives } from "./archive/codex-archive-migration.js";
 import { SessionArchiveService } from "./archive/index.js";
 import { AuthService } from "./auth/AuthService.js";
 import { getRuntimeBuildInfo } from "./build-info.js";
@@ -675,6 +676,7 @@ async function startServer() {
   // InstallService first since it generates the installation ID used by other services
   await installService.initialize();
   await notificationService.initialize();
+  await reconcileRestoredCodexArchives(config.dataDir, "startup");
   await sessionMetadataService.initialize();
   await projectMetadataService.initialize();
   await sessionIndexService.initialize();

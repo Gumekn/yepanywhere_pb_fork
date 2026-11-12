@@ -2020,6 +2020,92 @@ describe("Sessions metadata route", () => {
     );
   });
 
+  it.each(["codex", "codex-oss"])(
+    "archives %s only in Yep metadata and keeps its resident worker",
+    async (provider) => {
+      const testDir = join(tmpdir(), `yep-codex-metadata-${randomUUID()}`);
+      try {
+        await mkdir(testDir, { recursive: true });
+        const sessionPath = join(testDir, "rollout.jsonl");
+        const content = '{"type":"session_meta","payload":{"id":"sess-1"}}\n';
+        await writeFile(sessionPath, content);
+        const before = await stat(sessionPath);
+        const project = { ...createProject(), sessionDir: testDir, provider };
+        const reader = {
+          getSessionSummary: vi.fn(async () => ({
+            ...createSummary(),
+            provider,
+          })),
+          getSessionFilePath: vi.fn(async () => sessionPath),
+        } as unknown as ISessionReader;
+        const dataDir = join(testDir, "data");
+        const archiveService = new SessionArchiveService({ dataDir });
+        const metadataService = new SessionMetadataService({ dataDir });
+        await archiveService.initialize();
+        await metadataService.initialize();
+        await metadataService.updateMetadata("sess-1", {
+          title: "Keep title",
+          starred: true,
+        });
+        const physicalArchive = vi.spyOn(archiveService, "archiveSession");
+        const abortProcess = vi.fn();
+        const eventBus = new EventBus();
+        const emit = vi.spyOn(eventBus, "emit");
+        const routes = createSessionsRoutes({
+          supervisor: {
+            getProcessForSession: vi.fn(() => ({
+              id: "resident",
+              permissionMode: "default",
+              modeVersion: 0,
+              state: { type: "idle", since: new Date() },
+            })),
+            abortProcess,
+          } as unknown as SessionsDeps["supervisor"],
+          scanner: {
+            listProjects: vi.fn(async () => [project]),
+            invalidateCache: vi.fn(),
+          } as unknown as SessionsDeps["scanner"],
+          readerFactory: () => reader,
+          codexReaderFactory: () => reader as CodexSessionReader,
+          sessionMetadataService: metadataService,
+          sessionArchiveService: archiveService,
+          eventBus,
+        });
+        for (const archived of [true, true, false]) {
+          const response = await routes.request("/sessions/sess-1/metadata", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ archived }),
+          });
+          expect(response.status).toBe(200);
+          expect((await response.json()).archive.physical).toBe(false);
+          expect(metadataService.getMetadata("sess-1")).toMatchObject({
+            isStarred: true,
+            customTitle: "Keep title",
+          });
+          expect(
+            Boolean(metadataService.getMetadata("sess-1")?.isArchived),
+          ).toBe(archived);
+          expect(await readFile(sessionPath, "utf8")).toBe(content);
+          expect((await stat(sessionPath)).mtimeMs).toBe(before.mtimeMs);
+        }
+        expect(physicalArchive).not.toHaveBeenCalled();
+        expect(abortProcess).not.toHaveBeenCalled();
+        expect(archiveService.listArchivedSessions()).toEqual([]);
+        expect(
+          emit.mock.calls.some(([event]) => event.type === "file-change"),
+        ).toBe(false);
+        expect(
+          emit.mock.calls.filter(
+            ([event]) => event.type === "session-metadata-changed",
+          ),
+        ).toHaveLength(3);
+      } finally {
+        await rm(testDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("physically archives and restores session files through metadata updates", async () => {
     const testDir = join(tmpdir(), `yep-route-archive-test-${randomUUID()}`);
     const dataDir = join(testDir, "data");

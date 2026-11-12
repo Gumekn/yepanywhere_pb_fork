@@ -25,6 +25,7 @@ import {
   type ArchivedSessionRecord,
   type SessionArchiveService,
 } from "../archive/index.js";
+import { usesMetadataOnlyArchive } from "../archive/policy.js";
 import {
   type BridgeControllers,
   getAnyBridgeSessionView,
@@ -3154,55 +3155,50 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
         );
       }
 
-      if (activeProcess) {
-        await runtimeController.abortProcess(activeProcess.id);
-      }
-
       const target = await resolveArchiveTarget(deps, sessionId);
       if (!target) {
         return c.json({ error: "Session file not found for archive" }, 404);
       }
 
-      try {
-        const record = await deps.sessionArchiveService.archiveSession({
-          sessionId,
-          provider: target.provider,
-          project: target.project,
-          summary: target.summary,
-          sessionFilePath: target.sessionFilePath,
-          reason: "manual",
-        });
-        deps.scanner.invalidateCache();
-        deps.codexScanner?.invalidateCache();
-        deps.cursorScanner?.invalidateCache();
-        deps.mcodeScanner?.invalidateCache();
-        emitArchiveFileEvents(deps, record, "delete");
-        archiveResult = { physical: true, action: "archive", record };
-      } catch (error) {
-        if (
-          error instanceof ArchiveError &&
-          error.code === "already_archived"
-        ) {
-          archiveResult = {
-            physical: true,
-            action: "already_archived",
-            record: deps.sessionArchiveService.getArchivedSession(sessionId),
-          };
-        } else if (
-          error instanceof ArchiveError &&
-          error.code === "unsupported_provider" &&
-          (target.provider === "mcode" || target.provider === "dsh")
-        ) {
-          // MiniMax Code and DeepSeek Harness share their stores with their
-          // own apps; Yep only hides the session through metadata and never
-          // moves their files.
-        } else if (error instanceof ArchiveError) {
-          return c.json(
-            { error: error.message, code: error.code },
-            archiveHttpStatus(error),
-          );
-        } else {
-          return c.json({ error: "Failed to archive session" }, 500);
+      if (usesMetadataOnlyArchive(target.provider)) {
+        archiveResult = { physical: false, action: "archive" };
+      } else {
+        if (activeProcess) {
+          await runtimeController.abortProcess(activeProcess.id);
+        }
+        try {
+          const record = await deps.sessionArchiveService.archiveSession({
+            sessionId,
+            provider: target.provider,
+            project: target.project,
+            summary: target.summary,
+            sessionFilePath: target.sessionFilePath,
+            reason: "manual",
+          });
+          deps.scanner.invalidateCache();
+          deps.codexScanner?.invalidateCache();
+          deps.cursorScanner?.invalidateCache();
+          deps.mcodeScanner?.invalidateCache();
+          emitArchiveFileEvents(deps, record, "delete");
+          archiveResult = { physical: true, action: "archive", record };
+        } catch (error) {
+          if (
+            error instanceof ArchiveError &&
+            error.code === "already_archived"
+          ) {
+            archiveResult = {
+              physical: true,
+              action: "already_archived",
+              record: deps.sessionArchiveService.getArchivedSession(sessionId),
+            };
+          } else if (error instanceof ArchiveError) {
+            return c.json(
+              { error: error.message, code: error.code },
+              archiveHttpStatus(error),
+            );
+          } else {
+            return c.json({ error: "Failed to archive session" }, 500);
+          }
         }
       }
     }
@@ -3211,15 +3207,20 @@ export function createSessionsRoutes(deps: SessionsDeps): Hono {
       try {
         const { record } =
           await deps.sessionArchiveService.restoreSession(sessionId);
-        deps.scanner.invalidateCache();
-        deps.codexScanner?.invalidateCache();
-        deps.cursorScanner?.invalidateCache();
-        deps.mcodeScanner?.invalidateCache();
-        emitArchiveFileEvents(deps, record, "create");
-        archiveResult = { physical: true, action: "restore", record };
+        if (record.provider === "codex") {
+          archiveResult = { physical: false, action: "restore" };
+        } else {
+          deps.scanner.invalidateCache();
+          deps.codexScanner?.invalidateCache();
+          deps.cursorScanner?.invalidateCache();
+          deps.mcodeScanner?.invalidateCache();
+          emitArchiveFileEvents(deps, record, "create");
+          archiveResult = { physical: true, action: "restore", record };
+        }
       } catch (error) {
         if (error instanceof ArchiveError && error.code === "not_archived") {
           // Existing metadata-only archives still unarchive normally.
+          archiveResult = { physical: false, action: "restore" };
         } else if (error instanceof ArchiveError) {
           return c.json(
             { error: error.message, code: error.code },

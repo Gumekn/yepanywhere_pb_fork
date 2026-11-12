@@ -11,6 +11,7 @@ import {
   type ArchivedSessionRecord,
   type SessionArchiveService,
 } from "./archive/index.js";
+import { usesMetadataOnlyArchive } from "./archive/policy.js";
 import type { AuthService } from "./auth/AuthService.js";
 import { createAuthRoutes } from "./auth/routes.js";
 import type { FeishuBindingStore } from "./channels/feishu/binding-store.js";
@@ -1110,6 +1111,10 @@ export function createApp(options: AppOptions): AppResult {
             const metadata = options.sessionMetadataService?.getMetadata(
               session.id,
             );
+            if (metadata?.isArchived) {
+              skippedCount++;
+              continue;
+            }
             if (shouldSkipAutoArchiveForPinnedSession(session, metadata)) {
               skippedCount++;
               continue;
@@ -1123,6 +1128,27 @@ export function createApp(options: AppOptions): AppResult {
             }
 
             try {
+              if (usesMetadataOnlyArchive(archiveProvider)) {
+                // Never move a Codex rollout or emit a synthetic file deletion.
+                // Without metadata storage there is nothing safe to archive.
+                if (!options.sessionMetadataService) {
+                  skippedCount++;
+                  continue;
+                }
+                await options.sessionMetadataService.setArchived(
+                  session.id,
+                  true,
+                );
+                archivedCount++;
+                options.eventBus?.emit({
+                  type: "session-metadata-changed",
+                  sessionId: session.id,
+                  projectId: session.projectId,
+                  archived: true,
+                  timestamp: new Date().toISOString(),
+                });
+                continue;
+              }
               const sessionFilePath = await findSessionFileForArchive(
                 project,
                 source.reader,
